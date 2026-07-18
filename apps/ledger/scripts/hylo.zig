@@ -6,9 +6,37 @@ const durable_store = @import("durable_store");
 const hctp = @import("hctp.zig");
 const hctp_fold = @import("hctp_fold.zig");
 const hctp_fixtures = @import("hctp_fixtures");
+const hctp_source = if (builtin.is_test) @import("hctp_source") else struct {};
+const hylo_operator_recipe_paths = if (builtin.is_test) blk: {
+    break :blk @import("hylo_operator_recipe_paths");
+} else struct {};
 const retrace_core = @import("retrace_core");
 const std = @import("std");
 
+const m = std.mem;
+const fmt = std.fmt;
+const t = std.testing;
+const px = std.posix;
+const dir = std.Io.Dir;
+const sj = std.json.Stringify;
+const jfmt = std.json.fmt;
+const hc = retrace_core.hctp_trial_custody;
+const jf = jsonRequired;
+const js = jsonRequiredString;
+const jo = jsonRequiredObject;
+const ja = jsonRequiredArray;
+const op = jsonObjectPtr;
+const wj = writeCanonicalJson;
+const fm = error.RequiredFieldMissing;
+const invalid_fd = error.InvalidFd;
+const MES = durable_store.MemoryEventStore;
+const oe = optionalStringsEqual;
+const oi = randomOpaqueIdAlloc;
+const ft = findTrialAcrossCampaigns;
+const vs = validateTrialBuildSealing;
+const fb = findTargetBinding;
+const sa = targetSnapshotArtifactAlloc;
+const fs = findScenario;
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "ledger --source hylo";
@@ -23,7 +51,7 @@ fn defaultIo() std.Io {
     return if (builtin.is_test) std.testing.io else runtime_io orelse Io.io();
 }
 
-const UsageText =
+const UsageText = (
     \\ledger --source hylo
     \\
     \\usage: ledger --source hylo [-h] [--repo PATH] [--path PATH] COMMAND [options]
@@ -33,7 +61,8 @@ const UsageText =
     \\commands:
     \\  capabilities       Print HCTP and fold capability versions
     \\  validate-campaign  Validate campaign.json and its scenarios JSONL
-    \\  validate-trial     Purely validate one hylo-trial/v1 artifact
+    \\  validate-trial     Purely validate one hylo-trial/v1 or v2 artifact
+    \\  compile-trial      Compile an admitted campaign and source receipt into one trial
     \\  register-trial     Atomically register one complete trial manifest
     \\  start-lane         Durably start one registered lane and deliver its lease by FD
     \\  commit-lane-start  Commit or recover a caller-retained lane lease idempotently
@@ -63,9 +92,19 @@ const UsageText =
     \\  --repo PATH        Git repository to address (default: current repository)
     \\  --path PATH        Persistent-adapter path (default: .ledger/hylo/events.jsonl)
     \\  --campaign FILE    campaign.json for validate-campaign
-    \\  --trial FILE       trial.json for validate-trial
+    \\  --trial FILE       hylo-trial/v1 or v2 JSON for validation/registration
+    \\  --request FILE     hylo-trial-build-request/v1 for compile-trial
+    \\  --source-receipt FILE  hylo-source-selection-receipt/v1 for compile-trial
     \\  --receipt FILE     run or grade receipt JSON
-    \\  --reveal FILE      hylo-trial-reveal/v1 JSON
+    \\  --reveal FILE      Legacy hylo-trial-reveal/v1 JSON only
+    \\  --custody-output-fd N  Protected FD receiving private trial custody material
+    \\  --reveal-output-fd N  Compatibility alias for --custody-output-fd
+    \\  --reveal-material-fd N  Compatibility alias for reveal-time --custody-input-fd
+    \\
+) ++ "  --custody-input-fd N  Protected v2 custody for " ++
+    "registration/start/commit/materialization/reveal\n" ++ (
+    \\  --materialization-output-fd N  Protected FD receiving one lease-bound private arm
+    \\  --materialization-receipt FILE  Repeatable reveal-time materialization receipt
     \\  --trial-id ID      Registered trial identity
     \\  --lane-id ID       Registered lane identity
     \\  --runner-id ID     Frozen runner identity
@@ -88,7 +127,7 @@ const UsageText =
     \\  --format FORMAT    json|markdown for progress, frontier, or trial-result (default: json)
     \\  -h, --help         Show help
     \\  -V, --version      Show version
-;
+);
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = ProgramName,
@@ -99,6 +138,7 @@ const Command = enum {
     capabilities,
     validate_campaign,
     validate_trial,
+    compile_trial,
     register_trial,
     start_lane,
     commit_lane_start,
@@ -133,8 +173,11 @@ const Args = struct {
     path: []const u8 = DefaultStorePath,
     campaign_path: ?[]const u8 = null,
     trial_path: ?[]const u8 = null,
+    request_path: ?[]const u8 = null,
+    source_receipt_path: ?[]const u8 = null,
     receipt_path: ?[]const u8 = null,
     reveal_path: ?[]const u8 = null,
+    materialization_receipt_paths: std.ArrayList([]const u8) = .empty,
     input_path: ?[]const u8 = null,
     expected_campaign_head: ?[]const u8 = null,
     expected_trust_policy_fingerprint: ?[]const u8 = null,
@@ -150,12 +193,20 @@ const Args = struct {
     sanitization_receipt_path: ?[]const u8 = null,
     lease_output_fd: ?std.posix.fd_t = null,
     lease_input_fd: ?std.posix.fd_t = null,
+    reveal_output_fd: ?std.posix.fd_t = null,
+    reveal_material_fd: ?std.posix.fd_t = null,
+    custody_input_fd: ?std.posix.fd_t = null,
+    materialization_output_fd: ?std.posix.fd_t = null,
     registration_event_digest: ?[]const u8 = null,
     lane_started_event_digest: ?[]const u8 = null,
     lane_lease_digest: ?[]const u8 = null,
     revision: []const u8 = "HEAD",
     revision_set: bool = false,
     format: OutputFormat = .json,
+
+    fn deinit(self: *Args, allocator: std.mem.Allocator) void {
+        self.materialization_receipt_paths.deinit(allocator);
+    }
 };
 
 const EventKind = enum {
@@ -599,6 +650,59 @@ const TargetSnapshotRequest = struct {
     roots: []const []const u8,
 };
 
+const TrialBuildTargetInput = struct {
+    change_id: []const u8,
+    before_target_fingerprint: []const u8,
+    before_bundle_ref: ?[]const u8 = null,
+    before_bundle_fingerprint: []const u8,
+    before_snapshot_fingerprint: []const u8,
+    after_target_fingerprint: []const u8,
+    after_bundle_ref: ?[]const u8 = null,
+    after_bundle_fingerprint: []const u8,
+    after_snapshot_fingerprint: []const u8,
+};
+
+const TrialBuildFactorVerifierInput = struct {
+    id: []const u8,
+    version: []const u8,
+    fingerprint: []const u8,
+};
+
+const TrialBuildFactorInput = struct {
+    kind: []const u8,
+    allowed_difference_roots: []const []const u8,
+    verifier: TrialBuildFactorVerifierInput,
+    intervention_witness_ref: []const u8,
+};
+
+const TrialBuildAllocationInput = struct {
+    method: []const u8,
+};
+
+const TrialBuildRequest = struct {
+    schema: []const u8,
+    trial_id: []const u8,
+    campaign_id: []const u8,
+    expected_campaign_head: []const u8,
+    purpose: []const u8,
+    source_selection_receipt_ref: []const u8,
+    source_selection_receipt_fingerprint: []const u8,
+    unit_ids: []const []const u8,
+    target: TrialBuildTargetInput,
+    factor: TrialBuildFactorInput,
+    hypothesis: std.json.Value,
+    estimand: std.json.Value,
+    execution: std.json.Value,
+    grading: std.json.Value,
+    assurance: std.json.Value,
+    sealing: std.json.Value,
+    allocation: TrialBuildAllocationInput,
+    stop_policy: std.json.Value,
+    calibration: std.json.Value,
+    proof_policy: ?std.json.Value = null,
+    publication_policy: ?std.json.Value = null,
+};
+
 const AttemptPayload = struct {
     status: []const u8,
     target_fingerprint: []const u8,
@@ -738,9 +842,10 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
         try core_cli.printVersion(&stdout_writer.interface, Version);
         return 0;
     }
-    const args = parseArgs(argv) catch |err| {
+    var args = parseArgs(allocator, argv) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
+    defer args.deinit(allocator);
     if (core_cli.containsHelpArg(argv[1..])) {
         try printHelp();
         return 0;
@@ -757,8 +862,23 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
         .capabilities => try cmdCapabilities(allocator),
         .validate_campaign => try cmdValidateCampaign(allocator, args.campaign_path.?),
         .validate_trial => try cmdValidateTrial(allocator, repo, args.trial_path.?),
-        .register_trial => try cmdRegisterTrial(allocator, repo, store, args.trial_path.?),
-        .start_lane => try cmdStartLane(
+        .compile_trial => try cmdCompileTrial(
+            allocator,
+            repo,
+            store,
+            args.request_path.?,
+            args.source_receipt_path.?,
+            args.output_path.?,
+            args.reveal_output_fd.?,
+        ),
+        .register_trial => try cmdRegisterTrial(
+            allocator,
+            repo,
+            store,
+            args.trial_path.?,
+            args.custody_input_fd,
+        ),
+        .start_lane => try cmdStartLaneWithCustody(
             allocator,
             repo,
             store,
@@ -767,8 +887,9 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
             args.lane_id.?,
             args.runner_id.?,
             args.lease_output_fd.?,
+            args.custody_input_fd,
         ),
-        .commit_lane_start => try cmdCommitLaneStart(
+        .commit_lane_start => try cmdCommitLaneStartWithCustody(
             allocator,
             repo,
             store,
@@ -778,6 +899,7 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
             args.runner_id.?,
             args.lane_lease_digest.?,
             args.lease_input_fd.?,
+            args.custody_input_fd,
         ),
         .recover_lane_start => try cmdRecoverLaneStart(
             allocator,
@@ -797,6 +919,9 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
             args.registration_event_digest.?,
             args.lane_started_event_digest.?,
             args.lane_lease_digest.?,
+            args.custody_input_fd,
+            args.lease_input_fd,
+            args.materialization_output_fd,
         ),
         .finish_lane => try cmdFinishLane(allocator, repo, store, args.receipt_path.?, args.lease_input_fd.?),
         .recover_lane_finish => try cmdRecoverLaneFinish(
@@ -807,7 +932,16 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
         ),
         .grade_lane => try cmdGradeLane(allocator, repo, store, args.receipt_path.?),
         .grade_pair => try cmdGradePair(allocator, repo, store, args.receipt_path.?),
-        .reveal_trial => try cmdRevealTrial(allocator, repo, store, args.reveal_path.?),
+        .reveal_trial => if (args.reveal_path) |path|
+            try cmdRevealTrial(allocator, repo, store, path)
+        else
+            try cmdRevealTrialFromMaterial(
+                allocator,
+                repo,
+                store,
+                args.custody_input_fd orelse args.reveal_material_fd.?,
+                args.materialization_receipt_paths.items,
+            ),
         .trial_result => try cmdTrialResult(allocator, store, args.trial_id.?, args.format),
         .close_trial => try cmdCloseTrial(
             allocator,
@@ -871,8 +1005,9 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
     return 0;
 }
 
-fn parseArgs(argv: []const []const u8) !Args {
+fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
     var args = Args{};
+    errdefer args.deinit(allocator);
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const token = argv[i];
@@ -901,6 +1036,18 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.trial_path = argv[i];
             continue;
         }
+        if (std.mem.eql(u8, token, "--request")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.request_path = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--source-receipt")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.source_receipt_path = argv[i];
+            continue;
+        }
         if (std.mem.eql(u8, token, "--receipt")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -911,6 +1058,12 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             args.reveal_path = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--materialization-receipt")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try args.materialization_receipt_paths.append(allocator, argv[i]);
             continue;
         }
         if (std.mem.eql(u8, token, "--input")) {
@@ -978,6 +1131,33 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             args.lease_input_fd = std.fmt.parseInt(std.posix.fd_t, argv[i], 10) catch return error.InvalidFd;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--custody-output-fd") or
+            std.mem.eql(u8, token, "--reveal-output-fd"))
+        {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.reveal_output_fd = fmt.parseInt(px.fd_t, argv[i], 10) catch return invalid_fd;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--reveal-material-fd")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.reveal_material_fd = fmt.parseInt(px.fd_t, argv[i], 10) catch return invalid_fd;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--custody-input-fd")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.custody_input_fd = fmt.parseInt(px.fd_t, argv[i], 10) catch return invalid_fd;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--materialization-output-fd")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.materialization_output_fd = std.fmt.parseInt(std.posix.fd_t, argv[i], 10) catch
+                return error.InvalidFd;
             continue;
         }
         if (std.mem.eql(u8, token, "--registration-event-digest")) {
@@ -1049,6 +1229,7 @@ fn parseArgs(argv: []const []const u8) !Args {
     const command = args.command orelse return error.MissingCommand;
     const uses_campaign_path = command == .validate_campaign;
     const uses_trial_path = command == .validate_trial or command == .register_trial;
+    const compiles_trial = command == .compile_trial;
     const grade_commitment_inspect = command == .inspect and args.inspect_kind != null and
         std.mem.eql(u8, args.inspect_kind.?, "grade-commitment");
     const uses_input_path = command == .fingerprint or command == .snapshot_target or
@@ -1067,12 +1248,40 @@ fn parseArgs(argv: []const []const u8) !Args {
         command == .grade_lane or command == .grade_pair;
     if (uses_campaign_path != (args.campaign_path != null)) return error.CampaignNotAllowed;
     if (uses_trial_path != (args.trial_path != null)) return error.TrialNotAllowed;
+    if (compiles_trial != (args.request_path != null and args.source_receipt_path != null and
+        args.output_path != null and args.reveal_output_fd != null))
+    {
+        return error.TrialCompileArgumentsInvalid;
+    }
+    if (!compiles_trial and (args.request_path != null or args.source_receipt_path != null or
+        args.reveal_output_fd != null)) return error.TrialCompileArgumentsInvalid;
+    if (command != .register_trial and command != .start_lane and
+        command != .commit_lane_start and command != .lane_materialization and
+        command != .reveal_trial and args.custody_input_fd != null)
+    {
+        return error.TrialCustodyArgumentsInvalid;
+    }
     if (uses_input_path != (args.input_path != null)) return error.InputNotAllowed;
     if (uses_json_path != (args.json_path != null)) return error.JsonNotAllowed;
     if (uses_campaign_id != (args.campaign_id != null)) return error.CampaignIdNotAllowed;
     if (uses_trial_id != (args.trial_id != null)) return error.TrialIdNotAllowed;
     if (uses_receipt != (args.receipt_path != null)) return error.ReceiptNotAllowed;
-    if ((command == .reveal_trial) != (args.reveal_path != null)) return error.RevealNotAllowed;
+    if (command == .reveal_trial) {
+        const custody_fd_count: usize = @intFromBool(args.custody_input_fd != null) +
+            @intFromBool(args.reveal_material_fd != null);
+        if (custody_fd_count > 1 or
+            (args.reveal_path == null) == (custody_fd_count == 0))
+        {
+            return error.RevealNotAllowed;
+        }
+        if (args.reveal_path != null and args.materialization_receipt_paths.items.len != 0) {
+            return error.RevealNotAllowed;
+        }
+    } else if (args.reveal_path != null or args.reveal_material_fd != null or
+        args.materialization_receipt_paths.items.len != 0)
+    {
+        return error.RevealNotAllowed;
+    }
     const any_lane_start_argument = args.runner_id != null or args.lease_output_fd != null;
     if (command == .start_lane) {
         if (args.lane_id == null or args.runner_id == null or args.lease_output_fd == null) {
@@ -1091,7 +1300,18 @@ fn parseArgs(argv: []const []const u8) !Args {
         {
             return error.LaneMaterializationArgumentsInvalid;
         }
-    } else if (any_materialization_lineage_argument) return error.LaneMaterializationArgumentsInvalid;
+        const private_materialization = args.custody_input_fd != null or
+            args.materialization_output_fd != null;
+        if (private_materialization) {
+            if (args.custody_input_fd == null or args.lease_input_fd == null or
+                args.materialization_output_fd == null)
+            {
+                return error.LaneMaterializationArgumentsInvalid;
+            }
+        } else if (args.lease_input_fd != null) return error.LeaseInputNotAllowed;
+    } else if (any_materialization_lineage_argument or args.materialization_output_fd != null) {
+        return error.LaneMaterializationArgumentsInvalid;
+    }
     if (command == .commit_lane_start or command == .recover_lane_start) {
         if (args.lane_lease_digest == null) return error.LaneStartRecoveryArgumentsInvalid;
     } else if (command != .lane_materialization and args.lane_lease_digest != null) {
@@ -1107,7 +1327,9 @@ fn parseArgs(argv: []const []const u8) !Args {
         command == .commit_lane_start or command == .recover_lane_start)
     {
         if (args.lease_input_fd == null) return error.LeaseInputNotAllowed;
-    } else if (args.lease_input_fd != null) return error.LeaseInputNotAllowed;
+    } else if (command != .lane_materialization and args.lease_input_fd != null) {
+        return error.LeaseInputNotAllowed;
+    }
     const any_close_argument = args.close_status != null or args.reason != null;
     if (command == .close_trial) {
         if (args.close_status == null or args.reason == null) return error.CloseArgumentsInvalid;
@@ -1120,7 +1342,7 @@ fn parseArgs(argv: []const []const u8) !Args {
         if (command == .export_proof and args.sanitization_receipt_path == null) {
             return error.SanitizationReceiptRequired;
         }
-    } else if (args.output_path != null) return error.OutputNotAllowed;
+    } else if (!compiles_trial and args.output_path != null) return error.OutputNotAllowed;
     if (command != .export_proof and args.sanitization_receipt_path != null) {
         return error.SanitizationReceiptNotAllowed;
     }
@@ -1143,6 +1365,7 @@ fn parseArgs(argv: []const []const u8) !Args {
 fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "validate-campaign")) return .validate_campaign;
     if (std.mem.eql(u8, raw, "validate-trial")) return .validate_trial;
+    if (std.mem.eql(u8, raw, "compile-trial")) return .compile_trial;
     if (std.mem.eql(u8, raw, "register-trial")) return .register_trial;
     if (std.mem.eql(u8, raw, "start-lane")) return .start_lane;
     if (std.mem.eql(u8, raw, "commit-lane-start")) return .commit_lane_start;
@@ -1223,7 +1446,14 @@ fn cmdValidateTrial(allocator: std.mem.Allocator, repo: []const u8, trial_path: 
     defer result.deinit(allocator);
     var parsed = try parseValue(allocator, input);
     defer parsed.deinit();
-    _ = try verifyTrialInterventionAgainstRepo(allocator, repo, parsed.value);
+    const trial = try jsonObject(parsed.value);
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(trial, "schema"),
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+    )) {
+        _ = try verifyTrialInterventionAgainstRepo(allocator, repo, parsed.value);
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"schema\":\"hylo-trial-validation/v1\",\"status\":\"valid\",\"trial_id\":");
@@ -1234,6 +1464,1300 @@ fn cmdValidateTrial(allocator: std.mem.Allocator, repo: []const u8, trial_path: 
         ",\"unit_count\":{d},\"pair_count\":{d},\"lane_count\":{d},\"coverage\":\"structural\",\"limitations\":[]}}\n",
         .{ result.unit_count, result.pair_count, result.lane_count },
     );
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn randomOpaqueIdAlloc(
+    allocator: std.mem.Allocator,
+    salt: []const u8,
+    domain: []const u8,
+    values: []const []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashTagged(&hasher, "hylo-opaque-id", domain);
+    hashTagged(&hasher, "salt", salt);
+    for (values) |value| hashTagged(&hasher, "value", value);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "opaque-{s}", .{hex});
+}
+
+fn trialBuildSourceCase(
+    receipt: std.json.ObjectMap,
+    unit_id: []const u8,
+) !std.json.ObjectMap {
+    var matched: ?std.json.ObjectMap = null;
+    for ((try jsonRequiredArray(receipt, "cases")).items) |case_value| {
+        const candidate = try jsonObject(case_value);
+        if (!std.mem.eql(u8, try jsonRequiredString(candidate, "unit_id"), unit_id)) continue;
+        if (matched != null) return error.SourceCaseDuplicate;
+        matched = candidate;
+    }
+    return matched orelse error.SourceCaseMissing;
+}
+fn ensureTrialOutputAbsent(output_path: []const u8) !void {
+    const stat_opts: dir.StatFileOptions = .{ .follow_symlinks = false };
+    var path_components = std.mem.tokenizeAny(u8, output_path, "/\\");
+    while (path_components.next()) |component| {
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return error.TrialOutputPathNotCanonical;
+        }
+    }
+    const parent = std.fs.path.dirname(output_path) orelse ".";
+    try durable_store.rejectSymlinkComponents(parent);
+    var parent_dir = if (std.fs.path.isAbsolute(output_path))
+        std.Io.Dir.openDirAbsolute(defaultIo(), parent, .{ .follow_symlinks = false }) catch |err|
+            switch (err) {
+                error.FileNotFound => return error.TrialOutputParentMissing,
+                else => return err,
+            }
+    else
+        std.Io.Dir.cwd().openDir(defaultIo(), parent, .{ .follow_symlinks = false }) catch |err|
+            switch (err) {
+                error.FileNotFound => return error.TrialOutputParentMissing,
+                else => return err,
+            };
+    parent_dir.close(defaultIo());
+    const stat = dir.cwd().statFile(defaultIo(), output_path, stat_opts) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    _ = stat;
+    return error.TrialOutputExists;
+}
+
+fn validateTrialBuildSealing(
+    sealing_value: std.json.Value,
+    expected_case_visibility: []const u8,
+) !void {
+    const sealing = try jsonObject(sealing_value);
+    const materializer_contract = sealing.get("case_materializer_contract");
+    var fields = sealing.iterator();
+    while (fields.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "reveal_scope") and
+            !std.mem.eql(u8, entry.key_ptr.*, "case_materializer_ref") and
+            !std.mem.eql(u8, entry.key_ptr.*, "case_materializer_fingerprint") and
+            !std.mem.eql(u8, entry.key_ptr.*, "case_materializer_contract"))
+        {
+            return error.TrialBuildGeneratedFieldConflict;
+        }
+    }
+    const reveal_scope = try jsonRequiredString(sealing, "reveal_scope");
+    if (!std.mem.eql(u8, reveal_scope, "trial") and
+        !std.mem.eql(u8, reveal_scope, "campaign_holdout"))
+    {
+        return error.TrialBuildSealingInvalid;
+    }
+    const materializer_ref = try jsonRequired(sealing, "case_materializer_ref");
+    const materializer_fingerprint = try jsonRequired(sealing, "case_materializer_fingerprint");
+    if (std.mem.eql(u8, expected_case_visibility, "open") or
+        std.mem.eql(u8, expected_case_visibility, "result_blind"))
+    {
+        if (materializer_ref != .null or materializer_fingerprint != .null or
+            (materializer_contract != null and materializer_contract.? != .null))
+        {
+            return error.TrialBuildSealingInvalid;
+        }
+    } else if (std.mem.eql(u8, expected_case_visibility, "case_blind")) {
+        if (materializer_ref != .string or materializer_fingerprint != .string or
+            materializer_contract == null or materializer_contract.? != .object)
+        {
+            return error.TrialBuildSealingInvalid;
+        }
+        try validateNonEmpty(materializer_ref.string);
+        try validateFingerprint(materializer_fingerprint.string);
+    } else return error.CaseVisibilityInvalid;
+}
+
+fn validateTrialBuildRequestPreEntropy(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    loaded: *LedgerLoad,
+    request: TrialBuildRequest,
+    receipt_value: std.json.Value,
+) !struct {
+    campaign: *CampaignState,
+    receipt: std.json.ObjectMap,
+    before_binding: *const TargetBindingState,
+    after_binding: *const TargetBindingState,
+    change: *const ChangeState,
+    baseline_revision: []u8,
+    baseline_ref: []u8,
+    candidate_ref: []u8,
+    verifier_fingerprint: []u8,
+    common_projection: TargetSnapshotArtifact,
+} {
+    if (!std.mem.eql(u8, request.schema, "hylo-trial-build-request/v1")) {
+        return error.TrialBuildRequestInvalid;
+    }
+    if (request.proof_policy != null or request.publication_policy != null) {
+        return error.TrialBuildPolicyUnsupported;
+    }
+    try validateId(request.trial_id);
+    try validateId(request.campaign_id);
+    try validateFingerprint(request.expected_campaign_head);
+    try validateFingerprint(request.source_selection_receipt_fingerprint);
+    if (!std.mem.eql(u8, request.purpose, "practice_repair") and
+        !std.mem.eql(u8, request.purpose, "promotion"))
+    {
+        return error.TrialBuildPurposeUnsupported;
+    }
+    if (!std.mem.eql(u8, request.factor.kind, "target_snapshot") or
+        !std.mem.eql(u8, request.factor.verifier.id, "git-target-projection") or
+        !std.mem.eql(u8, request.factor.verifier.version, "v1"))
+    {
+        return error.TrialBuildFactorUnsupported;
+    }
+    try validateFingerprint(request.factor.verifier.fingerprint);
+    const verifier_fingerprint = try currentExecutableFingerprintAlloc(allocator);
+    errdefer allocator.free(verifier_fingerprint);
+    if (!std.mem.eql(u8, request.factor.verifier.fingerprint, verifier_fingerprint)) {
+        return error.TrialBuildVerifierFingerprintMismatch;
+    }
+    if (!std.mem.eql(u8, request.allocation.method, "balanced_ab_ba")) {
+        return error.TrialBuildAllocationUnsupported;
+    }
+    const stop_policy = try jsonObject(request.stop_policy);
+    const required_pairs = try jsonUnsigned(try jf(stop_policy, "required_pairs_per_unit"));
+    if (!std.mem.eql(u8, try jsonRequiredString(stop_policy, "kind"), "fixed") or
+        required_pairs == 0 or required_pairs % 2 != 0)
+    {
+        return error.TrialBuildAllocationUnsupported;
+    }
+    const assurance = try jsonObject(request.assurance);
+    if (std.mem.eql(u8, try jsonRequiredString(assurance, "required_level"), "sealed")) {
+        return error.SealedBrokerUnavailable;
+    }
+
+    const campaign_index = findCampaign(loaded.campaigns.items, request.campaign_id) orelse
+        return error.CampaignMissing;
+    const campaign = &loaded.campaigns.items[campaign_index];
+    if (!campaign.created) return error.CampaignMissing;
+    if (campaign.closed) return error.CampaignClosed;
+    if (!campaign.trial_profile) return error.TrialProfileMissing;
+    if (!campaign.private_trial_profile) return error.PrivateTrialProfileMissing;
+    if (!try campaignRequiresSourceRouteAdmission(allocator, campaign)) {
+        return error.SourceRouteAdmissionPolicyRequired;
+    }
+    if (!std.mem.eql(u8, campaign.last_digest, request.expected_campaign_head)) {
+        return error.TrialBuildCampaignHeadMismatch;
+    }
+    if (!allScenariosAdmitted(campaign)) return error.ScenarioManifestNotSealed;
+    if (!targetIdentityReady(campaign)) return error.BaselineTargetBundleMissing;
+    if ((try ft(loaded, request.trial_id)) != null) return error.TrialIdDuplicate;
+    const episode_key = "source_episode_fingerprint";
+    const receipt = try jsonObject(receipt_value);
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(receipt, "schema"),
+        "hylo-source-selection-receipt/v1",
+    ) or !std.mem.eql(u8, try jsonRequiredString(receipt, "campaign_id"), request.campaign_id) or
+        !std.mem.eql(
+            u8,
+            try jsonRequiredString(receipt, "receipt_fingerprint"),
+            request.source_selection_receipt_fingerprint,
+        ))
+    {
+        return error.SourceReceiptTrialMismatch;
+    }
+    const observed_receipt_fingerprint = try hctp.digestObjectOmittingAlloc(
+        allocator,
+        receipt_value,
+        "receipt_fingerprint",
+    );
+    defer allocator.free(observed_receipt_fingerprint);
+    if (!m.eql(u8, observed_receipt_fingerprint, request.source_selection_receipt_fingerprint)) {
+        return error.SourceReceiptTrialMismatch;
+    }
+    const cases = try jsonRequiredArray(receipt, "cases");
+    if (request.unit_ids.len == 0 or cases.items.len != request.unit_ids.len) {
+        return error.SourceReceiptTrialMismatch;
+    }
+    var case_visibility: ?[]const u8 = null;
+    for (request.unit_ids, 0..) |unit_id, index| {
+        try validateId(unit_id);
+        for (request.unit_ids[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, unit_id)) return error.DuplicateUnit;
+        }
+        const source_case = try trialBuildSourceCase(receipt, unit_id);
+        const scenario_id = try jsonRequiredString(source_case, "scenario_id");
+        _ = findScenario(campaign, scenario_id) orelse return error.ScenarioNotAdmitted;
+        const visibility = try jsonRequiredString(source_case, "case_visibility");
+        if (case_visibility) |expected| {
+            if (!std.mem.eql(u8, expected, visibility)) return error.CaseVisibilityInvalid;
+        } else case_visibility = visibility;
+        const admission_value = source_case.get("source_route_admission") orelse
+            return error.SourceRouteAdmissionMissing;
+        try retrace_core.hctp_route_admission.validateValue(allocator, admission_value, .{
+            .campaign_id = request.campaign_id,
+            .unit_id = unit_id,
+            .scenario_id = scenario_id,
+            .source_profile_fingerprint = try js(source_case, "source_profile_fingerprint"),
+            .source_episode_projection_fingerprint = try js(source_case, episode_key),
+        });
+        try retrace_core.hctp_route_admission.requireComparisonEligible(admission_value);
+        if ((std.mem.eql(u8, request.purpose, "practice_repair") or
+            std.mem.eql(u8, request.purpose, "promotion")) and
+            std.mem.eql(
+                u8,
+                try jsonRequiredString(try jsonObject(admission_value), "source_profile_kind"),
+                "historical_decision",
+            ))
+        {
+            const admission = try jsonObject(admission_value);
+            const state = admission.get("source_governance_state") orelse
+                return error.HistoricalGovernanceNotAuthoritative;
+            const allowed = admission.get("source_governance_workflow_effect_allowed") orelse
+                return error.HistoricalGovernanceNotAuthoritative;
+            if (state != .string or !std.mem.eql(u8, state.string, "authoritative") or
+                allowed != .bool or !allowed.bool)
+            {
+                return error.HistoricalGovernanceNotAuthoritative;
+            }
+        }
+    }
+    try vs(request.sealing, case_visibility orelse return error.CaseVisibilityInvalid);
+    const tgt = request.target;
+    const before_binding = fb(campaign, request.target.before_target_fingerprint) orelse
+        return error.UnknownTargetFingerprint;
+    const after_binding = fb(campaign, request.target.after_target_fingerprint) orelse
+        return error.UnknownTargetFingerprint;
+    if (!m.eql(u8, before_binding.bundle_fingerprint, request.target.before_bundle_fingerprint) or
+        !m.eql(u8, before_binding.target_snapshot_fingerprint, tgt.before_snapshot_fingerprint) or
+        !m.eql(u8, after_binding.bundle_fingerprint, request.target.after_bundle_fingerprint) or
+        !m.eql(u8, after_binding.target_snapshot_fingerprint, tgt.after_snapshot_fingerprint))
+    {
+        return error.TargetBundleAdmissionMissing;
+    }
+    const change = findChange(campaign, tgt.change_id) orelse return error.PromotionChangeMissing;
+    if (change.status != .applied or
+        !m.eql(u8, change.before_target_fingerprint, request.target.before_target_fingerprint) or
+        !m.eql(u8, change.after_target_fingerprint, request.target.after_target_fingerprint) or
+        !oe(change.before_target_bundle_fingerprint, request.target.before_bundle_fingerprint) or
+        !oe(change.after_target_bundle_fingerprint, request.target.after_bundle_fingerprint) or
+        !oe(change.before_target_snapshot_fingerprint, tgt.before_snapshot_fingerprint) or
+        !oe(change.after_target_snapshot_fingerprint, request.target.after_snapshot_fingerprint) or
+        !m.eql(u8, currentTargetFingerprint(campaign), request.target.after_target_fingerprint))
+    {
+        return error.ChangeBaseMismatch;
+    }
+    if (request.factor.allowed_difference_roots.len == 0) return error.TargetSnapshotRootsMissing;
+    for (request.factor.allowed_difference_roots) |root| {
+        try validateRelativePath(root);
+        var admitted = false;
+        for (campaign.allowed_paths) |allowed_root| if (pathWithin(root, allowed_root)) {
+            admitted = true;
+            break;
+        };
+        if (!admitted) return error.UnexpectedFactorDifference;
+    }
+    for (change.paths) |path| {
+        var covered = false;
+        for (request.factor.allowed_difference_roots) |root| if (pathWithin(path, root)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.UnexpectedFactorDifference;
+    }
+    try verifyStagedChange(
+        allocator,
+        repo,
+        @ptrCast(change.paths),
+        @ptrCast(campaign.allowed_paths),
+        change.diff_fingerprint,
+    );
+    const baseline_revision = try resolveSnapshotRevisionAlloc(allocator, repo, "HEAD");
+    errdefer allocator.free(baseline_revision);
+    const baseline_ref = try fmt.allocPrint(allocator, "git-revision:{s}", .{baseline_revision});
+    errdefer allocator.free(baseline_ref);
+    const candidate_ref = try allocator.dupe(u8, "git-revision:INDEX");
+    errdefer allocator.free(candidate_ref);
+    if (request.target.before_bundle_ref) |ref| {
+        if (!std.mem.eql(u8, ref, baseline_ref)) return error.TargetBundleAdmissionMissing;
+    }
+    if (request.target.after_bundle_ref) |ref| {
+        if (!std.mem.eql(u8, ref, candidate_ref)) return error.TargetBundleAdmissionMissing;
+    }
+    var baseline_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        request.factor.allowed_difference_roots,
+    );
+    defer baseline_snapshot.deinit(allocator);
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        "INDEX",
+        request.factor.allowed_difference_roots,
+    );
+    defer candidate_snapshot.deinit(allocator);
+    if (!m.eql(u8, baseline_snapshot.fingerprint, before_binding.target_snapshot_fingerprint) or
+        !std.mem.eql(u8, candidate_snapshot.fingerprint, after_binding.target_snapshot_fingerprint))
+    {
+        return error.TargetSnapshotMismatch;
+    }
+    return .{
+        .campaign = campaign,
+        .receipt = receipt,
+        .before_binding = before_binding,
+        .after_binding = after_binding,
+        .change = change,
+        .baseline_revision = baseline_revision,
+        .baseline_ref = baseline_ref,
+        .candidate_ref = candidate_ref,
+        .verifier_fingerprint = verifier_fingerprint,
+        .common_projection = try targetCommonProjectionArtifactAlloc(
+            allocator,
+            repo,
+            baseline_revision,
+            request.factor.allowed_difference_roots,
+        ),
+    };
+}
+
+fn writeUniqueSourceCommitments(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    cases: std.json.Array,
+    field: []const u8,
+) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    var emitted: usize = 0;
+    for (cases.items) |case_value| {
+        const commitment = try jsonRequiredString(try jsonObject(case_value), field);
+        if ((try seen.getOrPut(commitment)).found_existing) continue;
+        if (emitted != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(commitment, .{}, writer);
+        emitted += 1;
+    }
+}
+fn writeTrialBuildUnits(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    request: TrialBuildRequest,
+    receipt: std.json.ObjectMap,
+    arm0_id: []const u8,
+    arm1_id: []const u8,
+    salt: []const u8,
+) !void {
+    const tid = request.trial_id;
+    const stop_policy = try jsonObject(request.stop_policy);
+    const required_pairs = try jsonUnsigned(try jf(stop_policy, "required_pairs_per_unit"));
+    try writer.writeByte('[');
+    for (request.unit_ids, 0..) |unit_id, unit_index| {
+        if (unit_index != 0) try writer.writeByte(',');
+        const source_case = try trialBuildSourceCase(receipt, unit_id);
+        try writer.writeAll("{\"independence_cluster_id\":");
+        try wj(allocator, writer, try jf(source_case, "independence_cluster_id"));
+        try writer.writeAll(",\"pairs\":[");
+        var repeat_index: u64 = 1;
+        while (repeat_index <= required_pairs) : (repeat_index += 1) {
+            if (repeat_index != 1) try writer.writeByte(',');
+            var repeat_buffer: [32]u8 = undefined;
+            const repeat_text = try std.fmt.bufPrint(&repeat_buffer, "{d}", .{repeat_index});
+            const pair_id = try oi(allocator, salt, "pair", &.{ tid, unit_id, repeat_text });
+            defer allocator.free(pair_id);
+            const block_id = try oi(allocator, salt, "block", &.{ tid, unit_id, repeat_text });
+            defer allocator.free(block_id);
+            const lane0_id = try oi(allocator, salt, "lane-0", &.{ tid, unit_id, repeat_text });
+            defer allocator.free(lane0_id);
+            const lane1_id = try oi(allocator, salt, "lane-1", &.{ tid, unit_id, repeat_text });
+            defer allocator.free(lane1_id);
+            const first = if (repeat_index % 2 == 1) arm0_id else arm1_id;
+            const second = if (repeat_index % 2 == 1) arm1_id else arm0_id;
+            try writer.writeAll("{\"block_id\":");
+            try std.json.Stringify.value(block_id, .{}, writer);
+            try writer.writeAll(",\"lanes\":{");
+            try std.json.Stringify.value(arm0_id, .{}, writer);
+            try writer.writeAll(":{\"lane_id\":");
+            try std.json.Stringify.value(lane0_id, .{}, writer);
+            try writer.writeAll("},");
+            try std.json.Stringify.value(arm1_id, .{}, writer);
+            try writer.writeAll(":{\"lane_id\":");
+            try std.json.Stringify.value(lane1_id, .{}, writer);
+            try writer.writeAll("}},\"order\":[");
+            try std.json.Stringify.value(first, .{}, writer);
+            try writer.writeByte(',');
+            try std.json.Stringify.value(second, .{}, writer);
+            try writer.writeAll("],\"pair_id\":");
+            try std.json.Stringify.value(pair_id, .{}, writer);
+            try writer.print(",\"repeat_index\":{d},\"shared_seed\":null}}", .{repeat_index});
+        }
+        try writer.writeAll("],\"scenario_id\":");
+        try writeCanonicalJson(allocator, writer, try jsonRequired(source_case, "scenario_id"));
+        try writer.writeAll(",\"source_profile\":");
+        try writeCanonicalJson(allocator, writer, try jsonRequired(source_case, "source_profile"));
+        try writer.writeAll(",\"split\":");
+        try writeCanonicalJson(allocator, writer, try jsonRequired(source_case, "split"));
+        try writer.writeAll(",\"unit_id\":");
+        try std.json.Stringify.value(unit_id, .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn buildTrialAndRevealAlloc(
+    allocator: std.mem.Allocator,
+    request: TrialBuildRequest,
+    receipt_value: std.json.Value,
+    context: anytype,
+    arm0_id: []const u8,
+    arm1_id: []const u8,
+    salt: []const u8,
+    nonce: []const u8,
+    baseline_is_arm0: bool,
+) !struct { trial: []u8, reveal_material: []u8 } {
+    const arm0_semantic = if (baseline_is_arm0) "baseline" else "candidate";
+    const arm1_semantic = if (baseline_is_arm0) "candidate" else "baseline";
+    const arm0_value = if (baseline_is_arm0)
+        request.target.before_target_fingerprint
+    else
+        request.target.after_target_fingerprint;
+    const arm1_value = if (baseline_is_arm0)
+        request.target.after_target_fingerprint
+    else
+        request.target.before_target_fingerprint;
+    const arm0_snapshot = if (baseline_is_arm0)
+        request.target.before_snapshot_fingerprint
+    else
+        request.target.after_snapshot_fingerprint;
+    const arm1_snapshot = if (baseline_is_arm0)
+        request.target.after_snapshot_fingerprint
+    else
+        request.target.before_snapshot_fingerprint;
+    const arm0_ref = if (baseline_is_arm0) context.baseline_ref else context.candidate_ref;
+    const arm1_ref = if (baseline_is_arm0) context.candidate_ref else context.baseline_ref;
+    var mapping_text: std.Io.Writer.Allocating = .init(allocator);
+    defer mapping_text.deinit();
+    try mapping_text.writer.writeByte('{');
+    try std.json.Stringify.value(arm0_id, .{}, &mapping_text.writer);
+    try mapping_text.writer.writeByte(':');
+    try std.json.Stringify.value(arm0_semantic, .{}, &mapping_text.writer);
+    try mapping_text.writer.writeByte(',');
+    try std.json.Stringify.value(arm1_id, .{}, &mapping_text.writer);
+    try mapping_text.writer.writeByte(':');
+    try std.json.Stringify.value(arm1_semantic, .{}, &mapping_text.writer);
+    try mapping_text.writer.writeByte('}');
+    var mapping = try parseValue(allocator, mapping_text.written());
+    defer mapping.deinit();
+    const arm_commitment = try hctp.revealCommitmentAlloc(
+        allocator,
+        request.trial_id,
+        mapping.value,
+        nonce,
+    );
+    defer allocator.free(arm_commitment);
+
+    var witness_text: std.Io.Writer.Allocating = .init(allocator);
+    defer witness_text.deinit();
+    try witness_text.writer.writeAll("{\"arm_values\":{");
+    try std.json.Stringify.value(arm0_id, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(":{\"fingerprint\":");
+    try std.json.Stringify.value(arm0_value, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"snapshot_fingerprint\":");
+    try std.json.Stringify.value(arm0_snapshot, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll("},");
+    try std.json.Stringify.value(arm1_id, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(":{\"fingerprint\":");
+    try std.json.Stringify.value(arm1_value, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"snapshot_fingerprint\":");
+    try std.json.Stringify.value(arm1_snapshot, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll("}},\"common_projection\":{\"compared_fields\":[" ++
+        "\"environment\",\"model_policy\",\"replay_policy" ++
+        "\",\"effect_policy\"],\"fingerprint\":");
+    try std.json.Stringify.value(context.common_projection.fingerprint, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll("},\"differing_projection\":{\"allowed_roots\":");
+    try sj.value(request.factor.allowed_difference_roots, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"diff_fingerprint\":");
+    try std.json.Stringify.value(context.change.diff_fingerprint, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"observed_paths\":");
+    try std.json.Stringify.value(context.change.paths, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll("},\"factor_kind\":\"target_snapshot\",\"limitati" ++
+        "ons\":[],\"schema\":\"hylo-intervention-witness/" ++ "v1\",\"trial_id\":");
+    try std.json.Stringify.value(request.trial_id, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"verdict\":{\"one_factor_closed\":true},\"veri" ++
+        "fier\":{\"binary_fingerprint\":");
+    try std.json.Stringify.value(context.verifier_fingerprint, .{}, &witness_text.writer);
+    try witness_text.writer.writeAll(",\"id\":\"git-target-projection\",\"version\":\"v1\"}}");
+    var witness = try parseValue(allocator, witness_text.written());
+    defer witness.deinit();
+    const witness_fingerprint = try digestValueAlloc(allocator, witness.value);
+    defer allocator.free(witness_fingerprint);
+
+    const receipt = try jsonObject(receipt_value);
+    const cases = try jsonRequiredArray(receipt, "cases");
+    const case_visibility = try js(try jsonObject(cases.items[0]), "case_visibility");
+    const sealing_policy = try jsonObject(request.sealing);
+    var trial_text: std.Io.Writer.Allocating = .init(allocator);
+    defer trial_text.deinit();
+    try trial_text.writer.writeAll("{\"allocation\":{\"method\":\"balanced_ab_ba\"," ++
+        "\"position_balance_required\":true,\"seed_commit" ++
+        "ment\":null},\"arm_map_commitment\":{\"algorithm" ++ "\":");
+    try std.json.Stringify.value(hctp.CanonicalJsonSha256Algorithm, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"fingerprint\":");
+    try std.json.Stringify.value(arm_commitment, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll("},\"arms\":[{\"arm_id\":");
+    try std.json.Stringify.value(arm0_id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"materialization_fingerprint\":");
+    try std.json.Stringify.value(arm0_snapshot, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"materialization_ref\":");
+    try std.json.Stringify.value(arm0_ref, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"value_fingerprint\":");
+    try std.json.Stringify.value(arm0_value, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll("},{\"arm_id\":");
+    try std.json.Stringify.value(arm1_id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"materialization_fingerprint\":");
+    try std.json.Stringify.value(arm1_snapshot, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"materialization_ref\":");
+    try std.json.Stringify.value(arm1_ref, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"value_fingerprint\":");
+    try std.json.Stringify.value(arm1_value, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll("}],\"assurance\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.assurance);
+    try trial_text.writer.writeAll(",\"calibration\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.calibration);
+    try trial_text.writer.writeAll(",\"campaign_id\":");
+    try std.json.Stringify.value(request.campaign_id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"canonical_json_profile\":");
+    try std.json.Stringify.value(hctp.CanonicalJsonProfile, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"estimand\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.estimand);
+    try trial_text.writer.writeAll(",\"execution\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.execution);
+    try trial_text.writer.writeAll(",\"factor\":{\"allowed_difference_roots\":");
+    try std.json.Stringify.value(request.factor.allowed_difference_roots, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"common_projection_fingerprint\":");
+    try std.json.Stringify.value(context.common_projection.fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"intervention_witness\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, witness.value);
+    try trial_text.writer.writeAll(",\"intervention_witness_fingerprint\":");
+    try std.json.Stringify.value(witness_fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"intervention_witness_ref\":");
+    try std.json.Stringify.value(request.factor.intervention_witness_ref, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"kind\":\"target_snapshot\",\"target_common_projection\":");
+    try trial_text.writer.writeAll(context.common_projection.json);
+    try trial_text.writer.writeAll(",\"verifier\":{\"fingerprint\":");
+    try std.json.Stringify.value(context.verifier_fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"id\":");
+    try std.json.Stringify.value(request.factor.verifier.id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"version\":");
+    try std.json.Stringify.value(request.factor.verifier.version, .{}, &trial_text.writer);
+    try trial_text.writer.writeByte('}');
+    try trial_text.writer.writeAll("},\"grading\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.grading);
+    try trial_text.writer.writeAll(",\"hypothesis\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.hypothesis);
+    try trial_text.writer.writeAll(",\"purpose\":");
+    try std.json.Stringify.value(request.purpose, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"schema\":\"hylo-trial/v1\",\"sealing\":{\"arm" ++
+        "_visibility\":\"opaque_until_reveal\",\"case_mat" ++ "erializer_fingerprint\":");
+    try wj(allocator, &trial_text.writer, try jf(sealing_policy, "case_materializer_fingerprint"));
+    try trial_text.writer.writeAll(",\"case_materializer_ref\":");
+    try wj(allocator, &trial_text.writer, try jf(sealing_policy, "case_materializer_ref"));
+    if (sealing_policy.get("case_materializer_contract")) |contract| {
+        try trial_text.writer.writeAll(",\"case_materializer_contract\":");
+        try writeCanonicalJson(allocator, &trial_text.writer, contract);
+    }
+    try trial_text.writer.writeAll(",\"case_visibility\":");
+    try std.json.Stringify.value(case_visibility, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"grade_visibility\":\"opaque_until_reveal\",\"" ++
+        "hidden_reference_commitments\":[");
+    try writeUniqueSourceCommitments(
+        allocator,
+        &trial_text.writer,
+        cases,
+        "hidden_reference_fingerprint",
+    );
+    try trial_text.writer.writeAll("],\"reveal_scope\":");
+    try wj(allocator, &trial_text.writer, try jf(sealing_policy, "reveal_scope"));
+    try trial_text.writer.writeAll(",\"source_selection_receipt\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, receipt_value);
+    try trial_text.writer.writeAll(",\"source_selection_receipt_fingerprint\":");
+    try sj.value(request.source_selection_receipt_fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"source_selection_receipt_ref\":");
+    try std.json.Stringify.value(request.source_selection_receipt_ref, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"visible_input_commitments\":[");
+    try writeUniqueSourceCommitments(
+        allocator,
+        &trial_text.writer,
+        cases,
+        "visible_input_fingerprint",
+    );
+    try trial_text.writer.writeAll("]},\"stop_policy\":");
+    try writeCanonicalJson(allocator, &trial_text.writer, request.stop_policy);
+    try trial_text.writer.writeAll(",\"target_epoch\":{\"after_target_fingerprint\":");
+    try std.json.Stringify.value(request.target.after_target_fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"before_target_fingerprint\":");
+    try std.json.Stringify.value(request.target.before_target_fingerprint, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"change_id\":");
+    try std.json.Stringify.value(request.target.change_id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll("},\"trial_id\":");
+    try std.json.Stringify.value(request.trial_id, .{}, &trial_text.writer);
+    try trial_text.writer.writeAll(",\"units\":");
+    try writeTrialBuildUnits(
+        allocator,
+        &trial_text.writer,
+        request,
+        receipt,
+        arm0_id,
+        arm1_id,
+        salt,
+    );
+    try trial_text.writer.writeByte('}');
+    var trial_parsed = try parseValue(allocator, trial_text.written());
+    defer trial_parsed.deinit();
+    const trial = try canonicalJsonAlloc(allocator, trial_parsed.value);
+    errdefer allocator.free(trial);
+    const trial_fingerprint = try digestValueAlloc(allocator, trial_parsed.value);
+    defer allocator.free(trial_fingerprint);
+
+    var reveal: std.Io.Writer.Allocating = .init(allocator);
+    defer reveal.deinit();
+    try reveal.writer.writeAll("{\"mapping\":");
+    try writeCanonicalJson(allocator, &reveal.writer, mapping.value);
+    try reveal.writer.writeAll(",\"nonce\":");
+    try std.json.Stringify.value(nonce, .{}, &reveal.writer);
+    try reveal.writer.writeAll(",\"schema\":\"hylo-trial-reveal-material/v1\",\"" ++
+        "trial_fingerprint\":");
+    try std.json.Stringify.value(trial_fingerprint, .{}, &reveal.writer);
+    try reveal.writer.writeByte('}');
+    return .{ .trial = trial, .reveal_material = try reveal.toOwnedSlice() };
+}
+
+fn privateNonceAlloc(
+    allocator: std.mem.Allocator,
+    salt: []const u8,
+    label: []const u8,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("HCTP/private-trial-custody/v1\x00");
+    hasher.update(salt);
+    hasher.update("\x00");
+    hasher.update(label);
+    var digest: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &hex);
+}
+
+fn projectPublicV2SourceProfile(
+    allocator: std.mem.Allocator,
+    public_allocator: std.mem.Allocator,
+    profile: *std.json.ObjectMap,
+    source_case: std.json.ObjectMap,
+    case_visibility: []const u8,
+) !void {
+    const kind = try jsonRequiredString(profile.*, "kind");
+    const source_profile_fingerprint = try public_allocator.dupe(
+        u8,
+        try jsonRequiredString(source_case, "source_profile_fingerprint"),
+    );
+    const case_blind = std.mem.eql(u8, case_visibility, "case_blind");
+    if (std.mem.eql(u8, kind, "direct")) {
+        profile.clearRetainingCapacity();
+        try profile.put(public_allocator, "kind", .{ .string = @constCast("direct") });
+        try profile.put(
+            public_allocator,
+            "source_profile_fingerprint",
+            .{ .string = source_profile_fingerprint },
+        );
+        if (case_blind) try profile.put(public_allocator, "sealed_payload", .{ .bool = true });
+        return;
+    }
+    if (!std.mem.eql(u8, kind, "historical_decision")) return error.SourceProfileInvalid;
+
+    const governance_fingerprint = try jf(profile.*, "source_governance_fingerprint");
+    const decision_context_fingerprint = try jf(profile.*, "decision_context_fingerprint");
+    const temporal_horizon = try jsonRequired(profile.*, "temporal_horizon");
+    const source_target_text_policy = try jsonRequired(profile.*, "source_target_text_policy");
+    const retrace_mode = try jsonRequired(profile.*, "retrace_mode");
+    const required_lineage = try jsonRequired(profile.*, "required_lineage");
+    const required_fir_version = try jsonRequired(profile.*, "required_fir_version");
+    const reconstructability = try jsonRequired(profile.*, "reconstructability");
+    const limitations = try jsonRequired(profile.*, "limitations");
+    const witness_fingerprint = if (profile.get("source_target_text_witness_fingerprint")) |value|
+        try public_allocator.dupe(u8, try jsonString(value))
+    else blk: {
+        const fingerprint = try digestValueAlloc(
+            allocator,
+            try jsonRequired(profile.*, "source_target_text_witness"),
+        );
+        defer allocator.free(fingerprint);
+        break :blk try public_allocator.dupe(u8, fingerprint);
+    };
+
+    profile.clearRetainingCapacity();
+    try profile.put(public_allocator, "kind", .{ .string = @constCast("historical_decision") });
+    try profile.put(public_allocator, "source_governance_fingerprint", governance_fingerprint);
+    try profile.put(public_allocator, "decision_context_fingerprint", decision_context_fingerprint);
+    try profile.put(public_allocator, "temporal_horizon", temporal_horizon);
+    try profile.put(public_allocator, "source_target_text_policy", source_target_text_policy);
+    try profile.put(public_allocator, "retrace_mode", retrace_mode);
+    try profile.put(public_allocator, "required_lineage", required_lineage);
+    try profile.put(public_allocator, "required_fir_version", required_fir_version);
+    try profile.put(public_allocator, "reconstructability", reconstructability);
+    try profile.put(public_allocator, "limitations", limitations);
+    try profile.put(
+        public_allocator,
+        "source_profile_fingerprint",
+        .{ .string = source_profile_fingerprint },
+    );
+    try profile.put(
+        public_allocator,
+        "profile_body_delivery",
+        .{ .string = @constCast("source_profile_fd") },
+    );
+    if (case_blind) try profile.put(public_allocator, "sealed_payload", .{ .bool = true });
+    try profile.put(
+        public_allocator,
+        "source_target_text_witness_fingerprint",
+        .{ .string = witness_fingerprint },
+    );
+}
+
+fn buildPrivateTrialV2Alloc(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    semantic_trial_bytes: []const u8,
+    reveal_material_bytes: []const u8,
+    salt: []const u8,
+) !struct { trial: []u8, custody: []u8 } {
+    var semantic_parsed = try parseValue(allocator, semantic_trial_bytes);
+    defer semantic_parsed.deinit();
+    const semantic = try jsonObject(semantic_parsed.value);
+    var reveal_parsed = try parseValue(allocator, reveal_material_bytes);
+    defer reveal_parsed.deinit();
+    const reveal = try jsonObject(reveal_parsed.value);
+    const mapping = try jsonRequiredObject(reveal, "mapping");
+    const arms = try jsonRequiredArray(semantic, "arms");
+    if (arms.items.len != 2) return error.PairShapeInvalid;
+
+    const semantic_sealing = try jsonRequiredObject(semantic, "sealing");
+    const source_selection_receipt = try jsonRequired(semantic_sealing, "source_selection_receipt");
+    var source_selection_text: std.Io.Writer.Allocating = .init(allocator);
+    defer source_selection_text.deinit();
+    try source_selection_text.writer.writeAll("{\"nonce\":");
+    const source_selection_nonce = try privateNonceAlloc(allocator, salt, "source-selection");
+    defer allocator.free(source_selection_nonce);
+    try std.json.Stringify.value(source_selection_nonce, .{}, &source_selection_text.writer);
+    try source_selection_text.writer.writeAll(",\"receipt\":");
+    try writeCanonicalJson(allocator, &source_selection_text.writer, source_selection_receipt);
+    try source_selection_text.writer.writeAll(",\"schema\":\"hylo-source-selection-opening/v1\"}");
+    var source_selection_parsed = try parseValue(allocator, source_selection_text.written());
+    defer source_selection_parsed.deinit();
+    const selection_commitment = try digestValueAlloc(allocator, source_selection_parsed.value);
+    defer allocator.free(selection_commitment);
+
+    var opening_text: std.Io.Writer.Allocating = .init(allocator);
+    defer opening_text.deinit();
+    try opening_text.writer.writeAll("{\"arm_map_nonce\":");
+    try writeCanonicalJson(allocator, &opening_text.writer, try jsonRequired(reveal, "nonce"));
+    try opening_text.writer.writeAll(",\"intervention_witness\":{\"nonce\":");
+    const witness_nonce = try privateNonceAlloc(allocator, salt, "intervention-witness");
+    defer allocator.free(witness_nonce);
+    try std.json.Stringify.value(witness_nonce, .{}, &opening_text.writer);
+    try opening_text.writer.writeAll(",\"schema\":\"hylo-intervention-witness-opening/" ++
+        "v1\",\"witness\":");
+    try writeCanonicalJson(
+        allocator,
+        &opening_text.writer,
+        try jsonRequired(try jsonRequiredObject(semantic, "factor"), "intervention_witness"),
+    );
+    try opening_text.writer.writeAll("},\"schema\":\"hylo-trial-custody-opening/v1\"," ++
+        "\"source_selection_commitment\":");
+    try std.json.Stringify.value(selection_commitment, .{}, &opening_text.writer);
+    try opening_text.writer.writeAll(",\"target_epoch\":{\"after\":{\"nonce\":");
+    const after_nonce = try privateNonceAlloc(allocator, salt, "target-after");
+    defer allocator.free(after_nonce);
+    try std.json.Stringify.value(after_nonce, .{}, &opening_text.writer);
+    const semantic_epoch = try jsonRequiredObject(semantic, "target_epoch");
+    try opening_text.writer.writeAll(",\"schema\":\"hylo-target-opening/v1\",\"semanti" ++
+        "c_role\":\"candidate\",\"target_fingerprint\":");
+    try writeCanonicalJson(
+        allocator,
+        &opening_text.writer,
+        try jsonRequired(semantic_epoch, "after_target_fingerprint"),
+    );
+    try opening_text.writer.writeAll("},\"before\":{\"nonce\":");
+    const before_nonce = try privateNonceAlloc(allocator, salt, "target-before");
+    defer allocator.free(before_nonce);
+    try std.json.Stringify.value(before_nonce, .{}, &opening_text.writer);
+    try opening_text.writer.writeAll(",\"schema\":\"hylo-target-opening/v1\",\"semanti" ++
+        "c_role\":\"baseline\",\"target_fingerprint\":");
+    try writeCanonicalJson(
+        allocator,
+        &opening_text.writer,
+        try jsonRequired(semantic_epoch, "before_target_fingerprint"),
+    );
+    try opening_text.writer.writeAll("},\"change\":{\"change_id\":");
+    try wj(allocator, &opening_text.writer, try jf(semantic_epoch, "change_id"));
+    try opening_text.writer.writeAll(",\"nonce\":");
+    const change_nonce = try privateNonceAlloc(allocator, salt, "target-change");
+    defer allocator.free(change_nonce);
+    try std.json.Stringify.value(change_nonce, .{}, &opening_text.writer);
+    try opening_text.writer.writeAll(",\"schema\":\"hylo-change-opening/v1\"}},\"treatments\":[");
+    for (arms.items, 0..) |arm_value, index| {
+        if (index != 0) try opening_text.writer.writeByte(',');
+        const arm = try jsonObject(arm_value);
+        const arm_id = try jsonRequiredString(arm, "arm_id");
+        const role = try jsonRequiredString(mapping, arm_id);
+        const nonce_label = try std.fmt.allocPrint(allocator, "treatment:{s}", .{arm_id});
+        defer allocator.free(nonce_label);
+        const nonce = try privateNonceAlloc(allocator, salt, nonce_label);
+        defer allocator.free(nonce);
+        try opening_text.writer.writeAll("{\"arm_id\":");
+        try std.json.Stringify.value(arm_id, .{}, &opening_text.writer);
+        try opening_text.writer.writeAll(",\"materialization_fingerprint\":");
+        try wj(allocator, &opening_text.writer, try jf(arm, "materialization_fingerprint"));
+        try opening_text.writer.writeAll(",\"materialization_ref\":");
+        try wj(allocator, &opening_text.writer, try jf(arm, "materialization_ref"));
+        try opening_text.writer.writeAll(",\"nonce\":");
+        try std.json.Stringify.value(nonce, .{}, &opening_text.writer);
+        try opening_text.writer.writeAll(",\"schema\":\"hylo-treatment-opening/v1\",\"sema" ++
+            "ntic_role\":");
+        try std.json.Stringify.value(role, .{}, &opening_text.writer);
+        try opening_text.writer.writeAll(",\"value_fingerprint\":");
+        try wj(allocator, &opening_text.writer, try jf(arm, "value_fingerprint"));
+        try opening_text.writer.writeByte('}');
+    }
+    try opening_text.writer.writeAll("],\"target_common_projection\":{\"nonce\":");
+    const projection_nonce = try privateNonceAlloc(allocator, salt, "target-common-projection");
+    defer allocator.free(projection_nonce);
+    try std.json.Stringify.value(projection_nonce, .{}, &opening_text.writer);
+    try opening_text.writer.writeAll(",\"projection\":");
+    try writeCanonicalJson(
+        allocator,
+        &opening_text.writer,
+        try jsonRequired(try jsonRequiredObject(semantic, "factor"), "target_common_projection"),
+    );
+    try opening_text.writer.writeAll(",\"schema\":\"hylo-target-common-projection-open" ++
+        "ing/v1\"},\"trial_id\":");
+    try writeCanonicalJson(allocator, &opening_text.writer, try jsonRequired(semantic, "trial_id"));
+    try opening_text.writer.writeByte('}');
+    var opening_parsed = try parseValue(allocator, opening_text.written());
+    defer opening_parsed.deinit();
+    const opening = try jsonObject(opening_parsed.value);
+    const custody_commitment = try digestValueAlloc(allocator, opening_parsed.value);
+    defer allocator.free(custody_commitment);
+    const witness_commitment = try digestValueAlloc(
+        allocator,
+        try jsonRequired(opening, "intervention_witness"),
+    );
+    defer allocator.free(witness_commitment);
+    const common_projection_commitment = try digestValueAlloc(
+        allocator,
+        try jsonRequired(opening, "target_common_projection"),
+    );
+    defer allocator.free(common_projection_commitment);
+    const target_opening = try jsonRequiredObject(opening, "target_epoch");
+    const before_commitment = try digestValueAlloc(allocator, try jf(target_opening, "before"));
+    defer allocator.free(before_commitment);
+    const after_commitment = try digestValueAlloc(allocator, try jf(target_opening, "after"));
+    defer allocator.free(after_commitment);
+    const change_commitment = try digestValueAlloc(allocator, try jf(target_opening, "change"));
+    defer allocator.free(change_commitment);
+    var public_parsed = try parseValue(allocator, semantic_trial_bytes);
+    defer public_parsed.deinit();
+    const public_allocator = public_parsed.arena.allocator();
+    const pa = public_allocator;
+    const public_root = try jsonObjectPtr(&public_parsed.value);
+    try public_root.put(pa, "schema", .{ .string = @constCast(hc.PublicTrialSchema) });
+    try public_root.put(public_allocator, "custody_commitment", .{ .string = custody_commitment });
+    const case_visibility = try jsonRequiredString(semantic_sealing, "case_visibility");
+    const source_receipt = try jsonObject(source_selection_receipt);
+    const public_units_value = public_root.getPtr("units") orelse return error.RequiredFieldMissing;
+    if (public_units_value.* != .array) return error.ArrayRequired;
+    for (public_units_value.array.items) |*unit_value| {
+        const unit = try jsonObjectPtr(unit_value);
+        const source_case = try trialBuildSourceCase(
+            source_receipt,
+            try jsonRequiredString(unit.*, "unit_id"),
+        );
+        const source_profile = try jsonObjectPtr(
+            unit.getPtr("source_profile") orelse return error.RequiredFieldMissing,
+        );
+        try projectPublicV2SourceProfile(
+            allocator,
+            public_allocator,
+            source_profile,
+            source_case,
+            case_visibility,
+        );
+    }
+    const public_arms_value = public_root.getPtr("arms") orelse return error.RequiredFieldMissing;
+    if (public_arms_value.* != .array) return error.ArrayRequired;
+    for (public_arms_value.array.items) |*arm_value| {
+        const arm = try jsonObjectPtr(arm_value);
+        const arm_id = try jsonRequiredString(arm.*, "arm_id");
+        var opening_for_arm: ?std.json.Value = null;
+        for ((try jsonRequiredArray(opening, "treatments")).items) |treatment_value| {
+            if (std.mem.eql(
+                u8,
+                try jsonRequiredString(try jsonObject(treatment_value), "arm_id"),
+                arm_id,
+            )) opening_for_arm = treatment_value;
+        }
+        const treatment_commitment = try retrace_core.hctp_trial_custody.treatmentCommitmentAlloc(
+            allocator,
+            try jsonObject(opening_for_arm orelse return error.CustodyTreatmentMissing),
+        );
+        defer allocator.free(treatment_commitment);
+        const retained_treatment_commitment = try public_allocator.dupe(u8, treatment_commitment);
+        _ = arm.orderedRemove("value_fingerprint");
+        _ = arm.orderedRemove("materialization_ref");
+        _ = arm.orderedRemove("materialization_fingerprint");
+        try arm.put(
+            public_allocator,
+            "treatment_commitment",
+            .{ .string = retained_treatment_commitment },
+        );
+    }
+    const public_epoch = try op(public_root.getPtr("target_epoch") orelse return fm);
+    _ = public_epoch.orderedRemove("before_target_fingerprint");
+    _ = public_epoch.orderedRemove("after_target_fingerprint");
+    _ = public_epoch.orderedRemove("change_id");
+    try public_epoch.put(pa, "before_target_commitment", .{ .string = before_commitment });
+    try public_epoch.put(pa, "after_target_commitment", .{ .string = after_commitment });
+    try public_epoch.put(public_allocator, "change_commitment", .{ .string = change_commitment });
+    const public_factor = try op(public_root.getPtr("factor") orelse return fm);
+    _ = public_factor.orderedRemove("intervention_witness");
+    _ = public_factor.orderedRemove("intervention_witness_fingerprint");
+    _ = public_factor.orderedRemove("target_common_projection");
+    try public_factor.put(pa, "intervention_witness_commitment", .{ .string = witness_commitment });
+    try public_factor.put(
+        public_allocator,
+        "target_common_projection_commitment",
+        .{ .string = common_projection_commitment },
+    );
+    const witness_ref = try fmt.allocPrint(allocator, "private-custody:{s}", .{witness_commitment});
+    defer allocator.free(witness_ref);
+    try public_factor.put(pa, "intervention_witness_ref", .{ .string = witness_ref });
+    const public_sealing = try op(public_root.getPtr("sealing") orelse return fm);
+    _ = public_sealing.orderedRemove("source_selection_receipt");
+    const source_selection_receipt_fingerprint = try jsonRequiredString(
+        semantic_sealing,
+        "source_selection_receipt_fingerprint",
+    );
+    const portable_source_selection_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{source_selection_receipt_fingerprint},
+    );
+    defer allocator.free(portable_source_selection_ref);
+    try public_sealing.put(
+        public_allocator,
+        "source_selection_receipt_ref",
+        .{ .string = try public_allocator.dupe(u8, portable_source_selection_ref) },
+    );
+    try public_sealing.put(
+        public_allocator,
+        "source_selection_receipt_commitment",
+        .{ .string = selection_commitment },
+    );
+    const public_trial = try canonicalJsonAlloc(allocator, public_parsed.value);
+    errdefer allocator.free(public_trial);
+    const public_fingerprint = try digestValueAlloc(allocator, public_parsed.value);
+    defer allocator.free(public_fingerprint);
+
+    var custody_text: std.Io.Writer.Allocating = .init(allocator);
+    defer custody_text.deinit();
+    try custody_text.writer.writeAll("{\"materializations\":[");
+    for (arms.items, 0..) |arm_value, index| {
+        if (index != 0) try custody_text.writer.writeByte(',');
+        const envelope = try armMaterializationEnvelopeAlloc(
+            allocator,
+            repo,
+            semantic,
+            try jsonObject(arm_value),
+        );
+        defer allocator.free(envelope);
+        try custody_text.writer.writeAll(envelope);
+    }
+    try custody_text.writer.writeAll("],\"opening\":");
+    try writeCanonicalJson(allocator, &custody_text.writer, opening_parsed.value);
+    try custody_text.writer.writeAll(",\"public_trial_fingerprint\":");
+    try std.json.Stringify.value(public_fingerprint, .{}, &custody_text.writer);
+    try custody_text.writer.writeAll(",\"schema\":\"hylo-trial-custody/v1\",\"source_selection\":");
+    try writeCanonicalJson(allocator, &custody_text.writer, source_selection_parsed.value);
+    try custody_text.writer.writeAll(",\"trial_id\":");
+    try writeCanonicalJson(allocator, &custody_text.writer, try jsonRequired(semantic, "trial_id"));
+    try custody_text.writer.writeByte('}');
+    var custody_parsed = try parseValue(allocator, custody_text.written());
+    defer custody_parsed.deinit();
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        public_parsed.value,
+        custody_parsed.value,
+    );
+    return .{
+        .trial = public_trial,
+        .custody = try canonicalJsonAlloc(allocator, custody_parsed.value),
+    };
+}
+fn semanticTrialFromCustodyAlloc(
+    allocator: std.mem.Allocator,
+    public_trial_value: std.json.Value,
+    custody_value: std.json.Value,
+) ![]u8 {
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        public_trial_value,
+        custody_value,
+    );
+    const custody = try jsonObject(custody_value);
+    const opening = try jsonRequiredObject(custody, "opening");
+    var semantic_parsed = blk: {
+        const public_bytes = try canonicalJsonAlloc(allocator, public_trial_value);
+        defer allocator.free(public_bytes);
+        break :blk try parseValue(allocator, public_bytes);
+    };
+    defer semantic_parsed.deinit();
+    const semantic_allocator = semantic_parsed.arena.allocator();
+    const sem = semantic_allocator;
+    const materialization_fp = "materialization_fingerprint";
+    const root = try jsonObjectPtr(&semantic_parsed.value);
+    try root.put(semantic_allocator, "schema", .{ .string = @constCast(hctp.TrialSchema) });
+    _ = root.orderedRemove("custody_commitment");
+    const arms_value = root.getPtr("arms") orelse return error.RequiredFieldMissing;
+    if (arms_value.* != .array) return error.ArrayRequired;
+    for (arms_value.array.items) |*arm_value| {
+        const arm = try jsonObjectPtr(arm_value);
+        const treatment = try retrace_core.hctp_trial_custody.treatmentOpeningForArm(
+            custody,
+            try jsonRequiredString(arm.*, "arm_id"),
+        );
+        _ = arm.orderedRemove("treatment_commitment");
+        inline for (.{ "value_fingerprint", "materialization_ref", materialization_fp }) |key| {
+            try arm.put(semantic_allocator, key, try jsonRequired(treatment, key));
+        }
+    }
+    const epoch = try op(root.getPtr("target_epoch") orelse return fm);
+    _ = epoch.orderedRemove("before_target_commitment");
+    _ = epoch.orderedRemove("after_target_commitment");
+    _ = epoch.orderedRemove("change_commitment");
+    const target_opening = try jsonRequiredObject(opening, "target_epoch");
+    try epoch.put(
+        semantic_allocator,
+        "before_target_fingerprint",
+        try jsonRequired(try jsonRequiredObject(target_opening, "before"), "target_fingerprint"),
+    );
+    try epoch.put(
+        semantic_allocator,
+        "after_target_fingerprint",
+        try jsonRequired(try jsonRequiredObject(target_opening, "after"), "target_fingerprint"),
+    );
+    try epoch.put(
+        semantic_allocator,
+        "change_id",
+        try jsonRequired(try jsonRequiredObject(target_opening, "change"), "change_id"),
+    );
+    const factor = try op(root.getPtr("factor") orelse return fm);
+    _ = factor.orderedRemove("intervention_witness_commitment");
+    _ = factor.orderedRemove("target_common_projection_commitment");
+    const witness = try jf(try jo(opening, "intervention_witness"), "witness");
+    const witness_fingerprint = try digestValueAlloc(allocator, witness);
+    defer allocator.free(witness_fingerprint);
+    try factor.put(semantic_allocator, "intervention_witness", witness);
+    try factor.put(sem, "intervention_witness_fingerprint", .{ .string = witness_fingerprint });
+    try factor.put(
+        semantic_allocator,
+        "target_common_projection",
+        try jsonRequired(try jsonRequiredObject(opening, "target_common_projection"), "projection"),
+    );
+    const sealing = try op(root.getPtr("sealing") orelse return fm);
+    _ = sealing.orderedRemove("source_selection_receipt_commitment");
+    try sealing.put(
+        semantic_allocator,
+        "source_selection_receipt",
+        try jsonRequired(try jsonRequiredObject(custody, "source_selection"), "receipt"),
+    );
+    return canonicalJsonAlloc(allocator, semantic_parsed.value);
+}
+fn cmdCompileTrial(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    request_path: []const u8,
+    source_receipt_path: []const u8,
+    output_path: []const u8,
+    reveal_output_fd: std.posix.fd_t,
+) !void {
+    return compileTrial(
+        allocator,
+        repo,
+        store,
+        request_path,
+        source_receipt_path,
+        output_path,
+        reveal_output_fd,
+        true,
+    );
+}
+
+fn publishTrialAndReveal(
+    output_path: []const u8,
+    trial_bytes: []const u8,
+    reveal_output_fd: std.posix.fd_t,
+    custody_material: []const u8,
+) !void {
+    try validateRevealOutputEndpoint(reveal_output_fd);
+    if (custody_material.len == 0 or custody_material.len > MaxInputBytes) {
+        return error.TrialCustodyRecordInvalid;
+    }
+    const parent = std.fs.path.dirname(output_path) orelse ".";
+    const base = std.fs.path.basename(output_path);
+    var output_dir = if (std.fs.path.isAbsolute(output_path))
+        try std.Io.Dir.openDirAbsolute(defaultIo(), parent, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(defaultIo(), parent, .{ .follow_symlinks = false });
+    defer output_dir.close(defaultIo());
+    var atomic_file = try output_dir.createFileAtomic(defaultIo(), base, .{
+        .permissions = @enumFromInt(0o600),
+        .replace = false,
+    });
+    defer atomic_file.deinit(defaultIo());
+    try atomic_file.file.writeStreamingAll(defaultIo(), trial_bytes);
+    try atomic_file.file.sync(defaultIo());
+    atomic_file.link(defaultIo()) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.TrialOutputExists,
+        else => return err,
+    };
+
+    writePrivateCustodyRecord(reveal_output_fd, custody_material) catch |delivery_error| {
+        output_dir.deleteFile(defaultIo(), base) catch return error.TrialOutputRollbackFailed;
+        return delivery_error;
+    };
+}
+
+fn compileTrial(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    request_path: []const u8,
+    source_receipt_path: []const u8,
+    output_path: []const u8,
+    reveal_output_fd: std.posix.fd_t,
+    emit_receipt: bool,
+) !void {
+    try validateRevealOutputEndpoint(reveal_output_fd);
+    try ensureTrialOutputAbsent(output_path);
+    const request_bytes = try readInputAlloc(allocator, request_path);
+    defer allocator.free(request_bytes);
+    var request = try parseTyped(TrialBuildRequest, allocator, request_bytes);
+    defer request.deinit();
+    const receipt_bytes = try readInputAlloc(allocator, source_receipt_path);
+    defer {
+        std.crypto.secureZero(u8, receipt_bytes);
+        allocator.free(receipt_bytes);
+    }
+    var receipt = try parseValue(allocator, receipt_bytes);
+    defer receipt.deinit();
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    var context = try validateTrialBuildRequestPreEntropy(
+        allocator,
+        repo,
+        &loaded,
+        request.value,
+        receipt.value,
+    );
+    defer {
+        allocator.free(context.baseline_revision);
+        allocator.free(context.baseline_ref);
+        allocator.free(context.candidate_ref);
+        allocator.free(context.verifier_fingerprint);
+        context.common_projection.deinit(allocator);
+    }
+
+    var salt: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &salt);
+    try std.Io.randomSecure(defaultIo(), &salt);
+    var nonce_bytes: [16]u8 = undefined;
+    defer std.crypto.secureZero(u8, &nonce_bytes);
+    try std.Io.randomSecure(defaultIo(), &nonce_bytes);
+    var nonce_hex = std.fmt.bytesToHex(nonce_bytes, .lower);
+    defer std.crypto.secureZero(u8, &nonce_hex);
+    const arm0_id = try randomOpaqueIdAlloc(allocator, &salt, "arm-0", &.{request.value.trial_id});
+    defer allocator.free(arm0_id);
+    const arm1_id = try randomOpaqueIdAlloc(allocator, &salt, "arm-1", &.{request.value.trial_id});
+    defer allocator.free(arm1_id);
+    const built = try buildTrialAndRevealAlloc(
+        allocator,
+        request.value,
+        receipt.value,
+        context,
+        arm0_id,
+        arm1_id,
+        &salt,
+        &nonce_hex,
+        (salt[0] & 1) == 0,
+    );
+    defer {
+        std.crypto.secureZero(u8, built.trial);
+        allocator.free(built.trial);
+    }
+    defer {
+        std.crypto.secureZero(u8, built.reveal_material);
+        allocator.free(built.reveal_material);
+    }
+    var semantic_validation = try hctp.validateTrialAlloc(allocator, built.trial);
+    defer semantic_validation.deinit(allocator);
+    const private_built = try buildPrivateTrialV2Alloc(
+        allocator,
+        repo,
+        built.trial,
+        built.reveal_material,
+        &salt,
+    );
+    defer allocator.free(private_built.trial);
+    defer {
+        std.crypto.secureZero(u8, private_built.custody);
+        allocator.free(private_built.custody);
+    }
+    var validation = try hctp.validateTrialAlloc(allocator, private_built.trial);
+    defer validation.deinit(allocator);
+    var trial_parsed = try parseValue(allocator, built.trial);
+    defer trial_parsed.deinit();
+    try validateTrialAgainstCampaign(allocator, context.campaign, trial_parsed.value);
+    try requireTrialInterventionAgainstRepo(allocator, repo, trial_parsed.value);
+    try verifyTrialChangeBaseAgainstRepo(
+        allocator,
+        repo,
+        context.campaign,
+        try jsonObject(trial_parsed.value),
+        true,
+        error.ChangeBaseMismatch,
+    );
+    const counts = .{ validation.lane_count, validation.pair_count };
+    try publishTrialAndReveal(
+        output_path,
+        private_built.trial,
+        reveal_output_fd,
+        private_built.custody,
+    );
+
+    if (!emit_receipt) return;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"allocation_method\":\"balanced_ab_ba\",\"auth" ++
+        "ority_granted\":false,\"campaign_head\":");
+    try std.json.Stringify.value(context.campaign.last_digest, .{}, &out.writer);
+    try out.writer.writeAll(",\"campaign_id\":");
+    try std.json.Stringify.value(context.campaign.id, .{}, &out.writer);
+    try out.writer.print(",\"custody_material_delivered\":true,\"lane_coun" ++
+        "t\":{d},\"pair_count\":{d},\"schema\":\"hylo-tri" ++
+        "al-build-receipt/v2\",\"semantic_evidence_return" ++
+        "ed\":false,\"source_selection_receipt_fingerprin" ++ "t\":", counts);
+    try sj.value(request.value.source_selection_receipt_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"trial_fingerprint\":");
+    try std.json.Stringify.value(validation.fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"trial_id\":");
+    try std.json.Stringify.value(validation.trial_id, .{}, &out.writer);
+    try out.writer.print(",\"unit_count\":{d}}}\n", .{validation.unit_count});
     try writeStdoutAlloc(allocator, &out);
 }
 
@@ -1277,6 +2801,13 @@ fn jsonNumber(value: std.json.Value) !f64 {
     return result;
 }
 
+fn jsonBoolean(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |flag| flag,
+        else => error.BooleanRequired,
+    };
+}
+
 fn jsonRequiredString(map: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return jsonString(try jsonRequired(map, key));
 }
@@ -1308,6 +2839,21 @@ fn findTrialAcrossCampaigns(load: *LedgerLoad, trial_id: []const u8) !?TrialLoca
     for (load.campaigns.items) |*campaign| {
         if (campaign.hctp_trials.findTrial(trial_id)) |trial| {
             if (found != null) return error.TrialIdAmbiguous;
+            found = .{ .campaign = campaign, .trial = trial };
+        }
+    }
+    return found;
+}
+
+fn findTrialByFingerprintAcrossCampaigns(
+    load: *LedgerLoad,
+    trial_fingerprint: []const u8,
+) !?TrialLocation {
+    var found: ?TrialLocation = null;
+    for (load.campaigns.items) |*campaign| {
+        for (campaign.hctp_trials.trials.items) |*trial| {
+            if (!std.mem.eql(u8, trial.fingerprint, trial_fingerprint)) continue;
+            if (found != null) return error.TrialFingerprintAmbiguous;
             found = .{ .campaign = campaign, .trial = trial };
         }
     }
@@ -1372,6 +2918,95 @@ fn appendHighLevelEvent(
     return appendIntentToStore(allocator, repo, store, intent);
 }
 
+const RevealAppendProvenance = enum {
+    legacy_v1,
+    validated_private_custody_v2,
+};
+
+fn appendTrialRevealEvent(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    payload: std.json.Value,
+    provenance: RevealAppendProvenance,
+) !AppendResult {
+    const intent = try eventIntentAlloc(
+        allocator,
+        campaign_id,
+        "trial_revealed",
+        null,
+        null,
+        null,
+        payload,
+    );
+    defer allocator.free(intent);
+    return appendIntentToStoreInternal(
+        allocator,
+        repo,
+        store,
+        intent,
+        null,
+        provenance,
+    );
+}
+
+fn appendPrivateTrialRegistrationEvent(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    payload: std.json.Value,
+    semantic_trial: std.json.Value,
+) !AppendResult {
+    const intent = try eventIntentAlloc(
+        allocator,
+        campaign_id,
+        "trial_registered",
+        null,
+        null,
+        null,
+        payload,
+    );
+    defer allocator.free(intent);
+    return appendIntentToStoreWithPrivateTrial(
+        allocator,
+        repo,
+        store,
+        intent,
+        semantic_trial,
+    );
+}
+
+fn appendPrivateLaneStartEvent(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    scenario_id: []const u8,
+    lane_id: []const u8,
+    payload: std.json.Value,
+    semantic_trial: std.json.Value,
+) !AppendResult {
+    const intent = try eventIntentAlloc(
+        allocator,
+        campaign_id,
+        "lane_started",
+        scenario_id,
+        lane_id,
+        null,
+        payload,
+    );
+    defer allocator.free(intent);
+    return appendIntentToStoreWithPrivateTrial(
+        allocator,
+        repo,
+        store,
+        intent,
+        semantic_trial,
+    );
+}
+
 fn printHighLevelReceipt(
     allocator: std.mem.Allocator,
     schema: []const u8,
@@ -1400,6 +3035,17 @@ fn signedSourceCaseForUnit(
 ) !?std.json.ObjectMap {
     const receipt_value = sealing.get("source_selection_receipt") orelse return null;
     if (receipt_value == .null) return null;
+    return @as(
+        ?std.json.ObjectMap,
+        try signedSourceCaseFromReceiptForUnit(receipt_value, unit_id, scenario_id),
+    );
+}
+
+fn signedSourceCaseFromReceiptForUnit(
+    receipt_value: std.json.Value,
+    unit_id: []const u8,
+    scenario_id: []const u8,
+) !std.json.ObjectMap {
     const source_cases = try jsonRequiredArray(try jsonObject(receipt_value), "cases");
     var matched: ?std.json.ObjectMap = null;
     for (source_cases.items) |case_value| {
@@ -1540,14 +3186,37 @@ fn validatePromotionRepeatPolicy(
     if (required_pairs < campaign.repeat_count) return error.ScenarioPromotionIncomplete;
 }
 
-fn validateTrialAgainstCampaign(
+fn campaignRequiresSourceRouteAdmission(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+) !bool {
+    const policy_bytes = campaign.trial_policy_json orelse return false;
+    var parsed = try parseValue(allocator, policy_bytes);
+    defer parsed.deinit();
+    const policy = try jsonObject(parsed.value);
+    const value = policy.get("source_route_admission") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, "required");
+}
+const TrialCampaignValidationMode = enum {
+    semantic,
+    validated_private_registration,
+};
+fn validateTrialAgainstCampaignMode(
     allocator: std.mem.Allocator,
     campaign: *const CampaignState,
     trial_value: std.json.Value,
+    mode: TrialCampaignValidationMode,
+    require_source_route_admission: bool,
 ) !void {
+    const episode_key = "source_episode_fingerprint";
     if (!campaign.trial_profile) return error.TrialProfileMissing;
     if (!allScenariosAdmitted(campaign)) return error.ScenarioManifestNotSealed;
     const trial = try jsonObject(trial_value);
+    const private_registration = mode == .validated_private_registration;
+    const schema = try jsonRequiredString(trial, "schema");
+    if (private_registration != std.mem.eql(u8, schema, hctp.PrivateTrialSchema)) {
+        return error.PrivateTrialCustodyReceiptInvalid;
+    }
     try hctp.validateCanonicalJsonProfile(trial);
     if (!std.mem.eql(u8, try jsonRequiredString(trial, "campaign_id"), campaign.id)) {
         return error.CampaignMismatch;
@@ -1625,31 +3294,40 @@ fn validateTrialAgainstCampaign(
     const sealing = try jsonRequiredObject(trial, "sealing");
     const execution = try jsonRequiredObject(trial, "execution");
     const units = try jsonRequiredArray(trial, "units");
+    const route_admission_required = require_source_route_admission or
+        try campaignRequiresSourceRouteAdmission(allocator, campaign);
+    const purpose = try jsonRequiredString(trial, "purpose");
     try validateAdmittedSourceIndependence(campaign.scenarios.items, units);
     for (units.items) |unit_value| {
         const unit = try jsonObject(unit_value);
         const unit_id = try jsonRequiredString(unit, "unit_id");
         const scenario_id = try jsonRequiredString(unit, "scenario_id");
-        const scenario = findScenario(campaign, scenario_id) orelse return error.ScenarioNotAdmitted;
-        if (!std.mem.eql(u8, @tagName(scenario.split), try jsonRequiredString(unit, "split"))) {
+        const s = findScenario(campaign, scenario_id) orelse return error.ScenarioNotAdmitted;
+        if (!std.mem.eql(u8, @tagName(s.split), try jsonRequiredString(unit, "split"))) {
             return error.ScenarioSplitMismatch;
         }
         if (!std.mem.eql(
             u8,
             try jsonRequiredString(execution, "environment_fingerprint"),
-            scenario.environment_fingerprint,
+            s.environment_fingerprint,
         )) return error.EnvironmentMismatch;
         if (!std.mem.eql(
             u8,
             try jsonRequiredString(execution, "replay_policy_fingerprint"),
-            scenario.replay_policy_fingerprint,
+            s.replay_policy_fingerprint,
         )) return error.ReplayPolicyMismatch;
         if (!std.mem.eql(
             u8,
             try jsonRequiredString(execution, "effect_policy_fingerprint"),
-            scenario.effect_policy_fingerprint,
+            s.effect_policy_fingerprint,
         )) return error.EffectPolicyMismatch;
-        const signed_source_case = try signedSourceCaseForUnit(sealing, unit_id, scenario_id);
+        const signed_source_case = if (private_registration)
+            null
+        else
+            try signedSourceCaseForUnit(sealing, unit_id, scenario_id);
+        if (!private_registration and route_admission_required and signed_source_case == null) {
+            return error.SourceSelectionReceiptMissing;
+        }
         if (signed_source_case) |source_case| {
             if (!std.mem.eql(
                 u8,
@@ -1658,61 +3336,103 @@ fn validateTrialAgainstCampaign(
             ) or !std.mem.eql(
                 u8,
                 try jsonRequiredString(source_case, "source_episode_fingerprint"),
-                scenario.source_episode_fingerprint,
+                s.source_episode_fingerprint,
             )) return error.SourceCaseCommitmentMismatch;
+            if (source_case.get("source_route_admission")) |admission_value| {
+                try retrace_core.hctp_route_admission.validateValue(allocator, admission_value, .{
+                    .campaign_id = campaign.id,
+                    .unit_id = unit_id,
+                    .scenario_id = scenario_id,
+                    .source_profile_fingerprint = try js(source_case, "source_profile_fingerprint"),
+                    .source_episode_projection_fingerprint = try js(source_case, episode_key),
+                });
+                try retrace_core.hctp_route_admission.requireComparisonEligible(admission_value);
+                const admission = try jsonObject(admission_value);
+                const unit_profile = try jsonRequiredObject(unit, "source_profile");
+                if (!std.mem.eql(
+                    u8,
+                    try jsonRequiredString(admission, "source_profile_kind"),
+                    try jsonRequiredString(unit_profile, "kind"),
+                )) return error.SourceRouteAdmissionBindingMismatch;
+                if ((std.mem.eql(u8, purpose, "practice_repair") or
+                    std.mem.eql(u8, purpose, "promotion")) and
+                    m.eql(u8, try js(admission, "source_profile_kind"), "historical_decision"))
+                {
+                    const state = admission.get("source_governance_state") orelse
+                        return error.HistoricalGovernanceNotAuthoritative;
+                    const effect_allowed =
+                        admission.get("source_governance_workflow_effect_allowed") orelse
+                        return error.HistoricalGovernanceNotAuthoritative;
+                    if (state != .string or !std.mem.eql(u8, state.string, "authoritative") or
+                        effect_allowed != .bool or !effect_allowed.bool)
+                    {
+                        return error.HistoricalGovernanceNotAuthoritative;
+                    }
+                }
+            } else if (route_admission_required) {
+                return error.SourceRouteAdmissionMissing;
+            }
         }
-        if (std.mem.eql(u8, scenario.case_visibility, "case_blind")) {
+        if (std.mem.eql(u8, s.case_visibility, "case_blind")) {
             if (!std.mem.eql(u8, try jsonRequiredString(sealing, "case_visibility"), "case_blind")) {
                 return error.CaseVisibilityInvalid;
             }
-            const signed_case = signed_source_case orelse return error.SourceCaseMissing;
-            if (!std.mem.eql(u8, try jsonRequiredString(signed_case, "case_visibility"), "case_blind") or
-                !std.mem.eql(u8, try jsonRequiredString(signed_case, "visible_input_fingerprint"), scenario.visible_input_fingerprint) or
-                !std.mem.eql(u8, try jsonRequiredString(signed_case, "hidden_reference_fingerprint"), scenario.hidden_reference_fingerprint.?) or
-                !std.mem.eql(u8, try jsonRequiredString(signed_case, "source_profile_fingerprint"), scenario.source_profile_fingerprint.?))
-            {
-                return error.SourceCaseCommitmentMismatch;
+            const vis = s.visible_input_fingerprint;
+            const hid = s.hidden_reference_fingerprint.?;
+            const prof = s.source_profile_fingerprint.?;
+            if (!private_registration) {
+                const c = signed_source_case orelse return error.SourceCaseMissing;
+                if (!m.eql(u8, try js(c, "case_visibility"), "case_blind") or
+                    !m.eql(u8, try js(c, "visible_input_fingerprint"), vis) or
+                    !m.eql(u8, try js(c, "hidden_reference_fingerprint"), hid) or
+                    !m.eql(u8, try js(c, "source_profile_fingerprint"), prof))
+                {
+                    return error.SourceCaseCommitmentMismatch;
+                }
             }
             const unit_profile = try jsonRequiredObject(unit, "source_profile");
             if (!std.mem.eql(
                 u8,
                 try jsonRequiredString(unit_profile, "source_profile_fingerprint"),
-                scenario.source_profile_fingerprint.?,
+                s.source_profile_fingerprint.?,
             )) return error.SourceCaseCommitmentMismatch;
-            var visible_declared = false;
+            var vd = false;
             for ((try jsonRequiredArray(sealing, "visible_input_commitments")).items) |value| {
-                if (std.mem.eql(u8, try jsonString(value), scenario.visible_input_fingerprint)) visible_declared = true;
+                if (std.mem.eql(u8, try jsonString(value), vis)) vd = true;
             }
-            var hidden_declared = false;
+            var hd = false;
             for ((try jsonRequiredArray(sealing, "hidden_reference_commitments")).items) |value| {
-                if (std.mem.eql(u8, try jsonString(value), scenario.hidden_reference_fingerprint.?)) hidden_declared = true;
+                if (std.mem.eql(u8, try jsonString(value), hid)) hd = true;
             }
-            if (!visible_declared or !hidden_declared) return error.SourceCaseCommitmentMismatch;
+            if (!vd or !hd) return error.SourceCaseCommitmentMismatch;
         }
     }
     if (campaign.target_identity_mode == .bundle_snapshot) {
         if (!targetIdentityReady(campaign)) return error.BaselineTargetBundleMissing;
-        const factor_kind = try jsonRequiredString(try jsonRequiredObject(trial, "factor"), "kind");
-        for ((try jsonRequiredArray(trial, "arms")).items) |arm_value| {
-            const arm = try jsonObject(arm_value);
-            const binding = findTargetBinding(
-                campaign,
-                try jsonRequiredString(arm, "value_fingerprint"),
-            ) orelse return error.UnknownTargetFingerprint;
-            if (std.mem.eql(u8, factor_kind, "target_snapshot") and !std.mem.eql(
-                u8,
-                try jsonRequiredString(arm, "materialization_fingerprint"),
-                binding.target_snapshot_fingerprint,
-            )) return error.TargetSnapshotMismatch;
+        if (!private_registration) {
+            const factor_kind = try js(try jo(trial, "factor"), "kind");
+            for ((try jsonRequiredArray(trial, "arms")).items) |arm_value| {
+                const arm = try jsonObject(arm_value);
+                const binding = findTargetBinding(
+                    campaign,
+                    try jsonRequiredString(arm, "value_fingerprint"),
+                ) orelse return error.UnknownTargetFingerprint;
+                if (std.mem.eql(u8, factor_kind, "target_snapshot") and !std.mem.eql(
+                    u8,
+                    try jsonRequiredString(arm, "materialization_fingerprint"),
+                    binding.target_snapshot_fingerprint,
+                )) return error.TargetSnapshotMismatch;
+            }
         }
     }
-    const purpose = try jsonRequiredString(trial, "purpose");
     if (std.mem.eql(u8, purpose, "promotion")) {
         try validatePromotionRepeatPolicy(campaign, trial);
-        try validatePromotionTargetEpochUnique(allocator, campaign, trial);
+        if (mode == .semantic) try validatePromotionTargetEpochUnique(allocator, campaign, trial);
         try validatePromotionScenarioCoverage(campaign, units);
     }
-    if (std.mem.eql(u8, purpose, "practice_repair") or std.mem.eql(u8, purpose, "promotion")) {
+    if (!private_registration and
+        (std.mem.eql(u8, purpose, "practice_repair") or std.mem.eql(u8, purpose, "promotion")))
+    {
         const epoch = try jsonRequiredObject(trial, "target_epoch");
         const change_id = try jsonNullableString(epoch, "change_id");
         if (std.mem.eql(u8, purpose, "practice_repair") and change_id == null) {
@@ -1754,6 +3474,60 @@ fn validateTrialAgainstCampaign(
             return error.InterventionNotClosed;
         }
     }
+}
+fn validateTrialAgainstCampaign(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+    trial_value: std.json.Value,
+) !void {
+    return validateTrialAgainstCampaignMode(
+        allocator,
+        campaign,
+        trial_value,
+        .semantic,
+        false,
+    );
+}
+fn validateRegisteredTrialAgainstCampaign(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+    payload: std.json.ObjectMap,
+) !void {
+    const trial_value = try jsonRequired(payload, "trial");
+    const trial = try jsonObject(trial_value);
+    const schema = try jsonRequiredString(trial, "schema");
+    if (!std.mem.eql(u8, schema, hctp.PrivateTrialSchema)) {
+        if (payload.get("private_custody") != null) return error.PrivateTrialCustodyReceiptInvalid;
+        return validateTrialAgainstCampaign(allocator, campaign, trial_value);
+    }
+
+    const custody = try jsonRequiredObject(payload, "private_custody");
+    if (custody.count() != 3 or
+        custody.get("commitment") == null or
+        custody.get("semantic_material_persisted") == null or
+        custody.get("validated") == null or
+        payload.get("arm_materializations") != null or
+        payload.get("target_common_projection") != null or
+        !std.mem.eql(
+            u8,
+            try jsonRequiredString(custody, "commitment"),
+            try jsonRequiredString(trial, "custody_commitment"),
+        ) or try jsonBoolean(try jsonRequired(custody, "semantic_material_persisted")) or
+        !try jsonBoolean(try jsonRequired(custody, "validated")))
+    {
+        return error.PrivateTrialCustodyReceiptInvalid;
+    }
+    const trial_bytes = try canonicalJsonAlloc(allocator, trial_value);
+    defer allocator.free(trial_bytes);
+    var validation = try hctp.validateTrialAlloc(allocator, trial_bytes);
+    defer validation.deinit(allocator);
+    return validateTrialAgainstCampaignMode(
+        allocator,
+        campaign,
+        trial_value,
+        .validated_private_registration,
+        false,
+    );
 }
 
 fn validatePromotionSentinelRegistration(
@@ -1804,6 +3578,7 @@ fn cmdRegisterTrial(
     repo: []const u8,
     store: durable_store.EventStore,
     trial_path: []const u8,
+    custody_input_fd: ?std.posix.fd_t,
 ) !void {
     const input = try readInputAlloc(allocator, trial_path);
     defer allocator.free(input);
@@ -1812,19 +3587,73 @@ fn cmdRegisterTrial(
     var trial_parsed = try parseValue(allocator, input);
     defer trial_parsed.deinit();
     const trial = try jsonObject(trial_parsed.value);
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial, "schema"),
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+    );
+    var custody_bytes: ?[]u8 = null;
+    defer if (custody_bytes) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var custody_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (custody_parsed) |*parsed| parsed.deinit();
+    var semantic_bytes: ?[]u8 = null;
+    defer if (semantic_bytes) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var semantic_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (semantic_parsed) |*parsed| parsed.deinit();
+    if (private_trial) {
+        custody_bytes = try readRevealMaterialFdAlloc(
+            allocator,
+            custody_input_fd orelse return error.TrialCustodyRequired,
+        );
+        custody_parsed = try parseValue(allocator, custody_bytes.?);
+        semantic_bytes = try semanticTrialFromCustodyAlloc(
+            allocator,
+            trial_parsed.value,
+            custody_parsed.?.value,
+        );
+        semantic_parsed = try parseValue(allocator, semantic_bytes.?);
+    } else if (custody_input_fd != null) {
+        return error.TrialCustodyForbidden;
+    }
+    const semantic_value = if (private_trial) semantic_parsed.?.value else trial_parsed.value;
+    const semantic_trial = try jsonObject(semantic_value);
+    if (private_trial) {
+        var semantic_validation = try hctp.validateTrialAlloc(allocator, semantic_bytes.?);
+        defer semantic_validation.deinit(allocator);
+        if (!std.mem.eql(
+            u8,
+            semantic_validation.trial_id,
+            try jsonRequiredString(trial, "trial_id"),
+        )) return error.TrialCustodyInvalid;
+    }
     const campaign_id = try jsonRequiredString(trial, "campaign_id");
     const trial_id = try jsonRequiredString(trial, "trial_id");
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
     if ((try findTrialAcrossCampaigns(&loaded, trial_id)) != null) return error.TrialIdDuplicate;
     const campaign_index = findCampaign(loaded.campaigns.items, campaign_id) orelse return error.CampaignMissing;
-    try validateTrialAgainstCampaign(allocator, &loaded.campaigns.items[campaign_index], trial_parsed.value);
-    try requireTrialInterventionAgainstRepo(allocator, repo, trial_parsed.value);
+    if (private_trial and !loaded.campaigns.items[campaign_index].private_trial_profile) {
+        return error.PrivateTrialProfileMissing;
+    }
+    try validateTrialAgainstCampaignMode(
+        allocator,
+        &loaded.campaigns.items[campaign_index],
+        semantic_value,
+        .semantic,
+        private_trial,
+    );
+    try requireTrialInterventionAgainstRepo(allocator, repo, semantic_value);
     try verifyTrialChangeBaseAgainstRepo(
         allocator,
         repo,
         &loaded.campaigns.items[campaign_index],
-        trial,
+        semantic_trial,
         true,
         error.ChangeBaseMismatch,
     );
@@ -1842,22 +3671,29 @@ fn cmdRegisterTrial(
         trial_parsed.value,
         loaded.event_count + 1,
     );
-    try payload_text.writer.writeAll(",\"arm_materializations\":[");
-    const arms = try jsonRequiredArray(trial, "arms");
-    for (arms.items, 0..) |arm_value, index| {
-        if (index != 0) try payload_text.writer.writeByte(',');
-        const envelope = try armMaterializationEnvelopeAlloc(
-            allocator,
-            repo,
-            trial,
-            try jsonObject(arm_value),
-        );
-        defer allocator.free(envelope);
-        try payload_text.writer.writeAll(envelope);
+    if (private_trial) {
+        try payload_text.writer.writeAll(",\"private_custody\":{\"commitment\":");
+        try wj(allocator, &payload_text.writer, try jf(trial, "custody_commitment"));
+        try payload_text.writer.writeAll(",\"semantic_material_persisted\":false,\"validat" ++
+            "ed\":true}");
+    } else {
+        try payload_text.writer.writeAll(",\"arm_materializations\":[");
+        const arms = try jsonRequiredArray(trial, "arms");
+        for (arms.items, 0..) |arm_value, index| {
+            if (index != 0) try payload_text.writer.writeByte(',');
+            const envelope = try armMaterializationEnvelopeAlloc(
+                allocator,
+                repo,
+                trial,
+                try jsonObject(arm_value),
+            );
+            defer allocator.free(envelope);
+            try payload_text.writer.writeAll(envelope);
+        }
+        try payload_text.writer.writeByte(']');
     }
-    try payload_text.writer.writeByte(']');
     const factor = try jsonRequiredObject(trial, "factor");
-    if (std.mem.eql(u8, try jsonRequiredString(factor, "kind"), "target_snapshot")) {
+    if (!private_trial and m.eql(u8, try js(factor, "kind"), "target_snapshot")) {
         try payload_text.writer.writeAll(",\"target_common_projection\":");
         try writeCanonicalJson(
             allocator,
@@ -1870,17 +3706,27 @@ fn cmdRegisterTrial(
     defer allocator.free(payload_bytes);
     var payload = try parseValue(allocator, payload_bytes);
     defer payload.deinit();
-    var result = try appendHighLevelEvent(
-        allocator,
-        repo,
-        store,
-        campaign_id,
-        "trial_registered",
-        null,
-        null,
-        null,
-        payload.value,
-    );
+    var result = if (private_trial)
+        try appendPrivateTrialRegistrationEvent(
+            allocator,
+            repo,
+            store,
+            campaign_id,
+            payload.value,
+            semantic_value,
+        )
+    else
+        try appendHighLevelEvent(
+            allocator,
+            repo,
+            store,
+            campaign_id,
+            "trial_registered",
+            null,
+            null,
+            null,
+            payload.value,
+        );
     defer result.deinit(allocator);
     try printHighLevelReceipt(allocator, "hylo-trial-registration-receipt/v1", result, "trial_id", validation.trial_id);
 }
@@ -1899,6 +3745,8 @@ const LeaseDelivery = struct {
     writer: LeaseRecordWriter,
 };
 const MinimumPipeBuf: usize = 512;
+extern "c" fn fpathconf(fd: c_int, name: c_int) c_long;
+const DarwinPipeBufPathconfName: c_int = 6;
 
 fn validateCanonicalLaneLease(lease: []const u8) !void {
     if (lease.len != "HYL1-".len + 64 or !std.mem.startsWith(u8, lease, "HYL1-")) {
@@ -1992,19 +3840,156 @@ fn readLeaseFdAlloc(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
     return allocator.dupe(u8, buffer[0..used]);
 }
 
-fn trialJsonParsed(allocator: std.mem.Allocator, trial: *const hctp.TrialState) !std.json.Parsed(std.json.Value) {
-    return parseValue(allocator, trial.trial_json);
+fn validateRevealOutputEndpoint(fd: std.posix.fd_t) !void {
+    validateLeaseOutputEndpoint(fd) catch return error.RevealOutputEndpointUnbound;
+    const raw_flags = std.c.fcntl(fd, std.c.F.GETFL);
+    if (raw_flags < 0) return error.RevealOutputEndpointUnbound;
+    const flags: std.c.O = @bitCast(@as(u32, @intCast(raw_flags)));
+    if (flags.NONBLOCK) return error.RevealOutputEndpointUnbound;
+    if (comptime builtin.os.tag == .macos) {
+        if (std.c.fcntl(fd, std.c.F.SETNOSIGPIPE, @as(c_int, 1)) != 0) {
+            return error.RevealOutputEndpointUnbound;
+        }
+    }
+}
+
+fn validateRevealInputEndpoint(fd: std.posix.fd_t) !void {
+    validateLeaseInputEndpoint(fd) catch return error.RevealMaterialInputEndpointUnbound;
+}
+
+fn requireDistinctSensitiveFds(left: std.posix.fd_t, right: std.posix.fd_t) !void {
+    var left_stat: std.c.Stat = undefined;
+    var right_stat: std.c.Stat = undefined;
+    if (std.c.fstat(left, &left_stat) != 0 or
+        std.c.fstat(right, &right_stat) != 0 or
+        (left_stat.dev == right_stat.dev and left_stat.ino == right_stat.ino))
+    {
+        return error.SensitiveFdAliased;
+    }
+}
+
+fn revealPipeBuf(fd: std.posix.fd_t) !usize {
+    if (comptime builtin.os.tag == .macos) {
+        const queried = fpathconf(fd, DarwinPipeBufPathconfName);
+        if (queried < @as(c_long, @intCast(MinimumPipeBuf))) {
+            return error.RevealOutputEndpointUnbound;
+        }
+        return @intCast(queried);
+    }
+    return MinimumPipeBuf;
+}
+
+fn validateRevealMaterialRecord(fd: std.posix.fd_t, bytes: []const u8) !void {
+    if (bytes.len == 0 or bytes.len > try revealPipeBuf(fd)) {
+        return error.RevealMaterialRecordInvalid;
+    }
+}
+
+fn writeRevealMaterialRecord(fd: std.posix.fd_t, bytes: []const u8) !void {
+    try validateRevealOutputEndpoint(fd);
+    try validateRevealMaterialRecord(fd, bytes);
+    while (true) { // tiger: event-loop: Retry one atomic write only after an interrupt.
+        const written = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(written)) {
+            .SUCCESS => {
+                if (written != @as(isize, @intCast(bytes.len))) {
+                    return error.RevealMaterialDeliveryFailed;
+                }
+                return;
+            },
+            .INTR => continue,
+            else => return error.RevealMaterialDeliveryFailed,
+        }
+    }
+}
+
+fn writePrivateCustodyRecord(fd: std.posix.fd_t, bytes: []const u8) !void {
+    try validateRevealOutputEndpoint(fd);
+    if (bytes.len == 0 or bytes.len > MaxInputBytes) return error.TrialCustodyRecordInvalid;
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = std.c.write(fd, bytes[offset..].ptr, bytes.len - offset);
+        switch (std.posix.errno(written)) {
+            .SUCCESS => {
+                if (written <= 0) return error.TrialCustodyDeliveryFailed;
+                offset += @intCast(written);
+            },
+            .INTR => continue,
+            else => return error.TrialCustodyDeliveryFailed,
+        }
+    }
+}
+
+fn readRevealMaterialFdAlloc(allocator: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
+    try validateRevealInputEndpoint(fd);
+    const scratch = try allocator.alloc(u8, MaxInputBytes + 1);
+    defer {
+        std.crypto.secureZero(u8, scratch);
+        allocator.free(scratch);
+    }
+    var used: usize = 0;
+    while (used < scratch.len) {
+        const count = std.c.read(fd, scratch[used..].ptr, scratch.len - used);
+        switch (std.posix.errno(count)) {
+            .SUCCESS => {
+                if (count == 0) break;
+                used += @intCast(count);
+            },
+            .INTR => continue,
+            else => return error.RevealMaterialReadFailed,
+        }
+    }
+    if (used == 0) return error.RevealMaterialInvalid;
+    if (used > MaxInputBytes) return error.RevealMaterialTooLarge;
+    return allocator.dupe(u8, scratch[0..used]);
+}
+
+fn trialJsonParsed(a: m.Allocator, trial: *const hctp.TrialState) !std.json.Parsed(std.json.Value) {
+    return parseValue(a, trial.trial_json);
+}
+
+const PrivateRevealEvidence = struct {
+    reveal: std.json.Parsed(std.json.Value),
+    evidence: retrace_core.hctp_trial_custody.RevealedEvidence,
+
+    fn deinit(self: *PrivateRevealEvidence) void {
+        self.reveal.deinit();
+    }
+};
+
+fn privateRevealEvidenceAlloc(
+    allocator: std.mem.Allocator,
+    trial: *const hctp.TrialState,
+    public_trial_value: std.json.Value,
+) !PrivateRevealEvidence {
+    const reveal_json = trial.reveal_json orelse return error.ProofBundleBlindEvidenceIncomplete;
+    var reveal = try parseValue(allocator, reveal_json);
+    errdefer reveal.deinit();
+    const evidence = try retrace_core.hctp_trial_custody.revealedEvidence(
+        allocator,
+        public_trial_value,
+        reveal.value,
+    );
+    return .{ .reveal = reveal, .evidence = evidence };
 }
 
 fn armMaterializationFingerprint(
     trial_object: std.json.ObjectMap,
     arm_id: []const u8,
 ) ![]const u8 {
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_object, "schema"),
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+    );
     const arms = try jsonRequiredArray(trial_object, "arms");
     for (arms.items) |arm_value| {
         const arm = try jsonObject(arm_value);
         if (std.mem.eql(u8, arm_id, try jsonRequiredString(arm, "arm_id"))) {
-            return jsonRequiredString(arm, "materialization_fingerprint");
+            return jsonRequiredString(
+                arm,
+                if (private_trial) "treatment_commitment" else "materialization_fingerprint",
+            );
         }
     }
     return error.PairShapeInvalid;
@@ -2095,6 +4080,31 @@ fn cmdStartLane(
     );
 }
 
+fn cmdStartLaneWithCustody(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    runner_id: []const u8,
+    lease_output_fd: std.posix.fd_t,
+    custody_input_fd: ?std.posix.fd_t,
+) !void {
+    return cmdStartLaneWithWriterAndCustody(
+        allocator,
+        repo,
+        store,
+        campaign_id,
+        trial_id,
+        lane_id,
+        runner_id,
+        lease_output_fd,
+        writeLaneLeaseRecord,
+        custody_input_fd,
+    );
+}
+
 fn cmdStartLaneWithWriter(
     allocator: std.mem.Allocator,
     repo: []const u8,
@@ -2106,6 +4116,37 @@ fn cmdStartLaneWithWriter(
     lease_output_fd: std.posix.fd_t,
     lease_writer: LeaseRecordWriter,
 ) !void {
+    return cmdStartLaneWithWriterAndCustody(
+        allocator,
+        repo,
+        store,
+        campaign_id,
+        trial_id,
+        lane_id,
+        runner_id,
+        lease_output_fd,
+        lease_writer,
+        null,
+    );
+}
+
+fn cmdStartLaneWithWriterAndCustody(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    runner_id: []const u8,
+    lease_output_fd: std.posix.fd_t,
+    lease_writer: LeaseRecordWriter,
+    custody_input_fd: ?std.posix.fd_t,
+) !void {
+    if (custody_input_fd) |custody_fd| {
+        try validateRevealInputEndpoint(custody_fd);
+        try validateLeaseOutputEndpoint(lease_output_fd);
+        try requireDistinctSensitiveFds(custody_fd, lease_output_fd);
+    }
     const lease = try randomLeaseAlloc(allocator);
     defer {
         std.crypto.secureZero(u8, lease);
@@ -2113,7 +4154,7 @@ fn cmdStartLaneWithWriter(
     }
     const lease_digest = try digestBytesAlloc(allocator, lease);
     defer allocator.free(lease_digest);
-    const receipt = try commitLaneStartReceiptAlloc(
+    const receipt = try commitLaneStartReceiptAllocWithCustody(
         allocator,
         repo,
         store,
@@ -2125,6 +4166,7 @@ fn cmdStartLaneWithWriter(
         lease_digest,
         false,
         .{ .fd = lease_output_fd, .writer = lease_writer },
+        custody_input_fd,
     );
     defer allocator.free(receipt);
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
@@ -2143,6 +4185,36 @@ fn commitLaneStartReceiptAlloc(
     expected_lease_digest: []const u8,
     allow_exact_existing: bool,
     delivery: ?LeaseDelivery,
+) ![]u8 {
+    return commitLaneStartReceiptAllocWithCustody(
+        allocator,
+        repo,
+        store,
+        campaign_id,
+        trial_id,
+        lane_id,
+        runner_id,
+        retained_lease,
+        expected_lease_digest,
+        allow_exact_existing,
+        delivery,
+        null,
+    );
+}
+
+fn commitLaneStartReceiptAllocWithCustody(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    runner_id: []const u8,
+    retained_lease: []const u8,
+    expected_lease_digest: []const u8,
+    allow_exact_existing: bool,
+    delivery: ?LeaseDelivery,
+    custody_input_fd: ?std.posix.fd_t,
 ) ![]u8 {
     try validateId(campaign_id);
     try validateId(trial_id);
@@ -2182,6 +4254,40 @@ fn commitLaneStartReceiptAlloc(
     var trial_parsed = try trialJsonParsed(allocator, trial);
     defer trial_parsed.deinit();
     const trial_object = try jsonObject(trial_parsed.value);
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_object, "schema"),
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+    );
+    var custody_bytes: ?[]u8 = null;
+    defer if (custody_bytes) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var custody_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (custody_parsed) |*parsed| parsed.deinit();
+    var semantic_bytes: ?[]u8 = null;
+    defer if (semantic_bytes) |bytes| {
+        std.crypto.secureZero(u8, bytes);
+        allocator.free(bytes);
+    };
+    var semantic_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (semantic_parsed) |*parsed| parsed.deinit();
+    if (private_trial) {
+        custody_bytes = try readRevealMaterialFdAlloc(
+            allocator,
+            custody_input_fd orelse return error.TrialCustodyRequired,
+        );
+        custody_parsed = try parseValue(allocator, custody_bytes.?);
+        semantic_bytes = try semanticTrialFromCustodyAlloc(
+            allocator,
+            trial_parsed.value,
+            custody_parsed.?.value,
+        );
+        semantic_parsed = try parseValue(allocator, semantic_bytes.?);
+    } else if (custody_input_fd != null) {
+        return error.TrialCustodyForbidden;
+    }
     const execution = try jsonRequiredObject(trial_object, "execution");
     const runner_authority = try jsonRequiredObject(execution, "runner_authority");
     const trial_sealing = try jsonRequiredObject(trial_object, "sealing");
@@ -2221,7 +4327,10 @@ fn commitLaneStartReceiptAlloc(
     try std.json.Stringify.value(runner_id, .{}, &payload_text.writer);
     try payload_text.writer.writeAll(",\"runner_contract_fingerprint\":");
     try writeCanonicalJson(allocator, &payload_text.writer, try jsonRequired(execution, "runner_contract_fingerprint"));
-    try payload_text.writer.writeAll(",\"target_snapshot_fingerprint\":");
+    try payload_text.writer.writeAll(if (private_trial)
+        ",\"treatment_commitment\":"
+    else
+        ",\"target_snapshot_fingerprint\":");
     try std.json.Stringify.value(
         try armMaterializationFingerprint(trial_object, lane.arm_id),
         .{},
@@ -2256,17 +4365,29 @@ fn commitLaneStartReceiptAlloc(
         // calling commit-lane-start with no delivery endpoint.
         try endpoint.writer(endpoint.fd, retained_lease);
     }
-    var result = appendHighLevelEvent(
-        allocator,
-        repo,
-        store,
-        campaign.id,
-        "lane_started",
-        lane.scenario_id,
-        lane.id,
-        null,
-        payload.value,
-    ) catch |err| switch (err) {
+    var result = (if (private_trial)
+        appendPrivateLaneStartEvent(
+            allocator,
+            repo,
+            store,
+            campaign.id,
+            lane.scenario_id,
+            lane.id,
+            payload.value,
+            semantic_parsed.?.value,
+        )
+    else
+        appendHighLevelEvent(
+            allocator,
+            repo,
+            store,
+            campaign.id,
+            "lane_started",
+            lane.scenario_id,
+            lane.id,
+            null,
+            payload.value,
+        )) catch |err| switch (err) {
         error.LaneAlreadyStarted => {
             if (!allow_exact_existing) return err;
             return recoverLaneStartReceiptAlloc(
@@ -2292,7 +4413,7 @@ fn commitLaneStartReceiptAlloc(
     );
 }
 
-fn cmdCommitLaneStart(
+fn cmdCommitLaneStartWithCustody(
     allocator: std.mem.Allocator,
     repo: []const u8,
     store: durable_store.EventStore,
@@ -2302,13 +4423,19 @@ fn cmdCommitLaneStart(
     runner_id: []const u8,
     expected_lease_digest: []const u8,
     lease_input_fd: std.posix.fd_t,
+    custody_input_fd: ?std.posix.fd_t,
 ) !void {
+    if (custody_input_fd) |custody_fd| {
+        try validateRevealInputEndpoint(custody_fd);
+        try validateLeaseInputEndpoint(lease_input_fd);
+        try requireDistinctSensitiveFds(custody_fd, lease_input_fd);
+    }
     const retained_lease = try readLeaseFdAlloc(allocator, lease_input_fd);
     defer {
         std.crypto.secureZero(u8, retained_lease);
         allocator.free(retained_lease);
     }
-    const receipt = try commitLaneStartReceiptAlloc(
+    const receipt = try commitLaneStartReceiptAllocWithCustody(
         allocator,
         repo,
         store,
@@ -2320,6 +4447,7 @@ fn cmdCommitLaneStart(
         expected_lease_digest,
         true,
         null,
+        custody_input_fd,
     );
     defer allocator.free(receipt);
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
@@ -2405,29 +4533,28 @@ fn laneMaterializationClaimAlloc(
     store: durable_store.EventStore,
     trial_id: []const u8,
     lane_id: []const u8,
-    expected_registration_digest: []const u8,
-    expected_start_digest: []const u8,
-    expected_lease_digest: []const u8,
+    registration_digest: []const u8,
+    start: []const u8,
+    lease_digest: []const u8,
 ) ![]u8 {
     try validateId(trial_id);
     try validateId(lane_id);
-    try validateFingerprint(expected_registration_digest);
-    try validateFingerprint(expected_start_digest);
-    try validateFingerprint(expected_lease_digest);
+    try validateFingerprint(registration_digest);
+    try validateFingerprint(start);
+    try validateFingerprint(lease_digest);
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
     const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
     const lane = location.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
-    if (!std.mem.eql(u8, location.trial.registration_event_digest, expected_registration_digest) or
-        lane.started_event_digest == null or !std.mem.eql(u8, lane.started_event_digest.?, expected_start_digest) or
-        lane.lease_digest == null or !std.mem.eql(u8, lane.lease_digest.?, expected_lease_digest))
+    if (!std.mem.eql(u8, location.trial.registration_event_digest, registration_digest) or
+        lane.started_event_digest == null or !m.eql(u8, lane.started_event_digest.?, start) or
+        lane.lease_digest == null or !std.mem.eql(u8, lane.lease_digest.?, lease_digest))
     {
         return error.LaneMaterializationLineageMismatch;
     }
     var trial_parsed = try trialJsonParsed(allocator, location.trial);
     defer trial_parsed.deinit();
     const trial_root = try jsonObject(trial_parsed.value);
-    try validatePrivateTrialCarrierForMaterialization(allocator, trial_parsed.value);
     var registered_arm: ?[]u8 = null;
     defer if (registered_arm) |bytes| allocator.free(bytes);
     var registered_trial: ?[]u8 = null;
@@ -2441,7 +4568,7 @@ fn laneMaterializationClaimAlloc(
         defer event_parsed.deinit();
         const event = event_parsed.value;
         if (event.sequence != location.trial.registration_sequence or
-            !std.mem.eql(u8, event.event_digest, expected_registration_digest) or
+            !std.mem.eql(u8, event.event_digest, registration_digest) or
             !std.mem.eql(u8, event.campaign_id, location.campaign.id) or
             !std.mem.eql(u8, event.kind, "trial_registered")) continue;
         const payload = try jsonRequiredObject(try jsonObject(event.body), "payload");
@@ -2530,11 +4657,11 @@ fn laneMaterializationClaimAlloc(
     try out.writer.writeAll(",\"opaque_arm_id\":");
     try std.json.Stringify.value(lane.arm_id, .{}, &out.writer);
     try out.writer.writeAll(",\"registration_event_digest\":");
-    try std.json.Stringify.value(expected_registration_digest, .{}, &out.writer);
+    try std.json.Stringify.value(registration_digest, .{}, &out.writer);
     try out.writer.writeAll(",\"lane_started_event_digest\":");
-    try std.json.Stringify.value(expected_start_digest, .{}, &out.writer);
+    try std.json.Stringify.value(start, .{}, &out.writer);
     try out.writer.writeAll(",\"lane_lease_digest\":");
-    try std.json.Stringify.value(expected_lease_digest, .{}, &out.writer);
+    try std.json.Stringify.value(lease_digest, .{}, &out.writer);
     try out.writer.writeAll(",\"presented_input_fingerprint\":");
     try std.json.Stringify.value(
         lane.presented_input_fingerprint orelse return error.LaneMaterializationLineageMismatch,
@@ -2565,6 +4692,145 @@ fn laneMaterializationClaimAlloc(
     return out.toOwnedSlice();
 }
 
+fn privateLaneMaterializationClaimAlloc(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    registration_digest: []const u8,
+    start_digest: []const u8,
+    lease_digest: []const u8,
+    retained_lease: []const u8,
+    custody_value: std.json.Value,
+) ![]u8 {
+    try validateId(trial_id);
+    try validateId(lane_id);
+    try validateFingerprint(registration_digest);
+    try validateFingerprint(start_digest);
+    try validateFingerprint(lease_digest);
+    try validateCanonicalLaneLease(retained_lease);
+    const observed_lease_digest = try digestBytesAlloc(allocator, retained_lease);
+    defer allocator.free(observed_lease_digest);
+    if (!std.mem.eql(u8, observed_lease_digest, lease_digest)) {
+        return error.LaneMaterializationLeaseMismatch;
+    }
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const loc = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
+    const l = loc.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
+    if (l.status != .started or
+        !std.mem.eql(u8, loc.trial.registration_event_digest, registration_digest) or
+        l.started_event_digest == null or !m.eql(u8, l.started_event_digest.?, start_digest) or
+        l.lease_digest == null or !std.mem.eql(u8, l.lease_digest.?, lease_digest))
+    {
+        return error.LaneMaterializationLineageMismatch;
+    }
+    var trial_parsed = try trialJsonParsed(allocator, loc.trial);
+    defer trial_parsed.deinit();
+    const trial = try jsonObject(trial_parsed.value);
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(trial, "schema"),
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+    )) return error.TrialCustodyForbidden;
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        trial_parsed.value,
+        custody_value,
+    );
+    const custody = try jsonObject(custody_value);
+    const treatment = try hc.treatmentOpeningForArm(custody, l.arm_id);
+    const treatment_opening = try hc.treatmentMaterializationOpeningAlloc(
+        allocator,
+        treatment,
+    );
+    defer {
+        std.crypto.secureZero(u8, treatment_opening);
+        allocator.free(treatment_opening);
+    }
+    const materialization = try hc.materializationForArm(custody, l.arm_id);
+    const source_case = try signedSourceCaseFromReceiptForUnit(
+        try jsonRequired(try jsonRequiredObject(custody, "source_selection"), "receipt"),
+        l.unit_id,
+        l.scenario_id,
+    );
+    const scenario = fs(loc.campaign, l.scenario_id) orelse return error.ScenarioNotAdmitted;
+    const execution = try jsonRequiredObject(trial, "execution");
+    if (!std.mem.eql(
+        u8,
+        scenario.effect_policy_fingerprint,
+        try jsonRequiredString(execution, "effect_policy_fingerprint"),
+    )) return error.EffectPolicyMismatch;
+    const treatment_commitment = try retrace_core.hctp_trial_custody.treatmentCommitmentAlloc(
+        allocator,
+        treatment,
+    );
+    defer allocator.free(treatment_commitment);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"arm_materialization\":{\"arm_id\":");
+    try std.json.Stringify.value(l.arm_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"materialization\":");
+    try writeCanonicalJson(allocator, &out.writer, materialization);
+    try out.writer.writeAll(",\"materialization_fingerprint\":");
+    try wj(allocator, &out.writer, try jf(treatment, "materialization_fingerprint"));
+    try out.writer.writeAll(",\"materialization_ref\":");
+    try wj(allocator, &out.writer, try jf(treatment, "materialization_ref"));
+    try out.writer.writeAll(",\"schema\":\"hylo-arm-materialization/v2\",\"tr" ++
+        "eatment_commitment\":");
+    try std.json.Stringify.value(treatment_commitment, .{}, &out.writer);
+    try out.writer.writeAll(",\"value_fingerprint\":");
+    try wj(allocator, &out.writer, try jf(treatment, "value_fingerprint"));
+    try out.writer.writeAll("},\"campaign_id\":");
+    try std.json.Stringify.value(loc.campaign.id, .{}, &out.writer);
+    try out.writer.writeAll(",\"effect_policy\":");
+    try out.writer.writeAll(scenario.effect_policy_json);
+    try out.writer.writeAll(",\"effect_policy_fingerprint\":");
+    try std.json.Stringify.value(scenario.effect_policy_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"lane_id\":");
+    try std.json.Stringify.value(l.id, .{}, &out.writer);
+    try out.writer.writeAll(",\"lane_lease_digest\":");
+    try std.json.Stringify.value(lease_digest, .{}, &out.writer);
+    try out.writer.writeAll(",\"lane_started_event_digest\":");
+    try std.json.Stringify.value(start_digest, .{}, &out.writer);
+    try out.writer.writeAll(",\"opaque_arm_id\":");
+    try std.json.Stringify.value(l.arm_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"pair_id\":");
+    try std.json.Stringify.value(l.pair_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"presented_input_fingerprint\":");
+    try std.json.Stringify.value(
+        l.presented_input_fingerprint orelse return error.LaneMaterializationLineageMismatch,
+        .{},
+        &out.writer,
+    );
+    try out.writer.writeAll(",\"registered_trial\":");
+    try writeCanonicalJson(allocator, &out.writer, trial_parsed.value);
+    try out.writer.writeAll(",\"registration_event_digest\":");
+    try std.json.Stringify.value(registration_digest, .{}, &out.writer);
+    try out.writer.writeAll(",\"scenario_id\":");
+    try std.json.Stringify.value(l.scenario_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"schema\":\"hylo-lane-materialization-claim/v2\",\"source_case\":");
+    try writeCanonicalJson(allocator, &out.writer, .{ .object = source_case });
+    try out.writer.writeAll(",\"target_common_projection_opening\":");
+    const opening = try jsonRequiredObject(custody, "opening");
+    try writeCanonicalJson(
+        allocator,
+        &out.writer,
+        try jsonRequired(opening, "target_common_projection"),
+    );
+    try out.writer.writeAll(",\"treatment_opening\":");
+    try out.writer.writeAll(treatment_opening);
+    try out.writer.writeAll(",\"trial_fingerprint\":");
+    try std.json.Stringify.value(loc.trial.fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"trial_id\":");
+    try std.json.Stringify.value(trial_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"unit_id\":");
+    try std.json.Stringify.value(l.unit_id, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
 fn cmdLaneMaterialization(
     allocator: std.mem.Allocator,
     store: durable_store.EventStore,
@@ -2573,7 +4839,74 @@ fn cmdLaneMaterialization(
     expected_registration_digest: []const u8,
     expected_start_digest: []const u8,
     expected_lease_digest: []const u8,
+    custody_input_fd: ?std.posix.fd_t,
+    lease_input_fd: ?std.posix.fd_t,
+    output_fd_arg: ?std.posix.fd_t,
 ) !void {
+    if (custody_input_fd) |custody_fd| {
+        const lease_fd = lease_input_fd orelse return error.LaneMaterializationArgumentsInvalid;
+        const output_fd = output_fd_arg orelse return error.LaneMaterializationArgumentsInvalid;
+        try validateRevealInputEndpoint(custody_fd);
+        try validateLeaseInputEndpoint(lease_fd);
+        try validateRevealOutputEndpoint(output_fd);
+        var custody_stat: std.c.Stat = undefined;
+        var lease_stat: std.c.Stat = undefined;
+        var output_stat: std.c.Stat = undefined;
+        if (std.c.fstat(custody_fd, &custody_stat) != 0 or
+            std.c.fstat(lease_fd, &lease_stat) != 0 or
+            std.c.fstat(output_fd, &output_stat) != 0 or
+            (custody_stat.dev == lease_stat.dev and custody_stat.ino == lease_stat.ino) or
+            (custody_stat.dev == output_stat.dev and custody_stat.ino == output_stat.ino) or
+            (lease_stat.dev == output_stat.dev and lease_stat.ino == output_stat.ino))
+        {
+            return error.SensitiveFdAliased;
+        }
+        const custody_bytes = try readRevealMaterialFdAlloc(allocator, custody_fd);
+        defer {
+            std.crypto.secureZero(u8, custody_bytes);
+            allocator.free(custody_bytes);
+        }
+        var custody = try parseValue(allocator, custody_bytes);
+        defer custody.deinit();
+        const retained_lease = try readLeaseFdAlloc(allocator, lease_fd);
+        defer {
+            std.crypto.secureZero(u8, retained_lease);
+            allocator.free(retained_lease);
+        }
+        const claim = try privateLaneMaterializationClaimAlloc(
+            allocator,
+            store,
+            trial_id,
+            lane_id,
+            expected_registration_digest,
+            expected_start_digest,
+            expected_lease_digest,
+            retained_lease,
+            custody.value,
+        );
+        defer {
+            std.crypto.secureZero(u8, claim);
+            allocator.free(claim);
+        }
+        const claim_fingerprint = try digestBytesAlloc(allocator, claim);
+        defer allocator.free(claim_fingerprint);
+        try writePrivateCustodyRecord(output_fd, claim);
+        var receipt: std.Io.Writer.Allocating = .init(allocator);
+        defer receipt.deinit();
+        try receipt.writer.writeAll("{\"claim_fingerprint\":");
+        try std.json.Stringify.value(claim_fingerprint, .{}, &receipt.writer);
+        try receipt.writer.writeAll(",\"delivered_by_fd\":true,\"lane_id\":");
+        try std.json.Stringify.value(lane_id, .{}, &receipt.writer);
+        try receipt.writer.writeAll(",\"schema\":\"hylo-lane-materialization-receipt/" ++
+            "v2\",\"semantic_role_disclosed\":false,\"trial_i" ++ "d\":");
+        try std.json.Stringify.value(trial_id, .{}, &receipt.writer);
+        try receipt.writer.writeAll("}\n");
+        try writeStdoutAlloc(allocator, &receipt);
+        return;
+    }
+    if (lease_input_fd != null or output_fd_arg != null) {
+        return error.LaneMaterializationArgumentsInvalid;
+    }
     const claim = try laneMaterializationClaimAlloc(
         allocator,
         store,
@@ -2603,14 +4936,25 @@ fn cmdFinishLane(
     var receipt_parsed = try parseValue(allocator, receipt_bytes);
     defer receipt_parsed.deinit();
     const receipt = try jsonObject(receipt_parsed.value);
-    if (!std.mem.eql(u8, try jsonRequiredString(receipt, "schema"), "hylo-run-receipt/v1")) {
+    const receipt_schema = try jsonRequiredString(receipt, "schema");
+    if (runReceiptProofSchemasForSource(receipt_schema) == null) {
         return error.RunReceiptInvalid;
     }
     const trial_id = try jsonRequiredString(receipt, "trial_id");
     const lane_id = try jsonRequiredString(receipt, "lane_id");
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
-    const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
+    const location = (try ft(&loaded, trial_id)) orelse return error.TrialMissing;
+    var trial_parsed = try trialJsonParsed(allocator, location.trial);
+    defer trial_parsed.deinit();
+    const trial_schema = try jsonRequiredString(try jsonObject(trial_parsed.value), "schema");
+    const expected_receipt_schema = if (std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema))
+        PrivateRunReceiptSourceSchema
+    else if (std.mem.eql(u8, trial_schema, hctp.TrialSchema))
+        RunReceiptSourceSchema
+    else
+        return error.TrialSchemaInvalid;
+    if (!std.mem.eql(u8, receipt_schema, expected_receipt_schema)) return error.RunReceiptInvalid;
     const lane = location.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
     if (lane.status != .started) {
         if (lane.status == .registered) return error.LaneFinishWithoutStart;
@@ -2667,7 +5011,8 @@ fn recoverLaneFinishReceiptAlloc(
     retained_lease: []const u8,
 ) ![]u8 {
     const receipt = try jsonObject(receipt_value);
-    if (!std.mem.eql(u8, try jsonRequiredString(receipt, "schema"), "hylo-run-receipt/v1")) {
+    const receipt_schema = try jsonRequiredString(receipt, "schema");
+    if (runReceiptProofSchemasForSource(receipt_schema) == null) {
         return error.RunReceiptInvalid;
     }
     const trial_id = try jsonRequiredString(receipt, "trial_id");
@@ -2681,6 +5026,16 @@ fn recoverLaneFinishReceiptAlloc(
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
     const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
+    var trial_parsed = try trialJsonParsed(allocator, location.trial);
+    defer trial_parsed.deinit();
+    const trial_schema = try jsonRequiredString(try jsonObject(trial_parsed.value), "schema");
+    const expected_receipt_schema = if (std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema))
+        PrivateRunReceiptSourceSchema
+    else if (std.mem.eql(u8, trial_schema, hctp.TrialSchema))
+        RunReceiptSourceSchema
+    else
+        return error.TrialSchemaInvalid;
+    if (!std.mem.eql(u8, receipt_schema, expected_receipt_schema)) return error.RunReceiptInvalid;
     const lane = location.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
     if (!lane.status.isTerminal()) return error.LaneFinishRecoveryNotTerminal;
     if (lane.terminal_sequence == null or lane.lease_digest == null or
@@ -2930,40 +5285,266 @@ fn cmdRevealTrial(
     defer allocator.free(reveal_bytes);
     var reveal_parsed = try parseValue(allocator, reveal_bytes);
     defer reveal_parsed.deinit();
-    const reveal = try jsonObject(reveal_parsed.value);
-    if (!std.mem.eql(u8, try jsonRequiredString(reveal, "schema"), "hylo-trial-reveal/v1")) {
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(try jsonObject(reveal_parsed.value), "schema"),
+        "hylo-trial-reveal/v1",
+    )) return error.RevealProvenanceInvalid;
+    try cmdRevealTrialValue(allocator, repo, store, reveal_parsed.value, .legacy_v1);
+}
+
+fn v2RevealFromCustodyAlloc(
+    allocator: std.mem.Allocator,
+    public_trial_value: std.json.Value,
+    custody_value: std.json.Value,
+    materialization_receipts: []const []const u8,
+    materializer_validations_json: []const u8,
+) ![]u8 {
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        public_trial_value,
+        custody_value,
+    );
+    const trial = try jsonObject(public_trial_value);
+    const custody = try jsonObject(custody_value);
+    const opening = try jsonRequiredObject(custody, "opening");
+    const mapping_bytes = try retrace_core.hctp_trial_custody.mappingAlloc(
+        allocator,
+        trial,
+        custody,
+    );
+    defer allocator.free(mapping_bytes);
+    var mapping = try parseValue(allocator, mapping_bytes);
+    defer mapping.deinit();
+    var reveal_text: std.Io.Writer.Allocating = .init(allocator);
+    defer reveal_text.deinit();
+    try reveal_text.writer.writeAll("{\"arm_map_nonce\":");
+    try wj(allocator, &reveal_text.writer, try jf(opening, "arm_map_nonce"));
+    try reveal_text.writer.writeAll(",\"custody_opening\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, try jsonRequired(custody, "opening"));
+    try reveal_text.writer.writeAll(",\"mapping\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, mapping.value);
+    try reveal_text.writer.writeAll(",\"materialization_receipts\":[");
+    for (materialization_receipts, 0..) |receipt_bytes, index| {
+        var receipt = try parseValue(allocator, receipt_bytes);
+        defer receipt.deinit();
+        if (index != 0) try reveal_text.writer.writeByte(',');
+        try writeCanonicalJson(allocator, &reveal_text.writer, receipt.value);
+    }
+    var materializer_validations = try parseValue(allocator, materializer_validations_json);
+    defer materializer_validations.deinit();
+    if (materializer_validations.value != .array) return error.RevealMaterialInvalid;
+    try reveal_text.writer.writeAll("],\"materializer_validations\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, materializer_validations.value);
+    try reveal_text.writer.writeAll(",\"revealed_at_scope\":");
+    try writeCanonicalJson(
+        allocator,
+        &reveal_text.writer,
+        try jsonRequired(try jsonRequiredObject(trial, "sealing"), "reveal_scope"),
+    );
+    try reveal_text.writer.writeAll(",\"schema\":\"hylo-trial-reveal/v2\",\"trial_id\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, try jsonRequired(trial, "trial_id"));
+    try reveal_text.writer.writeByte('}');
+    const reveal_bytes = try reveal_text.toOwnedSlice();
+    errdefer allocator.free(reveal_bytes);
+    var reveal = try parseValue(allocator, reveal_bytes);
+    defer reveal.deinit();
+    _ = try retrace_core.hctp_trial_custody.validateReveal(
+        allocator,
+        public_trial_value,
+        reveal.value,
+    );
+    return reveal_bytes;
+}
+
+fn cmdRevealTrialFromMaterial(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    reveal_material_fd: std.posix.fd_t,
+    materialization_receipt_paths: []const []const u8,
+) !void {
+    const material_bytes = try readRevealMaterialFdAlloc(allocator, reveal_material_fd);
+    defer {
+        std.crypto.secureZero(u8, material_bytes);
+        allocator.free(material_bytes);
+    }
+    var material_parsed = try parseValue(allocator, material_bytes);
+    defer material_parsed.deinit();
+    const material = try jsonObject(material_parsed.value);
+    const material_schema = try jsonRequiredString(material, "schema");
+    const legacy_material = std.mem.eql(u8, material_schema, "hylo-trial-reveal-material/v1");
+    const private_custody = std.mem.eql(
+        u8,
+        material_schema,
+        retrace_core.hctp_trial_custody.CustodySchema,
+    );
+    if (!legacy_material and !private_custody) return error.RevealMaterialInvalid;
+    if (legacy_material and material.count() != 4) return error.RevealMaterialInvalid;
+    const trial_fingerprint = if (legacy_material)
+        try jsonRequiredString(material, "trial_fingerprint")
+    else
+        try jsonRequiredString(material, "public_trial_fingerprint");
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const location = (try findTrialByFingerprintAcrossCampaigns(&loaded, trial_fingerprint)) orelse
+        return error.TrialMissing;
+    const trial_id = location.trial.id;
+    var trial_parsed = try trialJsonParsed(allocator, location.trial);
+    defer trial_parsed.deinit();
+    const trial = try jsonObject(trial_parsed.value);
+    const sealing = try jsonRequiredObject(trial, "sealing");
+
+    if (private_custody) {
+        var safe_receipt_bytes: std.ArrayList([]u8) = .empty;
+        defer {
+            for (safe_receipt_bytes.items) |bytes| allocator.free(bytes);
+            safe_receipt_bytes.deinit(allocator);
+        }
+        var private_receipt_bytes: std.ArrayList([]u8) = .empty;
+        defer {
+            for (private_receipt_bytes.items) |bytes| {
+                std.crypto.secureZero(u8, bytes);
+                allocator.free(bytes);
+            }
+            private_receipt_bytes.deinit(allocator);
+        }
+        for (materialization_receipt_paths) |path| {
+            const bytes = try readInputAlloc(allocator, path);
+            errdefer allocator.free(bytes);
+            var parsed = try parseValue(allocator, bytes);
+            defer parsed.deinit();
+            const schema = try jsonRequiredString(try jsonObject(parsed.value), "schema");
+            if (std.mem.eql(u8, schema, "hylo-lane-materialization-receipt/v2")) {
+                try safe_receipt_bytes.append(allocator, bytes);
+            } else if (std.mem.eql(u8, schema, "hylo-materialization-receipt/v1")) {
+                try private_receipt_bytes.append(allocator, bytes);
+            } else {
+                return error.RevealMaterialInvalid;
+            }
+        }
+        const semantic_bytes = try semanticTrialFromCustodyAlloc(
+            allocator,
+            trial_parsed.value,
+            material_parsed.value,
+        );
+        defer {
+            std.crypto.secureZero(u8, semantic_bytes);
+            allocator.free(semantic_bytes);
+        }
+        var semantic_trial = try parseValue(allocator, semantic_bytes);
+        defer semantic_trial.deinit();
+        const materializer_validations = try hctp.privateMaterializerValidationsAlloc(
+            allocator,
+            location.trial,
+            semantic_trial.value,
+            private_receipt_bytes.items,
+        );
+        defer allocator.free(materializer_validations);
+        const reveal_bytes = try v2RevealFromCustodyAlloc(
+            allocator,
+            trial_parsed.value,
+            material_parsed.value,
+            safe_receipt_bytes.items,
+            materializer_validations,
+        );
+        defer allocator.free(reveal_bytes);
+        var reveal_parsed = try parseValue(allocator, reveal_bytes);
+        defer reveal_parsed.deinit();
+        try cmdRevealTrialValue(
+            allocator,
+            repo,
+            store,
+            reveal_parsed.value,
+            .validated_private_custody_v2,
+        );
+        return;
+    }
+
+    var reveal_text: std.Io.Writer.Allocating = .init(allocator);
+    defer reveal_text.deinit();
+    const target_epoch = try jsonRequiredObject(trial, "target_epoch");
+    try reveal_text.writer.writeAll("{\"baseline_target_fingerprint\":");
+    try wj(allocator, &reveal_text.writer, try jf(target_epoch, "before_target_fingerprint"));
+    try reveal_text.writer.writeAll(",\"candidate_change_id\":");
+    try wj(allocator, &reveal_text.writer, try jf(target_epoch, "change_id"));
+    try reveal_text.writer.writeAll(",\"candidate_target_fingerprint\":");
+    try wj(allocator, &reveal_text.writer, try jf(target_epoch, "after_target_fingerprint"));
+    try reveal_text.writer.writeAll(",\"mapping\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, try jsonRequired(material, "mapping"));
+    try reveal_text.writer.writeAll(",\"materialization_receipts\":[");
+    for (materialization_receipt_paths, 0..) |path, index| {
+        const receipt_bytes = try readInputAlloc(allocator, path);
+        defer allocator.free(receipt_bytes);
+        var receipt = try parseValue(allocator, receipt_bytes);
+        defer receipt.deinit();
+        if (index != 0) try reveal_text.writer.writeByte(',');
+        try writeCanonicalJson(allocator, &reveal_text.writer, receipt.value);
+    }
+    try reveal_text.writer.writeAll("],\"nonce\":");
+    try writeCanonicalJson(allocator, &reveal_text.writer, try jsonRequired(material, "nonce"));
+    try reveal_text.writer.writeAll(",\"revealed_at_scope\":");
+    try wj(allocator, &reveal_text.writer, try jf(sealing, "reveal_scope"));
+    try reveal_text.writer.writeAll(",\"schema\":");
+    try std.json.Stringify.value("hylo-trial-reveal/v1", .{}, &reveal_text.writer);
+    try reveal_text.writer.writeAll(",\"trial_id\":");
+    try std.json.Stringify.value(trial_id, .{}, &reveal_text.writer);
+    try reveal_text.writer.writeByte('}');
+    var reveal_parsed = try parseValue(allocator, reveal_text.written());
+    defer reveal_parsed.deinit();
+    try cmdRevealTrialValue(allocator, repo, store, reveal_parsed.value, .legacy_v1);
+}
+
+fn cmdRevealTrialValue(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    reveal_value: std.json.Value,
+    provenance: RevealAppendProvenance,
+) !void {
+    const reveal = try jsonObject(reveal_value);
+    const reveal_schema = try jsonRequiredString(reveal, "schema");
+    if (!std.mem.eql(u8, reveal_schema, "hylo-trial-reveal/v1") and
+        !std.mem.eql(u8, reveal_schema, retrace_core.hctp_trial_custody.RevealSchema))
+    {
         return error.RevealInvalid;
     }
     const trial_id = try jsonRequiredString(reveal, "trial_id");
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
     const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
-    const reveal_fingerprint = try digestValueAlloc(allocator, reveal_parsed.value);
+    const reveal_fingerprint = try digestValueAlloc(allocator, reveal_value);
     defer allocator.free(reveal_fingerprint);
     var payload_text: std.Io.Writer.Allocating = .init(allocator);
     defer payload_text.deinit();
     try payload_text.writer.writeAll("{\"reveal_fingerprint\":");
     try std.json.Stringify.value(reveal_fingerprint, .{}, &payload_text.writer);
     try payload_text.writer.writeAll(",\"reveal\":");
-    try writeCanonicalJson(allocator, &payload_text.writer, reveal_parsed.value);
+    try writeCanonicalJson(allocator, &payload_text.writer, reveal_value);
     try payload_text.writer.writeByte('}');
     const payload_bytes = try payload_text.toOwnedSlice();
     defer allocator.free(payload_bytes);
     var payload = try parseValue(allocator, payload_bytes);
     defer payload.deinit();
-    var result = try appendHighLevelEvent(
+    var result = try appendTrialRevealEvent(
         allocator,
         repo,
         store,
         location.campaign.id,
-        "trial_revealed",
-        null,
-        null,
-        null,
         payload.value,
+        provenance,
     );
     defer result.deinit(allocator);
-    try printHighLevelReceipt(allocator, "hylo-trial-reveal-receipt/v1", result, "trial_id", trial_id);
+    try printHighLevelReceipt(
+        allocator,
+        if (std.mem.eql(u8, reveal_schema, retrace_core.hctp_trial_custody.RevealSchema))
+            "hylo-trial-reveal-receipt/v2"
+        else
+            "hylo-trial-reveal-receipt/v1",
+        result,
+        "trial_id",
+        trial_id,
+    );
 }
 
 fn trialPhase(trial: *const hctp.TrialState) []const u8 {
@@ -3144,6 +5725,17 @@ fn trialReportAlloc(
     var trial_parsed = try parseValue(allocator, trial.trial_json);
     defer trial_parsed.deinit();
     const trial_root = try jsonObject(trial_parsed.value);
+    const trial_schema = try jsonRequiredString(trial_root, "schema");
+    const private_trial = std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema);
+    var private_evidence: ?PrivateRevealEvidence = null;
+    defer if (private_evidence) |*evidence| evidence.deinit();
+    if (private_trial and trial.revealed) {
+        private_evidence = try privateRevealEvidenceAlloc(
+            allocator,
+            trial,
+            trial_parsed.value,
+        );
+    }
     var result_parsed = try parseValue(allocator, result_json);
     defer result_parsed.deinit();
     const result_root = try jsonObject(result_parsed.value);
@@ -3173,9 +5765,18 @@ fn trialReportAlloc(
         if (std.mem.eql(u8, kind, "historical_decision")) historical_units += 1 else direct_units += 1;
     }
 
-    const change_id = try jsonNullableString(target_epoch, "change_id");
-    const before_target = try jsonNullableString(target_epoch, "before_target_fingerprint");
-    const after_target = try jsonNullableString(target_epoch, "after_target_fingerprint");
+    const change_id = if (private_evidence) |evidence|
+        try jsonNullableString(evidence.evidence.change, "change_id")
+    else
+        try jsonNullableString(target_epoch, "change_id");
+    const before_target = if (private_evidence) |evidence|
+        try jsonNullableString(evidence.evidence.before_target, "target_fingerprint")
+    else
+        try jsonNullableString(target_epoch, "before_target_fingerprint");
+    const after_target = if (private_evidence) |evidence|
+        try jsonNullableString(evidence.evidence.after_target, "target_fingerprint")
+    else
+        try jsonNullableString(target_epoch, "after_target_fingerprint");
     const next_route = try trialReportNextRoute(allocator, campaign, trial, result_root);
     const hypothesis_class = if (std.mem.eql(u8, trial.purpose, "environment_probe"))
         "environment_defect"
@@ -3198,7 +5799,7 @@ fn trialReportAlloc(
     try writeMarkdownLabelValue(&out.writer, "After target", after_target orelse "not-applicable");
 
     try out.writer.writeAll("\n## Protocol and estimand\n\n");
-    try writeMarkdownLabelValue(&out.writer, "Protocol", "hylo-trial/v1");
+    try writeMarkdownLabelValue(&out.writer, "Protocol", trial_schema);
     try writeMarkdownLabelValue(&out.writer, "Trial fold", hctp.TrialFoldVersion);
     try writeMarkdownLabelValue(&out.writer, "Bootstrap", hctp.BootstrapVersion);
     try writeMarkdownLabelValue(&out.writer, "Pair grade", hctp.PairGradeVersion);
@@ -3227,7 +5828,11 @@ fn trialReportAlloc(
     try out.writer.writeAll("\n## Intervention\n\n");
     try writeMarkdownLabelValue(&out.writer, "Factor", try jsonRequiredString(intervention, "factor_kind"));
     try writeMarkdownLabelValue(&out.writer, "One-factor closure", "verified");
-    try writeMarkdownLabelValue(&out.writer, "Witness", try jsonRequiredString(intervention, "witness_fingerprint"));
+    try writeMarkdownLabelValue(
+        &out.writer,
+        "Witness",
+        (try jsonNullableString(intervention, "witness_fingerprint")) orelse "not-revealed",
+    );
     try writeMarkdownLabelValue(&out.writer, "Verifier", try jsonRequiredString(try jsonRequiredObject(factor, "verifier"), "id"));
 
     try out.writer.writeAll("\n## Execution accounting\n\n");
@@ -3458,6 +6063,79 @@ fn writeBlindedTrialInspectProjection(
     const commitment = try jsonRequiredObject(root, "arm_map_commitment");
     const factor = try jsonRequiredObject(root, "factor");
     const sealing = try jsonRequiredObject(root, "sealing");
+    if (std.mem.eql(
+        u8,
+        try jsonRequiredString(root, "schema"),
+        hctp.PrivateTrialSchema,
+    )) {
+        try writer.writeAll("{\"schema\":\"hylo-trial-blinded-inspect/v2\",\"trial_id\":");
+        try std.json.Stringify.value(trial.id, .{}, writer);
+        try writer.writeAll(",\"campaign_id\":");
+        try std.json.Stringify.value(try jsonRequiredString(root, "campaign_id"), .{}, writer);
+        try writer.writeAll(",\"purpose\":");
+        try std.json.Stringify.value(trial.purpose, .{}, writer);
+        try writer.writeAll(",\"trial_fingerprint\":");
+        try std.json.Stringify.value(trial.fingerprint, .{}, writer);
+        try writer.writeAll(",\"registration_event_digest\":");
+        try std.json.Stringify.value(trial.registration_event_digest, .{}, writer);
+        try writer.writeAll(",\"custody_commitment\":");
+        try sj.value(try js(root, "custody_commitment"), .{}, writer);
+        try writer.writeAll(",\"arm_map_commitment\":");
+        try writeCanonicalJson(allocator, writer, .{ .object = commitment });
+        try writer.writeAll(",\"opaque_arm_commitments\":[");
+        for ((try jsonRequiredArray(root, "arms")).items, 0..) |arm_value, index| {
+            if (index != 0) try writer.writeByte(',');
+            const arm = try jsonObject(arm_value);
+            try writer.writeAll("{\"arm_id\":");
+            try std.json.Stringify.value(try jsonRequiredString(arm, "arm_id"), .{}, writer);
+            try writer.writeAll(",\"treatment_commitment\":");
+            try std.json.Stringify.value(
+                try jsonRequiredString(arm, "treatment_commitment"),
+                .{},
+                writer,
+            );
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("],\"factor_commitment\":{\"kind\":");
+        try std.json.Stringify.value(try jsonRequiredString(factor, "kind"), .{}, writer);
+        try writer.writeAll(",\"common_projection_fingerprint\":");
+        try std.json.Stringify.value(
+            try jsonRequiredString(factor, "common_projection_fingerprint"),
+            .{},
+            writer,
+        );
+        try writer.writeAll(",\"intervention_witness_commitment\":");
+        try std.json.Stringify.value(
+            try jsonRequiredString(factor, "intervention_witness_commitment"),
+            .{},
+            writer,
+        );
+        try writer.writeAll(",\"target_common_projection_commitment\":");
+        try std.json.Stringify.value(
+            try jsonRequiredString(factor, "target_common_projection_commitment"),
+            .{},
+            writer,
+        );
+        try writer.writeAll("},\"sealing\":{\"case_visibility\":");
+        try sj.value(try js(sealing, "case_visibility"), .{}, writer);
+        try writer.writeAll(",\"arm_visibility\":");
+        try sj.value(try js(sealing, "arm_visibility"), .{}, writer);
+        try writer.writeAll(",\"grade_visibility\":");
+        try sj.value(try js(sealing, "grade_visibility"), .{}, writer);
+        try writer.writeAll(",\"reveal_scope\":");
+        try std.json.Stringify.value(try jsonRequiredString(sealing, "reveal_scope"), .{}, writer);
+        try writer.writeAll(",\"source_selection_receipt_fingerprint\":");
+        try std.json.Stringify.value(
+            try jsonRequiredString(sealing, "source_selection_receipt_fingerprint"),
+            .{},
+            writer,
+        );
+        try writer.print(
+            "}},\"counts\":{{\"units\":{d},\"pairs\":{d},\"lanes\":{d}}}}}",
+            .{ (try ja(root, "units")).items.len, trial.pairs.items.len, trial.lanes.items.len },
+        );
+        return;
+    }
     try writer.writeAll("{\"schema\":\"hylo-trial-blinded-inspect/v1\",\"trial_id\":");
     try std.json.Stringify.value(trial.id, .{}, writer);
     try writer.writeAll(",\"campaign_id\":");
@@ -4152,6 +6830,37 @@ fn isSensitiveProofKey(key: []const u8) bool {
         asciiEndsWithIgnoreCase(key, "_capability_ref");
 }
 
+fn isForbiddenPrivateSemanticProofKey(key: []const u8) bool {
+    inline for (.{
+        "chain_of_thought",
+        "future_outcome",
+        "future_outcome_ref",
+        "grade_opening",
+        "grade_openings",
+        "hidden_oracle_ref",
+        "hidden_oracle",
+        "hidden_oracle_text",
+        "hidden_reasoning",
+        "historical_answer",
+        "historical_response",
+        "historical_response_ref",
+        "private_reasoning",
+        "source_target_text",
+    }) |forbidden| {
+        if (std.ascii.eqlIgnoreCase(key, forbidden)) return true;
+    }
+    return false;
+}
+
+fn validateProofPrivateSemanticEntry(key: []const u8, value: std.json.Value) !void {
+    if (isForbiddenPrivateSemanticProofKey(key)) return error.ProofBundleSecretLeak;
+    if (!std.ascii.eqlIgnoreCase(key, "hidden_reference")) return;
+    switch (value) {
+        .bool => |presented| if (presented) return error.ProofBundleSecretLeak,
+        else => return error.ProofBundleSecretLeak,
+    }
+}
+
 fn validateProofSanitizedValue(value: std.json.Value) !void {
     retrace_core.portable_credentials.validateJson(value) catch return error.ProofBundleSecretLeak;
     return validateProofSpecificSanitizedValue(value, proofSanitizerRootContext(value));
@@ -4181,7 +6890,15 @@ const ProofSanitizerContext = enum {
     trust_policy,
     trust_policy_key_array,
     trust_policy_key,
+    campaign,
+    campaign_trial_policy,
+    proof_authority,
     factor,
+    trial_reveal,
+    custody_opening,
+    witness_opening,
+    target_common_projection_opening,
+    target_common_projection,
     intervention_witness,
     differing_projection,
     semantic_path_array,
@@ -4197,11 +6914,17 @@ fn isProofTrialObject(value: std.json.Value) bool {
     if (value != .object) return false;
     const map = value.object;
     return proofObjectHasSchema(map, hctp.TrialSchema) or
+        proofObjectHasSchema(map, hctp.PrivateTrialSchema) or
         (proofObjectHasSchema(map, "hylo-trial-proof-projection/v1") and
             if (map.get("source_schema")) |source|
                 source == .string and std.mem.eql(u8, source.string, hctp.TrialSchema)
             else
                 false);
+}
+
+fn isProofPrivateTrialRevealObject(value: std.json.Value) bool {
+    return value == .object and
+        proofObjectHasSchema(value.object, retrace_core.hctp_trial_custody.RevealSchema);
 }
 
 fn isProofTrialProjectionObject(value: std.json.Value) bool {
@@ -4262,10 +6985,30 @@ fn isProofTrustPolicyObject(value: std.json.Value) bool {
     return value == .object and proofObjectHasSchema(value.object, "hylo-trust-policy/v1");
 }
 
+fn isProofCampaignObject(value: std.json.Value) bool {
+    return value == .object and proofObjectHasSchema(value.object, "hylo-campaign/v1");
+}
+
+fn isProofAuthorityObject(value: std.json.Value) bool {
+    return value == .object and proofObjectHasSchema(value.object, "hylo-proof-authority/v1");
+}
+
 fn isProofEd25519SignatureObject(value: std.json.Value) bool {
     if (value != .object) return false;
     const algorithm = value.object.get("algorithm") orelse return false;
     return algorithm == .string and std.mem.eql(u8, algorithm.string, "ed25519");
+}
+
+fn isProofTypedAttestationObject(value: std.json.Value) bool {
+    if (value != .object or !proofObjectHasSchema(value.object, "hylo-attestation/v1")) {
+        return false;
+    }
+    const subject_schema = value.object.get("subject_schema") orelse return false;
+    if (subject_schema != .string or subject_schema.string.len == 0) return false;
+    const signature = value.object.get("signature") orelse return false;
+    if (!isProofEd25519SignatureObject(signature)) return false;
+    const signature_value = signature.object.get("value_base64") orelse return false;
+    return signature_value == .string;
 }
 
 fn proofSanitizerRootContext(value: std.json.Value) ProofSanitizerContext {
@@ -4274,7 +7017,10 @@ fn proofSanitizerRootContext(value: std.json.Value) ProofSanitizerContext {
     }
     if (isProofSourceSelectionReceiptObject(value)) return .source_selection_receipt;
     if (isProofTrustPolicyObject(value)) return .trust_policy;
+    if (isProofCampaignObject(value)) return .campaign;
+    if (isProofAuthorityObject(value)) return .proof_authority;
     if (isProofInterventionWitnessObject(value)) return .intervention_witness;
+    if (isProofPrivateTrialRevealObject(value)) return .trial_reveal;
     if (isProofEventObject(value)) return .event;
     if (value == .object and proofObjectHasSchema(value.object, "hylo-proof-bundle/v1")) {
         return .proof_bundle;
@@ -4293,6 +7039,11 @@ fn proofSanitizerChildContext(
     key: []const u8,
     value: std.json.Value,
 ) ProofSanitizerContext {
+    if (context == .ordinary and std.mem.eql(u8, key, "attestation") and
+        isProofTypedAttestationObject(value))
+    {
+        return .attestation;
+    }
     return switch (context) {
         .ordinary,
         .attestation_signature_base64,
@@ -4335,6 +7086,27 @@ fn proofSanitizerChildContext(
             .ordinary,
         .event_payload => if (std.mem.eql(u8, key, "trial") and isProofTrialObject(value))
             if (isProofTrialProjectionObject(value)) .trial_projection else .trial
+        else if (std.mem.eql(u8, key, "campaign") and isProofCampaignObject(value))
+            .campaign
+        else if (std.mem.eql(u8, key, "reveal") and isProofPrivateTrialRevealObject(value))
+            .trial_reveal
+        else
+            .ordinary,
+        .campaign => if (std.mem.eql(u8, key, "trial_policy") and value == .object)
+            .campaign_trial_policy
+        else
+            .ordinary,
+        .campaign_trial_policy => if (std.mem.eql(u8, key, "proof_authority") and
+            isProofAuthorityObject(value))
+            .proof_authority
+        else if (std.mem.eql(u8, key, "proof_trust_policy") and
+            isProofTrustPolicyObject(value))
+            .trust_policy
+        else
+            .ordinary,
+        .proof_authority => if (std.mem.eql(u8, key, "public_key_base64") and
+            value == .string)
+            .ed25519_public_key_base64
         else
             .ordinary,
         .trial,
@@ -4394,6 +7166,31 @@ fn proofSanitizerChildContext(
         else if (std.mem.eql(u8, key, "intervention_witness") and
             isProofInterventionWitnessObject(value))
             .intervention_witness
+        else
+            .ordinary,
+        .trial_reveal => if (std.mem.eql(u8, key, "custody_opening") and value == .object)
+            .custody_opening
+        else
+            .ordinary,
+        .custody_opening => if (std.mem.eql(u8, key, "intervention_witness") and value == .object)
+            .witness_opening
+        else if (std.mem.eql(u8, key, "target_common_projection") and value == .object)
+            .target_common_projection_opening
+        else
+            .ordinary,
+        .witness_opening => if (std.mem.eql(u8, key, "witness") and
+            isProofInterventionWitnessObject(value))
+            .intervention_witness
+        else
+            .ordinary,
+        .target_common_projection_opening => if (std.mem.eql(u8, key, "projection") and
+            value == .object)
+            .target_common_projection
+        else
+            .ordinary,
+        .target_common_projection => if (std.mem.eql(u8, key, "excluded_roots") and
+            value == .array)
+            .semantic_path_array
         else
             .ordinary,
         .intervention_witness => if (std.mem.eql(u8, key, "differing_projection"))
@@ -4476,7 +7273,10 @@ fn validateProofSpecificSanitizedValue(
         .object => |map| {
             var iterator = map.iterator();
             while (iterator.next()) |entry| {
-                if (isSensitiveProofKey(entry.key_ptr.*)) return error.ProofBundleSecretLeak;
+                if (isSensitiveProofKey(entry.key_ptr.*)) {
+                    return error.ProofBundleSecretLeak;
+                }
+                try validateProofPrivateSemanticEntry(entry.key_ptr.*, entry.value_ptr.*);
                 try validateProofSpecificSanitizedValue(
                     entry.value_ptr.*,
                     proofSanitizerChildContext(context, entry.key_ptr.*, entry.value_ptr.*),
@@ -4496,6 +7296,13 @@ fn isProofLocalLocator(value: []const u8) bool {
     return std.fs.path.isAbsolute(value) or isProofFileLocator(value);
 }
 
+fn isProofPortableContentAddressedRef(value: []const u8) bool {
+    const prefix = "artifact:";
+    if (!std.mem.startsWith(u8, value, prefix)) return false;
+    validateFingerprint(value[prefix.len..]) catch return false;
+    return true;
+}
+
 fn proofKeyMustBeOmitted(key: []const u8) bool {
     return std.ascii.eqlIgnoreCase(key, "ciphertext_or_capability_ref") or
         std.ascii.eqlIgnoreCase(key, "case_materialization_capability") or
@@ -4511,6 +7318,43 @@ const SealedCaseLocatorKey = "ciphertext_or_capability_ref";
 const RunReceiptSourceSchema = "hylo-run-receipt/v1";
 const RunReceiptProjectionSchema = "hylo-run-receipt-proof-projection/v1";
 const RunReceiptOmissionSchema = "hylo-run-receipt-proof-omission/v1";
+const PrivateRunReceiptSourceSchema = "hylo-run-receipt/v2";
+const PrivateRunReceiptProjectionSchema = "hylo-run-receipt-proof-projection/v2";
+const PrivateRunReceiptOmissionSchema = "hylo-run-receipt-proof-omission/v2";
+const ScenarioSourceSchema = "hylo-scenario/v1";
+const ScenarioProjectionSchema = "hylo-scenario-proof-projection/v1";
+const ScenarioOmissionSchema = "hylo-scenario-proof-omission/v1";
+const ScenarioHiddenReferencePath = "request.hidden_reference_ref";
+
+const RunReceiptProofSchemas = struct {
+    source: []const u8,
+    projection: []const u8,
+    omission: []const u8,
+};
+
+fn runReceiptProofSchemasForSource(schema: []const u8) ?RunReceiptProofSchemas {
+    if (std.mem.eql(u8, schema, RunReceiptSourceSchema)) return .{
+        .source = RunReceiptSourceSchema,
+        .projection = RunReceiptProjectionSchema,
+        .omission = RunReceiptOmissionSchema,
+    };
+    if (std.mem.eql(u8, schema, PrivateRunReceiptSourceSchema)) return .{
+        .source = PrivateRunReceiptSourceSchema,
+        .projection = PrivateRunReceiptProjectionSchema,
+        .omission = PrivateRunReceiptOmissionSchema,
+    };
+    return null;
+}
+
+fn runReceiptProofSchemasForProjection(schema: []const u8) ?RunReceiptProofSchemas {
+    if (std.mem.eql(u8, schema, RunReceiptProjectionSchema)) {
+        return runReceiptProofSchemasForSource(RunReceiptSourceSchema);
+    }
+    if (std.mem.eql(u8, schema, PrivateRunReceiptProjectionSchema)) {
+        return runReceiptProofSchemasForSource(PrivateRunReceiptSourceSchema);
+    }
+    return null;
+}
 
 const RunReceiptLocatorPaths = [_][]const u8{
     "effects.external_effect_receipt_ref",
@@ -4532,6 +7376,10 @@ const RunReceiptLocatorPaths = [_][]const u8{
     "native_receipt.ref",
     "native_receipt.receipt.execution.execution_audit_ref",
     "native_receipt.receipt.execution.executor",
+    "native_receipt.receipt.fork_inquiry_receipt.answer.final_text_ref",
+    "native_receipt.receipt.fork_inquiry_receipt.lifecycle.event_log_ref",
+    "native_receipt.receipt.fork_inquiry_receipt.source.source_rollout_path",
+    "native_receipt.receipt.fork_inquiry_receipt.workspace_reconstruction.path",
     "native_receipt.receipt.source.decision_context_ref",
     "terminal.failure_detail_ref",
 };
@@ -4574,8 +7422,12 @@ fn collectRunReceiptProofOmissions(
 ) !void {
     switch (value) {
         .string => |text| {
-            if (!isProofLocalLocator(text)) return;
-            if (!runReceiptLocatorPathAllowed(path)) return error.ProofProjectionUnknownLocalLocator;
+            const enumerated_locator = runReceiptLocatorPathAllowed(path);
+            if (enumerated_locator and isProofPortableContentAddressedRef(text)) return;
+            if (!enumerated_locator) {
+                if (isProofLocalLocator(text)) return error.ProofProjectionUnknownLocalLocator;
+                return;
+            }
             const omission_path = try allocator.dupe(u8, path);
             errdefer allocator.free(omission_path);
             const value_fingerprint = try hctp.digestValueAlloc(allocator, value);
@@ -4585,8 +7437,10 @@ fn collectRunReceiptProofOmissions(
                 .kind = if (text.len >= "file:".len and
                     std.ascii.eqlIgnoreCase(text[0.."file:".len], "file:"))
                     "file_uri"
+                else if (std.fs.path.isAbsolute(text))
+                    "absolute_path"
                 else
-                    "absolute_path",
+                    "relative_or_unportable_ref",
                 .value_fingerprint = value_fingerprint,
             });
         },
@@ -4627,6 +7481,7 @@ fn writeRunReceiptProofProjectionValue(
     path: []const u8,
     source_receipt_fingerprint: []const u8,
     omissions: []const RunReceiptProofOmission,
+    schemas: RunReceiptProofSchemas,
 ) !void {
     switch (value) {
         .object => |map| {
@@ -4653,7 +7508,7 @@ fn writeRunReceiptProofProjectionValue(
                 try retrace_core.canonical_json.writeCanonicalString(writer, key);
                 try writer.writeByte(':');
                 if (root and std.mem.eql(u8, key, "source_schema")) {
-                    try std.json.Stringify.value(RunReceiptSourceSchema, .{}, writer);
+                    try std.json.Stringify.value(schemas.source, .{}, writer);
                 } else if (root and std.mem.eql(u8, key, "source_receipt_fingerprint")) {
                     try std.json.Stringify.value(source_receipt_fingerprint, .{}, writer);
                 } else if (root and std.mem.eql(u8, key, ProofOmissionsKey)) {
@@ -4665,14 +7520,14 @@ fn writeRunReceiptProofProjectionValue(
                         try writer.writeAll(",\"path\":");
                         try std.json.Stringify.value(omission.path, .{}, writer);
                         try writer.writeAll(",\"schema\":");
-                        try std.json.Stringify.value(RunReceiptOmissionSchema, .{}, writer);
+                        try std.json.Stringify.value(schemas.omission, .{}, writer);
                         try writer.writeAll(",\"value_fingerprint\":");
                         try std.json.Stringify.value(omission.value_fingerprint, .{}, writer);
                         try writer.writeByte('}');
                     }
                     try writer.writeByte(']');
                 } else if (root and std.mem.eql(u8, key, "schema")) {
-                    try std.json.Stringify.value(RunReceiptProjectionSchema, .{}, writer);
+                    try std.json.Stringify.value(schemas.projection, .{}, writer);
                 } else {
                     const child_path = try proofChildPathAlloc(allocator, path, key);
                     defer allocator.free(child_path);
@@ -4683,6 +7538,7 @@ fn writeRunReceiptProofProjectionValue(
                         child_path,
                         source_receipt_fingerprint,
                         omissions,
+                        schemas,
                     );
                 }
             }
@@ -4701,6 +7557,7 @@ fn writeRunReceiptProofProjectionValue(
                     child_path,
                     source_receipt_fingerprint,
                     omissions,
+                    schemas,
                 );
             }
             try writer.writeByte(']');
@@ -4714,9 +7571,9 @@ fn runReceiptProofProjectionAlloc(
     receipt_value: std.json.Value,
 ) ![]u8 {
     const receipt = try jsonObject(receipt_value);
-    if (!std.mem.eql(u8, try jsonRequiredString(receipt, "schema"), RunReceiptSourceSchema)) {
-        return error.RunReceiptInvalid;
-    }
+    const schemas = runReceiptProofSchemasForSource(
+        try jsonRequiredString(receipt, "schema"),
+    ) orelse return error.RunReceiptInvalid;
     const source_receipt_fingerprint = try hctp.digestValueAlloc(allocator, receipt_value);
     defer allocator.free(source_receipt_fingerprint);
     var omissions: std.ArrayList(RunReceiptProofOmission) = .empty;
@@ -4735,13 +7592,135 @@ fn runReceiptProofProjectionAlloc(
         "",
         source_receipt_fingerprint,
         omissions.items,
+        schemas,
     );
     return out.toOwnedSlice();
 }
 
 fn isRunReceiptProofProjection(map: std.json.ObjectMap) bool {
     const schema = map.get("schema") orelse return false;
-    return schema == .string and std.mem.eql(u8, schema.string, RunReceiptProjectionSchema);
+    return schema == .string and runReceiptProofSchemasForProjection(schema.string) != null;
+}
+
+fn isOpenScenarioSourceObject(map: std.json.ObjectMap) bool {
+    const schema = map.get("schema") orelse return false;
+    if (schema != .string or !std.mem.eql(u8, schema.string, ScenarioSourceSchema)) return false;
+    const request = map.get("request") orelse return false;
+    return request == .object and request.object.get("hidden_reference_ref") != null;
+}
+
+fn isScenarioProofProjection(map: std.json.ObjectMap) bool {
+    const schema = map.get("schema") orelse return false;
+    const source_schema = map.get("source_schema") orelse return false;
+    return schema == .string and source_schema == .string and
+        std.mem.eql(u8, schema.string, ScenarioProjectionSchema) and
+        std.mem.eql(u8, source_schema.string, ScenarioSourceSchema);
+}
+
+fn requireExactProofKeys(map: std.json.ObjectMap, expected: []const []const u8) !void {
+    if (map.count() != expected.len) return error.ProofProjectionSemanticMutation;
+    for (expected) |key| _ = map.get(key) orelse return error.ProofProjectionSemanticMutation;
+}
+
+fn validateScenarioProofProjection(value: std.json.Value) !void {
+    const scenario = try jsonObject(value);
+    if (!isScenarioProofProjection(scenario)) return error.ProofProjectionSemanticMutation;
+    try requireExactProofKeys(scenario, &.{
+        "campaign_id",
+        "environment",
+        "mutation",
+        "oracles",
+        ProofOmissionsKey,
+        "replay_policy_fingerprint",
+        "request",
+        "scenario_id",
+        "schema",
+        "source_episode_fingerprint",
+        "source_refs",
+        "source_schema",
+        "split",
+    });
+    const request = try jsonRequiredObject(scenario, "request");
+    try requireExactProofKeys(
+        request,
+        &.{ "message", "visible_context" },
+    );
+    if (request.get("hidden_reference_ref") != null) {
+        return error.ProofProjectionSemanticMutation;
+    }
+    const omissions = try jsonRequiredArray(scenario, ProofOmissionsKey);
+    if (omissions.items.len != 1) return error.ProofProjectionSemanticMutation;
+    const omission = try jsonObject(omissions.items[0]);
+    try requireExactProofKeys(
+        omission,
+        &.{ "path", "schema", "value_fingerprint" },
+    );
+    if (!std.mem.eql(u8, try jsonRequiredString(omission, "schema"), ScenarioOmissionSchema) or
+        !std.mem.eql(u8, try jsonRequiredString(omission, "path"), ScenarioHiddenReferencePath))
+    {
+        return error.ProofProjectionSemanticMutation;
+    }
+    try validateFingerprint(try jsonRequiredString(omission, "value_fingerprint"));
+}
+
+fn writeScenarioProofProjection(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    scenario: std.json.ObjectMap,
+) anyerror!void {
+    if (!isOpenScenarioSourceObject(scenario)) return error.ProofProjectionSemanticMutation;
+    const request = try jsonRequiredObject(scenario, "request");
+    const hidden_reference = try jsonRequired(request, "hidden_reference_ref");
+    _ = try jsonString(hidden_reference);
+    const hidden_reference_fingerprint = try hctp.digestValueAlloc(allocator, hidden_reference);
+    defer allocator.free(hidden_reference_fingerprint);
+
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(allocator);
+    var iterator = scenario.iterator();
+    while (iterator.next()) |entry| try keys.append(allocator, entry.key_ptr.*);
+    try keys.appendSlice(allocator, &.{ ProofOmissionsKey, "source_schema" });
+    std.mem.sort([]const u8, keys.items, {}, stringLessThan);
+    try writer.writeByte('{');
+    for (keys.items, 0..) |key, index| {
+        if (index != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(key, .{}, writer);
+        try writer.writeByte(':');
+        if (std.mem.eql(u8, key, "schema")) {
+            try std.json.Stringify.value(ScenarioProjectionSchema, .{}, writer);
+        } else if (std.mem.eql(u8, key, "source_schema")) {
+            try std.json.Stringify.value(ScenarioSourceSchema, .{}, writer);
+        } else if (std.mem.eql(u8, key, ProofOmissionsKey)) {
+            try writer.writeAll("[{\"path\":");
+            try std.json.Stringify.value(ScenarioHiddenReferencePath, .{}, writer);
+            try writer.writeAll(",\"schema\":");
+            try std.json.Stringify.value(ScenarioOmissionSchema, .{}, writer);
+            try writer.writeAll(",\"value_fingerprint\":");
+            try std.json.Stringify.value(hidden_reference_fingerprint, .{}, writer);
+            try writer.writeAll("}]");
+        } else if (std.mem.eql(u8, key, "request")) {
+            var request_keys: std.ArrayList([]const u8) = .empty;
+            defer request_keys.deinit(allocator);
+            var request_iterator = request.iterator();
+            while (request_iterator.next()) |entry| {
+                if (!std.mem.eql(u8, entry.key_ptr.*, "hidden_reference_ref")) {
+                    try request_keys.append(allocator, entry.key_ptr.*);
+                }
+            }
+            std.mem.sort([]const u8, request_keys.items, {}, stringLessThan);
+            try writer.writeByte('{');
+            for (request_keys.items, 0..) |request_key, request_index| {
+                if (request_index != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(request_key, .{}, writer);
+                try writer.writeByte(':');
+                try writeProofSafeCanonicalJson(allocator, writer, request.get(request_key).?);
+            }
+            try writer.writeByte('}');
+        } else {
+            try writeProofSafeCanonicalJson(allocator, writer, scenario.get(key).?);
+        }
+    }
+    try writer.writeByte('}');
 }
 
 fn jsonValueAtDotPath(root: std.json.ObjectMap, path: []const u8) ?std.json.Value {
@@ -4754,11 +7733,577 @@ fn jsonValueAtDotPath(root: std.json.ObjectMap, path: []const u8) ?std.json.Valu
     return current;
 }
 
+fn proofOmissionDeclaresChild(
+    omissions: std.json.Array,
+    parent: []const u8,
+    child: []const u8,
+) !bool {
+    for (omissions.items) |omission_value| {
+        const omission = try jsonObject(omission_value);
+        const path = try jsonRequiredString(omission, "path");
+        if (parent.len == 0) {
+            if (std.mem.eql(u8, path, child)) return true;
+            continue;
+        }
+        if (path.len == parent.len + 1 + child.len and
+            std.mem.startsWith(u8, path, parent) and
+            path[parent.len] == '.' and
+            std.mem.eql(u8, path[parent.len + 1 ..], child)) return true;
+    }
+    return false;
+}
+
+fn requirePrivateProjectionKeys(
+    map: std.json.ObjectMap,
+    expected: []const []const u8,
+    path: []const u8,
+    omissions: std.json.Array,
+) !void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsString(expected, entry.key_ptr.*)) {
+            return error.ProofProjectionSemanticMutation;
+        }
+    }
+    for (expected) |key| {
+        if (map.get(key) != null) continue;
+        if (!try proofOmissionDeclaresChild(omissions, path, key)) {
+            return error.ProofProjectionSemanticMutation;
+        }
+    }
+}
+
+fn validatePrivateProjectionAttestationShape(
+    projection: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    const attestation_value = try jsonRequired(projection, "attestation");
+    if (attestation_value == .null) return;
+    const attestation = try jsonObject(attestation_value);
+    try requirePrivateProjectionKeys(attestation, &.{
+        "binary_fingerprint",
+        "issued_at_unix",
+        "key_id",
+        "producer_id",
+        "producer_version",
+        "role",
+        "schema",
+        "signature",
+        "subject_fingerprint",
+        "subject_schema",
+    }, "attestation", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(attestation, "signature"),
+        &.{ "algorithm", "value_base64" },
+        "attestation.signature",
+        omissions,
+    );
+}
+
+fn validatePrivateProjectionCasNativeShape(
+    native_receipt: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    try requirePrivateProjectionKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        "native_receipt",
+        omissions,
+    );
+    const receipt = try jsonRequiredObject(native_receipt, "receipt");
+    try requirePrivateProjectionKeys(receipt, &.{
+        "claim",
+        "execution",
+        "lane_id",
+        "runner_contract_fingerprint",
+        "schema",
+        "terminal_status",
+        "trial_id",
+    }, "native_receipt.receipt", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(receipt, "claim"),
+        &.{ "atomic", "claim_count", "claim_id", "claimed_before_execution", "lane_lease_digest" },
+        "native_receipt.receipt.claim",
+        omissions,
+    );
+    try requirePrivateProjectionKeys(try jsonRequiredObject(receipt, "execution"), &.{
+        "execution_audit_fingerprint",
+        "execution_audit_ref",
+        "executor",
+        "executor_binary_fingerprint",
+        "handle_count",
+        "handle_id",
+        "hidden_fork_count",
+        "internal_execution_verified",
+        "observation_scope",
+        "retry_count",
+        "terminal_receipt_once",
+    }, "native_receipt.receipt.execution", omissions);
+}
+
+fn validatePrivateProjectionHistoricalFailureShape(
+    native_receipt: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    try requirePrivateProjectionKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        "native_receipt",
+        omissions,
+    );
+    const receipt = try jsonRequiredObject(native_receipt, "receipt");
+    try requirePrivateProjectionKeys(receipt, &.{
+        "claim",
+        "execution",
+        "fir",
+        "lane_id",
+        "runner_contract_fingerprint",
+        "schema",
+        "source",
+        "terminal_status",
+        "trial_id",
+    }, "native_receipt.receipt", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(receipt, "claim"),
+        &.{ "atomic", "claim_count", "claim_id", "claimed_before_execution", "lane_lease_digest" },
+        "native_receipt.receipt.claim",
+        omissions,
+    );
+    try requirePrivateProjectionKeys(try jsonRequiredObject(receipt, "source"), &.{
+        "decision_context_fingerprint",
+        "replay_plan_fingerprint",
+        "required_fir_version",
+        "required_lineage",
+        "source_governance_fingerprint",
+        "source_profile_body_delivery",
+        "source_profile_fingerprint",
+        "source_target_text_policy",
+        "source_target_text_witness_fingerprint",
+        "temporal_horizon",
+    }, "native_receipt.receipt.source", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(receipt, "execution"), &.{
+        "execution_audit_fingerprint",
+        "execution_audit_ref",
+        "executor",
+        "executor_binary_fingerprint",
+        "handle_count",
+        "hidden_fork_count",
+        "internal_execution_verified",
+        "retry_count",
+    }, "native_receipt.receipt.execution", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(receipt, "fir"),
+        &.{ "reason", "receipt_fingerprint", "receipt_ref", "status" },
+        "native_receipt.receipt.fir",
+        omissions,
+    );
+}
+
+fn validatePrivateProjectionFirBodyShape(
+    receipt: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    try requirePrivateProjectionKeys(
+        receipt,
+        &.{ "fork_inquiry_receipt", "replay_binding" },
+        "native_receipt.receipt",
+        omissions,
+    );
+    const fir = try jsonRequiredObject(receipt, "fork_inquiry_receipt");
+    try requirePrivateProjectionKeys(fir, &.{
+        "answer",
+        "fork",
+        "gate",
+        "inquiry",
+        "inquiry_id",
+        "lane_id",
+        "lifecycle",
+        "receipt_id",
+        "receipt_version",
+        "source",
+        "workspace_reconstruction",
+    }, "native_receipt.receipt.fork_inquiry_receipt", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fir, "source"), &.{
+        "capsule_id",
+        "lineage_mode",
+        "source_artifact_reconstructability",
+        "source_episode_id",
+        "source_rollout_path",
+        "source_thread_id",
+        "source_thread_id_present",
+        "source_turn_digest",
+    }, "native_receipt.receipt.fork_inquiry_receipt.source", omissions);
+    const fork = try jsonRequiredObject(fir, "fork");
+    try requirePrivateProjectionKeys(fork, &.{
+        "anchor",
+        "approval_policy",
+        "codex_version",
+        "ephemeral",
+        "fork_thread_id",
+        "forked_from_id",
+        "hooks",
+        "lineage_mode",
+        "model",
+        "model_provider",
+        "multi_agent_mode",
+        "permissions",
+        "sandbox",
+        "service_tier",
+    }, "native_receipt.receipt.fork_inquiry_receipt.fork", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fork, "anchor"), &.{
+        "anchor_digest_expected",
+        "anchor_digest_observed",
+        "exact",
+        "temporal_horizon",
+        "turns_after",
+        "turns_before",
+        "turns_dropped",
+    }, "native_receipt.receipt.fork_inquiry_receipt.fork.anchor", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fir, "workspace_reconstruction"), &.{
+        "dependencies_exact",
+        "dirty_state_exact",
+        "generated_artifacts_exact",
+        "head_exact",
+        "limitations",
+        "mode",
+        "network_allowed",
+        "path",
+        "tools_allowed",
+    }, "native_receipt.receipt.fork_inquiry_receipt.workspace_reconstruction", omissions);
+    const inquiry = try jsonRequiredObject(fir, "inquiry");
+    try requirePrivateProjectionKeys(inquiry, &.{
+        "client_user_message_id",
+        "ended_at",
+        "evidence_allowed",
+        "evidence_withheld",
+        "mode",
+        "question",
+        "started_at",
+        "status",
+        "token_usage",
+        "turn_id",
+    }, "native_receipt.receipt.fork_inquiry_receipt.inquiry", omissions);
+    const token_usage = try jsonRequiredArray(inquiry, "token_usage");
+    if (token_usage.items.len != 0) return error.ProofProjectionSemanticMutation;
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fir, "answer"), &.{
+        "alternatives",
+        "assumptions",
+        "evidence_refs",
+        "final_text_ref",
+        "hindsight_available",
+        "reconstructed_decision",
+        "rejected_routes",
+        "route_flip_conditions",
+        "selected_route",
+        "uncertainty",
+        "unsupported_claims",
+    }, "native_receipt.receipt.fork_inquiry_receipt.answer", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fir, "lifecycle"), &.{
+        "archived",
+        "cleanup_status",
+        "deleted",
+        "event_log_ref",
+        "interrupted",
+    }, "native_receipt.receipt.fork_inquiry_receipt.lifecycle", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(fir, "gate"), &.{
+        "anchor_valid",
+        "answer_complete",
+        "approval_or_tool_request_observed",
+        "hindsight_label_valid",
+        "lineage_valid",
+        "permissions_valid",
+        "receipt_valid",
+    }, "native_receipt.receipt.fork_inquiry_receipt.gate", omissions);
+    try requirePrivateProjectionKeys(try jsonRequiredObject(receipt, "replay_binding"), &.{
+        "historical_dcp_fingerprint",
+        "historical_rip_fingerprint",
+        "lane_id",
+        "required_lineage",
+        "source_profile_fingerprint",
+        "trial_id",
+    }, "native_receipt.receipt.replay_binding", omissions);
+}
+
+fn validatePrivateProjectionFirNativeShape(
+    native_receipt: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    try requirePrivateProjectionKeys(native_receipt, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "execution_audit_fingerprint",
+        "execution_audit_ref",
+        "executor",
+        "executor_binary_fingerprint",
+        "fingerprint",
+        "kind",
+        "receipt",
+        "ref",
+        "replay_plan_fingerprint",
+        "source_governance_fingerprint",
+        "source_profile_body_delivery",
+        "source_profile_fingerprint",
+        "source_target_text_policy",
+        "source_target_text_witness_fingerprint",
+        "target_instruction_count",
+    }, "native_receipt", omissions);
+    try validatePrivateProjectionFirBodyShape(
+        try jsonRequiredObject(native_receipt, "receipt"),
+        omissions,
+    );
+}
+
+fn validatePrivateProjectionFirPublicShape(
+    native_receipt: std.json.ObjectMap,
+    omissions: std.json.Array,
+    expected_trial_id: []const u8,
+    expected_lane_id: []const u8,
+) !void {
+    try requirePrivateProjectionKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        "native_receipt",
+        omissions,
+    );
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(native_receipt, "kind"),
+        hctp.FirPublicProjectionKind,
+    )) return error.ProofProjectionSemanticMutation;
+    const fingerprint = try jsonRequiredString(native_receipt, "fingerprint");
+    try validateFingerprint(fingerprint);
+    const ref = try jsonRequiredString(native_receipt, "ref");
+    if (!std.mem.startsWith(u8, ref, "artifact:") or
+        !std.mem.eql(u8, ref["artifact:".len..], fingerprint))
+    {
+        return error.ProofProjectionSemanticMutation;
+    }
+    const receipt_value = try jsonRequired(native_receipt, "receipt");
+    const receipt = try jsonObject(receipt_value);
+    try requirePrivateProjectionKeys(receipt, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "lane_id",
+        "replay_plan_fingerprint",
+        "required_lineage",
+        "schema",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+        "trial_id",
+        "validated",
+    }, "native_receipt.receipt", omissions);
+    if (!m.eql(u8, try js(receipt, "schema"), hctp.FirPublicProjectionSchema) or
+        !std.mem.eql(u8, try jsonRequiredString(receipt, "trial_id"), expected_trial_id) or
+        !std.mem.eql(u8, try jsonRequiredString(receipt, "lane_id"), expected_lane_id))
+    {
+        return error.ProofProjectionSemanticMutation;
+    }
+    inline for (.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "replay_plan_fingerprint",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+    }) |key| try validateFingerprint(try jsonRequiredString(receipt, key));
+    const required_lineage = try jsonRequiredString(receipt, "required_lineage");
+    if (!containsString(&.{ "thread_fork", "rollout_transcript", "either" }, required_lineage)) {
+        return error.ProofProjectionSemanticMutation;
+    }
+    const validated = try jsonRequired(receipt, "validated");
+    if (validated != .bool or !validated.bool) return error.ProofProjectionSemanticMutation;
+    const observed_fingerprint = try hctp.digestValueAlloc(std.heap.page_allocator, receipt_value);
+    defer std.heap.page_allocator.free(observed_fingerprint);
+    if (!std.mem.eql(u8, observed_fingerprint, fingerprint)) {
+        return error.ProofProjectionSemanticMutation;
+    }
+}
+
+fn validatePrivateRunReceiptProofProjectionShape(
+    projection: std.json.ObjectMap,
+    omissions: std.json.Array,
+) !void {
+    try requirePrivateProjectionKeys(projection, &.{
+        "attestation",
+        "effects",
+        "evidence",
+        "isolation",
+        "lane_id",
+        "lineage",
+        "materialization",
+        "native_receipt",
+        "opaque_arm_id",
+        "pair_id",
+        "producer",
+        "proof_omissions",
+        "runtime",
+        "scenario_id",
+        "schema",
+        "source_receipt_fingerprint",
+        "source_schema",
+        "terminal",
+        "trial_id",
+        "unit_id",
+    }, "", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(projection, "lineage"),
+        &.{ "lane_lease_digest", "lane_started_event_digest", "registration_event_digest" },
+        "lineage",
+        omissions,
+    );
+    try requirePrivateProjectionKeys(try jsonRequiredObject(projection, "producer"), &.{
+        "binary_fingerprint",
+        "id",
+        "key_id",
+        "receiver_key_id",
+        "receiver_role",
+        "version",
+    }, "producer", omissions);
+    const materialization = try jsonRequiredObject(projection, "materialization");
+    const materialization_keys = [_][]const u8{
+        "hidden_reference_presented",
+        "historical_dcp_fingerprint",
+        "historical_rip_fingerprint",
+        "materialization_claim_fingerprint",
+        "presented_input_fingerprint",
+        "presented_input_ref",
+        "sibling_output_presented",
+        "source_episode_fingerprint",
+        "source_profile_body_delivery",
+        "source_profile_fingerprint",
+        "treatment_commitment",
+        "visibility",
+    };
+    var materialization_iterator = materialization.iterator();
+    while (materialization_iterator.next()) |entry| {
+        if (!containsString(&materialization_keys, entry.key_ptr.*)) {
+            return error.ProofProjectionSemanticMutation;
+        }
+    }
+    inline for (.{
+        "hidden_reference_presented",
+        "materialization_claim_fingerprint",
+        "presented_input_fingerprint",
+        "presented_input_ref",
+        "sibling_output_presented",
+        "treatment_commitment",
+        "visibility",
+    }) |key| if (materialization.get(key) == null and
+        !try proofOmissionDeclaresChild(omissions, "materialization", key))
+    {
+        return error.ProofProjectionSemanticMutation;
+    };
+    try validateFingerprint(try jsonRequiredString(
+        materialization,
+        "materialization_claim_fingerprint",
+    ));
+    if ((materialization.get("source_episode_fingerprint") == null) !=
+        (materialization.get("source_profile_fingerprint") == null))
+    {
+        return error.ProofProjectionSemanticMutation;
+    }
+    const replay_present = materialization.get("historical_dcp_fingerprint") != null or
+        materialization.get("historical_rip_fingerprint") != null or
+        materialization.get("source_profile_body_delivery") != null;
+    if (replay_present and (materialization.get("historical_dcp_fingerprint") == null or
+        materialization.get("historical_rip_fingerprint") == null or
+        materialization.get("source_profile_body_delivery") == null))
+    {
+        return error.ProofProjectionSemanticMutation;
+    }
+    try requirePrivateProjectionKeys(try jsonRequiredObject(projection, "runtime"), &.{
+        "effect_policy_fingerprint",
+        "ended_at_unix",
+        "environment_fingerprint",
+        "model_configuration_fingerprint",
+        "model_id",
+        "model_provider",
+        "replay_policy_fingerprint",
+        "runtime_version",
+        "seed",
+        "started_at_unix",
+        "tokens_used",
+    }, "runtime", omissions);
+    const isolation = try jsonRequiredObject(projection, "isolation");
+    const sealed = try jsonBoolean(try jsonRequired(isolation, "capability_sealed"));
+    if (sealed) {
+        try requirePrivateProjectionKeys(isolation, &.{
+            "capability_effect_policy_fingerprint",
+            "capability_profile_id",
+            "capability_sealed",
+            "fresh_thread",
+            "fresh_workspace",
+            "limitations",
+            "os_confinement",
+            "reset_receipt_fingerprint",
+            "reset_receipt_ref",
+            "shared_mutable_state_detected",
+            "target_cache_cleared",
+        }, "isolation", omissions);
+    } else {
+        try requirePrivateProjectionKeys(isolation, &.{
+            "capability_sealed",
+            "fresh_thread",
+            "fresh_workspace",
+            "limitations",
+            "os_confinement",
+            "reset_receipt_fingerprint",
+            "reset_receipt_ref",
+            "shared_mutable_state_detected",
+            "target_cache_cleared",
+        }, "isolation", omissions);
+    }
+    try requirePrivateProjectionKeys(try jsonRequiredObject(projection, "effects"), &.{
+        "external_effect_receipt_fingerprint",
+        "external_effect_receipt_ref",
+        "filesystem_receipt_fingerprint",
+        "filesystem_receipt_ref",
+        "network_receipt_fingerprint",
+        "network_receipt_ref",
+        "policy_violations",
+    }, "effects", omissions);
+    try requirePrivateProjectionKeys(
+        try jsonRequiredObject(projection, "terminal"),
+        &.{ "failure_class", "failure_detail_ref", "status" },
+        "terminal",
+        omissions,
+    );
+    try requirePrivateProjectionKeys(try jsonRequiredObject(projection, "evidence"), &.{
+        "metrics_fingerprint",
+        "metrics_ref",
+        "output_fingerprint",
+        "output_ref",
+        "trace_fingerprint",
+        "trace_ref",
+        "world_state_fingerprint",
+        "world_state_ref",
+    }, "evidence", omissions);
+    const native_receipt = try jsonRequiredObject(projection, "native_receipt");
+    const native_kind = try jsonRequiredString(native_receipt, "kind");
+    if (std.mem.eql(u8, native_kind, "cas-trial-receipt")) {
+        try validatePrivateProjectionCasNativeShape(native_receipt, omissions);
+    } else if (std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt")) {
+        try validatePrivateProjectionHistoricalFailureShape(native_receipt, omissions);
+    } else if (std.mem.eql(u8, native_kind, hctp.FirPublicProjectionKind)) {
+        try validatePrivateProjectionFirPublicShape(
+            native_receipt,
+            omissions,
+            try jsonRequiredString(projection, "trial_id"),
+            try jsonRequiredString(projection, "lane_id"),
+        );
+    } else return error.ProofProjectionSemanticMutation;
+    try validatePrivateProjectionAttestationShape(projection, omissions);
+}
+
 fn validateRunReceiptProofProjection(value: std.json.Value) !void {
     const projection = try jsonObject(value);
-    if (!isRunReceiptProofProjection(projection) or
-        !std.mem.eql(u8, try jsonRequiredString(projection, "source_schema"), RunReceiptSourceSchema))
-    {
+    const schemas = runReceiptProofSchemasForProjection(
+        try jsonRequiredString(projection, "schema"),
+    ) orelse return error.ProofProjectionSemanticMutation;
+    if (!std.mem.eql(u8, try jsonRequiredString(projection, "source_schema"), schemas.source)) {
         return error.ProofProjectionSemanticMutation;
     }
     try validateFingerprint(try jsonRequiredString(projection, "source_receipt_fingerprint"));
@@ -4767,7 +8312,7 @@ fn validateRunReceiptProofProjection(value: std.json.Value) !void {
     for (omissions.items) |omission_value| {
         const omission = try jsonObject(omission_value);
         if (omission.count() != 4 or
-            !std.mem.eql(u8, try jsonRequiredString(omission, "schema"), RunReceiptOmissionSchema))
+            !std.mem.eql(u8, try jsonRequiredString(omission, "schema"), schemas.omission))
         {
             return error.ProofProjectionSemanticMutation;
         }
@@ -4780,10 +8325,16 @@ fn validateRunReceiptProofProjection(value: std.json.Value) !void {
         }
         previous_path = path;
         const kind = try jsonRequiredString(omission, "kind");
-        if (!std.mem.eql(u8, kind, "absolute_path") and !std.mem.eql(u8, kind, "file_uri")) {
+        if (!std.mem.eql(u8, kind, "absolute_path") and
+            !std.mem.eql(u8, kind, "file_uri") and
+            !std.mem.eql(u8, kind, "relative_or_unportable_ref"))
+        {
             return error.ProofProjectionSemanticMutation;
         }
         try validateFingerprint(try jsonRequiredString(omission, "value_fingerprint"));
+    }
+    if (std.mem.eql(u8, schemas.source, PrivateRunReceiptSourceSchema)) {
+        try validatePrivateRunReceiptProofProjectionShape(projection, omissions);
     }
 }
 
@@ -4862,6 +8413,10 @@ fn proofProjectionHasOmissions(value: std.json.Value) !bool {
                 try validateRunReceiptProofProjection(value);
                 break :blk true;
             }
+            if (isScenarioProofProjection(map)) {
+                try validateScenarioProofProjection(value);
+                break :blk true;
+            }
             if (try objectHasProjectedOuterProofRef(map)) break :blk true;
             if (map.get(ProofOmissionsKey) != null) {
                 _ = (try proofOmittedLocatorFingerprint(map)) orelse
@@ -4880,11 +8435,12 @@ fn proofProjectionHasOmissions(value: std.json.Value) !bool {
 
 fn proofProjectionSchema(source_schema: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, source_schema, "hylo-trial/v1")) return "hylo-trial-proof-projection/v1";
+    if (std.mem.eql(u8, source_schema, ScenarioSourceSchema)) return ScenarioProjectionSchema;
     if (std.mem.eql(u8, source_schema, "hylo-source-selection-receipt/v1")) {
         return "hylo-source-selection-proof-projection/v1";
     }
     if (std.mem.eql(u8, source_schema, "hylo-sealed-case/v1")) return "hylo-sealed-case-proof-projection/v1";
-    if (std.mem.eql(u8, source_schema, RunReceiptSourceSchema)) return RunReceiptProjectionSchema;
+    if (runReceiptProofSchemasForSource(source_schema)) |schemas| return schemas.projection;
     return null;
 }
 
@@ -4897,6 +8453,7 @@ fn validateProofEventProjectionSource(value: std.json.Value) !void {
             }
             var iterator = map.iterator();
             while (iterator.next()) |entry| {
+                try validateProofPrivateSemanticEntry(entry.key_ptr.*, entry.value_ptr.*);
                 if (proofKeyMustBeOmitted(entry.key_ptr.*)) {
                     // The source-selection contract requires this local
                     // locator in a production case-blind registration.  It is
@@ -4923,6 +8480,7 @@ fn validateProofEventProjectionShape(value: std.json.Value) !void {
         .object => |map| {
             const projected_sealed_case = try isProjectedSealedCaseObject(map);
             const projected_run_receipt = isRunReceiptProofProjection(map);
+            const projected_scenario = isScenarioProofProjection(map);
             if (map.get("source_schema")) |source_schema_value| {
                 const source_schema = try jsonString(source_schema_value);
                 const expected = proofProjectionSchema(source_schema) orelse
@@ -4934,9 +8492,11 @@ fn validateProofEventProjectionShape(value: std.json.Value) !void {
                 const schema = try jsonString(schema_value);
                 inline for (.{
                     "hylo-trial/v1",
+                    ScenarioSourceSchema,
                     "hylo-source-selection-receipt/v1",
                     "hylo-sealed-case/v1",
                     RunReceiptSourceSchema,
+                    PrivateRunReceiptSourceSchema,
                 }) |source_schema| {
                     if (std.mem.eql(u8, schema, proofProjectionSchema(source_schema).?)) {
                         return error.ProofProjectionSemanticMutation;
@@ -4948,6 +8508,8 @@ fn validateProofEventProjectionShape(value: std.json.Value) !void {
                     return error.ProofProjectionSemanticMutation;
             } else if (projected_run_receipt) {
                 try validateRunReceiptProofProjection(value);
+            } else if (projected_scenario) {
+                try validateScenarioProofProjection(value);
             } else if (map.get(ProofOmissionsKey) != null) {
                 return error.ProofProjectionSemanticMutation;
             }
@@ -4968,9 +8530,13 @@ fn writeProofSafeCanonicalJson(
 ) !void {
     switch (value) {
         .object => |map| {
+            if (isOpenScenarioSourceObject(map)) {
+                try writeScenarioProofProjection(allocator, writer, map);
+                return;
+            }
             if (map.get("schema")) |schema_value| {
                 if (schema_value == .string and
-                    std.mem.eql(u8, schema_value.string, RunReceiptSourceSchema))
+                    runReceiptProofSchemasForSource(schema_value.string) != null)
                 {
                     const projection = try runReceiptProofProjectionAlloc(allocator, value);
                     defer allocator.free(projection);
@@ -4984,7 +8550,15 @@ fn writeProofSafeCanonicalJson(
                 if (schema_value == .string) schema_value.string else null
             else
                 null;
-            const projected_schema = if (source_schema) |schema| proofProjectionSchema(schema) else null;
+            // Open scenarios are projected by the dedicated branch above so
+            // their hidden-reference locator receives a typed omission.
+            // Case-blind scenarios share the source schema but are already a
+            // commitment-only public shape and must not be relabelled as that
+            // open-scenario projection.
+            const projected_schema = if (source_schema) |schema|
+                if (m.eql(u8, schema, ScenarioSourceSchema)) null else proofProjectionSchema(schema)
+            else
+                null;
             const sealed_locator = if (source_schema != null and
                 std.mem.eql(u8, source_schema.?, SealedCaseSourceSchema))
                 map.get(SealedCaseLocatorKey)
@@ -5075,6 +8649,11 @@ fn writeProofReplayCanonicalJson(
         .object => |map| {
             if (isRunReceiptProofProjection(map)) {
                 try validateRunReceiptProofProjection(value);
+                try writeCanonicalJson(allocator, writer, value);
+                return;
+            }
+            if (isScenarioProofProjection(map)) {
+                try validateScenarioProofProjection(value);
                 try writeCanonicalJson(allocator, writer, value);
                 return;
             }
@@ -5252,6 +8831,38 @@ fn writeProofArtifactManifestEntry(writer: *std.Io.Writer, artifact: ProofArtifa
     try writer.writeByte('}');
 }
 
+fn validateProofManifestArtifactEntry(artifact: std.json.ObjectMap) !void {
+    if (artifact.count() != 7) return error.ProofBundleSchemaInvalid;
+    inline for (.{
+        "fingerprint",
+        "media_type",
+        "path",
+        "privacy_class",
+        "producer",
+        "schema",
+        "size_bytes",
+    }) |key| _ = artifact.get(key) orelse return error.ProofBundleSchemaInvalid;
+    validateRelativePath(try jsonRequiredString(artifact, "path")) catch
+        return error.ProofBundleSchemaInvalid;
+    validateFingerprint(try jsonRequiredString(artifact, "fingerprint")) catch
+        return error.ProofBundleSchemaInvalid;
+    try validateNonEmpty(try jsonRequiredString(artifact, "schema"));
+    try validateNonEmpty(try jsonRequiredString(artifact, "producer"));
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(artifact, "media_type"),
+        "application/json",
+    )) return error.ProofBundleSchemaInvalid;
+    const privacy_class = try jsonRequiredString(artifact, "privacy_class");
+    if (!std.mem.eql(u8, privacy_class, "sanitized") and
+        !std.mem.eql(u8, privacy_class, "public") and
+        !std.mem.eql(u8, privacy_class, "sealed"))
+    {
+        return error.ProofBundlePrivacyClassInvalid;
+    }
+    _ = try jsonUnsigned(try jsonRequired(artifact, "size_bytes"));
+}
+
 fn proofArtifactSetAlloc(
     allocator: std.mem.Allocator,
     artifacts: []const ProofArtifact,
@@ -5270,10 +8881,14 @@ fn proofArtifactSetAlloc(
         }
         try out.writer.writeAll("{\"fingerprint\":");
         try std.json.Stringify.value(artifact.fingerprint, .{}, &out.writer);
-        try out.writer.writeAll(",\"path\":");
+        try out.writer.writeAll(",\"media_type\":\"application/json\",\"path\":");
         try std.json.Stringify.value(artifact.path, .{}, &out.writer);
         try out.writer.writeAll(",\"privacy_class\":");
         try std.json.Stringify.value(artifact.privacy_class, .{}, &out.writer);
+        try out.writer.writeAll(",\"producer\":");
+        try std.json.Stringify.value(artifact.producer, .{}, &out.writer);
+        try out.writer.writeAll(",\"schema\":");
+        try std.json.Stringify.value(artifact.schema, .{}, &out.writer);
         try out.writer.print(",\"size_bytes\":{d}}}", .{artifact.bytes.len});
     }
     try out.writer.writeAll("],\"projection_binding\":");
@@ -5297,6 +8912,7 @@ fn proofArtifactSetFromManifestAlloc(
     var previous_path: ?[]const u8 = null;
     for (artifacts.items, 0..) |artifact_value, index| {
         const artifact = try jsonObject(artifact_value);
+        try validateProofManifestArtifactEntry(artifact);
         const path = try jsonRequiredString(artifact, "path");
         const privacy_class = try jsonRequiredString(artifact, "privacy_class");
         if (previous_path) |previous| {
@@ -5312,10 +8928,16 @@ fn proofArtifactSetFromManifestAlloc(
         if (index != 0) try out.writer.writeByte(',');
         try out.writer.writeAll("{\"fingerprint\":");
         try std.json.Stringify.value(try jsonRequiredString(artifact, "fingerprint"), .{}, &out.writer);
+        try out.writer.writeAll(",\"media_type\":");
+        try sj.value(try js(artifact, "media_type"), .{}, &out.writer);
         try out.writer.writeAll(",\"path\":");
         try std.json.Stringify.value(path, .{}, &out.writer);
         try out.writer.writeAll(",\"privacy_class\":");
         try std.json.Stringify.value(privacy_class, .{}, &out.writer);
+        try out.writer.writeAll(",\"producer\":");
+        try sj.value(try js(artifact, "producer"), .{}, &out.writer);
+        try out.writer.writeAll(",\"schema\":");
+        try std.json.Stringify.value(try jsonRequiredString(artifact, "schema"), .{}, &out.writer);
         try out.writer.print(",\"size_bytes\":{d}}}", .{
             try jsonUnsigned(try jsonRequired(artifact, "size_bytes")),
         });
@@ -5328,6 +8950,87 @@ fn proofArtifactSetFromManifestAlloc(
     }
     try out.writer.writeAll(",\"schema\":\"hylo-proof-artifact-set/v1\"}");
     return out.toOwnedSlice();
+}
+
+fn proofBundleIdAlloc(
+    allocator: std.mem.Allocator,
+    campaign_id: []const u8,
+    trial_id: []const u8,
+    campaign_head: []const u8,
+    trial_result_fingerprint: []const u8,
+) ![]u8 {
+    try validateId(campaign_id);
+    try validateId(trial_id);
+    try validateFingerprint(campaign_head);
+    try validateFingerprint(trial_result_fingerprint);
+    var identity: std.Io.Writer.Allocating = .init(allocator);
+    defer identity.deinit();
+    try identity.writer.writeAll("{\"campaign_head\":");
+    try std.json.Stringify.value(campaign_head, .{}, &identity.writer);
+    try identity.writer.writeAll(",\"campaign_id\":");
+    try std.json.Stringify.value(campaign_id, .{}, &identity.writer);
+    try identity.writer.writeAll(",\"schema\":\"hylo-proof-bundle-id/v1\",\"trial_id\":");
+    try std.json.Stringify.value(trial_id, .{}, &identity.writer);
+    try identity.writer.writeAll(",\"trial_result_fingerprint\":");
+    try std.json.Stringify.value(trial_result_fingerprint, .{}, &identity.writer);
+    try identity.writer.writeByte('}');
+    const fingerprint = try digestBytesAlloc(allocator, identity.written());
+    defer allocator.free(fingerprint);
+    return std.fmt.allocPrint(allocator, "bundle:{s}", .{fingerprint});
+}
+
+fn validateProofManifestShape(manifest: std.json.ObjectMap) !void {
+    if (manifest.count() != 12) return error.ProofBundleSchemaInvalid;
+    inline for (.{
+        "artifacts",
+        "bundle_fingerprint",
+        "bundle_id",
+        "campaign_head",
+        "campaign_id",
+        "event_range",
+        "limitations",
+        "projection_binding",
+        "sanitization_receipt",
+        "schema",
+        "trial_id",
+        "trial_result_fingerprint",
+    }) |key| _ = manifest.get(key) orelse return error.ProofBundleSchemaInvalid;
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(manifest, "schema"),
+        "hylo-proof-bundle/v1",
+    )) return error.ProofBundleSchemaInvalid;
+    try validateNonEmpty(try jsonRequiredString(manifest, "bundle_id"));
+    try validateId(try jsonRequiredString(manifest, "campaign_id"));
+    try validateId(try jsonRequiredString(manifest, "trial_id"));
+    try validateFingerprint(try jsonRequiredString(manifest, "campaign_head"));
+    try validateFingerprint(try jsonRequiredString(manifest, "trial_result_fingerprint"));
+    try validateFingerprint(try jsonRequiredString(manifest, "bundle_fingerprint"));
+
+    const event_range = try jsonRequiredObject(manifest, "event_range");
+    if (event_range.count() != 3 or
+        event_range.get("event_digests") == null or
+        event_range.get("first_sequence") == null or
+        event_range.get("last_sequence") == null)
+    {
+        return error.ProofBundleSchemaInvalid;
+    }
+    const first_sequence = try jsonUnsigned(try jsonRequired(event_range, "first_sequence"));
+    const last_sequence = try jsonUnsigned(try jsonRequired(event_range, "last_sequence"));
+    const event_digests = try jsonRequiredArray(event_range, "event_digests");
+    const last_sequence_usize = std.math.cast(usize, last_sequence) orelse
+        return error.ProofBundleSchemaInvalid;
+    if (first_sequence != 1 or last_sequence == 0 or
+        event_digests.items.len != last_sequence_usize)
+    {
+        return error.ProofBundleSchemaInvalid;
+    }
+    for (event_digests.items) |digest| try validateFingerprint(try jsonString(digest));
+    const artifacts = try jsonRequiredArray(manifest, "artifacts");
+    if (artifacts.items.len == 0) return error.ProofBundleIncomplete;
+    for (artifacts.items) |artifact| {
+        try validateProofManifestArtifactEntry(try jsonObject(artifact));
+    }
 }
 
 fn proofProjectionBindingAlloc(
@@ -5571,17 +9274,17 @@ fn checkpointJsonAlloc(allocator: std.mem.Allocator, event: EventWire) ![]u8 {
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
-
 fn addEventPayloadArtifacts(
     allocator: std.mem.Allocator,
     repo: []const u8,
     artifacts: *std.ArrayList(ProofArtifact),
     event: EventWire,
     trial_id: []const u8,
-    campaign: *const CampaignState,
+    ctx: *const CampaignState,
 ) !void {
     const body = try jsonObject(event.body);
     const payload = try jsonObject(try jsonRequired(body, "payload"));
+    const missing_projection = error.TargetCommonProjectionMissing;
     if (std.mem.eql(u8, event.kind, "campaign_created")) {
         try addProofJsonArtifact(allocator, artifacts, "campaign/campaign.json", try jsonRequired(payload, "campaign"), ProgramName, "sanitized");
     } else if (std.mem.eql(u8, event.kind, "scenario_admitted")) {
@@ -5592,34 +9295,65 @@ fn addEventPayloadArtifacts(
             .{try jsonRequiredString(scenario, "scenario_id")},
         );
         defer allocator.free(path);
-        try addProofJsonArtifact(allocator, artifacts, path, try jsonRequired(payload, "scenario"), ProgramName, "sanitized");
+        const safe_scenario = try proofSafeValidatedJsonAlloc(
+            allocator,
+            try jsonRequired(payload, "scenario"),
+        );
+        defer allocator.free(safe_scenario);
+        try addProofJsonBytesArtifact(
+            allocator,
+            artifacts,
+            path,
+            safe_scenario,
+            ProgramName,
+            "sanitized",
+        );
     } else if (std.mem.eql(u8, event.kind, "trial_registered") and
-        std.mem.eql(u8, try jsonRequiredString(try jsonRequiredObject(payload, "trial"), "trial_id"), trial_id))
+        m.eql(u8, try js(try jo(payload, "trial"), "trial_id"), trial_id))
     {
-        const materializations = payload.get("arm_materializations") orelse
-            return error.ProofArmMaterializationsMissing;
-        const arms = try jsonArray(materializations);
-        if (arms.items.len != 2) return error.ProofArmMaterializationsMissing;
-        for (arms.items) |arm_value| {
-            const arm = try jsonObject(arm_value);
-            const path = try std.fmt.allocPrint(
-                allocator,
-                "trial/arm-materializations/{s}.json",
-                .{try jsonRequiredString(arm, "arm_id")},
-            );
-            defer allocator.free(path);
-            try addProofJsonArtifact(allocator, artifacts, path, arm_value, ProgramName, "sealed");
-        }
-        const factor = try jsonRequiredObject(try jsonRequiredObject(payload, "trial"), "factor");
-        if (std.mem.eql(u8, try jsonRequiredString(factor, "kind"), "target_snapshot")) {
-            try addProofJsonArtifact(
-                allocator,
-                artifacts,
-                "trial/target-common-projection.json",
-                payload.get("target_common_projection") orelse return error.TargetCommonProjectionMissing,
-                ProgramName,
-                "sealed",
-            );
+        const registered_trial = try jsonRequiredObject(payload, "trial");
+        const trial_schema = try jsonRequiredString(registered_trial, "schema");
+        if (std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema)) {
+            const custody = try jsonRequiredObject(payload, "private_custody");
+            if (payload.get("arm_materializations") != null or
+                payload.get("target_common_projection") != null or
+                !std.mem.eql(
+                    u8,
+                    try jsonRequiredString(custody, "commitment"),
+                    try jsonRequiredString(registered_trial, "custody_commitment"),
+                ) or try jsonBoolean(try jsonRequired(custody, "semantic_material_persisted")) or
+                !try jsonBoolean(try jsonRequired(custody, "validated")))
+            {
+                return error.PrivateTrialCustodyReceiptInvalid;
+            }
+        } else if (std.mem.eql(u8, trial_schema, hctp.TrialSchema)) {
+            const materializations = payload.get("arm_materializations") orelse
+                return error.ProofArmMaterializationsMissing;
+            const arms = try jsonArray(materializations);
+            if (arms.items.len != 2) return error.ProofArmMaterializationsMissing;
+            for (arms.items) |value| {
+                const arm = try jsonObject(value);
+                const path = try std.fmt.allocPrint(
+                    allocator,
+                    "trial/arm-materializations/{s}.json",
+                    .{try jsonRequiredString(arm, "arm_id")},
+                );
+                defer allocator.free(path);
+                try addProofJsonArtifact(allocator, artifacts, path, value, ProgramName, "sealed");
+            }
+            const factor = try jsonRequiredObject(registered_trial, "factor");
+            if (std.mem.eql(u8, try jsonRequiredString(factor, "kind"), "target_snapshot")) {
+                try addProofJsonArtifact(
+                    allocator,
+                    artifacts,
+                    "trial/target-common-projection.json",
+                    payload.get("target_common_projection") orelse return missing_projection,
+                    ProgramName,
+                    "sealed",
+                );
+            }
+        } else {
+            return error.TrialSchemaInvalid;
         }
     } else if (std.mem.eql(u8, event.kind, "lane_finished") and
         std.mem.eql(u8, try jsonRequiredString(payload, "trial_id"), trial_id))
@@ -5689,6 +9423,36 @@ fn addEventPayloadArtifacts(
         const reveal = try jsonRequiredObject(payload, "reveal");
         if (std.mem.eql(u8, try jsonRequiredString(reveal, "trial_id"), trial_id)) {
             try addProofJsonArtifact(allocator, artifacts, "trial/reveal.json", try jsonRequired(payload, "reveal"), ProgramName, "sanitized");
+            const trial = ctx.hctp_trials.findTrialConst(trial_id) orelse return error.TrialMissing;
+            var trial_parsed = try trialJsonParsed(allocator, trial);
+            defer trial_parsed.deinit();
+            if (std.mem.eql(
+                u8,
+                try jsonRequiredString(try jsonObject(trial_parsed.value), "schema"),
+                hctp.PrivateTrialSchema,
+            )) {
+                const evidence = try retrace_core.hctp_trial_custody.revealedEvidence(
+                    allocator,
+                    trial_parsed.value,
+                    try jsonRequired(payload, "reveal"),
+                );
+                try addProofJsonArtifact(
+                    allocator,
+                    artifacts,
+                    "trial/intervention-witness.json",
+                    evidence.intervention_witness,
+                    ProgramName,
+                    "sanitized",
+                );
+                try addProofJsonArtifact(
+                    allocator,
+                    artifacts,
+                    "trial/target-common-projection.json",
+                    evidence.target_common_projection,
+                    ProgramName,
+                    "sanitized",
+                );
+            }
         }
     } else if (std.mem.eql(u8, event.kind, "publication_recorded")) {
         const publication_trial = payload.get("promotion_trial_id") orelse return;
@@ -5714,7 +9478,7 @@ fn addEventPayloadArtifacts(
                 allocator,
                 repo,
                 commit_sha,
-                @ptrCast(campaign.allowed_paths),
+                @ptrCast(ctx.allowed_paths),
             );
             defer snapshot.deinit(allocator);
             try addProofJsonBytesArtifact(
@@ -5851,14 +9615,21 @@ fn cmdExportProof(
         ProgramName,
         if (case_blind_projection) "sealed" else "sanitized",
     );
-    try addProofJsonArtifact(
-        allocator,
-        &artifacts,
-        "trial/intervention-witness.json",
-        try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
-        ProgramName,
-        "sanitized",
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_root, "schema"),
+        hctp.PrivateTrialSchema,
     );
+    if (!private_trial) {
+        try addProofJsonArtifact(
+            allocator,
+            &artifacts,
+            "trial/intervention-witness.json",
+            try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
+            ProgramName,
+            "sanitized",
+        );
+    }
     const assurance = try jsonRequiredObject(trial_root, "assurance");
     if (assurance.get("trust_policy")) |trust_policy| {
         try addProofJsonArtifact(
@@ -5948,11 +9719,17 @@ fn cmdExportProof(
     const result_root = try jsonObject(result_parsed.value);
     const result_fingerprint = try jsonRequiredString(result_root, "result_fingerprint");
     const result_limitations = try jsonRequiredArray(result_root, "limitations");
+    const bundle_id = try proofBundleIdAlloc(
+        allocator,
+        location.campaign.id,
+        trial_id,
+        campaign_head.?,
+        result_fingerprint,
+    );
+    defer allocator.free(bundle_id);
     var manifest_core: std.Io.Writer.Allocating = .init(allocator);
     defer manifest_core.deinit();
     try manifest_core.writer.writeAll("{\"schema\":\"hylo-proof-bundle/v1\",\"bundle_id\":");
-    const bundle_id = try std.fmt.allocPrint(allocator, "bundle-{s}", .{trial_id});
-    defer allocator.free(bundle_id);
     try std.json.Stringify.value(bundle_id, .{}, &manifest_core.writer);
     try manifest_core.writer.writeAll(",\"campaign_id\":");
     try std.json.Stringify.value(location.campaign.id, .{}, &manifest_core.writer);
@@ -5979,6 +9756,17 @@ fn cmdExportProof(
         if (manifest_limitation_count != 0) try manifest_core.writer.writeByte(',');
         try std.json.Stringify.value(
             "sealed ciphertext and capability locators are omitted; source-owner sanitization attests the exported commitment projection",
+            .{},
+            &manifest_core.writer,
+        );
+        manifest_limitation_count += 1;
+    }
+    if (private_trial) {
+        if (manifest_limitation_count != 0) try manifest_core.writer.writeByte(',');
+        try std.json.Stringify.value(
+            "private trial custody and treatment materializat" ++
+                "ion bodies are excluded; validated public reveal" ++
+                " openings prove the registered commitments",
             .{},
             &manifest_core.writer,
         );
@@ -6021,6 +9809,7 @@ fn cmdExportProof(
     var manifest_parsed = try parseValue(allocator, manifest_bytes);
     defer manifest_parsed.deinit();
     try validateProofSanitizedValue(manifest_parsed.value);
+    try validateProofManifestShape(try jsonObject(manifest_parsed.value));
     const canonical_manifest = try canonicalJsonAlloc(allocator, manifest_parsed.value);
     defer allocator.free(canonical_manifest);
 
@@ -6120,6 +9909,7 @@ fn verifyManifestArtifacts(
     if (entries.len != artifacts.items.len + 1) return error.ProofBundleIncomplete;
     for (artifacts.items) |artifact_value| {
         const artifact = try jsonObject(artifact_value);
+        try validateProofManifestArtifactEntry(artifact);
         const path = try jsonRequiredString(artifact, "path");
         const entry = findTarEntry(entries, path) orelse return error.ProofBundleIncomplete;
         if (entry.bytes.len != try jsonUnsigned(try jsonRequired(artifact, "size_bytes"))) {
@@ -6173,11 +9963,89 @@ fn verifyProofArtifactMatchesValue(
     if (!std.mem.eql(u8, expected, entry.bytes)) return error.ProofBundleFingerprintMismatch;
 }
 
+fn privateTrialProofPathAllowed(path: []const u8) bool {
+    inline for (.{
+        "manifest.json",
+        "campaign/campaign.json",
+        "lineage/campaign-events.json",
+        "lineage/global-checkpoints.json",
+        "trial/trial.json",
+        "trial/reveal.json",
+        "trial/intervention-witness.json",
+        "trial/target-common-projection.json",
+        "trial/trust-policy.json",
+        "trial/result.json",
+        "publication/publication.json",
+        "publication/committed-target-snapshot.json",
+    }) |exact| if (std.mem.eql(u8, path, exact)) return true;
+    inline for (.{
+        "campaign/scenarios/",
+        "trial/run-receipts/",
+        "trial/grade-receipts/",
+        "trial/grade-presentations/",
+        "trial/pair-grade-receipts/",
+        "calibration/",
+    }) |prefix| if (std.mem.startsWith(u8, path, prefix)) return true;
+    return false;
+}
+
 fn verifyProofArmMaterializations(
     allocator: std.mem.Allocator,
     entries: []TarEntry,
     trial_root: std.json.ObjectMap,
 ) !void {
+    const trial_schema = try jsonRequiredString(trial_root, "schema");
+    const private_trial = std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema);
+    if (private_trial) {
+        for (entries) |entry| {
+            if (!privateTrialProofPathAllowed(entry.path)) return error.ProofBundleInvalidEntry;
+            if (std.mem.startsWith(u8, entry.path, "trial/arm-materializations/")) {
+                return error.PrivateTrialSemanticLeak;
+            }
+            if (std.mem.eql(u8, entry.path, "manifest.json")) continue;
+            var artifact = try parseValue(allocator, entry.bytes);
+            defer artifact.deinit();
+            if (artifact.value != .object) continue;
+            const schema_value = artifact.value.object.get("schema") orelse continue;
+            if (schema_value != .string) continue;
+            if (m.eql(u8, schema_value.string, hc.CustodySchema) or
+                std.mem.eql(u8, schema_value.string, "hylo-arm-materialization/v1") or
+                std.mem.eql(u8, schema_value.string, "hylo-arm-materialization/v2"))
+            {
+                return error.PrivateTrialSemanticLeak;
+            }
+        }
+        const reveal_entry = findTarEntry(entries, "trial/reveal.json") orelse
+            return error.ProofBundleBlindEvidenceIncomplete;
+        var reveal = try parseValue(allocator, reveal_entry.bytes);
+        defer reveal.deinit();
+        const evidence = try retrace_core.hctp_trial_custody.revealedEvidence(
+            allocator,
+            .{ .object = trial_root },
+            reveal.value,
+        );
+        try verifyProofArtifactMatchesValue(
+            allocator,
+            entries,
+            "trial/intervention-witness.json",
+            evidence.intervention_witness,
+        );
+        try verifyProofArtifactMatchesValue(
+            allocator,
+            entries,
+            "trial/target-common-projection.json",
+            evidence.target_common_projection,
+        );
+        return;
+    }
+    const legacy_trial = std.mem.eql(u8, trial_schema, hctp.TrialSchema) or
+        (std.mem.eql(u8, trial_schema, "hylo-trial-proof-projection/v1") and
+            std.mem.eql(
+                u8,
+                try jsonRequiredString(trial_root, "source_schema"),
+                hctp.TrialSchema,
+            ));
+    if (!legacy_trial) return error.TrialSchemaInvalid;
     const arms = try jsonRequiredArray(trial_root, "arms");
     if (arms.items.len != 2) return error.PairShapeInvalid;
     var values: [2]std.json.Value = undefined;
@@ -6285,13 +10153,19 @@ fn verifyProofArmMaterializations(
     defer allocator.free(declared);
     if (!pathsEqualAsSets(@ptrCast(observed.items), declared)) return error.UnexpectedFactorDifference;
 }
-
 fn verifyProofEventArtifactBindings(
     allocator: std.mem.Allocator,
     entries: []TarEntry,
     events: std.json.Array,
     trial_id: []const u8,
 ) !void {
+    const sentinel_ref_keys = .{ "required_null_sentinel_refs", "required_positive_sentinel_refs" };
+    var private_trial = false;
+    var event_bound_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (event_bound_paths.items) |path| allocator.free(path);
+        event_bound_paths.deinit(allocator);
+    }
     for (events.items) |event_value| {
         const event = try jsonObject(event_value);
         const kind = try jsonRequiredString(event, "kind");
@@ -6313,35 +10187,79 @@ fn verifyProofEventArtifactBindings(
             );
             defer allocator.free(path);
             try verifyProofArtifactMatchesValue(allocator, entries, path, try jsonRequired(payload, "scenario"));
+            try event_bound_paths.append(allocator, try allocator.dupe(u8, path));
         } else if (std.mem.eql(u8, kind, "trial_registered") and
             std.mem.eql(u8, try jsonRequiredString(try jsonRequiredObject(payload, "trial"), "trial_id"), trial_id))
         {
+            const reg_trial = try jsonRequiredObject(payload, "trial");
             try verifyProofArtifactMatchesValue(
                 allocator,
                 entries,
                 "trial/trial.json",
                 try jsonRequired(payload, "trial"),
             );
-            const materializations = try jsonRequiredArray(payload, "arm_materializations");
-            if (materializations.items.len != 2) return error.ProofArmMaterializationsMissing;
-            for (materializations.items) |arm_value| {
-                const arm = try jsonObject(arm_value);
-                const path = try std.fmt.allocPrint(
-                    allocator,
-                    "trial/arm-materializations/{s}.json",
-                    .{try jsonRequiredString(arm, "arm_id")},
-                );
-                defer allocator.free(path);
-                try verifyProofArtifactMatchesValue(allocator, entries, path, arm_value);
-            }
-            const factor = try jsonRequiredObject(try jsonRequiredObject(payload, "trial"), "factor");
-            if (std.mem.eql(u8, try jsonRequiredString(factor, "kind"), "target_snapshot")) {
-                try verifyProofArtifactMatchesValue(
-                    allocator,
-                    entries,
-                    "trial/target-common-projection.json",
-                    payload.get("target_common_projection") orelse return error.TargetCommonProjectionMissing,
-                );
+            const registered_schema = try jsonRequiredString(reg_trial, "schema");
+            if (std.mem.eql(u8, registered_schema, hctp.PrivateTrialSchema)) {
+                private_trial = true;
+                const custody = try jsonRequiredObject(payload, "private_custody");
+                if (payload.get("arm_materializations") != null or
+                    payload.get("target_common_projection") != null or
+                    !std.mem.eql(
+                        u8,
+                        try jsonRequiredString(custody, "commitment"),
+                        try jsonRequiredString(reg_trial, "custody_commitment"),
+                    ) or try jsonBoolean(try jf(custody, "semantic_material_persisted")) or
+                    !try jsonBoolean(try jsonRequired(custody, "validated")))
+                {
+                    return error.PrivateTrialCustodyReceiptInvalid;
+                }
+                const calibration = try jsonRequiredObject(reg_trial, "calibration");
+                inline for (sentinel_ref_keys) |key| {
+                    for ((try jsonRequiredArray(calibration, key)).items) |ref_value| {
+                        const raw_ref = try jsonString(ref_value);
+                        const calibration_id = if (std.mem.startsWith(u8, raw_ref, "trial:"))
+                            raw_ref["trial:".len..]
+                        else
+                            raw_ref;
+                        const calibration_path = try std.fmt.allocPrint(
+                            allocator,
+                            "calibration/{s}/result.json",
+                            .{calibration_id},
+                        );
+                        try event_bound_paths.append(allocator, calibration_path);
+                    }
+                }
+            } else if (std.mem.eql(u8, registered_schema, hctp.TrialSchema) or
+                (std.mem.eql(u8, registered_schema, "hylo-trial-proof-projection/v1") and
+                    std.mem.eql(
+                        u8,
+                        try jsonRequiredString(reg_trial, "source_schema"),
+                        hctp.TrialSchema,
+                    )))
+            {
+                const materializations = try jsonRequiredArray(payload, "arm_materializations");
+                if (materializations.items.len != 2) return error.ProofArmMaterializationsMissing;
+                for (materializations.items) |arm_value| {
+                    const arm = try jsonObject(arm_value);
+                    const path = try std.fmt.allocPrint(
+                        allocator,
+                        "trial/arm-materializations/{s}.json",
+                        .{try jsonRequiredString(arm, "arm_id")},
+                    );
+                    defer allocator.free(path);
+                    try verifyProofArtifactMatchesValue(allocator, entries, path, arm_value);
+                }
+                const missing_projection = error.TargetCommonProjectionMissing;
+                if (m.eql(u8, try js(try jo(reg_trial, "factor"), "kind"), "target_snapshot")) {
+                    try verifyProofArtifactMatchesValue(
+                        allocator,
+                        entries,
+                        "trial/target-common-projection.json",
+                        payload.get("target_common_projection") orelse return missing_projection,
+                    );
+                }
+            } else {
+                return error.TrialSchemaInvalid;
             }
         } else if (std.mem.eql(u8, kind, "lane_finished") and
             std.mem.eql(u8, try jsonRequiredString(payload, "trial_id"), trial_id))
@@ -6354,6 +10272,7 @@ fn verifyProofEventArtifactBindings(
             );
             defer allocator.free(path);
             try verifyProofArtifactMatchesValue(allocator, entries, path, try jsonRequired(payload, "run_receipt"));
+            try event_bound_paths.append(allocator, try allocator.dupe(u8, path));
         } else if (std.mem.eql(u8, kind, "grade_recorded") and payload.get("trial_id") != null and
             std.mem.eql(u8, try jsonRequiredString(payload, "trial_id"), trial_id))
         {
@@ -6365,6 +10284,7 @@ fn verifyProofEventArtifactBindings(
             );
             defer allocator.free(path);
             try verifyProofArtifactMatchesValue(allocator, entries, path, try jsonRequired(payload, "grade_receipt"));
+            try event_bound_paths.append(allocator, try allocator.dupe(u8, path));
             if (payload.get("grade_presentation_receipt")) |presentation| {
                 const presentation_path = try std.fmt.allocPrint(
                     allocator,
@@ -6373,6 +10293,7 @@ fn verifyProofEventArtifactBindings(
                 );
                 defer allocator.free(presentation_path);
                 try verifyProofArtifactMatchesValue(allocator, entries, presentation_path, presentation);
+                try event_bound_paths.append(allocator, try allocator.dupe(u8, presentation_path));
             }
         } else if (std.mem.eql(u8, kind, "pair_grade_recorded") and
             std.mem.eql(u8, try jsonRequiredString(payload, "trial_id"), trial_id))
@@ -6385,6 +10306,7 @@ fn verifyProofEventArtifactBindings(
             );
             defer allocator.free(path);
             try verifyProofArtifactMatchesValue(allocator, entries, path, try jsonRequired(payload, "pair_grade_receipt"));
+            try event_bound_paths.append(allocator, try allocator.dupe(u8, path));
             if (payload.get("grade_presentation_receipt")) |presentation| {
                 const presentation_path = try std.fmt.allocPrint(
                     allocator,
@@ -6393,6 +10315,7 @@ fn verifyProofEventArtifactBindings(
                 );
                 defer allocator.free(presentation_path);
                 try verifyProofArtifactMatchesValue(allocator, entries, presentation_path, presentation);
+                try event_bound_paths.append(allocator, try allocator.dupe(u8, presentation_path));
             }
         } else if (std.mem.eql(u8, kind, "trial_revealed")) {
             const reveal = try jsonRequiredObject(payload, "reveal");
@@ -6416,6 +10339,29 @@ fn verifyProofEventArtifactBindings(
                 try jsonRequired(body, "payload"),
             );
         }
+    }
+    if (!private_trial) return;
+    for (entries) |entry| {
+        var dynamic = false;
+        inline for (.{
+            "calibration/",
+            "campaign/scenarios/",
+            "trial/grade-presentations/",
+            "trial/grade-receipts/",
+            "trial/pair-grade-receipts/",
+            "trial/run-receipts/",
+        }) |prefix| {
+            if (std.mem.startsWith(u8, entry.path, prefix)) dynamic = true;
+        }
+        if (!dynamic) continue;
+        var bound = false;
+        for (event_bound_paths.items) |path| {
+            if (std.mem.eql(u8, entry.path, path)) {
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) return error.ProofBundleInvalidEntry;
     }
 }
 
@@ -6496,11 +10442,34 @@ fn verifyProofPublicationArtifacts(
     )) return error.PublicationTargetSnapshotMismatch;
 
     var expected_snapshot: ?[]const u8 = null;
-    for ((try jsonRequiredArray(trial_root, "arms")).items) |arm_value| {
-        const arm = try jsonObject(arm_value);
-        if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm)) {
-            if (expected_snapshot != null) return error.ProofArmMaterializationMismatch;
-            expected_snapshot = try jsonRequiredString(arm, "materialization_fingerprint");
+    const private_trial = if (trial_root.get("schema")) |schema_value|
+        schema_value == .string and std.mem.eql(u8, schema_value.string, hctp.PrivateTrialSchema)
+    else
+        false;
+    if (private_trial) {
+        const reveal_entry = findTarEntry(entries, "trial/reveal.json") orelse
+            return error.ProofBundleBlindEvidenceIncomplete;
+        var reveal = try parseValue(allocator, reveal_entry.bytes);
+        defer reveal.deinit();
+        const evidence = try retrace_core.hctp_trial_custody.revealedEvidence(
+            allocator,
+            .{ .object = trial_root },
+            reveal.value,
+        );
+        if (!std.mem.eql(u8, evidence.candidate_arm_id, candidate_arm)) {
+            return error.ProofArmMaterializationMismatch;
+        }
+        expected_snapshot = try jsonRequiredString(
+            evidence.candidate_treatment,
+            "materialization_fingerprint",
+        );
+    } else {
+        for ((try jsonRequiredArray(trial_root, "arms")).items) |arm_value| {
+            const arm = try jsonObject(arm_value);
+            if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm)) {
+                if (expected_snapshot != null) return error.ProofArmMaterializationMismatch;
+                expected_snapshot = try jsonRequiredString(arm, "materialization_fingerprint");
+            }
         }
     }
     var snapshot_parsed = try parseValue(allocator, snapshot_entry.?.bytes);
@@ -6811,6 +10780,24 @@ fn projectedTrialPair(
     return error.PairMissing;
 }
 
+fn proofProjectedMaterializationClaimCopyAlloc(
+    allocator: std.mem.Allocator,
+    materialization: std.json.ObjectMap,
+    lane: *const hctp.LaneState,
+) !?[]u8 {
+    const fingerprint = try jsonRequiredString(
+        materialization,
+        "materialization_claim_fingerprint",
+    );
+    try validateFingerprint(fingerprint);
+    if (lane.materialization_claim_fingerprint) |authenticated| {
+        if (!std.mem.eql(u8, authenticated, fingerprint)) return error.RunReceiptInvalid;
+        return null;
+    }
+    const copy = try allocator.dupe(u8, fingerprint);
+    return copy;
+}
+
 /// Fold only the state-driving observations retained by a portable run-receipt
 /// projection. Raw receipt acceptance remains owned by hctp.applyLaneFinished;
 /// the original event/checkpoint chain and proof sanitization receipt bind this
@@ -6883,6 +10870,21 @@ fn applyProofProjectedLaneFinishedObservation(
     var trial_parsed = try trialJsonParsed(allocator, trial);
     defer trial_parsed.deinit();
     const trial_root = try jsonObject(trial_parsed.value);
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_root, "schema"),
+        hctp.PrivateTrialSchema,
+    );
+    const receipt_schemas = runReceiptProofSchemasForProjection(
+        try jsonRequiredString(receipt, "schema"),
+    ) orelse return error.RunReceiptInvalid;
+    const expected_source_schema = if (private_trial)
+        PrivateRunReceiptSourceSchema
+    else
+        RunReceiptSourceSchema;
+    if (!std.mem.eql(u8, receipt_schemas.source, expected_source_schema)) {
+        return error.RunReceiptInvalid;
+    }
     const execution = try jsonRequiredObject(trial_root, "execution");
     const runner_authority = try jsonRequiredObject(execution, "runner_authority");
     const producer = try jsonRequiredObject(receipt, "producer");
@@ -6910,26 +10912,58 @@ fn applyProofProjectedLaneFinishedObservation(
 
     const arm = try projectedTrialArm(trial_root, lane.arm_id);
     const materialization = try jsonRequiredObject(receipt, "materialization");
-    if (!std.mem.eql(
-        u8,
-        try jsonRequiredString(materialization, "arm_value_fingerprint"),
-        try jsonRequiredString(arm, "value_fingerprint"),
-    ) or !std.mem.eql(
-        u8,
-        try jsonRequiredString(materialization, "target_snapshot_fingerprint"),
-        try jsonRequiredString(arm, "materialization_fingerprint"),
-    ) or lane.presented_input_fingerprint == null or !std.mem.eql(
+    var materialization_claim_copy: ?[]u8 = null;
+    errdefer if (materialization_claim_copy) |value| allocator.free(value);
+    if (private_trial) {
+        materialization_claim_copy = try proofProjectedMaterializationClaimCopyAlloc(
+            allocator,
+            materialization,
+            lane,
+        );
+        if (!std.mem.eql(
+            u8,
+            try jsonRequiredString(materialization, "visibility"),
+            "commitment_only",
+        ) or !std.mem.eql(
+            u8,
+            try jsonRequiredString(materialization, "treatment_commitment"),
+            try jsonRequiredString(arm, "treatment_commitment"),
+        )) return error.RunReceiptInvalid;
+        inline for (.{
+            "semantic_role",
+            "arm_value_fingerprint",
+            "target_snapshot_ref",
+            "target_snapshot_fingerprint",
+            "target_materialization_ref",
+            "target_materialization_fingerprint",
+            "target_materialization_archive_ref",
+            "target_materialization_archive_fingerprint",
+            "target_package_tree_before_fingerprint",
+            "target_package_tree_after_fingerprint",
+        }) |key| if (materialization.get(key) != null) return error.PrivateTrialSemanticLeak;
+    } else {
+        if (!std.mem.eql(
+            u8,
+            try jsonRequiredString(materialization, "arm_value_fingerprint"),
+            try jsonRequiredString(arm, "value_fingerprint"),
+        ) or !std.mem.eql(
+            u8,
+            try jsonRequiredString(materialization, "target_snapshot_fingerprint"),
+            try jsonRequiredString(arm, "materialization_fingerprint"),
+        )) return error.RunReceiptInvalid;
+        if (materialization.get("target_snapshot_ref")) |target_snapshot_ref| {
+            if (!std.mem.eql(
+                u8,
+                try jsonString(target_snapshot_ref),
+                try jsonRequiredString(arm, "materialization_ref"),
+            )) return error.RunReceiptInvalid;
+        }
+    }
+    if (lane.presented_input_fingerprint == null or !std.mem.eql(
         u8,
         try jsonRequiredString(materialization, "presented_input_fingerprint"),
         lane.presented_input_fingerprint.?,
     )) return error.RunReceiptInvalid;
-    if (materialization.get("target_snapshot_ref")) |target_snapshot_ref| {
-        if (!std.mem.eql(
-            u8,
-            try jsonString(target_snapshot_ref),
-            try jsonRequiredString(arm, "materialization_ref"),
-        )) return error.RunReceiptInvalid;
-    }
 
     const runtime = try jsonRequiredObject(receipt, "runtime");
     inline for (.{
@@ -6995,7 +11029,7 @@ fn applyProofProjectedLaneFinishedObservation(
                 try jsonRequiredString(attestation, "binary_fingerprint"),
                 runner_binary_fingerprint,
             ) or
-            !std.mem.eql(u8, try jsonRequiredString(attestation, "subject_schema"), RunReceiptSourceSchema) or
+            !m.eql(u8, try js(attestation, "subject_schema"), expected_source_schema) or
             !std.mem.eql(u8, try jsonRequiredString(attestation, "key_id"), runner_producer_key_id))
         {
             return error.AttestationInvalid;
@@ -7043,6 +11077,10 @@ fn applyProofProjectedLaneFinishedObservation(
     lane.terminal_sequence = sequence;
     lane.run_receipt_fingerprint = receipt_fingerprint_copy;
     lane.run_receipt_json = projected_receipt_json;
+    if (materialization_claim_copy) |value| {
+        lane.materialization_claim_fingerprint = value;
+        materialization_claim_copy = null;
+    }
     lane.output_fingerprint = output_copy;
     lane.trace_fingerprint = trace_copy;
     lane.model_id = model_id_copy;
@@ -7053,6 +11091,152 @@ fn applyProofProjectedLaneFinishedObservation(
     lane.runner_binary_fingerprint = runner_binary_copy;
     lane.runner_producer_key_id = runner_producer_key_copy;
     lane.runner_key_id = runner_key_copy;
+}
+
+fn replayableScenarioFromProjectionAlloc(
+    allocator: std.mem.Allocator,
+    projection_value: std.json.Value,
+) ![]u8 {
+    try validateScenarioProofProjection(projection_value);
+    const projection = try jsonObject(projection_value);
+    const omission = try jsonObject((try ja(projection, ProofOmissionsKey)).items[0]);
+    var parsed = blk: {
+        const canonical = try canonicalJsonAlloc(allocator, projection_value);
+        defer allocator.free(canonical);
+        break :blk try parseValue(allocator, canonical);
+    };
+    defer parsed.deinit();
+    const mutation_allocator = parsed.arena.allocator();
+    const root = try jsonObjectPtr(&parsed.value);
+    _ = root.orderedRemove("source_schema");
+    _ = root.orderedRemove(ProofOmissionsKey);
+    try root.put(mutation_allocator, "schema", .{ .string = @constCast(ScenarioSourceSchema) });
+    const request = try op(root.getPtr("request") orelse return fm);
+    try request.put(
+        mutation_allocator,
+        "hidden_reference_ref",
+        .{ .string = @constCast(try jsonRequiredString(omission, "value_fingerprint")) },
+    );
+    return canonicalJsonAlloc(allocator, parsed.value);
+}
+fn applyProofProjectedScenarioAdmitted(
+    allocator: std.mem.Allocator,
+    campaign: *CampaignState,
+    body_value: std.json.Value,
+    sequence: u64,
+) !void {
+    const missing_scenario = error.ScenarioNotInManifest;
+    try requireCreated(campaign);
+    var body = try parseValueAs(EventBody, allocator, body_value);
+    defer body.deinit();
+    try validateBodyIds(body.value, true, false, false);
+    const scenario_id = body.value.scenario_id.?;
+    if (findScenario(campaign, scenario_id) != null) return error.DuplicateScenario;
+    const expected = findExpectedScenario(campaign, scenario_id) orelse return missing_scenario;
+    const payload = try jsonObject(body.value.payload);
+    const scenario_fingerprint = try jsonRequiredString(payload, "scenario_fingerprint");
+    try validateFingerprint(scenario_fingerprint);
+    if (!std.mem.eql(u8, expected.fingerprint, scenario_fingerprint)) {
+        return error.ScenarioManifestMismatch;
+    }
+    const projected_scenario = try jsonRequired(payload, "scenario");
+    try validateScenarioProofProjection(projected_scenario);
+    const replayable_bytes = try replayableScenarioFromProjectionAlloc(
+        allocator,
+        projected_scenario,
+    );
+    defer allocator.free(replayable_bytes);
+    var scenario = try parseTyped(ScenarioInput, allocator, replayable_bytes);
+    defer scenario.deinit();
+    try validateScenarioAgainstCampaign(
+        scenario.value,
+        campaign.id,
+        campaign.replay_policy_fingerprint.?,
+    );
+    if (!std.mem.eql(u8, scenario.value.scenario_id, scenario_id)) return error.ScenarioMismatch;
+    const split = Split.parse(scenario.value.split) orelse return error.InvalidSplit;
+    if (split != expected.split) return error.ScenarioManifestMismatch;
+    if (scenario.value.mutation) |mutation| {
+        if (findScenario(campaign, mutation.parent_scenario_id) == null) {
+            return error.MutationParentMissing;
+        }
+    }
+
+    const state_id = try allocator.dupe(u8, scenario_id);
+    errdefer allocator.free(state_id);
+    const fingerprint = try allocator.dupe(u8, scenario_fingerprint);
+    errdefer allocator.free(fingerprint);
+    const fidelity = try allocator.dupe(u8, scenario.value.environment.fidelity);
+    errdefer allocator.free(fidelity);
+    const source_episode_fingerprint = try allocator.dupe(
+        u8,
+        scenario.value.source_episode_fingerprint,
+    );
+    errdefer allocator.free(source_episode_fingerprint);
+    const case_visibility = try allocator.dupe(u8, "open");
+    errdefer allocator.free(case_visibility);
+    const visible_input_fingerprint = try allocator.dupe(u8, scenario_fingerprint);
+    errdefer allocator.free(visible_input_fingerprint);
+    const environment_fingerprint = try allocator.dupe(u8, scenario.value.environment.fingerprint);
+    errdefer allocator.free(environment_fingerprint);
+    const effect_policy_json = try canonicalJsonAlloc(
+        allocator,
+        try jsonRequired(
+            try jsonRequiredObject(try jsonObject(projected_scenario), "environment"),
+            "effect_policy",
+        ),
+    );
+    errdefer allocator.free(effect_policy_json);
+    var effect_policy = try parseValue(allocator, effect_policy_json);
+    defer effect_policy.deinit();
+    const effect_policy_fingerprint = try hctp.digestValueAlloc(allocator, effect_policy.value);
+    errdefer allocator.free(effect_policy_fingerprint);
+    const replay_policy_fingerprint = try allocator.dupe(
+        u8,
+        scenario.value.replay_policy_fingerprint,
+    );
+    errdefer allocator.free(replay_policy_fingerprint);
+    const oracles = try allocator.alloc(OracleState, scenario.value.oracles.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (oracles[0..initialized]) |*oracle| oracle.deinit(allocator);
+        allocator.free(oracles);
+    }
+    for (scenario.value.oracles, 0..) |oracle, index| {
+        const oracle_id = try allocator.dupe(u8, oracle.id);
+        errdefer allocator.free(oracle_id);
+        const oracle_kind = try allocator.dupe(u8, oracle.kind);
+        errdefer allocator.free(oracle_kind);
+        const grader_ref = try allocator.dupe(u8, oracle.grader_ref);
+        errdefer allocator.free(grader_ref);
+        const grader_fingerprint = try allocator.dupe(u8, oracle.grader_fingerprint);
+        errdefer allocator.free(grader_fingerprint);
+        oracles[index] = .{
+            .id = oracle_id,
+            .kind = oracle_kind,
+            .critical = oracle.critical,
+            .grader_ref = grader_ref,
+            .grader_fingerprint = grader_fingerprint,
+        };
+        initialized += 1;
+    }
+    try campaign.scenarios.append(allocator, .{
+        .id = state_id,
+        .split = split,
+        .fidelity = fidelity,
+        .fingerprint = fingerprint,
+        .source_episode_fingerprint = source_episode_fingerprint,
+        .case_visibility = case_visibility,
+        .visible_input_fingerprint = visible_input_fingerprint,
+        .hidden_reference_fingerprint = null,
+        .source_profile_fingerprint = null,
+        .environment_fingerprint = environment_fingerprint,
+        .effect_policy_json = effect_policy_json,
+        .effect_policy_fingerprint = effect_policy_fingerprint,
+        .replay_policy_fingerprint = replay_policy_fingerprint,
+        .oracles = oracles,
+    });
+    _ = sequence;
 }
 
 fn replayProjectedCampaignEvents(
@@ -7086,12 +11270,19 @@ fn replayProjectedCampaignEvents(
         {
             return error.CampaignSequenceMismatch;
         }
-        if (has_omissions and kind == .trial_registered) {
+        if (has_omissions and kind == .scenario_admitted) {
+            try applyProofProjectedScenarioAdmitted(
+                allocator,
+                campaign,
+                replay_body.value,
+                sequence,
+            );
+        } else if (has_omissions and kind == .trial_registered) {
             try requireCreated(campaign);
             if (!campaign.trial_profile) return error.TrialProfileMissing;
             const payload = try jsonRequiredObject(try jsonObject(replay_body.value), "payload");
             const trial_value = try jsonRequired(payload, "trial");
-            try validateTrialAgainstCampaign(allocator, campaign, trial_value);
+            try validateRegisteredTrialAgainstCampaign(allocator, campaign, payload);
             try validatePromotionSentinelRegistration(
                 allocator,
                 campaign,
@@ -7400,14 +11591,21 @@ fn verifyProjectedSealedProof(
         return error.ProofBundleFingerprintMismatch;
     }
     const trial = campaign.hctp_trials.findTrial(trial_id) orelse return error.TrialMissing;
-    try verifyProofArtifactMatchesValue(
-        allocator,
-        entries,
-        "trial/intervention-witness.json",
-        try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_root, "schema"),
+        hctp.PrivateTrialSchema,
     );
-    if (assurance.get("trust_policy")) |trust_policy| {
-        try verifyProofArtifactMatchesValue(allocator, entries, "trial/trust-policy.json", trust_policy);
+    if (!private_trial) {
+        try verifyProofArtifactMatchesValue(
+            allocator,
+            entries,
+            "trial/intervention-witness.json",
+            try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
+        );
+    }
+    if (assurance.get("trust_policy")) |tp| {
+        try verifyProofArtifactMatchesValue(allocator, entries, "trial/trust-policy.json", tp);
     }
     const calibration = try jsonRequiredObject(trial_root, "calibration");
     inline for (.{ "required_null_sentinel_refs", "required_positive_sentinel_refs" }) |key| {
@@ -7443,6 +11641,7 @@ fn verifyProjectedSealedProof(
     var sealed_omission_explicit = false;
     var local_locator_omission_explicit = false;
     var external_omission_explicit = false;
+    var private_custody_omission_explicit = false;
     for ((try jsonRequiredArray(manifest, "limitations")).items) |limitation_value| {
         const limitation = try jsonString(limitation_value);
         if (std.mem.eql(
@@ -7460,8 +11659,16 @@ fn verifyProjectedSealedProof(
             limitation,
             "external and local-only evidence references are not embedded; inspect referenced artifacts separately",
         )) external_omission_explicit = true;
+        if (std.mem.eql(
+            u8,
+            limitation,
+            "private trial custody and treatment materializat" ++
+                "ion bodies are excluded; validated public reveal" ++
+                " openings prove the registered commitments",
+        )) private_custody_omission_explicit = true;
     }
     if ((case_blind_projection and !sealed_omission_explicit) or
+        (private_trial and !private_custody_omission_explicit) or
         !local_locator_omission_explicit or !external_omission_explicit)
     {
         return error.ProofBundleIncomplete;
@@ -7496,9 +11703,7 @@ fn cmdVerifyProofAnchored(
     defer manifest_parsed.deinit();
     try validateProofSanitizedValue(manifest_parsed.value);
     const manifest = try jsonObject(manifest_parsed.value);
-    if (!std.mem.eql(u8, try jsonRequiredString(manifest, "schema"), "hylo-proof-bundle/v1")) {
-        return error.ProofBundleSchemaInvalid;
-    }
+    try validateProofManifestShape(manifest);
     const limitations = try jsonRequiredArray(manifest, "limitations");
     if (limitations.items.len == 0) return error.ProofBundleIncomplete;
     for (limitations.items) |limitation| try validateNonEmpty(try jsonString(limitation));
@@ -7512,6 +11717,19 @@ fn cmdVerifyProofAnchored(
         u8,
         actual_bundle_fingerprint,
         try jsonRequiredString(manifest, "bundle_fingerprint"),
+    )) return error.ProofBundleFingerprintMismatch;
+    const expected_bundle_id = try proofBundleIdAlloc(
+        allocator,
+        try jsonRequiredString(manifest, "campaign_id"),
+        try jsonRequiredString(manifest, "trial_id"),
+        try jsonRequiredString(manifest, "campaign_head"),
+        try jsonRequiredString(manifest, "trial_result_fingerprint"),
+    );
+    defer allocator.free(expected_bundle_id);
+    if (!std.mem.eql(
+        u8,
+        expected_bundle_id,
+        try jsonRequiredString(manifest, "bundle_id"),
     )) return error.ProofBundleFingerprintMismatch;
     try verifyManifestArtifacts(allocator, entries.items, manifest);
     const checkpoints_entry = findTarEntry(entries.items, "lineage/global-checkpoints.json") orelse
@@ -7602,12 +11820,19 @@ fn cmdVerifyProofAnchored(
         try jsonRequiredObject(try jsonObject(proof_policy.value), "proof_authority"),
         expected_artifact_set.value,
     );
-    try verifyProofArtifactMatchesValue(
-        allocator,
-        entries.items,
-        "trial/intervention-witness.json",
-        try jsonRequired(try jsonRequiredObject(trial_artifact_root, "factor"), "intervention_witness"),
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_artifact_root, "schema"),
+        hctp.PrivateTrialSchema,
     );
+    if (!private_trial) {
+        try verifyProofArtifactMatchesValue(
+            allocator,
+            entries.items,
+            "trial/intervention-witness.json",
+            try jf(try jo(trial_artifact_root, "factor"), "intervention_witness"),
+        );
+    }
     const assurance = try jsonRequiredObject(trial_artifact_root, "assurance");
     if (assurance.get("trust_policy")) |trust_policy| {
         try verifyProofArtifactMatchesValue(
@@ -7649,14 +11874,26 @@ fn cmdVerifyProofAnchored(
         if (!preserved) return error.ProofBundleIncomplete;
     }
     var omitted_external_evidence_is_explicit = false;
+    var private_custody_omission_explicit = false;
     for (manifest_limitations.items) |limitation| {
         if (std.mem.eql(
             u8,
             try jsonString(limitation),
             "external and local-only evidence references are not embedded; inspect referenced artifacts separately",
         )) omitted_external_evidence_is_explicit = true;
+        if (std.mem.eql(
+            u8,
+            try jsonString(limitation),
+            "private trial custody and treatment materializat" ++
+                "ion bodies are excluded; validated public reveal" ++
+                " openings prove the registered commitments",
+        )) private_custody_omission_explicit = true;
     }
-    if (!omitted_external_evidence_is_explicit) return error.ProofBundleIncomplete;
+    if (!omitted_external_evidence_is_explicit or
+        (private_trial and !private_custody_omission_explicit))
+    {
+        return error.ProofBundleIncomplete;
+    }
     try verifyProofPublicationArtifacts(
         allocator,
         entries.items,
@@ -7730,6 +11967,24 @@ fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 
 fn digestValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return retrace_core.canonical_json.digestValueAlloc(allocator, value);
+}
+
+fn executableFileFingerprintAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(defaultIo(), path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(defaultIo(), path, .{});
+    defer file.close(defaultIo());
+    var reader = file.reader(defaultIo(), &.{});
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(MaxStoreBytes));
+    defer allocator.free(bytes);
+    return digestBytesAlloc(allocator, bytes);
+}
+
+fn currentExecutableFingerprintAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const path = try std.process.executablePathAlloc(defaultIo(), allocator);
+    defer allocator.free(path);
+    return executableFileFingerprintAlloc(allocator, path);
 }
 
 fn hashTagged(hasher: *std.crypto.hash.sha2.Sha256, tag: []const u8, value: []const u8) void {
@@ -7931,13 +12186,20 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
     }
     if (campaign.stop_policy.require_holdout_pass and !manifest_has_holdout) return error.HoldoutScenarioMissing;
     var trial_profile = false;
+    var private_trial_profile = false;
     if (campaign.protocol_profiles) |profiles| {
         for (profiles, 0..) |profile, index| {
-            if (!std.mem.eql(u8, profile, hctp.TrialSchema)) return error.UnknownProtocolProfile;
+            if (!std.mem.eql(u8, profile, hctp.TrialSchema) and
+                !std.mem.eql(u8, profile, hctp.PrivateTrialSchema))
+            {
+                return error.UnknownProtocolProfile;
+            }
             for (profiles[0..index]) |prior| {
                 if (std.mem.eql(u8, profile, prior)) return error.DuplicateProtocolProfile;
             }
             trial_profile = true;
+            private_trial_profile = private_trial_profile or
+                std.mem.eql(u8, profile, hctp.PrivateTrialSchema);
         }
     }
     if (trial_profile) {
@@ -7954,6 +12216,13 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
     if (campaign.trial_policy) |policy| {
         if (policy != .object) return error.TrialPolicyInvalid;
         const policy_object = try jsonObject(policy);
+        if (policy_object.get("source_route_admission")) |route_policy| {
+            if (route_policy != .string or !std.mem.eql(u8, route_policy.string, "required")) {
+                return error.TrialPolicyInvalid;
+            }
+        } else if (private_trial_profile) {
+            return error.SourceRouteAdmissionPolicyRequired;
+        }
         const claims = try jsonRequiredArray(policy_object, "publication_claims");
         if (claims.items.len == 0) return error.TrialPolicyInvalid;
         for (claims.items, 0..) |claim_value, index| {
@@ -8546,6 +12815,7 @@ const CampaignState = struct {
     target_bindings: std.ArrayList(TargetBindingState) = .empty,
     causal_frontier_state: causal_frontier.State = .{},
     trial_profile: bool = false,
+    private_trial_profile: bool = false,
     trial_policy_fingerprint: ?[]u8 = null,
     trial_policy_json: ?[]u8 = null,
     hctp_trials: hctp.CampaignTrials = .{},
@@ -10212,6 +14482,60 @@ fn verifyTrialChangeBaseAgainstRepo(
     ) catch return mismatch_error;
 }
 
+fn verifyPrivateTrialChangeBaseAgainstRepo(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    campaign: *const CampaignState,
+    trial: std.json.ObjectMap,
+    evidence: retrace_core.hctp_trial_custody.RevealedEvidence,
+    require_live_change_base: bool,
+    mismatch_error: anyerror,
+) !void {
+    const purpose = try jsonRequiredString(trial, "purpose");
+    if (!std.mem.eql(u8, purpose, "practice_repair") and
+        !std.mem.eql(u8, purpose, "promotion")) return;
+    const change_id = (try jsonNullableString(evidence.change, "change_id")) orelse return;
+    const change = findChange(campaign, change_id) orelse return error.PromotionChangeMissing;
+    const before = try jsonRequiredString(evidence.before_target, "target_fingerprint");
+    const after = try jsonRequiredString(evidence.after_target, "target_fingerprint");
+    if (change.status != .applied or
+        !std.mem.eql(u8, before, change.before_target_fingerprint) or
+        !std.mem.eql(u8, after, change.after_target_fingerprint)) return mismatch_error;
+    const mismatch = mismatch_error;
+    const revision = materializationRevision(try jsonRequiredString(
+        evidence.baseline_treatment,
+        "materialization_ref",
+    )) catch return mismatch_error;
+    if (std.mem.eql(u8, revision, "INDEX")) return mismatch_error;
+    const resolved = resolveSnapshotRevisionAlloc(allocator, repo, revision) catch return mismatch;
+    defer allocator.free(resolved);
+    if (!std.mem.eql(u8, revision, resolved)) return mismatch_error;
+    const roots = try jsonStringSliceAlloc(
+        allocator,
+        try jsonRequiredArray(try jsonRequiredObject(trial, "factor"), "allowed_difference_roots"),
+    );
+    defer allocator.free(roots);
+    var baseline_snapshot = targetSnapshotArtifactAlloc(allocator, repo, resolved, roots) catch
+        return mismatch_error;
+    defer baseline_snapshot.deinit(allocator);
+    if (!std.mem.eql(
+        u8,
+        baseline_snapshot.fingerprint,
+        try jsonRequiredString(evidence.baseline_treatment, "materialization_fingerprint"),
+    )) return mismatch_error;
+    if (!require_live_change_base) return;
+    const head = resolveSnapshotRevisionAlloc(allocator, repo, "HEAD") catch return mismatch_error;
+    defer allocator.free(head);
+    if (!std.mem.eql(u8, resolved, head)) return mismatch_error;
+    verifyStagedChange(
+        allocator,
+        repo,
+        @ptrCast(change.paths),
+        @ptrCast(campaign.allowed_paths),
+        change.diff_fingerprint,
+    ) catch return mismatch_error;
+}
+
 fn factorVerifierId(kind: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, kind, "instruction_bundle") or std.mem.eql(u8, kind, "evidence_set")) {
         return "canonical-projection";
@@ -10755,9 +15079,25 @@ fn verifyTrialLaneStart(
 ) !void {
     var trial_parsed = try trialJsonParsed(allocator, trial);
     defer trial_parsed.deinit();
-    const root = try jsonObject(trial_parsed.value);
+    return verifyTrialLaneStartValue(
+        allocator,
+        repo,
+        campaign,
+        trial_parsed.value,
+        lane,
+    );
+}
+
+fn verifyTrialLaneStartValue(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    campaign: *const CampaignState,
+    trial_value: std.json.Value,
+    lane: *const hctp.LaneState,
+) !void {
+    const root = try jsonObject(trial_value);
     const factor = try jsonRequiredObject(root, "factor");
-    _ = try verifyTrialInterventionAgainstRepo(allocator, repo, trial_parsed.value);
+    _ = try verifyTrialInterventionAgainstRepo(allocator, repo, trial_value);
     try verifyTrialChangeBaseAgainstRepo(
         allocator,
         repo,
@@ -10863,16 +15203,49 @@ fn validateTrialPublication(
     var trial_parsed = try trialJsonParsed(allocator, trial);
     defer trial_parsed.deinit();
     const trial_root = try jsonObject(trial_parsed.value);
+    const private_trial = std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_root, "schema"),
+        hctp.PrivateTrialSchema,
+    );
+    var private_evidence: ?PrivateRevealEvidence = null;
+    defer if (private_evidence) |*evidence| evidence.deinit();
+    if (private_trial) {
+        private_evidence = try privateRevealEvidenceAlloc(
+            allocator,
+            trial,
+            trial_parsed.value,
+        );
+    }
     try validatePromotionRepeatPolicy(campaign, trial_root);
     const epoch = try jsonRequiredObject(trial_root, "target_epoch");
-    if (!std.mem.eql(u8, try jsonRequiredString(epoch, "change_id"), change.id) or
-        !std.mem.eql(u8, try jsonRequiredString(epoch, "after_target_fingerprint"), change.after_target_fingerprint))
+    const change_id = if (private_evidence) |evidence|
+        try jsonRequiredString(evidence.evidence.change, "change_id")
+    else
+        try jsonRequiredString(epoch, "change_id");
+    const after_target_fingerprint = if (private_evidence) |evidence|
+        try jsonRequiredString(evidence.evidence.after_target, "target_fingerprint")
+    else
+        try jsonRequiredString(epoch, "after_target_fingerprint");
+    if (!std.mem.eql(u8, change_id, change.id) or
+        !std.mem.eql(u8, after_target_fingerprint, change.after_target_fingerprint))
     {
         return error.PublicationTrialInvalid;
     }
     const candidate_arm = trial.candidate_arm orelse return error.PublicationTrialInvalid;
     var candidate_snapshot: ?[]const u8 = null;
-    for ((try jsonRequiredArray(trial_root, "arms")).items) |arm_value| {
+    if (private_evidence) |evidence| {
+        if (!std.mem.eql(u8, evidence.evidence.candidate_arm_id, candidate_arm) or
+            !std.mem.eql(
+                u8,
+                try jsonRequiredString(evidence.evidence.candidate_treatment, "value_fingerprint"),
+                change.after_target_fingerprint,
+            )) return error.PublicationTrialInvalid;
+        candidate_snapshot = try jsonRequiredString(
+            evidence.evidence.candidate_treatment,
+            "materialization_fingerprint",
+        );
+    } else for ((try jsonRequiredArray(trial_root, "arms")).items) |arm_value| {
         const arm = try jsonObject(arm_value);
         if (!std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm)) continue;
         if (!std.mem.eql(
@@ -11006,29 +15379,67 @@ fn verifyPublicationCommit(
         var trial_parsed = try trialJsonParsed(allocator, trial);
         defer trial_parsed.deinit();
         const root = try jsonObject(trial_parsed.value);
-        try verifyTrialChangeBaseAgainstRepo(
-            allocator,
-            repo,
-            campaign,
-            root,
-            false,
-            error.PublicationBaselineInvalid,
-        );
         const candidate_arm = trial.candidate_arm orelse return error.PublicationTrialInvalid;
         const baseline_arm = trial.baseline_arm orelse return error.PublicationTrialInvalid;
         var baseline_revision: ?[]const u8 = null;
-        for ((try jsonRequiredArray(root, "arms")).items) |arm_value| {
-            const arm = try jsonObject(arm_value);
-            if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm)) {
-                promotion_snapshot = try allocator.dupe(
-                    u8,
-                    try jsonRequiredString(arm, "materialization_fingerprint"),
-                );
+        var baseline_revision_owned: ?[]u8 = null;
+        defer if (baseline_revision_owned) |value| allocator.free(value);
+        if (std.mem.eql(
+            u8,
+            try jsonRequiredString(root, "schema"),
+            hctp.PrivateTrialSchema,
+        )) {
+            var evidence = try privateRevealEvidenceAlloc(allocator, trial, trial_parsed.value);
+            defer evidence.deinit();
+            try verifyPrivateTrialChangeBaseAgainstRepo(
+                allocator,
+                repo,
+                campaign,
+                root,
+                evidence.evidence,
+                false,
+                error.PublicationBaselineInvalid,
+            );
+            if (!std.mem.eql(u8, evidence.evidence.candidate_arm_id, candidate_arm) or
+                !std.mem.eql(u8, evidence.evidence.baseline_arm_id, baseline_arm))
+            {
+                return error.PublicationTrialInvalid;
             }
-            if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), baseline_arm)) {
-                baseline_revision = try materializationRevision(
-                    try jsonRequiredString(arm, "materialization_ref"),
-                );
+            promotion_snapshot = try allocator.dupe(
+                u8,
+                try jsonRequiredString(
+                    evidence.evidence.candidate_treatment,
+                    "materialization_fingerprint",
+                ),
+            );
+            const revealed_revision = try materializationRevision(try jsonRequiredString(
+                evidence.evidence.baseline_treatment,
+                "materialization_ref",
+            ));
+            baseline_revision_owned = try allocator.dupe(u8, revealed_revision);
+            baseline_revision = baseline_revision_owned.?;
+        } else {
+            try verifyTrialChangeBaseAgainstRepo(
+                allocator,
+                repo,
+                campaign,
+                root,
+                false,
+                error.PublicationBaselineInvalid,
+            );
+            for ((try jsonRequiredArray(root, "arms")).items) |arm_value| {
+                const arm = try jsonObject(arm_value);
+                if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm)) {
+                    promotion_snapshot = try allocator.dupe(
+                        u8,
+                        try jsonRequiredString(arm, "materialization_fingerprint"),
+                    );
+                }
+                if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), baseline_arm)) {
+                    baseline_revision = try materializationRevision(
+                        try jsonRequiredString(arm, "materialization_ref"),
+                    );
+                }
             }
         }
         const baseline_ref = baseline_revision orelse return error.PublicationBaselineMissing;
@@ -11107,11 +15518,21 @@ fn validateTrialMotivation(
         var parsed = try trialJsonParsed(allocator, trial);
         defer parsed.deinit();
         const root = try jsonObject(parsed.value);
+        const private_trial = std.mem.eql(
+            u8,
+            try jsonRequiredString(root, "schema"),
+            hctp.PrivateTrialSchema,
+        );
+        var private_evidence: ?PrivateRevealEvidence = null;
+        defer if (private_evidence) |*evidence| evidence.deinit();
+        if (private_trial) {
+            private_evidence = try privateRevealEvidenceAlloc(allocator, trial, parsed.value);
+        }
         const factor_kind = try jsonRequiredString(try jsonRequiredObject(root, "factor"), "kind");
         if (!std.mem.eql(u8, factor_kind, "target_snapshot") and
             !std.mem.eql(u8, factor_kind, "null")) return error.InvalidMotivationTrial;
         const epoch = try jsonRequiredObject(root, "target_epoch");
-        if (std.mem.eql(u8, factor_kind, "null") and
+        if (!private_trial and std.mem.eql(u8, factor_kind, "null") and
             (try jsonNullableString(epoch, "change_id") != null or
                 !std.mem.eql(
                     u8,
@@ -11128,7 +15549,14 @@ fn validateTrialMotivation(
         }
         const candidate_arm = trial.candidate_arm orelse return error.InvalidMotivationTrial;
         var candidate_matches = false;
-        for ((try jsonRequiredArray(root, "arms")).items) |arm_value| {
+        if (private_evidence) |evidence| {
+            candidate_matches = m.eql(u8, evidence.evidence.candidate_arm_id, candidate_arm) and
+                std.mem.eql(
+                    u8,
+                    try js(evidence.evidence.candidate_treatment, "value_fingerprint"),
+                    change.before_target_fingerprint,
+                );
+        } else for ((try jsonRequiredArray(root, "arms")).items) |arm_value| {
             const arm = try jsonObject(arm_value);
             if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), candidate_arm) and
                 std.mem.eql(
@@ -11397,7 +15825,9 @@ fn applyEvent(
             campaign.rubric_dimensions = rubric_dimensions;
             campaign.expected_scenarios = expected_scenarios;
             if (campaign_input.value.protocol_profiles) |profiles| {
-                campaign.trial_profile = containsString(profiles, hctp.TrialSchema);
+                campaign.trial_profile = containsString(profiles, hctp.TrialSchema) or
+                    containsString(profiles, hctp.PrivateTrialSchema);
+                campaign.private_trial_profile = containsString(profiles, hctp.PrivateTrialSchema);
             }
             if (campaign_input.value.trial_policy) |trial_policy| {
                 campaign.trial_policy_fingerprint = try digestValueAlloc(allocator, trial_policy);
@@ -12207,11 +16637,7 @@ fn applyEvent(
             if (!campaign.trial_profile) return error.TrialProfileMissing;
             const payload = try jsonObject(body.value.payload);
             const trial_value = try jsonRequired(payload, "trial");
-            try validateTrialAgainstCampaign(
-                allocator,
-                campaign,
-                trial_value,
-            );
+            try validateRegisteredTrialAgainstCampaign(allocator, campaign, payload);
             try validatePromotionSentinelRegistration(
                 allocator,
                 campaign,
@@ -12586,13 +17012,68 @@ fn appendIntentToStore(
     store: durable_store.EventStore,
     intent_json: []const u8,
 ) !AppendResult {
+    return appendIntentToStoreInternal(allocator, repo, store, intent_json, null, null);
+}
+
+fn appendIntentToStoreWithPrivateTrial(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    intent_json: []const u8,
+    semantic_trial: std.json.Value,
+) !AppendResult {
+    return appendIntentToStoreInternal(allocator, repo, store, intent_json, semantic_trial, null);
+}
+
+fn validateRevealAppendProvenance(
+    kind: EventKind,
+    payload_value: std.json.Value,
+    provenance: ?RevealAppendProvenance,
+) !void {
+    if (kind != .trial_revealed) {
+        if (provenance != null) return error.RevealProvenanceForbidden;
+        return;
+    }
+    const admitted = provenance orelse return error.RevealProvenanceRequired;
+    const payload = try jsonObject(payload_value);
+    const reveal = try jsonRequiredObject(payload, "reveal");
+    const schema = try jsonRequiredString(reveal, "schema");
+    switch (admitted) {
+        .legacy_v1 => if (!std.mem.eql(u8, schema, "hylo-trial-reveal/v1")) {
+            return error.RevealProvenanceInvalid;
+        },
+        .validated_private_custody_v2 => if (!std.mem.eql(
+            u8,
+            schema,
+            retrace_core.hctp_trial_custody.RevealSchema,
+        )) {
+            return error.RevealProvenanceInvalid;
+        },
+    }
+}
+
+fn appendIntentToStoreInternal(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    intent_json: []const u8,
+    private_semantic_trial: ?std.json.Value,
+    reveal_provenance: ?RevealAppendProvenance,
+) !AppendResult {
     var intent_parsed = try parseTyped(EventIntent, allocator, intent_json);
     defer intent_parsed.deinit();
     const intent = intent_parsed.value;
     if (!std.mem.eql(u8, intent.schema, "hylo-event-intent/v1")) return error.InvalidIntentSchema;
     try validateId(intent.campaign_id);
     const kind = EventKind.parse(intent.kind) orelse return error.InvalidEventKind;
+    if (private_semantic_trial != null and
+        kind != .trial_registered and
+        kind != .lane_started)
+    {
+        return error.TrialCustodyForbidden;
+    }
     if (intent.payload != .object) return error.PayloadMustBeObject;
+    try validateRevealAppendProvenance(kind, intent.payload, reveal_provenance);
 
     const body_json = try canonicalBodyAlloc(allocator, intent);
     defer allocator.free(body_json);
@@ -12633,6 +17114,21 @@ fn appendIntentToStore(
         body_digest,
     );
     errdefer allocator.free(event_digest);
+    if (kind == .trial_registered) {
+        if (private_semantic_trial) |semantic_trial| {
+            const payload = try jsonObject(intent.payload);
+            const public_trial = try jsonObject(try jsonRequired(payload, "trial"));
+            if (!std.mem.eql(
+                u8,
+                try jsonRequiredString(public_trial, "schema"),
+                hctp.PrivateTrialSchema,
+            )) return error.TrialCustodyForbidden;
+            // The earlier command preflight is advisory. Campaign-dependent
+            // semantic admission must be repeated against the exact snapshot
+            // held by this exclusive append owner.
+            try validateTrialAgainstCampaign(allocator, campaign, semantic_trial);
+        }
+    }
     try applyEvent(allocator, campaign, kind, body_value.value, sequence, event_digest);
     if (campaign.target_identity_mode == .legacy and kind == .publication_recorded and
         std.mem.eql(u8, try jsonRequiredString(try jsonObject(intent.payload), "status"), "committed"))
@@ -12647,12 +17143,34 @@ fn appendIntentToStore(
     if (kind == .trial_registered) {
         const payload = try jsonObject(intent.payload);
         const trial_value = try jsonRequired(payload, "trial");
-        try requireTrialInterventionAgainstRepo(allocator, repo, trial_value);
+        const trial = try jsonObject(trial_value);
+        const private_trial = std.mem.eql(
+            u8,
+            try jsonRequiredString(trial, "schema"),
+            hctp.PrivateTrialSchema,
+        );
+        const repo_trial_value = if (private_trial)
+            private_semantic_trial orelse return error.TrialCustodyRequired
+        else blk: {
+            if (private_semantic_trial != null) return error.TrialCustodyForbidden;
+            break :blk trial_value;
+        };
+        const repo_trial = try jsonObject(repo_trial_value);
+        if (!std.mem.eql(
+            u8,
+            try jsonRequiredString(repo_trial, "trial_id"),
+            try jsonRequiredString(trial, "trial_id"),
+        ) or !std.mem.eql(
+            u8,
+            try jsonRequiredString(repo_trial, "campaign_id"),
+            try jsonRequiredString(trial, "campaign_id"),
+        )) return error.TrialCustodyInvalid;
+        try requireTrialInterventionAgainstRepo(allocator, repo, repo_trial_value);
         try verifyTrialChangeBaseAgainstRepo(
             allocator,
             repo,
             campaign,
-            try jsonObject(trial_value),
+            repo_trial,
             true,
             error.ChangeBaseMismatch,
         );
@@ -12674,7 +17192,33 @@ fn appendIntentToStore(
         ) orelse return error.TrialMissing;
         const lane = trial.findLane(intent.attempt_id orelse return error.LaneNotRegistered) orelse
             return error.LaneNotRegistered;
-        try verifyTrialLaneStart(allocator, repo, campaign, trial, lane);
+        var stored_trial = try trialJsonParsed(allocator, trial);
+        defer stored_trial.deinit();
+        const stored_root = try jsonObject(stored_trial.value);
+        const private_trial = std.mem.eql(
+            u8,
+            try jsonRequiredString(stored_root, "schema"),
+            hctp.PrivateTrialSchema,
+        );
+        if (private_trial) {
+            const semantic_value = private_semantic_trial orelse return error.TrialCustodyRequired;
+            const semantic_root = try jsonObject(semantic_value);
+            if (!std.mem.eql(
+                u8,
+                try jsonRequiredString(semantic_root, "trial_id"),
+                trial.id,
+            )) return error.TrialCustodyInvalid;
+            try verifyTrialLaneStartValue(
+                allocator,
+                repo,
+                campaign,
+                semantic_value,
+                lane,
+            );
+        } else {
+            if (private_semantic_trial != null) return error.TrialCustodyForbidden;
+            try verifyTrialLaneStart(allocator, repo, campaign, trial, lane);
+        }
     }
     if (kind == .publication_recorded) {
         var publication = try parseValueAs(PublicationPayload, allocator, intent.payload);
@@ -13536,6 +18080,8 @@ fn writeSplitSummary(writer: *std.Io.Writer, summary: SplitSummary) !void {
     );
 }
 
+const TestBaselineFingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+    "aaaaaaaaaaaaaaaaaaaaaaa";
 const TestCandidateFingerprint = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TestCampaignJson =
     \\{
@@ -13669,9 +18215,31 @@ fn testIntentAlloc(
     grade_id: ?[]const u8,
     payload_json: []const u8,
 ) ![]u8 {
+    return testIntentForCampaignAlloc(
+        allocator,
+        "cmp-test",
+        kind,
+        scenario_id,
+        attempt_id,
+        grade_id,
+        payload_json,
+    );
+}
+
+fn testIntentForCampaignAlloc(
+    allocator: std.mem.Allocator,
+    campaign_id: []const u8,
+    kind: []const u8,
+    scenario_id: ?[]const u8,
+    attempt_id: ?[]const u8,
+    grade_id: ?[]const u8,
+    payload_json: []const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"hylo-event-intent/v1\",\"campaign_id\":\"cmp-test\",\"kind\":");
+    try out.writer.writeAll("{\"schema\":\"hylo-event-intent/v1\",\"campaign_id\":");
+    try std.json.Stringify.value(campaign_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"kind\":");
     try std.json.Stringify.value(kind, .{}, &out.writer);
     try out.writer.writeAll(",\"scenario_id\":");
     try writeOptionalString(&out.writer, scenario_id);
@@ -13688,6 +18256,7 @@ fn testIntentAlloc(
 fn testCampaignIntentFromJsonAlloc(allocator: std.mem.Allocator, campaign_json: []const u8) ![]u8 {
     var campaign = try parseValue(allocator, campaign_json);
     defer campaign.deinit();
+    const campaign_id = try jsonRequiredString(try jsonObject(campaign.value), "campaign_id");
     const fingerprint = try digestValueAlloc(allocator, campaign.value);
     defer allocator.free(fingerprint);
     const canonical = try canonicalJsonAlloc(allocator, campaign.value);
@@ -13699,7 +18268,15 @@ fn testCampaignIntentFromJsonAlloc(allocator: std.mem.Allocator, campaign_json: 
     try payload.writer.writeAll(",\"campaign\":");
     try payload.writer.writeAll(canonical);
     try payload.writer.writeByte('}');
-    return testIntentAlloc(allocator, "campaign_created", null, null, null, payload.written());
+    return testIntentForCampaignAlloc(
+        allocator,
+        campaign_id,
+        "campaign_created",
+        null,
+        null,
+        null,
+        payload.written(),
+    );
 }
 
 fn testCampaignIntentAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -13713,6 +18290,7 @@ fn testScenarioIntentAlloc(
 ) ![]u8 {
     var scenario = try parseValue(allocator, scenario_json);
     defer scenario.deinit();
+    const campaign_id = try jsonRequiredString(try jsonObject(scenario.value), "campaign_id");
     const fingerprint = try digestValueAlloc(allocator, scenario.value);
     defer allocator.free(fingerprint);
     const canonical = try canonicalJsonAlloc(allocator, scenario.value);
@@ -13724,7 +18302,15 @@ fn testScenarioIntentAlloc(
     try payload.writer.writeAll(",\"scenario\":");
     try payload.writer.writeAll(canonical);
     try payload.writer.writeByte('}');
-    return testIntentAlloc(allocator, "scenario_admitted", scenario_id, null, null, payload.written());
+    return testIntentForCampaignAlloc(
+        allocator,
+        campaign_id,
+        "scenario_admitted",
+        scenario_id,
+        null,
+        null,
+        payload.written(),
+    );
 }
 
 fn testStrictTargetCampaignAlloc(
@@ -13865,7 +18451,7 @@ fn testRecordConformanceBackendObservation(observation: TestConformanceBackendOb
 }
 
 const TestConformanceStoreBackend = union(TestConformanceBackendKind) {
-    memory: durable_store.MemoryEventStore,
+    memory: MES,
     persistent: durable_store.PersistentEventStore,
 };
 
@@ -13905,7 +18491,7 @@ const TestConformanceStore = struct {
             .matrix_lane = requested != null,
             .persistent_path = persistent_path,
             .backend = switch (kind) {
-                .memory => .{ .memory = durable_store.MemoryEventStore.init(allocator, memory_ref) },
+                .memory => .{ .memory = MES.init(allocator, memory_ref) },
                 .persistent => .{ .persistent = durable_store.PersistentEventStore.init(persistent_path) },
             },
         };
@@ -14442,11 +19028,25 @@ fn testBindLegacyNullMaterializationAlloc(
     repo: []const u8,
     trial_bytes: []const u8,
 ) ![]u8 {
-    if (std.mem.indexOf(u8, trial_bytes, "\"kind\": \"null\"") == null or
-        std.mem.indexOf(u8, trial_bytes, "artifact:baseline") == null)
-    {
+    var trial = parseValue(allocator, trial_bytes) catch return allocator.dupe(u8, trial_bytes);
+    defer trial.deinit();
+    const root = jsonObjectPtr(&trial.value) catch return allocator.dupe(u8, trial_bytes);
+    const factor = op(root.getPtr("factor") orelse return allocator.dupe(u8, trial_bytes)) catch
         return allocator.dupe(u8, trial_bytes);
+    const factor_kind = jsonRequiredString(factor.*, "kind") catch
+        return allocator.dupe(u8, trial_bytes);
+    if (!std.mem.eql(u8, factor_kind, "null")) return allocator.dupe(u8, trial_bytes);
+    const arms = jsonRequiredArray(root.*, "arms") catch return allocator.dupe(u8, trial_bytes);
+    var has_legacy_placeholder = false;
+    for (arms.items) |arm_value| {
+        const arm = jsonObject(arm_value) catch return allocator.dupe(u8, trial_bytes);
+        const materialization_ref = jsonRequiredString(arm, "materialization_ref") catch
+            return allocator.dupe(u8, trial_bytes);
+        has_legacy_placeholder = has_legacy_placeholder or
+            std.mem.eql(u8, materialization_ref, "artifact:baseline");
     }
+    if (!has_legacy_placeholder) return allocator.dupe(u8, trial_bytes);
+
     try runTestGit(allocator, repo, &.{ "init", "--quiet" });
     const factor_path = try std.fs.path.join(allocator, &.{ repo, ".git", "hctp-null-factor.json" });
     defer allocator.free(factor_path);
@@ -14459,54 +19059,126 @@ fn testBindLegacyNullMaterializationAlloc(
     );
     defer allocator.free(oid_raw);
     const oid = std.mem.trim(u8, oid_raw, " \t\r\n");
-    var factor = try parseValue(allocator, factor_bytes);
-    defer factor.deinit();
-    const fingerprint = try hctp.digestValueAlloc(allocator, factor.value);
-    defer allocator.free(fingerprint);
-    var current = try allocator.dupe(u8, trial_bytes);
-    errdefer allocator.free(current);
     const ref = try std.fmt.allocPrint(allocator, "git-blob-json:{s}", .{oid});
     defer allocator.free(ref);
-    try testReplaceAllCurrent(allocator, &current, "artifact:baseline", ref);
-    const materialization_field = try std.fmt.allocPrint(
-        allocator,
-        "\"materialization_fingerprint\": \"{s}\"",
-        .{fingerprint},
-    );
-    defer allocator.free(materialization_field);
-    try testReplaceAllCurrent(
-        allocator,
-        &current,
-        "\"materialization_fingerprint\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-        materialization_field,
-    );
-    const snapshot_field = try std.fmt.allocPrint(
-        allocator,
-        "\"snapshot_fingerprint\": \"{s}\"",
-        .{fingerprint},
-    );
-    defer allocator.free(snapshot_field);
-    try testReplaceAllCurrent(
-        allocator,
-        &current,
-        "\"snapshot_fingerprint\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
-        snapshot_field,
-    );
-    var parsed = try parseValue(allocator, current);
-    defer parsed.deinit();
+    var materialization = try readGitBlobJsonMaterialization(allocator, repo, ref);
+    defer materialization.deinit();
+    const fingerprint = try hctp.digestValueAlloc(allocator, materialization.value);
+    defer allocator.free(fingerprint);
     const witness = try jsonRequired(
-        try jsonRequiredObject(try jsonObject(parsed.value), "factor"),
+        factor.*,
         "intervention_witness",
     );
+    const witness_root = try jsonObjectPtr(factor.getPtr("intervention_witness") orelse
+        return error.RequiredFieldMissing);
+    const arm_values = try jsonObjectPtr(witness_root.getPtr("arm_values") orelse
+        return error.RequiredFieldMissing);
+    for (arms.items) |*arm_value| {
+        const arm = try jsonObjectPtr(arm_value);
+        if (!std.mem.eql(
+            u8,
+            try jsonRequiredString(arm.*, "materialization_ref"),
+            "artifact:baseline",
+        )) continue;
+        (arm.getPtr("materialization_ref") orelse return error.RequiredFieldMissing).* =
+            .{ .string = ref };
+        (arm.getPtr("materialization_fingerprint") orelse return error.RequiredFieldMissing).* =
+            .{ .string = fingerprint };
+        const arm_id = try jsonRequiredString(arm.*, "arm_id");
+        const witness_arm = try jsonObjectPtr(
+            arm_values.getPtr(arm_id) orelse return error.RequiredFieldMissing,
+        );
+        (witness_arm.getPtr("snapshot_fingerprint") orelse
+            return error.RequiredFieldMissing).* = .{ .string = fingerprint };
+    }
     const witness_fingerprint = try hctp.digestValueAlloc(allocator, witness);
     defer allocator.free(witness_fingerprint);
-    try testReplaceAllCurrent(
+    (factor.getPtr("intervention_witness_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = witness_fingerprint };
+    return canonicalJsonAlloc(allocator, trial.value);
+}
+
+test "operator recipe executable canonical null materialization binding is structural" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+
+    var fixture = try parseValue(allocator, hctp_fixtures.valid_null_trial);
+    defer fixture.deinit();
+    const canonical = try canonicalJsonAlloc(allocator, fixture.value);
+    defer allocator.free(canonical);
+    const bound = try testBindLegacyNullMaterializationAlloc(allocator, repo, canonical);
+    defer allocator.free(bound);
+    var bound_trial = try parseValue(allocator, bound);
+    defer bound_trial.deinit();
+    const root = try jsonObject(bound_trial.value);
+    const factor = try jsonRequiredObject(root, "factor");
+    const witness = try jsonRequiredObject(factor, "intervention_witness");
+    const arm_values = try jsonRequiredObject(witness, "arm_values");
+    var expected_ref: ?[]const u8 = null;
+    var expected_fingerprint: ?[]const u8 = null;
+    for ((try jsonRequiredArray(root, "arms")).items) |arm_value| {
+        const arm = try jsonObject(arm_value);
+        const materialization_ref = try jsonRequiredString(arm, "materialization_ref");
+        try std.testing.expect(std.mem.startsWith(u8, materialization_ref, "git-blob-json:"));
+        const materialization_fingerprint = try jsonRequiredString(
+            arm,
+            "materialization_fingerprint",
+        );
+        if (expected_ref) |value| {
+            try std.testing.expectEqualStrings(value, materialization_ref);
+            try std.testing.expectEqualStrings(expected_fingerprint.?, materialization_fingerprint);
+        } else {
+            expected_ref = materialization_ref;
+            expected_fingerprint = materialization_fingerprint;
+        }
+        const witness_arm = try jsonRequiredObject(
+            arm_values,
+            try jsonRequiredString(arm, "arm_id"),
+        );
+        try std.testing.expectEqualStrings(
+            materialization_fingerprint,
+            try jsonRequiredString(witness_arm, "snapshot_fingerprint"),
+        );
+    }
+    var observed_materialization = try readGitBlobJsonMaterialization(
         allocator,
-        &current,
-        "sha256:eb611af244ff839ac5e8abe3bf83d404905bf4dda344478970d433f8d7bb03ee",
-        witness_fingerprint,
+        repo,
+        expected_ref orelse return error.RequiredFieldMissing,
     );
-    return current;
+    defer observed_materialization.deinit();
+    const observed_materialization_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        observed_materialization.value,
+    );
+    defer allocator.free(observed_materialization_fingerprint);
+    try std.testing.expectEqualStrings(
+        expected_fingerprint orelse return error.RequiredFieldMissing,
+        observed_materialization_fingerprint,
+    );
+    const observed_witness_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        try jsonRequired(factor, "intervention_witness"),
+    );
+    defer allocator.free(observed_witness_fingerprint);
+    try std.testing.expectEqualStrings(
+        observed_witness_fingerprint,
+        try jsonRequiredString(factor, "intervention_witness_fingerprint"),
+    );
+
+    var non_null_fixture = try parseValue(allocator, hctp_fixtures.valid_trial);
+    defer non_null_fixture.deinit();
+    const non_null_canonical = try canonicalJsonAlloc(allocator, non_null_fixture.value);
+    defer allocator.free(non_null_canonical);
+    const unchanged = try testBindLegacyNullMaterializationAlloc(
+        allocator,
+        repo,
+        non_null_canonical,
+    );
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(non_null_canonical, unchanged);
 }
 
 fn testRegisterTrialBytes(
@@ -14986,6 +19658,7 @@ fn testRevealAndCloseTrial(
     repo: []const u8,
     store: durable_store.EventStore,
     reveal_bytes: []const u8,
+    provenance: RevealAppendProvenance,
 ) ![]u8 {
     var reveal = try parseValue(allocator, reveal_bytes);
     defer reveal.deinit();
@@ -15007,16 +19680,13 @@ fn testRevealAndCloseTrial(
     var loaded = try loadLedgerFromStore(allocator, store);
     defer loaded.deinit(allocator);
     const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
-    var reveal_result = try appendHighLevelEvent(
+    var reveal_result = try appendTrialRevealEvent(
         allocator,
         repo,
         store,
         location.campaign.id,
-        "trial_revealed",
-        null,
-        null,
-        null,
         reveal_payload.value,
+        provenance,
     );
     reveal_result.deinit(allocator);
     var after_reveal = try loadLedgerFromStore(allocator, store);
@@ -15067,10 +19737,10 @@ fn testCompleteNullTrialWithBytes(
         .{ "lane-null-a0", "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
         .{ "lane-null-a1", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
     }) |lane| {
-        var started = try testStartTrialLane(allocator, repo, store, "trial-null-001", lane[0], lane[1]);
-        const start_digest = try allocator.dupe(u8, started.event_digest);
+        var s = try testStartTrialLane(allocator, repo, store, "trial-null-001", lane[0], lane[1]);
+        const start_digest = try allocator.dupe(u8, s.event_digest);
         defer allocator.free(start_digest);
-        started.deinit(allocator);
+        s.deinit(allocator);
         var finished = try testFinishTrialLane(allocator, repo, store, "trial-null-001", lane[0], start_digest, lane[1]);
         finished.deinit(allocator);
         var graded = try testGradeTrialLane(allocator, repo, store, "trial-null-001", lane[0]);
@@ -15086,7 +19756,13 @@ fn testCompleteNullTrialWithBytes(
         "lane-null-a1",
     );
     pair_grade.deinit(allocator);
-    return testRevealAndCloseTrial(allocator, repo, store, hctp_fixtures.valid_reveal);
+    return testRevealAndCloseTrial(
+        allocator,
+        repo,
+        store,
+        hctp_fixtures.valid_reveal,
+        .legacy_v1,
+    );
 }
 
 fn testCompleteNullTrial(
@@ -15101,6 +19777,8 @@ const TestProofSourceOwnerSeed = [_]u8{0x5a} ** 32;
 const TestProofSourceOwnerBinary = "sha256:abababababababababababababababababababababababababababababababab";
 const TestSelectionSourceOwnerSeed = [_]u8{0x6b} ** 32;
 const TestSelectionSourceOwnerBinary = "sha256:bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+const TestDirectCrfEpisodeFingerprint = "sha256:edededededededededededededededededededede" ++
+    "dededededededededededed";
 
 const TestSourceSelectionReceipt = struct {
     bytes: []u8,
@@ -15117,6 +19795,30 @@ fn testSourceSelectionReceiptAlloc(
     campaign_id: []const u8,
     cases: std.json.Value,
 ) !TestSourceSelectionReceipt {
+    const case_items = switch (cases) {
+        .array => |items| items,
+        else => return error.ArrayRequired,
+    };
+    if (case_items.items.len == 0) return error.SourceManifestEmpty;
+    var clusters = std.StringHashMap(void).init(allocator);
+    defer clusters.deinit();
+    var practice: usize = 0;
+    var holdout: usize = 0;
+    var challenge: usize = 0;
+    for (case_items.items) |case_value| {
+        const source_case = try jsonObject(case_value);
+        _ = try clusters.getOrPut(try jsonRequiredString(source_case, "independence_cluster_id"));
+        const split = try jsonRequiredString(source_case, "split");
+        if (std.mem.eql(u8, split, "practice")) {
+            practice += 1;
+        } else if (std.mem.eql(u8, split, "holdout")) {
+            holdout += 1;
+        } else if (std.mem.eql(u8, split, "challenge")) {
+            challenge += 1;
+        } else {
+            return error.SourceSplitInvalid;
+        }
+    }
     const public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
         allocator,
         TestSelectionSourceOwnerSeed,
@@ -15126,9 +19828,23 @@ fn testSourceSelectionReceiptAlloc(
     defer core.deinit();
     try core.writer.writeAll("{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":");
     try std.json.Stringify.value(campaign_id, .{}, &core.writer);
+    try core.writer.print(
+        ",\"denominator\":{{\"source_cases\":{d},\"indepe" ++
+            "ndence_clusters\":{d},\"practice\":{d},\"holdout" ++ "\":{d},\"challenge\":{d}}}",
+        .{ case_items.items.len, clusters.count(), practice, holdout, challenge },
+    );
     try core.writer.writeAll(",\"cases\":");
     try std.json.Stringify.value(cases, .{}, &core.writer);
-    try core.writer.writeAll(",\"duplicate_analysis\":{\"cross_split_exact_duplicates\":0}}");
+    try core.writer.print(
+        ",\"duplicate_analysis\":{{\"exact_duplicate_pair" ++
+            "s\":0,\"near_duplicate_pairs\":0,\"cross_split_e" ++ "xact_duplicates\":0}}," ++
+            "\"final_redaction\":{{\"schema\":\"hylo-final-sa" ++
+            "nitization-receipt/v1\",\"policy_id\":\"seq-fina" ++
+            "l-redaction-v1\",\"status\":\"sanitized\",\"arti" ++
+            "facts_checked\":{d},\"plaintext_sealed_cases_per" ++
+            "sisted\":false,\"secret_patterns_detected\":0}}}" ++ "}",
+        .{case_items.items.len},
+    );
     const core_bytes = core.written();
     var core_value = try parseValue(allocator, core_bytes);
     defer core_value.deinit();
@@ -15177,6 +19893,251 @@ fn testSourceSelectionReceiptAlloc(
         ),
         .fingerprint = fingerprint,
     };
+}
+
+fn testDirectRouteAdmissionAlloc(
+    allocator: std.mem.Allocator,
+    campaign_id: []const u8,
+    unit_id: []const u8,
+    scenario_id: []const u8,
+    episode_fingerprint: []const u8,
+    source_episode_fingerprint: []const u8,
+    source_profile_fingerprint: []const u8,
+) ![]u8 {
+    if (!std.mem.startsWith(u8, episode_fingerprint, "sha256:") or
+        episode_fingerprint.len < "sha256:".len + 16)
+    {
+        return error.InvalidFingerprint;
+    }
+    const episode_id = try std.fmt.allocPrint(
+        allocator,
+        "ep-{s}",
+        .{episode_fingerprint["sha256:".len .. "sha256:".len + 16]},
+    );
+    defer allocator.free(episode_id);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"campaign_id\":{f},\"comparison_eligible\":tr" ++
+            "ue,\"effective_reconstruction_class\":\"controll" ++ "ed_replay\"," ++
+            "\"episode_fingerprint\":{f},\"episode_id\":{f},\"execution_route\":\"direct\"," ++
+            "\"fidelity\":{{\"class\":\"controlled_replay\"," ++
+            "\"replay_eligible\":true}},\"limitations\":[\"op" ++ "erator recipe fixture\"]," ++
+            "\"required_fir_version\":null,\"required_lineage\":null,\"scenario_id\":{f}," ++
+            "\"schema\":\"hylo-source-route-admission/v1\",\"source_governance_state\":null," ++
+            "\"source_governance_workflow_effect_allowed\":fa" ++
+            "lse,\"source_episode_projection_fingerprint\":{f" ++ "}," ++
+            "\"source_episode_projection_version\":\"hylo-source-episode-projection/v1\"," ++
+            "\"source_profile_fingerprint\":{f},\"source_prof" ++
+            "ile_kind\":\"direct\",\"unit_id\":{f}}}",
+        .{
+            std.json.fmt(campaign_id, .{}),
+            std.json.fmt(episode_fingerprint, .{}),
+            std.json.fmt(episode_id, .{}),
+            std.json.fmt(scenario_id, .{}),
+            std.json.fmt(source_episode_fingerprint, .{}),
+            std.json.fmt(source_profile_fingerprint, .{}),
+            std.json.fmt(unit_id, .{}),
+        },
+    );
+}
+
+fn testDirectSourceSelectionReceiptAlloc(
+    allocator: std.mem.Allocator,
+    campaign_id: []const u8,
+    unit_id: []const u8,
+    scenario_id: []const u8,
+    cluster_id: []const u8,
+    visible_input_json: []const u8,
+    visible_input_fingerprint: []const u8,
+    hidden_reference_fingerprint: []const u8,
+    episode_fingerprint: []const u8,
+    source_episode_fingerprint: []const u8,
+) !TestSourceSelectionReceipt {
+    var direct_profile = try parseValue(allocator, "{\"kind\":\"direct\"}");
+    defer direct_profile.deinit();
+    const direct_profile_fingerprint = try hctp.digestValueAlloc(allocator, direct_profile.value);
+    defer allocator.free(direct_profile_fingerprint);
+    const route_admission = try testDirectRouteAdmissionAlloc(
+        allocator,
+        campaign_id,
+        unit_id,
+        scenario_id,
+        episode_fingerprint,
+        source_episode_fingerprint,
+        direct_profile_fingerprint,
+    );
+    defer allocator.free(route_admission);
+    const cases_bytes = try std.fmt.allocPrint(
+        allocator,
+        "[{{\"case_visibility\":\"open\",\"hidden_reference_fingerprint\":{f}," ++
+            "\"independence_cluster_id\":{f},\"scenario_id\":" ++
+            "{f},\"source_episode_fingerprint\":{f}," ++
+            "\"source_episode_projection_version\":\"hylo-source-episode-projection/v1\"," ++
+            "\"source_profile\":{{\"kind\":\"direct\"}},\"source_profile_fingerprint\":{f}," ++
+            "\"source_route_admission\":{s},\"split\":\"practice\",\"unit_id\":{f}," ++
+            "\"visible_input\":{s},\"visible_input_fingerprint\":{f}}}]",
+        .{
+            std.json.fmt(hidden_reference_fingerprint, .{}),
+            std.json.fmt(cluster_id, .{}),
+            std.json.fmt(scenario_id, .{}),
+            std.json.fmt(source_episode_fingerprint, .{}),
+            std.json.fmt(direct_profile_fingerprint, .{}),
+            route_admission,
+            std.json.fmt(unit_id, .{}),
+            visible_input_json,
+            std.json.fmt(visible_input_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(cases_bytes);
+    var cases = try parseValue(allocator, cases_bytes);
+    defer cases.deinit();
+    return testSourceSelectionReceiptAlloc(allocator, campaign_id, cases.value);
+}
+
+fn testBindDirectSourceRouteAlloc(
+    allocator: std.mem.Allocator,
+    trial_bytes: []const u8,
+    receipt: *const TestSourceSelectionReceipt,
+    visible_input_fingerprint: []const u8,
+    hidden_reference_fingerprint: []const u8,
+) ![]u8 {
+    const public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        TestSelectionSourceOwnerSeed,
+    );
+    defer allocator.free(public_key);
+    const trust_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-trust-policy/v1\",\"policy_i" ++
+            "d\":\"hylo-source-owner-policy\",\"keys\":[{{\"k" ++
+            "ey_id\":\"hylo-source-owner-key\",\"public_key_b" ++
+            "ase64\":{f},\"allowed_roles\":[\"source_owner\"]" ++
+            ",\"producer_ids\":[\"hylo-source-fixture\"],\"pr" ++
+            "oducer_binary_fingerprints\":[\"{s}\"]}}],\"sepa" ++
+            "ration\":{{\"runner_and_pair_grader_distinct\":t" ++
+            "rue,\"materializer_and_pair_grader_distinct\":tr" ++
+            "ue,\"human_confirmation_required_for_human_grade" ++ "\":true}}}}",
+        .{ std.json.fmt(public_key, .{}), TestSelectionSourceOwnerBinary },
+    );
+    defer allocator.free(trust_bytes);
+    var trust = try parseValue(allocator, trust_bytes);
+    defer trust.deinit();
+    const trust_fingerprint = try hctp.digestValueAlloc(allocator, trust.value);
+    defer allocator.free(trust_fingerprint);
+    var current_value = try parseValue(allocator, trial_bytes);
+    defer current_value.deinit();
+    var receipt_value = try parseValue(allocator, receipt.bytes);
+    defer receipt_value.deinit();
+    const current_root = try jsonObjectPtr(&current_value.value);
+    const current_allocator = current_value.arena.allocator();
+    const sealing = try jsonObjectPtr(
+        current_root.getPtr("sealing") orelse return error.RequiredFieldMissing,
+    );
+    var visible_commitments: std.json.Array = .init(current_allocator);
+    try visible_commitments.append(.{ .string = @constCast(visible_input_fingerprint) });
+    (sealing.getPtr("visible_input_commitments") orelse
+        return error.RequiredFieldMissing).* = .{ .array = visible_commitments };
+    var hidden_commitments: std.json.Array = .init(current_allocator);
+    try hidden_commitments.append(.{ .string = @constCast(hidden_reference_fingerprint) });
+    (sealing.getPtr("hidden_reference_commitments") orelse
+        return error.RequiredFieldMissing).* = .{ .array = hidden_commitments };
+    (sealing.getPtr("case_materializer_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .null;
+    try sealing.put(
+        current_allocator,
+        "source_selection_receipt_ref",
+        .{ .string = @constCast("artifact:source-selection") },
+    );
+    try sealing.put(
+        current_allocator,
+        "source_selection_receipt_fingerprint",
+        .{ .string = receipt.fingerprint },
+    );
+    try sealing.put(current_allocator, "source_selection_receipt", receipt_value.value);
+    const assurance = try jsonObjectPtr(
+        current_root.getPtr("assurance") orelse return error.RequiredFieldMissing,
+    );
+    (assurance.getPtr("trust_policy_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = trust_fingerprint };
+    try assurance.put(current_allocator, "trust_policy", trust.value);
+    const receipt_cases = try jsonRequiredArray(try jsonObject(receipt_value.value), "cases");
+    const trial_units = try jsonRequiredArray(current_root.*, "units");
+    for (trial_units.items) |*unit_value| {
+        const unit = try jsonObjectPtr(unit_value);
+        const unit_id = try jsonRequiredString(unit.*, "unit_id");
+        var matched_profile: ?std.json.Value = null;
+        for (receipt_cases.items) |case_value| {
+            const source_case = try jsonObject(case_value);
+            if (!std.mem.eql(u8, try jsonRequiredString(source_case, "unit_id"), unit_id)) continue;
+            if (matched_profile != null) return error.SourceCaseDuplicate;
+            matched_profile = try jsonRequired(source_case, "source_profile");
+        }
+        (unit.getPtr("source_profile") orelse return error.RequiredFieldMissing).* =
+            matched_profile orelse return error.SourceCaseMissing;
+    }
+    return canonicalJsonAlloc(allocator, current_value.value);
+}
+
+fn testSourceSelectionReceiptWithoutRouteAlloc(
+    allocator: std.mem.Allocator,
+    receipt_bytes: []const u8,
+) !TestSourceSelectionReceipt {
+    var parsed = try parseValue(allocator, receipt_bytes);
+    defer parsed.deinit();
+    const root = try jsonObjectPtr(&parsed.value);
+    const cases = try jsonRequiredArray(root.*, "cases");
+    for (cases.items) |*case_value| {
+        const source_case = try jsonObjectPtr(case_value);
+        if (!source_case.orderedRemove("source_route_admission")) {
+            return error.SourceRouteAdmissionMissing;
+        }
+        const source_profile = try jsonObjectPtr(
+            source_case.getPtr("source_profile") orelse return error.RequiredFieldMissing,
+        );
+        if (!std.mem.eql(u8, try jsonRequiredString(source_profile.*, "kind"), "direct")) {
+            return error.SourceProfileInvalid;
+        }
+        const source_profile_fingerprint = try jsonRequired(
+            source_case.*,
+            "source_profile_fingerprint",
+        );
+        source_profile.clearRetainingCapacity();
+        try source_profile.put(
+            parsed.arena.allocator(),
+            "kind",
+            .{ .string = @constCast("direct") },
+        );
+        try source_profile.put(
+            parsed.arena.allocator(),
+            "source_profile_fingerprint",
+            source_profile_fingerprint,
+        );
+    }
+    return testSourceSelectionReceiptAlloc(
+        allocator,
+        try jsonRequiredString(root.*, "campaign_id"),
+        .{ .array = cases },
+    );
+}
+
+fn testRebindTrialTrustPolicyAlloc(
+    allocator: std.mem.Allocator,
+    trial_bytes: []const u8,
+    trust_policy_bytes: []const u8,
+    trust_policy_fingerprint: []const u8,
+) ![]u8 {
+    var trial = try parseValue(allocator, trial_bytes);
+    defer trial.deinit();
+    var trust_policy = try parseValue(allocator, trust_policy_bytes);
+    defer trust_policy.deinit();
+    const assurance = try jsonObjectPtr(
+        (try jsonObjectPtr(&trial.value)).getPtr("assurance") orelse
+            return error.RequiredFieldMissing,
+    );
+    (assurance.getPtr("trust_policy_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = @constCast(trust_policy_fingerprint) };
+    try assurance.put(trial.arena.allocator(), "trust_policy", trust_policy.value);
+    return canonicalJsonAlloc(allocator, trial.value);
 }
 
 fn testProofTrialAlloc(allocator: std.mem.Allocator, repo: []const u8) ![]u8 {
@@ -15382,14 +20343,20 @@ fn proofArtifactSetForTrialAlloc(
         ProgramName,
         if (case_blind_projection) "sealed" else "sanitized",
     );
-    try addProofJsonArtifact(
-        allocator,
-        &artifacts,
-        "trial/intervention-witness.json",
-        try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
-        ProgramName,
-        "sanitized",
-    );
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(trial_root, "schema"),
+        hctp.PrivateTrialSchema,
+    )) {
+        try addProofJsonArtifact(
+            allocator,
+            &artifacts,
+            "trial/intervention-witness.json",
+            try jsonRequired(try jsonRequiredObject(trial_root, "factor"), "intervention_witness"),
+            ProgramName,
+            "sanitized",
+        );
+    }
     const assurance = try jsonRequiredObject(trial_root, "assurance");
     if (assurance.get("trust_policy")) |trust_policy| {
         try addProofJsonArtifact(allocator, &artifacts, "trial/trust-policy.json", trust_policy, ProgramName, "public");
@@ -15527,6 +20494,54 @@ fn testWriteSelectionProofSanitizationReceipt(
     try durable_store.writeTextAtomic(allocator, receipt_path, signed);
 }
 
+fn testWriteSelectionProofSanitizationReceiptForArtifactSet(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    trial_id: []const u8,
+    artifact_set_bytes: []const u8,
+    receipt_path: []const u8,
+) !void {
+    var artifact_set = try parseValue(allocator, artifact_set_bytes);
+    defer artifact_set.deinit();
+    const set_fingerprint = try hctp.digestValueAlloc(allocator, artifact_set.value);
+    defer allocator.free(set_fingerprint);
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse
+        return error.TrialMissing;
+    const unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-proof-sanitization-receipt/v1\",\"campaign_id\":{f}," ++
+            "\"trial_id\":{f},\"artifact_set\":{s},\"artifact_set_fingerprint\":{f}," ++
+            "\"producer\":{{\"id\":\"hylo-source-fixture\",\"version\":\"v1\"," ++
+            "\"binary_fingerprint\":\"{s}\",\"key_id\":\"hylo-source-owner-key\"}}," ++
+            "\"attestation\":null}}",
+        .{
+            std.json.fmt(location.campaign.id, .{}),
+            std.json.fmt(trial_id, .{}),
+            artifact_set_bytes,
+            std.json.fmt(set_fingerprint, .{}),
+            TestSelectionSourceOwnerBinary,
+        },
+    );
+    defer allocator.free(unsigned);
+    const signed = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        unsigned,
+        .{
+            .id = "hylo-source-fixture",
+            .version = "v1",
+            .binary_fingerprint = TestSelectionSourceOwnerBinary,
+            .key_id = "hylo-source-owner-key",
+        },
+        "source_owner",
+        1,
+        TestSelectionSourceOwnerSeed,
+    );
+    defer allocator.free(signed);
+    try durable_store.writeTextAtomic(allocator, receipt_path, signed);
+}
+
 fn testWriteTamperedProof(
     allocator: std.mem.Allocator,
     source_path: []const u8,
@@ -15545,6 +20560,9 @@ fn testWriteTamperedProof(
     const index = std.mem.indexOf(u8, bytes, marker) orelse return error.TestExpectedProofMarker;
     if (std.mem.eql(u8, marker, "\"attestation\":null")) {
         @memcpy(bytes[index + marker.len - "null".len .. index + marker.len], "true");
+    } else if (std.mem.eql(u8, marker, "\"bundle_id\":\"bundle:sha256:")) {
+        const mutation_index = index + marker.len;
+        bytes[mutation_index] = if (bytes[mutation_index] == '0') '1' else '0';
     } else if (std.mem.eql(u8, marker, "\"value_base64\":\"")) {
         const mutation_index = index + marker.len;
         bytes[mutation_index] = if (bytes[mutation_index] == 'A') 'B' else 'A';
@@ -15652,24 +20670,103 @@ fn testSeedOneScenarioProfileCampaign(
     scenario_result.deinit(allocator);
 }
 
-const TestCaseBlindVisibleFingerprint = "sha256:abababababababababababababababababababababababababababababababab";
-const TestCaseBlindHiddenFingerprint = "sha256:1212121212121212121212121212121212121212121212121212121212121212";
-const TestCaseBlindEpisodeFingerprint = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const TestCaseBlindProfileFingerprint = "sha256:3434343434343434343434343434343434343434343434343434343434343434";
-const TestCaseBlindCiphertextFingerprint = "sha256:5656565656565656565656565656565656565656565656565656565656565656";
+fn testSeedOneScenarioRouteCampaign(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    publication_claims_json: []const u8,
+    baseline_bundle_fingerprint: ?[]const u8,
+) !void {
+    const base_campaign_json = try testOneScenarioProfileCampaignJsonAlloc(
+        allocator,
+        publication_claims_json,
+    );
+    defer allocator.free(base_campaign_json);
+    const policy_marker = try std.fmt.allocPrint(
+        allocator,
+        "\"trial_policy\":{{\"publication_claims\":{s}}}",
+        .{publication_claims_json},
+    );
+    defer allocator.free(policy_marker);
+    const route_policy = try std.fmt.allocPrint(
+        allocator,
+        "\"trial_policy\":{{\"publication_claims\":{s},\"source_route_admission\":\"required\"}}",
+        .{publication_claims_json},
+    );
+    defer allocator.free(route_policy);
+    const route_campaign_json = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        base_campaign_json,
+        policy_marker,
+        route_policy,
+    );
+    defer allocator.free(route_campaign_json);
+    if (std.mem.indexOf(u8, route_campaign_json, "\"source_route_admission\":\"required\"") ==
+        null)
+    {
+        return error.TestFixtureNeedleMissing;
+    }
+    const private_json = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        route_campaign_json,
+        "\"protocol_profiles\":[\"hylo-trial/v1\"]",
+        "\"protocol_profiles\":[\"hylo-trial/v1\",\"hylo-trial/v2\"]",
+    );
+    defer allocator.free(private_json);
+    if (std.mem.indexOf(u8, private_json, "\"hylo-trial/v2\"") == null) {
+        return error.TestFixtureNeedleMissing;
+    }
+    const strict_campaign_json = if (baseline_bundle_fingerprint) |fingerprint|
+        try testCampaignWithStrictTargetIdentityAlloc(allocator, private_json, fingerprint)
+    else
+        null;
+    defer if (strict_campaign_json) |value| allocator.free(value);
+    const campaign_json = strict_campaign_json orelse private_json;
+    const campaign_intent = try testCampaignIntentFromJsonAlloc(allocator, campaign_json);
+    defer allocator.free(campaign_intent);
+    var campaign_result = try appendIntentToStore(allocator, repo, store, campaign_intent);
+    campaign_result.deinit(allocator);
+    const intent = try testScenarioIntentAlloc(allocator, TestScenarioJson, "scenario-holdout");
+    defer allocator.free(intent);
+    var scenario_result = try appendIntentToStore(allocator, repo, store, intent);
+    scenario_result.deinit(allocator);
+}
+
+const TestCaseBlindVisibleFingerprint = "sha256:ababababababababababababababababababababa" ++
+    "bababababababababababab";
+const TestCaseBlindHiddenFingerprint = "sha256:12121212121212121212121212121212121212121" ++
+    "21212121212121212121212";
+const TestCaseBlindEpisodeFingerprint = "sha256:ccccccccccccccccccccccccccccccccccccccccc" ++
+    "ccccccccccccccccccccccc";
+const TestCaseBlindProfileFingerprint = "sha256:34343434343434343434343434343434343434343" ++
+    "43434343434343434343434";
+const TestCaseBlindCiphertextFingerprint = "sha256:56565656565656565656565656565656565656565" ++
+    "65656565656565656565656";
 const TestCaseBlindLocator = "/private/controller-only/case.sealed.json";
 
 fn testCaseBlindScenarioAlloc(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"hylo-scenario/v1\",\"campaign_id\":\"cmp-test\",\"scenario_id\":\"scenario-holdout\",\"split\":\"practice\"," ++
+        "{{\"schema\":\"hylo-scenario/v1\",\"campaign_id" ++
+            "\":\"cmp-test\",\"scenario_id\":\"scenario-holdo" ++ "ut\",\"split\":\"practice\"," ++
             "\"case_visibility\":\"case_blind\",\"source_episode_fingerprint\":{f}," ++
             "\"visible_input_fingerprint\":{f},\"hidden_reference_fingerprint\":{f}," ++
             "\"source_profile_fingerprint\":{f}," ++
-            "\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"," ++
-            "\"effect_policy\":{{\"filesystem\":\"workspace_write\",\"allowed_paths\":[],\"network\":\"deny\",\"network_allowlist\":[],\"external_side_effects\":\"deny\",\"external_effect_allowlist\":[]}}," ++
-            "\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"," ++
-            "\"oracle_commitments\":[{{\"id\":\"required-test\",\"kind\":\"deterministic\",\"critical\":true,\"grader_ref\":\"test:oracle-grader\",\"grader_fingerprint\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\"}}]," ++
+            "\"environment_fingerprint\":\"sha256:11111111111" ++
+            "111111111111111111111111111111111111111111111111" ++ "11111\"," ++
+            "\"effect_policy\":{{\"filesystem\":\"workspace_w" ++
+            "rite\",\"allowed_paths\":[],\"network\":\"deny\"" ++
+            ",\"network_allowlist\":[],\"external_side_effect" ++
+            "s\":\"deny\",\"external_effect_allowlist\":[]}}," ++
+            "\"replay_policy_fingerprint\":\"sha256:fffffffff" ++
+            "ffffffffffffffffffffffffffffffffffffffffffffffff" ++ "fffffff\"," ++
+            "\"oracle_commitments\":[{{\"id\":\"required-test" ++
+            "\",\"kind\":\"deterministic\",\"critical\":true," ++
+            "\"grader_ref\":\"test:oracle-grader\",\"grader_f" ++
+            "ingerprint\":\"sha256:88888888888888888888888888" ++
+            "88888888888888888888888888888888888888\"}}]," ++
             "\"limitations\":[\"plaintext is released only by the scoped materializer\"]}}",
         .{
             std.json.fmt(TestCaseBlindEpisodeFingerprint, .{}),
@@ -15679,7 +20776,6 @@ fn testCaseBlindScenarioAlloc(allocator: std.mem.Allocator) ![]u8 {
         },
     );
 }
-
 fn testDerivedHoldoutScenarioAlloc(
     allocator: std.mem.Allocator,
     practice_scenario_json: []const u8,
@@ -15692,7 +20788,8 @@ fn testDerivedHoldoutScenarioAlloc(
     (root.getPtr("split") orelse return error.RequiredFieldMissing).* =
         .{ .string = @constCast("holdout") };
     (root.getPtr("source_episode_fingerprint") orelse return error.RequiredFieldMissing).* = .{
-        .string = @constCast("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+        .string = @constCast("sha256:ddddddddddddddddddddddddddddddddddddddddd" ++
+            "ddddddddddddddddddddddd"),
     };
     return canonicalJsonAlloc(allocator, parsed.value);
 }
@@ -15823,18 +20920,11 @@ fn testBindSelectionTrustPolicyAlloc(
     defer trust.deinit();
     const trust_fingerprint = try hctp.digestValueAlloc(allocator, trust.value);
     defer allocator.free(trust_fingerprint);
-    const replacement = try std.fmt.allocPrint(
-        allocator,
-        "\"trust_policy_fingerprint\": \"{s}\",\n    \"trust_policy\": {s},",
-        .{ trust_fingerprint, trust_bytes },
-    );
-    defer allocator.free(replacement);
-    return std.mem.replaceOwned(
-        u8,
+    return testRebindTrialTrustPolicyAlloc(
         allocator,
         trial_bytes,
-        "\"trust_policy_fingerprint\": \"sha256:7777777777777777777777777777777777777777777777777777777777777777\",",
-        replacement,
+        trust_bytes,
+        trust_fingerprint,
     );
 }
 
@@ -15904,6 +20994,53 @@ fn testAppendTargetBundleAdmission(
     snapshot: *const TargetSnapshotArtifact,
     snapshot_path: []const u8,
 ) !void {
+    return testAppendTargetBundleAdmissionForCampaign(
+        allocator,
+        repo,
+        store,
+        "cmp-test",
+        target_fingerprint,
+        bundle,
+        snapshot_revision,
+        snapshot,
+        snapshot_path,
+    );
+}
+
+fn testAppendTargetBundleAdmissionForCampaign(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    target_fingerprint: []const u8,
+    bundle: *const retrace_core.target_bundle.BuiltBundle,
+    snapshot_revision: []const u8,
+    snapshot: *const TargetSnapshotArtifact,
+    snapshot_path: []const u8,
+) !void {
+    const intent_bytes = try testTargetBundleAdmissionIntentAlloc(
+        allocator,
+        campaign_id,
+        target_fingerprint,
+        bundle,
+        snapshot_revision,
+        snapshot,
+        snapshot_path,
+    );
+    defer allocator.free(intent_bytes);
+    var result = try appendIntentToStore(allocator, repo, store, intent_bytes);
+    result.deinit(allocator);
+}
+
+fn testTargetBundleAdmissionIntentAlloc(
+    allocator: std.mem.Allocator,
+    campaign_id: []const u8,
+    target_fingerprint: []const u8,
+    bundle: *const retrace_core.target_bundle.BuiltBundle,
+    snapshot_revision: []const u8,
+    snapshot: *const TargetSnapshotArtifact,
+    snapshot_path: []const u8,
+) ![]u8 {
     var payload_bytes: std.Io.Writer.Allocating = .init(allocator);
     defer payload_bytes.deinit();
     try payload_bytes.writer.writeAll("{\"schema\":\"hylo-target-bundle-admission/v1\",\"target_fingerprint\":");
@@ -15923,20 +21060,15 @@ fn testAppendTargetBundleAdmission(
     try payload_bytes.writer.writeAll(",\"materialization\":[{\"bundle_path\":\"SKILL.md\",\"snapshot_path\":");
     try std.json.Stringify.value(snapshot_path, .{}, &payload_bytes.writer);
     try payload_bytes.writer.writeAll("}]}");
-    var payload = try parseValue(allocator, payload_bytes.written());
-    defer payload.deinit();
-    var result = try appendHighLevelEvent(
+    return testIntentForCampaignAlloc(
         allocator,
-        repo,
-        store,
-        "cmp-test",
+        campaign_id,
         "target_bundle_admitted",
         null,
         null,
         null,
-        payload.value,
+        payload_bytes.written(),
     );
-    result.deinit(allocator);
 }
 
 const TestStrictTargetIdentity = struct {
@@ -15977,21 +21109,28 @@ fn testBootstrapFirstAppliedChange(
             "target.txt",
         );
     }
-    var bootstrap_trial = try allocator.dupe(u8, hctp_fixtures.valid_null_trial);
+    const bound_bootstrap_trial = try testBindLegacyNullMaterializationAlloc(
+        allocator,
+        repo,
+        hctp_fixtures.valid_null_trial,
+    );
+    defer allocator.free(bound_bootstrap_trial);
+    var bootstrap_trial_value = try parseValue(allocator, bound_bootstrap_trial);
+    defer bootstrap_trial_value.deinit();
+    const bootstrap_root = try jsonObjectPtr(&bootstrap_trial_value.value);
+    (bootstrap_root.getPtr("purpose") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast("practice_repair") };
+    const bootstrap_grading = try jsonObjectPtr(
+        bootstrap_root.getPtr("grading") orelse return error.RequiredFieldMissing,
+    );
+    (bootstrap_grading.getPtr("mode") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast("independent_absolute") };
+    (bootstrap_grading.getPtr("judge_contracts") orelse
+        return error.RequiredFieldMissing).* = .{
+        .array = .init(bootstrap_trial_value.arena.allocator()),
+    };
+    const bootstrap_trial = try canonicalJsonAlloc(allocator, bootstrap_trial_value.value);
     defer allocator.free(bootstrap_trial);
-    try testReplaceFirstCurrent(
-        allocator,
-        &bootstrap_trial,
-        "\"purpose\": \"calibration_null\"",
-        "\"purpose\": \"practice_repair\"",
-    );
-    try testReplaceFirstCurrent(
-        allocator,
-        &bootstrap_trial,
-        "\"mode\": \"composite\"",
-        "\"mode\": \"independent_absolute\"",
-    );
-    try testRemovePairJudgeCurrent(allocator, &bootstrap_trial);
     const anchored_trial = if (proof_anchor)
         try testBindSelectionTrustPolicyAlloc(allocator, bootstrap_trial)
     else
@@ -16002,16 +21141,51 @@ fn testBootstrapFirstAppliedChange(
     else
         try allocator.dupe(u8, anchored_trial);
     defer allocator.free(registered_trial);
-    var registration = try testRegisterTrialBytes(allocator, repo, store, registered_trial);
+    var route_state = try loadLedgerFromStore(allocator, store);
+    defer route_state.deinit(allocator);
+    const route_campaign_index = findCampaign(route_state.campaigns.items, "cmp-test") orelse
+        return error.CampaignMissing;
+    const route_required = try campaignRequiresSourceRouteAdmission(
+        allocator,
+        &route_state.campaigns.items[route_campaign_index],
+    );
+    var route_receipt: ?TestSourceSelectionReceipt = if (route_required)
+        try testDirectSourceSelectionReceiptAlloc(
+            allocator,
+            "cmp-test",
+            "unit-null-001",
+            "scenario-holdout",
+            "cluster-null-001",
+            TestScenarioJson,
+            "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+            "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+            TestDirectCrfEpisodeFingerprint,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+    else
+        null;
+    defer if (route_receipt) |*receipt| receipt.deinit(allocator);
+    const route_bound_trial = if (route_receipt) |*receipt|
+        try testBindDirectSourceRouteAlloc(
+            allocator,
+            registered_trial,
+            receipt,
+            "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+            "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        )
+    else
+        try allocator.dupe(u8, registered_trial);
+    defer allocator.free(route_bound_trial);
+    var registration = try testRegisterTrialBytes(allocator, repo, store, route_bound_trial);
     registration.deinit(allocator);
     inline for (.{
         .{ "lane-null-a0", "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", true },
         .{ "lane-null-a1", "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", false },
     }) |lane| {
-        var started = try testStartTrialLane(allocator, repo, store, "trial-null-001", lane[0], lane[1]);
-        const start_digest = try allocator.dupe(u8, started.event_digest);
+        var s = try testStartTrialLane(allocator, repo, store, "trial-null-001", lane[0], lane[1]);
+        const start_digest = try allocator.dupe(u8, s.event_digest);
         defer allocator.free(start_digest);
-        started.deinit(allocator);
+        s.deinit(allocator);
         var finished = try testFinishTrialLane(
             allocator,
             repo,
@@ -16030,15 +21204,16 @@ fn testBootstrapFirstAppliedChange(
         repo,
         store,
         hctp_fixtures.valid_reveal,
+        .legacy_v1,
     );
     defer allocator.free(result_fingerprint);
-
     try durable_store.writeTextAtomic(allocator, target_path, "candidate\n");
     try runTestGit(allocator, repo, &.{ "add", "target.txt" });
+    const no_ext = "--no-ext-diff";
     const diff = try runGitStdoutAlloc(
         allocator,
         repo,
-        &.{ "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-color", "HEAD", "--" },
+        &.{ "diff", "--cached", "--binary", "--full-index", no_ext, "--no-color", "HEAD", "--" },
     );
     defer allocator.free(diff);
     const diff_fingerprint = try digestBytesAlloc(allocator, diff);
@@ -16087,6 +21262,256 @@ fn testBootstrapFirstAppliedChange(
     return allocator.dupe(u8, diff_fingerprint);
 }
 
+fn testBootstrapOperatorRecipeChange(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    scenario_id: []const u8,
+    route_receipt: *const TestSourceSelectionReceipt,
+    visible_input_fingerprint: []const u8,
+    hidden_reference_fingerprint: []const u8,
+    baseline_bundle_fingerprint: []const u8,
+    baseline_snapshot_fingerprint: []const u8,
+    candidate_bundle: *const retrace_core.target_bundle.BuiltBundle,
+    trust_policy_bytes: []const u8,
+    trust_policy_fingerprint: []const u8,
+    materializer_contract_bytes: []const u8,
+    materializer_contract_fingerprint: []const u8,
+) ![]u8 {
+    const target_path = try std.fs.path.join(allocator, &.{ repo, "target.txt" });
+    defer allocator.free(target_path);
+    var bootstrap_trial = try allocator.dupe(u8, hctp_fixtures.valid_null_trial);
+    defer allocator.free(bootstrap_trial);
+    try testReplaceAllCurrent(allocator, &bootstrap_trial, "cmp-test", campaign_id);
+    try testReplaceAllCurrent(allocator, &bootstrap_trial, "scenario-holdout", scenario_id);
+    try testReplaceFirstCurrent(
+        allocator,
+        &bootstrap_trial,
+        "\"purpose\": \"calibration_null\"",
+        "\"purpose\": \"practice_repair\"",
+    );
+    try testReplaceFirstCurrent(
+        allocator,
+        &bootstrap_trial,
+        "\"mode\": \"composite\"",
+        "\"mode\": \"independent_absolute\"",
+    );
+    try testRemovePairJudgeCurrent(allocator, &bootstrap_trial);
+    const source_bound_trial = try testBindDirectSourceRouteAlloc(
+        allocator,
+        bootstrap_trial,
+        route_receipt,
+        visible_input_fingerprint,
+        hidden_reference_fingerprint,
+    );
+    defer allocator.free(source_bound_trial);
+    var case_blind_source_bound = try parseValue(allocator, source_bound_trial);
+    defer case_blind_source_bound.deinit();
+    const case_blind_root = try jsonObjectPtr(&case_blind_source_bound.value);
+    const case_blind_sealing = try jsonObjectPtr(
+        case_blind_root.getPtr("sealing") orelse return error.RequiredFieldMissing,
+    );
+    (case_blind_sealing.getPtr("case_visibility") orelse
+        return error.RequiredFieldMissing).* = .{ .string = @constCast("case_blind") };
+    (case_blind_sealing.getPtr("case_materializer_ref") orelse
+        return error.RequiredFieldMissing).* = .{
+        .string = @constCast("artifact:operator-case-materializer"),
+    };
+    (case_blind_sealing.getPtr("case_materializer_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = materializer_contract_fingerprint };
+    var materializer_contract = try parseValue(allocator, materializer_contract_bytes);
+    defer materializer_contract.deinit();
+    try case_blind_sealing.put(
+        case_blind_source_bound.arena.allocator(),
+        "case_materializer_contract",
+        materializer_contract.value,
+    );
+    const case_blind_source_bound_trial = try canonicalJsonAlloc(
+        allocator,
+        case_blind_source_bound.value,
+    );
+    defer allocator.free(case_blind_source_bound_trial);
+    const route_bound_trial = try testRebindTrialTrustPolicyAlloc(
+        allocator,
+        case_blind_source_bound_trial,
+        trust_policy_bytes,
+        trust_policy_fingerprint,
+    );
+    defer allocator.free(route_bound_trial);
+    var registration = try testRegisterTrialBytes(allocator, repo, store, route_bound_trial);
+    registration.deinit(allocator);
+    inline for (.{
+        .{ "lane-null-a0", "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ++
+            "eeeeeeeeeeeeeeeeeeeeeee", true },
+        .{ "lane-null-a1", "sha256:ddddddddddddddddddddddddddddddddddddddddd" ++
+            "ddddddddddddddddddddddd", false },
+    }) |lane| {
+        var s = try testStartTrialLane(allocator, repo, store, "trial-null-001", lane[0], lane[1]);
+        const start_digest = try allocator.dupe(u8, s.event_digest);
+        defer allocator.free(start_digest);
+        s.deinit(allocator);
+        var finished = try testFinishTrialLane(
+            allocator,
+            repo,
+            store,
+            "trial-null-001",
+            lane[0],
+            start_digest,
+            lane[1],
+        );
+        finished.deinit(allocator);
+        var graded = try testGradeTrialLaneOutcome(
+            allocator,
+            repo,
+            store,
+            "trial-null-001",
+            lane[0],
+            lane[2],
+        );
+        graded.deinit(allocator);
+    }
+    var reveal = try parseValue(allocator, hctp_fixtures.valid_reveal);
+    defer reveal.deinit();
+    const reveal_root = try jsonObjectPtr(&reveal.value);
+    (reveal_root.getPtr("baseline_target_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(TestBaselineFingerprint) };
+    (reveal_root.getPtr("candidate_target_fingerprint") orelse return fm).* =
+        .{ .string = @constCast(TestBaselineFingerprint) };
+    const reveal_bytes = try canonicalJsonAlloc(allocator, reveal.value);
+    defer allocator.free(reveal_bytes);
+    const result_fingerprint = try testRevealAndCloseTrial(
+        allocator,
+        repo,
+        store,
+        reveal_bytes,
+        .legacy_v1,
+    );
+    defer allocator.free(result_fingerprint);
+
+    // The owner-applied candidate is created only after the motivating
+    // practice evidence is terminal. Its compatibility events cross the same
+    // released append surface as the documented operator recipe.
+    try durable_store.writeTextAtomic(allocator, target_path, "candidate\n");
+    try runTestGit(allocator, repo, &.{ "add", "target.txt" });
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        "INDEX",
+        &.{"target.txt"},
+    );
+    defer candidate_snapshot.deinit(allocator);
+    const candidate_intent = try testTargetBundleAdmissionIntentAlloc(
+        allocator,
+        campaign_id,
+        TestCandidateFingerprint,
+        candidate_bundle,
+        "INDEX",
+        &candidate_snapshot,
+        "target.txt",
+    );
+    defer allocator.free(candidate_intent);
+    const candidate_intent_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "candidate-target-bundle-admitted.json" },
+    );
+    defer allocator.free(candidate_intent_path);
+    try durable_store.writeTextAtomic(allocator, candidate_intent_path, candidate_intent);
+    const candidate_append = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "append",
+        "--repo",
+        repo,
+        "--json",
+        candidate_intent_path,
+    });
+    defer allocator.free(candidate_append);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        candidate_append,
+        "hylo-ledger-append-receipt/v1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        candidate_append,
+        "\"kind\":\"target_bundle_admitted\"",
+    ) != null);
+    const no_ext = "--no-ext-diff";
+    const diff = try runGitStdoutAlloc(
+        allocator,
+        repo,
+        &.{ "diff", "--cached", "--binary", "--full-index", no_ext, "--no-color", "HEAD", "--" },
+    );
+    defer allocator.free(diff);
+    const diff_fingerprint = try digestBytesAlloc(allocator, diff);
+    defer allocator.free(diff_fingerprint);
+    const change_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"change_id\":\"change-operator-recipe\",\"status\":\"applied\"," ++
+            "\"before_target_fingerprint\":{f},\"after_target_fingerprint\":{f}," ++
+            "\"before_target_bundle_fingerprint\":{f},\"after_target_bundle_fingerprint\":{f}," ++
+            "\"before_target_snapshot_fingerprint\":{f},\"aft" ++
+            "er_target_snapshot_fingerprint\":{f}," ++
+            "\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\"," ++
+            "\"paths\":[\"target.txt\"],\"diff_ref\":\"git-in" ++
+            "dex:HEAD\",\"diff_fingerprint\":{f}," ++
+            "\"motivation_grade_ids\":[],\"motivation_trial_ids\":[\"trial-null-001\"]," ++
+            "\"motivation_result_fingerprints\":[{f}],\"feedback_ids\":[]," ++
+            "\"validation_refs\":[\"test:operator-recipe-bootstrap\"]}}",
+        .{
+            std.json.fmt(TestBaselineFingerprint, .{}),
+            std.json.fmt(TestCandidateFingerprint, .{}),
+            std.json.fmt(baseline_bundle_fingerprint, .{}),
+            std.json.fmt(candidate_bundle.bundle_fingerprint, .{}),
+            std.json.fmt(baseline_snapshot_fingerprint, .{}),
+            std.json.fmt(candidate_snapshot.fingerprint, .{}),
+            std.json.fmt(diff_fingerprint, .{}),
+            std.json.fmt(result_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(change_bytes);
+    const change_intent = try testIntentForCampaignAlloc(
+        allocator,
+        campaign_id,
+        "change_recorded",
+        null,
+        null,
+        null,
+        change_bytes,
+    );
+    defer allocator.free(change_intent);
+    const change_intent_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "owner-applied-change-recorded.json" },
+    );
+    defer allocator.free(change_intent_path);
+    try durable_store.writeTextAtomic(allocator, change_intent_path, change_intent);
+    const change_append = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "append",
+        "--repo",
+        repo,
+        "--json",
+        change_intent_path,
+    });
+    defer allocator.free(change_append);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        change_append,
+        "hylo-ledger-append-receipt/v1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        change_append,
+        "\"kind\":\"change_recorded\"",
+    ) != null);
+    return allocator.dupe(u8, diff_fingerprint);
+}
+const tc_missing = error.TargetCommonProjectionMissing;
 fn testBindTargetCommonProjectionAlloc(
     allocator: std.mem.Allocator,
     repo: []const u8,
@@ -16101,16 +21526,16 @@ fn testBindTargetCommonProjectionAlloc(
     defer projection.deinit();
     const factor_value = root_ptr.getPtr("factor") orelse return error.RequiredFieldMissing;
     const factor = try jsonObjectPtr(factor_value);
-    (factor.getPtr("target_common_projection") orelse return error.TargetCommonProjectionMissing).* = projection.value;
+    (factor.getPtr("target_common_projection") orelse return tc_missing).* = projection.value;
     (factor.getPtr("common_projection_fingerprint") orelse return error.RequiredFieldMissing).* = .{
         .string = artifact.fingerprint,
     };
-    const witness = try jsonObjectPtr(factor.getPtr("intervention_witness") orelse return error.InterventionWitnessMissing);
-    const common = try jsonObjectPtr(witness.getPtr("common_projection") orelse return error.RequiredFieldMissing);
-    (common.getPtr("fingerprint") orelse return error.RequiredFieldMissing).* = .{ .string = artifact.fingerprint };
+    const witness = try op(factor.getPtr("intervention_witness") orelse return iw_missing);
+    const common = try op(witness.getPtr("common_projection") orelse return fm);
+    (common.getPtr("fingerprint") orelse return fm).* = .{ .string = artifact.fingerprint };
     const witness_fingerprint = try hctp.digestValueAlloc(allocator, .{ .object = witness.* });
     defer allocator.free(witness_fingerprint);
-    (factor.getPtr("intervention_witness_fingerprint") orelse return error.RequiredFieldMissing).* = .{
+    (factor.getPtr("intervention_witness_fingerprint") orelse return fm).* = .{
         .string = witness_fingerprint,
     };
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -16118,7 +21543,7 @@ fn testBindTargetCommonProjectionAlloc(
     try std.json.Stringify.value(parsed.value, .{ .whitespace = .indent_2 }, &out.writer);
     return out.toOwnedSlice();
 }
-
+const iw_missing = error.InterventionWitnessMissing;
 fn testPromotionTrialAlloc(
     allocator: std.mem.Allocator,
     repo: []const u8,
@@ -16130,7 +21555,7 @@ fn testPromotionTrialAlloc(
     var current = try allocator.dupe(u8, hctp_fixtures.valid_trial);
     errdefer allocator.free(current);
     try testReplaceAllCurrent(allocator, &current, "campaign-valid-001", "cmp-test");
-    try testReplaceFirstCurrent(allocator, &current, "\"purpose\": \"practice_repair\"", "\"purpose\": \"promotion\"");
+    try trf(allocator, &current, "\"purpose\": \"practice_repair\"", "\"purpose\": \"promotion\"");
     try testReplaceAllCurrent(allocator, &current, "change-001", "change-1");
     try testReplaceAllCurrent(allocator, &current, "scenario-001", "scenario-holdout");
     try testReplaceAllCurrent(
@@ -16145,7 +21570,7 @@ fn testPromotionTrialAlloc(
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
         "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     );
-    const baseline_ref = try std.fmt.allocPrint(allocator, "git-revision:{s}", .{baseline_revision});
+    const baseline_ref = try fmt.allocPrint(allocator, "git-revision:{s}", .{baseline_revision});
     defer allocator.free(baseline_ref);
     try testReplaceAllCurrent(allocator, &current, "artifact:arm-0", baseline_ref);
     try testReplaceAllCurrent(allocator, &current, "artifact:arm-1", "git-revision:INDEX");
@@ -16161,7 +21586,7 @@ fn testPromotionTrialAlloc(
         "sha256:3222222222222222222222222222222222222222222222222222222222222222",
         candidate_snapshot_fingerprint,
     );
-    try testReplaceAllCurrent(allocator, &current, "\"codex/skills/hylo\"", "\"target.txt\", \"target-scope\"");
+    try tra(allocator, &current, "\"codex/skills/hylo\"", "\"target.txt\", \"target-scope\"");
     try testReplaceAllCurrent(allocator, &current, "codex/skills/hylo/SKILL.md", "target.txt");
     const witness_diff_field = try std.fmt.allocPrint(
         allocator,
@@ -16172,16 +21597,19 @@ fn testPromotionTrialAlloc(
     try testReplaceFirstCurrent(
         allocator,
         &current,
-        "\"diff_fingerprint\": \"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"",
+        "\"diff_fingerprint\": \"sha256:eeeeeeeeeeeeeeeee" ++
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ++ "\"",
         witness_diff_field,
     );
     try testReplaceFirstCurrent(
         allocator,
         &current,
-        "\"rubric_fingerprint\": \"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"",
-        "\"rubric_fingerprint\": \"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"",
+        "\"rubric_fingerprint\": \"sha256:ccccccccccccccc" ++
+            "cccccccccccccccccccccccccccccccccccccccccccccccc" ++ "c\"",
+        "\"rubric_fingerprint\": \"sha256:eeeeeeeeeeeeeee" ++
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ++ "e\"",
     );
-    try testReplaceFirstCurrent(allocator, &current, "\"mode\": \"composite\"", "\"mode\": \"independent_absolute\"");
+    try trf(allocator, &current, "\"mode\": \"composite\"", "\"mode\": \"independent_absolute\"");
     try testRemovePairJudgeCurrent(allocator, &current);
 
     const source_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
@@ -16191,7 +21619,15 @@ fn testPromotionTrialAlloc(
     defer allocator.free(source_public_key);
     const source_trust_bytes = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"hylo-trust-policy/v1\",\"policy_id\":\"hylo-source-owner-policy\",\"keys\":[{{\"key_id\":\"hylo-source-owner-key\",\"public_key_base64\":{f},\"allowed_roles\":[\"source_owner\"],\"producer_ids\":[\"hylo-source-fixture\"],\"producer_binary_fingerprints\":[\"{s}\"]}}],\"separation\":{{\"runner_and_pair_grader_distinct\":true,\"materializer_and_pair_grader_distinct\":true,\"human_confirmation_required_for_human_grade\":true}}}}",
+        "{{\"schema\":\"hylo-trust-policy/v1\",\"policy_i" ++
+            "d\":\"hylo-source-owner-policy\",\"keys\":[{{\"k" ++
+            "ey_id\":\"hylo-source-owner-key\",\"public_key_b" ++
+            "ase64\":{f},\"allowed_roles\":[\"source_owner\"]" ++
+            ",\"producer_ids\":[\"hylo-source-fixture\"],\"pr" ++
+            "oducer_binary_fingerprints\":[\"{s}\"]}}],\"sepa" ++
+            "ration\":{{\"runner_and_pair_grader_distinct\":t" ++
+            "rue,\"materializer_and_pair_grader_distinct\":tr" ++
+            "ue,\"human_confirmation_required_for_human_grade" ++ "\":true}}}}",
         .{ std.json.fmt(source_public_key, .{}), TestSelectionSourceOwnerBinary },
     );
     defer allocator.free(source_trust_bytes);
@@ -16272,15 +21708,15 @@ fn testPromotionTrialAlloc(
     allocator.free(current);
     return bound;
 }
-
+const trf = testReplaceFirstCurrent;
 fn testCaseBlindPromotionTrialAlloc(
     allocator: std.mem.Allocator,
     trial_bytes: []const u8,
 ) ![]u8 {
     var trial = try parseValue(allocator, trial_bytes);
     defer trial.deinit();
-    const trial_root = try jsonObject(trial.value);
-    const units = try jsonRequiredArray(trial_root, "units");
+    const trial_root = try jsonObjectPtr(&trial.value);
+    const units = try jsonRequiredArray(trial_root.*, "units");
     if (units.items.len != 1) return error.TestExpectedTrial;
     const unit = try jsonObject(units.items[0]);
     const unit_id = try jsonRequiredString(unit, "unit_id");
@@ -16354,54 +21790,17 @@ fn testCaseBlindPromotionTrialAlloc(
         },
     );
     defer allocator.free(sealing_bytes);
-
-    var current = try allocator.dupe(u8, trial_bytes);
-    errdefer allocator.free(current);
-    const source_profile_marker = "\"source_profile\":";
-    const source_profile_start = std.mem.indexOf(u8, current, source_profile_marker) orelse
-        return error.TestFixtureNeedleMissing;
-    var source_profile_value_start = source_profile_start + source_profile_marker.len;
-    while (source_profile_value_start < current.len and
-        std.ascii.isWhitespace(current[source_profile_value_start]))
-    {
-        source_profile_value_start += 1;
-    }
-    if (source_profile_value_start >= current.len or current[source_profile_value_start] != '{') {
-        return error.TestFixtureNeedleMissing;
-    }
-    const source_profile_end = (std.mem.indexOfPos(
-        u8,
-        current,
-        source_profile_value_start,
-        "}",
-    ) orelse return error.TestFixtureNeedleMissing) + 1;
-    const with_profile = try std.fmt.allocPrint(
-        allocator,
-        "{s}{s}{s}",
-        .{ current[0..source_profile_value_start], source_profile_json, current[source_profile_end..] },
-    );
-    allocator.free(current);
-    current = with_profile;
-    const sealing_start_marker = "\"sealing\": {";
-    const sealing_end_marker = "\n  },\n  \"execution\":";
-    const sealing_start = std.mem.indexOf(u8, current, sealing_start_marker) orelse
-        return error.TestFixtureNeedleMissing;
-    const sealing_content_start = sealing_start + "\"sealing\": ".len;
-    const sealing_end = std.mem.indexOfPos(
-        u8,
-        current,
-        sealing_content_start,
-        sealing_end_marker,
-    ) orelse return error.TestFixtureNeedleMissing;
-    const replaced = try std.fmt.allocPrint(
-        allocator,
-        "{s}{s}{s}",
-        .{ current[0..sealing_content_start], sealing_bytes, current[sealing_end + "\n  }".len ..] },
-    );
-    allocator.free(current);
-    return replaced;
+    var source_profile = try parseValue(allocator, source_profile_json);
+    defer source_profile.deinit();
+    const mutable_unit = try jsonObjectPtr(&units.items[0]);
+    (mutable_unit.getPtr("source_profile") orelse
+        return error.RequiredFieldMissing).* = source_profile.value;
+    var sealing = try parseValue(allocator, sealing_bytes);
+    defer sealing.deinit();
+    try trial_root.put(trial.arena.allocator(), "sealing", sealing.value);
+    return canonicalJsonAlloc(allocator, trial.value);
 }
-
+const tra = testReplaceAllCurrent;
 fn testPromotionRevealAlloc(
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -16953,7 +22352,13 @@ fn testSetupPromotionProfileOutcome(
     }
     const reveal = try testPromotionRevealAlloc(allocator);
     defer allocator.free(reveal);
-    const result_fingerprint = try testRevealAndCloseTrial(allocator, repo, store, reveal);
+    const result_fingerprint = try testRevealAndCloseTrial(
+        allocator,
+        repo,
+        store,
+        reveal,
+        .legacy_v1,
+    );
     errdefer allocator.free(result_fingerprint);
     var completed = try loadLedgerFromStore(allocator, store);
     defer completed.deinit(allocator);
@@ -17192,7 +22597,7 @@ test "later grade commitment events cannot cross canonical profiles" {
 }
 
 test "hylo grade commitment inspect requires one exact retained intent" {
-    const args = try parseArgs(&.{
+    const args = try parseArgs(std.testing.allocator, &.{
         "ledger",
         "inspect",
         "--trial-id",
@@ -17205,7 +22610,7 @@ test "hylo grade commitment inspect requires one exact retained intent" {
     try std.testing.expectEqualStrings("-", args.input_path.?);
     try std.testing.expectError(
         error.InputNotAllowed,
-        parseArgs(&.{
+        parseArgs(std.testing.allocator, &.{
             "ledger",
             "inspect",
             "--trial-id",
@@ -17216,7 +22621,7 @@ test "hylo grade commitment inspect requires one exact retained intent" {
     );
     try std.testing.expectError(
         error.InputNotAllowed,
-        parseArgs(&.{
+        parseArgs(std.testing.allocator, &.{
             "ledger",
             "inspect",
             "--trial-id",
@@ -17671,16 +23076,46 @@ test "hylo capabilities advertise the deterministic allocation replay version" {
         "hylo-proof-external-anchor/v1",
         try jsonRequiredString(try jsonObject(parsed.value), "proof_anchor_version"),
     );
+    const features = try jsonRequiredArray(try jsonObject(parsed.value), "features");
+    for (&[_][]const u8{
+        "hylo_trial_v2",
+        "hylo_private_trial_custody_v1",
+        "hylo_trial_custody_fd_v1",
+        "hylo_private_lane_start_custody_fd_v1",
+        "hylo_trial_build_receipt_v2",
+        "hylo_lane_materialization_v1",
+        "hylo_lane_materialization_receipt_v2",
+        "hylo_trial_reveal_v2",
+        "hylo_run_receipt_v2",
+    }) |expected| {
+        var found = false;
+        for (features.items) |feature| {
+            if (feature != .string) continue;
+            if (std.mem.eql(u8, feature.string, expected)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "hylo help binds private v2 custody to every lifecycle consumer" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        UsageText,
+        "Protected v2 custody for registration/start/commit/materialization/reveal",
+    ) != null);
 }
 
 test "hylo verify-proof portable anchor requires the complete external pair" {
     try std.testing.expect(!ProofAuthority.internal_closure.authoritative());
-    try std.testing.expectEqualStrings("internal_closure", ProofAuthority.internal_closure.status());
+    try t.expectEqualStrings("internal_closure", ProofAuthority.internal_closure.status());
     try std.testing.expect(ProofAuthority.expected_values.authoritative());
     try std.testing.expectEqualStrings("valid", ProofAuthority.expected_values.status());
     try std.testing.expectError(
         error.ProofAnchorArgumentsIncomplete,
-        parseArgs(&.{
+        parseArgs(std.testing.allocator, &.{
             "ledger",
             "verify-proof",
             "--input",
@@ -17689,7 +23124,7 @@ test "hylo verify-proof portable anchor requires the complete external pair" {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }),
     );
-    const args = try parseArgs(&.{
+    const args = try parseArgs(std.testing.allocator, &.{
         "ledger",
         "verify-proof",
         "--input",
@@ -17810,7 +23245,7 @@ test "hylo trial admission joins the campaign rubric and every scenario world" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-trial-authority-joins");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-trial-authority-joins");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -18099,7 +23534,7 @@ test "hylo atomically registers a trial through the shared event store" {
         .{ trimmed[0 .. trimmed.len - 1], std.json.fmt(hctp.CanonicalJsonProfile, .{}) },
     );
     defer std.testing.allocator.free(profile_json);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-register");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-register");
     defer backend.deinit();
     const store = backend.eventStore();
     const campaign_intent = try testCampaignIntentFromJsonAlloc(std.testing.allocator, profile_json);
@@ -18212,6 +23647,7 @@ test "hylo atomically registers a trial through the shared event store" {
             repo,
             store,
             cross_campaign_trial_path,
+            null,
         ),
     );
     var after_cross_campaign_rejection = try store.snapshot(std.testing.allocator, MaxStoreBytes);
@@ -18290,7 +23726,7 @@ test "hylo deterministic fold rejects a digest-valid cross-campaign duplicate tr
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-replay-duplicate");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-replay-duplicate");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(
@@ -18398,6 +23834,7 @@ test "hylo rejected trial reveal preserves durable store revision and digest" {
             repo,
             store,
             hctp_fixtures.valid_reveal,
+            .legacy_v1,
         ),
     );
     var after = try store.snapshot(std.testing.allocator, MaxStoreBytes);
@@ -18411,7 +23848,73 @@ test "hylo rejected trial reveal preserves durable store revision and digest" {
     );
 }
 
-test "hylo native canonical factor verifier accepts an allowed deletion only from immutable Git blobs" {
+test "hylo reveal append owner rejects caller-authored v2 provenance without append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(allocator, "memory:hctp-reveal-provenance");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    var payload = try parseValue(
+        allocator,
+        "{\"reveal_fingerprint\":\"sha256:aaaaaaaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "a\",\"reveal\":{\"schema\":\"hylo-trial-reveal/v" ++
+            "2\",\"trial_id\":\"trial-private\"}}",
+    );
+    defer payload.deinit();
+    try validateRevealAppendProvenance(
+        .trial_revealed,
+        payload.value,
+        .validated_private_custody_v2,
+    );
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    try std.testing.expectError(
+        error.RevealProvenanceInvalid,
+        appendTrialRevealEvent(
+            allocator,
+            repo,
+            store,
+            "cmp-private",
+            payload.value,
+            .legacy_v1,
+        ),
+    );
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before, after);
+
+    const reveal_path = try std.fs.path.join(allocator, &.{ repo, "caller-v2-reveal.json" });
+    defer allocator.free(reveal_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        reveal_path,
+        "{\"schema\":\"hylo-trial-reveal/v2\",\"trial_id\":\"trial-private\"}",
+    );
+    try std.testing.expectError(
+        error.RevealProvenanceInvalid,
+        cmdRevealTrial(allocator, repo, store, reveal_path),
+    );
+    var after_file_rejection = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_file_rejection.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before, after_file_rejection);
+
+    var legacy_payload = try parseValue(
+        allocator,
+        "{\"reveal_fingerprint\":\"sha256:bbbbbbbbbbbbbbb" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+            "b\",\"reveal\":{\"schema\":\"hylo-trial-reveal/v" ++
+            "1\",\"trial_id\":\"trial-legacy\"}}",
+    );
+    defer legacy_payload.deinit();
+    try validateRevealAppendProvenance(.trial_revealed, legacy_payload.value, .legacy_v1);
+}
+
+test // Keep the exact diagnostic name within the source-line limit.
+"hylo native canonical factor verifier accepts an allowed deletion only from immutable Git blobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -18511,7 +24014,7 @@ test "hylo pre-reveal lane inspect exposes start commitments only" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:blind-lane-inspect");
+    var backend = MES.init(std.testing.allocator, "memory:blind-lane-inspect");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(
@@ -18591,7 +24094,7 @@ test "hylo admits a commitment-only case-blind scenario without plaintext reques
         scenario_fingerprint,
     );
     defer std.testing.allocator.free(campaign_bytes);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:case-blind-scenario");
+    var backend = MES.init(std.testing.allocator, "memory:case-blind-scenario");
     defer backend.deinit();
     const store = backend.eventStore();
     const campaign_intent = try testCampaignIntentFromJsonAlloc(std.testing.allocator, campaign_bytes);
@@ -18617,7 +24120,17 @@ test "hylo admits a commitment-only case-blind scenario without plaintext reques
     try std.testing.expect(!std.mem.eql(u8, admitted.fingerprint, admitted.visible_input_fingerprint));
     const joined_trial_bytes = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"campaign_id\":\"cmp-test\",\"purpose\":\"calibration_null\",\"canonical_json_profile\":{f},\"estimand\":{{\"primary_dimensions\":[\"correctness\"]}},\"units\":[{{\"unit_id\":\"unit-commitment\",\"scenario_id\":\"scenario-holdout\",\"split\":\"practice\",\"independence_cluster_id\":\"cluster-commitment\",\"source_profile\":{{\"kind\":\"direct\",\"sealed_payload\":true,\"source_profile_fingerprint\":\"sha256:3434343434343434343434343434343434343434343434343434343434343434\"}}}}]," ++
+        "{{\"schema\":\"hylo-trial/v1\",\"campaign_id\":" ++
+            "\"cmp-test\",\"purpose\":\"calibration_null\",\"" ++
+            "canonical_json_profile\":{f},\"estimand\":{{\"pr" ++
+            "imary_dimensions\":[\"correctness\"]}},\"units\"" ++
+            ":[{{\"unit_id\":\"unit-commitment\",\"scenario_i" ++
+            "d\":\"scenario-holdout\",\"split\":\"practice\"," ++
+            "\"independence_cluster_id\":\"cluster-commitment" ++
+            "\",\"source_profile\":{{\"kind\":\"direct\",\"se" ++
+            "aled_payload\":true,\"source_profile_fingerprint" ++
+            "\":\"sha256:343434343434343434343434343434343434" ++
+            "3434343434343434343434343434\"}}}}]," ++
             "\"sealing\":{{\"case_visibility\":\"case_blind\",\"visible_input_commitments\":[{f}],\"hidden_reference_commitments\":[\"sha256:1212121212121212121212121212121212121212121212121212121212121212\"],\"source_selection_receipt\":{{\"cases\":[{{\"unit_id\":\"unit-commitment\",\"scenario_id\":\"scenario-holdout\",\"case_visibility\":\"case_blind\",\"visible_input_fingerprint\":{f},\"hidden_reference_fingerprint\":\"sha256:1212121212121212121212121212121212121212121212121212121212121212\",\"source_episode_projection_version\":\"hylo-source-episode-projection/v1\",\"source_episode_fingerprint\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"source_profile_fingerprint\":\"sha256:3434343434343434343434343434343434343434343434343434343434343434\"}}]}}}}," ++
             "\"grading\":{{\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}}," ++
             "\"execution\":{{\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"effect_policy_fingerprint\":{f},\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}}}}",
@@ -18701,6 +24214,60 @@ test "hylo sealed proof projection omits locators and retains signed commitments
     );
 }
 
+test // Keep the exact diagnostic name within the source-line limit.
+"hylo scenario proof projection omits hidden-reference locators and retains a bound fingerprint" {
+    var source = try parseValue(std.testing.allocator, TestScenarioJson);
+    defer source.deinit();
+    const projected_bytes = try proofSafeValidatedJsonAlloc(std.testing.allocator, source.value);
+    defer std.testing.allocator.free(projected_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, projected_bytes, "local:hidden-test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected_bytes, "\"hidden_reference_ref\":") ==
+        null);
+    var projected = try parseValue(std.testing.allocator, projected_bytes);
+    defer projected.deinit();
+    try validateScenarioProofProjection(projected.value);
+    const projected_root = try jsonObject(projected.value);
+    try std.testing.expectEqualStrings(
+        ScenarioProjectionSchema,
+        try jsonRequiredString(projected_root, "schema"),
+    );
+    const omission = try jsonObject(
+        (try jsonRequiredArray(projected_root, ProofOmissionsKey)).items[0],
+    );
+    try std.testing.expectEqualStrings(
+        ScenarioHiddenReferencePath,
+        try jsonRequiredString(omission, "path"),
+    );
+    try validateFingerprint(try jsonRequiredString(omission, "value_fingerprint"));
+
+    const replayable = try replayableScenarioFromProjectionAlloc(
+        std.testing.allocator,
+        projected.value,
+    );
+    defer std.testing.allocator.free(replayable);
+    var replayed = try parseTyped(ScenarioInput, std.testing.allocator, replayable);
+    defer replayed.deinit();
+    try std.testing.expectEqualStrings(
+        try jsonRequiredString(omission, "value_fingerprint"),
+        replayed.value.request.hidden_reference_ref,
+    );
+
+    const projected_allocator = projected.arena.allocator();
+    const request = try jsonObjectPtr(
+        (try jsonObjectPtr(&projected.value)).getPtr("request") orelse
+            return error.TestFixtureInvalid,
+    );
+    try request.put(
+        projected_allocator,
+        "hidden_reference_ref",
+        .{ .string = @constCast("relative/private-hidden.json") },
+    );
+    try std.testing.expectError(
+        error.ProofProjectionSemanticMutation,
+        validateScenarioProofProjection(projected.value),
+    );
+}
+
 test "hylo run receipt proof projection is deterministic and fails closed under locator and omission tampering" {
     var receipt_bytes = try std.testing.allocator.dupe(u8, hctp_fixtures.valid_run_receipt);
     defer std.testing.allocator.free(receipt_bytes);
@@ -18715,6 +24282,20 @@ test "hylo run receipt proof projection is deterministic and fails closed under 
         &receipt_bytes,
         "artifact:network",
         "file:///private/hylo/network-receipt.json",
+    );
+    try testReplaceFirstCurrent(
+        std.testing.allocator,
+        &receipt_bytes,
+        "artifact:output-a0",
+        "relative/private-output.json",
+    );
+    const portable_trace_ref =
+        "artifact:sha256:abababababababababababababababababababababababababababababababab";
+    try testReplaceFirstCurrent(
+        std.testing.allocator,
+        &receipt_bytes,
+        "artifact:trace-a0",
+        portable_trace_ref,
     );
     try testReplaceFirstCurrent(
         std.testing.allocator,
@@ -18755,6 +24336,7 @@ test "hylo run receipt proof projection is deterministic and fails closed under 
         "/private/hylo/native-decision-context.json",
         "/private/hylo/native-execution-audit.json",
         "/private/hylo/native-executor",
+        "relative/private-output.json",
     }) |locator| {
         try std.testing.expect(std.mem.indexOf(u8, first_projection, locator) == null);
     }
@@ -18769,8 +24351,9 @@ test "hylo run receipt proof projection is deterministic and fails closed under 
         try jsonRequiredString(projected_root, "source_receipt_fingerprint"),
     );
     const omissions = try jsonRequiredArray(projected_root, ProofOmissionsKey);
-    const expected_omission_paths = [_][]const u8{
+    const required_omission_paths = [_][]const u8{
         "effects.network_receipt_ref",
+        "evidence.output_ref",
         "materialization.target_snapshot_ref",
         "native_receipt.decision_context_ref",
         "native_receipt.execution_audit_ref",
@@ -18779,29 +24362,35 @@ test "hylo run receipt proof projection is deterministic and fails closed under 
         "native_receipt.receipt.execution.executor",
         "native_receipt.receipt.source.decision_context_ref",
     };
-    try std.testing.expectEqual(expected_omission_paths.len, omissions.items.len);
-    for (expected_omission_paths, omissions.items) |expected_path, omission| {
-        try std.testing.expectEqualStrings(
-            expected_path,
-            try jsonRequiredString(try jsonObject(omission), "path"),
-        );
+    for (required_omission_paths) |expected_path| {
+        var matched = false;
+        for (omissions.items) |omission| {
+            if (std.mem.eql(
+                u8,
+                expected_path,
+                try jsonRequiredString(try jsonObject(omission), "path"),
+            )) matched = true;
+        }
+        try std.testing.expect(matched);
     }
-    try std.testing.expectEqualStrings(
-        "effects.network_receipt_ref",
-        try jsonRequiredString(try jsonObject(omissions.items[0]), "path"),
-    );
-    try std.testing.expectEqualStrings(
-        "file_uri",
-        try jsonRequiredString(try jsonObject(omissions.items[0]), "kind"),
-    );
-    try std.testing.expectEqualStrings(
-        "materialization.target_snapshot_ref",
-        try jsonRequiredString(try jsonObject(omissions.items[1]), "path"),
-    );
-    try std.testing.expectEqualStrings(
-        "absolute_path",
-        try jsonRequiredString(try jsonObject(omissions.items[1]), "kind"),
-    );
+    var relative_kind_seen = false;
+    var portable_trace_omitted = false;
+    for (omissions.items) |omission_value| {
+        const omission = try jsonObject(omission_value);
+        const path = try jsonRequiredString(omission, "path");
+        if (std.mem.eql(u8, path, "evidence.output_ref")) {
+            relative_kind_seen = std.mem.eql(
+                u8,
+                try jsonRequiredString(omission, "kind"),
+                "relative_or_unportable_ref",
+            );
+        }
+        portable_trace_omitted = portable_trace_omitted or
+            std.mem.eql(u8, path, "evidence.trace_ref");
+    }
+    try std.testing.expect(relative_kind_seen);
+    try std.testing.expect(!portable_trace_omitted);
+    try std.testing.expect(std.mem.indexOf(u8, first_projection, portable_trace_ref) != null);
 
     var unknown_bytes = try std.testing.allocator.dupe(u8, hctp_fixtures.valid_run_receipt);
     defer std.testing.allocator.free(unknown_bytes);
@@ -18855,6 +24444,271 @@ test "hylo run receipt proof projection is deterministic and fails closed under 
     try std.testing.expectError(error.ProofBundleLocalLocatorLeak, validateProofSanitizedValue(leaked.value));
 }
 
+test "hylo private proof replay restores public materialization claim state" {
+    const claim = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    var parsed = try parseValue(
+        std.testing.allocator,
+        "{\"materialization_claim_fingerprint\":\"sha256:" ++
+            "444444444444444444444444444444444444444444444444" ++ "4444444444444444\"}",
+    );
+    defer parsed.deinit();
+    const materialization = try jsonObject(parsed.value);
+    var lane: hctp.LaneState = .{
+        .id = @constCast("lane-private"),
+        .unit_id = @constCast("unit-private"),
+        .scenario_id = @constCast("scenario-private"),
+        .pair_id = @constCast("pair-private"),
+        .arm_id = @constCast("opaque-private"),
+    };
+
+    const staged = (try proofProjectedMaterializationClaimCopyAlloc(
+        std.testing.allocator,
+        materialization,
+        &lane,
+    )) orelse return error.TestFixtureInvalid;
+    defer std.testing.allocator.free(staged);
+    lane.materialization_claim_fingerprint = staged;
+    try std.testing.expectEqualStrings(claim, lane.materialization_claim_fingerprint.?);
+    try std.testing.expect((try proofProjectedMaterializationClaimCopyAlloc(
+        std.testing.allocator,
+        materialization,
+        &lane,
+    )) == null);
+
+    const root = try jsonObjectPtr(&parsed.value);
+    try root.put(
+        parsed.arena.allocator(),
+        "materialization_claim_fingerprint",
+        .{ .string = @constCast("sha256:55555555555555555555555555555555555555555" ++
+            "55555555555555555555555") },
+    );
+    try std.testing.expectError(
+        error.RunReceiptInvalid,
+        proofProjectedMaterializationClaimCopyAlloc(
+            std.testing.allocator,
+            materialization,
+            &lane,
+        ),
+    );
+    try root.put(
+        parsed.arena.allocator(),
+        "materialization_claim_fingerprint",
+        .{ .string = @constCast("sha256:forged") },
+    );
+    try std.testing.expectError(
+        error.InvalidFingerprint,
+        proofProjectedMaterializationClaimCopyAlloc(
+            std.testing.allocator,
+            materialization,
+            &lane,
+        ),
+    );
+}
+const rm_keys = .{ "arm_value_fingerprint", "target_snapshot_ref", "target_snapshot_fingerprint" };
+test "hylo private run receipt proof projection rejects supplemental root and nested fields" {
+    var receipt = try parseValue(std.testing.allocator, hctp_fixtures.valid_run_receipt);
+    defer receipt.deinit();
+    const ra = receipt.arena.allocator();
+    const root = try jsonObjectPtr(&receipt.value);
+    try root.put(
+        ra,
+        "schema",
+        .{ .string = @constCast(PrivateRunReceiptSourceSchema) },
+    );
+    const producer = try op(root.getPtr("producer") orelse return error.TestFixtureInvalid);
+    try producer.put(ra, "receiver_role", .{ .string = @constCast("runner") });
+    try producer.put(ra, "receiver_key_id", .{ .string = @constCast("runner-key") });
+    const materialization = try jsonObjectPtr(
+        root.getPtr("materialization") orelse return error.TestFixtureInvalid,
+    );
+    inline for (rm_keys) |key| {
+        _ = materialization.orderedRemove(key);
+    }
+    try materialization.put(ra, "visibility", .{ .string = @constCast("commitment_only") });
+    try materialization.put(
+        ra,
+        "treatment_commitment",
+        .{ .string = @constCast("sha256:11111111111111111111111111111111111111111" ++
+            "11111111111111111111111") },
+    );
+    try materialization.put(
+        ra,
+        "materialization_claim_fingerprint",
+        .{ .string = @constCast("sha256:44444444444444444444444444444444444444444" ++
+            "44444444444444444444444") },
+    );
+    const isolation = try op(root.getPtr("isolation") orelse return error.TestFixtureInvalid);
+    try isolation.put(ra, "capability_sealed", .{ .bool = false });
+    try isolation.put(ra, "os_confinement", .{ .bool = false });
+    const native = try op(root.getPtr("native_receipt") orelse return error.TestFixtureInvalid);
+    const native_receipt = try op(native.getPtr("receipt") orelse return error.TestFixtureInvalid);
+    const execution = try jsonObjectPtr(
+        native_receipt.getPtr("execution") orelse return error.TestFixtureInvalid,
+    );
+    try execution.put(
+        ra,
+        "execution_audit_fingerprint",
+        .{ .string = @constCast("sha256:22222222222222222222222222222222222222222" ++
+            "22222222222222222222222") },
+    );
+    try execution.put(ra, "execution_audit_ref", .{ .string = @constCast("artifact:audit") });
+    try execution.put(ra, "executor", .{ .string = @constCast("executor") });
+    try execution.put(
+        ra,
+        "executor_binary_fingerprint",
+        .{ .string = @constCast("sha256:33333333333333333333333333333333333333333" ++
+            "33333333333333333333333") },
+    );
+    try execution.put(ra, "internal_execution_verified", .{ .bool = true });
+    try execution.put(
+        ra,
+        "observation_scope",
+        .{ .string = @constCast("registered-executor-audit") },
+    );
+    const projection_bytes = try runReceiptProofProjectionAlloc(t.allocator, receipt.value);
+    defer std.testing.allocator.free(projection_bytes);
+    var projection = try parseValue(std.testing.allocator, projection_bytes);
+    defer projection.deinit();
+    try validateRunReceiptProofProjection(projection.value);
+
+    const projection_allocator = projection.arena.allocator();
+    const pr = try jsonObjectPtr(&projection.value);
+    const projected_materialization = try jsonObjectPtr(
+        pr.getPtr("materialization") orelse return error.TestFixtureInvalid,
+    );
+    const retained_claim = projected_materialization.get(
+        "materialization_claim_fingerprint",
+    ) orelse return error.TestFixtureInvalid;
+    if (!projected_materialization.orderedRemove("materialization_claim_fingerprint")) {
+        return error.TestFixtureInvalid;
+    }
+    try std.testing.expectError(
+        error.ProofProjectionSemanticMutation,
+        validateRunReceiptProofProjection(projection.value),
+    );
+    try projected_materialization.put(
+        projection_allocator,
+        "materialization_claim_fingerprint",
+        retained_claim,
+    );
+    const claim_value = projected_materialization.getPtr(
+        "materialization_claim_fingerprint",
+    ) orelse return error.TestFixtureInvalid;
+    claim_value.* = .{ .string = @constCast("sha256:forged") };
+    try std.testing.expectError(
+        error.InvalidFingerprint,
+        validateRunReceiptProofProjection(projection.value),
+    );
+    claim_value.* = retained_claim;
+    try validateRunReceiptProofProjection(projection.value);
+
+    const fir_projection_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"decision_context_fingerprint\":\"sha256:2222" ++
+            "222222222222222222222222222222222222222222222222" ++ "222222222222\"," ++
+            "\"episode_identity_fingerprint\":\"sha256:eeeeee" ++
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ++ "eeeeeeeeee\"," ++
+            "\"fir_receipt_fingerprint\":\"sha256:fffffffffff" ++
+            "ffffffffffffffffffffffffffffffffffffffffffffffff" ++ "fffff\"," ++
+            "\"lane_id\":{f},\"replay_plan_fingerprint\":\"sh" ++
+            "a256:3333333333333333333333333333333333333333333" ++ "333333333333333333333\"," ++
+            "\"required_lineage\":\"rollout_transcript\",\"schema\":{f}," ++
+            "\"source_governance_fingerprint\":\"sha256:11111" ++
+            "111111111111111111111111111111111111111111111111" ++ "11111111111\"," ++
+            "\"source_profile_fingerprint\":\"sha256:44444444" ++
+            "444444444444444444444444444444444444444444444444" ++ "44444444\"," ++
+            "\"source_target_text_witness_fingerprint\":\"sha" ++
+            "256:55555555555555555555555555555555555555555555" ++ "55555555555555555555\"," ++
+            "\"trial_id\":{f},\"validated\":true}}",
+        .{
+            std.json.fmt(try jsonRequiredString(pr.*, "lane_id"), .{}),
+            std.json.fmt(hctp.FirPublicProjectionSchema, .{}),
+            std.json.fmt(try jsonRequiredString(pr.*, "trial_id"), .{}),
+        },
+    );
+    defer std.testing.allocator.free(fir_projection_bytes);
+    var fir_projection = try parseValue(std.testing.allocator, fir_projection_bytes);
+    defer fir_projection.deinit();
+    const fir_projection_fingerprint = try hctp.digestValueAlloc(
+        std.testing.allocator,
+        fir_projection.value,
+    );
+    defer std.testing.allocator.free(fir_projection_fingerprint);
+    const fir_native_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fingerprint\":{f},\"kind\":{f},\"receipt\":{s},\"ref\":\"artifact:{s}\"}}",
+        .{
+            std.json.fmt(fir_projection_fingerprint, .{}),
+            std.json.fmt(hctp.FirPublicProjectionKind, .{}),
+            fir_projection_bytes,
+            fir_projection_fingerprint,
+        },
+    );
+    defer std.testing.allocator.free(fir_native_bytes);
+    var fir_native = try parseValue(std.testing.allocator, fir_native_bytes);
+    defer fir_native.deinit();
+    try pr.put(projection_allocator, "native_receipt", fir_native.value);
+    const proof_omissions_value = pr.getPtr(ProofOmissionsKey) orelse
+        return error.TestFixtureInvalid;
+    if (proof_omissions_value.* != .array) return error.TestFixtureInvalid;
+    var omission_index: usize = 0;
+    while (omission_index < proof_omissions_value.array.items.len) : (omission_index += 1) {
+        const omission = try jsonObject(proof_omissions_value.array.items[omission_index]);
+        if (std.mem.eql(
+            u8,
+            try jsonRequiredString(omission, "path"),
+            "native_receipt.ref",
+        )) {
+            _ = proof_omissions_value.array.orderedRemove(omission_index);
+            break;
+        }
+    }
+    try validateRunReceiptProofProjection(projection.value);
+    const fir_public_receipt = try jsonObjectPtr(
+        fir_native.value.object.getPtr("receipt") orelse return error.TestFixtureInvalid,
+    );
+    inline for (.{ "{}", "[{}]" }) |invalid_token_usage| {
+        const injected_bytes = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"inquiry\":{{\"token_usage\":{s}}}}}",
+            .{invalid_token_usage},
+        );
+        defer std.testing.allocator.free(injected_bytes);
+        var injected = try parseValue(std.testing.allocator, injected_bytes);
+        defer injected.deinit();
+        try fir_public_receipt.put(
+            fir_native.arena.allocator(),
+            "fork_inquiry_receipt",
+            injected.value,
+        );
+        try std.testing.expectError(
+            error.ProofProjectionSemanticMutation,
+            validateRunReceiptProofProjection(projection.value),
+        );
+        _ = fir_public_receipt.orderedRemove("fork_inquiry_receipt");
+    }
+    try pr.put(
+        projection_allocator,
+        "filesystem_observation",
+        .{ .object = try std.json.ObjectMap.init(projection_allocator, &.{}, &.{}) },
+    );
+    try std.testing.expectError(
+        error.ProofProjectionSemanticMutation,
+        validateRunReceiptProofProjection(projection.value),
+    );
+    _ = pr.orderedRemove("filesystem_observation");
+    const runtime = try op(pr.getPtr("runtime") orelse return error.TestFixtureInvalid);
+    try runtime.put(
+        projection_allocator,
+        "private_target_materialization",
+        .{ .object = try std.json.ObjectMap.init(projection_allocator, &.{}, &.{}) },
+    );
+    try std.testing.expectError(
+        error.ProofProjectionSemanticMutation,
+        validateRunReceiptProofProjection(projection.value),
+    );
+}
+
 test "hylo proof sanitizer distinguishes canonical Ed25519 Base64 from local locators" {
     const signature_bytes: [std.crypto.sign.Ed25519.Signature.encoded_length]u8 = @splat(0xfc);
     var encoded_buffer: [std.base64.standard.Encoder.calcSize(signature_bytes.len)]u8 = undefined;
@@ -18900,6 +24754,150 @@ test "hylo proof sanitizer distinguishes canonical Ed25519 Base64 from local loc
     try std.testing.expectError(
         error.ProofBundleLocalLocatorLeak,
         validateProofSanitizedValue(wrong_algorithm.value),
+    );
+}
+
+test "hylo proof sanitizer admits typed ordinary-root attestations only" {
+    const signature_bytes: [std.crypto.sign.Ed25519.Signature.encoded_length]u8 = @splat(0xfc);
+    var signature_buffer: [std.base64.standard.Encoder.calcSize(signature_bytes.len)]u8 = undefined;
+    const signature = std.base64.standard.Encoder.encode(&signature_buffer, &signature_bytes);
+    try std.testing.expectEqual(@as(u8, '/'), signature[0]);
+
+    inline for (.{
+        "hylo-grade-receipt/v1",
+        "hylo-grade-presentation-receipt/v1",
+        "hylo-run-receipt-proof-projection/v2",
+    }) |root_schema| {
+        const typed_bytes = try std.mem.concat(
+            std.testing.allocator,
+            u8,
+            &.{
+                "{\"schema\":\"",
+                root_schema,
+                "\",\"attestation\":{\"schema\":\"hylo-attestation/v1\",\"subject_schema\":\"",
+                root_schema,
+                "\",\"signature\":{\"algorithm\":\"ed25519\",\"value_base64\":\"",
+                signature,
+                "\"}}}",
+            },
+        );
+        defer std.testing.allocator.free(typed_bytes);
+        var typed = try parseValue(std.testing.allocator, typed_bytes);
+        defer typed.deinit();
+        try validateProofSanitizedValue(typed.value);
+    }
+
+    var typed_locator = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-grade-presentation-receipt/v1" ++
+            "\",\"attestation\":{\"schema\":\"hylo-attestatio" ++
+            "n/v1\",\"subject_schema\":\"hylo-grade-presentat" ++
+            "ion-receipt/v1\",\"signature\":{\"algorithm\":\"" ++
+            "ed25519\",\"value_base64\":\"/private/hylo/grade" ++ "r-signature\"}}}",
+    );
+    defer typed_locator.deinit();
+    try std.testing.expectError(
+        error.ProofSanitizationAttestationInvalid,
+        validateProofSanitizedValue(typed_locator.value),
+    );
+
+    const untyped_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-grade-presentation-receipt/v1" ++
+                "\",\"signature\":{\"algorithm\":\"ed25519\",\"va" ++ "lue_base64\":\"",
+            signature,
+            "\"}}",
+        },
+    );
+    defer std.testing.allocator.free(untyped_bytes);
+    var untyped = try parseValue(std.testing.allocator, untyped_bytes);
+    defer untyped.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(untyped.value),
+    );
+}
+
+test "hylo proof sanitizer admits campaign proof keys only at exact typed paths" {
+    const public_key_bytes: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = @splat(0xfc);
+    var public_key_buffer: [std.base64.standard.Encoder.calcSize(public_key_bytes.len)]u8 =
+        undefined;
+    const public_key = std.base64.standard.Encoder.encode(&public_key_buffer, &public_key_bytes);
+    try std.testing.expectEqual(@as(u8, '/'), public_key[0]);
+
+    const campaign_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-campaign/v1\",\"trial_policy" ++
+                "\":{\"proof_authority\":{\"schema\":\"hylo-proof" ++
+                "-authority/v1\",\"public_key_base64\":\"",
+            public_key,
+            "\"},\"proof_trust_policy\":{\"schema\":\"hylo-tr" ++
+                "ust-policy/v1\",\"keys\":[{\"public_key_base64\"" ++ ":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(campaign_bytes);
+    var campaign = try parseValue(std.testing.allocator, campaign_bytes);
+    defer campaign.deinit();
+    try validateProofSanitizedValue(campaign.value);
+
+    const event_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"hylo-event/v1\",\"body\":{{\"payload\":{{\"campaign\":{s}}}}}}}",
+        .{campaign_bytes},
+    );
+    defer std.testing.allocator.free(event_bytes);
+    var event = try parseValue(std.testing.allocator, event_bytes);
+    defer event.deinit();
+    try validateProofSanitizedValue(event.value);
+
+    var authority_locator = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-campaign/v1\",\"trial_policy" ++
+            "\":{\"proof_authority\":{\"schema\":\"hylo-proof" ++
+            "-authority/v1\",\"public_key_base64\":\"/private" ++ "/hylo/proof-authority.key\"}}}",
+    );
+    defer authority_locator.deinit();
+    try std.testing.expectError(
+        error.ProofSanitizationPublicKeyInvalid,
+        validateProofSanitizedValue(authority_locator.value),
+    );
+
+    var trust_locator = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-campaign/v1\",\"trial_policy" ++
+            "\":{\"proof_trust_policy\":{\"schema\":\"hylo-tr" ++
+            "ust-policy/v1\",\"keys\":[{\"public_key_base64\"" ++
+            ":\"/private/hylo/trust-policy.key\"}]}}}",
+    );
+    defer trust_locator.deinit();
+    try std.testing.expectError(
+        error.ProofSanitizationPublicKeyInvalid,
+        validateProofSanitizedValue(trust_locator.value),
+    );
+
+    const untyped_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"test/v1\",\"trial_policy\":{\"proo" ++
+                "f_authority\":{\"schema\":\"hylo-proof-authority" ++
+                "/v1\",\"public_key_base64\":\"",
+            public_key,
+            "\"}}}",
+        },
+    );
+    defer std.testing.allocator.free(untyped_bytes);
+    var untyped = try parseValue(std.testing.allocator, untyped_bytes);
+    defer untyped.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(untyped.value),
     );
 }
 
@@ -19368,7 +25366,7 @@ test "HCTP Section 36 case 68: complete post-reveal proof round trips across mem
     const proof_trial = try testProofTrialAlloc(std.testing.allocator, repo);
     defer std.testing.allocator.free(proof_trial);
 
-    var memory_backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-proof-complete");
+    var memory_backend = MES.init(std.testing.allocator, "memory:hctp-proof-complete");
     defer memory_backend.deinit();
     const memory_store = memory_backend.eventStore();
     try testSeedProofProfileCampaign(std.testing.allocator, repo, memory_store, "[\"absolute_qualification\",\"noninferiority\"]");
@@ -19476,6 +25474,7 @@ test "HCTP Section 36 case 68: complete post-reveal proof round trips across mem
         repo,
         crash_reloaded_store,
         hctp_fixtures.valid_reveal,
+        .legacy_v1,
     );
     defer std.testing.allocator.free(persistent_result_fingerprint);
 
@@ -19689,7 +25688,7 @@ test "hylo live proof prefix remains anchored through a valid later same-campaig
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-proof-prefix-suffix");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-proof-prefix-suffix");
     defer backend.deinit();
     const store = backend.eventStore();
     const proof_trial = try testProofTrialAlloc(std.testing.allocator, repo);
@@ -19757,7 +25756,7 @@ test "hylo case-blind promotion proof exports a production sealed source receipt
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-case-blind-proof");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-case-blind-proof");
     defer backend.deinit();
     const store = backend.eventStore();
     var harness = try testSetupCaseBlindPromotionProof(
@@ -19882,7 +25881,7 @@ test "hylo target-snapshot promotion proof carries both executed arms and reject
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-target-proof");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-target-proof");
     defer backend.deinit();
     const store = backend.eventStore();
     var harness = try testSetupCompletedPromotionProfile(
@@ -20134,7 +26133,7 @@ test "HCTP Section 36 case 69: proof verification detects artifact event attesta
         .{ "artifact-tampered.tar", "artifact:output-a0" },
         .{ "event-tampered.tar", "\"kind\":\"campaign_created\"" },
         .{ "attestation-tampered.tar", "\"value_base64\":\"" },
-        .{ "manifest-tampered.tar", "bundle-trial-null-001" },
+        .{ "manifest-tampered.tar", "\"bundle_id\":\"bundle:sha256:" },
     }) |mutation| {
         const path = try std.fs.path.join(std.testing.allocator, &.{ repo, mutation[0] });
         defer std.testing.allocator.free(path);
@@ -20169,17 +26168,124 @@ test "hylo proof sanitizer rejects an injected private capability" {
     try std.testing.expectEqual(@as(usize, 0), artifacts.items.len);
 }
 
+test "hylo proof sanitizer rejects private semantic fields but preserves disclosure booleans" {
+    inline for (.{
+        "chain_of_thought",
+        "future_outcome",
+        "future_outcome_ref",
+        "grade_opening",
+        "grade_openings",
+        "hidden_oracle_ref",
+        "hidden_oracle",
+        "hidden_oracle_text",
+        "hidden_reasoning",
+        "historical_answer",
+        "historical_response",
+        "historical_response_ref",
+        "private_reasoning",
+        "source_target_text",
+    }) |forbidden_key| {
+        const artifact_text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"schema\":\"hylo-grade-receipt/v1\",{f}:\"private semantic text\"}}",
+            .{std.json.fmt(forbidden_key, .{})},
+        );
+        defer std.testing.allocator.free(artifact_text);
+        var artifact = try parseValue(std.testing.allocator, artifact_text);
+        defer artifact.deinit();
+        try std.testing.expectError(
+            error.ProofBundleSecretLeak,
+            validateProofSanitizedValue(artifact.value),
+        );
+        var artifacts: std.ArrayList(ProofArtifact) = .empty;
+        defer proofArtifactsDeinit(std.testing.allocator, &artifacts);
+        try std.testing.expectError(
+            error.ProofBundleSecretLeak,
+            addProofJsonArtifact(
+                std.testing.allocator,
+                &artifacts,
+                "trial/private-grade.json",
+                artifact.value,
+                "absolute_grader",
+                "sanitized",
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 0), artifacts.items.len);
+    }
+
+    var event = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-event/v1\",\"body\":{\"payloa" ++
+            "d\":{\"grade_receipt\":{\"schema\":\"hylo-grade-" ++
+            "receipt/v1\",\"private_reasoning\":\"must not pu" ++ "blish\"}}}}",
+    );
+    defer event.deinit();
+    try std.testing.expectError(
+        error.ProofBundleSecretLeak,
+        proofSafeValidatedJsonAlloc(std.testing.allocator, event.value),
+    );
+
+    var hidden_reference_event = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-event/v1\",\"body\":{\"payloa" ++
+            "d\":{\"hidden_reference\":{\"historical_response" ++
+            "_ref\":\"custody:historical-response.sealed.json" ++ "\"}}}}",
+    );
+    defer hidden_reference_event.deinit();
+    try std.testing.expectError(
+        error.ProofBundleSecretLeak,
+        validateProofSanitizedValue(hidden_reference_event.value),
+    );
+    try std.testing.expectError(
+        error.ProofBundleSecretLeak,
+        proofSafeValidatedJsonAlloc(std.testing.allocator, hidden_reference_event.value),
+    );
+    var disclosed_hidden_reference = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-grade-presentation-receipt/v1" ++
+            "\",\"disclosure\":{\"hidden_reference\":true}}",
+    );
+    defer disclosed_hidden_reference.deinit();
+    try std.testing.expectError(
+        error.ProofBundleSecretLeak,
+        validateProofSanitizedValue(disclosed_hidden_reference.value),
+    );
+
+    var public_disclosure = try parseValue(
+        std.testing.allocator,
+        "{\"schema\":\"hylo-grade-presentation-receipt/v1" ++
+            "\",\"disclosure\":{\"hidden_reference\":false}}",
+    );
+    defer public_disclosure.deinit();
+    try validateProofSanitizedValue(public_disclosure.value);
+    var public_artifacts: std.ArrayList(ProofArtifact) = .empty;
+    defer proofArtifactsDeinit(std.testing.allocator, &public_artifacts);
+    try addProofJsonArtifact(
+        std.testing.allocator,
+        &public_artifacts,
+        "trial/public-disclosure.json",
+        public_disclosure.value,
+        "materializer",
+        "sealed",
+    );
+    try std.testing.expectEqual(@as(usize, 1), public_artifacts.items.len);
+}
 test "hylo proof verifier exact-joins publication event artifact result and target snapshot" {
     const snapshot_bytes = "{\"entries\":[],\"schema\":\"hylo-target-snapshot/v1\"}";
     var snapshot = try parseValue(std.testing.allocator, snapshot_bytes);
     defer snapshot.deinit();
     const snapshot_fingerprint = try hctp.digestValueAlloc(std.testing.allocator, snapshot.value);
     defer std.testing.allocator.free(snapshot_fingerprint);
-    const result_fingerprint = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-    const candidate_target = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const result_fingerprint = "sha256:11111111111111111111111111111111111111111" ++
+        "11111111111111111111111";
+    const candidate_target = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+        "bbbbbbbbbbbbbbbbbbbbbbb";
     const publication_bytes = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"candidate_target_fingerprint\":{f},\"commit_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"promotion_trial_id\":\"trial-proof\",\"promotion_trial_result_fingerprint\":{f},\"schema\":\"hylo-publication/v1\",\"status\":\"committed\"}}",
+        "{{\"candidate_target_fingerprint\":{f},\"commit_sha\":\"aaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"promotion_trial_id\":\"trial-proof\"," ++
+            "\"promotion_trial_result_fingerprint\":{f},\"schema\":" ++
+            "\"hylo-publication/v1\",\"status\":\"committed\"}}",
         .{ std.json.fmt(candidate_target, .{}), std.json.fmt(result_fingerprint, .{}) },
     );
     defer std.testing.allocator.free(publication_bytes);
@@ -20228,7 +26334,6 @@ test "hylo proof verifier exact-joins publication event artifact result and targ
         try jsonObject(trial.value),
         try jsonObject(result.value),
     );
-
     const forged_publication = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -20340,7 +26445,7 @@ test "hylo proof verifier binds calibration artifacts to derived sentinel result
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-calibration-proof-binding");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-calibration-proof-binding");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -20497,7 +26602,7 @@ test "HCTP Section 36 case 2: rejects unknown campaigns and unadmitted scenarios
     defer before.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.CampaignMissing,
-        cmdRegisterTrial(std.testing.allocator, repo, store, missing_campaign_path),
+        cmdRegisterTrial(std.testing.allocator, repo, store, missing_campaign_path, null),
     );
     var after = try store.snapshot(std.testing.allocator, MaxStoreBytes);
     defer after.deinit(std.testing.allocator);
@@ -20520,7 +26625,7 @@ test "HCTP Section 36 case 2: rejects unknown campaigns and unadmitted scenarios
     defer before_unknown.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.ScenarioNotAdmitted,
-        cmdRegisterTrial(std.testing.allocator, repo, store, unknown_scenario_path),
+        cmdRegisterTrial(std.testing.allocator, repo, store, unknown_scenario_path, null),
     );
     var after_unknown = try store.snapshot(std.testing.allocator, MaxStoreBytes);
     defer after_unknown.deinit(std.testing.allocator);
@@ -20773,7 +26878,7 @@ test "protected evidence exposure remains irreversible across trial closure" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(
+    var backend = MES.init(
         std.testing.allocator,
         "memory:protected-evidence-exposure",
     );
@@ -21126,7 +27231,7 @@ test "hylo lane start emits the exact canonical lease accepted by the retained l
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-round-trip");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-round-trip");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21179,7 +27284,7 @@ test "hylo lane start rejects regular character and socket lease sinks without a
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-delivery");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-delivery");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21322,7 +27427,7 @@ test "hylo lane start delivery failure appends no durable start" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-delivery-failure");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-delivery-failure");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21364,7 +27469,7 @@ test "hylo retained lease commit appends once and exact retries reuse the start 
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-retained-commit");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-retained-commit");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21495,7 +27600,7 @@ test "hylo lane start recovery re-emits the exact receipt without append and rej
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-start-recovery");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-start-recovery");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21504,7 +27609,7 @@ test "hylo lane start recovery re-emits the exact receipt without append and rej
     const retained_lease = "HYL1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const lease_digest = try digestBytesAlloc(std.testing.allocator, retained_lease);
     defer std.testing.allocator.free(lease_digest);
-    const recovery_args = try parseArgs(&.{
+    const recovery_args = try parseArgs(std.testing.allocator, &.{
         "ledger",
         "recover-lane-start",
         "--campaign-id",
@@ -21601,7 +27706,7 @@ test "hylo lane finish recovery requires exact terminal receipt and lease withou
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-finish-recovery");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-finish-recovery");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21611,7 +27716,7 @@ test "hylo lane finish recovery requires exact terminal receipt and lease withou
     const retained_lease = "HYL1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const lease_digest = try digestBytesAlloc(std.testing.allocator, retained_lease);
     defer std.testing.allocator.free(lease_digest);
-    const recovery_args = try parseArgs(&.{
+    const recovery_args = try parseArgs(std.testing.allocator, &.{
         "ledger",
         "recover-lane-finish",
         "--receipt",
@@ -21763,7 +27868,7 @@ test "hylo failed duplicate lane start discloses no lease bytes" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-append-failure");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-append-failure");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21802,7 +27907,7 @@ test "hylo lane start rejects a regular-file lease endpoint" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-wrong-owner");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-wrong-owner");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21841,7 +27946,7 @@ test "hylo lane materialization exact-joins lineage and selected registered arm"
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-materialization");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-lane-materialization");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -21925,7 +28030,7 @@ test "hylo trial registration binds execution effect policy to the admitted scen
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(
+    var backend = MES.init(
         std.testing.allocator,
         "memory:hctp-effect-policy-binding",
     );
@@ -21975,7 +28080,7 @@ test "hylo exclusive registration revalidates the Git intervention" {
     const baseline_raw = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "rev-parse", "HEAD" });
     defer std.testing.allocator.free(baseline_raw);
     const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-registration-revalidation");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-registration-revalidation");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedOneScenarioProfileCampaign(
@@ -22027,6 +28132,72 @@ test "hylo exclusive registration revalidates the Git intervention" {
     try std.testing.expectEqual(before.records.len, after.records.len);
 }
 
+test "hylo private registration rejects a stale semantic campaign view without append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(
+        allocator,
+        "memory:hctp-private-registration-stale-campaign",
+    );
+    defer backend.deinit();
+    const store = backend.eventStore();
+    try testSeedProfileCampaign(allocator, repo, store, "[\"absolute_qualification\"]");
+
+    const stale_environment =
+        "sha256:abababababababababababababababababababababababababababababababab";
+    const stale_semantic_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        stale_environment,
+    );
+    defer allocator.free(stale_semantic_bytes);
+    var stale_semantic = try parseValue(allocator, stale_semantic_bytes);
+    defer stale_semantic.deinit();
+
+    // The stale preflight view accepts the semantic trial, while the exact
+    // authoritative snapshot retained by the store still owns the original
+    // scenario environment.
+    var preflight = try loadLedgerFromStore(allocator, store);
+    defer preflight.deinit(allocator);
+    const preflight_campaign = &preflight.campaigns.items[0];
+    const scenario = &preflight_campaign.scenarios.items[0];
+    const authoritative_environment = scenario.environment_fingerprint;
+    scenario.environment_fingerprint = @constCast(stale_environment);
+    try validateTrialAgainstCampaign(allocator, preflight_campaign, stale_semantic.value);
+    scenario.environment_fingerprint = authoritative_environment;
+
+    var public_payload = try parseValue(
+        allocator,
+        "{\"trial_fingerprint\":\"sha256:cccccccccccccccc" ++
+            "cccccccccccccccccccccccccccccccccccccccccccccccc" ++
+            "\",\"trial\":{\"campaign_id\":\"cmp-test\",\"fac" ++
+            "tor\":{\"kind\":\"null\"},\"schema\":\"hylo-tria" ++
+            "l/v2\",\"trial_id\":\"trial-null-001\"}}",
+    );
+    defer public_payload.deinit();
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    try std.testing.expectError(
+        error.EnvironmentMismatch,
+        appendPrivateTrialRegistrationEvent(
+            allocator,
+            repo,
+            store,
+            "cmp-test",
+            public_payload.value,
+            stale_semantic.value,
+        ),
+    );
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before, after);
+}
+
 test "hylo promotion registration binds the logical change epoch to the exact live Git base" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -22034,7 +28205,7 @@ test "hylo promotion registration binds the logical change epoch to the exact li
     defer std.testing.allocator.free(repo);
     try runTestGit(std.testing.allocator, repo, &.{ "init", "--quiet" });
     try runTestGit(std.testing.allocator, repo, &.{ "config", "user.name", "Hylo Trial Test" });
-    try runTestGit(std.testing.allocator, repo, &.{ "config", "user.email", "hylo-trial@example.invalid" });
+    try runTestGit(t.allocator, repo, &.{ "config", "user.email", "hylo-trial@example.invalid" });
     const gitignore_path = try std.fs.path.join(std.testing.allocator, &.{ repo, ".gitignore" });
     defer std.testing.allocator.free(gitignore_path);
     const target_path = try std.fs.path.join(std.testing.allocator, &.{ repo, "target.txt" });
@@ -22054,7 +28225,7 @@ test "hylo promotion registration binds the logical change epoch to the exact li
     defer std.testing.allocator.free(baseline_raw);
     const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
 
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-change-base-identity");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-change-base-identity");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedTwoScenarioProfileCampaign(
@@ -22141,7 +28312,7 @@ test "hylo pre-reveal inspect blinds semantic arms and withholds grades" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-blinded-inspect");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-blinded-inspect");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -22191,7 +28362,7 @@ test "hylo inspect kinds project their authoritative evidence" {
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-inspect-evidence");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-inspect-evidence");
     defer backend.deinit();
     const store = backend.eventStore();
     try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
@@ -22219,7 +28390,7 @@ test "hylo report attributes publication by trial and routes from frozen claims"
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-report-policy");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-report-policy");
     defer backend.deinit();
     const store = backend.eventStore();
     var harness = try testSetupCompletedPromotionProfile(
@@ -22449,7 +28620,7 @@ test "HCTP promotion publication requires absolute qualification beyond selected
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-publication-qualification-floor");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-publication-qualification-floor");
     defer backend.deinit();
     const store = backend.eventStore();
     var harness = try testSetupFailedPromotion(
@@ -22930,7 +29101,7 @@ test "hylo duplicate committed publication for one promotion trial is rejected w
     defer tmp.cleanup();
     const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(repo);
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-duplicate-trial-publication");
+    var backend = MES.init(std.testing.allocator, "memory:hctp-duplicate-trial-publication");
     defer backend.deinit();
     const store = backend.eventStore();
     var harness = try testSetupCompletedPromotion(
@@ -23292,7 +29463,7 @@ test "hylo event stores remain repo local" {
 }
 
 test "hylo appends and folds through backend-independent event stores" {
-    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hylo-test");
+    var backend = MES.init(std.testing.allocator, "memory:hylo-test");
     defer backend.deinit();
     const store = backend.eventStore();
     const intent = try testCampaignIntentAlloc(std.testing.allocator);
@@ -23786,4 +29957,6800 @@ test "hylo legacy ledger rejects gaming and refuses target publication" {
     defer std.testing.allocator.free(tampered_path);
     try durable_store.writeTextAtomic(std.testing.allocator, tampered_path, tampered);
     try std.testing.expectError(error.EventDigestMismatch, loadTestLedger(std.testing.allocator, tampered_path));
+}
+
+test "hylo trial compiler argument carriers are complete and mutually exclusive" {
+    const materialization_base = [_][]const u8{
+        "ledger",
+        "lane-materialization",
+        "--trial-id",
+        "trial",
+        "--lane-id",
+        "lane",
+        "--registration-event-digest",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--lane-started-event-digest",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--lane-lease-digest",
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    };
+    var legacy_materialization_args = try parseArgs(
+        std.testing.allocator,
+        &materialization_base,
+    );
+    defer legacy_materialization_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        Command.lane_materialization,
+        legacy_materialization_args.command.?,
+    );
+    try std.testing.expect(legacy_materialization_args.lease_input_fd == null);
+
+    var private_materialization_argv: std.ArrayList([]const u8) = .empty;
+    defer private_materialization_argv.deinit(std.testing.allocator);
+    try private_materialization_argv.appendSlice(std.testing.allocator, &materialization_base);
+    try private_materialization_argv.appendSlice(std.testing.allocator, &.{
+        "--custody-input-fd",
+        "7",
+        "--lease-input-fd",
+        "8",
+        "--materialization-output-fd",
+        "9",
+    });
+    var private_materialization_args = try parseArgs(
+        std.testing.allocator,
+        private_materialization_argv.items,
+    );
+    defer private_materialization_args.deinit(std.testing.allocator);
+    try t.expectEqual(@as(px.fd_t, 8), private_materialization_args.lease_input_fd.?);
+
+    var partial_private_argv: std.ArrayList([]const u8) = .empty;
+    defer partial_private_argv.deinit(std.testing.allocator);
+    try partial_private_argv.appendSlice(std.testing.allocator, &materialization_base);
+    try partial_private_argv.appendSlice(std.testing.allocator, &.{
+        "--custody-input-fd",
+        "7",
+        "--materialization-output-fd",
+        "9",
+    });
+    try std.testing.expectError(
+        error.LaneMaterializationArgumentsInvalid,
+        parseArgs(std.testing.allocator, partial_private_argv.items),
+    );
+
+    var legacy_with_raw_lease_argv: std.ArrayList([]const u8) = .empty;
+    defer legacy_with_raw_lease_argv.deinit(std.testing.allocator);
+    try legacy_with_raw_lease_argv.appendSlice(std.testing.allocator, &materialization_base);
+    try legacy_with_raw_lease_argv.appendSlice(std.testing.allocator, &.{
+        "--lease-input-fd",
+        "8",
+    });
+    try std.testing.expectError(
+        error.LeaseInputNotAllowed,
+        parseArgs(std.testing.allocator, legacy_with_raw_lease_argv.items),
+    );
+
+    var start_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "start-lane",
+        "--campaign-id",
+        "campaign",
+        "--trial-id",
+        "trial",
+        "--lane-id",
+        "lane",
+        "--runner-id",
+        "runner",
+        "--lease-output-fd",
+        "7",
+        "--custody-input-fd",
+        "8",
+    });
+    defer start_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Command.start_lane, start_args.command.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 8), start_args.custody_input_fd.?);
+
+    var commit_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "commit-lane-start",
+        "--campaign-id",
+        "campaign",
+        "--trial-id",
+        "trial",
+        "--lane-id",
+        "lane",
+        "--runner-id",
+        "runner",
+        "--lane-lease-digest",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--lease-input-fd",
+        "7",
+        "--custody-input-fd",
+        "8",
+    });
+    defer commit_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Command.commit_lane_start, commit_args.command.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 8), commit_args.custody_input_fd.?);
+
+    var compile_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "compile-trial",
+        "--request",
+        "request.json",
+        "--source-receipt",
+        "selection.json",
+        "--output",
+        "trial.json",
+        "--custody-output-fd",
+        "7",
+    });
+    defer compile_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Command.compile_trial, compile_args.command.?);
+    try std.testing.expectEqualStrings("request.json", compile_args.request_path.?);
+    try std.testing.expectEqualStrings("selection.json", compile_args.source_receipt_path.?);
+    try std.testing.expectEqualStrings("trial.json", compile_args.output_path.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 7), compile_args.reveal_output_fd.?);
+
+    var compatibility_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "compile-trial",
+        "--request",
+        "request.json",
+        "--source-receipt",
+        "selection.json",
+        "--output",
+        "trial.json",
+        "--reveal-output-fd",
+        "8",
+    });
+    defer compatibility_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 8), compatibility_args.reveal_output_fd.?);
+
+    try std.testing.expectError(
+        error.TrialCompileArgumentsInvalid,
+        parseArgs(std.testing.allocator, &.{
+            "ledger",
+            "compile-trial",
+            "--request",
+            "request.json",
+            "--source-receipt",
+            "selection.json",
+            "--output",
+            "trial.json",
+        }),
+    );
+
+    var reveal_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "reveal-trial",
+        "--custody-input-fd",
+        "8",
+        "--materialization-receipt",
+        "baseline.json",
+        "--materialization-receipt",
+        "candidate.json",
+    });
+    defer reveal_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Command.reveal_trial, reveal_args.command.?);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 8), reveal_args.custody_input_fd.?);
+    try std.testing.expectEqual(@as(usize, 2), reveal_args.materialization_receipt_paths.items.len);
+    try std.testing.expectEqualStrings(
+        "baseline.json",
+        reveal_args.materialization_receipt_paths.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "candidate.json",
+        reveal_args.materialization_receipt_paths.items[1],
+    );
+
+    var reveal_compatibility_args = try parseArgs(std.testing.allocator, &.{
+        "ledger",
+        "reveal-trial",
+        "--reveal-material-fd",
+        "9",
+    });
+    defer reveal_compatibility_args.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(std.posix.fd_t, 9),
+        reveal_compatibility_args.reveal_material_fd.?,
+    );
+
+    try std.testing.expectError(
+        error.RevealNotAllowed,
+        parseArgs(std.testing.allocator, &.{
+            "ledger",
+            "reveal-trial",
+            "--reveal",
+            "legacy.json",
+            "--reveal-material-fd",
+            "8",
+        }),
+    );
+}
+
+test "hylo reveal material round trips only across anonymous directional pipes" {
+    const reveal_material =
+        "{\"schema\":\"hylo-trial-reveal-material/v1\",\"trial_id\":\"trial-test\"}";
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    var writer_open = true;
+    defer {
+        if (writer_open) {
+            _ = std.c.close(pipe_fds[1]);
+        }
+    }
+
+    try std.testing.expectError(
+        error.RevealOutputEndpointUnbound,
+        validateRevealOutputEndpoint(pipe_fds[0]),
+    );
+    try std.testing.expectError(
+        error.RevealMaterialInputEndpointUnbound,
+        validateRevealInputEndpoint(pipe_fds[1]),
+    );
+    try writeRevealMaterialRecord(pipe_fds[1], reveal_material);
+    _ = std.c.close(pipe_fds[1]);
+    writer_open = false;
+    const observed = try readRevealMaterialFdAlloc(std.testing.allocator, pipe_fds[0]);
+    defer {
+        std.crypto.secureZero(u8, observed);
+        std.testing.allocator.free(observed);
+    }
+    try std.testing.expectEqualStrings(reveal_material, observed);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var regular = try tmp.dir.createFile(std.testing.io, "reveal.json", .{});
+    defer regular.close(std.testing.io);
+    try std.testing.expectError(
+        error.RevealOutputEndpointUnbound,
+        validateRevealOutputEndpoint(regular.handle),
+    );
+    try std.testing.expectError(
+        error.RevealMaterialInputEndpointUnbound,
+        validateRevealInputEndpoint(regular.handle),
+    );
+}
+
+test "hylo reveal material is one blocking PIPE_BUF bounded record" {
+    const allocator = std.testing.allocator;
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    var writer_open = true;
+    defer {
+        if (writer_open) _ = std.c.close(pipe_fds[1]);
+    }
+    const pipe_buf = try revealPipeBuf(pipe_fds[1]);
+    const maximum_record = try allocator.alloc(u8, pipe_buf);
+    defer allocator.free(maximum_record);
+    @memset(maximum_record, 'x');
+    try writeRevealMaterialRecord(pipe_fds[1], maximum_record);
+    _ = std.c.close(pipe_fds[1]);
+    writer_open = false;
+    const observed = try readRevealMaterialFdAlloc(allocator, pipe_fds[0]);
+    defer {
+        std.crypto.secureZero(u8, observed);
+        allocator.free(observed);
+    }
+    try std.testing.expectEqualSlices(u8, maximum_record, observed);
+
+    var nonblocking_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&nonblocking_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(nonblocking_fds[0]);
+    defer _ = std.c.close(nonblocking_fds[1]);
+    const raw_flags = std.c.fcntl(nonblocking_fds[1], std.c.F.GETFL);
+    if (raw_flags < 0) return error.TestFdSetupFailed;
+    var flags: std.c.O = @bitCast(@as(u32, @intCast(raw_flags)));
+    flags.NONBLOCK = true;
+    if (std.c.fcntl(nonblocking_fds[1], std.c.F.SETFL, @as(c_int, @bitCast(flags))) < 0) {
+        return error.TestFdSetupFailed;
+    }
+    try std.testing.expectError(
+        error.RevealOutputEndpointUnbound,
+        validateRevealOutputEndpoint(nonblocking_fds[1]),
+    );
+}
+
+test "v2 trial compiler projects source profiles to exact nonsemantic shapes" {
+    const allocator = std.testing.allocator;
+    const profile_fingerprint = "sha256:ccccccccccccccccccccccccccccccccccccccccc" ++
+        "ccccccccccccccccccccccc";
+    inline for (.{ "open", "result_blind", "case_blind" }) |visibility| {
+        var direct = try parseValue(
+            allocator,
+            "{\"case\":{\"source_profile_fingerprint\":\"sha2" ++
+                "56:ccccccccccccccccccccccccccccccccccccccccccccc" ++ "ccccccccccccccccccc\"}," ++
+                "\"profile\":{\"kind\":\"direct\",\"historical_answer\":\"private-answer\"," ++
+                "\"grade_opening\":\"private-opening\",\"source_t" ++
+                "arget_text\":\"private-target-text\"}}",
+        );
+        defer direct.deinit();
+        const direct_root = try jsonObjectPtr(&direct.value);
+        const direct_profile = try jsonObjectPtr(
+            direct_root.getPtr("profile") orelse return error.RequiredFieldMissing,
+        );
+        try projectPublicV2SourceProfile(
+            allocator,
+            direct.arena.allocator(),
+            direct_profile,
+            try jsonRequiredObject(direct_root.*, "case"),
+            visibility,
+        );
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, visibility, "case_blind")) @as(usize, 3) else @as(usize, 2),
+            direct_profile.count(),
+        );
+        try t.expectEqualStrings("direct", try js(direct_profile.*, "kind"));
+        try std.testing.expectEqualStrings(
+            profile_fingerprint,
+            try jsonRequiredString(direct_profile.*, "source_profile_fingerprint"),
+        );
+        try std.testing.expect(direct_profile.get("historical_answer") == null);
+        try std.testing.expect(direct_profile.get("grade_opening") == null);
+        try std.testing.expect(direct_profile.get("source_target_text") == null);
+
+        var historical = try parseValue(
+            allocator,
+            "{\"case\":{\"source_profile_fingerprint\":\"sha2" ++
+                "56:ccccccccccccccccccccccccccccccccccccccccccccc" ++ "ccccccccccccccccccc\"}," ++
+                "\"profile\":{\"kind\":\"historical_decision\",\"" ++
+                "source_governance_ref\":\"artifact:sgg-private\"" ++ "," ++
+                "\"source_governance_fingerprint\":\"sha256:aaaaa" ++
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "aaaaaaaaaaa\"," ++
+                "\"source_governance\":{\"secret\":\"private-gove" ++
+                "rnance\"},\"decision_context_ref\":\"artifact:dc" ++ "p-private\"," ++
+                "\"decision_context_fingerprint\":\"sha256:bbbbbb" ++
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++ "bbbbbbbbbb\"," ++
+                "\"decision_context\":{\"selected_route\":\"priva" ++
+                "te-route\"},\"temporal_horizon\":\"pre_decision" ++ "\"," ++
+                "\"source_target_text_policy\":\"absent\",\"retra" ++
+                "ce_mode\":\"replay\",\"required_lineage\":\"eith" ++ "er\"," ++
+                "\"required_fir_version\":\"FIR-v1\",\"reconstruc" ++
+                "tability\":\"transcript_only\",\"limitations\":[" ++ "]," ++
+                "\"source_target_text_witness\":{\"source_target_" ++
+                "text\":\"private-target-text\"}," ++
+                "\"historical_answer\":\"private-answer\",\"grade_opening\":\"private-opening\"}}",
+        );
+        defer historical.deinit();
+        const historical_root = try jsonObjectPtr(&historical.value);
+        const historical_profile = try jsonObjectPtr(
+            historical_root.getPtr("profile") orelse return error.RequiredFieldMissing,
+        );
+        try projectPublicV2SourceProfile(
+            allocator,
+            historical.arena.allocator(),
+            historical_profile,
+            try jsonRequiredObject(historical_root.*, "case"),
+            visibility,
+        );
+        try std.testing.expectEqual(
+            if (std.mem.eql(u8, visibility, "case_blind")) @as(usize, 14) else @as(usize, 13),
+            historical_profile.count(),
+        );
+        try std.testing.expectEqualStrings(
+            "source_profile_fd",
+            try jsonRequiredString(historical_profile.*, "profile_body_delivery"),
+        );
+        try validateFingerprint(try jsonRequiredString(
+            historical_profile.*,
+            "source_target_text_witness_fingerprint",
+        ));
+        inline for (.{
+            "source_governance_ref",
+            "source_governance",
+            "decision_context_ref",
+            "decision_context",
+            "source_target_text_witness",
+            "historical_answer",
+            "grade_opening",
+        }) |forbidden| try std.testing.expect(historical_profile.get(forbidden) == null);
+    }
+}
+test "hylo trial compiler core emits a valid balanced trial and private opening" {
+    const allocator = std.testing.allocator;
+    const no_ext = "--no-ext-diff";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    try runTestGit(allocator, repo, &.{ "init", "--quiet" });
+    try runTestGit(allocator, repo, &.{ "config", "user.name", "Hylo Compiler Test" });
+    try runTestGit(allocator, repo, &.{ "config", "user.email", "hylo-compiler@example.invalid" });
+    const gitignore_path = try std.fs.path.join(allocator, &.{ repo, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const target_path = try std.fs.path.join(allocator, &.{ repo, "target.txt" });
+    defer allocator.free(target_path);
+    try durable_store.writeTextAtomic(allocator, gitignore_path, ".ledger/\n*.jsonl\n");
+    try durable_store.writeTextAtomic(allocator, target_path, "baseline\n");
+    try runTestGit(allocator, repo, &.{ "add", ".gitignore", "target.txt" });
+    try runTestGit(allocator, repo, &.{ "commit", "--quiet", "-m", "baseline" });
+    const baseline_raw = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(baseline_raw);
+    const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
+    try durable_store.writeTextAtomic(allocator, target_path, "candidate\n");
+    try runTestGit(allocator, repo, &.{ "add", "target.txt" });
+    const diff = try runGitStdoutAlloc(
+        allocator,
+        repo,
+        &.{ "diff", "--cached", "--binary", "--full-index", no_ext, "--no-color", "HEAD", "--" },
+    );
+    defer allocator.free(diff);
+    const diff_fingerprint = try digestBytesAlloc(allocator, diff);
+    defer allocator.free(diff_fingerprint);
+    const roots = [_][]const u8{ "target-scope", "target.txt" };
+    var baseline_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        &roots,
+    );
+    defer baseline_snapshot.deinit(allocator);
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(allocator, repo, "INDEX", &roots);
+    defer candidate_snapshot.deinit(allocator);
+
+    const donor_bytes = try testPromotionTrialAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        baseline_snapshot.fingerprint,
+        candidate_snapshot.fingerprint,
+        diff_fingerprint,
+    );
+    defer allocator.free(donor_bytes);
+    var donor = try parseValue(allocator, donor_bytes);
+    defer donor.deinit();
+    const donor_root = try jsonObject(donor.value);
+    const donor_factor = try jsonRequiredObject(donor_root, "factor");
+    const donor_verifier = try jsonRequiredObject(donor_factor, "verifier");
+    const donor_sealing = try jsonRequiredObject(donor_root, "sealing");
+    const receipt_value = try jsonRequired(donor_sealing, "source_selection_receipt");
+    const receipt_fingerprint = try jsonRequiredString(
+        donor_sealing,
+        "source_selection_receipt_fingerprint",
+    );
+    const common_projection_value = try jsonRequired(donor_factor, "target_common_projection");
+    const common_projection_json = try canonicalJsonAlloc(allocator, common_projection_value);
+    defer allocator.free(common_projection_json);
+    const baseline_materialization_ref = try std.fmt.allocPrint(
+        allocator,
+        "git-revision:{s}",
+        .{baseline_revision},
+    );
+    defer allocator.free(baseline_materialization_ref);
+
+    const request = TrialBuildRequest{
+        .schema = "hylo-trial-build-request/v1",
+        .trial_id = "trial-compiler-core",
+        .campaign_id = "cmp-test",
+        .expected_campaign_head = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaa",
+        .purpose = "promotion",
+        .source_selection_receipt_ref = "artifact:source-selection",
+        .source_selection_receipt_fingerprint = receipt_fingerprint,
+        .unit_ids = &.{"unit-001"},
+        .target = .{
+            .change_id = "change-1",
+            .before_target_fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+                "aaaaaaaaaaaaaaaaaaaaaaa",
+            .before_bundle_fingerprint = "sha256:01010101010101010101010101010101010101010" ++
+                "10101010101010101010101",
+            .before_snapshot_fingerprint = baseline_snapshot.fingerprint,
+            .after_target_fingerprint = TestCandidateFingerprint,
+            .after_bundle_fingerprint = "sha256:02020202020202020202020202020202020202020" ++
+                "20202020202020202020202",
+            .after_snapshot_fingerprint = candidate_snapshot.fingerprint,
+        },
+        .factor = .{
+            .kind = "target_snapshot",
+            .allowed_difference_roots = &roots,
+            .verifier = .{
+                .id = try jsonRequiredString(donor_verifier, "id"),
+                .version = try jsonRequiredString(donor_verifier, "version"),
+                .fingerprint = try jsonRequiredString(donor_verifier, "fingerprint"),
+            },
+            .intervention_witness_ref = "artifact:compiler-intervention-witness",
+        },
+        .hypothesis = try jsonRequired(donor_root, "hypothesis"),
+        .estimand = try jsonRequired(donor_root, "estimand"),
+        .execution = try jsonRequired(donor_root, "execution"),
+        .grading = try jsonRequired(donor_root, "grading"),
+        .assurance = try jsonRequired(donor_root, "assurance"),
+        .sealing = try jsonRequired(donor_root, "sealing"),
+        .allocation = .{ .method = "balanced_ab_ba" },
+        .stop_policy = try jsonRequired(donor_root, "stop_policy"),
+        .calibration = try jsonRequired(donor_root, "calibration"),
+    };
+    const observed_paths = [_][]const u8{"target.txt"};
+    const context = .{
+        .common_projection = .{
+            .fingerprint = try jsonRequiredString(donor_factor, "common_projection_fingerprint"),
+            .json = common_projection_json,
+        },
+        .change = .{
+            .diff_fingerprint = diff_fingerprint,
+            .paths = &observed_paths,
+        },
+        .baseline_ref = baseline_materialization_ref,
+        .candidate_ref = "git-revision:INDEX",
+        .verifier_fingerprint = request.factor.verifier.fingerprint,
+    };
+    const salt = [_]u8{0x42} ** 32;
+    const arm0_id = try randomOpaqueIdAlloc(allocator, &salt, "arm-0", &.{request.trial_id});
+    defer allocator.free(arm0_id);
+    const arm1_id = try randomOpaqueIdAlloc(allocator, &salt, "arm-1", &.{request.trial_id});
+    defer allocator.free(arm1_id);
+    const built = try buildTrialAndRevealAlloc(
+        allocator,
+        request,
+        receipt_value,
+        context,
+        arm0_id,
+        arm1_id,
+        &salt,
+        "00112233445566778899aabbccddeeff",
+        true,
+    );
+    defer allocator.free(built.trial);
+    defer {
+        std.crypto.secureZero(u8, built.reveal_material);
+        allocator.free(built.reveal_material);
+    }
+
+    var validation = try hctp.validateTrialAlloc(allocator, built.trial);
+    defer validation.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), validation.unit_count);
+    try std.testing.expectEqual(@as(usize, 2), validation.pair_count);
+    try std.testing.expectEqual(@as(usize, 4), validation.lane_count);
+    try std.testing.expect(std.mem.indexOf(u8, arm0_id, "baseline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm0_id, "candidate") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm1_id, "baseline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, arm1_id, "candidate") == null);
+
+    var trial = try parseValue(allocator, built.trial);
+    defer trial.deinit();
+    const units = try jsonRequiredArray(try jsonObject(trial.value), "units");
+    const pairs = try jsonRequiredArray(try jsonObject(units.items[0]), "pairs");
+    const first_order = try jsonRequiredArray(try jsonObject(pairs.items[0]), "order");
+    const second_order = try jsonRequiredArray(try jsonObject(pairs.items[1]), "order");
+    try std.testing.expectEqualStrings(arm0_id, try jsonString(first_order.items[0]));
+    try std.testing.expectEqualStrings(arm1_id, try jsonString(first_order.items[1]));
+    try std.testing.expectEqualStrings(arm1_id, try jsonString(second_order.items[0]));
+    try std.testing.expectEqualStrings(arm0_id, try jsonString(second_order.items[1]));
+
+    var reveal = try parseValue(allocator, built.reveal_material);
+    defer reveal.deinit();
+    const reveal_root = try jsonObject(reveal.value);
+    try std.testing.expectEqualStrings(
+        "hylo-trial-reveal-material/v1",
+        try jsonRequiredString(reveal_root, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        validation.fingerprint,
+        try jsonRequiredString(reveal_root, "trial_fingerprint"),
+    );
+    const mapping = try jsonRequiredObject(reveal_root, "mapping");
+    try std.testing.expectEqualStrings("baseline", try jsonRequiredString(mapping, arm0_id));
+    try std.testing.expectEqualStrings("candidate", try jsonRequiredString(mapping, arm1_id));
+
+    const private_built = try buildPrivateTrialV2Alloc(
+        allocator,
+        repo,
+        built.trial,
+        built.reveal_material,
+        &salt,
+    );
+    defer allocator.free(private_built.trial);
+    defer {
+        std.crypto.secureZero(u8, private_built.custody);
+        allocator.free(private_built.custody);
+    }
+    var public_v2 = try parseValue(allocator, private_built.trial);
+    defer public_v2.deinit();
+    var custody = try parseValue(allocator, private_built.custody);
+    defer custody.deinit();
+    var public_validation = try hctp.validateTrialAlloc(allocator, private_built.trial);
+    defer public_validation.deinit(allocator);
+    const smuggled_public_trial = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        private_built.trial,
+        "\"kind\":\"direct\",\"source_profile_fingerprint\":",
+        "\"historical_answer\":\"private-answer\",\"kind" ++
+            "\":\"direct\",\"source_profile_fingerprint\":",
+    );
+    defer allocator.free(smuggled_public_trial);
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        hctp.validateTrialAlloc(allocator, smuggled_public_trial),
+    );
+    var nested_smuggle = try parseValue(allocator, private_built.trial);
+    defer nested_smuggle.deinit();
+    const nested_smuggle_root = try jsonObjectPtr(&nested_smuggle.value);
+    const nested_smuggle_allocation = try jsonObjectPtr(
+        nested_smuggle_root.getPtr("allocation") orelse return error.RequiredFieldMissing,
+    );
+    var semantic_arm_map = try std.json.ObjectMap.init(
+        nested_smuggle.arena.allocator(),
+        &.{},
+        &.{},
+    );
+    try semantic_arm_map.put(
+        nested_smuggle.arena.allocator(),
+        arm0_id,
+        .{ .string = @constCast("baseline") },
+    );
+    try semantic_arm_map.put(
+        nested_smuggle.arena.allocator(),
+        arm1_id,
+        .{ .string = @constCast("candidate") },
+    );
+    try nested_smuggle_allocation.put(
+        nested_smuggle.arena.allocator(),
+        "semantic_arm_map",
+        .{ .object = semantic_arm_map },
+    );
+    const nested_smuggle_bytes = try canonicalJsonAlloc(allocator, nested_smuggle.value);
+    defer allocator.free(nested_smuggle_bytes);
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        hctp.validateTrialAlloc(allocator, nested_smuggle_bytes),
+    );
+
+    const nested_smuggle_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "nested-semantic-smuggle-trial.json" },
+    );
+    defer allocator.free(nested_smuggle_path);
+    try durable_store.writeTextAtomic(allocator, nested_smuggle_path, nested_smuggle_bytes);
+    var registration_backend = MES.init(
+        allocator,
+        "memory:nested-semantic-smuggle-registration",
+    );
+    defer registration_backend.deinit();
+    const registration_store = registration_backend.eventStore();
+    var before_rejected_registration = try registration_store.snapshot(allocator, MaxStoreBytes);
+    defer before_rejected_registration.deinit(allocator);
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        cmdRegisterTrial(
+            allocator,
+            repo,
+            registration_store,
+            nested_smuggle_path,
+            null,
+        ),
+    );
+    var after_rejected_registration = try registration_store.snapshot(allocator, MaxStoreBytes);
+    defer after_rejected_registration.deinit(allocator);
+    try testExpectSnapshotsEquivalent(
+        before_rejected_registration,
+        after_rejected_registration,
+    );
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        public_v2.value,
+        custody.value,
+    );
+    const compiled_custody = try jsonObject(custody.value);
+    const compiled_opening = try jsonRequiredObject(compiled_custody, "opening");
+    const compiled_target_epoch = try jsonRequiredObject(compiled_opening, "target_epoch");
+    const compiled_treatments = try jsonRequiredArray(compiled_opening, "treatments");
+    try std.testing.expectEqual(@as(usize, 2), compiled_treatments.items.len);
+    const compiled_nonces = [_][]const u8{
+        try jsonRequiredString(compiled_opening, "arm_map_nonce"),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_opening, "intervention_witness"),
+            "nonce",
+        ),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_target_epoch, "before"),
+            "nonce",
+        ),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_target_epoch, "after"),
+            "nonce",
+        ),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_target_epoch, "change"),
+            "nonce",
+        ),
+        try jsonRequiredString(try jsonObject(compiled_treatments.items[0]), "nonce"),
+        try jsonRequiredString(try jsonObject(compiled_treatments.items[1]), "nonce"),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_opening, "target_common_projection"),
+            "nonce",
+        ),
+        try jsonRequiredString(
+            try jsonRequiredObject(compiled_custody, "source_selection"),
+            "nonce",
+        ),
+    };
+    try retrace_core.hctp_trial_custody.validateArmMapNonce(compiled_nonces[0]);
+    for (compiled_nonces[1..]) |compiled_nonce| {
+        try retrace_core.hctp_trial_custody.validateNonce(compiled_nonce);
+    }
+    for (compiled_nonces) |compiled_nonce| {
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            std.mem.count(u8, private_built.custody, compiled_nonce),
+        );
+        const prefixed_nonce = try std.fmt.allocPrint(
+            allocator,
+            "prefix:{s}",
+            .{compiled_nonce},
+        );
+        defer allocator.free(prefixed_nonce);
+        const prefixed_custody_bytes = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            private_built.custody,
+            compiled_nonce,
+            prefixed_nonce,
+        );
+        defer allocator.free(prefixed_custody_bytes);
+        var prefixed_custody = try parseValue(allocator, prefixed_custody_bytes);
+        defer prefixed_custody.deinit();
+        try std.testing.expectError(
+            error.CustodyNonceInvalid,
+            retrace_core.hctp_trial_custody.validateCustody(
+                allocator,
+                public_v2.value,
+                prefixed_custody.value,
+            ),
+        );
+    }
+    const public_factor = try jsonRequiredObject(try jsonObject(public_v2.value), "factor");
+    try std.testing.expect(public_factor.get("target_common_projection") == null);
+    try std.testing.expect(public_factor.get("target_common_projection_commitment") != null);
+    const compiled_public_units = try jsonRequiredArray(try jsonObject(public_v2.value), "units");
+    const compiled_public_profile = try jsonRequiredObject(
+        try jsonObject(compiled_public_units.items[0]),
+        "source_profile",
+    );
+    try std.testing.expectEqual(@as(usize, 2), compiled_public_profile.count());
+    try t.expectEqualStrings("direct", try js(compiled_public_profile, "kind"));
+    try std.testing.expect(compiled_public_profile.get("historical_answer") == null);
+    try std.testing.expect(compiled_public_profile.get("grade_opening") == null);
+    try std.testing.expect(compiled_public_profile.get("source_target_text") == null);
+    const public_sealing = try jsonRequiredObject(try jsonObject(public_v2.value), "sealing");
+    const expected_source_selection_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{receipt_fingerprint},
+    );
+    defer allocator.free(expected_source_selection_ref);
+    try std.testing.expectEqualStrings(
+        expected_source_selection_ref,
+        try jsonRequiredString(public_sealing, "source_selection_receipt_ref"),
+    );
+    try t.expect(m.indexOf(u8, private_built.trial, "artifact:source-selection") == null);
+
+    const reveal_v2_bytes = try v2RevealFromCustodyAlloc(
+        allocator,
+        public_v2.value,
+        custody.value,
+        &.{},
+        "[]",
+    );
+    defer allocator.free(reveal_v2_bytes);
+    var reveal_v2 = try parseValue(allocator, reveal_v2_bytes);
+    defer reveal_v2.deinit();
+    const revealed = try retrace_core.hctp_trial_custody.validateReveal(
+        allocator,
+        public_v2.value,
+        reveal_v2.value,
+    );
+    try std.testing.expectEqualStrings(arm0_id, revealed.baseline_arm_id);
+    try std.testing.expectEqualStrings(arm1_id, revealed.candidate_arm_id);
+
+    var state: hctp.CampaignTrials = .{};
+    defer state.deinit(allocator);
+    const public_root = try jsonObject(public_v2.value);
+    const public_arms = try jsonRequiredArray(public_root, "arms");
+    const public_fingerprint = try digestValueAlloc(allocator, public_v2.value);
+    defer allocator.free(public_fingerprint);
+    try state.trials.append(allocator, .{
+        .id = try allocator.dupe(u8, try jsonRequiredString(public_root, "trial_id")),
+        .fingerprint = try allocator.dupe(u8, public_fingerprint),
+        .purpose = try allocator.dupe(u8, try jsonRequiredString(public_root, "purpose")),
+        .arm0_id = try allocator.dupe(u8, try js(try jsonObject(public_arms.items[0]), "arm_id")),
+        .arm1_id = try allocator.dupe(u8, try js(try jsonObject(public_arms.items[1]), "arm_id")),
+        .arm_map_commitment = try allocator.dupe(
+            u8,
+            try js(try jo(public_root, "arm_map_commitment"), "fingerprint"),
+        ),
+        .trial_json = try canonicalJsonAlloc(allocator, public_v2.value),
+        .requires_pair_grade = false,
+        .registration_sequence = 1,
+        .registration_event_digest = try allocator.dupe(
+            u8,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    });
+    const reveal_fingerprint = try digestValueAlloc(allocator, reveal_v2.value);
+    defer allocator.free(reveal_fingerprint);
+    var reveal_body_text: std.Io.Writer.Allocating = .init(allocator);
+    defer reveal_body_text.deinit();
+    try reveal_body_text.writer.writeAll("{\"payload\":{\"reveal\":");
+    try writeCanonicalJson(allocator, &reveal_body_text.writer, reveal_v2.value);
+    try reveal_body_text.writer.writeAll(",\"reveal_fingerprint\":");
+    try std.json.Stringify.value(reveal_fingerprint, .{}, &reveal_body_text.writer);
+    try reveal_body_text.writer.writeAll("}}");
+    var reveal_body = try parseValue(allocator, reveal_body_text.written());
+    defer reveal_body.deinit();
+    try hctp.applyReveal(allocator, &state, reveal_body.value, 2);
+    try std.testing.expect(state.trials.items[0].revealed);
+    try std.testing.expectEqualStrings(arm0_id, state.trials.items[0].baseline_arm.?);
+    try std.testing.expectEqualStrings(arm1_id, state.trials.items[0].candidate_arm.?);
+
+    var extra_reveal = try parseValue(allocator, reveal_v2_bytes);
+    defer extra_reveal.deinit();
+    const extra_reveal_root = try jsonObjectPtr(&extra_reveal.value);
+    try extra_reveal_root.put(extra_reveal.arena.allocator(), "materializations", .null);
+    try std.testing.expectError(
+        error.RevealInvalid,
+        retrace_core.hctp_trial_custody.validateReveal(
+            allocator,
+            public_v2.value,
+            extra_reveal.value,
+        ),
+    );
+    const public_units = try jsonRequiredArray(public_root, "units");
+    const first_unit = try jsonObject(public_units.items[0]);
+    const first_pair = try jsonObject((try ja(first_unit, "pairs")).items[0]);
+    const first_lane_id = try jsonRequiredString(
+        try jsonObject(
+            try jsonRequired(
+                try jsonRequiredObject(first_pair, "lanes"),
+                arm0_id,
+            ),
+        ),
+        "lane_id",
+    );
+    const safe_receipt = try std.fmt.allocPrint(
+        allocator,
+        "\"materialization_receipts\":[{{\"claim_fingerpr" ++
+            "int\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"delivered_by" ++
+            "_fd\":true,\"lane_id\":{f},\"schema\":\"hylo-lan" ++
+            "e-materialization-receipt/v2\",\"semantic_role_d" ++
+            "isclosed\":false,\"trial_id\":{f}}}]",
+        .{
+            std.json.fmt(first_lane_id, .{}),
+            std.json.fmt(try jsonRequiredString(public_root, "trial_id"), .{}),
+        },
+    );
+    defer allocator.free(safe_receipt);
+    const safe_reveal_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        reveal_v2_bytes,
+        "\"materialization_receipts\":[]",
+        safe_receipt,
+    );
+    defer allocator.free(safe_reveal_bytes);
+    var safe_reveal = try parseValue(allocator, safe_reveal_bytes);
+    defer safe_reveal.deinit();
+    _ = try retrace_core.hctp_trial_custody.validateReveal(
+        allocator,
+        public_v2.value,
+        safe_reveal.value,
+    );
+    const receipt_prefix = "\"materialization_receipts\":[";
+    const receipt_entry = safe_receipt[receipt_prefix.len .. safe_receipt.len - 1];
+    const duplicate_receipt_field = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s},{s}]",
+        .{ receipt_prefix, receipt_entry, receipt_entry },
+    );
+    defer allocator.free(duplicate_receipt_field);
+    const duplicate_receipt_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        safe_reveal_bytes,
+        safe_receipt,
+        duplicate_receipt_field,
+    );
+    defer allocator.free(duplicate_receipt_bytes);
+    var duplicate_reveal = try parseValue(allocator, duplicate_receipt_bytes);
+    defer duplicate_reveal.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptDuplicate,
+        retrace_core.hctp_trial_custody.validateReveal(
+            allocator,
+            public_v2.value,
+            duplicate_reveal.value,
+        ),
+    );
+    const unknown_lane_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        safe_reveal_bytes,
+        first_lane_id,
+        "lane-not-in-trial",
+    );
+    defer allocator.free(unknown_lane_bytes);
+    var unknown_lane_reveal = try parseValue(allocator, unknown_lane_bytes);
+    defer unknown_lane_reveal.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptInvalid,
+        retrace_core.hctp_trial_custody.validateReveal(
+            allocator,
+            public_v2.value,
+            unknown_lane_reveal.value,
+        ),
+    );
+    const unsafe_receipt = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        safe_reveal_bytes,
+        "\"semantic_role_disclosed\":false,\"trial_id\":",
+        "\"materialization\":{},\"semantic_role_disclosed\":false,\"trial_id\":",
+    );
+    defer allocator.free(unsafe_receipt);
+    var unsafe_reveal = try parseValue(allocator, unsafe_receipt);
+    defer unsafe_reveal.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptInvalid,
+        retrace_core.hctp_trial_custody.validateReveal(
+            allocator,
+            public_v2.value,
+            unsafe_reveal.value,
+        ),
+    );
+
+    var extra_opening = try parseValue(allocator, private_built.custody);
+    defer extra_opening.deinit();
+    const extra_opening_root = try jsonObjectPtr(&extra_opening.value);
+    const opening_value = extra_opening_root.getPtr("opening") orelse return fm;
+    const opening_root = try jsonObjectPtr(opening_value);
+    try opening_root.put(extra_opening.arena.allocator(), "materializations", .null);
+    try std.testing.expectError(
+        error.CustodyShapeInvalid,
+        retrace_core.hctp_trial_custody.validateOpening(
+            allocator,
+            public_v2.value,
+            opening_value.*,
+        ),
+    );
+    var extra_projection = try parseValue(allocator, private_built.custody);
+    defer extra_projection.deinit();
+    const extra_projection_root = try jsonObjectPtr(&extra_projection.value);
+    const projection_opening = try jsonObjectPtr(
+        (try op(extra_projection_root.getPtr("opening") orelse return fm))
+            .getPtr("target_common_projection") orelse return error.RequiredFieldMissing,
+    );
+    try projection_opening.put(extra_projection.arena.allocator(), "private_body", .null);
+    try std.testing.expectError(
+        error.CustodyShapeInvalid,
+        retrace_core.hctp_trial_custody.validateOpening(
+            allocator,
+            public_v2.value,
+            (extra_projection_root.getPtr("opening") orelse return error.RequiredFieldMissing).*,
+        ),
+    );
+    var extra_source = try parseValue(allocator, private_built.custody);
+    defer extra_source.deinit();
+    const extra_source_root = try jsonObjectPtr(&extra_source.value);
+    const source_opening = try jsonObjectPtr(
+        extra_source_root.getPtr("source_selection") orelse return error.RequiredFieldMissing,
+    );
+    try source_opening.put(extra_source.arena.allocator(), "private_body", .null);
+    try std.testing.expectError(
+        error.CustodyShapeInvalid,
+        retrace_core.hctp_trial_custody.validateCustody(
+            allocator,
+            public_v2.value,
+            extra_source.value,
+        ),
+    );
+}
+
+test "hylo trial compiler preflight failure leaves no public or private artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    const request_path = try std.fs.path.join(allocator, &.{ repo, "request.json" });
+    defer allocator.free(request_path);
+    const receipt_path = try std.fs.path.join(allocator, &.{ repo, "selection.json" });
+    defer allocator.free(receipt_path);
+    const output_path = try std.fs.path.join(allocator, &.{ repo, "trial.json" });
+    defer allocator.free(output_path);
+    const request_template =
+        "{\"schema\":\"hylo-trial-build-request/v1\",\"tr" ++
+        "ial_id\":\"trial-atomic\",\"campaign_id\":\"camp" ++ "aign-missing\"," ++
+        "\"expected_campaign_head\":\"sha256:aaaaaaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaa\",\"purpose\":\"practice_repair\"," ++
+        "\"source_selection_receipt_ref\":\"selection.jso" ++
+        "n\",\"source_selection_receipt_fingerprint\":\"s" ++
+        "ha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++ "bbbbbbbbbbbbbbbbbbbbbb\"," ++
+        "\"unit_ids\":[\"unit-atomic\"],\"target\":{\"cha" ++
+        "nge_id\":\"change-atomic\",\"before_target_finge" ++
+        "rprint\":\"sha256:cccccccccccccccccccccccccccccc" ++
+        "cccccccccccccccccccccccccccccccccc\"," ++
+        "\"before_bundle_fingerprint\":\"sha256:ddddddddd" ++
+        "dddddddddddddddddddddddddddddddddddddddddddddddd" ++
+        "ddddddd\",\"before_snapshot_fingerprint\":\"sha2" ++
+        "56:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" ++ "eeeeeeeeeeeeeeeeeee\"," ++
+        "\"after_target_fingerprint\":\"sha256:ffffffffff" ++
+        "ffffffffffffffffffffffffffffffffffffffffffffffff" ++
+        "ffffff\",\"after_bundle_fingerprint\":\"sha256:1" ++
+        "111111111111111111111111111111111111111111111111" ++ "111111111111111\"," ++
+        "\"after_snapshot_fingerprint\":\"sha256:22222222" ++
+        "222222222222222222222222222222222222222222222222" ++
+        "22222222\"},\"factor\":{\"kind\":\"target_snapsh" ++
+        "ot\",\"allowed_difference_roots\":[\"target.txt" ++ "\"]," ++
+        "\"verifier\":{\"id\":\"git-target-projection\"," ++
+        "\"version\":\"v1\",\"fingerprint\":\"sha256:3333" ++
+        "333333333333333333333333333333333333333333333333" ++
+        "333333333333\"},\"intervention_witness_ref\":\"a" ++ "rtifact:witness\"}," ++
+        "\"hypothesis\":{},\"estimand\":{},\"execution\":" ++
+        "{},\"grading\":{},\"assurance\":{\"required_leve" ++
+        "l\":\"precommitted\"},\"sealing\":{},\"allocatio" ++
+        "n\":{\"method\":\"balanced_ab_ba\"}," ++
+        "\"stop_policy\":{\"kind\":\"fixed\",\"required_pairs_per_unit\":2},\"calibration\":{}}";
+    const verifier_fingerprint = try currentExecutableFingerprintAlloc(allocator);
+    defer allocator.free(verifier_fingerprint);
+    var request = try allocator.dupe(u8, request_template);
+    defer allocator.free(request);
+    try testReplaceAllCurrent(
+        allocator,
+        &request,
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        verifier_fingerprint,
+    );
+    try durable_store.writeTextAtomic(allocator, request_path, request);
+    try durable_store.writeTextAtomic(allocator, receipt_path, "{}");
+    var backend = MES.init(allocator, "memory:trial-compiler-atomicity");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    var writer_open = true;
+    defer {
+        if (writer_open) {
+            _ = std.c.close(pipe_fds[1]);
+        }
+    }
+    try std.testing.expectError(
+        error.CampaignMissing,
+        cmdCompileTrial(
+            allocator,
+            repo,
+            store,
+            request_path,
+            receipt_path,
+            output_path,
+            pipe_fds[1],
+        ),
+    );
+    _ = std.c.close(pipe_fds[1]);
+    writer_open = false;
+    var private_buffer: [1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(isize, 0),
+        std.c.read(pipe_fds[0], &private_buffer, private_buffer.len),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(std.testing.io, output_path, .{}),
+    );
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before, after);
+}
+test "hylo trial compiler output preflight is create-new canonical and symlink-safe" {
+    const allocator = std.testing.allocator;
+    const path = std.fs.path;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(std.testing.io, "real-output", .default_dir);
+    try tmp.dir.symLink(std.testing.io, "real-output", "linked-output", .{ .is_directory = true });
+    const linked_output = try path.join(allocator, &.{ root, "linked-output", "trial.json" });
+    defer allocator.free(linked_output);
+    try std.testing.expectError(error.SymlinkComponent, ensureTrialOutputAbsent(linked_output));
+
+    const missing_output = try path.join(allocator, &.{ root, "missing-output", "trial.json" });
+    defer allocator.free(missing_output);
+    try t.expectError(error.TrialOutputParentMissing, ensureTrialOutputAbsent(missing_output));
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(std.testing.io, std.fs.path.dirname(missing_output).?, .{}),
+    );
+    try std.testing.expectError(
+        error.TrialOutputPathNotCanonical,
+        ensureTrialOutputAbsent("real-output/../escaped-trial.json"),
+    );
+
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "real-output/trial.json", .data = "owned" });
+    const existing_output = try path.join(allocator, &.{ root, "real-output", "trial.json" });
+    defer allocator.free(existing_output);
+    try std.testing.expectError(error.TrialOutputExists, ensureTrialOutputAbsent(existing_output));
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, existing_output, 16);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("owned", bytes);
+}
+
+test "hylo trial compiler publishes before private reveal and rolls back failed delivery" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const conflict_path = try std.fs.path.join(allocator, &.{ root, "conflict.json" });
+    defer allocator.free(conflict_path);
+
+    try ensureTrialOutputAbsent(conflict_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "conflict.json", .data = "racer-owned" });
+    var conflict_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&conflict_pipe) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(conflict_pipe[0]);
+    var conflict_writer_open = true;
+    defer {
+        if (conflict_writer_open) _ = std.c.close(conflict_pipe[1]);
+    }
+    try std.testing.expectError(
+        error.TrialOutputExists,
+        publishTrialAndReveal(
+            conflict_path,
+            "public-trial",
+            conflict_pipe[1],
+            "private-reveal",
+        ),
+    );
+    _ = std.c.close(conflict_pipe[1]);
+    conflict_writer_open = false;
+    var private_buffer: [1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(isize, 0),
+        std.c.read(conflict_pipe[0], &private_buffer, private_buffer.len),
+    );
+    const conflict_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        conflict_path,
+        32,
+    );
+    defer allocator.free(conflict_bytes);
+    try std.testing.expectEqualStrings("racer-owned", conflict_bytes);
+
+    if (comptime builtin.os.tag == .macos) {
+        const rollback_path = try std.fs.path.join(allocator, &.{ root, "rollback.json" });
+        defer allocator.free(rollback_path);
+        var rollback_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&rollback_pipe) != 0) return error.TestFdSetupFailed;
+        _ = std.c.close(rollback_pipe[0]);
+        defer _ = std.c.close(rollback_pipe[1]);
+        try std.testing.expectError(
+            error.TrialCustodyDeliveryFailed,
+            publishTrialAndReveal(
+                rollback_path,
+                "public-trial",
+                rollback_pipe[1],
+                "private-reveal",
+            ),
+        );
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().statFile(std.testing.io, rollback_path, .{ .follow_symlinks = false }),
+        );
+    }
+}
+
+const TestOperatorBootstrapReceipt = struct {
+    receipt: TestSourceSelectionReceipt,
+    visible_input_fingerprint: []u8,
+    hidden_reference_fingerprint: []u8,
+
+    fn deinit(self: *TestOperatorBootstrapReceipt, allocator: std.mem.Allocator) void {
+        self.receipt.deinit(allocator);
+        allocator.free(self.visible_input_fingerprint);
+        allocator.free(self.hidden_reference_fingerprint);
+    }
+};
+
+const TestProtectedCommandResult = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+    protected_output: []u8,
+    protected_output_2: []u8,
+
+    fn deinit(self: *TestProtectedCommandResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        std.crypto.secureZero(u8, self.protected_output);
+        allocator.free(self.protected_output);
+        std.crypto.secureZero(u8, self.protected_output_2);
+        allocator.free(self.protected_output_2);
+    }
+};
+
+const TestProtectedInput = struct {
+    fd_flag: []const u8,
+    bytes: []const u8,
+};
+
+const MaxTestProtectedInputs = 5;
+
+const TestProtectedWriteChannel = struct {
+    fd: ?std.posix.fd_t,
+    bytes: []const u8,
+};
+
+const TestProtectedWriterContext = struct {
+    channels: []TestProtectedWriteChannel,
+    result: ?anyerror = null,
+};
+
+fn testProtectedWriterMain(context: *TestProtectedWriterContext) void {
+    defer {
+        for (context.channels) |*channel| {
+            if (channel.fd) |fd| {
+                _ = std.c.close(fd);
+                channel.fd = null;
+            }
+        }
+    }
+    for (context.channels) |*channel| {
+        const fd = channel.fd.?;
+        testWriteFdAll(fd, channel.bytes) catch |err| {
+            context.result = err;
+            return;
+        };
+        _ = std.c.close(fd);
+        channel.fd = null;
+    }
+}
+
+fn testSetCloseOnExec(fd: std.posix.fd_t, enabled: bool) !void {
+    const current = std.c.fcntl(fd, std.c.F.GETFD);
+    if (current < 0) return error.TestFdSetupFailed;
+    const close_on_exec: c_int = @intCast(std.c.FD_CLOEXEC);
+    const wanted = if (enabled)
+        current | close_on_exec
+    else
+        current & ~close_on_exec;
+    if (std.c.fcntl(fd, std.c.F.SETFD, wanted) < 0) return error.TestFdSetupFailed;
+}
+
+fn testResolvedExecutablePathAlloc(
+    allocator: std.mem.Allocator,
+    raw_path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(raw_path)) return allocator.dupe(u8, raw_path);
+    const process_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(process_cwd);
+    return std.fs.path.resolve(allocator, &.{ process_cwd, raw_path });
+}
+
+fn testRunWithProtectedChannelsAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv_without_fd: []const []const u8,
+    protected_inputs: []const TestProtectedInput,
+    protected_output_flag: ?[]const u8,
+    protected_output_flag_2: ?[]const u8,
+) !TestProtectedCommandResult {
+    if (argv_without_fd.len == 0) return error.TestFdSetupFailed;
+    if (protected_inputs.len > MaxTestProtectedInputs) return error.TestFdSetupFailed;
+    const executable_path = try testResolvedExecutablePathAlloc(allocator, argv_without_fd[0]);
+    defer allocator.free(executable_path);
+
+    var input_pipes: [MaxTestProtectedInputs][2]std.posix.fd_t = undefined;
+    var input_read_open = [_]bool{false} ** MaxTestProtectedInputs;
+    var input_write_open = [_]bool{false} ** MaxTestProtectedInputs;
+    var input_count: usize = 0;
+    defer {
+        for (0..input_count) |index| {
+            if (input_read_open[index]) _ = std.c.close(input_pipes[index][0]);
+            if (input_write_open[index]) _ = std.c.close(input_pipes[index][1]);
+        }
+    }
+    for (protected_inputs, 0..) |_, index| {
+        if (std.c.pipe(&input_pipes[index]) != 0) return error.TestFdSetupFailed;
+        input_count += 1;
+        input_read_open[index] = true;
+        input_write_open[index] = true;
+        if (input_pipes[index][0] < 3 or input_pipes[index][1] < 3) {
+            return error.TestFdSetupFailed;
+        }
+        try testSetCloseOnExec(input_pipes[index][0], false);
+        try testSetCloseOnExec(input_pipes[index][1], true);
+        if (comptime builtin.os.tag == .macos) {
+            if (std.c.fcntl(
+                input_pipes[index][1],
+                std.c.F.SETNOSIGPIPE,
+                @as(c_int, 1),
+            ) != 0) return error.TestFdSetupFailed;
+        }
+    }
+
+    var output_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&output_pipe) != 0) return error.TestFdSetupFailed;
+    var output_read_open = true;
+    defer {
+        if (output_read_open) _ = std.c.close(output_pipe[0]);
+    }
+    var output_write_open = true;
+    defer {
+        if (output_write_open) _ = std.c.close(output_pipe[1]);
+    }
+    if (output_pipe[0] < 3 or output_pipe[1] < 3) return error.TestFdSetupFailed;
+    try testSetCloseOnExec(output_pipe[0], true);
+    try testSetCloseOnExec(output_pipe[1], protected_output_flag == null);
+
+    var output_pipe_2: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&output_pipe_2) != 0) return error.TestFdSetupFailed;
+    var output_read_open_2 = true;
+    defer {
+        if (output_read_open_2) _ = std.c.close(output_pipe_2[0]);
+    }
+    var output_write_open_2 = true;
+    defer {
+        if (output_write_open_2) _ = std.c.close(output_pipe_2[1]);
+    }
+    if (output_pipe_2[0] < 3 or output_pipe_2[1] < 3) return error.TestFdSetupFailed;
+    try testSetCloseOnExec(output_pipe_2[0], true);
+    try testSetCloseOnExec(output_pipe_2[1], protected_output_flag_2 == null);
+
+    var input_fd_args: [MaxTestProtectedInputs]?[]u8 = .{null} ** MaxTestProtectedInputs;
+    defer for (input_fd_args) |fd_arg| {
+        if (fd_arg) |bytes| allocator.free(bytes);
+    };
+    for (protected_inputs, 0..) |_, index| {
+        input_fd_args[index] = try std.fmt.allocPrint(
+            allocator,
+            "{d}",
+            .{input_pipes[index][0]},
+        );
+    }
+    const output_fd_arg = if (protected_output_flag != null)
+        try std.fmt.allocPrint(allocator, "{d}", .{output_pipe[1]})
+    else
+        null;
+    defer if (output_fd_arg) |bytes| allocator.free(bytes);
+    const output_fd_arg_2 = if (protected_output_flag_2 != null)
+        try std.fmt.allocPrint(allocator, "{d}", .{output_pipe_2[1]})
+    else
+        null;
+    defer if (output_fd_arg_2) |bytes| allocator.free(bytes);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, executable_path);
+    try argv.appendSlice(allocator, argv_without_fd[1..]);
+    for (protected_inputs, 0..) |input, index| {
+        try argv.append(allocator, input.fd_flag);
+        try argv.append(allocator, input_fd_args[index].?);
+    }
+    if (protected_output_flag) |flag| {
+        try argv.append(allocator, flag);
+        try argv.append(allocator, output_fd_arg.?);
+    }
+    if (protected_output_flag_2) |flag| {
+        try argv.append(allocator, flag);
+        try argv.append(allocator, output_fd_arg_2.?);
+    }
+    var child = std.process.spawn(std.testing.io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .progress_node = .none,
+    }) catch |err| {
+        std.debug.print(
+            "protected subprocess spawn failed: executable={s} cwd={s} error={s}\n",
+            .{ executable_path, cwd, @errorName(err) },
+        );
+        return err;
+    };
+    defer child.kill(std.testing.io);
+    for (protected_inputs, 0..) |_, index| {
+        _ = std.c.close(input_pipes[index][0]);
+        input_read_open[index] = false;
+    }
+    _ = std.c.close(output_pipe[1]);
+    output_write_open = false;
+    _ = std.c.close(output_pipe_2[1]);
+    output_write_open_2 = false;
+
+    var writer_channels: [MaxTestProtectedInputs]TestProtectedWriteChannel = undefined;
+    for (protected_inputs, 0..) |input, index| {
+        writer_channels[index] = .{
+            .fd = input_pipes[index][1],
+            .bytes = input.bytes,
+        };
+    }
+    var writer_context = TestProtectedWriterContext{
+        .channels = writer_channels[0..protected_inputs.len],
+    };
+    var writer_thread: ?std.Thread = null;
+    var writer_joined = false;
+    defer if (writer_thread) |thread| {
+        if (!writer_joined) {
+            child.kill(std.testing.io);
+            thread.join();
+        }
+    };
+    if (protected_inputs.len != 0) {
+        writer_thread = try std.Thread.spawn(.{}, testProtectedWriterMain, .{&writer_context});
+        for (0..protected_inputs.len) |index| input_write_open[index] = false;
+    }
+    const protected_file = std.Io.File{
+        .handle = output_pipe[0],
+        .flags = .{ .nonblocking = false },
+    };
+    const protected_file_2 = std.Io.File{
+        .handle = output_pipe_2[0],
+        .flags = .{ .nonblocking = false },
+    };
+    var buffer: std.Io.File.MultiReader.Buffer(4) = undefined;
+    var readers: std.Io.File.MultiReader = undefined;
+    readers.init(
+        allocator,
+        std.testing.io,
+        buffer.toStreams(),
+        &.{ child.stdout.?, child.stderr.?, protected_file, protected_file_2 },
+    );
+    defer readers.deinit();
+    while (readers.fill(64, .none)) |_| {
+        if (readers.reader(0).buffered().len > MaxProcessOutputBytes or
+            readers.reader(1).buffered().len > MaxProcessOutputBytes or
+            readers.reader(2).buffered().len > MaxInputBytes or
+            readers.reader(3).buffered().len > MaxInputBytes)
+        {
+            return error.StreamTooLong;
+        }
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |other| return other,
+    }
+    try readers.checkAnyError();
+    const term = try child.wait(std.testing.io);
+    if (writer_thread) |thread| {
+        thread.join();
+        writer_joined = true;
+        if (writer_context.result) |err| return err;
+    }
+    const stdout = try readers.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try readers.toOwnedSlice(1);
+    errdefer allocator.free(stderr);
+    const protected_output = try readers.toOwnedSlice(2);
+    errdefer {
+        std.crypto.secureZero(u8, protected_output);
+        allocator.free(protected_output);
+    }
+    const protected_output_2 = try readers.toOwnedSlice(3);
+    errdefer {
+        std.crypto.secureZero(u8, protected_output_2);
+        allocator.free(protected_output_2);
+    }
+    _ = std.c.close(output_pipe[0]);
+    output_read_open = false;
+    _ = std.c.close(output_pipe_2[0]);
+    output_read_open_2 = false;
+    return .{
+        .term = term,
+        .stdout = stdout,
+        .stderr = stderr,
+        .protected_output = protected_output,
+        .protected_output_2 = protected_output_2,
+    };
+}
+
+fn testRunWithProtectedOutputFdAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv_without_fd: []const []const u8,
+    fd_flag: []const u8,
+) !TestProtectedCommandResult {
+    return testRunWithProtectedChannelsAlloc(
+        allocator,
+        cwd,
+        argv_without_fd,
+        &.{},
+        fd_flag,
+        null,
+    );
+}
+
+fn testRunProductCommandAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+) ![]u8 {
+    if (argv.len == 0) return error.ProductCommandFailed;
+    const executable_path = try testResolvedExecutablePathAlloc(allocator, argv[0]);
+    defer allocator.free(executable_path);
+    var resolved_argv: std.ArrayList([]const u8) = .empty;
+    defer resolved_argv.deinit(allocator);
+    try resolved_argv.append(allocator, executable_path);
+    try resolved_argv.appendSlice(allocator, argv[1..]);
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = resolved_argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(MaxProcessOutputBytes),
+        .stderr_limit = .limited(MaxProcessOutputBytes),
+    });
+    defer allocator.free(result.stderr);
+    if (processExitCode(result.term) != 0 or result.stderr.len != 0) {
+        std.debug.print(
+            "product command failed: executable={s} cwd={s} stderr={s}\n",
+            .{ executable_path, cwd, result.stderr },
+        );
+        allocator.free(result.stdout);
+        return error.ProductCommandFailed;
+    }
+    try testExpectNoPrivateReceiptSurface(result.stdout);
+    return result.stdout;
+}
+
+fn testExpectNoPrivateReceiptSurface(bytes: []const u8) !void {
+    inline for (.{
+        "\"mapping\"",
+        "\"nonce\"",
+        "historical_response",
+        "selected_route",
+        "decision_context_packet",
+    }) |forbidden| {
+        try std.testing.expect(std.mem.indexOf(u8, bytes, forbidden) == null);
+    }
+}
+
+fn testCompileOperatorSourceReceipt(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    manifest_path: []const u8,
+    receipt_path: []const u8,
+) ![]u8 {
+    const sealed_dir = try std.fs.path.join(allocator, &.{ repo, "sealed-cases" });
+    defer allocator.free(sealed_dir);
+    const seed = [_]u8{0x42} ** 32;
+    var compiled = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.seq_path,
+            "hctp-source",
+            "compile",
+            "--manifest",
+            manifest_path,
+            "--output",
+            receipt_path,
+            "--sealed-dir",
+            sealed_dir,
+        },
+        &.{.{
+            .fd_flag = "--source-signing-seed-fd",
+            .bytes = &seed,
+        }},
+        "--seal-key-output-fd",
+        null,
+    );
+    defer compiled.deinit(allocator);
+    if (processExitCode(compiled.term) != 0 or compiled.stderr.len != 0) {
+        std.debug.print(
+            "operator source compile failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ compiled.stdout, compiled.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 32), compiled.protected_output.len);
+    try std.testing.expectEqual(@as(usize, 0), compiled.protected_output_2.len);
+    try testExpectNoPrivateReceiptSurface(compiled.stdout);
+    return allocator.dupe(u8, compiled.protected_output);
+}
+
+fn testExpectExactSealedCaseJoins(source_case: std.json.ObjectMap) !void {
+    const sealed = try jsonRequiredObject(source_case, "sealed_case");
+    try std.testing.expectEqualStrings(
+        "hylo-sealed-case/v1",
+        try jsonRequiredString(sealed, "schema"),
+    );
+    inline for (.{
+        "unit_id",
+        "visible_input_fingerprint",
+        "hidden_reference_fingerprint",
+        "source_episode_fingerprint",
+        "source_profile_fingerprint",
+    }) |field| {
+        try std.testing.expectEqualStrings(
+            try jsonRequiredString(source_case, field),
+            try jsonRequiredString(sealed, field),
+        );
+    }
+    try std.testing.expectEqualStrings(
+        retrace_core.hctp_adapter.source_episode_projection_version,
+        try jsonRequiredString(sealed, "source_episode_projection_version"),
+    );
+    try std.testing.expect(
+        (try jsonRequiredString(sealed, "ciphertext_or_capability_ref")).len != 0,
+    );
+    try validateFingerprint(try jsonRequiredString(sealed, "ciphertext_fingerprint"));
+}
+
+fn testOperatorBootstrapReceiptAlloc(
+    allocator: std.mem.Allocator,
+    selection_bytes: []const u8,
+    visible_input_fingerprint: []const u8,
+) !TestOperatorBootstrapReceipt {
+    var selection = try parseValue(allocator, selection_bytes);
+    defer selection.deinit();
+    const root = try jsonObject(selection.value);
+    const cases = try jsonRequiredArray(root, "cases");
+    var direct_value: ?std.json.Value = null;
+    for (cases.items) |case_value| {
+        const source_case = try jsonObject(case_value);
+        if (std.mem.eql(u8, try jsonRequiredString(source_case, "unit_id"), "unit-direct")) {
+            direct_value = case_value;
+            break;
+        }
+    }
+    const direct = direct_value orelse return error.SourceReceiptTrialMismatch;
+    const direct_bytes = try canonicalJsonAlloc(allocator, direct);
+    defer allocator.free(direct_bytes);
+    var rebound = try parseValue(allocator, direct_bytes);
+    defer rebound.deinit();
+    const rebound_root = try jsonObjectPtr(&rebound.value);
+    const hidden_reference_fingerprint = try jsonRequiredString(
+        rebound_root.*,
+        "hidden_reference_fingerprint",
+    );
+    const bootstrap_unit_id = "unit-null-001";
+    (rebound_root.getPtr("unit_id") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(bootstrap_unit_id) };
+    (rebound_root.getPtr("independence_cluster_id") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast("cluster-null-001") };
+    (rebound_root.getPtr("visible_input_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(visible_input_fingerprint) };
+    const sealed_case = try jsonObjectPtr(
+        rebound_root.getPtr("sealed_case") orelse return error.RequiredFieldMissing,
+    );
+    (sealed_case.getPtr("unit_id") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(bootstrap_unit_id) };
+    (sealed_case.getPtr("visible_input_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{
+        .string = @constCast(visible_input_fingerprint),
+    };
+    const missing = error.SourceRouteAdmissionMissing;
+    const route_value = rebound_root.getPtr("source_route_admission") orelse return missing;
+    const route = try op(route_value);
+    (route.getPtr("unit_id") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(bootstrap_unit_id) };
+    try testExpectExactSealedCaseJoins(rebound_root.*);
+    var case_array: std.Io.Writer.Allocating = .init(allocator);
+    defer case_array.deinit();
+    try case_array.writer.writeByte('[');
+    try writeCanonicalJson(allocator, &case_array.writer, rebound.value);
+    try case_array.writer.writeByte(']');
+    var parsed_cases = try parseValue(allocator, case_array.written());
+    defer parsed_cases.deinit();
+    return .{
+        .receipt = try testSourceSelectionReceiptAlloc(
+            allocator,
+            "campaign-operator-recipe",
+            parsed_cases.value,
+        ),
+        .visible_input_fingerprint = try allocator.dupe(u8, visible_input_fingerprint),
+        .hidden_reference_fingerprint = try allocator.dupe(u8, hidden_reference_fingerprint),
+    };
+}
+
+const TestOperatorLaneView = struct {
+    lane_id: []const u8,
+    arm_id: []const u8,
+    scenario_id: []const u8,
+    source_kind: []const u8,
+    source_profile_body_delivery: []const u8,
+    required_lineage: ?[]const u8,
+    treatment_commitment: []const u8,
+};
+
+fn testOperatorFrozenLane(
+    trial: std.json.ObjectMap,
+    unit_id: []const u8,
+    pair_index: usize,
+    order_index: usize,
+) !TestOperatorLaneView {
+    var selected_unit: ?std.json.ObjectMap = null;
+    for ((try jsonRequiredArray(trial, "units")).items) |unit_value| {
+        const unit = try jsonObject(unit_value);
+        if (std.mem.eql(u8, try jsonRequiredString(unit, "unit_id"), unit_id)) {
+            selected_unit = unit;
+            break;
+        }
+    }
+    const unit = selected_unit orelse return error.SourceReceiptTrialMismatch;
+    const pairs = try jsonRequiredArray(unit, "pairs");
+    if (pair_index >= pairs.items.len or order_index >= 2) return error.PairShapeInvalid;
+    const pair = try jsonObject(pairs.items[pair_index]);
+    const order = try jsonRequiredArray(pair, "order");
+    if (order.items.len != 2) return error.PairShapeInvalid;
+    const arm_id = try jsonString(order.items[order_index]);
+    const lanes = try jsonRequiredObject(pair, "lanes");
+    const lane = try jsonObject(lanes.get(arm_id) orelse return error.LaneNotRegistered);
+    const profile = try jsonRequiredObject(unit, "source_profile");
+    const source_kind = try jsonRequiredString(profile, "kind");
+    var selected_arm: ?std.json.ObjectMap = null;
+    for ((try jsonRequiredArray(trial, "arms")).items) |arm_value| {
+        const arm = try jsonObject(arm_value);
+        if (std.mem.eql(u8, try jsonRequiredString(arm, "arm_id"), arm_id)) {
+            selected_arm = arm;
+            break;
+        }
+    }
+    const arm = selected_arm orelse return error.PairShapeInvalid;
+    return .{
+        .lane_id = try jsonRequiredString(lane, "lane_id"),
+        .arm_id = arm_id,
+        .scenario_id = try jsonRequiredString(unit, "scenario_id"),
+        .source_kind = source_kind,
+        .source_profile_body_delivery = if (std.mem.eql(u8, source_kind, "historical_decision"))
+            if (profile.get("profile_body_delivery") != null)
+                try jsonRequiredString(profile, "profile_body_delivery")
+            else
+                "embedded"
+        else
+            "none",
+        .required_lineage = if (std.mem.eql(u8, source_kind, "historical_decision"))
+            try jsonRequiredString(profile, "required_lineage")
+        else
+            null,
+        .treatment_commitment = try jsonRequiredString(arm, "treatment_commitment"),
+    };
+}
+
+fn testOperatorScenarioProjectionAlloc(
+    allocator: std.mem.Allocator,
+    scenario_bytes: []const u8,
+    source_cases: std.json.Array,
+) ![]u8 {
+    var scenario = try parseValue(allocator, scenario_bytes);
+    defer scenario.deinit();
+    const scenario_root = try jsonObjectPtr(&scenario.value);
+    const scenario_id = try jsonRequiredString(scenario_root.*, "scenario_id");
+    for (source_cases.items) |case_value| {
+        const source_case = try jsonObject(case_value);
+        if (!std.mem.eql(
+            u8,
+            try jsonRequiredString(source_case, "scenario_id"),
+            scenario_id,
+        )) continue;
+        if (std.mem.eql(
+            u8,
+            try jsonRequiredString(source_case, "case_visibility"),
+            "case_blind",
+        )) {
+            const environment = try jsonRequiredObject(scenario_root.*, "environment");
+            const oracles = try jsonRequiredArray(scenario_root.*, "oracles");
+            var projection: std.Io.Writer.Allocating = .init(allocator);
+            defer projection.deinit();
+            try projection.writer.writeAll("{\"schema\":\"hylo-scenario/v1\",\"campaign_id\":");
+            try std.json.Stringify.value(
+                try jsonRequiredString(scenario_root.*, "campaign_id"),
+                .{},
+                &projection.writer,
+            );
+            try projection.writer.writeAll(",\"scenario_id\":");
+            try std.json.Stringify.value(scenario_id, .{}, &projection.writer);
+            try projection.writer.writeAll(",\"split\":");
+            try std.json.Stringify.value(
+                try jsonRequiredString(scenario_root.*, "split"),
+                .{},
+                &projection.writer,
+            );
+            try projection.writer.writeAll(",\"case_visibility\":\"case_blind\"");
+            inline for (.{
+                "source_episode_fingerprint",
+                "visible_input_fingerprint",
+                "hidden_reference_fingerprint",
+                "source_profile_fingerprint",
+            }) |key| {
+                try projection.writer.print(",\"{s}\":", .{key});
+                try std.json.Stringify.value(
+                    try jsonRequiredString(source_case, key),
+                    .{},
+                    &projection.writer,
+                );
+            }
+            try projection.writer.writeAll(",\"environment_fingerprint\":");
+            try std.json.Stringify.value(
+                try jsonRequiredString(environment, "fingerprint"),
+                .{},
+                &projection.writer,
+            );
+            try projection.writer.writeAll(",\"effect_policy\":");
+            try writeCanonicalJson(
+                allocator,
+                &projection.writer,
+                try jsonRequired(environment, "effect_policy"),
+            );
+            try projection.writer.writeAll(",\"replay_policy_fingerprint\":");
+            try std.json.Stringify.value(
+                try jsonRequiredString(scenario_root.*, "replay_policy_fingerprint"),
+                .{},
+                &projection.writer,
+            );
+            try projection.writer.writeAll(",\"oracle_commitments\":[");
+            for (oracles.items, 0..) |oracle_value, index| {
+                if (index != 0) try projection.writer.writeByte(',');
+                const oracle = try jsonObject(oracle_value);
+                try projection.writer.writeAll("{\"id\":");
+                try std.json.Stringify.value(
+                    try jsonRequiredString(oracle, "id"),
+                    .{},
+                    &projection.writer,
+                );
+                try projection.writer.writeAll(",\"kind\":");
+                try std.json.Stringify.value(
+                    try jsonRequiredString(oracle, "kind"),
+                    .{},
+                    &projection.writer,
+                );
+                try projection.writer.writeAll(",\"critical\":");
+                try writeCanonicalJson(
+                    allocator,
+                    &projection.writer,
+                    try jsonRequired(oracle, "critical"),
+                );
+                try projection.writer.writeAll(",\"grader_ref\":");
+                try std.json.Stringify.value(
+                    try jsonRequiredString(oracle, "grader_ref"),
+                    .{},
+                    &projection.writer,
+                );
+                try projection.writer.writeAll(",\"grader_fingerprint\":");
+                try std.json.Stringify.value(
+                    try jsonRequiredString(oracle, "grader_fingerprint"),
+                    .{},
+                    &projection.writer,
+                );
+                try projection.writer.writeByte('}');
+            }
+            try projection.writer.writeAll("],\"limitations\":");
+            try writeCanonicalJson(
+                allocator,
+                &projection.writer,
+                try jsonRequired(environment, "limitations"),
+            );
+            try projection.writer.writeByte('}');
+            var projected = try parseValue(allocator, projection.written());
+            defer projected.deinit();
+            return canonicalJsonAlloc(allocator, projected.value);
+        }
+        (scenario_root.getPtr("source_episode_fingerprint") orelse
+            return error.RequiredFieldMissing).* = .{ .string = try jsonRequiredString(
+            source_case,
+            "source_episode_fingerprint",
+        ) };
+        return canonicalJsonAlloc(allocator, scenario.value);
+    }
+    return error.SourceCaseMissing;
+}
+
+fn testOperatorScenarioBytesAlloc(
+    allocator: std.mem.Allocator,
+    scenario_id: []const u8,
+    source_cases: std.json.Array,
+) ![]u8 {
+    var lines = std.mem.splitScalar(u8, hctp_fixtures.operator_recipe_scenarios, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r\n").len == 0) continue;
+        var parsed = try parseValue(allocator, line);
+        defer parsed.deinit();
+        if (std.mem.eql(
+            u8,
+            try jsonRequiredString(try jsonObject(parsed.value), "scenario_id"),
+            scenario_id,
+        )) return testOperatorScenarioProjectionAlloc(allocator, line, source_cases);
+    }
+    return error.ScenarioNotAdmitted;
+}
+
+const TestOperatorLaneEvidence = struct {
+    lane_id: []u8,
+    start_event_digest: []u8,
+    materialization_claim_fingerprint: []u8,
+    materialization_receipt: []u8,
+    materialization_receipt_path: []u8,
+    private_materialization_receipt_path: []u8,
+    run_receipt_fingerprint: []u8,
+
+    fn deinit(self: *TestOperatorLaneEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.lane_id);
+        allocator.free(self.start_event_digest);
+        allocator.free(self.materialization_claim_fingerprint);
+        allocator.free(self.materialization_receipt);
+        allocator.free(self.materialization_receipt_path);
+        allocator.free(self.private_materialization_receipt_path);
+        allocator.free(self.run_receipt_fingerprint);
+    }
+};
+
+const TestOperatorSemanticObservation = struct {
+    fingerprint: []u8,
+    output_byte_counts: [2]usize = .{ 0, 0 },
+    output_count: usize = 0,
+    trace_byte_counts: [1]usize = .{0},
+    trace_count: usize = 0,
+
+    fn deinit(self: *TestOperatorSemanticObservation, allocator: std.mem.Allocator) void {
+        allocator.free(self.fingerprint);
+    }
+};
+
+fn testOperatorOpaqueGradeIdentifierAlloc(
+    allocator: std.mem.Allocator,
+    kind: []const u8,
+    field: []const u8,
+    registered_value: []const u8,
+) ![]u8 {
+    const preimage = try std.fmt.allocPrint(
+        allocator,
+        "HCTP/operator-grade-identifier-alias/v1\x00{s}\x00{s}\x00{s}",
+        .{ kind, field, registered_value },
+    );
+    defer allocator.free(preimage);
+    const fingerprint = try digestBytesAlloc(allocator, preimage);
+    defer allocator.free(fingerprint);
+    return std.fmt.allocPrint(
+        allocator,
+        "opaque-{s}",
+        .{fingerprint["sha256:".len..]},
+    );
+}
+
+fn testOperatorJsonTextDigestAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]u8 {
+    var parsed = try parseValue(allocator, text);
+    defer parsed.deinit();
+    return digestValueAlloc(allocator, parsed.value);
+}
+
+fn testOperatorWriteSemanticCarrier(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    slot: []const u8,
+    fingerprint: []const u8,
+    ref: []const u8,
+) !usize {
+    const bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        ref,
+        MaxInputBytes,
+    );
+    defer allocator.free(bytes);
+    if (bytes.len == 0) return error.GradePresentationInvalid;
+    const observed_fingerprint = try digestBytesAlloc(allocator, bytes);
+    defer allocator.free(observed_fingerprint);
+    if (!std.mem.eql(u8, observed_fingerprint, fingerprint)) {
+        return error.GradePresentationInvalid;
+    }
+    const encoded = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(bytes.len),
+    );
+    defer allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, bytes);
+    try writer.writeAll("{\"slot\":");
+    try std.json.Stringify.value(slot, .{}, writer);
+    try writer.writeAll(",\"fingerprint\":");
+    try std.json.Stringify.value(fingerprint, .{}, writer);
+    try writer.print(",\"size_bytes\":{d},\"content_base64\":", .{bytes.len});
+    try std.json.Stringify.value(encoded, .{}, writer);
+    try writer.writeByte('}');
+    return bytes.len;
+}
+
+fn testOperatorSemanticObservationAlloc(
+    allocator: std.mem.Allocator,
+    kind: []const u8,
+    lanes: []const *const hctp.LaneState,
+) !TestOperatorSemanticObservation {
+    const absolute = std.mem.eql(u8, kind, "absolute");
+    if ((!absolute and !std.mem.eql(u8, kind, "pair")) or
+        lanes.len != (if (absolute) @as(usize, 1) else 2))
+    {
+        return error.GradePresentationInvalid;
+    }
+    var result = TestOperatorSemanticObservation{
+        .fingerprint = undefined,
+    };
+    var observation: std.Io.Writer.Allocating = .init(allocator);
+    defer observation.deinit();
+    try observation.writer.writeAll("{\"schema\":\"hylo-grade-semantic-observation/v1\",\"kind\":");
+    try std.json.Stringify.value(kind, .{}, &observation.writer);
+    try observation.writer.writeAll(",\"output_carriers\":[");
+    for (lanes, 0..) |lane, index| {
+        var run = try parseValue(
+            allocator,
+            lane.run_receipt_json orelse return error.RunReceiptInvalid,
+        );
+        defer run.deinit();
+        const evidence = try jsonRequiredObject(try jsonObject(run.value), "evidence");
+        if (index != 0) try observation.writer.writeByte(',');
+        result.output_byte_counts[index] = try testOperatorWriteSemanticCarrier(
+            allocator,
+            &observation.writer,
+            if (absolute) "output" else if (index == 0) "left_output" else "right_output",
+            lane.output_fingerprint orelse return error.RunReceiptInvalid,
+            try jsonRequiredString(evidence, "output_ref"),
+        );
+    }
+    result.output_count = lanes.len;
+    try observation.writer.writeAll("],\"trace_carriers\":[");
+    if (absolute) {
+        const lane = lanes[0];
+        var run = try parseValue(
+            allocator,
+            lane.run_receipt_json orelse return error.RunReceiptInvalid,
+        );
+        defer run.deinit();
+        const evidence = try jsonRequiredObject(try jsonObject(run.value), "evidence");
+        result.trace_byte_counts[0] = try testOperatorWriteSemanticCarrier(
+            allocator,
+            &observation.writer,
+            "trace",
+            lane.trace_fingerprint orelse return error.RunReceiptInvalid,
+            try jsonRequiredString(evidence, "trace_ref"),
+        );
+        result.trace_count = 1;
+    }
+    try observation.writer.writeAll("]}");
+    result.fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        observation.written(),
+    );
+    return result;
+}
+
+fn testOperatorGradeAuthority(
+    grading: std.json.ObjectMap,
+    role: []const u8,
+) !std.json.ObjectMap {
+    var selected: ?std.json.ObjectMap = null;
+    for ((try jsonRequiredArray(grading, "producer_authorities")).items) |value| {
+        const authority = try jsonObject(value);
+        if (!std.mem.eql(u8, try jsonRequiredString(authority, "role"), role)) continue;
+        if (selected != null) return error.GraderAuthorityInvalid;
+        selected = authority;
+    }
+    return selected orelse error.GraderAuthorityInvalid;
+}
+
+fn testOperatorGradeCapabilityDigestAlloc(
+    allocator: std.mem.Allocator,
+    presentation_fingerprint: []const u8,
+    grader_presentation_fingerprint: []const u8,
+    alias_map_fingerprint: []const u8,
+    semantic_observation_fingerprint: []const u8,
+) ![]u8 {
+    const preimage = try std.fmt.allocPrint(
+        allocator,
+        "hctp-grade-capability/v1\x00{s}\x00{s}\x00{s}\x00{s}",
+        .{
+            presentation_fingerprint,
+            grader_presentation_fingerprint,
+            alias_map_fingerprint,
+            semantic_observation_fingerprint,
+        },
+    );
+    defer allocator.free(preimage);
+    return digestBytesAlloc(allocator, preimage);
+}
+
+fn testOperatorPairPositionCommitmentAlloc(
+    allocator: std.mem.Allocator,
+    left_lane_alias: []const u8,
+    right_lane_alias: []const u8,
+    nonce: []const u8,
+) ![]u8 {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-pair-grade-position-map/v1\"" ++
+            ",\"left_lane_id\":{f},\"right_lane_id\":{f},\"no" ++ "nce\":{f}}}",
+        .{
+            std.json.fmt(left_lane_alias, .{}),
+            std.json.fmt(right_lane_alias, .{}),
+            std.json.fmt(nonce, .{}),
+        },
+    );
+    defer allocator.free(body);
+    return testOperatorJsonTextDigestAlloc(allocator, body);
+}
+
+fn testOperatorGradeEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    materializer_seed: [32]u8,
+    grader_seed: [32]u8,
+) ![]u8 {
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse
+        return error.TrialMissing;
+    const lane = location.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
+    const run_fingerprint = lane.run_receipt_fingerprint orelse return error.RunReceiptInvalid;
+    const output_fingerprint = lane.output_fingerprint orelse return error.RunReceiptInvalid;
+    const trace_fingerprint = lane.trace_fingerprint orelse return error.RunReceiptInvalid;
+    var trial = try trialJsonParsed(allocator, location.trial);
+    defer trial.deinit();
+    const trial_root = try jsonObject(trial.value);
+    const grading = try jsonRequiredObject(trial_root, "grading");
+    const rubric_fingerprint = try jsonRequiredString(grading, "rubric_fingerprint");
+    const grader_authority = try testOperatorGradeAuthority(grading, "absolute_grader");
+    const presentation_materializer = try jsonRequiredObject(
+        grading,
+        "presentation_materializer",
+    );
+    const alias_trial = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "absolute",
+        "trial_id",
+        trial_id,
+    );
+    defer allocator.free(alias_trial);
+    const alias_unit = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "absolute",
+        "unit_id",
+        lane.unit_id,
+    );
+    defer allocator.free(alias_unit);
+    const alias_lane = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "absolute",
+        "lane_id",
+        lane.id,
+    );
+    defer allocator.free(alias_lane);
+    const alias_arm = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "absolute",
+        "opaque_arm_id",
+        lane.arm_id,
+    );
+    defer allocator.free(alias_arm);
+    const alias_map_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-identifier-alias-map/v" ++
+            "1\",\"kind\":\"absolute\",\"registered\":{{\"tri" ++
+            "al_id\":{f},\"unit_id\":{f},\"pair_ids\":[],\"la" ++
+            "ne_ids\":[{f}],\"opaque_arm_id\":{f}}},\"aliases" ++
+            "\":{{\"trial_id\":{f},\"unit_id\":{f},\"pair_ids" ++
+            "\":[],\"lane_ids\":[{f}],\"opaque_arm_id\":{f}}}" ++ "}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane.unit_id, .{}),
+            std.json.fmt(lane.id, .{}),
+            std.json.fmt(lane.arm_id, .{}),
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_unit, .{}),
+            std.json.fmt(alias_lane, .{}),
+            std.json.fmt(alias_arm, .{}),
+        },
+    );
+    defer allocator.free(alias_map_body);
+    const alias_map_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        alias_map_body,
+    );
+    defer allocator.free(alias_map_fingerprint);
+    const native_presentation_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-blind-absolute-presentation/" ++
+            "v1\",\"trial_id\":{f},\"lane_id\":{f},\"opaque_a" ++
+            "rm_id\":{f},\"run_receipt_fingerprint\":{f},\"ou" ++
+            "tput_fingerprint\":{f},\"trace_fingerprint\":{f}" ++ ",\"rubric_fingerprint\":{f}}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane.id, .{}),
+            std.json.fmt(lane.arm_id, .{}),
+            std.json.fmt(run_fingerprint, .{}),
+            std.json.fmt(output_fingerprint, .{}),
+            std.json.fmt(trace_fingerprint, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(native_presentation_body);
+    const presentation_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        native_presentation_body,
+    );
+    defer allocator.free(presentation_fingerprint);
+    const grader_presentation_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-blind-absolute-presentation/" ++
+            "v1\",\"trial_id\":{f},\"lane_id\":{f},\"opaque_a" ++
+            "rm_id\":{f},\"run_receipt_fingerprint\":{f},\"ou" ++
+            "tput_fingerprint\":{f},\"trace_fingerprint\":{f}" ++ ",\"rubric_fingerprint\":{f}}}",
+        .{
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_lane, .{}),
+            std.json.fmt(alias_arm, .{}),
+            std.json.fmt(run_fingerprint, .{}),
+            std.json.fmt(output_fingerprint, .{}),
+            std.json.fmt(trace_fingerprint, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(grader_presentation_body);
+    const grader_presentation_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        grader_presentation_body,
+    );
+    defer allocator.free(grader_presentation_fingerprint);
+    var semantic_observation = try testOperatorSemanticObservationAlloc(
+        allocator,
+        "absolute",
+        &.{lane},
+    );
+    defer semantic_observation.deinit(allocator);
+    const capability_digest = try testOperatorGradeCapabilityDigestAlloc(
+        allocator,
+        presentation_fingerprint,
+        grader_presentation_fingerprint,
+        alias_map_fingerprint,
+        semantic_observation.fingerprint,
+    );
+    defer allocator.free(capability_digest);
+    const presentation_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-presentation-receipt/v" ++
+            "1\",\"trial_id\":{f},\"kind\":\"absolute\",\"sco" ++
+            "pe\":{{\"lane_ids\":[{f}],\"pair_ids\":[],\"unit" ++
+            "_ids\":[{f}],\"unit_count\":1,\"lane_count\":1," ++
+            "\"pair_count\":0}},\"grader\":{{\"role\":\"absol" ++
+            "ute_grader\",\"id\":{f},\"version\":{f},\"binary" ++
+            "_fingerprint\":{f},\"key_id\":{f}}},\"capability" ++
+            "_scope\":{{\"capability_digest\":{f},\"trial_id" ++
+            "\":{f},\"lane_ids\":[{f}],\"pair_ids\":[],\"allo" ++
+            "wed_inputs\":[\"output\",\"trace\",\"rubric\"]," ++
+            "\"single_use\":true}},\"presentation\":{{\"schem" ++
+            "a\":\"hylo-blind-absolute-presentation/v1\",\"pr" ++
+            "esentation_fingerprint\":{f},\"grader_presentati" ++
+            "on_fingerprint\":{f},\"identifier_alias_map_fing" ++
+            "erprint\":{f},\"identifier_aliases\":{{\"trial_i" ++
+            "d\":{f},\"unit_id\":{f},\"pair_ids\":[],\"lane_i" ++
+            "ds\":[{f}],\"opaque_arm_id\":{f}}},\"run_receipt" ++
+            "_fingerprints\":[{f}],\"output_fingerprints\":[{" ++
+            "f}],\"trace_fingerprints\":[{f}],\"rubric_finger" ++
+            "print\":{f},\"position_map_commitment\":null,\"p" ++
+            "osition_map_nonce\":null}},\"semantic_observatio" ++
+            "n\":{{\"schema\":\"hylo-grade-semantic-observati" ++
+            "on-receipt/v1\",\"observation_fingerprint\":{f}," ++
+            "\"output_fingerprints\":[{f}],\"output_byte_coun" ++
+            "ts\":[{d}],\"trace_fingerprints\":[{f}],\"trace_" ++
+            "byte_counts\":[{d}],\"carrier_encoding\":\"base6" ++
+            "4\",\"semantic_bytes_presented\":true}},\"delive" ++
+            "ry\":{{\"method\":\"anonymous_fd\",\"receiver_bi" ++
+            "nding\":\"grader_key\",\"receiver_role\":\"absol" ++
+            "ute_grader\",\"receiver_key_id\":{f},\"single_us" ++
+            "e\":true}},\"disclosure\":{{\"semantic_arm_ident" ++
+            "ity\":false,\"target_diff\":false,\"lane_executi" ++
+            "on_order\":false,\"prior_grades\":false,\"hidden" ++
+            "_reference\":false,\"sibling_outputs\":false,\"r" ++
+            "egistered_identifiers\":false}},\"execution\":{{" ++
+            "\"separate_process\":true,\"os_confinement\":fal" ++
+            "se,\"inherited_capability_fds\":[0,1,2,3]}},\"pr" ++
+            "oducer\":{{\"id\":{f},\"version\":{f},\"binary_f" ++
+            "ingerprint\":{f},\"key_id\":{f}}},\"attestation" ++ "\":null}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane.id, .{}),
+            std.json.fmt(lane.unit_id, .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(capability_digest, .{}),
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane.id, .{}),
+            std.json.fmt(presentation_fingerprint, .{}),
+            std.json.fmt(grader_presentation_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_unit, .{}),
+            std.json.fmt(alias_lane, .{}),
+            std.json.fmt(alias_arm, .{}),
+            std.json.fmt(run_fingerprint, .{}),
+            std.json.fmt(output_fingerprint, .{}),
+            std.json.fmt(trace_fingerprint, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(output_fingerprint, .{}),
+            semantic_observation.output_byte_counts[0],
+            std.json.fmt(trace_fingerprint, .{}),
+            semantic_observation.trace_byte_counts[0],
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(try jsonRequiredString(presentation_materializer, "producer_id"), .{}),
+            jfmt(try js(presentation_materializer, "producer_version"), .{}),
+            jfmt(try js(presentation_materializer, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(presentation_materializer, "key_id"), .{}),
+        },
+    );
+    defer allocator.free(presentation_unsigned);
+    const signed_presentation = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        presentation_unsigned,
+        .{
+            .id = try jsonRequiredString(presentation_materializer, "producer_id"),
+            .version = try jsonRequiredString(presentation_materializer, "producer_version"),
+            .binary_fingerprint = try js(presentation_materializer, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(presentation_materializer, "key_id"),
+        },
+        "materializer",
+        1,
+        materializer_seed,
+    );
+    defer allocator.free(signed_presentation);
+    var presentation_value = try parseValue(allocator, signed_presentation);
+    defer presentation_value.deinit();
+    const presentation_receipt_fingerprint = try digestValueAlloc(
+        allocator,
+        presentation_value.value,
+    );
+    defer allocator.free(presentation_receipt_fingerprint);
+    const evidence_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{output_fingerprint},
+    );
+    defer allocator.free(evidence_ref);
+    const trace_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{trace_fingerprint},
+    );
+    defer allocator.free(trace_ref);
+    const blind_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-receipt/v1\",\"trial_i" ++
+            "d\":{f},\"lane_id\":{f},\"opaque_arm_id\":{f},\"" ++
+            "run_receipt_fingerprint\":{f},\"grade_presentati" ++
+            "on_receipt_fingerprint\":{f},\"identifier_alias_" ++
+            "map_fingerprint\":{f},\"semantic_observation_fin" ++
+            "gerprint\":{f},\"producer\":{{\"id\":{f},\"versi" ++
+            "on\":{f},\"binary_fingerprint\":{f},\"key_id\":{" ++
+            "f}}},\"blinding\":{{\"semantic_arm_identity_visi" ++
+            "ble\":false,\"target_diff_visible\":false,\"sibl" ++
+            "ing_output_visible\":false,\"prior_trial_results" ++
+            "_visible\":false,\"hidden_reference_visible\":fa" ++
+            "lse,\"registered_identifiers_visible\":false}}," ++
+            "\"status\":\"pass\",\"rubric_fingerprint\":{f}," ++
+            "\"judge\":{{\"kind\":\"composite\",\"id\":\"test" ++
+            "-judge\",\"version\":\"1\",\"config_fingerprint" ++
+            "\":\"sha256:666666666666666666666666666666666666" ++
+            "6666666666666666666666666666\"}},\"dimensions\":" ++
+            "[{{\"id\":\"correctness\",\"score\":1.0,\"weight" ++
+            "\":1.0,\"grader_kind\":\"deterministic\",\"grade" ++
+            "r_ref\":\"test:dimension\",\"grader_fingerprint" ++
+            "\":\"sha256:555555555555555555555555555555555555" ++
+            "5555555555555555555555555555\",\"evidence_refs\"" ++
+            ":[{f}]}}],\"oracle_results\":[{{\"id\":\"require" ++
+            "d-test\",\"status\":\"pass\",\"grader_kind\":\"d" ++
+            "eterministic\",\"grader_ref\":\"test:oracle-grad" ++
+            "er\",\"grader_fingerprint\":\"sha256:88888888888" ++
+            "888888888888888888888888888888888888888888888888" ++
+            "88888\",\"evidence_refs\":[{f}]}}],\"derived_cri" ++
+            "tical_violations\":[],\"evidence_refs\":[{f},{f}" ++ "],\"attestation\":null}}",
+        .{
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_lane, .{}),
+            std.json.fmt(alias_arm, .{}),
+            std.json.fmt(run_fingerprint, .{}),
+            std.json.fmt(presentation_receipt_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+            std.json.fmt(evidence_ref, .{}),
+            std.json.fmt(trace_ref, .{}),
+            std.json.fmt(evidence_ref, .{}),
+            std.json.fmt(trace_ref, .{}),
+        },
+    );
+    defer allocator.free(blind_unsigned);
+    const signed_blind = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        blind_unsigned,
+        .{
+            .id = try jsonRequiredString(grader_authority, "producer_id"),
+            .version = try jsonRequiredString(grader_authority, "producer_version"),
+            .binary_fingerprint = try jsonRequiredString(grader_authority, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(grader_authority, "key_id"),
+        },
+        "absolute_grader",
+        2,
+        grader_seed,
+    );
+    defer allocator.free(signed_blind);
+    var blind_value = try parseValue(allocator, signed_blind);
+    defer blind_value.deinit();
+    const blind_fingerprint = try digestValueAlloc(allocator, blind_value.value);
+    defer allocator.free(blind_fingerprint);
+    const outer_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-receipt/v1\",\"trial_i" ++
+            "d\":{f},\"lane_id\":{f},\"opaque_arm_id\":{f},\"" ++
+            "run_receipt_fingerprint\":{f},\"grade_presentati" ++
+            "on_receipt_fingerprint\":{f},\"identifier_alias_" ++
+            "map_fingerprint\":{f},\"semantic_observation_fin" ++
+            "gerprint\":{f},\"producer\":{{\"id\":{f},\"versi" ++
+            "on\":{f},\"binary_fingerprint\":{f},\"key_id\":{" ++
+            "f}}},\"blinding\":{{\"semantic_arm_identity_visi" ++
+            "ble\":false,\"target_diff_visible\":false,\"sibl" ++
+            "ing_output_visible\":false,\"prior_trial_results" ++
+            "_visible\":false,\"hidden_reference_visible\":fa" ++
+            "lse,\"registered_identifiers_visible\":false}}," ++
+            "\"status\":\"pass\",\"rubric_fingerprint\":{f}," ++
+            "\"judge\":{{\"kind\":\"composite\",\"id\":\"test" ++
+            "-judge\",\"version\":\"1\",\"config_fingerprint" ++
+            "\":\"sha256:666666666666666666666666666666666666" ++
+            "6666666666666666666666666666\"}},\"dimensions\":" ++
+            "[{{\"id\":\"correctness\",\"score\":1.0,\"weight" ++
+            "\":1.0,\"grader_kind\":\"deterministic\",\"grade" ++
+            "r_ref\":\"test:dimension\",\"grader_fingerprint" ++
+            "\":\"sha256:555555555555555555555555555555555555" ++
+            "5555555555555555555555555555\",\"evidence_refs\"" ++
+            ":[{f}]}}],\"oracle_results\":[{{\"id\":\"require" ++
+            "d-test\",\"status\":\"pass\",\"grader_kind\":\"d" ++
+            "eterministic\",\"grader_ref\":\"test:oracle-grad" ++
+            "er\",\"grader_fingerprint\":\"sha256:88888888888" ++
+            "888888888888888888888888888888888888888888888888" ++
+            "88888\",\"evidence_refs\":[{f}]}}],\"derived_cri" ++
+            "tical_violations\":[],\"evidence_refs\":[{f},{f}" ++
+            "],\"blind_evaluation\":{s},\"blind_evaluation_fi" ++
+            "ngerprint\":{f},\"attestation\":null}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane.id, .{}),
+            std.json.fmt(lane.arm_id, .{}),
+            std.json.fmt(run_fingerprint, .{}),
+            std.json.fmt(presentation_receipt_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+            std.json.fmt(evidence_ref, .{}),
+            std.json.fmt(trace_ref, .{}),
+            std.json.fmt(evidence_ref, .{}),
+            std.json.fmt(trace_ref, .{}),
+            signed_blind,
+            std.json.fmt(blind_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(outer_unsigned);
+    const signed_receipt = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        outer_unsigned,
+        .{
+            .id = try jsonRequiredString(grader_authority, "producer_id"),
+            .version = try jsonRequiredString(grader_authority, "producer_version"),
+            .binary_fingerprint = try jsonRequiredString(grader_authority, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(grader_authority, "key_id"),
+        },
+        "absolute_grader",
+        3,
+        grader_seed,
+    );
+    defer allocator.free(signed_receipt);
+    var signed_receipt_value = try parseValue(allocator, signed_receipt);
+    defer signed_receipt_value.deinit();
+    const fingerprint = try digestValueAlloc(allocator, signed_receipt_value.value);
+    defer allocator.free(fingerprint);
+    const receipt_ref = try std.fmt.allocPrint(allocator, "artifact:{s}", .{fingerprint});
+    defer allocator.free(receipt_ref);
+    const presentation_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{presentation_receipt_fingerprint},
+    );
+    defer allocator.free(presentation_ref);
+    var envelope: std.Io.Writer.Allocating = .init(allocator);
+    defer envelope.deinit();
+    try envelope.writer.writeAll("{\"schema\":\"hylo-grade-broker-envelope/v1\",\"" ++
+        "grade_receipt_ref\":");
+    try std.json.Stringify.value(receipt_ref, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_receipt_fingerprint\":");
+    try std.json.Stringify.value(fingerprint, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_receipt\":");
+    try writeCanonicalJson(allocator, &envelope.writer, signed_receipt_value.value);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt_ref\":");
+    try std.json.Stringify.value(presentation_ref, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt_fingerprint\":");
+    try std.json.Stringify.value(presentation_receipt_fingerprint, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt\":");
+    try writeCanonicalJson(allocator, &envelope.writer, presentation_value.value);
+    try envelope.writer.writeByte('}');
+    var envelope_value = try parseValue(allocator, envelope.written());
+    defer envelope_value.deinit();
+    return canonicalJsonAlloc(allocator, envelope_value.value);
+}
+
+fn testOperatorPairGradeEnvelopeAlloc(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    trial_id: []const u8,
+    pair_id: []const u8,
+    materializer_seed: [32]u8,
+    grader_seed: [32]u8,
+) ![]u8 {
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse
+        return error.TrialMissing;
+    const pair = location.trial.findPair(pair_id) orelse return error.PairMissing;
+    var siblings: [2]*hctp.LaneState = undefined;
+    var sibling_count: usize = 0;
+    for (location.trial.lanes.items) |*lane| {
+        if (!std.mem.eql(u8, lane.pair_id, pair_id)) continue;
+        if (sibling_count == siblings.len) return error.PairGradeReceiptInvalid;
+        siblings[sibling_count] = lane;
+        sibling_count += 1;
+    }
+    if (sibling_count != siblings.len) return error.PairGradeReceiptInvalid;
+    const left = siblings[0];
+    const right = siblings[1];
+    const left_run = left.run_receipt_fingerprint orelse return error.PairGradeReceiptInvalid;
+    const right_run = right.run_receipt_fingerprint orelse return error.PairGradeReceiptInvalid;
+    const left_output = left.output_fingerprint orelse return error.PairGradeReceiptInvalid;
+    const right_output = right.output_fingerprint orelse return error.PairGradeReceiptInvalid;
+    var trial = try trialJsonParsed(allocator, location.trial);
+    defer trial.deinit();
+    const trial_root = try jsonObject(trial.value);
+    const grading = try jsonRequiredObject(trial_root, "grading");
+    const rubric_fingerprint = try jsonRequiredString(grading, "rubric_fingerprint");
+    const judge_contracts = try jsonRequiredArray(grading, "judge_contracts");
+    if (judge_contracts.items.len != 1) return error.JudgeContractMismatch;
+    const judge_contract_fingerprint = try jsonRequiredString(
+        try jsonObject(judge_contracts.items[0]),
+        "contract_fingerprint",
+    );
+    const grader_authority = try testOperatorGradeAuthority(grading, "pair_grader");
+    const presentation_materializer = try jsonRequiredObject(
+        grading,
+        "presentation_materializer",
+    );
+    const alias_trial = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "pair",
+        "trial_id",
+        trial_id,
+    );
+    defer allocator.free(alias_trial);
+    const alias_unit = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "pair",
+        "unit_id",
+        pair.unit_id,
+    );
+    defer allocator.free(alias_unit);
+    const alias_pair = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "pair",
+        "pair_id",
+        pair_id,
+    );
+    defer allocator.free(alias_pair);
+    const alias_left = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "pair",
+        "left_lane_id",
+        left.id,
+    );
+    defer allocator.free(alias_left);
+    const alias_right = try testOperatorOpaqueGradeIdentifierAlloc(
+        allocator,
+        "pair",
+        "right_lane_id",
+        right.id,
+    );
+    defer allocator.free(alias_right);
+    const position_nonce_preimage = try std.fmt.allocPrint(
+        allocator,
+        "HCTP/operator-grade-position-nonce/v1\x00{s}\x00{s}\x00{s}",
+        .{ pair.id, left.id, right.id },
+    );
+    defer allocator.free(position_nonce_preimage);
+    const position_nonce_fingerprint = try digestBytesAlloc(
+        allocator,
+        position_nonce_preimage,
+    );
+    defer allocator.free(position_nonce_fingerprint);
+    const position_nonce = position_nonce_fingerprint["sha256:".len..];
+    const position_map_commitment = try testOperatorPairPositionCommitmentAlloc(
+        allocator,
+        alias_left,
+        alias_right,
+        position_nonce,
+    );
+    defer allocator.free(position_map_commitment);
+    const alias_map_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-identifier-alias-map/v" ++
+            "1\",\"kind\":\"pair\",\"registered\":{{\"trial_i" ++
+            "d\":{f},\"unit_id\":{f},\"pair_ids\":[{f}],\"lan" ++
+            "e_ids\":[{f},{f}],\"opaque_arm_id\":null}},\"ali" ++
+            "ases\":{{\"trial_id\":{f},\"unit_id\":{f},\"pair" ++
+            "_ids\":[{f}],\"lane_ids\":[{f},{f}],\"opaque_arm" ++ "_id\":null}}}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(pair.unit_id, .{}),
+            std.json.fmt(pair.id, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_unit, .{}),
+            std.json.fmt(alias_pair, .{}),
+            std.json.fmt(alias_left, .{}),
+            std.json.fmt(alias_right, .{}),
+        },
+    );
+    defer allocator.free(alias_map_body);
+    const alias_map_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        alias_map_body,
+    );
+    defer allocator.free(alias_map_fingerprint);
+    const native_presentation_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-blind-pair-presentation/v1\"" ++
+            ",\"trial_id\":{f},\"pair_id\":{f},\"left_lane_id" ++
+            "\":{f},\"left_output_fingerprint\":{f},\"right_l" ++
+            "ane_id\":{f},\"right_output_fingerprint\":{f},\"" ++
+            "position_map_commitment\":{f},\"rubric_fingerpri" ++ "nt\":{f}}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(pair.id, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(right_output, .{}),
+            std.json.fmt(position_map_commitment, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(native_presentation_body);
+    const presentation_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        native_presentation_body,
+    );
+    defer allocator.free(presentation_fingerprint);
+    const grader_presentation_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-blind-pair-presentation/v1\"" ++
+            ",\"trial_id\":{f},\"pair_id\":{f},\"left_lane_id" ++
+            "\":{f},\"left_output_fingerprint\":{f},\"right_l" ++
+            "ane_id\":{f},\"right_output_fingerprint\":{f},\"" ++
+            "position_map_commitment\":{f},\"rubric_fingerpri" ++ "nt\":{f}}}",
+        .{
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_pair, .{}),
+            std.json.fmt(alias_left, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(alias_right, .{}),
+            std.json.fmt(right_output, .{}),
+            std.json.fmt(position_map_commitment, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(grader_presentation_body);
+    const grader_presentation_fingerprint = try testOperatorJsonTextDigestAlloc(
+        allocator,
+        grader_presentation_body,
+    );
+    defer allocator.free(grader_presentation_fingerprint);
+    var semantic_observation = try testOperatorSemanticObservationAlloc(
+        allocator,
+        "pair",
+        &.{ left, right },
+    );
+    defer semantic_observation.deinit(allocator);
+    const capability_digest = try testOperatorGradeCapabilityDigestAlloc(
+        allocator,
+        presentation_fingerprint,
+        grader_presentation_fingerprint,
+        alias_map_fingerprint,
+        semantic_observation.fingerprint,
+    );
+    defer allocator.free(capability_digest);
+    const grader_identity_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"role\":\"pair_grader\",\"id\":{f},\"version" ++
+            "\":{f},\"binary_fingerprint\":{f},\"key_id\":{f}" ++ "}}",
+        .{
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+        },
+    );
+    defer allocator.free(grader_identity_json);
+    const aliases_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"trial_id\":{f},\"unit_id\":{f},\"pair_ids\":" ++
+            "[{f}],\"lane_ids\":[{f},{f}],\"opaque_arm_id\":n" ++ "ull}}",
+        .{
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_unit, .{}),
+            std.json.fmt(alias_pair, .{}),
+            std.json.fmt(alias_left, .{}),
+            std.json.fmt(alias_right, .{}),
+        },
+    );
+    defer allocator.free(aliases_json);
+    const semantic_observation_receipt_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-semantic-observation-r" ++
+            "eceipt/v1\",\"observation_fingerprint\":{f},\"ou" ++
+            "tput_fingerprints\":[{f},{f}],\"output_byte_coun" ++
+            "ts\":[{d},{d}],\"trace_fingerprints\":[],\"trace" ++
+            "_byte_counts\":[],\"carrier_encoding\":\"base64" ++
+            "\",\"semantic_bytes_presented\":true}}",
+        .{
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(right_output, .{}),
+            semantic_observation.output_byte_counts[0],
+            semantic_observation.output_byte_counts[1],
+        },
+    );
+    defer allocator.free(semantic_observation_receipt_json);
+    const materializer_producer_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":{f},\"version\":{f},\"binary_fingerprint\":{f},\"key_id\":{f}}}",
+        .{
+            std.json.fmt(try jsonRequiredString(presentation_materializer, "producer_id"), .{}),
+            jfmt(try js(presentation_materializer, "producer_version"), .{}),
+            jfmt(try js(presentation_materializer, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(presentation_materializer, "key_id"), .{}),
+        },
+    );
+    defer allocator.free(materializer_producer_json);
+    const presentation_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-presentation-receipt/v" ++
+            "1\",\"trial_id\":{f},\"kind\":\"pair\",\"scope\"" ++
+            ":{{\"lane_ids\":[{f},{f}],\"pair_ids\":[{f}],\"u" ++
+            "nit_ids\":[{f}],\"unit_count\":1,\"lane_count\":" ++
+            "2,\"pair_count\":1}},\"grader\":{s},\"capability" ++
+            "_scope\":{{\"capability_digest\":{f},\"trial_id" ++
+            "\":{f},\"lane_ids\":[{f},{f}],\"pair_ids\":[{f}]" ++
+            ",\"allowed_inputs\":[\"sibling_outputs\",\"rubri" ++
+            "c\",\"position_map_commitment\"],\"single_use\":" ++
+            "true}},\"presentation\":{{\"schema\":\"hylo-blin" ++
+            "d-pair-presentation/v1\",\"presentation_fingerpr" ++
+            "int\":{f},\"grader_presentation_fingerprint\":{f" ++
+            "},\"identifier_alias_map_fingerprint\":{f},\"ide" ++
+            "ntifier_aliases\":{s},\"run_receipt_fingerprints" ++
+            "\":[{f},{f}],\"output_fingerprints\":[{f},{f}]," ++
+            "\"trace_fingerprints\":[],\"rubric_fingerprint\"" ++
+            ":{f},\"position_map_commitment\":{f},\"position_" ++
+            "map_nonce\":{f}}},\"semantic_observation\":{s}," ++
+            "\"delivery\":{{\"method\":\"anonymous_fd\",\"rec" ++
+            "eiver_binding\":\"grader_key\",\"receiver_role\"" ++
+            ":\"pair_grader\",\"receiver_key_id\":{f},\"singl" ++
+            "e_use\":true}},\"disclosure\":{{\"semantic_arm_i" ++
+            "dentity\":false,\"target_diff\":false,\"lane_exe" ++
+            "cution_order\":false,\"prior_grades\":false,\"hi" ++
+            "dden_reference\":false,\"sibling_outputs\":true," ++
+            "\"registered_identifiers\":false}},\"execution\"" ++
+            ":{{\"separate_process\":true,\"os_confinement\":" ++
+            "false,\"inherited_capability_fds\":[0,1,2,3]}}," ++
+            "\"producer\":{s},\"attestation\":null}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(pair.id, .{}),
+            std.json.fmt(pair.unit_id, .{}),
+            grader_identity_json,
+            std.json.fmt(capability_digest, .{}),
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(pair.id, .{}),
+            std.json.fmt(presentation_fingerprint, .{}),
+            std.json.fmt(grader_presentation_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            aliases_json,
+            std.json.fmt(left_run, .{}),
+            std.json.fmt(right_run, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(right_output, .{}),
+            std.json.fmt(rubric_fingerprint, .{}),
+            std.json.fmt(position_map_commitment, .{}),
+            std.json.fmt(position_nonce, .{}),
+            semantic_observation_receipt_json,
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            materializer_producer_json,
+        },
+    );
+    defer allocator.free(presentation_unsigned);
+    const signed_presentation = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        presentation_unsigned,
+        .{
+            .id = try jsonRequiredString(presentation_materializer, "producer_id"),
+            .version = try jsonRequiredString(presentation_materializer, "producer_version"),
+            .binary_fingerprint = try js(presentation_materializer, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(presentation_materializer, "key_id"),
+        },
+        "materializer",
+        4,
+        materializer_seed,
+    );
+    defer allocator.free(signed_presentation);
+    var presentation_value = try parseValue(allocator, signed_presentation);
+    defer presentation_value.deinit();
+    const presentation_receipt_fingerprint = try digestValueAlloc(
+        allocator,
+        presentation_value.value,
+    );
+    defer allocator.free(presentation_receipt_fingerprint);
+    const left_evidence_ref = try std.fmt.allocPrint(allocator, "artifact:{s}", .{left_output});
+    defer allocator.free(left_evidence_ref);
+    const right_evidence_ref = try std.fmt.allocPrint(allocator, "artifact:{s}", .{right_output});
+    defer allocator.free(right_evidence_ref);
+    const blind_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-pair-grade-receipt/v1\",\"tr" ++
+            "ial_id\":{f},\"pair_id\":{f},\"lane_ids\":[{f},{" ++
+            "f}],\"grade_presentation_receipt_fingerprint\":{" ++
+            "f},\"identifier_alias_map_fingerprint\":{f},\"se" ++
+            "mantic_observation_fingerprint\":{f},\"judge_con" ++
+            "tract_fingerprint\":{f},\"presentation\":{{\"lef" ++
+            "t_lane_id\":{f},\"right_lane_id\":{f},\"left_out" ++
+            "put_fingerprint\":{f},\"right_output_fingerprint" ++
+            "\":{f},\"position_map_commitment\":{f},\"sibling" ++
+            "_outputs_only\":true}},\"producer\":{{\"id\":{f}" ++
+            ",\"version\":{f},\"binary_fingerprint\":{f},\"ke" ++
+            "y_id\":{f}}},\"blinding\":{{\"semantic_arm_ident" ++
+            "ity_visible\":false,\"opaque_arm_id_visible\":fa" ++
+            "lse,\"target_diff_visible\":false,\"lane_executi" ++
+            "on_order_visible\":false,\"absolute_grade_result" ++
+            "s_visible\":false,\"prior_pair_results_visible\"" ++
+            ":false,\"registered_identifiers_visible\":false}" ++
+            "},\"verdict\":{{\"preferred\":\"tie\",\"confiden" ++
+            "ce\":1.0}},\"dimensions\":[{{\"id\":\"correctnes" ++
+            "s\",\"preferred\":\"tie\",\"rationale_ref\":{f}," ++
+            "\"evidence_refs\":[{f},{f}]}}],\"prohibited_crit" ++
+            "ical_authority\":true,\"evidence_refs\":[{f},{f}" ++ "],\"attestation\":null}}",
+        .{
+            std.json.fmt(alias_trial, .{}),
+            std.json.fmt(alias_pair, .{}),
+            std.json.fmt(alias_left, .{}),
+            std.json.fmt(alias_right, .{}),
+            std.json.fmt(presentation_receipt_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(judge_contract_fingerprint, .{}),
+            std.json.fmt(alias_left, .{}),
+            std.json.fmt(alias_right, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(right_output, .{}),
+            std.json.fmt(position_map_commitment, .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(right_evidence_ref, .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(right_evidence_ref, .{}),
+        },
+    );
+    defer allocator.free(blind_unsigned);
+    const signed_blind = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        blind_unsigned,
+        .{
+            .id = try jsonRequiredString(grader_authority, "producer_id"),
+            .version = try jsonRequiredString(grader_authority, "producer_version"),
+            .binary_fingerprint = try jsonRequiredString(grader_authority, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(grader_authority, "key_id"),
+        },
+        "pair_grader",
+        5,
+        grader_seed,
+    );
+    defer allocator.free(signed_blind);
+    var blind_value = try parseValue(allocator, signed_blind);
+    defer blind_value.deinit();
+    const blind_fingerprint = try digestValueAlloc(allocator, blind_value.value);
+    defer allocator.free(blind_fingerprint);
+    const outer_unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-pair-grade-receipt/v1\",\"tr" ++
+            "ial_id\":{f},\"pair_id\":{f},\"lane_ids\":[{f},{" ++
+            "f}],\"grade_presentation_receipt_fingerprint\":{" ++
+            "f},\"identifier_alias_map_fingerprint\":{f},\"se" ++
+            "mantic_observation_fingerprint\":{f},\"judge_con" ++
+            "tract_fingerprint\":{f},\"presentation\":{{\"lef" ++
+            "t_lane_id\":{f},\"right_lane_id\":{f},\"left_out" ++
+            "put_fingerprint\":{f},\"right_output_fingerprint" ++
+            "\":{f},\"position_map_commitment\":{f},\"sibling" ++
+            "_outputs_only\":true}},\"producer\":{{\"id\":{f}" ++
+            ",\"version\":{f},\"binary_fingerprint\":{f},\"ke" ++
+            "y_id\":{f}}},\"blinding\":{{\"semantic_arm_ident" ++
+            "ity_visible\":false,\"opaque_arm_id_visible\":fa" ++
+            "lse,\"target_diff_visible\":false,\"lane_executi" ++
+            "on_order_visible\":false,\"absolute_grade_result" ++
+            "s_visible\":false,\"prior_pair_results_visible\"" ++
+            ":false,\"registered_identifiers_visible\":false}" ++
+            "},\"verdict\":{{\"preferred\":\"tie\",\"confiden" ++
+            "ce\":1.0}},\"dimensions\":[{{\"id\":\"correctnes" ++
+            "s\",\"preferred\":\"tie\",\"rationale_ref\":{f}," ++
+            "\"evidence_refs\":[{f},{f}]}}],\"prohibited_crit" ++
+            "ical_authority\":true,\"evidence_refs\":[{f},{f}" ++
+            "],\"blind_evaluation\":{s},\"blind_evaluation_fi" ++
+            "ngerprint\":{f},\"attestation\":null}}",
+        .{
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(pair.id, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(presentation_receipt_fingerprint, .{}),
+            std.json.fmt(alias_map_fingerprint, .{}),
+            std.json.fmt(semantic_observation.fingerprint, .{}),
+            std.json.fmt(judge_contract_fingerprint, .{}),
+            std.json.fmt(left.id, .{}),
+            std.json.fmt(right.id, .{}),
+            std.json.fmt(left_output, .{}),
+            std.json.fmt(right_output, .{}),
+            std.json.fmt(position_map_commitment, .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_id"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "producer_version"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "binary_fingerprint"), .{}),
+            std.json.fmt(try jsonRequiredString(grader_authority, "key_id"), .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(right_evidence_ref, .{}),
+            std.json.fmt(left_evidence_ref, .{}),
+            std.json.fmt(right_evidence_ref, .{}),
+            signed_blind,
+            std.json.fmt(blind_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(outer_unsigned);
+    const signed_receipt = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        outer_unsigned,
+        .{
+            .id = try jsonRequiredString(grader_authority, "producer_id"),
+            .version = try jsonRequiredString(grader_authority, "producer_version"),
+            .binary_fingerprint = try jsonRequiredString(grader_authority, "binary_fingerprint"),
+            .key_id = try jsonRequiredString(grader_authority, "key_id"),
+        },
+        "pair_grader",
+        6,
+        grader_seed,
+    );
+    defer allocator.free(signed_receipt);
+    var signed_receipt_value = try parseValue(allocator, signed_receipt);
+    defer signed_receipt_value.deinit();
+    const fingerprint = try digestValueAlloc(allocator, signed_receipt_value.value);
+    defer allocator.free(fingerprint);
+    const receipt_ref = try std.fmt.allocPrint(allocator, "artifact:{s}", .{fingerprint});
+    defer allocator.free(receipt_ref);
+    const presentation_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{presentation_receipt_fingerprint},
+    );
+    defer allocator.free(presentation_ref);
+    var envelope: std.Io.Writer.Allocating = .init(allocator);
+    defer envelope.deinit();
+    try envelope.writer.writeAll(
+        "{\"schema\":\"hylo-pair-grade-broker-envelope/v1\",\"pair_grade_receipt_ref\":",
+    );
+    try std.json.Stringify.value(receipt_ref, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"pair_grade_receipt_fingerprint\":");
+    try std.json.Stringify.value(fingerprint, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"pair_grade_receipt\":");
+    try writeCanonicalJson(allocator, &envelope.writer, signed_receipt_value.value);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt_ref\":");
+    try std.json.Stringify.value(presentation_ref, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt_fingerprint\":");
+    try std.json.Stringify.value(presentation_receipt_fingerprint, .{}, &envelope.writer);
+    try envelope.writer.writeAll(",\"grade_presentation_receipt\":");
+    try writeCanonicalJson(allocator, &envelope.writer, presentation_value.value);
+    try envelope.writer.writeByte('}');
+    var envelope_value = try parseValue(allocator, envelope.written());
+    defer envelope_value.deinit();
+    return canonicalJsonAlloc(allocator, envelope_value.value);
+}
+
+fn testExecutePrivateOperatorLane(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    trial_path: []const u8,
+    trial: std.json.ObjectMap,
+    custody_bytes: []const u8,
+    registration_event_digest: []const u8,
+    unit_id: []const u8,
+    expected_source_kind: []const u8,
+    visible_input_fingerprint: []const u8,
+    sealed_case_path: []const u8,
+    source_selection_opening: []const u8,
+    source_seal_key: []const u8,
+    materializer_seed: []const u8,
+    runner_seed: []const u8,
+    receipt_dir: []const u8,
+    executor_path: []const u8,
+    ledger_path: []const u8,
+    pair_index: usize,
+    order_index: usize,
+) !TestOperatorLaneEvidence {
+    const lane = try testOperatorFrozenLane(trial, unit_id, pair_index, order_index);
+    try std.testing.expectEqualStrings(expected_source_kind, lane.source_kind);
+
+    const preflight_bytes = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.cas_trial_path,
+        "preflight",
+        "--trial",
+        trial_path,
+        "--lane-id",
+        lane.lane_id,
+        "--json",
+    });
+    defer allocator.free(preflight_bytes);
+    var preflight = try parseValue(allocator, preflight_bytes);
+    defer preflight.deinit();
+    const preflight_root = try jsonObject(preflight.value);
+    try std.testing.expectEqualStrings(
+        "cas-trial-preflight/v1",
+        try jsonRequiredString(preflight_root, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        expected_source_kind,
+        try jsonRequiredString(preflight_root, "source_profile_kind"),
+    );
+    try std.testing.expectEqualStrings(
+        lane.source_profile_body_delivery,
+        try jsonRequiredString(preflight_root, "source_profile_body_delivery"),
+    );
+    const historical = std.mem.eql(u8, expected_source_kind, "historical_decision");
+    const replay_required = try jsonRequired(preflight_root, "compile_replay_required");
+    try std.testing.expect(replay_required == .bool and !replay_required.bool);
+    try std.testing.expectEqualStrings(
+        if (historical) "integrated_run" else "none",
+        try jsonRequiredString(preflight_root, "replay_preparation_mode"),
+    );
+    try std.testing.expectEqualStrings(
+        try jsonRequiredString(preflight_root, "source_profile_kind"),
+        try jsonRequiredString(preflight_root, "source_kind"),
+    );
+    try std.testing.expect(preflight_root.get("historical_replay_required") == null);
+    try std.testing.expectEqualStrings(
+        if (historical) "historical_replay" else "direct",
+        try jsonRequiredString(preflight_root, "execution_route"),
+    );
+    const projected_lineage = try jsonRequired(preflight_root, "required_lineage");
+    if (lane.required_lineage) |required_lineage| {
+        try std.testing.expectEqualStrings(required_lineage, try jsonString(projected_lineage));
+    } else {
+        try std.testing.expect(projected_lineage == .null);
+    }
+
+    const private_materialization_receipt_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/seq-materialization-{s}.json",
+        .{ receipt_dir, lane.lane_id },
+    );
+    errdefer allocator.free(private_materialization_receipt_path);
+    var source_materialization = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.seq_path,
+            "hctp-source",
+            "materialize",
+            "--sealed-case",
+            sealed_case_path,
+            "--trial",
+            trial_path,
+            "--lane-id",
+            lane.lane_id,
+            "--output",
+            private_materialization_receipt_path,
+        },
+        &.{
+            .{ .fd_flag = "--seal-key-fd", .bytes = source_seal_key },
+            .{
+                .fd_flag = "--source-selection-opening-fd",
+                .bytes = source_selection_opening,
+            },
+            .{ .fd_flag = "--signing-seed-fd", .bytes = materializer_seed },
+        },
+        "--visible-output-fd",
+        if (historical) "--source-profile-output-fd" else null,
+    );
+    defer source_materialization.deinit(allocator);
+    if (processExitCode(source_materialization.term) != 0 or
+        source_materialization.stderr.len != 0)
+    {
+        std.debug.print(
+            "operator Seq materialization failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ lane.lane_id, source_materialization.stdout, source_materialization.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try testExpectNoPrivateReceiptSurface(source_materialization.stdout);
+    try testExpectNoPrivateReceiptSurface(source_materialization.stderr);
+    var visible_input = try parseValue(allocator, source_materialization.protected_output);
+    defer visible_input.deinit();
+    const observed_visible_input_fingerprint = try digestValueAlloc(
+        allocator,
+        visible_input.value,
+    );
+    defer allocator.free(observed_visible_input_fingerprint);
+    try std.testing.expectEqualStrings(
+        visible_input_fingerprint,
+        observed_visible_input_fingerprint,
+    );
+    if (historical) {
+        var source_profile = try parseValue(
+            allocator,
+            source_materialization.protected_output_2,
+        );
+        defer source_profile.deinit();
+        const observed_source_profile_fingerprint = try digestValueAlloc(
+            allocator,
+            source_profile.value,
+        );
+        defer allocator.free(observed_source_profile_fingerprint);
+        var selected_unit: ?std.json.ObjectMap = null;
+        for ((try jsonRequiredArray(trial, "units")).items) |unit_value| {
+            const unit = try jsonObject(unit_value);
+            if (std.mem.eql(u8, try jsonRequiredString(unit, "unit_id"), unit_id)) {
+                selected_unit = unit;
+                break;
+            }
+        }
+        const public_profile = try jsonRequiredObject(
+            selected_unit orelse return error.SourceReceiptTrialMismatch,
+            "source_profile",
+        );
+        try std.testing.expectEqualStrings(
+            try jsonRequiredString(public_profile, "source_profile_fingerprint"),
+            observed_source_profile_fingerprint,
+        );
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), source_materialization.protected_output_2.len);
+    }
+    const private_materialization_receipt = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        private_materialization_receipt_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(private_materialization_receipt);
+    var private_materialization = try parseValue(allocator, private_materialization_receipt);
+    defer private_materialization.deinit();
+    try std.testing.expectEqualStrings(
+        "hylo-materialization-receipt/v1",
+        try jsonRequiredString(try jsonObject(private_materialization.value), "schema"),
+    );
+
+    var started = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "start-lane",
+            "--repo",
+            repo,
+            "--campaign-id",
+            "campaign-operator-recipe",
+            "--trial-id",
+            "trial-operator-recipe",
+            "--lane-id",
+            lane.lane_id,
+            "--runner-id",
+            "cas-trial",
+        },
+        &.{.{
+            .fd_flag = "--custody-input-fd",
+            .bytes = custody_bytes,
+        }},
+        "--lease-output-fd",
+        null,
+    );
+    defer started.deinit(allocator);
+    if (processExitCode(started.term) != 0 or started.stderr.len != 0) {
+        std.debug.print(
+            "operator start-lane failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ lane.lane_id, started.stdout, started.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try testExpectNoPrivateReceiptSurface(started.stdout);
+    try testExpectNoPrivateReceiptSurface(started.stderr);
+    try std.testing.expect(std.mem.startsWith(u8, started.protected_output, "HYL1-"));
+    var start_receipt = try parseValue(allocator, started.stdout);
+    defer start_receipt.deinit();
+    const start_root = try jsonObject(start_receipt.value);
+    try std.testing.expectEqualStrings(
+        "hylo-lane-start-receipt/v1",
+        try jsonRequiredString(start_root, "schema"),
+    );
+    const start_event_digest = try jsonRequiredString(start_root, "start_event_digest");
+    const lease_digest = try jsonRequiredString(start_root, "lane_lease_digest");
+    const observed_lease_digest = try digestBytesAlloc(allocator, started.protected_output);
+    defer allocator.free(observed_lease_digest);
+    try std.testing.expectEqualStrings(lease_digest, observed_lease_digest);
+
+    if (std.mem.eql(u8, unit_id, "unit-direct") and pair_index == 0 and order_index == 0) {
+        var before_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer before_recovery.deinit(allocator);
+        var recovered = try testRunWithProtectedChannelsAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "recover-lane-start",
+                "--repo",
+                repo,
+                "--campaign-id",
+                "campaign-operator-recipe",
+                "--trial-id",
+                "trial-operator-recipe",
+                "--lane-id",
+                lane.lane_id,
+                "--runner-id",
+                "cas-trial",
+                "--lane-lease-digest",
+                lease_digest,
+            },
+            &.{.{ .fd_flag = "--lease-input-fd", .bytes = started.protected_output }},
+            null,
+            null,
+        );
+        defer recovered.deinit(allocator);
+        if (processExitCode(recovered.term) != 0 or recovered.stderr.len != 0) {
+            std.debug.print(
+                "operator recover-lane-start failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+                .{ lane.lane_id, recovered.stdout, recovered.stderr },
+            );
+            return error.ProductCommandFailed;
+        }
+        try std.testing.expectEqualStrings(started.stdout, recovered.stdout);
+        var after_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer after_recovery.deinit(allocator);
+        try testExpectSnapshotContentsEquivalent(before_recovery, after_recovery);
+
+        const wrong_lease =
+            "HYL1-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        var rejected_recovery = try testRunWithProtectedChannelsAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "recover-lane-start",
+                "--repo",
+                repo,
+                "--campaign-id",
+                "campaign-operator-recipe",
+                "--trial-id",
+                "trial-operator-recipe",
+                "--lane-id",
+                lane.lane_id,
+                "--runner-id",
+                "cas-trial",
+                "--lane-lease-digest",
+                lease_digest,
+            },
+            &.{.{ .fd_flag = "--lease-input-fd", .bytes = wrong_lease }},
+            null,
+            null,
+        );
+        defer rejected_recovery.deinit(allocator);
+        try std.testing.expect(processExitCode(rejected_recovery.term) != 0);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.stdout.len);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.protected_output.len);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.protected_output_2.len);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rejected_recovery.stderr,
+            "LaneStartRecoveryLeaseMismatch",
+        ) != null);
+        var after_rejected_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer after_rejected_recovery.deinit(allocator);
+        try testExpectSnapshotContentsEquivalent(after_recovery, after_rejected_recovery);
+    }
+
+    var materialized = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "lane-materialization",
+            "--repo",
+            repo,
+            "--trial-id",
+            "trial-operator-recipe",
+            "--lane-id",
+            lane.lane_id,
+            "--registration-event-digest",
+            registration_event_digest,
+            "--lane-started-event-digest",
+            start_event_digest,
+            "--lane-lease-digest",
+            lease_digest,
+        },
+        &.{
+            .{ .fd_flag = "--custody-input-fd", .bytes = custody_bytes },
+            .{ .fd_flag = "--lease-input-fd", .bytes = started.protected_output },
+        },
+        "--materialization-output-fd",
+        null,
+    );
+    defer materialized.deinit(allocator);
+    if (processExitCode(materialized.term) != 0 or materialized.stderr.len != 0) {
+        std.debug.print(
+            "operator lane-materialization failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ lane.lane_id, materialized.stdout, materialized.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try testExpectNoPrivateReceiptSurface(materialized.stdout);
+    try testExpectNoPrivateReceiptSurface(materialized.stderr);
+    var materialization_receipt = try parseValue(allocator, materialized.stdout);
+    defer materialization_receipt.deinit();
+    const materialization_root = try jsonObject(materialization_receipt.value);
+    try std.testing.expectEqualStrings(
+        "hylo-lane-materialization-receipt/v2",
+        try jsonRequiredString(materialization_root, "schema"),
+    );
+    const semantic_role_disclosed = try jsonRequired(
+        materialization_root,
+        "semantic_role_disclosed",
+    );
+    try std.testing.expect(semantic_role_disclosed == .bool and !semantic_role_disclosed.bool);
+    const claim_fingerprint = try jsonRequiredString(materialization_root, "claim_fingerprint");
+    const observed_claim_fingerprint = try digestBytesAlloc(
+        allocator,
+        materialized.protected_output,
+    );
+    defer allocator.free(observed_claim_fingerprint);
+    try std.testing.expectEqualStrings(claim_fingerprint, observed_claim_fingerprint);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        materialized.stdout,
+        materialized.protected_output,
+    ) == null);
+
+    const safe_materialization_receipt_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/ledger-materialization-{s}.json",
+        .{ receipt_dir, lane.lane_id },
+    );
+    errdefer allocator.free(safe_materialization_receipt_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        safe_materialization_receipt_path,
+        materialized.stdout,
+    );
+    var cas_inputs: std.ArrayList(TestProtectedInput) = .empty;
+    defer cas_inputs.deinit(allocator);
+    try cas_inputs.appendSlice(allocator, &.{
+        .{ .fd_flag = "--lease-fd", .bytes = started.protected_output },
+        .{ .fd_flag = "--input-fd", .bytes = source_materialization.protected_output },
+        .{ .fd_flag = "--materialization-fd", .bytes = materialized.protected_output },
+        .{ .fd_flag = "--signing-seed-fd", .bytes = runner_seed },
+    });
+    if (historical) try cas_inputs.append(allocator, .{
+        .fd_flag = "--source-profile-fd",
+        .bytes = source_materialization.protected_output_2,
+    });
+    var cas_result = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.cas_trial_path,
+            "run",
+            "--trial",
+            trial_path,
+            "--lane-id",
+            lane.lane_id,
+            "--repo",
+            repo,
+            "--receipt-dir",
+            receipt_dir,
+            "--registration-event-digest",
+            registration_event_digest,
+            "--start-event-digest",
+            start_event_digest,
+            "--presented-input-fingerprint",
+            visible_input_fingerprint,
+            "--executor",
+            executor_path,
+            "--ledger",
+            ledger_path,
+            "--producer-id",
+            "cas-trial",
+            "--producer-key-id",
+            "runner-key",
+            "--json",
+        },
+        cas_inputs.items,
+        null,
+        null,
+    );
+    defer cas_result.deinit(allocator);
+    if (processExitCode(cas_result.term) != 0 or cas_result.stderr.len != 0) {
+        std.debug.print(
+            "operator CAS run failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ lane.lane_id, cas_result.stdout, cas_result.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 0), cas_result.protected_output.len);
+    try testExpectNoPrivateReceiptSurface(cas_result.stdout);
+    try testExpectNoPrivateReceiptSurface(cas_result.stderr);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        cas_result.stdout,
+        materialized.protected_output,
+    ) == null);
+    var cas_run_result = try parseValue(allocator, cas_result.stdout);
+    defer cas_run_result.deinit();
+    const cas_run_root = try jsonObject(cas_run_result.value);
+    try std.testing.expectEqualStrings(
+        "cas-trial-run-result/v1",
+        try jsonRequiredString(cas_run_root, "schema"),
+    );
+    const run_result_status = try jsonRequiredString(cas_run_root, "terminal_status");
+    if (!std.mem.eql(u8, run_result_status, "completed")) {
+        std.debug.print(
+            "operator CAS terminal status for {s} ({s}): {s}\n",
+            .{ lane.lane_id, expected_source_kind, run_result_status },
+        );
+    }
+    const receipt_path = try jsonRequiredString(cas_run_root, "receipt_ref");
+    const run_receipt_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        receipt_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(run_receipt_bytes);
+    var run_receipt = try parseValue(allocator, run_receipt_bytes);
+    defer run_receipt.deinit();
+    const run_receipt_fingerprint = try digestValueAlloc(allocator, run_receipt.value);
+    defer allocator.free(run_receipt_fingerprint);
+    try std.testing.expectEqualStrings(
+        try jsonRequiredString(cas_run_root, "receipt_fingerprint"),
+        run_receipt_fingerprint,
+    );
+    const run_root = try jsonObject(run_receipt.value);
+    try std.testing.expectEqualStrings(
+        "hylo-run-receipt/v2",
+        try jsonRequiredString(run_root, "schema"),
+    );
+    const terminal = try jsonRequiredObject(run_root, "terminal");
+    if (!std.mem.eql(u8, try jsonRequiredString(terminal, "status"), "completed")) {
+        var runner_error: []const u8 = "unavailable";
+        var failure_detail_bytes: ?[]u8 = null;
+        defer if (failure_detail_bytes) |bytes| allocator.free(bytes);
+        var failure_detail: ?std.json.Parsed(std.json.Value) = null;
+        defer if (failure_detail) |*parsed| parsed.deinit();
+        if (terminal.get("failure_detail_ref")) |failure_ref| {
+            if (failure_ref == .string) {
+                failure_detail_bytes = try durable_store.readRegularFileNoSymlink(
+                    allocator,
+                    failure_ref.string,
+                    MaxInputBytes,
+                );
+                failure_detail = try parseValue(allocator, failure_detail_bytes.?);
+                runner_error = try jsonRequiredString(
+                    try jsonObject(failure_detail.?.value),
+                    "runner_error",
+                );
+            }
+        }
+        std.debug.print(
+            "operator CAS terminal failure for {s} ({s}): {s} ({s})\n",
+            .{
+                lane.lane_id,
+                expected_source_kind,
+                try jsonRequiredString(terminal, "failure_class"),
+                runner_error,
+            },
+        );
+    }
+    try std.testing.expectEqualStrings("completed", try jsonRequiredString(terminal, "status"));
+    const public_materialization = try jsonRequiredObject(run_root, "materialization");
+    try std.testing.expectEqualStrings(
+        "commitment_only",
+        try jsonRequiredString(public_materialization, "visibility"),
+    );
+    try std.testing.expectEqualStrings(
+        lane.treatment_commitment,
+        try jsonRequiredString(public_materialization, "treatment_commitment"),
+    );
+    try std.testing.expectEqualStrings(
+        claim_fingerprint,
+        try jsonRequiredString(public_materialization, "materialization_claim_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        visible_input_fingerprint,
+        try jsonRequiredString(public_materialization, "presented_input_fingerprint"),
+    );
+    inline for (.{
+        "semantic_role",
+        "arm_value_fingerprint",
+        "target_snapshot_ref",
+        "target_snapshot_fingerprint",
+        "target_materialization_archive_ref",
+        "factor_materialization_ref",
+    }) |forbidden| {
+        try std.testing.expect(std.mem.indexOf(u8, run_receipt_bytes, forbidden) == null);
+    }
+    const native_receipt = try jsonRequiredObject(run_root, "native_receipt");
+    if (historical) {
+        try std.testing.expectEqualStrings(
+            hctp.FirPublicProjectionKind,
+            try jsonRequiredString(native_receipt, "kind"),
+        );
+        const fir_projection = try jsonRequiredObject(native_receipt, "receipt");
+        try std.testing.expectEqualStrings(
+            hctp.FirPublicProjectionSchema,
+            try jsonRequiredString(fir_projection, "schema"),
+        );
+        try std.testing.expect(std.mem.indexOf(u8, run_receipt_bytes, "token_usage") == null);
+        _ = try jsonRequiredString(public_materialization, "historical_dcp_fingerprint");
+        _ = try jsonRequiredString(public_materialization, "historical_rip_fingerprint");
+        try std.testing.expectEqualStrings(
+            lane.source_profile_body_delivery,
+            try jsonRequiredString(public_materialization, "source_profile_body_delivery"),
+        );
+    } else {
+        try std.testing.expectEqualStrings(
+            "cas-trial-receipt",
+            try jsonRequiredString(native_receipt, "kind"),
+        );
+        try std.testing.expect(public_materialization.get("historical_dcp_fingerprint") == null);
+        try std.testing.expect(public_materialization.get("historical_rip_fingerprint") == null);
+        try std.testing.expect(public_materialization.get("source_profile_body_delivery") == null);
+    }
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        run_receipt_bytes,
+        materialized.protected_output,
+    ) == null);
+
+    var finished = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "finish-lane",
+            "--repo",
+            repo,
+            "--receipt",
+            receipt_path,
+        },
+        &.{.{ .fd_flag = "--lease-input-fd", .bytes = started.protected_output }},
+        null,
+        null,
+    );
+    defer finished.deinit(allocator);
+    if (processExitCode(finished.term) != 0 or finished.stderr.len != 0) {
+        std.debug.print(
+            "operator finish-lane failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ lane.lane_id, finished.stdout, finished.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 0), finished.protected_output.len);
+    try testExpectNoPrivateReceiptSurface(finished.stdout);
+    try testExpectNoPrivateReceiptSurface(finished.stderr);
+    var finish_receipt = try parseValue(allocator, finished.stdout);
+    defer finish_receipt.deinit();
+    const finish_root = try jsonObject(finish_receipt.value);
+    try std.testing.expectEqualStrings(
+        "hylo-lane-finish-receipt/v1",
+        try jsonRequiredString(finish_root, "schema"),
+    );
+    try std.testing.expectEqualStrings("appended", try jsonRequiredString(finish_root, "status"));
+
+    if (std.mem.eql(u8, unit_id, "unit-direct") and pair_index == 0 and order_index == 0) {
+        var before_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer before_recovery.deinit(allocator);
+        var recovered = try testRunWithProtectedChannelsAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "recover-lane-finish",
+                "--repo",
+                repo,
+                "--receipt",
+                receipt_path,
+            },
+            &.{.{ .fd_flag = "--lease-input-fd", .bytes = started.protected_output }},
+            null,
+            null,
+        );
+        defer recovered.deinit(allocator);
+        if (processExitCode(recovered.term) != 0 or recovered.stderr.len != 0) {
+            std.debug.print(
+                "operator recover-lane-finish failed for {s}:\nstdout:\n{s}\nstderr:\n{s}\n",
+                .{ lane.lane_id, recovered.stdout, recovered.stderr },
+            );
+            return error.ProductCommandFailed;
+        }
+        var recovered_again = try testRunWithProtectedChannelsAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "recover-lane-finish",
+                "--repo",
+                repo,
+                "--receipt",
+                receipt_path,
+            },
+            &.{.{ .fd_flag = "--lease-input-fd", .bytes = started.protected_output }},
+            null,
+            null,
+        );
+        defer recovered_again.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), processExitCode(recovered_again.term));
+        try std.testing.expectEqualStrings(recovered.stdout, recovered_again.stdout);
+        var recovery_receipt = try parseValue(allocator, recovered.stdout);
+        defer recovery_receipt.deinit();
+        const recovery_root = try jsonObject(recovery_receipt.value);
+        try std.testing.expectEqualStrings(
+            "hylo-lane-finish-recovery-receipt/v1",
+            try jsonRequiredString(recovery_root, "schema"),
+        );
+        try std.testing.expectEqualStrings(
+            run_receipt_fingerprint,
+            try jsonRequiredString(recovery_root, "run_receipt_fingerprint"),
+        );
+        var after_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer after_recovery.deinit(allocator);
+        try testExpectSnapshotContentsEquivalent(before_recovery, after_recovery);
+
+        const wrong_lease =
+            "HYL1-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        var rejected_recovery = try testRunWithProtectedChannelsAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "recover-lane-finish",
+                "--repo",
+                repo,
+                "--receipt",
+                receipt_path,
+            },
+            &.{.{ .fd_flag = "--lease-input-fd", .bytes = wrong_lease }},
+            null,
+            null,
+        );
+        defer rejected_recovery.deinit(allocator);
+        try std.testing.expect(processExitCode(rejected_recovery.term) != 0);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.stdout.len);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.protected_output.len);
+        try std.testing.expectEqual(@as(usize, 0), rejected_recovery.protected_output_2.len);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            rejected_recovery.stderr,
+            "LaneFinishRecoveryLeaseMismatch",
+        ) != null);
+        var after_rejected_recovery = try store.snapshot(allocator, MaxStoreBytes);
+        defer after_rejected_recovery.deinit(allocator);
+        try testExpectSnapshotContentsEquivalent(after_recovery, after_rejected_recovery);
+    }
+
+    const retained_lane_id = try allocator.dupe(u8, lane.lane_id);
+    errdefer allocator.free(retained_lane_id);
+    const retained_start_event_digest = try allocator.dupe(u8, start_event_digest);
+    errdefer allocator.free(retained_start_event_digest);
+    const retained_claim_fingerprint = try allocator.dupe(u8, claim_fingerprint);
+    errdefer allocator.free(retained_claim_fingerprint);
+    const retained_materialization_receipt = try allocator.dupe(u8, materialized.stdout);
+    errdefer allocator.free(retained_materialization_receipt);
+    const retained_run_receipt_fingerprint = try allocator.dupe(u8, run_receipt_fingerprint);
+    errdefer allocator.free(retained_run_receipt_fingerprint);
+    return .{
+        .lane_id = retained_lane_id,
+        .start_event_digest = retained_start_event_digest,
+        .materialization_claim_fingerprint = retained_claim_fingerprint,
+        .materialization_receipt = retained_materialization_receipt,
+        .materialization_receipt_path = safe_materialization_receipt_path,
+        .private_materialization_receipt_path = private_materialization_receipt_path,
+        .run_receipt_fingerprint = retained_run_receipt_fingerprint,
+    };
+}
+
+test "operator recipe executable exact two routes and operator recipe CLI subprocess" {
+    const allocator = std.testing.allocator;
+    if (!hylo_operator_recipe_paths.cli_subprocess_enabled) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    try runTestGit(allocator, repo, &.{ "init", "--quiet" });
+    try runTestGit(allocator, repo, &.{ "config", "user.name", "Hylo Operator Recipe" });
+    try runTestGit(allocator, repo, &.{ "config", "user.email", "hylo-operator@example.invalid" });
+    const gitignore_path = try std.fs.path.join(allocator, &.{ repo, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const target_path = try std.fs.path.join(allocator, &.{ repo, "target.txt" });
+    defer allocator.free(target_path);
+    try durable_store.writeTextAtomic(allocator, gitignore_path, ".ledger/\n*.jsonl\n");
+    try durable_store.writeTextAtomic(allocator, target_path, "baseline\n");
+    try runTestGit(allocator, repo, &.{ "add", ".gitignore", "target.txt" });
+    try runTestGit(allocator, repo, &.{ "commit", "--quiet", "-m", "baseline" });
+    const baseline_raw = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(baseline_raw);
+    const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
+    const roots = [_][]const u8{"target.txt"};
+    var baseline_snapshot = try sa(allocator, repo, baseline_revision, &roots);
+    defer baseline_snapshot.deinit(allocator);
+    var baseline_bundle = try retrace_core.target_bundle.buildSkillBundleAlloc(
+        allocator,
+        "hylo",
+        "baseline\n",
+        "operator-baseline/SKILL.md",
+    );
+    defer baseline_bundle.deinit(allocator);
+    var candidate_bundle = try retrace_core.target_bundle.buildSkillBundleAlloc(
+        allocator,
+        "hylo",
+        "candidate\n",
+        "operator-candidate/SKILL.md",
+    );
+    defer candidate_bundle.deinit(allocator);
+
+    const store_path = try std.fs.path.join(allocator, &.{ repo, DefaultStorePath });
+    defer allocator.free(store_path);
+    var backend = durable_store.PersistentEventStore.init(store_path);
+    const store = backend.eventStore();
+    var before_admission = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_admission.deinit(allocator);
+    try std.testing.expectError(
+        error.CampaignMissing,
+        testRegisterTrialBytes(allocator, repo, store, hctp_fixtures.valid_null_trial),
+    );
+    var after_failed_registration = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_failed_registration.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before_admission, after_failed_registration);
+    const dcp = retrace_core.dcp_schema;
+    const manifest_path = try std.fs.path.join(allocator, &.{ repo, "source-manifest.json" });
+    defer allocator.free(manifest_path);
+    const receipt_path = try std.fs.path.join(allocator, &.{ repo, "selection.json" });
+    defer allocator.free(receipt_path);
+    var source_manifest = try allocator.dupe(
+        u8,
+        hctp_fixtures.operator_recipe_source_manifest,
+    );
+    defer allocator.free(source_manifest);
+    try testReplaceAllCurrent(
+        allocator,
+        &source_manifest,
+        TestBaselineFingerprint,
+        "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    );
+    try testReplaceAllCurrent(
+        allocator,
+        &source_manifest,
+        TestCandidateFingerprint,
+        "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    );
+    var source_manifest_value = try parseValue(allocator, source_manifest);
+    defer source_manifest_value.deinit();
+    const source_manifest_root = try jsonObjectPtr(&source_manifest_value.value);
+    const manifest_cases = try jsonRequiredArray(
+        source_manifest_root.*,
+        "cases",
+    );
+    const historical_manifest_case = try jsonObjectPtr(&manifest_cases.items[1]);
+    const historical_source_profile = try jsonObjectPtr(
+        historical_manifest_case.getPtr("source_profile") orelse
+            return error.RequiredFieldMissing,
+    );
+    const decision_context_value = historical_source_profile.getPtr("decision_context") orelse
+        return error.RequiredFieldMissing;
+    const decision_context = try jsonObjectPtr(decision_context_value);
+    const decision_context_packet = try jsonObjectPtr(
+        decision_context.getPtr("decision_context_packet") orelse
+            return error.RequiredFieldMissing,
+    );
+    const decision_context_packet_id = try dcp.packetIdForValueExcludingPacketId(
+        allocator,
+        decision_context_value.*,
+    );
+    defer allocator.free(decision_context_packet_id);
+    (decision_context_packet.getPtr("packet_id") orelse
+        return error.RequiredFieldMissing).* = .{ .string = decision_context_packet_id };
+    const decision_context_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        decision_context_value.*,
+    );
+    defer allocator.free(decision_context_fingerprint);
+    (historical_source_profile.getPtr("decision_context_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = decision_context_fingerprint };
+    const canonical_source_manifest = try canonicalJsonAlloc(
+        allocator,
+        source_manifest_value.value,
+    );
+    allocator.free(source_manifest);
+    source_manifest = canonical_source_manifest;
+    try durable_store.writeTextAtomic(allocator, manifest_path, source_manifest);
+    const source_seal_key = try testCompileOperatorSourceReceipt(
+        allocator,
+        repo,
+        manifest_path,
+        receipt_path,
+    );
+    defer {
+        std.crypto.secureZero(u8, source_seal_key);
+        allocator.free(source_seal_key);
+    }
+    const selection_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        receipt_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(selection_bytes);
+    var selection = try parseValue(allocator, selection_bytes);
+    defer selection.deinit();
+    const selection_root = try jsonObject(selection.value);
+    const source_cases = try jsonRequiredArray(selection_root, "cases");
+    try std.testing.expectEqual(@as(usize, 2), source_cases.items.len);
+    var saw_direct = false;
+    var saw_historical = false;
+    for (source_cases.items) |case_value| {
+        const source_case = try jsonObject(case_value);
+        const profile = try jsonRequiredObject(source_case, "source_profile");
+        const kind = try jsonRequiredString(profile, "kind");
+        saw_direct = saw_direct or std.mem.eql(u8, kind, "direct");
+        saw_historical = saw_historical or std.mem.eql(u8, kind, "historical_decision");
+    }
+    try std.testing.expect(saw_direct and saw_historical);
+    const paths = hylo_operator_recipe_paths;
+    const ledger_binary_fingerprint = if (hylo_operator_recipe_paths.cli_subprocess_enabled)
+        try executableFileFingerprintAlloc(allocator, hylo_operator_recipe_paths.ledger_path)
+    else
+        try currentExecutableFingerprintAlloc(allocator);
+    defer allocator.free(ledger_binary_fingerprint);
+    const runner_binary_fingerprint = if (hylo_operator_recipe_paths.cli_subprocess_enabled)
+        try executableFileFingerprintAlloc(allocator, hylo_operator_recipe_paths.cas_trial_path)
+    else
+        try currentExecutableFingerprintAlloc(allocator);
+    defer allocator.free(runner_binary_fingerprint);
+    const executor_binary_fingerprint = if (hylo_operator_recipe_paths.cli_subprocess_enabled)
+        try executableFileFingerprintAlloc(allocator, paths.fixture_executor_path)
+    else
+        try currentExecutableFingerprintAlloc(allocator);
+    defer allocator.free(executor_binary_fingerprint);
+    const materializer_binary_fingerprint = try executableFileFingerprintAlloc(
+        allocator,
+        hylo_operator_recipe_paths.seq_path,
+    );
+    defer allocator.free(materializer_binary_fingerprint);
+    const source_attestation = try jsonRequiredObject(selection_root, "source_owner_attestation");
+    const source_producer = try jsonRequiredObject(source_attestation, "producer");
+    const runner_seed = [_]u8{0x71} ** 32;
+    const executor_authority_seed = [_]u8{0x72} ** 32;
+    const runner_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        runner_seed,
+    );
+    defer allocator.free(runner_public_key);
+    const executor_authority_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        executor_authority_seed,
+    );
+    defer allocator.free(executor_authority_public_key);
+    const materializer_seed = [_]u8{0x73} ** 32;
+    const materializer_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        materializer_seed,
+    );
+    defer allocator.free(materializer_public_key);
+    const absolute_grader_seed = [_]u8{0x74} ** 32;
+    const absolute_grader_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        absolute_grader_seed,
+    );
+    defer allocator.free(absolute_grader_public_key);
+    const pair_grader_seed = [_]u8{0x75} ** 32;
+    const pair_grader_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        pair_grader_seed,
+    );
+    defer allocator.free(pair_grader_public_key);
+    const proof_public_key = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        TestSelectionSourceOwnerSeed,
+    );
+    defer allocator.free(proof_public_key);
+    const proof_public_key_bytes = try proofBase64DecodeAlloc(allocator, proof_public_key);
+    defer allocator.free(proof_public_key_bytes);
+    const proof_public_key_fingerprint = try digestBytesAlloc(
+        allocator,
+        proof_public_key_bytes,
+    );
+    defer allocator.free(proof_public_key_fingerprint);
+    const trust_policy_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-trust-policy/v1\",\"policy_id\":\"operator-recipe-proof-policy\"," ++
+            "\"keys\":[{{\"key_id\":{f},\"public_key_base64\"" ++
+            ":{f},\"allowed_roles\":[\"source_owner\"]," ++
+            "\"producer_ids\":[{f}],\"producer_binary_fingerprints\":[{f}]}}" ++
+            ",{{\"key_id\":\"hylo-source-owner-key\",\"public_key_base64\":{f}," ++
+            "\"allowed_roles\":[\"source_owner\"],\"producer_ids\":[\"hylo-source-fixture\"]," ++
+            "\"producer_binary_fingerprints\":[\"{s}\"]}}" ++
+            ",{{\"key_id\":\"runner-key\",\"public_key_base64" ++
+            "\":{f},\"allowed_roles\":[\"runner\"]," ++
+            "\"producer_ids\":[\"cas-trial\"],\"producer_binary_fingerprints\":[{f}]}}" ++
+            ",{{\"key_id\":\"materializer-key\",\"public_key_" ++
+            "base64\":{f},\"allowed_roles\":[\"materializer\"" ++ "]," ++
+            "\"producer_ids\":[\"seq-materializer\"],\"producer_binary_fingerprints\":[{f}]}}" ++
+            ",{{\"key_id\":\"grader-key\",\"public_key_base64" ++
+            "\":{f},\"allowed_roles\":[\"absolute_grader\"]," ++
+            "\"producer_ids\":[\"deterministic-grader\"]," ++
+            "\"producer_binary_fingerprints\":[\"sha256:11111" ++
+            "111111111111111111111111111111111111111111111111" ++ "11111111111\"]}}" ++
+            ",{{\"key_id\":\"pair-grader-key\",\"public_key_b" ++
+            "ase64\":{f},\"allowed_roles\":[\"pair_grader\"]," ++
+            "\"producer_ids\":[\"blind-pair-grader\"]," ++
+            "\"producer_binary_fingerprints\":[\"sha256:22222" ++
+            "222222222222222222222222222222222222222222222222" ++ "22222222222\"]}}" ++
+            ",{{\"key_id\":\"executor-authority-key\",\"public_key_base64\":{f}," ++
+            "\"allowed_roles\":[\"runner\"],\"producer_ids\":" ++
+            "[\"cas-trial-executor\",\"hylo-ledger\"]," ++
+            "\"producer_binary_fingerprints\":[{f},{f}]}}]," ++
+            "\"separation\":{{\"runner_and_pair_grader_distinct\":true," ++
+            "\"materializer_and_pair_grader_distinct\":true," ++
+            "\"human_confirmation_required_for_human_grade\":true}}}}",
+        .{
+            std.json.fmt(try jsonRequiredString(source_producer, "key_id"), .{}),
+            std.json.fmt(try jsonRequiredString(source_producer, "public_key_base64"), .{}),
+            std.json.fmt(try jsonRequiredString(source_producer, "id"), .{}),
+            std.json.fmt(try jsonRequiredString(source_producer, "binary_fingerprint"), .{}),
+            std.json.fmt(proof_public_key, .{}),
+            TestSelectionSourceOwnerBinary,
+            std.json.fmt(runner_public_key, .{}),
+            std.json.fmt(runner_binary_fingerprint, .{}),
+            std.json.fmt(materializer_public_key, .{}),
+            std.json.fmt(materializer_binary_fingerprint, .{}),
+            std.json.fmt(absolute_grader_public_key, .{}),
+            std.json.fmt(pair_grader_public_key, .{}),
+            std.json.fmt(executor_authority_public_key, .{}),
+            std.json.fmt(executor_binary_fingerprint, .{}),
+            std.json.fmt(ledger_binary_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(trust_policy_bytes);
+    var trust_policy = try parseValue(allocator, trust_policy_bytes);
+    defer trust_policy.deinit();
+    const trust_policy_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        trust_policy.value,
+    );
+    defer allocator.free(trust_policy_fingerprint);
+    const materializer_contract_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-case-materializer-contract/v" ++
+            "1\",\"controller_id\":\"hylo-controller\"," ++
+            "\"materializer_id\":\"seq-materializer\",\"runner_id\":\"cas-trial\"," ++
+            "\"materializer_version\":\"v1\",\"materializer_binary_fingerprint\":{f}," ++
+            "\"materializer_key_id\":\"materializer-key\",\"runner_key_id\":\"runner-key\"," ++
+            "\"capability_delivery\":\"anonymous_fd\",\"visib" ++
+            "le_input_delivery\":\"anonymous_fd\"," ++
+            "\"source_profile_delivery\":\"anonymous_fd\",\"receiver_binding\":\"runner_key\"," ++
+            "\"receiver_role\":\"runner\",\"single_use\":true,\"limitations\":[]}}",
+        .{std.json.fmt(materializer_binary_fingerprint, .{})},
+    );
+    defer allocator.free(materializer_contract_bytes);
+    var materializer_contract = try parseValue(allocator, materializer_contract_bytes);
+    defer materializer_contract.deinit();
+    const materializer_contract_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        materializer_contract.value,
+    );
+    defer allocator.free(materializer_contract_fingerprint);
+
+    var campaign = try parseValue(allocator, hctp_fixtures.operator_recipe_campaign_template);
+    defer campaign.deinit();
+    const campaign_root = try jsonObjectPtr(&campaign.value);
+    const campaign_target = try jsonObjectPtr(
+        campaign_root.getPtr("target") orelse return error.RequiredFieldMissing,
+    );
+    (campaign_target.getPtr("baseline_bundle_fingerprint") orelse return fm).* =
+        .{ .string = baseline_bundle.bundle_fingerprint };
+    const campaign_scenario_manifest = try jsonRequiredArray(
+        campaign_root.*,
+        "scenario_manifest",
+    );
+    var projected_scenario_fingerprints: std.ArrayList([]u8) = .empty;
+    defer {
+        for (projected_scenario_fingerprints.items) |fingerprint| allocator.free(fingerprint);
+        projected_scenario_fingerprints.deinit(allocator);
+    }
+    var projected_scenarios: std.Io.Writer.Allocating = .init(allocator);
+    defer projected_scenarios.deinit();
+    var projected_scenario_lines = std.mem.splitScalar(
+        u8,
+        hctp_fixtures.operator_recipe_scenarios,
+        '\n',
+    );
+    while (projected_scenario_lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r\n").len == 0) continue;
+        const projected_scenario = try testOperatorScenarioProjectionAlloc(
+            allocator,
+            line,
+            source_cases,
+        );
+        defer allocator.free(projected_scenario);
+        try projected_scenarios.writer.writeAll(projected_scenario);
+        try projected_scenarios.writer.writeByte('\n');
+        var projected_value = try parseValue(allocator, projected_scenario);
+        defer projected_value.deinit();
+        const projected_root = try jsonObject(projected_value.value);
+        const scenario_id = try jsonRequiredString(projected_root, "scenario_id");
+        const scenario_fingerprint = try digestValueAlloc(
+            allocator,
+            projected_value.value,
+        );
+        var fingerprint_retained = false;
+        defer if (!fingerprint_retained) allocator.free(scenario_fingerprint);
+        var manifest_updated = false;
+        for (campaign_scenario_manifest.items) |*manifest_value| {
+            const manifest = try jsonObjectPtr(manifest_value);
+            if (!std.mem.eql(
+                u8,
+                try jsonRequiredString(manifest.*, "scenario_id"),
+                scenario_id,
+            )) continue;
+            (manifest.getPtr("scenario_fingerprint") orelse
+                return error.RequiredFieldMissing).* = .{ .string = scenario_fingerprint };
+            manifest_updated = true;
+            break;
+        }
+        if (!manifest_updated) return error.ScenarioNotInManifest;
+        try projected_scenario_fingerprints.append(allocator, scenario_fingerprint);
+        fingerprint_retained = true;
+    }
+    const proof_policy_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"proof_authority\":{{\"schema\":\"hylo-proof-authority/v1\"," ++
+            "\"key_id\":\"hylo-source-owner-key\",\"public_key_base64\":{f}," ++
+            "\"public_key_fingerprint\":{f},\"producer_id\":\"hylo-source-fixture\"," ++
+            "\"producer_binary_fingerprint\":\"{s}\"}}," ++
+            "\"proof_trust_policy\":{s},\"proof_trust_policy_fingerprint\":{f}," ++
+            "\"publication_claims\":[\"absolute_qualification" ++
+            "\",\"noninferiority\",\"practice_gain\"]," ++
+            "\"source_route_admission\":\"required\"}}",
+        .{
+            std.json.fmt(proof_public_key, .{}),
+            std.json.fmt(proof_public_key_fingerprint, .{}),
+            TestSelectionSourceOwnerBinary,
+            trust_policy_bytes,
+            std.json.fmt(trust_policy_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(proof_policy_bytes);
+    var proof_policy = try parseValue(allocator, proof_policy_bytes);
+    defer proof_policy.deinit();
+    (campaign_root.getPtr("trial_policy") orelse return error.RequiredFieldMissing).* =
+        proof_policy.value;
+    const campaign_bytes = try canonicalJsonAlloc(allocator, campaign.value);
+    defer allocator.free(campaign_bytes);
+    const campaign_path = try std.fs.path.join(allocator, &.{ repo, "campaign.json" });
+    defer allocator.free(campaign_path);
+    const scenarios_path = try std.fs.path.join(allocator, &.{ repo, "scenarios.jsonl" });
+    defer allocator.free(scenarios_path);
+    try durable_store.writeTextAtomic(allocator, campaign_path, campaign_bytes);
+    try durable_store.writeTextAtomic(
+        allocator,
+        scenarios_path,
+        projected_scenarios.written(),
+    );
+    const validated_campaign = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "validate-campaign",
+        "--campaign",
+        campaign_path,
+    });
+    defer allocator.free(validated_campaign);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        validated_campaign,
+        "hylo-campaign-validation/v1",
+    ) != null);
+    const campaign_intent = try testCampaignIntentFromJsonAlloc(allocator, campaign_bytes);
+    defer allocator.free(campaign_intent);
+    const campaign_intent_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "campaign-created.json" },
+    );
+    defer allocator.free(campaign_intent_path);
+    try durable_store.writeTextAtomic(allocator, campaign_intent_path, campaign_intent);
+    const campaign_append = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "append",
+        "--repo",
+        repo,
+        "--json",
+        campaign_intent_path,
+    });
+    defer allocator.free(campaign_append);
+
+    const baseline_target_intent = try testTargetBundleAdmissionIntentAlloc(
+        allocator,
+        "campaign-operator-recipe",
+        TestBaselineFingerprint,
+        &baseline_bundle,
+        baseline_revision,
+        &baseline_snapshot,
+        "target.txt",
+    );
+    defer allocator.free(baseline_target_intent);
+    const baseline_target_intent_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "baseline-target-admitted.json" },
+    );
+    defer allocator.free(baseline_target_intent_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        baseline_target_intent_path,
+        baseline_target_intent,
+    );
+    const baseline_target_append = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "append",
+        "--repo",
+        repo,
+        "--json",
+        baseline_target_intent_path,
+    });
+    defer allocator.free(baseline_target_append);
+
+    var scenario_lines = std.mem.splitScalar(u8, projected_scenarios.written(), '\n');
+    var scenario_index: usize = 0;
+    while (scenario_lines.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r\n").len == 0) continue;
+        var scenario = try parseValue(allocator, line);
+        defer scenario.deinit();
+        const scenario_root = try jsonObjectPtr(&scenario.value);
+        const scenario_id = try jsonRequiredString(scenario_root.*, "scenario_id");
+        const scenario_intent = try testScenarioIntentAlloc(
+            allocator,
+            line,
+            scenario_id,
+        );
+        defer allocator.free(scenario_intent);
+        const scenario_intent_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/scenario-admitted-{d}.json",
+            .{ repo, scenario_index },
+        );
+        defer allocator.free(scenario_intent_path);
+        try durable_store.writeTextAtomic(allocator, scenario_intent_path, scenario_intent);
+        const scenario_append = try testRunProductCommandAlloc(allocator, repo, &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "append",
+            "--repo",
+            repo,
+            "--json",
+            scenario_intent_path,
+        });
+        defer allocator.free(scenario_append);
+        scenario_index += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), scenario_index);
+    var bootstrap_state = try loadLedgerFromStore(allocator, store);
+    defer bootstrap_state.deinit(allocator);
+    const bootstrap_campaign_index = findCampaign(
+        bootstrap_state.campaigns.items,
+        "campaign-operator-recipe",
+    ) orelse return error.CampaignMissing;
+    const bootstrap_scenario = findScenario(
+        &bootstrap_state.campaigns.items[bootstrap_campaign_index],
+        "scenario-direct",
+    ) orelse return error.ScenarioNotAdmitted;
+    var bootstrap_receipt = try testOperatorBootstrapReceiptAlloc(
+        allocator,
+        selection_bytes,
+        bootstrap_scenario.visible_input_fingerprint,
+    );
+    defer bootstrap_receipt.deinit(allocator);
+    const staged_diff_fingerprint = try testBootstrapOperatorRecipeChange(
+        allocator,
+        repo,
+        store,
+        "campaign-operator-recipe",
+        "scenario-direct",
+        &bootstrap_receipt.receipt,
+        bootstrap_receipt.visible_input_fingerprint,
+        bootstrap_receipt.hidden_reference_fingerprint,
+        baseline_bundle.bundle_fingerprint,
+        baseline_snapshot.fingerprint,
+        &candidate_bundle,
+        trust_policy_bytes,
+        trust_policy_fingerprint,
+        materializer_contract_bytes,
+        materializer_contract_fingerprint,
+    );
+    defer allocator.free(staged_diff_fingerprint);
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(allocator, repo, "INDEX", &roots);
+    defer candidate_snapshot.deinit(allocator);
+
+    var admitted = try loadLedgerFromStore(allocator, store);
+    defer admitted.deinit(allocator);
+    const campaign_index = findCampaign(admitted.campaigns.items, "campaign-operator-recipe") orelse
+        return error.CampaignMissing;
+    const campaign_state = &admitted.campaigns.items[campaign_index];
+    const candidate_binding = findTargetBinding(campaign_state, TestCandidateFingerprint) orelse
+        return error.TargetBundleAdmissionMissing;
+    try std.testing.expectEqualStrings(
+        candidate_bundle.bundle_fingerprint,
+        candidate_binding.bundle_fingerprint,
+    );
+    try std.testing.expectEqualStrings(
+        candidate_snapshot.fingerprint,
+        candidate_binding.target_snapshot_fingerprint,
+    );
+    const owner_applied_change = findChange(campaign_state, "change-operator-recipe") orelse
+        return error.ChangeMissing;
+    try std.testing.expect(owner_applied_change.status == .applied);
+    try std.testing.expectEqualStrings(
+        TestBaselineFingerprint,
+        owner_applied_change.before_target_fingerprint,
+    );
+    try std.testing.expectEqualStrings(
+        TestCandidateFingerprint,
+        owner_applied_change.after_target_fingerprint,
+    );
+    try std.testing.expectEqualStrings(
+        baseline_bundle.bundle_fingerprint,
+        owner_applied_change.before_target_bundle_fingerprint orelse
+            return error.ChangeTargetIdentityMissing,
+    );
+    try std.testing.expectEqualStrings(
+        candidate_bundle.bundle_fingerprint,
+        owner_applied_change.after_target_bundle_fingerprint orelse
+            return error.ChangeTargetIdentityMissing,
+    );
+    try std.testing.expectEqualStrings(
+        baseline_snapshot.fingerprint,
+        owner_applied_change.before_target_snapshot_fingerprint orelse
+            return error.ChangeTargetIdentityMissing,
+    );
+    try std.testing.expectEqualStrings(
+        candidate_snapshot.fingerprint,
+        owner_applied_change.after_target_snapshot_fingerprint orelse
+            return error.ChangeTargetIdentityMissing,
+    );
+    try std.testing.expectEqualStrings(
+        staged_diff_fingerprint,
+        owner_applied_change.diff_fingerprint,
+    );
+    try std.testing.expectEqualStrings(
+        TestCandidateFingerprint,
+        currentTargetFingerprint(campaign_state),
+    );
+    const doctor = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "doctor",
+        "--repo",
+        repo,
+    });
+    defer allocator.free(doctor);
+    try std.testing.expect(std.mem.indexOf(u8, doctor, "hylo-ledger-doctor/v1") != null);
+    const direct_scenario = findScenario(campaign_state, "scenario-direct") orelse
+        return error.ScenarioNotAdmitted;
+    const historical_scenario = findScenario(campaign_state, "scenario-historical") orelse
+        return error.ScenarioNotAdmitted;
+    var request = try parseValue(allocator, hctp_fixtures.operator_recipe_trial_build_request);
+    defer request.deinit();
+    const request_root = try jsonObjectPtr(&request.value);
+    (request_root.getPtr("expected_campaign_head") orelse return error.RequiredFieldMissing).* =
+        .{ .string = campaign_state.last_digest };
+    const selection_fingerprint = try jsonRequiredString(selection_root, "receipt_fingerprint");
+    const source_selection_receipt_ref = try std.fmt.allocPrint(
+        request.arena.allocator(),
+        "artifact:{s}",
+        .{selection_fingerprint},
+    );
+    (request_root.getPtr("source_selection_receipt_ref") orelse return fm).* =
+        .{ .string = source_selection_receipt_ref };
+    (request_root.getPtr("source_selection_receipt_fingerprint") orelse return fm).* =
+        .{ .string = selection_fingerprint };
+    const target = try op(request_root.getPtr("target") orelse return fm);
+    (target.getPtr("before_target_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(TestBaselineFingerprint) };
+    (target.getPtr("before_bundle_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = baseline_bundle.bundle_fingerprint };
+    (target.getPtr("before_snapshot_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = baseline_snapshot.fingerprint };
+    (target.getPtr("after_target_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast(TestCandidateFingerprint) };
+    (target.getPtr("after_bundle_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = candidate_bundle.bundle_fingerprint };
+    (target.getPtr("after_snapshot_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = candidate_snapshot.fingerprint };
+    const expected_verifier_fingerprint = ledger_binary_fingerprint;
+    const factor = try jsonObjectPtr(
+        request_root.getPtr("factor") orelse return error.RequiredFieldMissing,
+    );
+    const verifier = try jsonObjectPtr(
+        factor.getPtr("verifier") orelse return error.RequiredFieldMissing,
+    );
+    (verifier.getPtr("fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = expected_verifier_fingerprint };
+    const execution = try jsonObjectPtr(
+        request_root.getPtr("execution") orelse return error.RequiredFieldMissing,
+    );
+    (execution.getPtr("environment_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = direct_scenario.environment_fingerprint };
+    (execution.getPtr("replay_policy_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = direct_scenario.replay_policy_fingerprint };
+    (execution.getPtr("effect_policy_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = direct_scenario.effect_policy_fingerprint };
+    const runner_contract_value = execution.getPtr("runner_contract") orelse
+        return error.RequiredFieldMissing;
+    const runner_contract = try jsonObjectPtr(runner_contract_value);
+    try runner_contract.put(
+        request.arena.allocator(),
+        "executor_request_schema",
+        .{ .string = @constCast("cas-trial-executor-request/v2") },
+    );
+    (runner_contract.getPtr("executor_binary_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = executor_binary_fingerprint };
+    (runner_contract.getPtr("ledger_binary_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = ledger_binary_fingerprint };
+    const executor_authority = try jsonObjectPtr(
+        runner_contract.getPtr("executor_authority") orelse return error.RequiredFieldMissing,
+    );
+    (executor_authority.getPtr("binary_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = executor_binary_fingerprint };
+    const ledger_authority = try jsonObjectPtr(
+        runner_contract.getPtr("ledger_authority") orelse return error.RequiredFieldMissing,
+    );
+    (ledger_authority.getPtr("binary_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = ledger_binary_fingerprint };
+    const runner_contract_fingerprint = try hctp.digestValueAlloc(
+        allocator,
+        runner_contract_value.*,
+    );
+    defer allocator.free(runner_contract_fingerprint);
+    (execution.getPtr("runner_contract_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = runner_contract_fingerprint };
+    const runner_authority = try jsonObjectPtr(
+        execution.getPtr("runner_authority") orelse return error.RequiredFieldMissing,
+    );
+    (runner_authority.getPtr("producer_version") orelse return error.RequiredFieldMissing).* =
+        .{ .string = if (hylo_operator_recipe_paths.cli_subprocess_enabled)
+            @constCast(hylo_operator_recipe_paths.cas_version)
+        else
+            @constCast("test") };
+    (runner_authority.getPtr("binary_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = runner_binary_fingerprint };
+    const grading = try jsonObjectPtr(
+        request_root.getPtr("grading") orelse return error.RequiredFieldMissing,
+    );
+    (grading.getPtr("rubric_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = campaign_state.rubric_fingerprint orelse return error.RubricMissing };
+    const presentation_materializer_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-grade-presentation-materiali" ++
+            "zer/v1\",\"role\":\"materializer\",\"producer_id" ++
+            "\":\"seq-materializer\",\"producer_version\":{f}" ++
+            ",\"binary_fingerprint\":{f},\"key_id\":\"materia" ++
+            "lizer-key\",\"single_use_capabilities\":true}}",
+        .{
+            std.json.fmt(hylo_operator_recipe_paths.seq_version, .{}),
+            std.json.fmt(materializer_binary_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(presentation_materializer_bytes);
+    var presentation_materializer = try parseValue(
+        allocator,
+        presentation_materializer_bytes,
+    );
+    defer presentation_materializer.deinit();
+    try grading.put(
+        request.arena.allocator(),
+        "presentation_materializer",
+        presentation_materializer.value,
+    );
+    const assurance = try jsonObjectPtr(
+        request_root.getPtr("assurance") orelse return error.RequiredFieldMissing,
+    );
+    (assurance.getPtr("required_level") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast("role_separated") };
+    var required_roles = try parseValue(
+        allocator,
+        "[\"runner\",\"materializer\",\"absolute_grader\",\"pair_grader\"]",
+    );
+    defer required_roles.deinit();
+    (assurance.getPtr("required_distinct_roles") orelse return error.RequiredFieldMissing).* =
+        required_roles.value;
+    (assurance.getPtr("trust_policy_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = trust_policy_fingerprint };
+    (assurance.getPtr("trust_policy") orelse return error.RequiredFieldMissing).* =
+        trust_policy.value;
+    const sealing = try jsonObjectPtr(
+        request_root.getPtr("sealing") orelse return error.RequiredFieldMissing,
+    );
+    (sealing.getPtr("case_materializer_ref") orelse return error.RequiredFieldMissing).* =
+        .{ .string = @constCast("artifact:operator-case-materializer") };
+    (sealing.getPtr("case_materializer_fingerprint") orelse return error.RequiredFieldMissing).* =
+        .{ .string = materializer_contract_fingerprint };
+    try sealing.put(
+        request.arena.allocator(),
+        "case_materializer_contract",
+        materializer_contract.value,
+    );
+    const request_bytes = try canonicalJsonAlloc(allocator, request.value);
+    defer allocator.free(request_bytes);
+    const request_path = try std.fs.path.join(allocator, &.{ repo, "trial-build-request.json" });
+    defer allocator.free(request_path);
+    const output_path = try std.fs.path.join(allocator, &.{ repo, "compiled-trial.json" });
+    defer allocator.free(output_path);
+    try durable_store.writeTextAtomic(allocator, request_path, request_bytes);
+
+    var before_compile = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_compile.deinit(allocator);
+    var compiler_stdout: ?[]u8 = null;
+    defer {
+        if (compiler_stdout) |bytes| allocator.free(bytes);
+    }
+    const custody_bytes = if (hylo_operator_recipe_paths.cli_subprocess_enabled) blk: {
+        var result = try testRunWithProtectedOutputFdAlloc(
+            allocator,
+            repo,
+            &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "compile-trial",
+                "--repo",
+                repo,
+                "--request",
+                request_path,
+                "--source-receipt",
+                receipt_path,
+                "--output",
+                output_path,
+            },
+            "--custody-output-fd",
+        );
+        defer result.deinit(allocator);
+        if (processExitCode(result.term) != 0) {
+            std.debug.print(
+                "operator compile-trial failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+                .{ result.stdout, result.stderr },
+            );
+            return error.ProductCommandFailed;
+        }
+        try std.testing.expectEqual(@as(usize, 0), result.stderr.len);
+        try testExpectNoPrivateReceiptSurface(result.stdout);
+        try testExpectNoPrivateReceiptSurface(result.stderr);
+        compiler_stdout = try allocator.dupe(u8, result.stdout);
+        break :blk try allocator.dupe(u8, result.protected_output);
+    } else blk: {
+        var reveal_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&reveal_pipe) != 0) return error.TestFdSetupFailed;
+        var read_open = true;
+        defer {
+            if (read_open) _ = std.c.close(reveal_pipe[0]);
+        }
+        var write_open = true;
+        defer {
+            if (write_open) _ = std.c.close(reveal_pipe[1]);
+        }
+        try compileTrial(
+            allocator,
+            repo,
+            store,
+            request_path,
+            receipt_path,
+            output_path,
+            reveal_pipe[1],
+            false,
+        );
+        _ = std.c.close(reveal_pipe[1]);
+        write_open = false;
+        const material = try readRevealMaterialFdAlloc(allocator, reveal_pipe[0]);
+        _ = std.c.close(reveal_pipe[0]);
+        read_open = false;
+        break :blk material;
+    };
+    defer {
+        std.crypto.secureZero(u8, custody_bytes);
+        allocator.free(custody_bytes);
+    }
+    if (compiler_stdout) |stdout| {
+        var receipt = try parseValue(allocator, stdout);
+        defer receipt.deinit();
+        const receipt_root = try jsonObject(receipt.value);
+        try std.testing.expectEqualStrings(
+            "hylo-trial-build-receipt/v2",
+            try jsonRequiredString(receipt_root, "schema"),
+        );
+        const semantic_evidence = try jsonRequired(receipt_root, "semantic_evidence_returned");
+        const authority_granted = try jsonRequired(receipt_root, "authority_granted");
+        try std.testing.expect(semantic_evidence == .bool and !semantic_evidence.bool);
+        try std.testing.expect(authority_granted == .bool and !authority_granted.bool);
+        try std.testing.expect(std.mem.indexOf(u8, stdout, "\"mapping\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout, "\"nonce\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout, "historical_response") == null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout, "selected_route") == null);
+    }
+    var after_compile = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_compile.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before_compile, after_compile);
+    const trial_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        output_path,
+        hctp.MaxTrialArtifactBytes,
+    );
+    defer allocator.free(trial_bytes);
+    var validation = try hctp.validateTrialAlloc(allocator, trial_bytes);
+    defer validation.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), validation.pair_count);
+    try std.testing.expectEqual(@as(usize, 8), validation.lane_count);
+    if (hylo_operator_recipe_paths.cli_subprocess_enabled) {
+        const ledger_validation = try testRunProductCommandAlloc(allocator, repo, &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "validate-trial",
+            "--repo",
+            repo,
+            "--trial",
+            output_path,
+        });
+        defer allocator.free(ledger_validation);
+        var ledger_validation_receipt = try parseValue(allocator, ledger_validation);
+        defer ledger_validation_receipt.deinit();
+        const ledger_validation_root = try jsonObject(ledger_validation_receipt.value);
+        try std.testing.expectEqualStrings(
+            "hylo-trial-validation/v1",
+            try jsonRequiredString(ledger_validation_root, "schema"),
+        );
+        try std.testing.expectEqualStrings(
+            "valid",
+            try jsonRequiredString(ledger_validation_root, "status"),
+        );
+        const source_validation = try testRunProductCommandAlloc(allocator, repo, &.{
+            hylo_operator_recipe_paths.seq_path,
+            "hctp-source",
+            "validate",
+            "--receipt",
+            receipt_path,
+            "--trial",
+            output_path,
+        });
+        defer allocator.free(source_validation);
+        var source_validation_receipt = try parseValue(allocator, source_validation);
+        defer source_validation_receipt.deinit();
+        const source_validation_root = try jsonObject(source_validation_receipt.value);
+        try std.testing.expectEqualStrings(
+            "hylo-source-validation/v1",
+            try jsonRequiredString(source_validation_root, "schema"),
+        );
+        try std.testing.expectEqualStrings(
+            "valid",
+            try jsonRequiredString(source_validation_root, "status"),
+        );
+    } else {
+        try hctp_source.validateReceiptAgainstTrial(allocator, selection_bytes, trial_bytes);
+    }
+    var trial = try parseValue(allocator, trial_bytes);
+    defer trial.deinit();
+    const trial_root = try jsonObject(trial.value);
+    try std.testing.expectEqualStrings(
+        retrace_core.hctp_trial_custody.PublicTrialSchema,
+        try jsonRequiredString(trial_root, "schema"),
+    );
+    const trial_factor = try jsonRequiredObject(trial_root, "factor");
+    const trial_verifier = try jsonRequiredObject(trial_factor, "verifier");
+    try std.testing.expectEqualStrings(
+        expected_verifier_fingerprint,
+        try jsonRequiredString(trial_verifier, "fingerprint"),
+    );
+    try std.testing.expect(trial_factor.get("intervention_witness") == null);
+    try std.testing.expect(trial_factor.get("target_common_projection") == null);
+    try std.testing.expect(trial_root.get("source_selection_receipt") == null);
+    var custody = try parseValue(allocator, custody_bytes);
+    defer custody.deinit();
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        trial.value,
+        custody.value,
+    );
+    const custody_root = try jsonObject(custody.value);
+    const source_selection_opening = try canonicalJsonAlloc(
+        allocator,
+        try jsonRequired(custody_root, "source_selection"),
+    );
+    defer {
+        std.crypto.secureZero(u8, source_selection_opening);
+        allocator.free(source_selection_opening);
+    }
+    const opening = try jsonRequiredObject(custody_root, "opening");
+    const witness_opening = try jsonRequiredObject(opening, "intervention_witness");
+    const witness = try jsonRequiredObject(witness_opening, "witness");
+    const witness_verifier = try jsonRequiredObject(witness, "verifier");
+    try std.testing.expectEqualStrings(
+        expected_verifier_fingerprint,
+        try jsonRequiredString(witness_verifier, "binary_fingerprint"),
+    );
+    const units = try jsonRequiredArray(trial_root, "units");
+    try std.testing.expectEqual(@as(usize, 2), units.items.len);
+    for (units.items) |unit_value| {
+        const unit = try jsonObject(unit_value);
+        const source_profile = try jsonRequiredObject(unit, "source_profile");
+        const source_kind = try jsonRequiredString(source_profile, "kind");
+        if (std.mem.eql(u8, source_kind, "direct")) {
+            try std.testing.expectEqual(@as(usize, 3), source_profile.count());
+        } else {
+            try std.testing.expectEqualStrings("historical_decision", source_kind);
+            try std.testing.expectEqual(@as(usize, 14), source_profile.count());
+            try std.testing.expectEqualStrings(
+                "source_profile_fd",
+                try jsonRequiredString(source_profile, "profile_body_delivery"),
+            );
+            try validateFingerprint(try jsonRequiredString(
+                source_profile,
+                "source_target_text_witness_fingerprint",
+            ));
+        }
+        inline for (.{
+            "historical_answer",
+            "grade_opening",
+            "source_target_text",
+            "source_target_text_witness",
+            "source_governance_ref",
+            "source_governance",
+            "decision_context_ref",
+            "decision_context",
+        }) |forbidden| try std.testing.expect(source_profile.get(forbidden) == null);
+        const pairs = try jsonRequiredArray(unit, "pairs");
+        try std.testing.expectEqual(@as(usize, 2), pairs.items.len);
+        const first_order = try jsonRequiredArray(try jsonObject(pairs.items[0]), "order");
+        const second_order = try jsonRequiredArray(try jsonObject(pairs.items[1]), "order");
+        try std.testing.expectEqual(@as(usize, 2), first_order.items.len);
+        try std.testing.expectEqual(@as(usize, 2), second_order.items.len);
+        try std.testing.expectEqualStrings(
+            try jsonString(first_order.items[0]),
+            try jsonString(second_order.items[1]),
+        );
+        try std.testing.expectEqualStrings(
+            try jsonString(first_order.items[1]),
+            try jsonString(second_order.items[0]),
+        );
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            try jsonString(first_order.items[0]),
+            try jsonString(first_order.items[1]),
+        ));
+    }
+    const nonce = try jsonRequiredString(opening, "arm_map_nonce");
+    if (compiler_stdout) |stdout| {
+        try std.testing.expect(std.mem.indexOf(u8, stdout, nonce) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, trial_bytes, nonce) == null);
+    try std.testing.expect(std.mem.indexOf(u8, trial_bytes, "\"mapping\"") == null);
+    inline for (.{
+        "historical_answer",
+        "grade_opening",
+        "source_target_text\"",
+        "source_target_text_witness\"",
+        "source_governance_ref\"",
+        "source_governance\"",
+        "decision_context_ref\"",
+        "decision_context\"",
+        "selected_route\"",
+    }) |forbidden| try std.testing.expect(std.mem.indexOf(u8, trial_bytes, forbidden) == null);
+    var before_registration = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_registration.deinit(allocator);
+    try testExpectSnapshotsEquivalent(after_compile, before_registration);
+    var registration = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "register-trial",
+            "--repo",
+            repo,
+            "--trial",
+            output_path,
+        },
+        &.{.{ .fd_flag = "--custody-input-fd", .bytes = custody_bytes }},
+        null,
+        null,
+    );
+    defer registration.deinit(allocator);
+    if (processExitCode(registration.term) != 0 or registration.stderr.len != 0) {
+        std.debug.print(
+            "operator register-trial failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ registration.stdout, registration.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 0), registration.protected_output.len);
+    try testExpectNoPrivateReceiptSurface(registration.stdout);
+    try testExpectNoPrivateReceiptSurface(registration.stderr);
+    var registration_receipt = try parseValue(allocator, registration.stdout);
+    defer registration_receipt.deinit();
+    const registration_root = try jsonObject(registration_receipt.value);
+    try std.testing.expectEqualStrings(
+        "hylo-trial-registration-receipt/v1",
+        try jsonRequiredString(registration_root, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        "appended",
+        try jsonRequiredString(registration_root, "status"),
+    );
+    const registration_event_digest = try jsonRequiredString(
+        registration_root,
+        "event_digest",
+    );
+    var after_registration = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_registration.deinit(allocator);
+    try t.expectEqual(before_registration.records.len + 1, after_registration.records.len);
+    for (after_registration.records[before_registration.records.len..]) |event| {
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, nonce) == null);
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, custody_bytes) == null);
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, "\"mapping\"") == null);
+        inline for (.{
+            "historical_answer",
+            "grade_opening",
+            "source_target_text\"",
+            "source_target_text_witness\"",
+            "source_governance_ref\"",
+            "source_governance\"",
+            "decision_context_ref\"",
+            "decision_context\"",
+            "selected_route\"",
+        }) |forbidden| try std.testing.expect(std.mem.indexOf(u8, event.payload, forbidden) ==
+            null);
+    }
+
+    var direct_source_case: ?std.json.ObjectMap = null;
+    var historical_source_case: ?std.json.ObjectMap = null;
+    for (source_cases.items) |case_value| {
+        const source_case = try jsonObject(case_value);
+        const unit_id = try jsonRequiredString(source_case, "unit_id");
+        if (std.mem.eql(u8, unit_id, "unit-direct")) direct_source_case = source_case;
+        if (std.mem.eql(u8, unit_id, "unit-historical")) historical_source_case = source_case;
+    }
+    const direct_case = direct_source_case orelse return error.SourceCaseMissing;
+    const historical_case = historical_source_case orelse return error.SourceCaseMissing;
+    try std.testing.expectEqualStrings(
+        direct_scenario.visible_input_fingerprint,
+        try jsonRequiredString(direct_case, "visible_input_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        historical_scenario.visible_input_fingerprint,
+        try jsonRequiredString(historical_case, "visible_input_fingerprint"),
+    );
+
+    const resolved_executor_path = try testResolvedExecutablePathAlloc(
+        allocator,
+        hylo_operator_recipe_paths.fixture_executor_path,
+    );
+    defer allocator.free(resolved_executor_path);
+    const resolved_ledger_path = try testResolvedExecutablePathAlloc(
+        allocator,
+        hylo_operator_recipe_paths.ledger_path,
+    );
+    defer allocator.free(resolved_ledger_path);
+    const receipt_dir = try std.fs.path.join(allocator, &.{ repo, "operator-receipts" });
+    defer allocator.free(receipt_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, receipt_dir);
+
+    const route_fixtures = [_]struct {
+        unit_id: []const u8,
+        source_kind: []const u8,
+        visible_input_fingerprint: []const u8,
+        sealed_case_path: []const u8,
+    }{
+        .{
+            .unit_id = "unit-direct",
+            .source_kind = "direct",
+            .visible_input_fingerprint = try jsonRequiredString(
+                direct_case,
+                "visible_input_fingerprint",
+            ),
+            .sealed_case_path = try jsonRequiredString(
+                try jsonRequiredObject(direct_case, "sealed_case"),
+                "ciphertext_or_capability_ref",
+            ),
+        },
+        .{
+            .unit_id = "unit-historical",
+            .source_kind = "historical_decision",
+            .visible_input_fingerprint = try jsonRequiredString(
+                historical_case,
+                "visible_input_fingerprint",
+            ),
+            .sealed_case_path = try jsonRequiredString(
+                try jsonRequiredObject(historical_case, "sealed_case"),
+                "ciphertext_or_capability_ref",
+            ),
+        },
+    };
+    var lane_evidence: std.ArrayList(TestOperatorLaneEvidence) = .empty;
+    defer {
+        for (lane_evidence.items) |*evidence| evidence.deinit(allocator);
+        lane_evidence.deinit(allocator);
+    }
+    var first_historical_evidence_index: ?usize = null;
+    for (route_fixtures) |route| {
+        var selected_unit: ?std.json.ObjectMap = null;
+        for ((try jsonRequiredArray(trial_root, "units")).items) |unit_value| {
+            const unit = try jsonObject(unit_value);
+            if (std.mem.eql(u8, try jsonRequiredString(unit, "unit_id"), route.unit_id)) {
+                selected_unit = unit;
+                break;
+            }
+        }
+        const unit = selected_unit orelse return error.SourceReceiptTrialMismatch;
+        const pairs = try jsonRequiredArray(unit, "pairs");
+        for (pairs.items, 0..) |_, pair_index| {
+            for (0..2) |order_index| {
+                var evidence = try testExecutePrivateOperatorLane(
+                    allocator,
+                    repo,
+                    store,
+                    output_path,
+                    trial_root,
+                    custody_bytes,
+                    registration_event_digest,
+                    route.unit_id,
+                    route.source_kind,
+                    route.visible_input_fingerprint,
+                    route.sealed_case_path,
+                    source_selection_opening,
+                    source_seal_key,
+                    &materializer_seed,
+                    &runner_seed,
+                    receipt_dir,
+                    resolved_executor_path,
+                    resolved_ledger_path,
+                    pair_index,
+                    order_index,
+                );
+                errdefer evidence.deinit(allocator);
+                if (first_historical_evidence_index == null and
+                    std.mem.eql(u8, route.source_kind, "historical_decision"))
+                {
+                    first_historical_evidence_index = lane_evidence.items.len;
+                }
+                try lane_evidence.append(allocator, evidence);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), lane_evidence.items.len);
+
+    var after_execution = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_execution.deinit(allocator);
+    try std.testing.expectEqual(
+        after_registration.records.len + lane_evidence.items.len * 2,
+        after_execution.records.len,
+    );
+    for (after_execution.records[before_registration.records.len..]) |event| {
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, nonce) == null);
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, custody_bytes) == null);
+        try std.testing.expect(std.mem.indexOf(u8, event.payload, "\"mapping\"") == null);
+    }
+    {
+        var final_state = try loadLedgerFromStore(allocator, store);
+        defer final_state.deinit(allocator);
+        const final_campaign_index = findCampaign(
+            final_state.campaigns.items,
+            "campaign-operator-recipe",
+        ) orelse return error.CampaignMissing;
+        const final_trial = final_state.campaigns.items[final_campaign_index].hctp_trials.findTrial(
+            "trial-operator-recipe",
+        ) orelse return error.TrialMissing;
+        for (lane_evidence.items) |evidence| {
+            const lane = final_trial.findLane(evidence.lane_id) orelse
+                return error.LaneNotRegistered;
+            try std.testing.expect(lane.status == .completed);
+            try std.testing.expectEqualStrings(
+                evidence.start_event_digest,
+                lane.started_event_digest orelse return error.LaneStartNotCommitted,
+            );
+            try std.testing.expectEqualStrings(
+                evidence.run_receipt_fingerprint,
+                lane.run_receipt_fingerprint orelse return error.RunReceiptInvalid,
+            );
+            try std.testing.expectEqualStrings(
+                evidence.materialization_claim_fingerprint,
+                lane.materialization_claim_fingerprint orelse
+                    return error.RevealMaterializationReceiptMissing,
+            );
+        }
+    }
+
+    for (lane_evidence.items) |evidence| {
+        const grade_envelope = try testOperatorGradeEnvelopeAlloc(
+            allocator,
+            store,
+            "trial-operator-recipe",
+            evidence.lane_id,
+            materializer_seed,
+            absolute_grader_seed,
+        );
+        defer allocator.free(grade_envelope);
+        const grade_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/grade-{s}.json",
+            .{ receipt_dir, evidence.lane_id },
+        );
+        defer allocator.free(grade_path);
+        try durable_store.writeTextAtomic(allocator, grade_path, grade_envelope);
+        const grade_result = try testRunProductCommandAlloc(allocator, repo, &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "grade-lane",
+            "--repo",
+            repo,
+            "--receipt",
+            grade_path,
+        });
+        defer allocator.free(grade_result);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            grade_result,
+            "hylo-grade-append-receipt/v1",
+        ) != null);
+    }
+    var pair_grade_count: usize = 0;
+    for ((try jsonRequiredArray(trial_root, "units")).items) |unit_value| {
+        const unit = try jsonObject(unit_value);
+        for ((try jsonRequiredArray(unit, "pairs")).items) |pair_value| {
+            const pair_id = try jsonRequiredString(try jsonObject(pair_value), "pair_id");
+            const pair_grade_envelope = try testOperatorPairGradeEnvelopeAlloc(
+                allocator,
+                store,
+                "trial-operator-recipe",
+                pair_id,
+                materializer_seed,
+                pair_grader_seed,
+            );
+            defer allocator.free(pair_grade_envelope);
+            const pair_grade_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/pair-grade-{s}.json",
+                .{ receipt_dir, pair_id },
+            );
+            defer allocator.free(pair_grade_path);
+            try durable_store.writeTextAtomic(
+                allocator,
+                pair_grade_path,
+                pair_grade_envelope,
+            );
+            const pair_grade_result = try testRunProductCommandAlloc(allocator, repo, &.{
+                hylo_operator_recipe_paths.ledger_path,
+                "--source",
+                "hylo",
+                "grade-pair",
+                "--repo",
+                repo,
+                "--receipt",
+                pair_grade_path,
+            });
+            defer allocator.free(pair_grade_result);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                pair_grade_result,
+                "hylo-pair-grade-append-receipt/v1",
+            ) != null);
+            pair_grade_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), pair_grade_count);
+    var materialization_receipts: std.ArrayList([]const u8) = .empty;
+    defer materialization_receipts.deinit(allocator);
+    for (lane_evidence.items) |evidence| {
+        try materialization_receipts.append(allocator, evidence.materialization_receipt);
+    }
+    var private_materialization_receipts: std.ArrayList([]u8) = .empty;
+    defer {
+        for (private_materialization_receipts.items) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            allocator.free(bytes);
+        }
+        private_materialization_receipts.deinit(allocator);
+    }
+    for (lane_evidence.items) |evidence| {
+        try private_materialization_receipts.append(
+            allocator,
+            try durable_store.readRegularFileNoSymlink(
+                allocator,
+                evidence.private_materialization_receipt_path,
+                MaxInputBytes,
+            ),
+        );
+    }
+    const semantic_trial_bytes = try semanticTrialFromCustodyAlloc(
+        allocator,
+        trial.value,
+        custody.value,
+    );
+    defer {
+        std.crypto.secureZero(u8, semantic_trial_bytes);
+        allocator.free(semantic_trial_bytes);
+    }
+    var semantic_trial = try parseValue(allocator, semantic_trial_bytes);
+    defer semantic_trial.deinit();
+    var reveal_state = try loadLedgerFromStore(allocator, store);
+    defer reveal_state.deinit(allocator);
+    const reveal_campaign_index = findCampaign(
+        reveal_state.campaigns.items,
+        "campaign-operator-recipe",
+    ) orelse return error.CampaignMissing;
+    const reveal_trial_state =
+        reveal_state.campaigns.items[reveal_campaign_index].hctp_trials.findTrial(
+            "trial-operator-recipe",
+        ) orelse return error.TrialMissing;
+    const materializer_validations = try hctp.privateMaterializerValidationsAlloc(
+        allocator,
+        reveal_trial_state,
+        semantic_trial.value,
+        private_materialization_receipts.items,
+    );
+    defer allocator.free(materializer_validations);
+    const reveal_bytes = try v2RevealFromCustodyAlloc(
+        allocator,
+        trial.value,
+        custody.value,
+        materialization_receipts.items,
+        materializer_validations,
+    );
+    defer allocator.free(reveal_bytes);
+    const forged_reveal_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        reveal_bytes,
+        lane_evidence.items[0].materialization_claim_fingerprint,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    defer allocator.free(forged_reveal_bytes);
+    var before_forged_reveal = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_forged_reveal.deinit(allocator);
+    try std.testing.expectError(
+        error.RevealMaterializationClaimMismatch,
+        testRevealAndCloseTrial(
+            allocator,
+            repo,
+            store,
+            forged_reveal_bytes,
+            .validated_private_custody_v2,
+        ),
+    );
+    var after_forged_reveal = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_forged_reveal.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before_forged_reveal, after_forged_reveal);
+
+    const forged_materialization_receipt = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        lane_evidence.items[0].materialization_receipt,
+        lane_evidence.items[0].materialization_claim_fingerprint,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    defer allocator.free(forged_materialization_receipt);
+    const forged_materialization_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-forged-materialization-receipt.json" },
+    );
+    defer allocator.free(forged_materialization_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        forged_materialization_path,
+        forged_materialization_receipt,
+    );
+    var forged_reveal_argv: std.ArrayList([]const u8) = .empty;
+    defer forged_reveal_argv.deinit(allocator);
+    try forged_reveal_argv.appendSlice(allocator, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "reveal-trial",
+        "--repo",
+        repo,
+    });
+    for (lane_evidence.items, 0..) |evidence, index| {
+        try forged_reveal_argv.appendSlice(allocator, &.{
+            "--materialization-receipt",
+            if (index == 0) forged_materialization_path else evidence.materialization_receipt_path,
+            "--materialization-receipt",
+            evidence.private_materialization_receipt_path,
+        });
+    }
+    var before_product_forged_reveal = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_product_forged_reveal.deinit(allocator);
+    var rejected_product_reveal = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        forged_reveal_argv.items,
+        &.{.{ .fd_flag = "--custody-input-fd", .bytes = custody_bytes }},
+        null,
+        null,
+    );
+    defer rejected_product_reveal.deinit(allocator);
+    try std.testing.expect(processExitCode(rejected_product_reveal.term) != 0);
+    try std.testing.expectEqual(@as(usize, 0), rejected_product_reveal.stdout.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_product_reveal.protected_output.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_product_reveal.protected_output_2.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rejected_product_reveal.stderr,
+        "RevealMaterializationClaimMismatch",
+    ) != null);
+    var after_product_forged_reveal = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_product_forged_reveal.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(
+        before_product_forged_reveal,
+        after_product_forged_reveal,
+    );
+
+    var reveal_argv: std.ArrayList([]const u8) = .empty;
+    defer reveal_argv.deinit(allocator);
+    try reveal_argv.appendSlice(allocator, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "reveal-trial",
+        "--repo",
+        repo,
+    });
+    for (lane_evidence.items) |evidence| {
+        try reveal_argv.appendSlice(allocator, &.{
+            "--materialization-receipt",
+            evidence.materialization_receipt_path,
+            "--materialization-receipt",
+            evidence.private_materialization_receipt_path,
+        });
+    }
+    var revealed = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        reveal_argv.items,
+        &.{.{ .fd_flag = "--custody-input-fd", .bytes = custody_bytes }},
+        null,
+        null,
+    );
+    defer revealed.deinit(allocator);
+    if (processExitCode(revealed.term) != 0 or revealed.stderr.len != 0) {
+        std.debug.print(
+            "operator reveal-trial failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ revealed.stdout, revealed.stderr },
+        );
+        return error.ProductCommandFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 0), revealed.protected_output.len);
+    try std.testing.expectEqual(@as(usize, 0), revealed.protected_output_2.len);
+    try testExpectNoPrivateReceiptSurface(revealed.stdout);
+    try testExpectNoPrivateReceiptSurface(revealed.stderr);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        revealed.stdout,
+        "hylo-trial-reveal-receipt/v2",
+    ) != null);
+
+    const result_bytes = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "trial-result",
+        "--repo",
+        repo,
+        "--trial-id",
+        "trial-operator-recipe",
+        "--format",
+        "json",
+    });
+    defer allocator.free(result_bytes);
+    var result = try parseValue(allocator, result_bytes);
+    defer result.deinit();
+    const result_root = try jsonObject(result.value);
+    try std.testing.expectEqualStrings(
+        "hylo-trial-result/v1",
+        try jsonRequiredString(result_root, "schema"),
+    );
+    try validateFingerprint(try jsonRequiredString(result_root, "result_fingerprint"));
+    try std.testing.expectEqualStrings(
+        "inapplicable",
+        try jsonRequiredString(try jsonRequiredObject(result_root, "calibration"), "status"),
+    );
+
+    const close_bytes = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "close-trial",
+        "--repo",
+        repo,
+        "--trial-id",
+        "trial-operator-recipe",
+        "--status",
+        "completed",
+        "--reason",
+        "operator-recipe-complete",
+    });
+    defer allocator.free(close_bytes);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        close_bytes,
+        "hylo-trial-close-receipt/v1",
+    ) != null);
+
+    const sanitization_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-proof-sanitization.json" },
+    );
+    defer allocator.free(sanitization_path);
+    const artifact_set_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-proof-artifact-set.json" },
+    );
+    defer allocator.free(artifact_set_path);
+    const proof_path = try std.fs.path.join(allocator, &.{ repo, "operator-proof.tar" });
+    defer allocator.free(proof_path);
+    const artifact_set_stdout = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "proof-artifact-set",
+        "--repo",
+        repo,
+        "--trial-id",
+        "trial-operator-recipe",
+        "--output",
+        artifact_set_path,
+    });
+    defer allocator.free(artifact_set_stdout);
+    try std.testing.expectEqual(@as(usize, 0), artifact_set_stdout.len);
+    const artifact_set_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        artifact_set_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(artifact_set_bytes);
+    var artifact_set = try parseValue(allocator, artifact_set_bytes);
+    defer artifact_set.deinit();
+    try std.testing.expectEqualStrings(
+        "hylo-proof-artifact-set/v1",
+        try jsonRequiredString(try jsonObject(artifact_set.value), "schema"),
+    );
+    try testWriteSelectionProofSanitizationReceiptForArtifactSet(
+        allocator,
+        store,
+        "trial-operator-recipe",
+        artifact_set_bytes,
+        sanitization_path,
+    );
+
+    const private_sanitization_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-proof-private-sanitization.json" },
+    );
+    defer allocator.free(private_sanitization_path);
+    const rejected_proof_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-proof-private-rejected.tar" },
+    );
+    defer allocator.free(rejected_proof_path);
+    var private_artifact_set = try parseValue(allocator, artifact_set_bytes);
+    defer private_artifact_set.deinit();
+    try (try jsonObjectPtr(&private_artifact_set.value)).put(
+        private_artifact_set.arena.allocator(),
+        "historical_answer",
+        .{ .string = @constCast("private-semantic-evidence") },
+    );
+    const private_artifact_set_bytes = try canonicalJsonAlloc(
+        allocator,
+        private_artifact_set.value,
+    );
+    defer allocator.free(private_artifact_set_bytes);
+    try testWriteSelectionProofSanitizationReceiptForArtifactSet(
+        allocator,
+        store,
+        "trial-operator-recipe",
+        private_artifact_set_bytes,
+        private_sanitization_path,
+    );
+    var before_private_export = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_private_export.deinit(allocator);
+    var rejected_private_export = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "export-proof",
+            "--repo",
+            repo,
+            "--trial-id",
+            "trial-operator-recipe",
+            "--output",
+            rejected_proof_path,
+            "--sanitization-receipt",
+            private_sanitization_path,
+        },
+        &.{},
+        null,
+        null,
+    );
+    defer rejected_private_export.deinit(allocator);
+    try std.testing.expect(processExitCode(rejected_private_export.term) != 0);
+    try std.testing.expectEqual(@as(usize, 0), rejected_private_export.stdout.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_private_export.protected_output.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_private_export.protected_output_2.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rejected_private_export.stderr,
+        "ProofSanitization",
+    ) != null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(
+            std.testing.io,
+            rejected_proof_path,
+            .{ .follow_symlinks = false },
+        ),
+    );
+    var after_private_export = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_private_export.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before_private_export, after_private_export);
+
+    const export_bytes = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "export-proof",
+        "--repo",
+        repo,
+        "--trial-id",
+        "trial-operator-recipe",
+        "--output",
+        proof_path,
+        "--sanitization-receipt",
+        sanitization_path,
+    });
+    defer allocator.free(export_bytes);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        export_bytes,
+        "hylo-proof-export-receipt/v1",
+    ) != null);
+
+    const verification_bytes = try testRunProductCommandAlloc(allocator, repo, &.{
+        hylo_operator_recipe_paths.ledger_path,
+        "--source",
+        "hylo",
+        "verify-proof",
+        "--repo",
+        repo,
+        "--input",
+        proof_path,
+    });
+    defer allocator.free(verification_bytes);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        verification_bytes,
+        "hylo-proof-verification/v1",
+    ) != null);
+
+    const tampered_proof_path = try std.fs.path.join(
+        allocator,
+        &.{ repo, "operator-proof-tampered.tar" },
+    );
+    defer allocator.free(tampered_proof_path);
+    try testWriteTamperedProof(
+        allocator,
+        proof_path,
+        tampered_proof_path,
+        "\"bundle_id\":\"bundle:sha256:",
+    );
+    var before_tampered_verify = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_tampered_verify.deinit(allocator);
+    var rejected_tampered_verify = try testRunWithProtectedChannelsAlloc(
+        allocator,
+        repo,
+        &.{
+            hylo_operator_recipe_paths.ledger_path,
+            "--source",
+            "hylo",
+            "verify-proof",
+            "--repo",
+            repo,
+            "--input",
+            tampered_proof_path,
+        },
+        &.{},
+        null,
+        null,
+    );
+    defer rejected_tampered_verify.deinit(allocator);
+    try std.testing.expect(processExitCode(rejected_tampered_verify.term) != 0);
+    try std.testing.expectEqual(@as(usize, 0), rejected_tampered_verify.stdout.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_tampered_verify.protected_output.len);
+    try std.testing.expectEqual(@as(usize, 0), rejected_tampered_verify.protected_output_2.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rejected_tampered_verify.stderr,
+        "Proof",
+    ) != null);
+    var after_tampered_verify = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_tampered_verify.deinit(allocator);
+    try testExpectSnapshotContentsEquivalent(before_tampered_verify, after_tampered_verify);
+
+    const historical_evidence = lane_evidence.items[
+        first_historical_evidence_index orelse return error.TestExpectedLane
+    ];
+    const historical_proof_path = try std.fmt.allocPrint(
+        allocator,
+        "trial/run-receipts/{s}.json",
+        .{historical_evidence.lane_id},
+    );
+    defer allocator.free(historical_proof_path);
+    var projected_historical_receipt = try testProofEntryJson(
+        allocator,
+        proof_path,
+        historical_proof_path,
+    );
+    defer projected_historical_receipt.deinit();
+    try validateRunReceiptProofProjection(projected_historical_receipt.value);
+    const projected_historical_bytes = try canonicalJsonAlloc(
+        allocator,
+        projected_historical_receipt.value,
+    );
+    defer allocator.free(projected_historical_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, projected_historical_bytes, "token_usage") == null);
+    inline for (.{ "{}", "[{}]" }) |invalid_token_usage| {
+        var tampered = try parseValue(allocator, projected_historical_bytes);
+        defer tampered.deinit();
+        const tampered_native = try jsonObjectPtr(
+            (try jsonObjectPtr(&tampered.value)).getPtr("native_receipt") orelse
+                return error.TestFixtureInvalid,
+        );
+        const tampered_receipt = try jsonObjectPtr(
+            tampered_native.getPtr("receipt") orelse return error.TestFixtureInvalid,
+        );
+        const injected_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"inquiry\":{{\"token_usage\":{s}}}}}",
+            .{invalid_token_usage},
+        );
+        defer allocator.free(injected_bytes);
+        var injected = try parseValue(allocator, injected_bytes);
+        defer injected.deinit();
+        try tampered_receipt.put(
+            tampered.arena.allocator(),
+            "fork_inquiry_receipt",
+            injected.value,
+        );
+        try std.testing.expectError(
+            error.ProofProjectionSemanticMutation,
+            validateRunReceiptProofProjection(tampered.value),
+        );
+    }
+}
+
+const TestCompilerFailFixture = struct {
+    request_bytes: []u8,
+    receipt_bytes: []u8,
+
+    fn deinit(self: *TestCompilerFailFixture, allocator: std.mem.Allocator) void {
+        allocator.free(self.request_bytes);
+        allocator.free(self.receipt_bytes);
+    }
+};
+
+fn testPrepareCompilerFailFixture(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+) !TestCompilerFailFixture {
+    try runTestGit(allocator, repo, &.{ "init", "--quiet" });
+    try runTestGit(allocator, repo, &.{ "config", "user.name", "Hylo Compiler Fail Closed" });
+    try runTestGit(allocator, repo, &.{ "config", "user.email", "hylo-compiler@example.invalid" });
+    const gitignore_path = try std.fs.path.join(allocator, &.{ repo, ".gitignore" });
+    defer allocator.free(gitignore_path);
+    const target_path = try std.fs.path.join(allocator, &.{ repo, "target.txt" });
+    defer allocator.free(target_path);
+    try durable_store.writeTextAtomic(allocator, gitignore_path, ".ledger/\n*.jsonl\n");
+    try durable_store.writeTextAtomic(allocator, target_path, "baseline\n");
+    try runTestGit(allocator, repo, &.{ "add", ".gitignore", "target.txt" });
+    try runTestGit(allocator, repo, &.{ "commit", "--quiet", "-m", "baseline" });
+    const baseline_raw = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(baseline_raw);
+    const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
+    const roots = [_][]const u8{ "target.txt", "target-scope" };
+    var baseline_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        &roots,
+    );
+    defer baseline_snapshot.deinit(allocator);
+    var baseline_bundle = try retrace_core.target_bundle.buildSkillBundleAlloc(
+        allocator,
+        "target-skill",
+        "baseline\n",
+        "compiler-baseline/SKILL.md",
+    );
+    defer baseline_bundle.deinit(allocator);
+    var candidate_bundle = try retrace_core.target_bundle.buildSkillBundleAlloc(
+        allocator,
+        "target-skill",
+        "candidate\n",
+        "compiler-candidate/SKILL.md",
+    );
+    defer candidate_bundle.deinit(allocator);
+
+    try testSeedOneScenarioRouteCampaign(
+        allocator,
+        repo,
+        store,
+        "[\"absolute_qualification\"]",
+        baseline_bundle.bundle_fingerprint,
+    );
+    try testAppendTargetBundleAdmission(
+        allocator,
+        repo,
+        store,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &baseline_bundle,
+        baseline_revision,
+        &baseline_snapshot,
+        "target.txt",
+    );
+    const staged_diff_fingerprint = try testBootstrapFirstAppliedChange(
+        allocator,
+        repo,
+        store,
+        false,
+        false,
+        .{
+            .baseline_bundle_fingerprint = baseline_bundle.bundle_fingerprint,
+            .baseline_snapshot_fingerprint = baseline_snapshot.fingerprint,
+            .candidate_bundle = &candidate_bundle,
+        },
+    );
+    defer allocator.free(staged_diff_fingerprint);
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(allocator, repo, "INDEX", &roots);
+    defer candidate_snapshot.deinit(allocator);
+
+    var selection = try testDirectSourceSelectionReceiptAlloc(
+        allocator,
+        "cmp-test",
+        "unit-compiler-001",
+        "scenario-holdout",
+        "cluster-compiler-001",
+        TestScenarioJson,
+        "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+        "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        TestDirectCrfEpisodeFingerprint,
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+    defer selection.deinit(allocator);
+    const donor_bytes = try testPromotionTrialAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        baseline_snapshot.fingerprint,
+        candidate_snapshot.fingerprint,
+        staged_diff_fingerprint,
+    );
+    defer allocator.free(donor_bytes);
+    var donor = try parseValue(allocator, donor_bytes);
+    defer donor.deinit();
+    const donor_root = try jsonObject(donor.value);
+    var admitted = try loadLedgerFromStore(allocator, store);
+    defer admitted.deinit(allocator);
+    const campaign_index = findCampaign(admitted.campaigns.items, "cmp-test") orelse
+        return error.CampaignMissing;
+    const campaign = &admitted.campaigns.items[campaign_index];
+    const compiler_verifier_fingerprint = try currentExecutableFingerprintAlloc(allocator);
+    defer allocator.free(compiler_verifier_fingerprint);
+
+    var request: std.Io.Writer.Allocating = .init(allocator);
+    errdefer request.deinit();
+    try request.writer.writeAll("{\"allocation\":{\"method\":\"balanced_ab_ba\"},\"assurance\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "assurance"));
+    try request.writer.writeAll(",\"calibration\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "calibration"));
+    try request.writer.writeAll(",\"campaign_id\":\"cmp-test\",\"estimand\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "estimand"));
+    try request.writer.writeAll(",\"execution\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "execution"));
+    try request.writer.writeAll(",\"expected_campaign_head\":");
+    try std.json.Stringify.value(campaign.last_digest, .{}, &request.writer);
+    try request.writer.writeAll(",\"factor\":{\"allowed_difference_roots\":[\"tar" ++
+        "get.txt\",\"target-scope\"],\"intervention_witne" ++
+        "ss_ref\":\"artifact:compiler-witness\",\"kind\":" ++
+        "\"target_snapshot\",\"verifier\":{\"fingerprint" ++ "\":");
+    try std.json.Stringify.value(compiler_verifier_fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"id\":\"git-target-projection\",\"version\":\"" ++
+        "v1\"}},\"grading\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "grading"));
+    try request.writer.writeAll(",\"hypothesis\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "hypothesis"));
+    try request.writer.writeAll(",\"proof_policy\":null,\"publication_policy\":nu" ++
+        "ll,\"purpose\":\"practice_repair\",\"schema\":\"" ++
+        "hylo-trial-build-request/v1\",\"sealing\":{\"cas" ++
+        "e_materializer_fingerprint\":null,\"case_materia" ++
+        "lizer_ref\":null,\"reveal_scope\":\"trial\"}");
+    try request.writer.writeAll(",\"source_selection_receipt_fingerprint\":");
+    try std.json.Stringify.value(selection.fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"source_selection_receipt_ref\":\"artifact:com" ++
+        "piler-selection\",\"stop_policy\":");
+    try writeCanonicalJson(allocator, &request.writer, try jsonRequired(donor_root, "stop_policy"));
+    try request.writer.writeAll(",\"target\":{\"after_bundle_fingerprint\":");
+    try std.json.Stringify.value(candidate_bundle.bundle_fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"after_snapshot_fingerprint\":");
+    try std.json.Stringify.value(candidate_snapshot.fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"after_target_fingerprint\":\"sha256:bbbbbbbbb" ++
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+        "bbbbbbb\",\"before_bundle_fingerprint\":");
+    try std.json.Stringify.value(baseline_bundle.bundle_fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"before_snapshot_fingerprint\":");
+    try std.json.Stringify.value(baseline_snapshot.fingerprint, .{}, &request.writer);
+    try request.writer.writeAll(",\"before_target_fingerprint\":\"sha256:aaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaaaaaa\",\"change_id\":\"change-1\"},\"trial_i" ++
+        "d\":\"trial-compiler-fail-001\",\"unit_ids\":[\"" ++ "unit-compiler-001\"]}");
+    const request_bytes = try request.toOwnedSlice();
+    errdefer allocator.free(request_bytes);
+    return .{
+        .request_bytes = request_bytes,
+        .receipt_bytes = try allocator.dupe(u8, selection.bytes),
+    };
+}
+
+const TestCompilerRequestMutation = struct {
+    expected_campaign_head: ?[]const u8 = null,
+    purpose: ?[]const u8 = null,
+    source_receipt_fingerprint: ?[]const u8 = null,
+    assurance_level: ?[]const u8 = null,
+    verifier_fingerprint: ?[]const u8 = null,
+};
+
+fn testMutateCompilerRequestAlloc(
+    allocator: std.mem.Allocator,
+    request_bytes: []const u8,
+    mutation: TestCompilerRequestMutation,
+) ![]u8 {
+    var parsed = try parseValue(allocator, request_bytes);
+    defer parsed.deinit();
+    const root = try jsonObjectPtr(&parsed.value);
+    if (mutation.expected_campaign_head) |value| {
+        (root.getPtr("expected_campaign_head") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast(value) };
+    }
+    if (mutation.purpose) |value| {
+        (root.getPtr("purpose") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast(value) };
+    }
+    if (mutation.source_receipt_fingerprint) |value| {
+        (root.getPtr("source_selection_receipt_fingerprint") orelse return fm).* =
+            .{ .string = @constCast(value) };
+    }
+    if (mutation.assurance_level) |value| {
+        const assurance = try op(root.getPtr("assurance") orelse return fm);
+        (assurance.getPtr("required_level") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast(value) };
+    }
+    if (mutation.verifier_fingerprint) |value| {
+        const factor = try op(root.getPtr("factor") orelse return fm);
+        const verifier = try op(factor.getPtr("verifier") orelse return fm);
+        (verifier.getPtr("fingerprint") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast(value) };
+    }
+    return canonicalJsonAlloc(allocator, parsed.value);
+}
+
+fn testAddGeneratedSealingFieldAlloc(
+    allocator: std.mem.Allocator,
+    request_bytes: []const u8,
+    member_json: []const u8,
+) ![]u8 {
+    const replacement = try std.fmt.allocPrint(allocator, "\"sealing\":{{{s},", .{member_json});
+    defer allocator.free(replacement);
+    const mutated = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        request_bytes,
+        "\"sealing\":{",
+        replacement,
+    );
+    errdefer allocator.free(mutated);
+    if (std.mem.eql(u8, mutated, request_bytes)) return error.TestFixtureNeedleMissing;
+    return mutated;
+}
+
+const TestCompilerRouteMutation = enum {
+    direct_replay_ineligible,
+    historical_unavailable,
+    historical_uncontrolled,
+};
+
+fn testMutateCompilerReceiptRouteAlloc(
+    allocator: std.mem.Allocator,
+    receipt_bytes: []const u8,
+    mutation: TestCompilerRouteMutation,
+) !TestSourceSelectionReceipt {
+    var original = try parseValue(allocator, receipt_bytes);
+    defer original.deinit();
+    const original_root = try jsonObject(original.value);
+    const original_cases = try jsonRequiredArray(original_root, "cases");
+    if (original_cases.items.len != 1) return error.SourceReceiptTrialMismatch;
+    const original_case = try jsonObject(original_cases.items[0]);
+    const original_profile_fingerprint = try jsonRequiredString(
+        original_case,
+        "source_profile_fingerprint",
+    );
+    var current = try allocator.dupe(u8, receipt_bytes);
+    defer allocator.free(current);
+    switch (mutation) {
+        .direct_replay_ineligible => {
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"comparison_eligible\":true",
+                "\"comparison_eligible\":false",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"effective_reconstruction_class\":\"controlled_replay\"",
+                "\"effective_reconstruction_class\":\"transcript_only\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"execution_route\":\"direct\"",
+                "\"execution_route\":\"diagnostic_only\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"fidelity\":{\"class\":\"controlled_replay\",\"replay_eligible\":true}",
+                "\"fidelity\":{\"class\":\"transcript_only\",\"replay_eligible\":false}",
+            );
+        },
+        .historical_unavailable => {},
+        .historical_uncontrolled => {
+            var profile = try parseValue(allocator, "{\"kind\":\"historical_decision\"}");
+            defer profile.deinit();
+            const profile_fingerprint = try hctp.digestValueAlloc(allocator, profile.value);
+            defer allocator.free(profile_fingerprint);
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"source_profile\":{\"kind\":\"direct\"}",
+                "\"source_profile\":{\"kind\":\"historical_decision\"}",
+            );
+            try testReplaceAllCurrent(
+                allocator,
+                &current,
+                original_profile_fingerprint,
+                profile_fingerprint,
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"effective_reconstruction_class\":\"controlled_replay\"",
+                "\"effective_reconstruction_class\":\"exact\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"execution_route\":\"direct\"",
+                "\"execution_route\":\"historical_replay\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"required_fir_version\":null",
+                "\"required_fir_version\":\"FIR-v1\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"required_lineage\":null",
+                "\"required_lineage\":\"either\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"source_governance_state\":null",
+                "\"source_governance_state\":\"declared_uncontrolled\"",
+            );
+            try testReplaceFirstCurrent(
+                allocator,
+                &current,
+                "\"source_profile_kind\":\"direct\"",
+                "\"source_profile_kind\":\"historical_decision\"",
+            );
+        },
+    }
+    var mutated = try parseValue(allocator, current);
+    defer mutated.deinit();
+    if (mutation == .historical_unavailable) {
+        const profile_fingerprint =
+            "sha256:9999999999999999999999999999999999999999999999999999999999999999";
+        var historical_profile = try parseValue(
+            allocator,
+            "{\"kind\":\"historical_decision\"," ++
+                "\"source_governance_fingerprint\":\"sha256:11111" ++
+                "111111111111111111111111111111111111111111111111" ++ "11111111111\"," ++
+                "\"decision_context_fingerprint\":\"sha256:222222" ++
+                "222222222222222222222222222222222222222222222222" ++ "2222222222\"," ++
+                "\"temporal_horizon\":\"pre_decision\",\"source_target_text_policy\":\"absent\"," ++
+                "\"retrace_mode\":\"replay\",\"required_lineage\"" ++
+                ":\"either\",\"required_fir_version\":\"FIR-v1\"," ++
+                "\"reconstructability\":\"exact\",\"limitations\"" ++
+                ":[\"CRF fidelity is unusable\"]," ++
+                "\"source_profile_fingerprint\":\"sha256:99999999" ++
+                "999999999999999999999999999999999999999999999999" ++ "99999999\"," ++
+                "\"profile_body_delivery\":\"source_profile_fd\"," ++
+                "\"source_target_text_witness_fingerprint\":\"sha" ++
+                "256:33333333333333333333333333333333333333333333" ++ "33333333333333333333\"}",
+        );
+        defer historical_profile.deinit();
+        const root = try jsonObjectPtr(&mutated.value);
+        const cases_value = root.getPtr("cases") orelse return error.RequiredFieldMissing;
+        if (cases_value.* != .array or cases_value.array.items.len != 1) {
+            return error.SourceReceiptTrialMismatch;
+        }
+        const source_case = try jsonObjectPtr(&cases_value.array.items[0]);
+        (source_case.getPtr("source_profile") orelse return error.RequiredFieldMissing).* =
+            historical_profile.value;
+        (source_case.getPtr("source_profile_fingerprint") orelse
+            return error.RequiredFieldMissing).* = .{ .string = @constCast(profile_fingerprint) };
+        const route = try jsonObjectPtr(
+            source_case.getPtr("source_route_admission") orelse
+                return error.SourceRouteAdmissionMissing,
+        );
+        (route.getPtr("comparison_eligible") orelse return error.RequiredFieldMissing).* =
+            .{ .bool = false };
+        (route.getPtr("effective_reconstruction_class") orelse
+            return error.RequiredFieldMissing).* = .{ .string = @constCast("unavailable") };
+        (route.getPtr("execution_route") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("historical_replay") };
+        const fidelity = try jsonObjectPtr(
+            route.getPtr("fidelity") orelse return error.RequiredFieldMissing,
+        );
+        (fidelity.getPtr("class") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("diagnostic_only") };
+        (fidelity.getPtr("replay_eligible") orelse return error.RequiredFieldMissing).* =
+            .{ .bool = false };
+        (route.getPtr("required_fir_version") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("FIR-v1") };
+        (route.getPtr("required_lineage") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("either") };
+        (route.getPtr("source_governance_state") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("authoritative") };
+        (route.getPtr("source_governance_workflow_effect_allowed") orelse
+            return error.RequiredFieldMissing).* = .{ .bool = true };
+        (route.getPtr("source_profile_fingerprint") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast(profile_fingerprint) };
+        (route.getPtr("source_profile_kind") orelse return error.RequiredFieldMissing).* =
+            .{ .string = @constCast("historical_decision") };
+    }
+    const root = try jsonObject(mutated.value);
+    const cases = try jsonRequiredArray(root, "cases");
+    return testSourceSelectionReceiptAlloc(
+        allocator,
+        try jsonRequiredString(root, "campaign_id"),
+        .{ .array = cases },
+    );
+}
+
+fn testExpectCompilerFailureNoEffects(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    case_id: []const u8,
+    request_bytes: []const u8,
+    receipt_bytes: []const u8,
+    expected_error: anyerror,
+) !void {
+    const request_name = try std.fmt.allocPrint(allocator, "request-{s}.json", .{case_id});
+    defer allocator.free(request_name);
+    const receipt_name = try std.fmt.allocPrint(allocator, "receipt-{s}.json", .{case_id});
+    defer allocator.free(receipt_name);
+    const output_name = try std.fmt.allocPrint(allocator, "trial-{s}.json", .{case_id});
+    defer allocator.free(output_name);
+    const request_path = try std.fs.path.join(allocator, &.{ repo, request_name });
+    defer allocator.free(request_path);
+    const receipt_path = try std.fs.path.join(allocator, &.{ repo, receipt_name });
+    defer allocator.free(receipt_path);
+    const output_path = try std.fs.path.join(allocator, &.{ repo, output_name });
+    defer allocator.free(output_path);
+    try durable_store.writeTextAtomic(allocator, request_path, request_bytes);
+    try durable_store.writeTextAtomic(allocator, receipt_path, receipt_bytes);
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    var read_open = true;
+    defer {
+        if (read_open) _ = std.c.close(pipe_fds[0]);
+    }
+    var write_open = true;
+    defer {
+        if (write_open) _ = std.c.close(pipe_fds[1]);
+    }
+    try std.testing.expectError(
+        expected_error,
+        compileTrial(
+            allocator,
+            repo,
+            store,
+            request_path,
+            receipt_path,
+            output_path,
+            pipe_fds[1],
+            false,
+        ),
+    );
+    _ = std.c.close(pipe_fds[1]);
+    write_open = false;
+    var private_buffer: [1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(isize, 0),
+        std.c.read(pipe_fds[0], &private_buffer, private_buffer.len),
+    );
+    _ = std.c.close(pipe_fds[0]);
+    read_open = false;
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(std.testing.io, output_path, .{ .follow_symlinks = false }),
+    );
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before, after);
+}
+
+fn testExpectRegistrationFailureNoAppend(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    trial_bytes: []const u8,
+    expected_error: anyerror,
+) !void {
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    try std.testing.expectError(
+        expected_error,
+        testRegisterTrialBytes(allocator, repo, store, trial_bytes),
+    );
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before, after);
+}
+
+fn testExpectPrivateRegistrationFailureNoAppend(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    store: durable_store.EventStore,
+    trial_bytes: []const u8,
+    custody_bytes: []const u8,
+    expected_error: anyerror,
+) !void {
+    const trial_path = try std.fs.path.join(allocator, &.{ repo, "private-route-trial.json" });
+    defer allocator.free(trial_path);
+    try durable_store.writeTextAtomic(allocator, trial_path, trial_bytes);
+
+    var before = try store.snapshot(allocator, MaxStoreBytes);
+    defer before.deinit(allocator);
+    var custody_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&custody_pipe) != 0) return error.TestFdSetupFailed;
+    var read_open = true;
+    defer {
+        if (read_open) _ = std.c.close(custody_pipe[0]);
+    }
+    var write_open = true;
+    defer {
+        if (write_open) _ = std.c.close(custody_pipe[1]);
+    }
+    var channel = TestProtectedWriteChannel{
+        .fd = custody_pipe[1],
+        .bytes = custody_bytes,
+    };
+    var writer_context = TestProtectedWriterContext{ .channels = (&channel)[0..1] };
+    const writer_thread = try std.Thread.spawn(.{}, testProtectedWriterMain, .{&writer_context});
+    var writer_joined = false;
+    defer if (!writer_joined) writer_thread.join();
+    write_open = false;
+    try std.testing.expectError(
+        expected_error,
+        cmdRegisterTrial(
+            allocator,
+            repo,
+            store,
+            trial_path,
+            custody_pipe[0],
+        ),
+    );
+    _ = std.c.close(custody_pipe[0]);
+    read_open = false;
+    writer_thread.join();
+    writer_joined = true;
+    if (writer_context.result) |err| return err;
+
+    var after = try store.snapshot(allocator, MaxStoreBytes);
+    defer after.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before, after);
+}
+
+test "hylo trial compiler rejects authority drift before entropy and effects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(allocator, "memory:compiler-fail-closed");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    var fixture = try testPrepareCompilerFailFixture(allocator, repo, store);
+    defer fixture.deinit(allocator);
+
+    const verifier_drift = try testMutateCompilerRequestAlloc(allocator, fixture.request_bytes, .{
+        .verifier_fingerprint = "sha256:03030303030303030303030303030303030303030" ++
+            "30303030303030303030303",
+    });
+    defer allocator.free(verifier_drift);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "verifier-binary-drift",
+        verifier_drift,
+        fixture.receipt_bytes,
+        error.TrialBuildVerifierFingerprintMismatch,
+    );
+
+    inline for (.{
+        .{ "generated-case-visibility", "\"case_visibility\":\"case_blind\"" },
+        .{ "generated-arm-visibility", "\"arm_visibility\":\"open\"" },
+        .{ "generated-grade-visibility", "\"grade_visibility\":\"open\"" },
+        .{ "generated-visible-commitments", "\"visible_input_commitments\":[]" },
+        .{ "generated-hidden-commitments", "\"hidden_reference_commitments\":[]" },
+        .{ "generated-source-receipt", "\"source_selection_receipt_ref\":\"artifact:forged\"" },
+    }) |sealing_case| {
+        const generated_sealing = try testAddGeneratedSealingFieldAlloc(
+            allocator,
+            fixture.request_bytes,
+            sealing_case[1],
+        );
+        defer allocator.free(generated_sealing);
+        try testExpectCompilerFailureNoEffects(
+            allocator,
+            repo,
+            store,
+            sealing_case[0],
+            generated_sealing,
+            fixture.receipt_bytes,
+            error.TrialBuildGeneratedFieldConflict,
+        );
+    }
+
+    const stale_head = try testMutateCompilerRequestAlloc(allocator, fixture.request_bytes, .{
+        .expected_campaign_head = "sha256:01010101010101010101010101010101010101010" ++
+            "10101010101010101010101",
+    });
+    defer allocator.free(stale_head);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "stale-campaign-head",
+        stale_head,
+        fixture.receipt_bytes,
+        error.TrialBuildCampaignHeadMismatch,
+    );
+
+    const receipt_mismatch = try testMutateCompilerRequestAlloc(allocator, fixture.request_bytes, .{
+        .source_receipt_fingerprint = "sha256:02020202020202020202020202020202020202020" ++
+            "20202020202020202020202",
+    });
+    defer allocator.free(receipt_mismatch);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "source-receipt-mismatch",
+        receipt_mismatch,
+        fixture.receipt_bytes,
+        error.SourceReceiptTrialMismatch,
+    );
+
+    var replay_ineligible = try testMutateCompilerReceiptRouteAlloc(
+        allocator,
+        fixture.receipt_bytes,
+        .direct_replay_ineligible,
+    );
+    defer replay_ineligible.deinit(allocator);
+    const replay_ineligible_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .source_receipt_fingerprint = replay_ineligible.fingerprint },
+    );
+    defer allocator.free(replay_ineligible_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "replay-ineligible-direct",
+        replay_ineligible_request,
+        replay_ineligible.bytes,
+        error.CrfReplayIneligibleForDirectRoute,
+    );
+
+    var historical_unavailable = try testMutateCompilerReceiptRouteAlloc(
+        allocator,
+        fixture.receipt_bytes,
+        .historical_unavailable,
+    );
+    defer historical_unavailable.deinit(allocator);
+    const historical_unavailable_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .source_receipt_fingerprint = historical_unavailable.fingerprint },
+    );
+    defer allocator.free(historical_unavailable_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "historical-unavailable",
+        historical_unavailable_request,
+        historical_unavailable.bytes,
+        error.DiagnosticSourceNotComparisonEligible,
+    );
+
+    var historical_uncontrolled = try testMutateCompilerReceiptRouteAlloc(
+        allocator,
+        fixture.receipt_bytes,
+        .historical_uncontrolled,
+    );
+    defer historical_uncontrolled.deinit(allocator);
+    const historical_practice_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .source_receipt_fingerprint = historical_uncontrolled.fingerprint },
+    );
+    defer allocator.free(historical_practice_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "historical-practice-uncontrolled",
+        historical_practice_request,
+        historical_uncontrolled.bytes,
+        error.HistoricalGovernanceNotAuthoritative,
+    );
+    const historical_promotion_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        historical_practice_request,
+        .{ .purpose = "promotion" },
+    );
+    defer allocator.free(historical_promotion_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "historical-promotion-uncontrolled",
+        historical_promotion_request,
+        historical_uncontrolled.bytes,
+        error.HistoricalGovernanceNotAuthoritative,
+    );
+
+    const sealed_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .assurance_level = "sealed" },
+    );
+    defer allocator.free(sealed_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "sealed-broker-unavailable",
+        sealed_request,
+        fixture.receipt_bytes,
+        error.SealedBrokerUnavailable,
+    );
+}
+
+test "hylo v2 campaign requires source route policy without append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(
+        allocator,
+        "memory:v2-route-admission-required",
+    );
+    defer backend.deinit();
+    const store = backend.eventStore();
+
+    const v1_campaign = try testOneScenarioProfileCampaignJsonAlloc(
+        allocator,
+        "[\"absolute_qualification\"]",
+    );
+    defer allocator.free(v1_campaign);
+    const v2_without_route_policy = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        v1_campaign,
+        "\"protocol_profiles\":[\"hylo-trial/v1\"]",
+        "\"protocol_profiles\":[\"hylo-trial/v1\",\"hylo-trial/v2\"]",
+    );
+    defer allocator.free(v2_without_route_policy);
+    if (std.mem.eql(u8, v1_campaign, v2_without_route_policy)) {
+        return error.TestFixtureNeedleMissing;
+    }
+    const invalid_campaign_intent = try testCampaignIntentFromJsonAlloc(
+        allocator,
+        v2_without_route_policy,
+    );
+    defer allocator.free(invalid_campaign_intent);
+    var before_campaign = try store.snapshot(allocator, MaxStoreBytes);
+    defer before_campaign.deinit(allocator);
+    try std.testing.expectError(
+        error.SourceRouteAdmissionPolicyRequired,
+        appendIntentToStore(allocator, repo, store, invalid_campaign_intent),
+    );
+    var after_campaign = try store.snapshot(allocator, MaxStoreBytes);
+    defer after_campaign.deinit(allocator);
+    try testExpectSnapshotsEquivalent(before_campaign, after_campaign);
+}
+
+test "hylo v2 registration requires signed source route admission without append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(
+        allocator,
+        "memory:v2-source-route-admission-required",
+    );
+    defer backend.deinit();
+    const store = backend.eventStore();
+    var fixture = try testPrepareCompilerFailFixture(allocator, repo, store);
+    defer fixture.deinit(allocator);
+    const request_path = try std.fs.path.join(allocator, &.{ repo, "v2-route-request.json" });
+    defer allocator.free(request_path);
+    const receipt_path = try std.fs.path.join(allocator, &.{ repo, "v2-route-receipt.json" });
+    defer allocator.free(receipt_path);
+    const output_path = try std.fs.path.join(allocator, &.{ repo, "v2-route-valid-trial.json" });
+    defer allocator.free(output_path);
+    try durable_store.writeTextAtomic(allocator, request_path, fixture.request_bytes);
+    try durable_store.writeTextAtomic(allocator, receipt_path, fixture.receipt_bytes);
+
+    var custody_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&custody_pipe) != 0) return error.TestFdSetupFailed;
+    var custody_read_open = true;
+    defer {
+        if (custody_read_open) _ = std.c.close(custody_pipe[0]);
+    }
+    var custody_write_open = true;
+    defer {
+        if (custody_write_open) _ = std.c.close(custody_pipe[1]);
+    }
+    try compileTrial(
+        allocator,
+        repo,
+        store,
+        request_path,
+        receipt_path,
+        output_path,
+        custody_pipe[1],
+        false,
+    );
+    _ = std.c.close(custody_pipe[1]);
+    custody_write_open = false;
+    const valid_custody_bytes = try readRevealMaterialFdAlloc(allocator, custody_pipe[0]);
+    defer {
+        std.crypto.secureZero(u8, valid_custody_bytes);
+        allocator.free(valid_custody_bytes);
+    }
+    _ = std.c.close(custody_pipe[0]);
+    custody_read_open = false;
+    const valid_public_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        output_path,
+        hctp.MaxTrialArtifactBytes,
+    );
+    defer allocator.free(valid_public_bytes);
+    var valid_public = try parseValue(allocator, valid_public_bytes);
+    defer valid_public.deinit();
+    var valid_custody = try parseValue(allocator, valid_custody_bytes);
+    defer valid_custody.deinit();
+    const semantic_bytes = try semanticTrialFromCustodyAlloc(
+        allocator,
+        valid_public.value,
+        valid_custody.value,
+    );
+    defer {
+        std.crypto.secureZero(u8, semantic_bytes);
+        allocator.free(semantic_bytes);
+    }
+    var route_less_receipt = try testSourceSelectionReceiptWithoutRouteAlloc(
+        allocator,
+        fixture.receipt_bytes,
+    );
+    defer route_less_receipt.deinit(allocator);
+    var route_less_receipt_value = try parseValue(allocator, route_less_receipt.bytes);
+    defer route_less_receipt_value.deinit();
+    var semantic = try parseValue(allocator, semantic_bytes);
+    defer semantic.deinit();
+    const semantic_root = try jsonObjectPtr(&semantic.value);
+    const semantic_sealing = try jsonObjectPtr(
+        semantic_root.getPtr("sealing") orelse return error.RequiredFieldMissing,
+    );
+    (semantic_sealing.getPtr("source_selection_receipt") orelse
+        return error.RequiredFieldMissing).* = route_less_receipt_value.value;
+    (semantic_sealing.getPtr("source_selection_receipt_fingerprint") orelse
+        return error.RequiredFieldMissing).* = .{ .string = route_less_receipt.fingerprint };
+    const route_less_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{route_less_receipt.fingerprint},
+    );
+    defer allocator.free(route_less_ref);
+    (semantic_sealing.getPtr("source_selection_receipt_ref") orelse
+        return error.RequiredFieldMissing).* = .{ .string = route_less_ref };
+    const route_less_cases = try jsonRequiredArray(
+        try jsonObject(route_less_receipt_value.value),
+        "cases",
+    );
+    const semantic_units = try jsonRequiredArray(semantic_root.*, "units");
+    for (semantic_units.items) |*unit_value| {
+        const unit = try jsonObjectPtr(unit_value);
+        const unit_id = try jsonRequiredString(unit.*, "unit_id");
+        var matched_profile: ?std.json.Value = null;
+        for (route_less_cases.items) |case_value| {
+            const source_case = try jsonObject(case_value);
+            if (!std.mem.eql(u8, try jsonRequiredString(source_case, "unit_id"), unit_id)) continue;
+            if (matched_profile != null) return error.SourceCaseDuplicate;
+            matched_profile = try jsonRequired(source_case, "source_profile");
+        }
+        (unit.getPtr("source_profile") orelse return error.RequiredFieldMissing).* =
+            matched_profile orelse return error.SourceCaseMissing;
+    }
+    const route_less_semantic_bytes = try canonicalJsonAlloc(allocator, semantic.value);
+    defer {
+        std.crypto.secureZero(u8, route_less_semantic_bytes);
+        allocator.free(route_less_semantic_bytes);
+    }
+    var semantic_validation = try hctp.validateTrialAlloc(allocator, route_less_semantic_bytes);
+    defer semantic_validation.deinit(allocator);
+
+    const mapping_bytes = try retrace_core.hctp_trial_custody.mappingAlloc(
+        allocator,
+        try jsonObject(valid_public.value),
+        try jsonObject(valid_custody.value),
+    );
+    defer allocator.free(mapping_bytes);
+    const arm_map_nonce = try jsonRequiredString(
+        try jsonRequiredObject(try jsonObject(valid_custody.value), "opening"),
+        "arm_map_nonce",
+    );
+    const route_less_reveal_material = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mapping\":{s},\"nonce\":{f},\"schema\":\"hyl" ++
+            "o-trial-reveal-material/v1\",\"trial_fingerprint" ++ "\":{f}}}",
+        .{
+            mapping_bytes,
+            std.json.fmt(arm_map_nonce, .{}),
+            std.json.fmt(semantic_validation.fingerprint, .{}),
+        },
+    );
+    defer {
+        std.crypto.secureZero(u8, route_less_reveal_material);
+        allocator.free(route_less_reveal_material);
+    }
+    const salt = [_]u8{0x55} ** 32;
+    const route_less_private = try buildPrivateTrialV2Alloc(
+        allocator,
+        repo,
+        route_less_semantic_bytes,
+        route_less_reveal_material,
+        &salt,
+    );
+    defer allocator.free(route_less_private.trial);
+    defer {
+        std.crypto.secureZero(u8, route_less_private.custody);
+        allocator.free(route_less_private.custody);
+    }
+    var route_less_public_validation = try hctp.validateTrialAlloc(
+        allocator,
+        route_less_private.trial,
+    );
+    defer route_less_public_validation.deinit(allocator);
+    var route_less_public = try parseValue(allocator, route_less_private.trial);
+    defer route_less_public.deinit();
+    var route_less_custody = try parseValue(allocator, route_less_private.custody);
+    defer route_less_custody.deinit();
+    try retrace_core.hctp_trial_custody.validateCustody(
+        allocator,
+        route_less_public.value,
+        route_less_custody.value,
+    );
+    try testExpectPrivateRegistrationFailureNoAppend(
+        allocator,
+        repo,
+        store,
+        route_less_private.trial,
+        route_less_private.custody,
+        error.SourceRouteAdmissionMissing,
+    );
+}
+
+test "hylo trial registration rejects an unavailable historical route without append" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var backend = MES.init(
+        allocator,
+        "memory:registration-historical-unavailable",
+    );
+    defer backend.deinit();
+    const store = backend.eventStore();
+    try testSeedOneScenarioRouteCampaign(
+        allocator,
+        repo,
+        store,
+        "[\"absolute_qualification\"]",
+        null,
+    );
+    var direct = try testDirectSourceSelectionReceiptAlloc(
+        allocator,
+        "cmp-test",
+        "unit-null-001",
+        "scenario-holdout",
+        "cluster-null-001",
+        TestScenarioJson,
+        "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+        "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        TestDirectCrfEpisodeFingerprint,
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+    defer direct.deinit(allocator);
+    var unavailable = try testMutateCompilerReceiptRouteAlloc(
+        allocator,
+        direct.bytes,
+        .historical_unavailable,
+    );
+    defer unavailable.deinit(allocator);
+    const route_bound_trial = try testBindDirectSourceRouteAlloc(
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        &unavailable,
+        "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+        "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    );
+    defer allocator.free(route_bound_trial);
+    try testExpectRegistrationFailureNoAppend(
+        allocator,
+        repo,
+        store,
+        route_bound_trial,
+        error.DiagnosticSourceNotComparisonEligible,
+    );
+}
+
+test "hylo trial compiler rejects unsealed scenario manifests before entropy and effects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    var fixture_backend = MES.init(allocator, "memory:compiler-manifest-fixture");
+    defer fixture_backend.deinit();
+    var fixture = try testPrepareCompilerFailFixture(allocator, repo, fixture_backend.eventStore());
+    defer fixture.deinit(allocator);
+
+    var backend = MES.init(allocator, "memory:compiler-manifest-unsealed");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    const base_campaign_json = try testTwoScenarioProfileCampaignJsonAlloc(
+        allocator,
+        "[\"absolute_qualification\"]",
+    );
+    defer allocator.free(base_campaign_json);
+    var campaign_value = try parseValue(allocator, base_campaign_json);
+    defer campaign_value.deinit();
+    const campaign_root = try jsonObjectPtr(&campaign_value.value);
+    const protocol_profiles = campaign_root.getPtr("protocol_profiles") orelse
+        return error.RequiredFieldMissing;
+    if (protocol_profiles.* != .array) return error.ArrayRequired;
+    try protocol_profiles.array.append(
+        .{ .string = @constCast(retrace_core.hctp_trial_custody.PublicTrialSchema) },
+    );
+    const trial_policy = try jsonObjectPtr(campaign_root.getPtr("trial_policy") orelse
+        return error.RequiredFieldMissing);
+    try trial_policy.put(
+        allocator,
+        "source_route_admission",
+        .{ .string = @constCast("required") },
+    );
+    const campaign_json = try canonicalJsonAlloc(allocator, campaign_value.value);
+    defer allocator.free(campaign_json);
+    const campaign_intent = try testCampaignIntentFromJsonAlloc(allocator, campaign_json);
+    defer allocator.free(campaign_intent);
+    var campaign_result = try appendIntentToStore(allocator, repo, store, campaign_intent);
+    campaign_result.deinit(allocator);
+
+    var created = try loadLedgerFromStore(allocator, store);
+    defer created.deinit(allocator);
+    const created_index = findCampaign(created.campaigns.items, "cmp-test") orelse
+        return error.CampaignMissing;
+    const no_scenario_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .expected_campaign_head = created.campaigns.items[created_index].last_digest },
+    );
+    defer allocator.free(no_scenario_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "manifest-none-admitted",
+        no_scenario_request,
+        fixture.receipt_bytes,
+        error.ScenarioManifestNotSealed,
+    );
+
+    const intent = try testScenarioIntentAlloc(allocator, TestScenarioJson, "scenario-holdout");
+    defer allocator.free(intent);
+    var scenario_result = try appendIntentToStore(allocator, repo, store, intent);
+    scenario_result.deinit(allocator);
+    var partial = try loadLedgerFromStore(allocator, store);
+    defer partial.deinit(allocator);
+    const partial_index = findCampaign(partial.campaigns.items, "cmp-test") orelse
+        return error.CampaignMissing;
+    const partial_request = try testMutateCompilerRequestAlloc(
+        allocator,
+        fixture.request_bytes,
+        .{ .expected_campaign_head = partial.campaigns.items[partial_index].last_digest },
+    );
+    defer allocator.free(partial_request);
+    try testExpectCompilerFailureNoEffects(
+        allocator,
+        repo,
+        store,
+        "manifest-partial",
+        partial_request,
+        fixture.receipt_bytes,
+        error.ScenarioManifestNotSealed,
+    );
+}
+
+test "hylo trial registration admission ordering is atomic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo);
+    try runTestGit(allocator, repo, &.{ "init", "--quiet" });
+    try runTestGit(allocator, repo, &.{ "config", "user.name", "Hylo Registration Ordering" });
+    try runTestGit(allocator, repo, &.{ "config", "user.email", "hylo-ordering@example.invalid" });
+    const target_path = try std.fs.path.join(allocator, &.{ repo, "target.txt" });
+    defer allocator.free(target_path);
+    try durable_store.writeTextAtomic(allocator, target_path, "baseline\n");
+    try runTestGit(allocator, repo, &.{ "add", "target.txt" });
+    try runTestGit(allocator, repo, &.{ "commit", "--quiet", "-m", "baseline" });
+
+    var manifest_backend = MES.init(allocator, "memory:registration-manifest-order");
+    defer manifest_backend.deinit();
+    const manifest_store = manifest_backend.eventStore();
+    const campaign_json = try testProfileCampaignJsonAlloc(
+        allocator,
+        "[\"absolute_qualification\",\"noninferiority\"]",
+    );
+    defer allocator.free(campaign_json);
+    const campaign_intent = try testCampaignIntentFromJsonAlloc(allocator, campaign_json);
+    defer allocator.free(campaign_intent);
+    var campaign_result = try appendIntentToStore(allocator, repo, manifest_store, campaign_intent);
+    campaign_result.deinit(allocator);
+    try testExpectRegistrationFailureNoAppend(
+        allocator,
+        repo,
+        manifest_store,
+        hctp_fixtures.valid_null_trial,
+        error.ScenarioManifestNotSealed,
+    );
+    const intent = try testScenarioIntentAlloc(allocator, TestScenarioJson, "scenario-holdout");
+    defer allocator.free(intent);
+    var practice_result = try appendIntentToStore(allocator, repo, manifest_store, intent);
+    practice_result.deinit(allocator);
+    try testExpectRegistrationFailureNoAppend(
+        allocator,
+        repo,
+        manifest_store,
+        hctp_fixtures.valid_null_trial,
+        error.ScenarioManifestNotSealed,
+    );
+    inline for (.{
+        .{ TestHoldoutScenarioJson, "scenario-holdout-2" },
+        .{ TestChallengeScenarioJson, "scenario-challenge" },
+    }) |entry| {
+        const scenario_intent = try testScenarioIntentAlloc(allocator, entry[0], entry[1]);
+        defer allocator.free(scenario_intent);
+        var result = try appendIntentToStore(allocator, repo, manifest_store, scenario_intent);
+        result.deinit(allocator);
+    }
+    var before_complete_registration = try manifest_store.snapshot(allocator, MaxStoreBytes);
+    defer before_complete_registration.deinit(allocator);
+    var complete_registration = try testRegisterTrialBytes(
+        allocator,
+        repo,
+        manifest_store,
+        hctp_fixtures.valid_null_trial,
+    );
+    complete_registration.deinit(allocator);
+    var after_complete_registration = try manifest_store.snapshot(allocator, MaxStoreBytes);
+    defer after_complete_registration.deinit(allocator);
+    try std.testing.expectEqual(
+        before_complete_registration.records.len + 1,
+        after_complete_registration.records.len,
+    );
+
+    const baseline_raw = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(baseline_raw);
+    const baseline_revision = std.mem.trim(u8, baseline_raw, " \t\r\n");
+    const roots = [_][]const u8{ "target.txt", "target-scope" };
+    var baseline_snapshot = try targetSnapshotArtifactAlloc(
+        allocator,
+        repo,
+        baseline_revision,
+        &roots,
+    );
+    defer baseline_snapshot.deinit(allocator);
+    var baseline_bundle = try retrace_core.target_bundle.buildSkillBundleAlloc(
+        allocator,
+        "target-skill",
+        "baseline\n",
+        "registration-baseline/SKILL.md",
+    );
+    defer baseline_bundle.deinit(allocator);
+    var target_backend = MES.init(allocator, "memory:registration-target-order");
+    defer target_backend.deinit();
+    const target_store = target_backend.eventStore();
+    const target_base_campaign = try testOneScenarioProfileCampaignJsonAlloc(
+        allocator,
+        "[\"absolute_qualification\"]",
+    );
+    defer allocator.free(target_base_campaign);
+    const strict_campaign = try testCampaignWithStrictTargetIdentityAlloc(
+        allocator,
+        target_base_campaign,
+        baseline_bundle.bundle_fingerprint,
+    );
+    defer allocator.free(strict_campaign);
+    const strict_campaign_intent = try testCampaignIntentFromJsonAlloc(allocator, strict_campaign);
+    defer allocator.free(strict_campaign_intent);
+    var strict_campaign_result = try appendIntentToStore(
+        allocator,
+        repo,
+        target_store,
+        strict_campaign_intent,
+    );
+    strict_campaign_result.deinit(allocator);
+    const strict_scenario_intent = try testScenarioIntentAlloc(
+        allocator,
+        TestScenarioJson,
+        "scenario-holdout",
+    );
+    defer allocator.free(strict_scenario_intent);
+    var strict_scenario_result = try appendIntentToStore(
+        allocator,
+        repo,
+        target_store,
+        strict_scenario_intent,
+    );
+    strict_scenario_result.deinit(allocator);
+    try testExpectRegistrationFailureNoAppend(
+        allocator,
+        repo,
+        target_store,
+        hctp_fixtures.valid_null_trial,
+        error.BaselineTargetBundleMissing,
+    );
+    try testAppendTargetBundleAdmission(
+        allocator,
+        repo,
+        target_store,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        &baseline_bundle,
+        baseline_revision,
+        &baseline_snapshot,
+        "target.txt",
+    );
+    var before_target_complete = try target_store.snapshot(allocator, MaxStoreBytes);
+    defer before_target_complete.deinit(allocator);
+    var target_complete = try testRegisterTrialBytes(
+        allocator,
+        repo,
+        target_store,
+        hctp_fixtures.valid_null_trial,
+    );
+    target_complete.deinit(allocator);
+    var after_target_complete = try target_store.snapshot(allocator, MaxStoreBytes);
+    defer after_target_complete.deinit(allocator);
+    try std.testing.expectEqual(
+        before_target_complete.records.len + 1,
+        after_target_complete.records.len,
+    );
 }

@@ -1,0 +1,476 @@
+{
+  "schema": "hylo-operator-surface-manifest/v1",
+  "commands": [
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "ledger validate",
+      "documented_command": "ledger validate"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-replay-episode",
+      "documented_command": "ledger validate hylo-replay-episode"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-runner-input",
+      "documented_command": "ledger validate hylo-runner-input"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-stimulus",
+      "documented_command": "ledger validate hylo-stimulus"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-target-bundle",
+      "documented_command": "ledger validate hylo-target-bundle"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-world-snapshot",
+      "documented_command": "ledger validate hylo-world-snapshot"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-world-availability-receipt",
+      "documented_command": "ledger validate hylo-world-availability-receipt"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-runtime-contract",
+      "documented_command": "ledger validate hylo-runtime-contract"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-counterfactual-cut-receipt",
+      "documented_command": "ledger validate hylo-counterfactual-cut-receipt"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-redaction-receipt",
+      "documented_command": "ledger validate hylo-redaction-receipt"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-custody-manifest",
+      "documented_command": "ledger validate hylo-custody-manifest"
+    },
+    {
+      "component": "ledger-validator",
+      "modes": ["validate"],
+      "help_argv": ["validate", "--help"],
+      "help_token": "hylo-trial",
+      "documented_command": "ledger validate hylo-trial"
+    },
+    {
+      "component": "seq",
+      "modes": [
+        "extract",
+        "source-selection",
+        "historical-trial",
+        "case-blind-trial"
+      ],
+      "help_argv": ["--help"],
+      "help_token": "capabilities",
+      "documented_command": "seq capabilities"
+    },
+    {
+      "component": "seq",
+      "modes": ["extract"],
+      "help_argv": ["--help"],
+      "help_token": "hylo-extract",
+      "documented_command": "seq hylo-extract"
+    },
+    {
+      "component": "seq",
+      "modes": ["source-selection", "case-blind-trial"],
+      "help_argv": ["--help"],
+      "help_token": "hctp-source",
+      "documented_command": "seq hctp-source"
+    },
+    {
+      "component": "seq",
+      "modes": ["source-selection"],
+      "help_argv": ["hctp-source", "--help"],
+      "help_token": "hctp-source compile",
+      "documented_command": "seq hctp-source compile"
+    },
+    {
+      "component": "seq",
+      "modes": ["source-selection"],
+      "help_argv": ["hctp-source", "--help"],
+      "help_token": "hctp-source validate",
+      "documented_command": "seq hctp-source validate"
+    },
+    {
+      "component": "seq",
+      "modes": ["case-blind-trial"],
+      "help_argv": ["hctp-source", "--help"],
+      "help_token": "hctp-source materialize",
+      "documented_command": "seq hctp-source materialize"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial", "proof-export"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "capabilities",
+      "documented_command": "ledger --source hylo capabilities"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "validate-campaign",
+      "documented_command": "ledger --source hylo validate-campaign"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "append",
+      "documented_command": "ledger --source hylo append"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "doctor",
+      "documented_command": "ledger --source hylo doctor"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "validate-trial",
+      "documented_command": "ledger --source hylo validate-trial"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "compile-trial",
+      "documented_command": "ledger --source hylo compile-trial"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "register-trial",
+      "documented_command": "ledger --source hylo register-trial"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "start-lane",
+      "documented_command": "ledger --source hylo start-lane"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "commit-lane-start",
+      "documented_command": "ledger --source hylo commit-lane-start"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "recover-lane-start",
+      "documented_command": "ledger --source hylo recover-lane-start"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "lane-materialization",
+      "documented_command": "ledger --source hylo lane-materialization"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "finish-lane",
+      "documented_command": "ledger --source hylo finish-lane"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "recover-lane-finish",
+      "documented_command": "ledger --source hylo recover-lane-finish"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "grade-lane",
+      "documented_command": "ledger --source hylo grade-lane"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "grade-pair",
+      "documented_command": "ledger --source hylo grade-pair"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "reveal-trial",
+      "documented_command": "ledger --source hylo reveal-trial"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "trial-result",
+      "documented_command": "ledger --source hylo trial-result"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "close-trial",
+      "documented_command": "ledger --source hylo close-trial"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "inspect",
+      "documented_command": "ledger --source hylo inspect"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "path",
+      "documented_command": "ledger --source hylo path"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "snapshot-target",
+      "documented_command": "ledger --source hylo snapshot-target"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "progress",
+      "documented_command": "ledger --source hylo progress"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "frontier",
+      "documented_command": "ledger --source hylo frontier"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "next-experiment",
+      "documented_command": "ledger --source hylo next-experiment"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["proof-export"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "proof-artifact-set",
+      "documented_command": "ledger --source hylo proof-artifact-set"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["proof-export"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "export-proof",
+      "documented_command": "ledger --source hylo export-proof"
+    },
+    {
+      "component": "ledger-hylo",
+      "modes": ["proof-export"],
+      "help_argv": ["--source", "hylo", "--help"],
+      "help_token": "verify-proof",
+      "documented_command": "ledger --source hylo verify-proof"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--help"],
+      "help_token": "capabilities",
+      "documented_command": "cas capabilities"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["--help"],
+      "help_token": "trial",
+      "documented_command": "cas trial"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["trial", "--help"],
+      "help_token": "preflight",
+      "documented_command": "cas trial preflight"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["trial", "--help"],
+      "help_token": "run",
+      "documented_command": "cas trial run"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["trial", "--help"],
+      "help_token": "status",
+      "documented_command": "cas trial status"
+    },
+    {
+      "component": "cas",
+      "modes": ["open-direct-trial"],
+      "help_argv": ["trial", "--help"],
+      "help_token": "cleanup",
+      "documented_command": "cas trial cleanup"
+    }
+  ],
+  "required_capabilities": [
+    {
+      "component": "seq",
+      "mode": "extract",
+      "keys": ["hylo_extract_v1"]
+    },
+    {
+      "component": "seq",
+      "mode": "source-selection",
+      "keys": [
+        "hctp_source_selection_v1",
+        "hctp_source_route_admission_v1",
+        "hctp_independence_clusters_v1"
+      ]
+    },
+    {
+      "component": "seq",
+      "mode": "case-blind-trial",
+      "keys": [
+        "hctp_sealed_case_v1",
+        "hctp_materializer_v1",
+        "hctp_source_materialization_v1",
+        "hctp_source_selection_opening_fd_v1"
+      ]
+    },
+    {
+      "component": "seq",
+      "mode": "historical-trial",
+      "keys": [
+        "hctp_historical_profile_v1"
+      ]
+    },
+    {
+      "component": "seq",
+      "mode": "historical-case-blind-trial",
+      "keys": [
+        "hctp_case_blind_source_profile_fd_v1"
+      ]
+    },
+    {
+      "component": "ledger-hylo",
+      "mode": "open-direct-trial",
+      "keys": [
+        "hylo_trial_v2",
+        "hylo_lane_leases_v1",
+        "hylo_lane_materialization_v1",
+        "hylo_signed_attestations_v1",
+        "hylo_trial_compiler_v1",
+        "hylo_reveal_material_fd_v1",
+        "hylo_private_trial_custody_v1",
+        "hylo_trial_custody_fd_v1",
+        "hylo_private_lane_start_custody_fd_v1",
+        "hylo_trial_build_receipt_v2",
+        "hylo_lane_materialization_receipt_v2",
+        "hylo_run_receipt_v2",
+        "hylo_trial_reveal_v2"
+      ]
+    },
+    {
+      "component": "ledger-hylo",
+      "mode": "ledger-v2-proof-prerequisites",
+      "keys": [
+        "hylo_trial_v2",
+        "hylo_lane_leases_v1",
+        "hylo_lane_materialization_v1",
+        "hylo_signed_attestations_v1",
+        "hylo_trial_compiler_v1",
+        "hylo_reveal_material_fd_v1",
+        "hylo_private_trial_custody_v1",
+        "hylo_trial_custody_fd_v1",
+        "hylo_private_lane_start_custody_fd_v1",
+        "hylo_trial_build_receipt_v2",
+        "hylo_lane_materialization_receipt_v2",
+        "hylo_run_receipt_v2",
+        "hylo_trial_reveal_v2"
+      ]
+    },
+    {
+      "component": "ledger-hylo",
+      "mode": "proof-export",
+      "keys": [
+        "hylo_proof_bundle_v1",
+        "hylo_external_proof_anchor_v1"
+      ]
+    },
+    {
+      "component": "cas",
+      "mode": "open-direct-trial",
+      "keys": [
+        "hylo_trial_runner_v2",
+        "hylo_fd_lane_lease_v1",
+        "hylo_signed_run_receipt_v2",
+        "hylo_private_lane_materialization_fd_v1",
+        "hylo_private_receipt_redaction_v1",
+        "hylo_target_common_projection_opening_v1",
+        "hylo_trial_route_projection_v1"
+      ]
+    },
+    {
+      "component": "cas",
+      "mode": "historical-trial",
+      "keys": [
+        "hylo_internal_historical_replay_v1",
+        "dcp_v2",
+        "rip_v1",
+        "fir_v1"
+      ]
+    }
+  ]
+}

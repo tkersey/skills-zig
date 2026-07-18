@@ -383,7 +383,33 @@ fn absoluteReceiptAlloc(
     const score = semantic_observation.scores[0];
     const unsigned = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"hylo-grade-receipt/v1\",\"trial_id\":{f},\"lane_id\":{f},\"opaque_arm_id\":{f},\"run_receipt_fingerprint\":{f},\"grade_presentation_receipt_fingerprint\":{f},\"identifier_alias_map_fingerprint\":{f},\"semantic_observation_fingerprint\":{f},\"producer\":{{\"id\":\"deterministic-grader\",\"version\":\"v1\",\"binary_fingerprint\":{f},\"key_id\":\"absolute-grader-key\"}},\"blinding\":{{\"semantic_arm_identity_visible\":false,\"target_diff_visible\":false,\"sibling_output_visible\":false,\"prior_trial_results_visible\":false,\"hidden_reference_visible\":false,\"registered_identifiers_visible\":false}},\"status\":{f},\"rubric_fingerprint\":{f},\"judge\":{{\"kind\":\"deterministic\",\"id\":\"sealed-output-grader\",\"version\":\"v1\",\"config_fingerprint\":\"sha256:6666666666666666666666666666666666666666666666666666666666666666\"}},\"dimensions\":[{{\"id\":\"correctness\",\"score\":{d},\"weight\":1.0,\"grader_kind\":\"deterministic\",\"grader_ref\":\"hctp:sealed-output\",\"grader_fingerprint\":{f},\"evidence_refs\":[{f}]}}],\"oracle_results\":[{{\"id\":\"required-test\",\"status\":\"pass\",\"grader_kind\":\"deterministic\",\"grader_ref\":\"hctp:sealed-output-oracle\",\"grader_fingerprint\":{f},\"evidence_refs\":[{f}]}}],\"derived_critical_violations\":[],\"evidence_refs\":[{f}],\"attestation\":null}}",
+        "{{\"schema\":\"hylo-grade-receipt/v1\",\"trial_id\":{f}," ++
+            "\"lane_id\":{f},\"opaque_arm_id\":{f},\"run_receipt_fingerprint\":{f}," ++
+            "\"grade_presentation_receipt_fingerprint\":{f}," ++
+            "\"identifier_alias_map_fingerprint\":{f}," ++
+            "\"semantic_observation_fingerprint\":{f},\"producer\":{{" ++
+            "\"id\":\"deterministic-grader\",\"version\":\"v1\"," ++
+            "\"binary_fingerprint\":{f},\"key_id\":\"absolute-grader-key\"}}," ++
+            "\"blinding\":{{\"semantic_arm_identity_visible\":false," ++
+            "\"target_diff_visible\":false,\"sibling_output_visible\":false," ++
+            "\"prior_trial_results_visible\":false," ++
+            "\"hidden_reference_visible\":false," ++
+            "\"registered_identifiers_visible\":false}},\"status\":{f}," ++
+            "\"rubric_fingerprint\":{f},\"judge\":{{\"kind\":\"deterministic\"," ++
+            "\"id\":\"sealed-output-grader\",\"version\":\"v1\"," ++
+            "\"config_fingerprint\":" ++
+            "\"sha256:6666666666666666666666666666666666666666666666666666666666666666\"}}," ++
+            "\"dimensions\":[{{\"id\":\"correctness\",\"score\":{d}," ++
+            "\"weight\":1.0,\"grader_kind\":\"deterministic\"," ++
+            "\"grader_ref\":\"hctp:sealed-output\",\"grader_fingerprint\":{f}," ++
+            "\"evidence_refs\":[\"artifact:{s}\"]}}],\"oracle_results\":[{{" ++
+            "\"id\":\"required-test\",\"status\":\"pass\"," ++
+            "\"grader_kind\":\"deterministic\"," ++
+            "\"grader_ref\":\"hctp:sealed-output-oracle\"," ++
+            "\"grader_fingerprint\":{f}," ++
+            "\"evidence_refs\":[\"artifact:{s}\"]}}]," ++
+            "\"derived_critical_violations\":[]," ++
+            "\"evidence_refs\":[\"artifact:{s}\"],\"attestation\":null}}",
         .{
             std.json.fmt(try requiredString(presentation, "trial_id"), .{}),
             std.json.fmt(try requiredString(presentation, "lane_id"), .{}),
@@ -397,10 +423,10 @@ fn absoluteReceiptAlloc(
             std.json.fmt(try requiredString(presentation, "rubric_fingerprint"), .{}),
             score,
             std.json.fmt(binary_fingerprint, .{}),
-            std.json.fmt(output_fingerprint, .{}),
+            output_fingerprint,
             std.json.fmt(binary_fingerprint, .{}),
-            std.json.fmt(output_fingerprint, .{}),
-            std.json.fmt(output_fingerprint, .{}),
+            output_fingerprint,
+            output_fingerprint,
         },
     );
     defer allocator.free(unsigned);
@@ -446,7 +472,31 @@ fn pairReceiptAlloc(
     );
     const unsigned = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"hylo-pair-grade-receipt/v1\",\"trial_id\":{f},\"pair_id\":{f},\"lane_ids\":[{f},{f}],\"grade_presentation_receipt_fingerprint\":{f},\"identifier_alias_map_fingerprint\":{f},\"semantic_observation_fingerprint\":{f},\"judge_contract_fingerprint\":\"sha256:9b296a9dec19da50db8597c607eef413f7d43fd173b9a8fd6d94075af9890432\",\"presentation\":{{\"left_lane_id\":{f},\"right_lane_id\":{f},\"left_output_fingerprint\":{f},\"right_output_fingerprint\":{f},\"position_map_commitment\":{f},\"sibling_outputs_only\":true}},\"producer\":{{\"id\":\"blind-pair-grader\",\"version\":\"v1\",\"binary_fingerprint\":{f},\"key_id\":\"pair-grader-key\"}},\"blinding\":{{\"semantic_arm_identity_visible\":false,\"opaque_arm_id_visible\":false,\"target_diff_visible\":false,\"lane_execution_order_visible\":false,\"absolute_grade_results_visible\":false,\"prior_pair_results_visible\":false,\"registered_identifiers_visible\":false}},\"verdict\":{{\"preferred\":{f},\"confidence\":1.0}},\"dimensions\":[{{\"id\":\"correctness\",\"preferred\":{f},\"rationale_ref\":\"hctp:sealed-output-pair\",\"evidence_refs\":[{f},{f}]}}],\"prohibited_critical_authority\":true,\"evidence_refs\":[{f},{f}],\"attestation\":null}}",
+        "{{\"schema\":\"hylo-pair-grade-receipt/v1\",\"trial_id\":{f}," ++
+            "\"pair_id\":{f},\"lane_ids\":[{f},{f}]," ++
+            "\"grade_presentation_receipt_fingerprint\":{f}," ++
+            "\"identifier_alias_map_fingerprint\":{f}," ++
+            "\"semantic_observation_fingerprint\":{f}," ++
+            "\"judge_contract_fingerprint\":" ++
+            "\"sha256:9b296a9dec19da50db8597c607eef413f7d43fd173b9a8fd6d94075af9890432\"," ++
+            "\"presentation\":{{\"left_lane_id\":{f},\"right_lane_id\":{f}," ++
+            "\"left_output_fingerprint\":{f},\"right_output_fingerprint\":{f}," ++
+            "\"position_map_commitment\":{f},\"sibling_outputs_only\":true}}," ++
+            "\"producer\":{{\"id\":\"blind-pair-grader\",\"version\":\"v1\"," ++
+            "\"binary_fingerprint\":{f},\"key_id\":\"pair-grader-key\"}}," ++
+            "\"blinding\":{{\"semantic_arm_identity_visible\":false," ++
+            "\"opaque_arm_id_visible\":false,\"target_diff_visible\":false," ++
+            "\"lane_execution_order_visible\":false," ++
+            "\"absolute_grade_results_visible\":false," ++
+            "\"prior_pair_results_visible\":false," ++
+            "\"registered_identifiers_visible\":false}}," ++
+            "\"verdict\":{{\"preferred\":{f},\"confidence\":1.0}}," ++
+            "\"dimensions\":[{{\"id\":\"correctness\",\"preferred\":{f}," ++
+            "\"rationale_ref\":\"artifact:{s}\"," ++
+            "\"evidence_refs\":[\"artifact:{s}\",\"artifact:{s}\"]}}]," ++
+            "\"prohibited_critical_authority\":true," ++
+            "\"evidence_refs\":[\"artifact:{s}\",\"artifact:{s}\"]," ++
+            "\"attestation\":null}}",
         .{
             std.json.fmt(try requiredString(presentation, "trial_id"), .{}),
             std.json.fmt(try requiredString(presentation, "pair_id"), .{}),
@@ -463,10 +513,11 @@ fn pairReceiptAlloc(
             std.json.fmt(binary_fingerprint, .{}),
             std.json.fmt(preferred, .{}),
             std.json.fmt(preferred, .{}),
-            std.json.fmt(left_output, .{}),
-            std.json.fmt(right_output, .{}),
-            std.json.fmt(left_output, .{}),
-            std.json.fmt(right_output, .{}),
+            semantic_observation.fingerprint,
+            left_output,
+            right_output,
+            left_output,
+            right_output,
         },
     );
     defer allocator.free(unsigned);

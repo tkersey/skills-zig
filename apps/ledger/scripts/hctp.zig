@@ -10,6 +10,9 @@ const ValidPairGradeReceiptFixture = fixtures.valid_pair_grade_receipt;
 const ValidRevealFixture = fixtures.valid_reveal;
 
 pub const TrialSchema = "hylo-trial/v1";
+pub const PrivateTrialSchema = retrace_core.hctp_trial_custody.PublicTrialSchema;
+pub const FirPublicProjectionSchema = "hylo-fir-public-projection/v1";
+pub const FirPublicProjectionKind = "FIR-v1-public-projection";
 pub const TrialFoldVersion = "hylo-trial-fold/v1";
 pub const BootstrapVersion = "hylo-bootstrap-xoshiro256pp-v1";
 pub const PairGradeVersion = "hylo-pair-grade/v1";
@@ -17,20 +20,31 @@ pub const TargetCommonProjectionVersion = "hylo-target-common-projection/v1";
 pub const GradeCommitmentDomain = "HCTP/hylo-grade-commitment/v1";
 pub const CanonicalJsonProfile = retrace_core.canonical_json.Profile;
 pub const CanonicalJsonSha256Algorithm = retrace_core.canonical_json.Sha256Algorithm;
+pub const MaxTrialArtifactBytes = 16 * 1024 * 1024;
 
 pub const FeatureFlags = [_][]const u8{
     "hylo_trial_v1",
+    "hylo_trial_v2",
     "hylo_lane_leases_v1",
     "hylo_lane_finish_recovery_v1",
     "hylo_lane_materialization_v1",
     "hylo_pair_grade_v1",
     "hylo_trial_reveal_v1",
+    "hylo_trial_reveal_v2",
     "hylo_trial_result_v1",
     "hylo_signed_attestations_v1",
     "hylo_proof_bundle_v1",
     "hylo_promotion_sentinel_binding_v1",
     "hylo_external_proof_anchor_v1",
     "hylo_grade_commit_open_v1",
+    "hylo_trial_compiler_v1",
+    "hylo_reveal_material_fd_v1",
+    "hylo_private_trial_custody_v1",
+    "hylo_trial_custody_fd_v1",
+    "hylo_private_lane_start_custody_fd_v1",
+    "hylo_trial_build_receipt_v2",
+    "hylo_lane_materialization_receipt_v2",
+    "hylo_run_receipt_v2",
 };
 
 pub fn isTrialEventKind(raw: []const u8) bool {
@@ -112,6 +126,18 @@ fn required(map: std.json.ObjectMap, key: []const u8) !std.json.Value {
 fn requireExactKeys(map: std.json.ObjectMap, expected: []const []const u8, err: anyerror) !void {
     if (map.count() != expected.len) return err;
     for (expected) |key| _ = map.get(key) orelse return err;
+}
+
+fn requireOnlyKeys(map: std.json.ObjectMap, allowed: []const []const u8, err: anyerror) !void {
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        if (!stringSliceContains(allowed, entry.key_ptr.*)) return err;
+    }
+}
+
+fn hasExactKeys(map: std.json.ObjectMap, expected: []const []const u8) bool {
+    requireExactKeys(map, expected, error.KeySetMismatch) catch return false;
+    return true;
 }
 
 fn string(value: std.json.Value) ![]const u8 {
@@ -716,6 +742,113 @@ fn validateInterventionWitness(
     }
 }
 
+fn hasExactPublicSourceProfileShape(
+    profile: std.json.ObjectMap,
+    case_visibility: []const u8,
+) bool {
+    const kind = requiredString(profile, "kind") catch return false;
+    const case_blind = std.mem.eql(u8, case_visibility, "case_blind");
+    if (std.mem.eql(u8, kind, "direct")) {
+        return if (case_blind)
+            hasExactKeys(profile, &.{ "kind", "sealed_payload", "source_profile_fingerprint" })
+        else
+            hasExactKeys(profile, &.{ "kind", "source_profile_fingerprint" });
+    }
+    if (!std.mem.eql(u8, kind, "historical_decision")) return false;
+    return if (case_blind)
+        hasExactKeys(profile, &.{
+            "kind",
+            "source_governance_fingerprint",
+            "decision_context_fingerprint",
+            "temporal_horizon",
+            "source_target_text_policy",
+            "retrace_mode",
+            "required_lineage",
+            "required_fir_version",
+            "reconstructability",
+            "limitations",
+            "source_profile_fingerprint",
+            "profile_body_delivery",
+            "sealed_payload",
+            "source_target_text_witness_fingerprint",
+        })
+    else
+        hasExactKeys(profile, &.{
+            "kind",
+            "source_governance_fingerprint",
+            "decision_context_fingerprint",
+            "temporal_horizon",
+            "source_target_text_policy",
+            "retrace_mode",
+            "required_lineage",
+            "required_fir_version",
+            "reconstructability",
+            "limitations",
+            "source_profile_fingerprint",
+            "profile_body_delivery",
+            "source_target_text_witness_fingerprint",
+        });
+}
+
+fn validatePublicV2SourceProfile(
+    profile: std.json.ObjectMap,
+    purpose: Purpose,
+    factor_kind: FactorKind,
+    case_visibility: []const u8,
+) !void {
+    if (!hasExactPublicSourceProfileShape(profile, case_visibility)) {
+        return error.PrivateTrialSemanticLeak;
+    }
+    const kind = try requiredString(profile, "kind");
+    try validateFingerprint(try requiredString(profile, "source_profile_fingerprint"));
+    const case_blind = std.mem.eql(u8, case_visibility, "case_blind");
+    if (case_blind and !try boolean(try required(profile, "sealed_payload"))) {
+        return error.CaseBlindProjectionInvalid;
+    }
+    if (std.mem.eql(u8, kind, "direct")) return;
+    if (!std.mem.eql(u8, kind, "historical_decision")) return error.SourceProfileInvalid;
+
+    try validateFingerprint(try requiredString(profile, "source_governance_fingerprint"));
+    try validateFingerprint(try requiredString(profile, "decision_context_fingerprint"));
+    try validateFingerprint(try requiredString(profile, "source_target_text_witness_fingerprint"));
+    if (!std.mem.eql(
+        u8,
+        try requiredString(profile, "profile_body_delivery"),
+        "source_profile_fd",
+    )) {
+        return error.SourceProfileInvalid;
+    }
+    if (!std.mem.eql(u8, try requiredString(profile, "temporal_horizon"), "pre_decision")) {
+        return error.OutcomeAwareDecisionContext;
+    }
+    const source_target_text_policy = try requiredString(profile, "source_target_text_policy");
+    try requireOneOf(
+        source_target_text_policy,
+        &.{ "absent", "preserve", "strip_and_replace" },
+        error.SourceTargetTextPolicyInvalid,
+    );
+    if (factor_kind == .target_snapshot and
+        std.mem.eql(u8, source_target_text_policy, "preserve"))
+    {
+        return error.SourceTargetTextContamination;
+    }
+    try validateHistoricalReplayMode(profile, purpose);
+    try requireOneOf(
+        try requiredString(profile, "required_lineage"),
+        &.{ "thread_fork", "rollout_transcript", "either" },
+        error.RetraceLineageInvalid,
+    );
+    if (!std.mem.eql(u8, try requiredString(profile, "required_fir_version"), "FIR-v1")) {
+        return error.RetraceFirVersionInvalid;
+    }
+    try requireOneOf(
+        try requiredString(profile, "reconstructability"),
+        &.{ "exact", "head_only", "transcript_only" },
+        error.ReconstructabilityInvalid,
+    );
+    try validateStringArray(try requiredArray(profile, "limitations"), false);
+}
+
 fn validateSourceProfile(
     allocator: std.mem.Allocator,
     profile: std.json.ObjectMap,
@@ -723,6 +856,12 @@ fn validateSourceProfile(
     factor_kind: FactorKind,
     case_visibility: []const u8,
 ) !void {
+    // The exact nonsemantic projection is also an admitted v1 compatibility
+    // form. Legacy v1 profiles retain their broader embedded-body semantics;
+    // v2 invokes this validator directly and therefore rejects all extras.
+    if (hasExactPublicSourceProfileShape(profile, case_visibility)) {
+        return validatePublicV2SourceProfile(profile, purpose, factor_kind, case_visibility);
+    }
     const kind = try requiredString(profile, "kind");
     const sealed_payload = if (profile.get("sealed_payload")) |value|
         try boolean(value)
@@ -1318,6 +1457,21 @@ fn validateSourceSelectionReceipt(
             return error.SourceSelectionReceiptInvalid;
         }
         const unit_profile = try object(unit_profile_value);
+        if (case.get("source_route_admission")) |admission_value| {
+            try retrace_core.hctp_route_admission.validateValue(allocator, admission_value, .{
+                .campaign_id = campaign_id,
+                .unit_id = try requiredString(unit, "unit_id"),
+                .scenario_id = scenario_id,
+                .source_profile_fingerprint = source_profile_fingerprint,
+                .source_episode_projection_fingerprint = source_episode_fingerprint,
+            });
+            try retrace_core.hctp_route_admission.requireComparisonEligible(admission_value);
+            if (!std.mem.eql(
+                u8,
+                try requiredString(try object(admission_value), "source_profile_kind"),
+                try requiredString(unit_profile, "kind"),
+            )) return error.SourceRouteAdmissionBindingMismatch;
+        }
         if (std.mem.eql(u8, case_visibility, "case_blind")) {
             if (!try boolean(try required(unit_profile, "sealed_payload")) or
                 !std.mem.eql(
@@ -1340,8 +1494,18 @@ fn validateSourceSelectionReceipt(
             try validateFingerprint(try requiredString(sealed, "ciphertext_fingerprint"));
         } else {
             if (unit_profile.get("source_profile_fingerprint")) |commitment_value| {
-                if (!std.mem.eql(u8, try string(commitment_value), source_profile_fingerprint) or
-                    !std.mem.eql(u8, try requiredString(unit_profile, "profile_body_delivery"), "source_profile_fd"))
+                if (!std.mem.eql(u8, try string(commitment_value), source_profile_fingerprint)) {
+                    return error.SourceSelectionReceiptInvalid;
+                }
+                const profile_kind = try requiredString(unit_profile, "kind");
+                if (std.mem.eql(u8, profile_kind, "historical_decision")) {
+                    if (!std.mem.eql(
+                        u8,
+                        try requiredString(unit_profile, "profile_body_delivery"),
+                        "source_profile_fd",
+                    )) return error.SourceSelectionReceiptInvalid;
+                } else if (!std.mem.eql(u8, profile_kind, "direct") or
+                    unit_profile.get("profile_body_delivery") != null)
                 {
                     return error.SourceSelectionReceiptInvalid;
                 }
@@ -1510,6 +1674,136 @@ test "case-blind historical registration accepts only an opaque target-text witn
             .target_snapshot,
             "case_blind",
         ),
+    );
+}
+
+test "v2 public source profiles reject arbitrary direct and historical extras at every visibility" {
+    const profile_fingerprint =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    inline for (.{ "open", "result_blind", "case_blind" }) |visibility| {
+        const sealed = if (std.mem.eql(u8, visibility, "case_blind"))
+            ",\"sealed_payload\":true"
+        else
+            "";
+        const direct_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"kind\":\"direct\",\"source_profile_fingerprint\":\"{s}\"{s}}}",
+            .{ profile_fingerprint, sealed },
+        );
+        defer std.testing.allocator.free(direct_json);
+        var direct = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            direct_json,
+            .{},
+        );
+        defer direct.deinit();
+        try validatePublicV2SourceProfile(
+            try object(direct.value),
+            .practice_repair,
+            .target_snapshot,
+            visibility,
+        );
+
+        const leaked_direct_json = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            direct_json,
+            "}",
+            ",\"historical_answer\":\"private-answer\"}",
+        );
+        defer std.testing.allocator.free(leaked_direct_json);
+        var leaked_direct = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            leaked_direct_json,
+            .{},
+        );
+        defer leaked_direct.deinit();
+        try std.testing.expectError(
+            error.PrivateTrialSemanticLeak,
+            validatePublicV2SourceProfile(
+                try object(leaked_direct.value),
+                .practice_repair,
+                .target_snapshot,
+                visibility,
+            ),
+        );
+
+        const historical_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"kind\":\"historical_decision\"," ++
+                "\"source_governance_fingerprint\":" ++
+                "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+                "\"decision_context_fingerprint\":" ++
+                "\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"," ++
+                "\"temporal_horizon\":\"pre_decision\"," ++
+                "\"source_target_text_policy\":\"absent\"," ++
+                "\"retrace_mode\":\"replay\",\"required_lineage\":\"either\"," ++
+                "\"required_fir_version\":\"FIR-v1\"," ++
+                "\"reconstructability\":\"transcript_only\",\"limitations\":[]," ++
+                "\"source_profile_fingerprint\":\"{s}\"," ++
+                "\"profile_body_delivery\":\"source_profile_fd\"{s}," ++
+                "\"source_target_text_witness_fingerprint\":" ++
+                "\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}}",
+            .{ profile_fingerprint, sealed },
+        );
+        defer std.testing.allocator.free(historical_json);
+        var historical = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            historical_json,
+            .{},
+        );
+        defer historical.deinit();
+        try validatePublicV2SourceProfile(
+            try object(historical.value),
+            .practice_repair,
+            .target_snapshot,
+            visibility,
+        );
+
+        const leaked_historical_json = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            historical_json,
+            "}",
+            ",\"grade_opening\":\"private-opening\"}",
+        );
+        defer std.testing.allocator.free(leaked_historical_json);
+        var leaked_historical = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            leaked_historical_json,
+            .{},
+        );
+        defer leaked_historical.deinit();
+        try std.testing.expectError(
+            error.PrivateTrialSemanticLeak,
+            validatePublicV2SourceProfile(
+                try object(leaked_historical.value),
+                .practice_repair,
+                .target_snapshot,
+                visibility,
+            ),
+        );
+    }
+}
+
+test "v1 source profile acceptance retains legacy extension semantics" {
+    var legacy = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"kind\":\"direct\",\"historical_answer\":\"legacy-extension\"}",
+        .{},
+    );
+    defer legacy.deinit();
+    try validateSourceProfile(
+        std.testing.allocator,
+        try object(legacy.value),
+        .practice_repair,
+        .target_snapshot,
+        "open",
     );
 }
 
@@ -1695,7 +1989,785 @@ fn validateRandomizedAllocationReceipt(
     if (assignment_index != assignments.items.len) return error.AllocationReceiptInvalid;
 }
 
+fn validatePrivateTrialAllocationShape(allocation: std.json.ObjectMap) !void {
+    const method = try requiredString(allocation, "method");
+    if (std.mem.eql(u8, method, "randomized_blocks")) {
+        try requireExactKeys(allocation, &.{
+            "allocation_receipt",
+            "allocation_receipt_fingerprint",
+            "method",
+            "position_balance_required",
+            "seed_commitment",
+        }, error.PrivateTrialSemanticLeak);
+        const receipt = try requiredObject(allocation, "allocation_receipt");
+        try requireExactKeys(
+            receipt,
+            &.{ "algorithm", "assignments", "schema", "seed" },
+            error.PrivateTrialSemanticLeak,
+        );
+        for ((try requiredArray(receipt, "assignments")).items) |assignment_value| {
+            try requireExactKeys(try object(assignment_value), &.{
+                "block_id",
+                "lane_order",
+                "order",
+                "pair_id",
+                "repeat_index",
+                "unit_id",
+            }, error.PrivateTrialSemanticLeak);
+        }
+        return;
+    }
+    try requireExactKeys(
+        allocation,
+        &.{ "method", "position_balance_required", "seed_commitment" },
+        error.PrivateTrialSemanticLeak,
+    );
+}
+
+fn validatePrivateTrialRunnerContractShape(contract: std.json.ObjectMap) !void {
+    const base_keys = [_][]const u8{
+        "atomic_claim",
+        "executor_authority",
+        "executor_binary_fingerprint",
+        "fresh_thread",
+        "fresh_workspace",
+        "ledger_authority",
+        "ledger_binary_fingerprint",
+        "materializes_opaque_arm",
+        "maximum_handles_per_lane",
+        "maximum_retries_per_lane",
+        "schema",
+    };
+    if (contract.get("capability_seal") != null) {
+        try requireExactKeys(contract, &.{
+            "atomic_claim",
+            "capability_delivery",
+            "capability_seal",
+            "executor_authority",
+            "executor_binary_fingerprint",
+            "executor_request_schema",
+            "fresh_thread",
+            "fresh_workspace",
+            "ledger_authority",
+            "ledger_binary_fingerprint",
+            "materializes_opaque_arm",
+            "maximum_handles_per_lane",
+            "maximum_retries_per_lane",
+            "receiver_binding",
+            "schema",
+            "single_use",
+        }, error.PrivateTrialSemanticLeak);
+        const capability_seal = try requiredObject(contract, "capability_seal");
+        try requireExactKeys(capability_seal, &.{
+            "cas_observations",
+            "default_effect_decision",
+            "effect_mediation",
+            "effect_policy_fingerprint",
+            "os_confinement",
+            "profile_id",
+            "schema",
+            "target_data_mode",
+        }, error.PrivateTrialSemanticLeak);
+        if (try boolean(try required(capability_seal, "os_confinement"))) {
+            return error.CapabilitySealContractInvalid;
+        }
+    } else if (contract.get("executor_request_schema") != null) {
+        try requireExactKeys(contract, &.{
+            "atomic_claim",
+            "executor_authority",
+            "executor_binary_fingerprint",
+            "executor_request_schema",
+            "fresh_thread",
+            "fresh_workspace",
+            "ledger_authority",
+            "ledger_binary_fingerprint",
+            "materializes_opaque_arm",
+            "maximum_handles_per_lane",
+            "maximum_retries_per_lane",
+            "schema",
+        }, error.PrivateTrialSemanticLeak);
+    } else {
+        try requireExactKeys(contract, &base_keys, error.PrivateTrialSemanticLeak);
+    }
+    try requireExactKeys(try requiredObject(contract, "executor_authority"), &.{
+        "authorized_observations",
+        "binary_fingerprint",
+        "key_id",
+        "producer_id",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(contract, "ledger_authority"),
+        &.{ "binary_fingerprint", "key_id", "producer_id" },
+        error.PrivateTrialSemanticLeak,
+    );
+}
+
+fn validatePrivateTrialExecutionShape(execution: std.json.ObjectMap) !void {
+    if (execution.get("runner_contract") != null) {
+        try requireExactKeys(execution, &.{
+            "effect_policy_fingerprint",
+            "environment_fingerprint",
+            "maximum_lane_duration_ms",
+            "maximum_tokens_per_lane",
+            "model_policy_fingerprint",
+            "replay_policy_fingerprint",
+            "reset_policy",
+            "runner_authority",
+            "runner_contract",
+            "runner_contract_fingerprint",
+            "runner_contract_ref",
+        }, error.PrivateTrialSemanticLeak);
+        try validatePrivateTrialRunnerContractShape(
+            try requiredObject(execution, "runner_contract"),
+        );
+    } else {
+        try requireExactKeys(execution, &.{
+            "effect_policy_fingerprint",
+            "environment_fingerprint",
+            "maximum_lane_duration_ms",
+            "maximum_tokens_per_lane",
+            "model_policy_fingerprint",
+            "replay_policy_fingerprint",
+            "reset_policy",
+            "runner_authority",
+            "runner_contract_fingerprint",
+            "runner_contract_ref",
+        }, error.PrivateTrialSemanticLeak);
+    }
+    try requireExactKeys(try requiredObject(execution, "runner_authority"), &.{
+        "binary_fingerprint",
+        "key_id",
+        "producer_id",
+        "producer_version",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(execution, "reset_policy"), &.{
+        "clear_target_local_caches",
+        "fresh_thread",
+        "fresh_workspace",
+        "sibling_output_isolation",
+    }, error.PrivateTrialSemanticLeak);
+}
+
+fn validatePrivateTrialGradingShape(grading: std.json.ObjectMap) !void {
+    if (grading.get("presentation_materializer") != null) {
+        try requireExactKeys(grading, &.{
+            "critical_policy",
+            "judge_contracts",
+            "mode",
+            "oracle_contracts",
+            "presentation_materializer",
+            "producer_authorities",
+            "require_all_grades_before_reveal",
+            "require_all_terminal_before_reveal",
+            "rubric_fingerprint",
+        }, error.PrivateTrialSemanticLeak);
+        try requireExactKeys(try requiredObject(grading, "presentation_materializer"), &.{
+            "binary_fingerprint",
+            "key_id",
+            "producer_id",
+            "producer_version",
+            "role",
+            "schema",
+            "single_use_capabilities",
+        }, error.PrivateTrialSemanticLeak);
+    } else {
+        try requireExactKeys(grading, &.{
+            "critical_policy",
+            "judge_contracts",
+            "mode",
+            "oracle_contracts",
+            "producer_authorities",
+            "require_all_grades_before_reveal",
+            "require_all_terminal_before_reveal",
+            "rubric_fingerprint",
+        }, error.PrivateTrialSemanticLeak);
+    }
+    try requireExactKeys(
+        try requiredObject(grading, "critical_policy"),
+        &.{ "derived_only", "model_may_be_sole_critical_authority" },
+        error.PrivateTrialSemanticLeak,
+    );
+    for ((try requiredArray(grading, "judge_contracts")).items) |judge_value| {
+        const judge = try object(judge_value);
+        try requireExactKeys(judge, &.{
+            "contract",
+            "contract_fingerprint",
+            "contract_id",
+            "contract_ref",
+            "kind",
+            "schema",
+            "version",
+        }, error.PrivateTrialSemanticLeak);
+        try requireExactKeys(
+            try requiredObject(judge, "contract"),
+            &.{ "policy", "prompt_template" },
+            error.PrivateTrialSemanticLeak,
+        );
+    }
+    for ((try requiredArray(grading, "producer_authorities")).items) |authority_value| {
+        try requireExactKeys(try object(authority_value), &.{
+            "binary_fingerprint",
+            "key_id",
+            "producer_id",
+            "producer_version",
+            "role",
+        }, error.PrivateTrialSemanticLeak);
+    }
+}
+
+fn validatePrivateTrialAssuranceShape(assurance: std.json.ObjectMap) !void {
+    if (assurance.get("trust_policy") != null) {
+        try requireExactKeys(assurance, &.{
+            "required_distinct_roles",
+            "required_level",
+            "trust_policy",
+            "trust_policy_fingerprint",
+            "trust_policy_ref",
+        }, error.PrivateTrialSemanticLeak);
+        const trust = try requiredObject(assurance, "trust_policy");
+        try requireExactKeys(
+            trust,
+            &.{ "keys", "policy_id", "schema", "separation" },
+            error.PrivateTrialSemanticLeak,
+        );
+        for ((try requiredArray(trust, "keys")).items) |key_value| {
+            const key = try object(key_value);
+            if (key.get("producer_binary_fingerprints") != null) {
+                try requireExactKeys(key, &.{
+                    "allowed_roles",
+                    "key_id",
+                    "producer_binary_fingerprints",
+                    "producer_ids",
+                    "public_key_base64",
+                }, error.PrivateTrialSemanticLeak);
+            } else {
+                try requireExactKeys(key, &.{
+                    "allowed_roles",
+                    "key_id",
+                    "producer_ids",
+                    "public_key_base64",
+                }, error.PrivateTrialSemanticLeak);
+            }
+        }
+        try requireExactKeys(try requiredObject(trust, "separation"), &.{
+            "human_confirmation_required_for_human_grade",
+            "materializer_and_pair_grader_distinct",
+            "runner_and_pair_grader_distinct",
+        }, error.PrivateTrialSemanticLeak);
+    } else {
+        try requireExactKeys(assurance, &.{
+            "required_distinct_roles",
+            "required_level",
+            "trust_policy_fingerprint",
+            "trust_policy_ref",
+        }, error.PrivateTrialSemanticLeak);
+    }
+}
+
+fn validatePrivateTrialSealingContractShape(sealing: std.json.ObjectMap) !void {
+    const contract_value = sealing.get("case_materializer_contract") orelse return;
+    if (contract_value == .null) return;
+    const contract = try object(contract_value);
+    if (contract.get("limitations") != null) {
+        try requireExactKeys(contract, &.{
+            "capability_delivery",
+            "controller_id",
+            "limitations",
+            "materializer_binary_fingerprint",
+            "materializer_id",
+            "materializer_key_id",
+            "materializer_version",
+            "receiver_binding",
+            "receiver_role",
+            "runner_id",
+            "runner_key_id",
+            "schema",
+            "single_use",
+            "source_profile_delivery",
+            "visible_input_delivery",
+        }, error.PrivateTrialSemanticLeak);
+    } else {
+        try requireExactKeys(contract, &.{
+            "capability_delivery",
+            "controller_id",
+            "materializer_binary_fingerprint",
+            "materializer_id",
+            "materializer_key_id",
+            "materializer_version",
+            "receiver_binding",
+            "receiver_role",
+            "runner_id",
+            "runner_key_id",
+            "schema",
+            "single_use",
+            "source_profile_delivery",
+            "visible_input_delivery",
+        }, error.PrivateTrialSemanticLeak);
+    }
+}
+
+fn validatePrivateTrialManifestShape(
+    root: std.json.ObjectMap,
+    case_visibility: []const u8,
+) !void {
+    const arms = try requiredArray(root, "arms");
+    const arm0_id = try requiredString(try object(arms.items[0]), "arm_id");
+    const arm1_id = try requiredString(try object(arms.items[1]), "arm_id");
+    for ((try requiredArray(root, "units")).items) |unit_value| {
+        const unit = try object(unit_value);
+        try requireExactKeys(unit, &.{
+            "independence_cluster_id",
+            "pairs",
+            "scenario_id",
+            "source_profile",
+            "split",
+            "unit_id",
+        }, error.PrivateTrialSemanticLeak);
+        if (!hasExactPublicSourceProfileShape(
+            try requiredObject(unit, "source_profile"),
+            case_visibility,
+        )) return error.PrivateTrialSemanticLeak;
+        for ((try requiredArray(unit, "pairs")).items) |pair_value| {
+            const pair = try object(pair_value);
+            try requireExactKeys(pair, &.{
+                "block_id",
+                "lanes",
+                "order",
+                "pair_id",
+                "repeat_index",
+                "shared_seed",
+            }, error.PrivateTrialSemanticLeak);
+            const lanes = try requiredObject(pair, "lanes");
+            try requireExactKeys(lanes, &.{ arm0_id, arm1_id }, error.PrivateTrialSemanticLeak);
+            inline for (0..2) |index| {
+                const arm_id = if (index == 0) arm0_id else arm1_id;
+                try requireExactKeys(
+                    try object(lanes.get(arm_id) orelse return error.PrivateTrialSemanticLeak),
+                    &.{"lane_id"},
+                    error.PrivateTrialSemanticLeak,
+                );
+            }
+        }
+    }
+}
+
+fn validatePrivateTrialPublicShape(root: std.json.ObjectMap) !void {
+    const allowed_root_keys = [_][]const u8{
+        "allocation",
+        "arm_map_commitment",
+        "arms",
+        "assurance",
+        "calibration",
+        "campaign_id",
+        "canonical_json_profile",
+        "custody_commitment",
+        "estimand",
+        "execution",
+        "factor",
+        "grading",
+        "hypothesis",
+        "purpose",
+        "schema",
+        "sealing",
+        "stop_policy",
+        "target_epoch",
+        "trial_id",
+        "units",
+    };
+    var root_iterator = root.iterator();
+    while (root_iterator.next()) |entry| {
+        if (!stringSliceContains(&allowed_root_keys, entry.key_ptr.*)) {
+            return error.PrivateTrialSemanticLeak;
+        }
+    }
+    try validateFingerprint(try requiredString(root, "custody_commitment"));
+    try requireExactKeys(
+        try requiredObject(root, "hypothesis"),
+        &.{
+            "claim",
+            "competing_explanations",
+            "falsifier",
+            "hypothesis_id",
+            "predicted_direction",
+            "primary_failure_signature",
+        },
+        error.PrivateTrialSemanticLeak,
+    );
+    const arms = try requiredArray(root, "arms");
+    if (arms.items.len != 2) return error.PairShapeInvalid;
+    var first_commitment: ?[]const u8 = null;
+    for (arms.items) |arm_value| {
+        const arm = try object(arm_value);
+        try requireExactKeys(
+            arm,
+            &.{ "arm_id", "treatment_commitment" },
+            error.PrivateTrialSemanticLeak,
+        );
+        try validateOpaqueArmId(try requiredString(arm, "arm_id"));
+        const commitment = try requiredString(arm, "treatment_commitment");
+        try validateFingerprint(commitment);
+        if (first_commitment) |first| {
+            if (std.mem.eql(u8, first, commitment)) return error.InterventionDifferenceMissing;
+        } else first_commitment = commitment;
+        inline for (.{
+            "value_fingerprint",
+            "materialization_ref",
+            "materialization_fingerprint",
+        }) |key| {
+            if (arm.get(key) != null) return error.PrivateTrialSemanticLeak;
+        }
+    }
+    const epoch = try requiredObject(root, "target_epoch");
+    try requireExactKeys(
+        epoch,
+        &.{ "after_target_commitment", "before_target_commitment", "change_commitment" },
+        error.PrivateTrialSemanticLeak,
+    );
+    inline for (.{
+        "before_target_commitment",
+        "after_target_commitment",
+        "change_commitment",
+    }) |key| {
+        try validateFingerprint(try requiredString(epoch, key));
+    }
+    inline for (.{ "before_target_fingerprint", "after_target_fingerprint", "change_id" }) |key| {
+        if (epoch.get(key) != null) return error.PrivateTrialSemanticLeak;
+    }
+    try requireExactKeys(
+        try requiredObject(root, "arm_map_commitment"),
+        &.{ "algorithm", "fingerprint" },
+        error.PrivateTrialSemanticLeak,
+    );
+    const factor = try requiredObject(root, "factor");
+    try requireExactKeys(factor, &.{
+        "allowed_difference_roots",
+        "common_projection_fingerprint",
+        "intervention_witness_commitment",
+        "intervention_witness_ref",
+        "kind",
+        "target_common_projection_commitment",
+        "verifier",
+    }, error.PrivateTrialSemanticLeak);
+    if (!std.mem.eql(u8, try requiredString(factor, "kind"), "target_snapshot")) {
+        return error.PrivateTrialFactorUnsupported;
+    }
+    const intervention_witness_commitment = try requiredString(
+        factor,
+        "intervention_witness_commitment",
+    );
+    try validateFingerprint(intervention_witness_commitment);
+    try validateFingerprint(try requiredString(factor, "target_common_projection_commitment"));
+    try validateFingerprint(try requiredString(factor, "common_projection_fingerprint"));
+    const intervention_witness_ref = try requiredString(factor, "intervention_witness_ref");
+    const private_custody_prefix = "private-custody:";
+    if (!std.mem.startsWith(u8, intervention_witness_ref, private_custody_prefix) or
+        !std.mem.eql(
+            u8,
+            intervention_witness_ref[private_custody_prefix.len..],
+            intervention_witness_commitment,
+        ))
+    {
+        return error.PrivateTrialSemanticLeak;
+    }
+    if (factor.get("intervention_witness") != null or
+        factor.get("intervention_witness_fingerprint") != null or
+        factor.get("target_common_projection") != null)
+    {
+        return error.PrivateTrialSemanticLeak;
+    }
+    if ((try requiredArray(factor, "allowed_difference_roots")).items.len == 0) {
+        return error.InterventionDifferenceMissing;
+    }
+    try requireExactKeys(
+        try requiredObject(factor, "verifier"),
+        &.{ "fingerprint", "id", "version" },
+        error.PrivateTrialSemanticLeak,
+    );
+    try validatePrivateTrialAllocationShape(try requiredObject(root, "allocation"));
+    const sealing = try requiredObject(root, "sealing");
+    const expected_sealing_count: usize =
+        if (sealing.get("case_materializer_contract") == null) 11 else 12;
+    if (sealing.count() != expected_sealing_count) return error.PrivateTrialSemanticLeak;
+    inline for (.{
+        "arm_visibility",
+        "case_materializer_fingerprint",
+        "case_materializer_ref",
+        "case_visibility",
+        "grade_visibility",
+        "hidden_reference_commitments",
+        "reveal_scope",
+        "source_selection_receipt_commitment",
+        "source_selection_receipt_fingerprint",
+        "source_selection_receipt_ref",
+        "visible_input_commitments",
+    }) |key| _ = sealing.get(key) orelse return error.PrivateTrialSemanticLeak;
+    try validateFingerprint(try requiredString(sealing, "source_selection_receipt_commitment"));
+    const source_selection_fingerprint = try requiredString(
+        sealing,
+        "source_selection_receipt_fingerprint",
+    );
+    try validateFingerprint(source_selection_fingerprint);
+    const source_selection_ref = try requiredString(sealing, "source_selection_receipt_ref");
+    const source_selection_ref_prefix = "artifact:";
+    if (!std.mem.startsWith(u8, source_selection_ref, source_selection_ref_prefix) or
+        !std.mem.eql(
+            u8,
+            source_selection_ref[source_selection_ref_prefix.len..],
+            source_selection_fingerprint,
+        ) or
+        sealing.get("source_selection_receipt") != null)
+    {
+        return error.PrivateTrialSemanticLeak;
+    }
+    try validatePrivateTrialSealingContractShape(sealing);
+    try validatePrivateTrialExecutionShape(try requiredObject(root, "execution"));
+    try validatePrivateTrialGradingShape(try requiredObject(root, "grading"));
+    try requireExactKeys(try requiredObject(root, "estimand"), &.{
+        "absolute_candidate_policy",
+        "aggregation_unit",
+        "effect_direction",
+        "minimum_effects",
+        "noninferiority_margins",
+        "primary_dimensions",
+        "uncertainty",
+        "zero_critical_regressions",
+    }, error.PrivateTrialSemanticLeak);
+    const estimand = try requiredObject(root, "estimand");
+    try requireExactKeys(
+        try requiredObject(estimand, "absolute_candidate_policy"),
+        &.{"require_all_candidate_lanes_pass"},
+        error.PrivateTrialSemanticLeak,
+    );
+    try requireExactKeys(try requiredObject(estimand, "uncertainty"), &.{
+        "confidence",
+        "method",
+        "minimum_independent_clusters",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(root, "calibration"), &.{
+        "null_bias_tolerance",
+        "positive_sensitivity_floor",
+        "required_null_sentinel_refs",
+        "required_positive_sentinel_refs",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(root, "stop_policy"), &.{
+        "kind",
+        "maximum_invalid_lanes",
+        "required_pairs_per_unit",
+    }, error.PrivateTrialSemanticLeak);
+    try validatePrivateTrialAssuranceShape(try requiredObject(root, "assurance"));
+    try validatePrivateTrialManifestShape(
+        root,
+        try requiredString(sealing, "case_visibility"),
+    );
+}
+
+fn privateTrialValidationProjectionAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+        .max_value_len = MaxTrialArtifactBytes,
+    });
+    defer parsed.deinit();
+    const mutation_allocator = parsed.arena.allocator();
+    const root = switch (parsed.value) {
+        .object => |*map| map,
+        else => return error.ObjectRequired,
+    };
+    try validatePrivateTrialPublicShape(root.*);
+
+    const fingerprint_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fingerprint_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const arms = try requiredArray(root.*, "arms");
+    for (arms.items, 0..) |*arm_value, index| {
+        const arm = switch (arm_value.*) {
+            .object => |*map| map,
+            else => return error.ObjectRequired,
+        };
+        _ = arm.orderedRemove("treatment_commitment");
+        const fingerprint = if (index == 0) fingerprint_a else fingerprint_b;
+        try arm.put(
+            mutation_allocator,
+            "value_fingerprint",
+            .{ .string = @constCast(fingerprint) },
+        );
+        try arm.put(
+            mutation_allocator,
+            "materialization_fingerprint",
+            .{ .string = @constCast(fingerprint) },
+        );
+        try arm.put(
+            mutation_allocator,
+            "materialization_ref",
+            .{ .string = @constCast(
+                if (index == 0) "private-custody:arm-a" else "private-custody:arm-b",
+            ) },
+        );
+    }
+
+    const epoch = switch ((root.getPtr("target_epoch") orelse
+        return error.RequiredFieldMissing).*) {
+        .object => |*map| map,
+        else => return error.ObjectRequired,
+    };
+    _ = epoch.orderedRemove("before_target_commitment");
+    _ = epoch.orderedRemove("after_target_commitment");
+    _ = epoch.orderedRemove("change_commitment");
+    try epoch.put(
+        mutation_allocator,
+        "before_target_fingerprint",
+        .{ .string = @constCast(fingerprint_a) },
+    );
+    try epoch.put(
+        mutation_allocator,
+        "after_target_fingerprint",
+        .{ .string = @constCast(fingerprint_b) },
+    );
+    try epoch.put(mutation_allocator, "change_id", .{ .string = @constCast("private-change") });
+
+    const factor = switch ((root.getPtr("factor") orelse return error.RequiredFieldMissing).*) {
+        .object => |*map| map,
+        else => return error.ObjectRequired,
+    };
+    _ = factor.orderedRemove("intervention_witness_commitment");
+    _ = factor.orderedRemove("target_common_projection_commitment");
+    const allowed_roots = try requiredArray(factor.*, "allowed_difference_roots");
+    const observed_path = try string(allowed_roots.items[0]);
+    const sorted_allowed_roots = try allocator.alloc([]const u8, allowed_roots.items.len);
+    defer allocator.free(sorted_allowed_roots);
+    for (allowed_roots.items, 0..) |root_value, index| {
+        sorted_allowed_roots[index] = try string(root_value);
+    }
+    std.mem.sort([]const u8, sorted_allowed_roots, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    const arm0_id = try requiredString(try object(arms.items[0]), "arm_id");
+    const arm1_id = try requiredString(try object(arms.items[1]), "arm_id");
+    const verifier = try requiredObject(factor.*, "verifier");
+    const trial_id = try requiredString(root.*, "trial_id");
+    var projection_text: std.Io.Writer.Allocating = .init(allocator);
+    defer projection_text.deinit();
+    try projection_text.writer.writeAll(
+        "{\"baseline_revision\":\"0000000000000000000000000000000000000000\"," ++
+            "\"entries\":[],\"excluded_roots\":[",
+    );
+    for (sorted_allowed_roots, 0..) |allowed_root, index| {
+        if (index != 0) try projection_text.writer.writeByte(',');
+        try retrace_core.canonical_json.writeCanonicalString(&projection_text.writer, allowed_root);
+    }
+    try projection_text.writer.writeByte(']');
+    try projection_text.writer.writeAll(
+        ",\"schema\":\"hylo-target-common-projection/v1\"," ++
+            "\"verifier\":{\"id\":\"git-target-common-projection\",\"version\":\"v1\"}}",
+    );
+    var projection = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        projection_text.written(),
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer projection.deinit();
+    const common_projection_fingerprint = try digestValueAlloc(allocator, projection.value);
+    defer allocator.free(common_projection_fingerprint);
+    try factor.put(mutation_allocator, "target_common_projection", projection.value);
+    try factor.put(
+        mutation_allocator,
+        "common_projection_fingerprint",
+        .{ .string = common_projection_fingerprint },
+    );
+    var witness_text: std.Io.Writer.Allocating = .init(allocator);
+    defer witness_text.deinit();
+    try witness_text.writer.writeAll("{\"arm_values\":{");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, arm0_id);
+    try witness_text.writer.writeAll(":{\"fingerprint\":");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, fingerprint_a);
+    try witness_text.writer.writeAll(",\"snapshot_fingerprint\":");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, fingerprint_a);
+    try witness_text.writer.writeAll("},");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, arm1_id);
+    try witness_text.writer.writeAll(":{\"fingerprint\":");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, fingerprint_b);
+    try witness_text.writer.writeAll(",\"snapshot_fingerprint\":");
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, fingerprint_b);
+    try witness_text.writer.writeAll("}},\"common_projection\":{\"fingerprint\":");
+    try retrace_core.canonical_json.writeCanonicalString(
+        &witness_text.writer,
+        common_projection_fingerprint,
+    );
+    try witness_text.writer.writeAll("},\"differing_projection\":{\"allowed_roots\":");
+    try writeCanonicalJson(allocator, &witness_text.writer, .{ .array = allowed_roots });
+    try witness_text.writer.writeAll(
+        ",\"diff_fingerprint\":" ++
+            "\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"," ++
+            "\"observed_paths\":[",
+    );
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, observed_path);
+    try witness_text.writer.writeAll(
+        "]},\"factor_kind\":\"target_snapshot\",\"limitations\":[]," ++
+            "\"schema\":\"hylo-intervention-witness/v1\",\"trial_id\":",
+    );
+    try retrace_core.canonical_json.writeCanonicalString(&witness_text.writer, trial_id);
+    try witness_text.writer.writeAll(
+        ",\"verdict\":{\"one_factor_closed\":true}," ++
+            "\"verifier\":{\"binary_fingerprint\":",
+    );
+    try retrace_core.canonical_json.writeCanonicalString(
+        &witness_text.writer,
+        try requiredString(verifier, "fingerprint"),
+    );
+    try witness_text.writer.writeAll(",\"id\":");
+    try retrace_core.canonical_json.writeCanonicalString(
+        &witness_text.writer,
+        try requiredString(verifier, "id"),
+    );
+    try witness_text.writer.writeAll(",\"version\":");
+    try retrace_core.canonical_json.writeCanonicalString(
+        &witness_text.writer,
+        try requiredString(verifier, "version"),
+    );
+    try witness_text.writer.writeAll("}}");
+    var witness = try std.json.parseFromSlice(std.json.Value, allocator, witness_text.written(), .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer witness.deinit();
+    const witness_fingerprint = try digestValueAlloc(allocator, witness.value);
+    defer allocator.free(witness_fingerprint);
+    try factor.put(mutation_allocator, "intervention_witness", witness.value);
+    try factor.put(
+        mutation_allocator,
+        "intervention_witness_fingerprint",
+        .{ .string = witness_fingerprint },
+    );
+
+    const sealing = switch ((root.getPtr("sealing") orelse return error.RequiredFieldMissing).*) {
+        .object => |*map| map,
+        else => return error.ObjectRequired,
+    };
+    _ = sealing.orderedRemove("source_selection_receipt_commitment");
+    try sealing.put(mutation_allocator, "source_selection_receipt", .null);
+
+    _ = root.orderedRemove("custody_commitment");
+    try root.put(mutation_allocator, "schema", .{ .string = @constCast(TrialSchema) });
+    return canonicalJsonAlloc(allocator, parsed.value);
+}
+
 pub fn validateTrialAlloc(allocator: std.mem.Allocator, bytes: []const u8) !Validation {
+    return validateTrialAllocInternal(allocator, bytes, false);
+}
+
+fn validateTrialAllocInternal(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    private_projection: bool,
+) !Validation {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
@@ -1704,7 +2776,21 @@ pub fn validateTrialAlloc(allocator: std.mem.Allocator, bytes: []const u8) !Vali
     defer parsed.deinit();
     const root = try object(parsed.value);
     try validateLimitationsRecursive(parsed.value);
-    if (!std.mem.eql(u8, try requiredString(root, "schema"), TrialSchema)) return error.TrialSchemaInvalid;
+    const schema = try requiredString(root, "schema");
+    if (std.mem.eql(u8, schema, PrivateTrialSchema)) {
+        const projection = try privateTrialValidationProjectionAlloc(allocator, bytes);
+        defer allocator.free(projection);
+        var projected = try validateTrialAllocInternal(allocator, projection, true);
+        defer projected.deinit(allocator);
+        return .{
+            .trial_id = try allocator.dupe(u8, try requiredString(root, "trial_id")),
+            .fingerprint = try digestValueAlloc(allocator, parsed.value),
+            .unit_count = projected.unit_count,
+            .pair_count = projected.pair_count,
+            .lane_count = projected.lane_count,
+        };
+    }
+    if (!std.mem.eql(u8, schema, TrialSchema)) return error.TrialSchemaInvalid;
     try validateCanonicalJsonProfile(root);
     const trial_id = try requiredString(root, "trial_id");
     try validateId(trial_id);
@@ -1848,13 +2934,23 @@ pub fn validateTrialAlloc(allocator: std.mem.Allocator, bytes: []const u8) !Vali
         if (purpose != .promotion and !std.mem.eql(u8, split, "practice")) {
             return error.PracticePurposeContainsProtectedSplit;
         }
-        try validateSourceProfile(
-            allocator,
-            try requiredObject(unit, "source_profile"),
-            purpose,
-            factor_kind,
-            case_visibility,
-        );
+        const source_profile = try requiredObject(unit, "source_profile");
+        if (private_projection) {
+            try validatePublicV2SourceProfile(
+                source_profile,
+                purpose,
+                factor_kind,
+                case_visibility,
+            );
+        } else {
+            try validateSourceProfile(
+                allocator,
+                source_profile,
+                purpose,
+                factor_kind,
+                case_visibility,
+            );
+        }
         const pairs = try requiredArray(unit, "pairs");
         if (pairs.items.len != required_pairs) return error.PairCountInvalid;
         var repeat_indexes = std.AutoHashMap(u64, void).init(allocator);
@@ -1948,14 +3044,16 @@ pub fn validateTrialAlloc(allocator: std.mem.Allocator, bytes: []const u8) !Vali
     for (visible_input_commitments.items) |value| try validateFingerprint(try string(value));
     for (hidden_reference_commitments.items) |value| try validateFingerprint(try string(value));
     const assurance = try requiredObject(root, "assurance");
-    try validateSourceSelectionReceipt(
-        allocator,
-        sealing,
-        units,
-        purpose == .promotion,
-        campaign_id,
-        assurance,
-    );
+    if (!private_projection) {
+        try validateSourceSelectionReceipt(
+            allocator,
+            sealing,
+            units,
+            purpose == .promotion,
+            campaign_id,
+            assurance,
+        );
+    }
     try validateExecution(allocator, root);
     try validateGrading(allocator, root);
     try validateEstimand(root);
@@ -2056,10 +3154,23 @@ pub fn validateTrialAlloc(allocator: std.mem.Allocator, bytes: []const u8) !Vali
             return error.RoleSeparationInvalid;
         }
         if (std.mem.eql(u8, role, "source_owner")) {
-            const source_receipt = sealing.get("source_selection_receipt") orelse
-                return error.RoleSeparationInvalid;
-            if (source_receipt == .null) return error.RoleSeparationInvalid;
+            if (private_projection) {
+                try validateFingerprint(
+                    try requiredString(sealing, "source_selection_receipt_fingerprint"),
+                );
+            } else {
+                const source_receipt = sealing.get("source_selection_receipt") orelse
+                    return error.RoleSeparationInvalid;
+                if (source_receipt == .null) return error.RoleSeparationInvalid;
+            }
         }
+    }
+    if (private_projection and
+        std.mem.eql(u8, case_visibility, "case_blind") and
+        std.mem.eql(u8, level, "role_separated") and
+        !try listContains(required_roles, "materializer"))
+    {
+        return error.RoleSeparationInvalid;
     }
     if (optional_trust_value) |trust_value| {
         try validateRequiredRoleKeyMaterial(
@@ -2162,6 +3273,7 @@ pub const LaneState = struct {
     runner_binary_fingerprint: ?[]u8 = null,
     runner_producer_key_id: ?[]u8 = null,
     presented_input_fingerprint: ?[]u8 = null,
+    materialization_claim_fingerprint: ?[]u8 = null,
     run_receipt_fingerprint: ?[]u8 = null,
     run_receipt_json: ?[]u8 = null,
     output_fingerprint: ?[]u8 = null,
@@ -2200,6 +3312,7 @@ pub const LaneState = struct {
         if (self.runner_producer_key_id) |value| allocator.free(value);
         if (self.started_event_digest) |value| allocator.free(value);
         if (self.presented_input_fingerprint) |value| allocator.free(value);
+        if (self.materialization_claim_fingerprint) |value| allocator.free(value);
         if (self.run_receipt_fingerprint) |value| allocator.free(value);
         if (self.run_receipt_json) |value| allocator.free(value);
         if (self.output_fingerprint) |value| allocator.free(value);
@@ -2948,19 +4061,62 @@ pub fn applyRegistered(
     defer validation.deinit(allocator);
     if (!std.mem.eql(u8, declared_fingerprint, validation.fingerprint)) return error.TrialFingerprintMismatch;
     const trial_root = try object(trial_value);
+    const private_trial = std.mem.eql(
+        u8,
+        try requiredString(trial_root, "schema"),
+        PrivateTrialSchema,
+    );
+    if (private_trial) {
+        const custody = try requiredObject(parts.payload, "private_custody");
+        try requireExactKeys(
+            custody,
+            &.{ "commitment", "semantic_material_persisted", "validated" },
+            error.PrivateTrialCustodyReceiptInvalid,
+        );
+        if (!std.mem.eql(
+            u8,
+            try requiredString(custody, "commitment"),
+            try requiredString(trial_root, "custody_commitment"),
+        ) or try boolean(try required(custody, "semantic_material_persisted")) or
+            !try boolean(try required(custody, "validated")) or
+            parts.payload.get("arm_materializations") != null)
+        {
+            return error.PrivateTrialCustodyReceiptInvalid;
+        }
+    } else if (parts.payload.get("private_custody") != null) {
+        return error.PrivateTrialCustodyReceiptInvalid;
+    }
     const factor = try requiredObject(trial_root, "factor");
     const factor_kind = try requiredString(factor, "kind");
     if (std.mem.eql(u8, factor_kind, "target_snapshot")) {
-        const factor_projection = factor.get("target_common_projection") orelse
-            return error.TargetCommonProjectionMissing;
-        const payload_projection = parts.payload.get("target_common_projection") orelse
-            return error.TargetCommonProjectionMissing;
-        const factor_projection_canonical = try canonicalJsonAlloc(allocator, factor_projection);
-        defer allocator.free(factor_projection_canonical);
-        const payload_projection_canonical = try canonicalJsonAlloc(allocator, payload_projection);
-        defer allocator.free(payload_projection_canonical);
-        if (!std.mem.eql(u8, factor_projection_canonical, payload_projection_canonical)) {
-            return error.TargetCommonProjectionMismatch;
+        if (private_trial) {
+            try validateFingerprint(
+                try requiredString(factor, "target_common_projection_commitment"),
+            );
+            try validateFingerprint(try requiredString(factor, "common_projection_fingerprint"));
+            if (factor.get("target_common_projection") != null or
+                parts.payload.get("target_common_projection") != null)
+            {
+                return error.PrivateTrialSemanticLeak;
+            }
+        } else {
+            const factor_projection = factor.get("target_common_projection") orelse
+                return error.TargetCommonProjectionMissing;
+            const payload_projection = parts.payload.get("target_common_projection") orelse
+                return error.TargetCommonProjectionMissing;
+            const factor_projection_canonical = try canonicalJsonAlloc(
+                allocator,
+                factor_projection,
+            );
+            defer allocator.free(factor_projection_canonical);
+            const payload_projection_canonical = try canonicalJsonAlloc(
+                allocator,
+                payload_projection,
+            );
+            defer allocator.free(payload_projection_canonical);
+            if (!std.mem.eql(u8, factor_projection_canonical, payload_projection_canonical)) {
+                return error.TargetCommonProjectionMismatch;
+            }
         }
     } else if (parts.payload.get("target_common_projection") != null) {
         return error.TargetCommonProjectionInvalid;
@@ -3008,25 +4164,69 @@ pub fn applyProofProjectedRegistered(
     }
     const trial_value = try required(parts.payload, "trial");
     const trial_root = try object(trial_value);
-    if (!std.mem.eql(u8, try requiredString(trial_root, "schema"), TrialSchema)) {
+    if (!std.mem.eql(u8, try requiredString(trial_root, "schema"), TrialSchema) and
+        !std.mem.eql(u8, try requiredString(trial_root, "schema"), PrivateTrialSchema))
+    {
         return error.TrialSchemaInvalid;
     }
     try validateCanonicalJsonProfile(trial_root);
     const declared_fingerprint = try requiredString(parts.payload, "trial_fingerprint");
     try validateFingerprint(declared_fingerprint);
+    const private_trial = std.mem.eql(
+        u8,
+        try requiredString(trial_root, "schema"),
+        PrivateTrialSchema,
+    );
+    if (private_trial) {
+        const custody = try requiredObject(parts.payload, "private_custody");
+        try requireExactKeys(
+            custody,
+            &.{ "commitment", "semantic_material_persisted", "validated" },
+            error.PrivateTrialCustodyReceiptInvalid,
+        );
+        if (!std.mem.eql(
+            u8,
+            try requiredString(custody, "commitment"),
+            try requiredString(trial_root, "custody_commitment"),
+        ) or try boolean(try required(custody, "semantic_material_persisted")) or
+            !try boolean(try required(custody, "validated")) or
+            parts.payload.get("arm_materializations") != null)
+        {
+            return error.PrivateTrialCustodyReceiptInvalid;
+        }
+    } else if (parts.payload.get("private_custody") != null) {
+        return error.PrivateTrialCustodyReceiptInvalid;
+    }
     const factor = try requiredObject(trial_root, "factor");
     const factor_kind = try requiredString(factor, "kind");
     if (std.mem.eql(u8, factor_kind, "target_snapshot")) {
-        const factor_projection = factor.get("target_common_projection") orelse
-            return error.TargetCommonProjectionMissing;
-        const payload_projection = parts.payload.get("target_common_projection") orelse
-            return error.TargetCommonProjectionMissing;
-        const factor_projection_canonical = try canonicalJsonAlloc(allocator, factor_projection);
-        defer allocator.free(factor_projection_canonical);
-        const payload_projection_canonical = try canonicalJsonAlloc(allocator, payload_projection);
-        defer allocator.free(payload_projection_canonical);
-        if (!std.mem.eql(u8, factor_projection_canonical, payload_projection_canonical)) {
-            return error.TargetCommonProjectionMismatch;
+        if (private_trial) {
+            try validateFingerprint(
+                try requiredString(factor, "target_common_projection_commitment"),
+            );
+            if (factor.get("target_common_projection") != null or
+                parts.payload.get("target_common_projection") != null)
+            {
+                return error.PrivateTrialSemanticLeak;
+            }
+        } else {
+            const factor_projection = factor.get("target_common_projection") orelse
+                return error.TargetCommonProjectionMissing;
+            const payload_projection = parts.payload.get("target_common_projection") orelse
+                return error.TargetCommonProjectionMissing;
+            const factor_projection_canonical = try canonicalJsonAlloc(
+                allocator,
+                factor_projection,
+            );
+            defer allocator.free(factor_projection_canonical);
+            const payload_projection_canonical = try canonicalJsonAlloc(
+                allocator,
+                payload_projection,
+            );
+            defer allocator.free(payload_projection_canonical);
+            if (!std.mem.eql(u8, factor_projection_canonical, payload_projection_canonical)) {
+                return error.TargetCommonProjectionMismatch;
+            }
         }
     } else if (parts.payload.get("target_common_projection") != null) {
         return error.TargetCommonProjectionInvalid;
@@ -3072,7 +4272,9 @@ pub fn registrationPayloadAlloc(
     try retrace_core.canonical_json.writeCanonicalString(&out.writer, declared_fingerprint);
     try out.writer.writeAll(",\"trial\":");
     try writeCanonicalJson(allocator, &out.writer, parsed.value);
-    if (std.mem.eql(u8, try requiredString(factor, "kind"), "target_snapshot")) {
+    if (std.mem.eql(u8, try requiredString(factor, "kind"), "target_snapshot") and
+        std.mem.eql(u8, try requiredString(trial, "schema"), TrialSchema))
+    {
         try out.writer.writeAll(",\"target_common_projection\":");
         try writeCanonicalJson(
             allocator,
@@ -3143,14 +4345,32 @@ pub fn applyLaneStarted(
     try validateLaneStartOrder(trial, trial_root, lane);
     const execution = try requiredObject(trial_root, "execution");
     const arm = try armObject(trial_root, lane.arm_id);
+    const private_trial = std.mem.eql(
+        u8,
+        try requiredString(trial_root, "schema"),
+        PrivateTrialSchema,
+    );
+    const target_binding_key = if (private_trial)
+        "treatment_commitment"
+    else
+        "materialization_fingerprint";
+    const presented_target_binding = if (private_trial)
+        try requiredString(parts.payload, "treatment_commitment")
+    else
+        try requiredString(parts.payload, "target_snapshot_fingerprint");
+    if ((private_trial and parts.payload.get("target_snapshot_fingerprint") != null) or
+        (!private_trial and parts.payload.get("treatment_commitment") != null))
+    {
+        return error.LaneManifestMismatch;
+    }
     if (!std.mem.eql(
         u8,
         try requiredString(parts.payload, "runner_contract_fingerprint"),
         try requiredString(execution, "runner_contract_fingerprint"),
     ) or !std.mem.eql(
         u8,
-        try requiredString(parts.payload, "target_snapshot_fingerprint"),
-        try requiredString(arm, "materialization_fingerprint"),
+        presented_target_binding,
+        try requiredString(arm, target_binding_key),
     ) or !std.mem.eql(
         u8,
         try requiredString(parts.payload, "environment_fingerprint"),
@@ -3389,15 +4609,23 @@ fn validateHistoricalTerminalFailureNativeReceipt(
     )) return error.NativeReceiptInvalid;
 
     const source = try requiredObject(receipt, "source");
+    const has_replay_binding = try validateHistoricalReplayFingerprints(
+        trial,
+        lane,
+        source_profile,
+        source,
+    );
     if (!std.mem.eql(
         u8,
         try requiredString(source, "source_governance_fingerprint"),
         try requiredString(source_profile, "source_governance_fingerprint"),
-    ) or (try requiredString(source, "decision_context_ref")).len == 0 or !std.mem.eql(
-        u8,
-        try requiredString(source, "decision_context_fingerprint"),
-        try requiredString(source_profile, "decision_context_fingerprint"),
-    ) or !std.mem.eql(u8, try requiredString(source, "temporal_horizon"), "pre_decision") or
+    ) or (!has_replay_binding and
+        (try requiredString(source, "decision_context_ref")).len == 0) or
+        !std.mem.eql(
+            u8,
+            try requiredString(source, "decision_context_fingerprint"),
+            try requiredString(source_profile, "decision_context_fingerprint"),
+        ) or !std.mem.eql(u8, try requiredString(source, "temporal_horizon"), "pre_decision") or
         !std.mem.eql(
             u8,
             try requiredString(source, "source_target_text_policy"),
@@ -3453,6 +4681,66 @@ fn rejectForkPortfolio(map: std.json.ObjectMap) !void {
     }
 }
 
+fn historicalSourceProfileDelivery(source_profile: std.json.ObjectMap) ![]const u8 {
+    if (source_profile.get("profile_body_delivery")) |value| {
+        return (try optionalStringValue(value)) orelse "embedded";
+    }
+    return "embedded";
+}
+
+fn validateHistoricalReplayFingerprints(
+    trial: std.json.ObjectMap,
+    lane: *const LaneState,
+    source_profile: std.json.ObjectMap,
+    binding: std.json.ObjectMap,
+) !bool {
+    const field_names = [_][]const u8{
+        "replay_plan_fingerprint",
+        "source_profile_fingerprint",
+        "source_profile_body_delivery",
+    };
+    var any_present = false;
+    for (field_names) |field| if (binding.get(field)) |value| {
+        any_present = any_present or value != .null;
+    };
+    if (!any_present) return false;
+    for (field_names) |field| {
+        const value = binding.get(field) orelse return error.HistoricalReplayBindingIncomplete;
+        if (value == .null) return error.HistoricalReplayBindingIncomplete;
+    }
+    if (binding.get("decision_context_ref") != null) {
+        return error.HistoricalReplayBindingInvalid;
+    }
+
+    const decision_context_fingerprint = try requiredString(
+        binding,
+        "decision_context_fingerprint",
+    );
+    const replay_plan_fingerprint = try requiredString(binding, "replay_plan_fingerprint");
+    const source_profile_fingerprint = try requiredString(binding, "source_profile_fingerprint");
+    try validateFingerprint(decision_context_fingerprint);
+    try validateFingerprint(replay_plan_fingerprint);
+    try validateFingerprint(source_profile_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        decision_context_fingerprint,
+        try requiredString(source_profile, "decision_context_fingerprint"),
+    ) or !std.mem.eql(
+        u8,
+        try requiredString(binding, "source_profile_body_delivery"),
+        try historicalSourceProfileDelivery(source_profile),
+    )) return error.HistoricalReplayBindingInvalid;
+
+    if (try sourceCaseForLane(trial, lane)) |source_case| {
+        if (!std.mem.eql(
+            u8,
+            source_profile_fingerprint,
+            try requiredString(source_case, "source_profile_fingerprint"),
+        )) return error.HistoricalReplayBindingInvalid;
+    }
+    return true;
+}
+
 fn validateFirNativeReceipt(
     allocator: std.mem.Allocator,
     trial: std.json.ObjectMap,
@@ -3478,6 +4766,12 @@ fn validateFirNativeReceipt(
     ) or try integer(try required(native_receipt, "target_instruction_count")) != 1) {
         return error.RetraceSourceLineageInvalid;
     }
+    const has_replay_binding = try validateHistoricalReplayFingerprints(
+        trial,
+        lane,
+        source_profile,
+        native_receipt,
+    );
     try rejectForkPortfolio(native_receipt);
     const receipt_value = try validateEmbeddedNativeFingerprint(allocator, native_receipt);
     const receipt_root = try object(receipt_value);
@@ -3488,6 +4782,35 @@ fn validateFirNativeReceipt(
         !std.mem.eql(u8, try requiredString(receipt, "lane_id"), lane.id))
     {
         return error.RetraceFirInvalid;
+    }
+    if (has_replay_binding) {
+        const replay_binding = try requiredObject(receipt_root, "replay_binding");
+        if (!std.mem.eql(
+            u8,
+            try requiredString(replay_binding, "trial_id"),
+            try requiredString(trial, "trial_id"),
+        ) or
+            !std.mem.eql(u8, try requiredString(replay_binding, "lane_id"), lane.id) or
+            !std.mem.eql(
+                u8,
+                try requiredString(replay_binding, "source_profile_fingerprint"),
+                try requiredString(native_receipt, "source_profile_fingerprint"),
+            ) or !std.mem.eql(
+            u8,
+            try requiredString(replay_binding, "historical_dcp_fingerprint"),
+            try requiredString(native_receipt, "decision_context_fingerprint"),
+        ) or !std.mem.eql(
+            u8,
+            try requiredString(replay_binding, "historical_rip_fingerprint"),
+            try requiredString(native_receipt, "replay_plan_fingerprint"),
+        ) or !std.mem.eql(
+            u8,
+            try requiredString(replay_binding, "required_lineage"),
+            try requiredString(source_profile, "required_lineage"),
+        )) return error.HistoricalReplayBindingInvalid;
+        try validateFingerprint(try requiredString(replay_binding, "historical_dcp_fingerprint"));
+        try validateFingerprint(try requiredString(replay_binding, "historical_rip_fingerprint"));
+        try validateFingerprint(try requiredString(replay_binding, "source_profile_fingerprint"));
     }
     const source = try requiredObject(receipt, "source");
     const required_lineage = try requiredString(source_profile, "required_lineage");
@@ -3569,6 +4892,106 @@ fn validateFirNativeReceipt(
     defer strict_fir.deinit(allocator);
 }
 
+fn validateFirPublicProjection(
+    allocator: std.mem.Allocator,
+    trial: std.json.ObjectMap,
+    lane: *const LaneState,
+    native_receipt: std.json.ObjectMap,
+) !void {
+    try requireExactKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        error.PrivateTrialSemanticLeak,
+    );
+    if (!std.mem.eql(
+        u8,
+        try requiredString(native_receipt, "kind"),
+        FirPublicProjectionKind,
+    )) return error.RetraceFirInvalid;
+    const projection_value = try validateEmbeddedNativeFingerprint(allocator, native_receipt);
+    const projection = try object(projection_value);
+    try requireExactKeys(projection, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "lane_id",
+        "replay_plan_fingerprint",
+        "required_lineage",
+        "schema",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+        "trial_id",
+        "validated",
+    }, error.PrivateTrialSemanticLeak);
+    if (!std.mem.eql(u8, try requiredString(projection, "schema"), FirPublicProjectionSchema) or
+        !std.mem.eql(
+            u8,
+            try requiredString(projection, "trial_id"),
+            try requiredString(trial, "trial_id"),
+        ) or
+        !std.mem.eql(u8, try requiredString(projection, "lane_id"), lane.id) or
+        !try boolean(try required(projection, "validated")))
+    {
+        return error.RetraceFirInvalid;
+    }
+    inline for (.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "replay_plan_fingerprint",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+    }) |key| try validateFingerprint(try requiredString(projection, key));
+    const projection_fingerprint = try requiredString(native_receipt, "fingerprint");
+    const expected_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{projection_fingerprint},
+    );
+    defer allocator.free(expected_ref);
+    if (!std.mem.eql(u8, try requiredString(native_receipt, "ref"), expected_ref)) {
+        return error.PrivateTrialSemanticLeak;
+    }
+
+    const source_profile = try unitSourceProfile(trial, lane.unit_id);
+    if (!std.mem.eql(u8, try requiredString(source_profile, "kind"), "historical_decision") or
+        !std.mem.eql(
+            u8,
+            try requiredString(projection, "source_governance_fingerprint"),
+            try requiredString(source_profile, "source_governance_fingerprint"),
+        ) or !std.mem.eql(
+        u8,
+        try requiredString(projection, "decision_context_fingerprint"),
+        try requiredString(source_profile, "decision_context_fingerprint"),
+    ) or !std.mem.eql(
+        u8,
+        try requiredString(projection, "required_lineage"),
+        try requiredString(source_profile, "required_lineage"),
+    )) return error.RetraceSourceLineageInvalid;
+    if (source_profile.get("source_profile_fingerprint")) |value| {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(projection, "source_profile_fingerprint"),
+            try string(value),
+        )) return error.RetraceSourceLineageInvalid;
+    } else if (try sourceCaseForLane(trial, lane)) |source_case| {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(projection, "source_profile_fingerprint"),
+            try requiredString(source_case, "source_profile_fingerprint"),
+        )) return error.RetraceSourceLineageInvalid;
+    } else return error.RetraceSourceLineageInvalid;
+    if (source_profile.get("source_target_text_witness_fingerprint")) |value| {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(projection, "source_target_text_witness_fingerprint"),
+            try string(value),
+        )) return error.RetraceSourceLineageInvalid;
+    }
+}
+
 fn validateGenericNativeReceipt(
     allocator: std.mem.Allocator,
     trial: std.json.ObjectMap,
@@ -3590,6 +5013,458 @@ fn validateGenericNativeReceipt(
     }
 }
 
+fn nativeHistoricalReplayBinding(
+    allocator: std.mem.Allocator,
+    native_kind: []const u8,
+    native_receipt: std.json.ObjectMap,
+) !?std.json.ObjectMap {
+    if (std.mem.eql(u8, native_kind, FirPublicProjectionKind)) {
+        const projection = try object(
+            try validateEmbeddedNativeFingerprint(allocator, native_receipt),
+        );
+        return projection;
+    }
+    if (std.mem.eql(u8, native_kind, "FIR-v1")) {
+        if (native_receipt.get("replay_plan_fingerprint") == null and
+            native_receipt.get("source_profile_body_delivery") == null)
+        {
+            return null;
+        }
+        return native_receipt;
+    }
+    if (std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt")) {
+        const receipt = try object(
+            try validateEmbeddedNativeFingerprint(allocator, native_receipt),
+        );
+        const source = try requiredObject(receipt, "source");
+        if (source.get("replay_plan_fingerprint") == null and
+            source.get("source_profile_body_delivery") == null)
+        {
+            return null;
+        }
+        return source;
+    }
+    return null;
+}
+
+fn validatePrivateRunReceiptAttestationShape(receipt: std.json.ObjectMap) !void {
+    const attestation_value = try required(receipt, "attestation");
+    if (attestation_value == .null) return;
+    const attestation = try object(attestation_value);
+    try requireExactKeys(attestation, &.{
+        "binary_fingerprint",
+        "issued_at_unix",
+        "key_id",
+        "producer_id",
+        "producer_version",
+        "role",
+        "schema",
+        "signature",
+        "subject_fingerprint",
+        "subject_schema",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(attestation, "signature"),
+        &.{ "algorithm", "value_base64" },
+        error.PrivateTrialSemanticLeak,
+    );
+}
+
+fn validatePrivateCasNativeReceiptShape(native_receipt: std.json.ObjectMap) !void {
+    try requireExactKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        error.PrivateTrialSemanticLeak,
+    );
+    const receipt = try object(try required(native_receipt, "receipt"));
+    try requireExactKeys(receipt, &.{
+        "claim",
+        "execution",
+        "lane_id",
+        "runner_contract_fingerprint",
+        "schema",
+        "terminal_status",
+        "trial_id",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(receipt, "claim"),
+        &.{ "atomic", "claim_count", "claim_id", "claimed_before_execution", "lane_lease_digest" },
+        error.PrivateTrialSemanticLeak,
+    );
+    try requireExactKeys(try requiredObject(receipt, "execution"), &.{
+        "execution_audit_fingerprint",
+        "execution_audit_ref",
+        "executor",
+        "executor_binary_fingerprint",
+        "handle_count",
+        "handle_id",
+        "hidden_fork_count",
+        "internal_execution_verified",
+        "observation_scope",
+        "retry_count",
+        "terminal_receipt_once",
+    }, error.PrivateTrialSemanticLeak);
+}
+
+fn validatePrivateHistoricalFailureReceiptShape(native_receipt: std.json.ObjectMap) !void {
+    try requireExactKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        error.PrivateTrialSemanticLeak,
+    );
+    const receipt = try object(try required(native_receipt, "receipt"));
+    try requireExactKeys(receipt, &.{
+        "claim",
+        "execution",
+        "fir",
+        "lane_id",
+        "runner_contract_fingerprint",
+        "schema",
+        "source",
+        "terminal_status",
+        "trial_id",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(receipt, "claim"),
+        &.{ "atomic", "claim_count", "claim_id", "claimed_before_execution", "lane_lease_digest" },
+        error.PrivateTrialSemanticLeak,
+    );
+    try requireExactKeys(try requiredObject(receipt, "source"), &.{
+        "decision_context_fingerprint",
+        "replay_plan_fingerprint",
+        "required_fir_version",
+        "required_lineage",
+        "source_governance_fingerprint",
+        "source_profile_body_delivery",
+        "source_profile_fingerprint",
+        "source_target_text_policy",
+        "source_target_text_witness_fingerprint",
+        "temporal_horizon",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(receipt, "execution"), &.{
+        "execution_audit_fingerprint",
+        "execution_audit_ref",
+        "executor",
+        "executor_binary_fingerprint",
+        "handle_count",
+        "hidden_fork_count",
+        "internal_execution_verified",
+        "retry_count",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(receipt, "fir"),
+        &.{ "reason", "receipt_fingerprint", "receipt_ref", "status" },
+        error.PrivateTrialSemanticLeak,
+    );
+}
+
+fn validatePrivateFirReceiptBodyShape(receipt_value: std.json.Value) !void {
+    const root = try object(receipt_value);
+    try requireExactKeys(
+        root,
+        &.{ "fork_inquiry_receipt", "replay_binding" },
+        error.PrivateTrialSemanticLeak,
+    );
+    const fir = try requiredObject(root, "fork_inquiry_receipt");
+    try requireExactKeys(fir, &.{
+        "answer",
+        "fork",
+        "gate",
+        "inquiry",
+        "inquiry_id",
+        "lane_id",
+        "lifecycle",
+        "receipt_id",
+        "receipt_version",
+        "source",
+        "workspace_reconstruction",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(fir, "source"), &.{
+        "capsule_id",
+        "lineage_mode",
+        "source_artifact_reconstructability",
+        "source_episode_id",
+        "source_rollout_path",
+        "source_thread_id",
+        "source_thread_id_present",
+        "source_turn_digest",
+    }, error.PrivateTrialSemanticLeak);
+    const fork = try requiredObject(fir, "fork");
+    try requireExactKeys(fork, &.{
+        "anchor",
+        "approval_policy",
+        "codex_version",
+        "ephemeral",
+        "fork_thread_id",
+        "forked_from_id",
+        "hooks",
+        "lineage_mode",
+        "model",
+        "model_provider",
+        "multi_agent_mode",
+        "permissions",
+        "sandbox",
+        "service_tier",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(fork, "anchor"), &.{
+        "anchor_digest_expected",
+        "anchor_digest_observed",
+        "exact",
+        "temporal_horizon",
+        "turns_after",
+        "turns_before",
+        "turns_dropped",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(fir, "workspace_reconstruction"), &.{
+        "dependencies_exact",
+        "dirty_state_exact",
+        "generated_artifacts_exact",
+        "head_exact",
+        "limitations",
+        "mode",
+        "network_allowed",
+        "path",
+        "tools_allowed",
+    }, error.PrivateTrialSemanticLeak);
+    const inquiry = try requiredObject(fir, "inquiry");
+    try requireExactKeys(inquiry, &.{
+        "client_user_message_id",
+        "ended_at",
+        "evidence_allowed",
+        "evidence_withheld",
+        "mode",
+        "question",
+        "started_at",
+        "status",
+        "token_usage",
+        "turn_id",
+    }, error.PrivateTrialSemanticLeak);
+    // The packaged FIR-v1 serializer admits token usage as an array. It does
+    // not currently define a public entry schema, so the private-v2 receipt
+    // projection must accept the canonical empty array and reject both the
+    // former object interpretation and undeclared entry shapes. The wider v1
+    // FIR validator remains unchanged.
+    const token_usage = requiredArray(inquiry, "token_usage") catch
+        return error.PrivateTrialSemanticLeak;
+    if (token_usage.items.len != 0) return error.PrivateTrialSemanticLeak;
+    try requireExactKeys(try requiredObject(fir, "answer"), &.{
+        "alternatives",
+        "assumptions",
+        "evidence_refs",
+        "final_text_ref",
+        "hindsight_available",
+        "reconstructed_decision",
+        "rejected_routes",
+        "route_flip_conditions",
+        "selected_route",
+        "uncertainty",
+        "unsupported_claims",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(fir, "lifecycle"), &.{
+        "archived",
+        "cleanup_status",
+        "deleted",
+        "event_log_ref",
+        "interrupted",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(fir, "gate"), &.{
+        "anchor_valid",
+        "answer_complete",
+        "approval_or_tool_request_observed",
+        "hindsight_label_valid",
+        "lineage_valid",
+        "permissions_valid",
+        "receipt_valid",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(try requiredObject(root, "replay_binding"), &.{
+        "historical_dcp_fingerprint",
+        "historical_rip_fingerprint",
+        "lane_id",
+        "required_lineage",
+        "source_profile_fingerprint",
+        "trial_id",
+    }, error.PrivateTrialSemanticLeak);
+}
+
+fn validatePrivateFirNativeReceiptShape(native_receipt: std.json.ObjectMap) !void {
+    try requireExactKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+        error.PrivateTrialSemanticLeak,
+    );
+    if (!std.mem.eql(
+        u8,
+        try requiredString(native_receipt, "kind"),
+        FirPublicProjectionKind,
+    )) return error.PrivateTrialSemanticLeak;
+    const projection = try object(try required(native_receipt, "receipt"));
+    try requireExactKeys(projection, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "lane_id",
+        "replay_plan_fingerprint",
+        "required_lineage",
+        "schema",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+        "trial_id",
+        "validated",
+    }, error.PrivateTrialSemanticLeak);
+}
+
+fn validatePrivateRunReceiptShape(
+    trial: std.json.ObjectMap,
+    lane: *const LaneState,
+    receipt: std.json.ObjectMap,
+) !void {
+    try requireExactKeys(receipt, &.{
+        "attestation",
+        "effects",
+        "evidence",
+        "isolation",
+        "lane_id",
+        "lineage",
+        "materialization",
+        "native_receipt",
+        "opaque_arm_id",
+        "pair_id",
+        "producer",
+        "runtime",
+        "scenario_id",
+        "schema",
+        "terminal",
+        "trial_id",
+        "unit_id",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(receipt, "lineage"),
+        &.{ "lane_lease_digest", "lane_started_event_digest", "registration_event_digest" },
+        error.PrivateTrialSemanticLeak,
+    );
+    try requireExactKeys(try requiredObject(receipt, "producer"), &.{
+        "binary_fingerprint",
+        "id",
+        "key_id",
+        "receiver_key_id",
+        "receiver_role",
+        "version",
+    }, error.PrivateTrialSemanticLeak);
+
+    const materialization = try requiredObject(receipt, "materialization");
+    var expected_materialization_count: usize = 7;
+    inline for (.{
+        "hidden_reference_presented",
+        "materialization_claim_fingerprint",
+        "presented_input_fingerprint",
+        "presented_input_ref",
+        "sibling_output_presented",
+        "treatment_commitment",
+        "visibility",
+    }) |key| _ = materialization.get(key) orelse return error.PrivateTrialSemanticLeak;
+    const source_case = try sourceCaseForLane(trial, lane);
+    if (source_case != null) {
+        expected_materialization_count += 2;
+        _ = materialization.get("source_episode_fingerprint") orelse
+            return error.PrivateTrialSemanticLeak;
+        _ = materialization.get("source_profile_fingerprint") orelse
+            return error.PrivateTrialSemanticLeak;
+    }
+    const source_profile = try unitSourceProfile(trial, lane.unit_id);
+    const historical = std.mem.eql(
+        u8,
+        try requiredString(source_profile, "kind"),
+        "historical_decision",
+    );
+    if (historical) {
+        expected_materialization_count += 3;
+        inline for (.{
+            "historical_dcp_fingerprint",
+            "historical_rip_fingerprint",
+            "source_profile_body_delivery",
+        }) |key| _ = materialization.get(key) orelse return error.PrivateTrialSemanticLeak;
+    }
+    if (materialization.count() != expected_materialization_count) {
+        return error.PrivateTrialSemanticLeak;
+    }
+
+    try requireExactKeys(try requiredObject(receipt, "runtime"), &.{
+        "effect_policy_fingerprint",
+        "ended_at_unix",
+        "environment_fingerprint",
+        "model_configuration_fingerprint",
+        "model_id",
+        "model_provider",
+        "replay_policy_fingerprint",
+        "runtime_version",
+        "seed",
+        "started_at_unix",
+        "tokens_used",
+    }, error.PrivateTrialSemanticLeak);
+    const isolation = try requiredObject(receipt, "isolation");
+    inline for (.{
+        "capability_sealed",
+        "fresh_thread",
+        "fresh_workspace",
+        "limitations",
+        "os_confinement",
+        "reset_receipt_fingerprint",
+        "reset_receipt_ref",
+        "shared_mutable_state_detected",
+        "target_cache_cleared",
+    }) |key| _ = isolation.get(key) orelse return error.PrivateTrialSemanticLeak;
+    if (try boolean(try required(isolation, "os_confinement"))) {
+        return error.IsolationInvalid;
+    }
+    const sealed = try boolean(try required(isolation, "capability_sealed"));
+    if (sealed) {
+        if (isolation.count() != 11 or
+            isolation.get("capability_profile_id") == null or
+            isolation.get("capability_effect_policy_fingerprint") == null)
+        {
+            return error.PrivateTrialSemanticLeak;
+        }
+    } else if (isolation.count() != 9) return error.PrivateTrialSemanticLeak;
+    try requireExactKeys(try requiredObject(receipt, "effects"), &.{
+        "external_effect_receipt_fingerprint",
+        "external_effect_receipt_ref",
+        "filesystem_receipt_fingerprint",
+        "filesystem_receipt_ref",
+        "network_receipt_fingerprint",
+        "network_receipt_ref",
+        "policy_violations",
+    }, error.PrivateTrialSemanticLeak);
+    try requireExactKeys(
+        try requiredObject(receipt, "terminal"),
+        &.{ "failure_class", "failure_detail_ref", "status" },
+        error.PrivateTrialSemanticLeak,
+    );
+    try requireExactKeys(try requiredObject(receipt, "evidence"), &.{
+        "metrics_fingerprint",
+        "metrics_ref",
+        "output_fingerprint",
+        "output_ref",
+        "trace_fingerprint",
+        "trace_ref",
+        "world_state_fingerprint",
+        "world_state_ref",
+    }, error.PrivateTrialSemanticLeak);
+    const native_receipt = try requiredObject(receipt, "native_receipt");
+    const native_kind = try requiredString(native_receipt, "kind");
+    if (std.mem.eql(u8, native_kind, "cas-trial-receipt")) {
+        if (historical) return error.PrivateTrialSemanticLeak;
+        try validatePrivateCasNativeReceiptShape(native_receipt);
+    } else if (std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt")) {
+        if (!historical) return error.PrivateTrialSemanticLeak;
+        try validatePrivateHistoricalFailureReceiptShape(native_receipt);
+    } else if (std.mem.eql(u8, native_kind, FirPublicProjectionKind)) {
+        if (!historical) return error.PrivateTrialSemanticLeak;
+        try validatePrivateFirNativeReceiptShape(native_receipt);
+    } else return error.PrivateTrialSemanticLeak;
+    try validatePrivateRunReceiptAttestationShape(receipt);
+}
+
 fn validateRunReceipt(
     allocator: std.mem.Allocator,
     trial_state: *const TrialState,
@@ -3598,7 +5473,9 @@ fn validateRunReceipt(
 ) !void {
     try validateLimitationsRecursive(receipt_value);
     const receipt = try object(receipt_value);
-    if (!std.mem.eql(u8, try requiredString(receipt, "schema"), "hylo-run-receipt/v1") or
+    const receipt_schema = try requiredString(receipt, "schema");
+    if ((!std.mem.eql(u8, receipt_schema, "hylo-run-receipt/v1") and
+        !std.mem.eql(u8, receipt_schema, "hylo-run-receipt/v2")) or
         !std.mem.eql(u8, try requiredString(receipt, "trial_id"), trial_state.id) or
         !std.mem.eql(u8, try requiredString(receipt, "unit_id"), lane.unit_id) or
         !std.mem.eql(u8, try requiredString(receipt, "scenario_id"), lane.scenario_id) or
@@ -3645,6 +5522,12 @@ fn validateRunReceipt(
     defer trial_parsed.deinit();
     const trial = try object(trial_parsed.value);
     const execution = try requiredObject(trial, "execution");
+    const source_profile = try unitSourceProfile(trial, lane.unit_id);
+    const historical = std.mem.eql(
+        u8,
+        try requiredString(source_profile, "kind"),
+        "historical_decision",
+    );
     const runner_authority = try requiredObject(execution, "runner_authority");
     if (!std.mem.eql(u8, try requiredString(producer, "id"), try requiredString(runner_authority, "producer_id")) or
         !std.mem.eql(u8, try requiredString(producer, "version"), try requiredString(runner_authority, "producer_version")) or
@@ -3655,7 +5538,65 @@ fn validateRunReceipt(
     }
     const arm = try armObject(trial, lane.arm_id);
     const materialization = try requiredObject(receipt, "materialization");
-    if (!std.mem.eql(
+    const private_trial = std.mem.eql(u8, try requiredString(trial, "schema"), PrivateTrialSchema);
+    if (private_trial) {
+        if (!std.mem.eql(u8, receipt_schema, "hylo-run-receipt/v2")) {
+            return error.RunReceiptInvalid;
+        }
+        try validatePrivateRunReceiptShape(trial, lane, receipt);
+        var materialization_fields = materialization.iterator();
+        while (materialization_fields.next()) |entry| {
+            var allowed = false;
+            inline for (.{
+                "visibility",
+                "treatment_commitment",
+                "materialization_claim_fingerprint",
+                "presented_input_ref",
+                "presented_input_fingerprint",
+                "hidden_reference_presented",
+                "sibling_output_presented",
+                "source_episode_fingerprint",
+                "source_profile_fingerprint",
+                "historical_dcp_fingerprint",
+                "historical_rip_fingerprint",
+                "source_profile_body_delivery",
+            }) |key| {
+                if (std.mem.eql(u8, entry.key_ptr.*, key)) allowed = true;
+            }
+            if (!allowed) return error.PrivateTrialSemanticLeak;
+        }
+        const commitment = try requiredString(arm, "treatment_commitment");
+        const materialization_claim_fingerprint = try requiredString(
+            materialization,
+            "materialization_claim_fingerprint",
+        );
+        try validateFingerprint(materialization_claim_fingerprint);
+        if (!std.mem.eql(
+            u8,
+            try requiredString(materialization, "visibility"),
+            "commitment_only",
+        ) or !std.mem.eql(
+            u8,
+            try requiredString(materialization, "treatment_commitment"),
+            commitment,
+        )) {
+            return error.RunReceiptInvalid;
+        }
+        inline for (.{
+            "semantic_role",
+            "arm_value_fingerprint",
+            "target_snapshot_ref",
+            "target_snapshot_fingerprint",
+            "target_materialization_ref",
+            "target_materialization_fingerprint",
+            "target_materialization_archive_ref",
+            "target_materialization_archive_fingerprint",
+            "target_package_tree_before_fingerprint",
+            "target_package_tree_after_fingerprint",
+        }) |key| {
+            if (materialization.get(key) != null) return error.PrivateTrialSemanticLeak;
+        }
+    } else if (!std.mem.eql(u8, receipt_schema, "hylo-run-receipt/v1") or !std.mem.eql(
         u8,
         try requiredString(materialization, "arm_value_fingerprint"),
         try requiredString(arm, "value_fingerprint"),
@@ -3684,6 +5625,35 @@ fn validateRunReceipt(
             try requiredString(materialization, "source_profile_fingerprint"),
             try requiredString(source_case, "source_profile_fingerprint"),
         )) return error.RunReceiptInvalid;
+    }
+    const replay_materialization_fields = [_][]const u8{
+        "historical_dcp_fingerprint",
+        "historical_rip_fingerprint",
+        "source_profile_body_delivery",
+    };
+    var has_replay_materialization = false;
+    for (replay_materialization_fields) |field| {
+        has_replay_materialization = has_replay_materialization or
+            materialization.get(field) != null;
+    }
+    if (has_replay_materialization) {
+        if (!historical) return error.HistoricalReplayBindingInvalid;
+        for (replay_materialization_fields) |field| if (materialization.get(field) == null) {
+            return error.HistoricalReplayBindingIncomplete;
+        };
+        const dcp_fingerprint = try requiredString(materialization, "historical_dcp_fingerprint");
+        const rip_fingerprint = try requiredString(materialization, "historical_rip_fingerprint");
+        try validateFingerprint(dcp_fingerprint);
+        try validateFingerprint(rip_fingerprint);
+        if (!std.mem.eql(
+            u8,
+            dcp_fingerprint,
+            try requiredString(source_profile, "decision_context_fingerprint"),
+        ) or !std.mem.eql(
+            u8,
+            try requiredString(materialization, "source_profile_body_delivery"),
+            try historicalSourceProfileDelivery(source_profile),
+        )) return error.HistoricalReplayBindingInvalid;
     }
     const hidden_reference_presented = try boolean(try required(materialization, "hidden_reference_presented"));
     const sibling_output_presented = try boolean(try required(materialization, "sibling_output_presented"));
@@ -3786,20 +5756,16 @@ fn validateRunReceipt(
     try validateFingerprintedRef(evidence, "metrics_ref", "metrics_fingerprint");
     const native_receipt = try requiredObject(receipt, "native_receipt");
     const native_kind = try requiredString(native_receipt, "kind");
-    const source_profile = try unitSourceProfile(trial, lane.unit_id);
-    const historical = std.mem.eql(
-        u8,
-        try requiredString(source_profile, "kind"),
-        "historical_decision",
-    );
     if (historical) {
         if (status == .completed) {
-            if (!std.mem.eql(u8, native_kind, "FIR-v1")) return error.RetraceFirInvalid;
+            const expected_kind = if (private_trial) FirPublicProjectionKind else "FIR-v1";
+            if (!std.mem.eql(u8, native_kind, expected_kind)) return error.RetraceFirInvalid;
         } else if (!std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt")) {
             return error.RetraceFirInvalid;
         }
     }
     if (!std.mem.eql(u8, native_kind, "FIR-v1") and
+        !std.mem.eql(u8, native_kind, FirPublicProjectionKind) and
         !std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt") and
         !std.mem.eql(u8, native_kind, "cas-trial-receipt") and
         !std.mem.eql(u8, native_kind, "emulator-receipt") and
@@ -3810,7 +5776,11 @@ fn validateRunReceipt(
     }
     if ((try requiredString(native_receipt, "ref")).len == 0) return error.NativeReceiptInvalid;
     try validateFingerprint(try requiredString(native_receipt, "fingerprint"));
-    if (std.mem.eql(u8, native_kind, "FIR-v1")) {
+    if (std.mem.eql(u8, native_kind, FirPublicProjectionKind)) {
+        if (!private_trial or !historical or status != .completed) return error.RetraceFirInvalid;
+        try validateFirPublicProjection(allocator, trial, lane, native_receipt);
+    } else if (std.mem.eql(u8, native_kind, "FIR-v1")) {
+        if (private_trial) return error.PrivateTrialSemanticLeak;
         try validateFirNativeReceipt(allocator, trial, lane, native_receipt);
     } else if (std.mem.eql(u8, native_kind, "cas-historical-terminal-receipt")) {
         const failure_detail_ref = try optionalStringValue(try required(terminal, "failure_detail_ref"));
@@ -3852,6 +5822,33 @@ fn validateRunReceipt(
             "container-receipt/v1",
         );
     } else return error.NativeReceiptAdapterUnsupported;
+
+    const native_replay_binding = try nativeHistoricalReplayBinding(
+        allocator,
+        native_kind,
+        native_receipt,
+    );
+    if (native_replay_binding != null or has_replay_materialization) {
+        const binding = native_replay_binding orelse return error.HistoricalReplayBindingIncomplete;
+        const binding_delivery = if (std.mem.eql(u8, native_kind, FirPublicProjectionKind))
+            try historicalSourceProfileDelivery(source_profile)
+        else
+            try requiredString(binding, "source_profile_body_delivery");
+        if (!has_replay_materialization or
+            !std.mem.eql(
+                u8,
+                try requiredString(materialization, "historical_dcp_fingerprint"),
+                try requiredString(binding, "decision_context_fingerprint"),
+            ) or !std.mem.eql(
+            u8,
+            try requiredString(materialization, "historical_rip_fingerprint"),
+            try requiredString(binding, "replay_plan_fingerprint"),
+        ) or !std.mem.eql(
+            u8,
+            try requiredString(materialization, "source_profile_body_delivery"),
+            binding_delivery,
+        )) return error.HistoricalReplayBindingInvalid;
+    }
 }
 
 pub fn applyLaneFinished(
@@ -3884,6 +5881,19 @@ pub fn applyLaneFinished(
         try required(parts.payload, "run_receipt"),
         "runner",
     );
+    const receipt_schema = try requiredString(receipt, "schema");
+    const materialization_claim_fingerprint = if (std.mem.eql(
+        u8,
+        receipt_schema,
+        "hylo-run-receipt/v2",
+    )) blk: {
+        const fingerprint = try requiredString(
+            try requiredObject(receipt, "materialization"),
+            "materialization_claim_fingerprint",
+        );
+        try validateFingerprint(fingerprint);
+        break :blk fingerprint;
+    } else null;
     const terminal = try requiredObject(receipt, "terminal");
     const status = LaneTerminal.parse(try requiredString(terminal, "status")) orelse return error.RunReceiptInvalid;
     if (!status.isTerminal()) return error.RunReceiptInvalid;
@@ -3920,6 +5930,9 @@ pub fn applyLaneFinished(
     lane.terminal_sequence = sequence;
     lane.run_receipt_fingerprint = try allocator.dupe(u8, receipt_fingerprint);
     lane.run_receipt_json = try canonicalJsonAlloc(allocator, try required(parts.payload, "run_receipt"));
+    if (materialization_claim_fingerprint) |fingerprint| {
+        lane.materialization_claim_fingerprint = try allocator.dupe(u8, fingerprint);
+    }
     if (status == .completed) {
         const evidence = try requiredObject(receipt, "evidence");
         lane.output_fingerprint = try dupeRequiredString(
@@ -4085,6 +6098,32 @@ fn pairGradePositionMapCommitmentAlloc(
     return digestValueAlloc(allocator, parsed.value);
 }
 
+fn validatePairGradePositionMapCommitment(
+    allocator: std.mem.Allocator,
+    left_lane_alias: []const u8,
+    right_lane_alias: []const u8,
+    nonce: []const u8,
+    declared_commitment: []const u8,
+) !void {
+    const expected = try pairGradePositionMapCommitmentAlloc(
+        allocator,
+        left_lane_alias,
+        right_lane_alias,
+        nonce,
+    );
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, expected, declared_commitment)) {
+        return error.GradePresentationInvalid;
+    }
+}
+
+fn requiresLegacyPairPresentationCommitment(
+    sealed: bool,
+    has_grade_presentation: bool,
+) bool {
+    return !sealed and !has_grade_presentation;
+}
+
 fn absoluteAliasPresentationFingerprintAlloc(
     allocator: std.mem.Allocator,
     lane: *const LaneState,
@@ -4093,7 +6132,10 @@ fn absoluteAliasPresentationFingerprintAlloc(
 ) ![]u8 {
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"hylo-blind-absolute-presentation/v1\",\"trial_id\":{f},\"lane_id\":{f},\"opaque_arm_id\":{f},\"run_receipt_fingerprint\":{f},\"output_fingerprint\":{f},\"trace_fingerprint\":{f},\"rubric_fingerprint\":{f}}}",
+        "{{\"schema\":\"hylo-blind-absolute-presentation/v1\"," ++
+            "\"trial_id\":{f},\"lane_id\":{f},\"opaque_arm_id\":{f}," ++
+            "\"run_receipt_fingerprint\":{f},\"output_fingerprint\":{f}," ++
+            "\"trace_fingerprint\":{f},\"rubric_fingerprint\":{f}}}",
         .{
             std.json.fmt(aliases.trial_id, .{}),
             std.json.fmt(try string(aliases.lane_ids.items[0]), .{}),
@@ -4412,6 +6454,481 @@ fn gradePresentationCapabilityUsed(state: *const CampaignTrials, digest: []const
     return false;
 }
 
+fn validatePortableGradeArtifactRef(value: []const u8, err: anyerror) !void {
+    const prefix = "artifact:";
+    if (!std.mem.startsWith(u8, value, prefix)) return err;
+    validateFingerprint(value[prefix.len..]) catch return err;
+}
+
+fn validatePortableGradeArtifactRefMatches(
+    value: []const u8,
+    fingerprint: []const u8,
+    err: anyerror,
+) !void {
+    try validatePortableGradeArtifactRef(value, err);
+    if (!std.mem.eql(u8, value["artifact:".len..], fingerprint)) return err;
+}
+
+fn validatePortableGradeArtifactRefs(
+    values: std.json.Array,
+    require_non_empty: bool,
+    err: anyerror,
+) !void {
+    if (require_non_empty and values.items.len == 0) return err;
+    for (values.items) |value| {
+        const reference = string(value) catch return err;
+        try validatePortableGradeArtifactRef(reference, err);
+    }
+}
+
+fn validateV2GradeAttestationShape(value: std.json.Value, err: anyerror) !void {
+    if (value == .null) return;
+    const attestation = object(value) catch return err;
+    try requireExactKeys(attestation, &.{
+        "binary_fingerprint",
+        "issued_at_unix",
+        "key_id",
+        "producer_id",
+        "producer_version",
+        "role",
+        "schema",
+        "signature",
+        "subject_fingerprint",
+        "subject_schema",
+    }, err);
+    try requireExactKeys(requiredObject(attestation, "signature") catch return err, &.{
+        "algorithm",
+        "value_base64",
+    }, err);
+}
+
+fn validateV2GradeProducerShape(producer: std.json.ObjectMap, err: anyerror) !void {
+    try requireExactKeys(producer, &.{ "binary_fingerprint", "id", "key_id", "version" }, err);
+}
+
+fn validateV2HumanConfirmationShape(value: std.json.Value) !void {
+    const confirmation = object(value) catch return error.GradeReceiptInvalid;
+    try requireExactKeys(confirmation, &.{
+        "attestation",
+        "confirmed",
+        "lane_id",
+        "producer",
+        "schema",
+        "trial_id",
+    }, error.GradeReceiptInvalid);
+    try validateV2GradeProducerShape(
+        requiredObject(confirmation, "producer") catch return error.GradeReceiptInvalid,
+        error.GradeReceiptInvalid,
+    );
+    try validateV2GradeAttestationShape(
+        required(confirmation, "attestation") catch return error.GradeReceiptInvalid,
+        error.GradeReceiptInvalid,
+    );
+}
+
+fn validateV2GradePresentationReceiptShape(receipt: std.json.ObjectMap) !void {
+    try requireOnlyKeys(receipt, &.{
+        "attestation",
+        "capability_scope",
+        "delivery",
+        "disclosure",
+        "execution",
+        "grader",
+        "kind",
+        "presentation",
+        "producer",
+        "schema",
+        "scope",
+        "semantic_observation",
+        "trial_id",
+    }, error.GradePresentationInvalid);
+    try requireExactKeys(
+        requiredObject(receipt, "scope") catch return error.GradePresentationInvalid,
+        &.{ "lane_count", "lane_ids", "pair_count", "pair_ids", "unit_count", "unit_ids" },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "grader") catch return error.GradePresentationInvalid,
+        &.{ "binary_fingerprint", "id", "key_id", "role", "version" },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "capability_scope") catch return error.GradePresentationInvalid,
+        &.{
+            "allowed_inputs",
+            "capability_digest",
+            "lane_ids",
+            "pair_ids",
+            "single_use",
+            "trial_id",
+        },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "presentation") catch return error.GradePresentationInvalid,
+        &.{
+            "grader_presentation_fingerprint",
+            "identifier_alias_map_fingerprint",
+            "identifier_aliases",
+            "output_fingerprints",
+            "position_map_commitment",
+            "position_map_nonce",
+            "presentation_fingerprint",
+            "rubric_fingerprint",
+            "run_receipt_fingerprints",
+            "schema",
+            "trace_fingerprints",
+        },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "semantic_observation") catch return error.GradePresentationInvalid,
+        &.{
+            "carrier_encoding",
+            "observation_fingerprint",
+            "output_byte_counts",
+            "output_fingerprints",
+            "schema",
+            "semantic_bytes_presented",
+            "trace_byte_counts",
+            "trace_fingerprints",
+        },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "delivery") catch return error.GradePresentationInvalid,
+        &.{ "method", "receiver_binding", "receiver_key_id", "receiver_role", "single_use" },
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(receipt, "disclosure") catch return error.GradePresentationInvalid,
+        &.{
+            "hidden_reference",
+            "lane_execution_order",
+            "prior_grades",
+            "registered_identifiers",
+            "semantic_arm_identity",
+            "sibling_outputs",
+            "target_diff",
+        },
+        error.GradePresentationInvalid,
+    );
+    try validateV2GradeProducerShape(
+        requiredObject(receipt, "producer") catch return error.GradePresentationInvalid,
+        error.GradePresentationInvalid,
+    );
+    try requireExactKeys(
+        requiredObject(
+            requiredObject(receipt, "presentation") catch return error.GradePresentationInvalid,
+            "identifier_aliases",
+        ) catch return error.GradePresentationInvalid,
+        &.{ "lane_ids", "opaque_arm_id", "pair_ids", "trial_id", "unit_id" },
+        error.GradePresentationInvalid,
+    );
+    if (receipt.get("execution")) |execution_value| {
+        try requireExactKeys(
+            object(execution_value) catch return error.GradePresentationInvalid,
+            &.{ "inherited_capability_fds", "os_confinement", "separate_process" },
+            error.GradePresentationInvalid,
+        );
+    }
+    try validateV2GradeAttestationShape(
+        required(receipt, "attestation") catch return error.GradePresentationInvalid,
+        error.GradePresentationInvalid,
+    );
+}
+
+fn validateV2GradePresentationCarrier(payload: std.json.ObjectMap) !void {
+    const receipt_value = payload.get("grade_presentation_receipt");
+    const ref_value = payload.get("grade_presentation_receipt_ref");
+    const fingerprint_value = payload.get("grade_presentation_receipt_fingerprint");
+    if ((receipt_value == null) != (ref_value == null) or
+        (receipt_value == null) != (fingerprint_value == null))
+    {
+        return error.GradePresentationInvalid;
+    }
+    if (receipt_value == null) return;
+    const fingerprint = string(fingerprint_value.?) catch return error.GradePresentationInvalid;
+    validateFingerprint(fingerprint) catch return error.GradePresentationInvalid;
+    try validatePortableGradeArtifactRefMatches(
+        string(ref_value.?) catch return error.GradePresentationInvalid,
+        fingerprint,
+        error.GradePresentationInvalid,
+    );
+    try validateV2GradePresentationReceiptShape(
+        object(receipt_value.?) catch return error.GradePresentationInvalid,
+    );
+}
+
+fn validateV2AbsoluteGradeReceiptShape(receipt: std.json.ObjectMap, allow_blind: bool) !void {
+    try requireOnlyKeys(receipt, &.{
+        "aggregate",
+        "attestation",
+        "blind_evaluation",
+        "blind_evaluation_fingerprint",
+        "blinding",
+        "derived_critical_violations",
+        "dimensions",
+        "evidence_refs",
+        "grade_presentation_receipt_fingerprint",
+        "human_confirmation_receipt",
+        "identifier_alias_map_fingerprint",
+        "judge",
+        "lane_id",
+        "opaque_arm_id",
+        "oracle_results",
+        "producer",
+        "rubric_fingerprint",
+        "run_receipt_fingerprint",
+        "schema",
+        "semantic_observation_fingerprint",
+        "status",
+        "trial_id",
+    }, error.GradeReceiptInvalid);
+    if (!allow_blind and
+        (receipt.get("blind_evaluation") != null or
+            receipt.get("blind_evaluation_fingerprint") != null))
+    {
+        return error.GradeReceiptInvalid;
+    }
+    try validateV2GradeProducerShape(
+        requiredObject(receipt, "producer") catch return error.GradeReceiptInvalid,
+        error.GradeReceiptInvalid,
+    );
+    const blinding = requiredObject(receipt, "blinding") catch return error.GradeReceiptInvalid;
+    if (blinding.get("registered_identifiers_visible") != null) {
+        try requireExactKeys(blinding, &.{
+            "hidden_reference_visible",
+            "prior_trial_results_visible",
+            "registered_identifiers_visible",
+            "semantic_arm_identity_visible",
+            "sibling_output_visible",
+            "target_diff_visible",
+        }, error.GradeReceiptInvalid);
+    } else {
+        try requireExactKeys(blinding, &.{
+            "hidden_reference_visible",
+            "prior_trial_results_visible",
+            "semantic_arm_identity_visible",
+            "sibling_output_visible",
+            "target_diff_visible",
+        }, error.GradeReceiptInvalid);
+    }
+    try requireExactKeys(
+        requiredObject(receipt, "judge") catch return error.GradeReceiptInvalid,
+        &.{ "config_fingerprint", "id", "kind", "version" },
+        error.GradeReceiptInvalid,
+    );
+    const dimensions = requiredArray(receipt, "dimensions") catch return error.GradeReceiptInvalid;
+    for (dimensions.items) |dimension_value| {
+        const dimension = object(dimension_value) catch return error.GradeReceiptInvalid;
+        try requireExactKeys(dimension, &.{
+            "evidence_refs",
+            "grader_fingerprint",
+            "grader_kind",
+            "grader_ref",
+            "id",
+            "score",
+            "weight",
+        }, error.GradeReceiptInvalid);
+        try validatePortableGradeArtifactRefs(
+            requiredArray(dimension, "evidence_refs") catch return error.GradeReceiptInvalid,
+            true,
+            error.GradeReceiptInvalid,
+        );
+    }
+    const oracles = requiredArray(receipt, "oracle_results") catch return error.GradeReceiptInvalid;
+    for (oracles.items) |oracle_value| {
+        const oracle = object(oracle_value) catch return error.GradeReceiptInvalid;
+        try requireExactKeys(oracle, &.{
+            "evidence_refs",
+            "grader_fingerprint",
+            "grader_kind",
+            "grader_ref",
+            "id",
+            "status",
+        }, error.GradeReceiptInvalid);
+        try validatePortableGradeArtifactRefs(
+            requiredArray(oracle, "evidence_refs") catch return error.GradeReceiptInvalid,
+            true,
+            error.GradeReceiptInvalid,
+        );
+    }
+    const criticals = requiredArray(receipt, "derived_critical_violations") catch
+        return error.GradeReceiptInvalid;
+    for (criticals.items) |critical_value| {
+        const critical = object(critical_value) catch return error.GradeReceiptInvalid;
+        try requireExactKeys(critical, &.{
+            "authority_id",
+            "authority_kind",
+            "evidence_refs",
+            "violation_id",
+        }, error.GradeReceiptInvalid);
+        try validatePortableGradeArtifactRefs(
+            requiredArray(critical, "evidence_refs") catch return error.GradeReceiptInvalid,
+            true,
+            error.GradeReceiptInvalid,
+        );
+    }
+    try validatePortableGradeArtifactRefs(
+        requiredArray(receipt, "evidence_refs") catch return error.GradeReceiptInvalid,
+        true,
+        error.GradeReceiptInvalid,
+    );
+    if (receipt.get("human_confirmation_receipt")) |confirmation| {
+        try validateV2HumanConfirmationShape(confirmation);
+    }
+    if (receipt.get("blind_evaluation")) |blind_value| {
+        try validateV2AbsoluteGradeReceiptShape(
+            object(blind_value) catch return error.GradeReceiptInvalid,
+            false,
+        );
+    }
+    try validateV2GradeAttestationShape(
+        required(receipt, "attestation") catch return error.GradeReceiptInvalid,
+        error.GradeReceiptInvalid,
+    );
+}
+
+fn validateV2PairGradeReceiptShape(receipt: std.json.ObjectMap, allow_blind: bool) !void {
+    try requireOnlyKeys(receipt, &.{
+        "attestation",
+        "blind_evaluation",
+        "blind_evaluation_fingerprint",
+        "blinding",
+        "dimensions",
+        "evidence_refs",
+        "grade_presentation_receipt_fingerprint",
+        "identifier_alias_map_fingerprint",
+        "judge_contract_fingerprint",
+        "lane_ids",
+        "pair_id",
+        "presentation",
+        "producer",
+        "prohibited_critical_authority",
+        "schema",
+        "semantic_observation_fingerprint",
+        "trial_id",
+        "verdict",
+    }, error.PairGradeReceiptInvalid);
+    if (!allow_blind and
+        (receipt.get("blind_evaluation") != null or
+            receipt.get("blind_evaluation_fingerprint") != null))
+    {
+        return error.PairGradeReceiptInvalid;
+    }
+    try requireExactKeys(
+        requiredObject(receipt, "presentation") catch return error.PairGradeReceiptInvalid,
+        &.{
+            "left_lane_id",
+            "left_output_fingerprint",
+            "position_map_commitment",
+            "right_lane_id",
+            "right_output_fingerprint",
+            "sibling_outputs_only",
+        },
+        error.PairGradeReceiptInvalid,
+    );
+    try validateV2GradeProducerShape(
+        requiredObject(receipt, "producer") catch return error.PairGradeReceiptInvalid,
+        error.PairGradeReceiptInvalid,
+    );
+    const blinding = requiredObject(receipt, "blinding") catch return error.PairGradeReceiptInvalid;
+    if (blinding.get("registered_identifiers_visible") != null) {
+        try requireExactKeys(blinding, &.{
+            "absolute_grade_results_visible",
+            "lane_execution_order_visible",
+            "opaque_arm_id_visible",
+            "prior_pair_results_visible",
+            "registered_identifiers_visible",
+            "semantic_arm_identity_visible",
+            "target_diff_visible",
+        }, error.PairGradeReceiptInvalid);
+    } else {
+        try requireExactKeys(blinding, &.{
+            "absolute_grade_results_visible",
+            "lane_execution_order_visible",
+            "opaque_arm_id_visible",
+            "prior_pair_results_visible",
+            "semantic_arm_identity_visible",
+            "target_diff_visible",
+        }, error.PairGradeReceiptInvalid);
+    }
+    try requireExactKeys(
+        requiredObject(receipt, "verdict") catch return error.PairGradeReceiptInvalid,
+        &.{ "confidence", "preferred" },
+        error.PairGradeReceiptInvalid,
+    );
+    const dimensions = requiredArray(receipt, "dimensions") catch
+        return error.PairGradeReceiptInvalid;
+    for (dimensions.items) |dimension_value| {
+        const dimension = object(dimension_value) catch return error.PairGradeReceiptInvalid;
+        try requireExactKeys(
+            dimension,
+            &.{ "evidence_refs", "id", "preferred", "rationale_ref" },
+            error.PairGradeReceiptInvalid,
+        );
+        try validatePortableGradeArtifactRef(
+            requiredString(dimension, "rationale_ref") catch return error.PairGradeReceiptInvalid,
+            error.PairGradeReceiptInvalid,
+        );
+        try validatePortableGradeArtifactRefs(
+            requiredArray(dimension, "evidence_refs") catch return error.PairGradeReceiptInvalid,
+            true,
+            error.PairGradeReceiptInvalid,
+        );
+    }
+    try validatePortableGradeArtifactRefs(
+        requiredArray(receipt, "evidence_refs") catch return error.PairGradeReceiptInvalid,
+        true,
+        error.PairGradeReceiptInvalid,
+    );
+    if (receipt.get("blind_evaluation")) |blind_value| {
+        try validateV2PairGradeReceiptShape(
+            object(blind_value) catch return error.PairGradeReceiptInvalid,
+            false,
+        );
+    }
+    try validateV2GradeAttestationShape(
+        required(receipt, "attestation") catch return error.PairGradeReceiptInvalid,
+        error.PairGradeReceiptInvalid,
+    );
+}
+
+fn validateAbsoluteGradeCarrierForTrial(
+    trial_root: std.json.ObjectMap,
+    payload: std.json.ObjectMap,
+    receipt: std.json.ObjectMap,
+    receipt_fingerprint: []const u8,
+) !void {
+    if (!std.mem.eql(u8, try requiredString(trial_root, "schema"), PrivateTrialSchema)) return;
+    try validateV2AbsoluteGradeReceiptShape(receipt, true);
+    try validatePortableGradeArtifactRefMatches(
+        try requiredString(payload, "grade_receipt_ref"),
+        receipt_fingerprint,
+        error.GradeReceiptInvalid,
+    );
+    try validateV2GradePresentationCarrier(payload);
+}
+
+fn validatePairGradeCarrierForTrial(
+    trial_root: std.json.ObjectMap,
+    payload: std.json.ObjectMap,
+    receipt: std.json.ObjectMap,
+    receipt_fingerprint: []const u8,
+) !void {
+    if (!std.mem.eql(u8, try requiredString(trial_root, "schema"), PrivateTrialSchema)) return;
+    try validateV2PairGradeReceiptShape(receipt, true);
+    if (payload.get("pair_grade_receipt_ref")) |ref_value| {
+        try validatePortableGradeArtifactRefMatches(
+            string(ref_value) catch return error.PairGradeReceiptInvalid,
+            receipt_fingerprint,
+            error.PairGradeReceiptInvalid,
+        );
+    }
+    try validateV2GradePresentationCarrier(payload);
+}
+
 fn validateGradePresentationEnvelope(
     allocator: std.mem.Allocator,
     state: *const CampaignTrials,
@@ -4420,7 +6937,12 @@ fn validateGradePresentationEnvelope(
     payload: std.json.ObjectMap,
     grade_producer: std.json.ObjectMap,
     expected_kind: []const u8,
-) !?struct { key_id: []u8, capability_digest: []u8, fingerprint: []const u8, receipt: std.json.ObjectMap } {
+) !?struct {
+    key_id: []u8,
+    capability_digest: []u8,
+    fingerprint: []const u8,
+    receipt: std.json.ObjectMap,
+} {
     const sealed = std.mem.eql(
         u8,
         try requiredString(try requiredObject(trial_root, "assurance"), "required_level"),
@@ -4861,16 +7383,13 @@ fn validatePairGradePresentation(
     {
         return error.GradePresentationInvalid;
     }
-    const expected_position_map_commitment = try pairGradePositionMapCommitmentAlloc(
+    try validatePairGradePositionMapCommitment(
         allocator,
         try string(aliases.lane_ids.items[0]),
         try string(aliases.lane_ids.items[1]),
         try requiredString(presentation, "position_map_nonce"),
+        position_map_commitment,
     );
-    defer allocator.free(expected_position_map_commitment);
-    if (!std.mem.eql(u8, expected_position_map_commitment, position_map_commitment)) {
-        return error.GradePresentationInvalid;
-    }
     const expected_alias_map_fingerprint = try pairGradeAliasMapFingerprintAlloc(
         allocator,
         trial,
@@ -5576,6 +8095,12 @@ pub fn applyAbsoluteGrade(
     });
     defer trial_parsed.deinit();
     const trial_root = try object(trial_parsed.value);
+    try validateAbsoluteGradeCarrierForTrial(
+        trial_root,
+        parts.payload,
+        receipt,
+        declared_receipt_fingerprint,
+    );
     var presentation_evidence = try validateAbsoluteGradePresentation(
         allocator,
         state,
@@ -5851,6 +8376,12 @@ pub fn applyPairGrade(
     });
     defer trial_parsed.deinit();
     const trial_root = try object(trial_parsed.value);
+    try validatePairGradeCarrierForTrial(
+        trial_root,
+        parts.payload,
+        receipt,
+        declared_receipt_fingerprint,
+    );
     const position_map_commitment = try requiredString(presentation, "position_map_commitment");
     try validateFingerprint(position_map_commitment);
     const sealed = std.mem.eql(
@@ -5858,7 +8389,7 @@ pub fn applyPairGrade(
         try requiredString(try requiredObject(trial_root, "assurance"), "required_level"),
         "sealed",
     );
-    if (!sealed) {
+    if (requiresLegacyPairPresentationCommitment(sealed, has_grade_presentation)) {
         const expected_presentation_commitment = try pairPresentationCommitmentAlloc(
             allocator,
             trial.id,
@@ -5978,7 +8509,7 @@ pub fn applyPairGrade(
     pair.pair_graded = true;
 }
 
-fn revealCommitmentAlloc(
+pub fn revealCommitmentAlloc(
     allocator: std.mem.Allocator,
     trial_id: []const u8,
     mapping: std.json.Value,
@@ -6031,7 +8562,7 @@ fn validateRoleSeparation(
     const require_human_confirmer = try listContains(required_roles, "human_confirmer");
     const require_materializer = try listContains(required_roles, "materializer");
     if (require_pair_grader and !trial.requires_pair_grade) return error.RoleSeparationInvalid;
-    if (std.mem.eql(u8, assurance_view.level, "sealed")) {
+    if (std.mem.eql(u8, assurance_view.level, "sealed") or require_materializer) {
         const receipts = try requiredArray(reveal, "materialization_receipts");
         if (receipts.items.len != trial.lanes.items.len) return error.SealedMaterializationMissing;
     }
@@ -6125,6 +8656,58 @@ fn validateRoleSeparation(
         }
     }
     if (!std.mem.eql(u8, assurance_view.level, "sealed") and !require_materializer) return;
+    const reveal_schema = try requiredString(reveal, "schema");
+    if (std.mem.eql(u8, reveal_schema, retrace_core.hctp_trial_custody.RevealSchema)) {
+        const validations = try requiredArray(reveal, "materializer_validations");
+        if (validations.items.len != trial.lanes.items.len) {
+            return error.SealedMaterializationMissing;
+        }
+        const trial_root = try object(assurance_view.parsed.value);
+        const materializer_contract = try requiredObject(
+            try requiredObject(trial_root, "sealing"),
+            "case_materializer_contract",
+        );
+        const materializer_key_id = try requiredString(
+            materializer_contract,
+            "materializer_key_id",
+        );
+        for (trial.lanes.items) |lane_state| {
+            if ((lane_state.runner_key_id != null and try keyIdsSharePublicMaterial(
+                allocator,
+                trust,
+                materializer_key_id,
+                lane_state.runner_key_id.?,
+            )) or
+                (lane_state.grade_key_id != null and try keyIdsSharePublicMaterial(
+                    allocator,
+                    trust,
+                    materializer_key_id,
+                    lane_state.grade_key_id.?,
+                )) or
+                (lane_state.human_confirmation_key_id != null and
+                    try keyIdsSharePublicMaterial(
+                        allocator,
+                        trust,
+                        materializer_key_id,
+                        lane_state.human_confirmation_key_id.?,
+                    )))
+            {
+                return error.RoleSeparationInvalid;
+            }
+        }
+        for (trial.pairs.items) |pair| {
+            if (pair.grader_key_id != null and try keyIdsSharePublicMaterial(
+                allocator,
+                trust,
+                materializer_key_id,
+                pair.grader_key_id.?,
+            )) return error.RoleSeparationInvalid;
+        }
+        return;
+    }
+    if (!std.mem.eql(u8, reveal_schema, "hylo-trial-reveal/v1")) {
+        return error.RevealInvalid;
+    }
     const receipts = try requiredArray(reveal, "materialization_receipts");
     if (receipts.items.len != trial.lanes.items.len) return error.SealedMaterializationMissing;
     const trial_root = try object(assurance_view.parsed.value);
@@ -6144,7 +8727,11 @@ fn validateRoleSeparation(
     defer materialized_lanes.deinit();
     for (receipts.items) |receipt_value| {
         const receipt = try object(receipt_value);
-        if (!std.mem.eql(u8, try requiredString(receipt, "schema"), "hylo-materialization-receipt/v1")) {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(receipt, "schema"),
+            "hylo-materialization-receipt/v1",
+        )) {
             return error.SealedMaterializationInvalid;
         }
         if (!std.mem.eql(u8, try requiredString(receipt, "trial_id"), trial.id)) {
@@ -6275,6 +8862,116 @@ fn validateRoleSeparation(
     }
 }
 
+/// Validates private signed Seq materialization receipts while the semantic v1
+/// projection is available, then forgets every source-bearing field and emits
+/// only per-lane public commitments for `hylo-trial-reveal/v2`.
+pub fn privateMaterializerValidationsAlloc(
+    allocator: std.mem.Allocator,
+    trial: *const TrialState,
+    semantic_trial_value: std.json.Value,
+    receipt_bytes: []const []const u8,
+) ![]u8 {
+    const semantic_trial = try object(semantic_trial_value);
+    if (!std.mem.eql(u8, try requiredString(semantic_trial, "schema"), TrialSchema)) {
+        return error.TrialInvalid;
+    }
+    const assurance = try requiredObject(semantic_trial, "assurance");
+    const level = try requiredString(assurance, "required_level");
+    const required_roles = try requiredArray(assurance, "required_distinct_roles");
+    const materializer_required = std.mem.eql(u8, level, "sealed") or
+        (std.mem.eql(u8, level, "role_separated") and
+            try listContains(required_roles, "materializer"));
+    if (!materializer_required) {
+        if (receipt_bytes.len != 0) return error.SealedMaterializationInvalid;
+        return allocator.dupe(u8, "[]");
+    }
+    if (receipt_bytes.len != trial.lanes.items.len) return error.SealedMaterializationMissing;
+
+    var reveal_text: std.Io.Writer.Allocating = .init(allocator);
+    defer reveal_text.deinit();
+    try reveal_text.writer.writeAll("{\"materialization_receipts\":[");
+    for (receipt_bytes, 0..) |bytes, index| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        });
+        defer parsed.deinit();
+        const receipt = try object(parsed.value);
+        if (!std.mem.eql(
+            u8,
+            try requiredString(receipt, "schema"),
+            "hylo-materialization-receipt/v1",
+        )) {
+            return error.SealedMaterializationInvalid;
+        }
+        if (index != 0) try reveal_text.writer.writeByte(',');
+        try writeCanonicalJson(allocator, &reveal_text.writer, parsed.value);
+    }
+    try reveal_text.writer.writeAll("],\"schema\":\"hylo-trial-reveal/v1\"}");
+    var reveal = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        reveal_text.written(),
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer reveal.deinit();
+    const semantic_trial_json = try canonicalJsonAlloc(allocator, semantic_trial_value);
+    defer {
+        std.crypto.secureZero(u8, semantic_trial_json);
+        allocator.free(semantic_trial_json);
+    }
+    var semantic_state = trial.*;
+    semantic_state.trial_json = semantic_trial_json;
+    try validateRoleSeparation(
+        allocator,
+        &semantic_state,
+        try object(reveal.value),
+    );
+
+    const receipts = try requiredArray(try object(reveal.value), "materialization_receipts");
+    const contract = try requiredObject(
+        try requiredObject(semantic_trial, "sealing"),
+        "case_materializer_contract",
+    );
+    const materializer_key_id = try requiredString(contract, "materializer_key_id");
+    var projection: std.Io.Writer.Allocating = .init(allocator);
+    defer projection.deinit();
+    try projection.writer.writeByte('[');
+    for (trial.lanes.items, 0..) |lane, index| {
+        var matched: ?std.json.Value = null;
+        for (receipts.items) |receipt_value| {
+            const receipt = try object(receipt_value);
+            if (!std.mem.eql(u8, try requiredString(receipt, "lane_id"), lane.id)) continue;
+            if (matched != null) return error.SealedMaterializationInvalid;
+            matched = receipt_value;
+        }
+        const receipt_value = matched orelse return error.SealedMaterializationMissing;
+        const receipt_fingerprint = try digestValueAlloc(allocator, receipt_value);
+        defer allocator.free(receipt_fingerprint);
+        if (index != 0) try projection.writer.writeByte(',');
+        try projection.writer.writeAll("{\"lane_id\":");
+        try writeCanonicalJson(allocator, &projection.writer, .{ .string = lane.id });
+        try projection.writer.writeAll(",\"materializer_key_id\":");
+        try writeCanonicalJson(allocator, &projection.writer, .{ .string = materializer_key_id });
+        try projection.writer.writeAll(
+            ",\"private_receipt_disclosed\":false,\"private_receipt_fingerprint\":",
+        );
+        try writeCanonicalJson(allocator, &projection.writer, .{ .string = receipt_fingerprint });
+        try projection.writer.writeAll(",\"schema\":\"");
+        try projection.writer.writeAll(
+            retrace_core.hctp_trial_custody.MaterializerValidationSchema,
+        );
+        try projection.writer.writeAll(
+            "\",\"semantic_evidence_returned\":false," ++
+                "\"semantic_material_persisted\":false,\"trial_id\":",
+        );
+        try writeCanonicalJson(allocator, &projection.writer, .{ .string = trial.id });
+        try projection.writer.writeAll(",\"validated\":true}");
+    }
+    try projection.writer.writeByte(']');
+    return projection.toOwnedSlice();
+}
+
 fn requireAttestationKey(actual: []const u8, expected: []const u8, err: anyerror) !void {
     if (!std.mem.eql(u8, actual, expected)) return err;
 }
@@ -6306,38 +9003,17 @@ fn promotionRevealEligible(allocator: std.mem.Allocator, trial: *const TrialStat
     return true;
 }
 
-pub fn applyReveal(
+const RevealProjection = struct {
+    baseline_arm_id: []const u8,
+    candidate_arm_id: []const u8,
+};
+
+fn validateV1Reveal(
     allocator: std.mem.Allocator,
-    state: *CampaignTrials,
-    body_value: std.json.Value,
-    sequence: u64,
-) !void {
-    const parts = try requiredBodyPayload(body_value);
-    if (try optionalString(parts.body, "scenario_id") != null or
-        try optionalString(parts.body, "attempt_id") != null or
-        try optionalString(parts.body, "grade_id") != null)
-    {
-        return error.TrialRevealIdsForbidden;
-    }
-    const reveal_value = try required(parts.payload, "reveal");
-    try validateLimitationsRecursive(reveal_value);
-    const reveal = try object(reveal_value);
-    if (!std.mem.eql(u8, try requiredString(reveal, "schema"), "hylo-trial-reveal/v1")) {
-        return error.RevealInvalid;
-    }
-    const trial = state.findTrial(try requiredString(reveal, "trial_id")) orelse return error.TrialMissing;
-    const reveal_fingerprint = try requiredString(parts.payload, "reveal_fingerprint");
-    try validateFingerprint(reveal_fingerprint);
-    const actual_reveal_fingerprint = try digestValueAlloc(allocator, reveal_value);
-    defer allocator.free(actual_reveal_fingerprint);
-    if (!std.mem.eql(u8, reveal_fingerprint, actual_reveal_fingerprint)) return error.RevealFingerprintMismatch;
-    if (trial.closed) return error.RevealAfterClose;
-    if (trial.revealed) return error.RevealAlreadyRecorded;
-    if (!trial.allLanesTerminal()) return error.RevealBeforeTerminal;
-    if (!trial.allRequiredGradeCommitmentsPresent()) return error.RevealBeforeGradeCommitments;
-    if (!trial.allRequiredGradesPresent()) return error.RevealBeforeGrades;
-    if (!try promotionRevealEligible(allocator, trial)) return error.TrialInvalid;
-    try validateRoleSeparation(allocator, trial, reveal);
+    trial: *const TrialState,
+    trial_object: std.json.ObjectMap,
+    reveal: std.json.ObjectMap,
+) !RevealProjection {
     const mapping_value = try required(reveal, "mapping");
     const mapping = try object(mapping_value);
     const arm0_semantic = try requiredString(mapping, trial.arm0_id);
@@ -6360,12 +9036,6 @@ pub fn applyReveal(
     if (!std.mem.eql(u8, commitment, trial.arm_map_commitment)) return error.RevealCommitmentMismatch;
     const baseline_arm = if (std.mem.eql(u8, arm0_semantic, "baseline")) trial.arm0_id else trial.arm1_id;
     const candidate_arm = if (std.mem.eql(u8, arm0_semantic, "candidate")) trial.arm0_id else trial.arm1_id;
-    var trial_parsed = try std.json.parseFromSlice(std.json.Value, allocator, trial.trial_json, .{
-        .allocate = .alloc_always,
-        .duplicate_field_behavior = .@"error",
-    });
-    defer trial_parsed.deinit();
-    const trial_object = try object(trial_parsed.value);
     if (!std.mem.eql(
         u8,
         try requiredString(reveal, "baseline_target_fingerprint"),
@@ -6405,8 +9075,107 @@ pub fn applyReveal(
     if (!std.mem.eql(u8, reveal_scope, try requiredString(sealing, "reveal_scope"))) {
         return error.RevealScopeInvalid;
     }
-    trial.baseline_arm = try allocator.dupe(u8, baseline_arm);
-    trial.candidate_arm = try allocator.dupe(u8, candidate_arm);
+    return .{
+        .baseline_arm_id = baseline_arm,
+        .candidate_arm_id = candidate_arm,
+    };
+}
+
+fn validateV2MaterializationClaimJoin(
+    allocator: std.mem.Allocator,
+    trial: *const TrialState,
+    reveal: std.json.ObjectMap,
+) !void {
+    const receipts = try requiredArray(reveal, "materialization_receipts");
+    if (receipts.items.len != trial.lanes.items.len) {
+        return error.RevealMaterializationReceiptMissing;
+    }
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    for (receipts.items) |receipt_value| {
+        const receipt = try object(receipt_value);
+        if (!std.mem.eql(
+            u8,
+            try requiredString(receipt, "schema"),
+            "hylo-lane-materialization-receipt/v2",
+        )) return error.RevealMaterializationReceiptVersionMismatch;
+        if (!std.mem.eql(u8, try requiredString(receipt, "trial_id"), trial.id)) {
+            return error.RevealMaterializationReceiptInvalid;
+        }
+        const lane_id = try requiredString(receipt, "lane_id");
+        const lane = trial.findLaneConst(lane_id) orelse
+            return error.RevealMaterializationReceiptInvalid;
+        const inserted = try seen.getOrPut(lane_id);
+        if (inserted.found_existing) return error.RevealMaterializationReceiptDuplicate;
+        const authenticated = lane.materialization_claim_fingerprint orelse
+            return error.RevealMaterializationReceiptMissing;
+        const supplied = try requiredString(receipt, "claim_fingerprint");
+        try validateFingerprint(supplied);
+        if (!std.mem.eql(u8, supplied, authenticated)) {
+            return error.RevealMaterializationClaimMismatch;
+        }
+    }
+}
+
+pub fn applyReveal(
+    allocator: std.mem.Allocator,
+    state: *CampaignTrials,
+    body_value: std.json.Value,
+    sequence: u64,
+) !void {
+    const parts = try requiredBodyPayload(body_value);
+    if (try optionalString(parts.body, "scenario_id") != null or
+        try optionalString(parts.body, "attempt_id") != null or
+        try optionalString(parts.body, "grade_id") != null)
+    {
+        return error.TrialRevealIdsForbidden;
+    }
+    const reveal_value = try required(parts.payload, "reveal");
+    try validateLimitationsRecursive(reveal_value);
+    const reveal = try object(reveal_value);
+    const reveal_schema = try requiredString(reveal, "schema");
+    const trial = state.findTrial(try requiredString(reveal, "trial_id")) orelse
+        return error.TrialMissing;
+    const reveal_fingerprint = try requiredString(parts.payload, "reveal_fingerprint");
+    try validateFingerprint(reveal_fingerprint);
+    const actual_reveal_fingerprint = try digestValueAlloc(allocator, reveal_value);
+    defer allocator.free(actual_reveal_fingerprint);
+    if (!std.mem.eql(u8, reveal_fingerprint, actual_reveal_fingerprint)) {
+        return error.RevealFingerprintMismatch;
+    }
+    if (trial.closed) return error.RevealAfterClose;
+    if (trial.revealed) return error.RevealAlreadyRecorded;
+    if (!trial.allLanesTerminal()) return error.RevealBeforeTerminal;
+    if (!trial.allRequiredGradeCommitmentsPresent()) return error.RevealBeforeGradeCommitments;
+    if (!trial.allRequiredGradesPresent()) return error.RevealBeforeGrades;
+    if (!try promotionRevealEligible(allocator, trial)) return error.TrialInvalid;
+    try validateRoleSeparation(allocator, trial, reveal);
+    var trial_parsed = try std.json.parseFromSlice(std.json.Value, allocator, trial.trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial_parsed.deinit();
+    const trial_object = try object(trial_parsed.value);
+    const trial_schema = try requiredString(trial_object, "schema");
+    const projection: RevealProjection = if (std.mem.eql(u8, trial_schema, TrialSchema) and
+        std.mem.eql(u8, reveal_schema, "hylo-trial-reveal/v1"))
+        try validateV1Reveal(allocator, trial, trial_object, reveal)
+    else if (std.mem.eql(u8, trial_schema, PrivateTrialSchema) and
+        std.mem.eql(u8, reveal_schema, retrace_core.hctp_trial_custody.RevealSchema))
+    blk: {
+        const validated = try retrace_core.hctp_trial_custody.validateReveal(
+            allocator,
+            trial_parsed.value,
+            reveal_value,
+        );
+        try validateV2MaterializationClaimJoin(allocator, trial, reveal);
+        break :blk .{
+            .baseline_arm_id = validated.baseline_arm_id,
+            .candidate_arm_id = validated.candidate_arm_id,
+        };
+    } else return error.RevealInvalid;
+    trial.baseline_arm = try allocator.dupe(u8, projection.baseline_arm_id);
+    trial.candidate_arm = try allocator.dupe(u8, projection.candidate_arm_id);
     trial.reveal_json = try canonicalJsonAlloc(allocator, reveal_value);
     trial.revealed = true;
     trial.reveal_sequence = sequence;
@@ -7041,6 +9810,312 @@ test "sealed materialization attestations use the contract-committed key" {
     );
 }
 
+test "private materializer receipts project to nonsemantic v2 reveal commitments" {
+    const allocator = std.testing.allocator;
+    const materializer_seed = [_]u8{0x61} ** 32;
+    const runner_seed = [_]u8{0x62} ** 32;
+    const grader_seed = [_]u8{0x63} ** 32;
+    const materializer_public = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        materializer_seed,
+    );
+    defer allocator.free(materializer_public);
+    const runner_public = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        runner_seed,
+    );
+    defer allocator.free(runner_public);
+    const grader_public = try retrace_core.hctp_attestation.publicKeyBase64Alloc(
+        allocator,
+        grader_seed,
+    );
+    defer allocator.free(grader_public);
+    const fp_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fp_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const fp_c = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const fp_d = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const semantic_trial_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-trial/v1\",\"assurance\":" ++
+            "{{\"required_level\":\"role_separated\",\"required_distinct_roles\":" ++
+            "[\"runner\",\"materializer\"],\"trust_policy\":{{\"keys\":[" ++
+            "{{\"key_id\":\"materializer-key\",\"public_key_base64\":{f}," ++
+            "\"allowed_roles\":[\"materializer\"]," ++
+            "\"producer_ids\":[\"seq-materializer\"]}}," ++
+            "{{\"key_id\":\"runner-key\",\"public_key_base64\":{f}," ++
+            "\"allowed_roles\":[\"runner\"],\"producer_ids\":[\"cas-runner\"]}}," ++
+            "{{\"key_id\":\"grader-key\",\"public_key_base64\":{f}," ++
+            "\"allowed_roles\":[\"absolute_grader\"]," ++
+            "\"producer_ids\":[\"grader\"]}}]}}}}," ++
+            "\"sealing\":{{\"case_materializer_contract\":" ++
+            "{{\"controller_id\":\"controller\",\"materializer_id\":" ++
+            "\"seq-materializer\",\"materializer_version\":\"v1\"," ++
+            "\"materializer_binary_fingerprint\":{f},\"runner_id\":\"cas-runner\"," ++
+            "\"materializer_key_id\":\"materializer-key\"," ++
+            "\"runner_key_id\":\"runner-key\"," ++
+            "\"capability_delivery\":\"anonymous_fd\"," ++
+            "\"visible_input_delivery\":\"anonymous_fd\"," ++
+            "\"source_profile_delivery\":\"anonymous_fd\"," ++
+            "\"receiver_binding\":\"runner_key\"}}," ++
+            "\"source_selection_receipt_fingerprint\":{f}," ++
+            "\"source_selection_receipt\":{{\"cases\":[{{" ++
+            "\"unit_id\":\"unit-private\",\"scenario_id\":\"scenario-private\"," ++
+            "\"visible_input_fingerprint\":{f}," ++
+            "\"hidden_reference_fingerprint\":{f}," ++
+            "\"source_episode_fingerprint\":{f}," ++
+            "\"source_profile_fingerprint\":{f}," ++
+            "\"sealed_case\":{{\"ciphertext_fingerprint\":{f}}}}}]}}}}}}",
+        .{
+            std.json.fmt(materializer_public, .{}),
+            std.json.fmt(runner_public, .{}),
+            std.json.fmt(grader_public, .{}),
+            std.json.fmt(fp_a, .{}),
+            std.json.fmt(fp_b, .{}),
+            std.json.fmt(fp_a, .{}),
+            std.json.fmt(fp_b, .{}),
+            std.json.fmt(fp_c, .{}),
+            std.json.fmt(fp_d, .{}),
+            std.json.fmt(fp_a, .{}),
+        },
+    );
+    defer allocator.free(semantic_trial_json);
+    var semantic_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        semantic_trial_json,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer semantic_trial.deinit();
+
+    const unsigned_receipt = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-materialization-receipt/v1\"," ++
+            "\"trial_id\":\"trial-private\",\"unit_id\":\"unit-private\"," ++
+            "\"lane_id\":\"lane-private\",\"opaque_arm_id\":\"opaque-private\"," ++
+            "\"visible_input_fingerprint\":{f},\"hidden_reference_fingerprint\":{f}," ++
+            "\"source_episode_projection_version\":" ++
+            "\"hylo-source-episode-projection/v1\"," ++
+            "\"source_episode_fingerprint\":{f},\"source_profile_fingerprint\":{f}," ++
+            "\"ciphertext_fingerprint\":{f}," ++
+            "\"source_selection_receipt_fingerprint\":{f}," ++
+            "\"hidden_reference_disclosed\":false," ++
+            "\"semantic_arm_identity_disclosed\":false," ++
+            "\"capability_scope\":{{\"capability_digest\":{f}," ++
+            "\"trial_id\":\"trial-private\",\"lane_id\":\"lane-private\"," ++
+            "\"unit_count\":1,\"lane_count\":1,\"single_use\":true}}," ++
+            "\"capability_domain\":{{\"controller_identity\":\"controller\"," ++
+            "\"materializer_identity\":\"seq-materializer\"," ++
+            "\"runner_identity\":\"cas-runner\"," ++
+            "\"materializer_key_id\":\"materializer-key\"," ++
+            "\"runner_key_id\":\"runner-key\",\"delivery\":\"anonymous_fd\"," ++
+            "\"receiver_binding\":\"runner_key\",\"single_use\":true}}," ++
+            "\"producer\":{{\"id\":\"seq-materializer\",\"version\":\"v1\"," ++
+            "\"binary_fingerprint\":{f},\"key_id\":\"materializer-key\"}}," ++
+            "\"attestation\":null}}",
+        .{
+            std.json.fmt(fp_a, .{}),
+            std.json.fmt(fp_b, .{}),
+            std.json.fmt(fp_c, .{}),
+            std.json.fmt(fp_d, .{}),
+            std.json.fmt(fp_a, .{}),
+            std.json.fmt(fp_b, .{}),
+            std.json.fmt(fp_c, .{}),
+            std.json.fmt(fp_a, .{}),
+        },
+    );
+    defer allocator.free(unsigned_receipt);
+    const signed_receipt = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        unsigned_receipt,
+        .{
+            .id = "seq-materializer",
+            .version = "v1",
+            .binary_fingerprint = fp_a,
+            .key_id = "materializer-key",
+        },
+        "materializer",
+        1,
+        materializer_seed,
+    );
+    defer allocator.free(signed_receipt);
+
+    var lanes = [_]LaneState{.{
+        .id = @constCast("lane-private"),
+        .unit_id = @constCast("unit-private"),
+        .scenario_id = @constCast("scenario-private"),
+        .pair_id = @constCast("pair-private"),
+        .arm_id = @constCast("opaque-private"),
+        .presented_input_fingerprint = @constCast(fp_a),
+        .runner_key_id = @constCast("runner-key"),
+        .grade_key_id = @constCast("grader-key"),
+    }};
+    var pairs = [_]PairState{.{
+        .id = @constCast("pair-private"),
+        .unit_id = @constCast("unit-private"),
+        .split = @constCast("practice"),
+        .independence_cluster_id = @constCast("cluster-private"),
+        .repeat_index = 0,
+    }};
+    const trial = TrialState{
+        .id = @constCast("trial-private"),
+        .fingerprint = @constCast(fp_a),
+        .purpose = @constCast("practice_repair"),
+        .arm0_id = @constCast("opaque-private"),
+        .arm1_id = @constCast("opaque-other"),
+        .arm_map_commitment = @constCast(fp_b),
+        .trial_json = @constCast("{}"),
+        .lanes = .{ .items = &lanes, .capacity = lanes.len },
+        .pairs = .{ .items = &pairs, .capacity = pairs.len },
+        .requires_pair_grade = false,
+        .registration_sequence = 1,
+        .registration_event_digest = @constCast(fp_c),
+    };
+    const projection = try privateMaterializerValidationsAlloc(
+        allocator,
+        &trial,
+        semantic_trial.value,
+        &.{signed_receipt},
+    );
+    defer allocator.free(projection);
+    try std.testing.expect(
+        std.mem.indexOf(u8, projection, "hylo-materializer-validation/v1") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, projection, "private_receipt_fingerprint") != null);
+    inline for (.{
+        "hidden_reference_fingerprint",
+        "source_episode_fingerprint",
+        "source_profile_fingerprint",
+        "capability_domain",
+        "attestation",
+    }) |forbidden| try std.testing.expect(std.mem.indexOf(u8, projection, forbidden) == null);
+
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        signed_receipt,
+        "lane-private",
+        "lane-changed",
+    );
+    defer allocator.free(tampered);
+    try std.testing.expectError(
+        error.SealedMaterializationInvalid,
+        privateMaterializerValidationsAlloc(
+            allocator,
+            &trial,
+            semantic_trial.value,
+            &.{tampered},
+        ),
+    );
+}
+
+test "v2 reveal exact-joins every materialization claim to authenticated lane state" {
+    const allocator = std.testing.allocator;
+    const claim_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const claim_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var trial = TrialState{
+        .id = try allocator.dupe(u8, "trial-claim-join"),
+        .fingerprint = try allocator.dupe(
+            u8,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+        .purpose = try allocator.dupe(u8, "practice_repair"),
+        .arm0_id = try allocator.dupe(u8, "arm-a"),
+        .arm1_id = try allocator.dupe(u8, "arm-b"),
+        .arm_map_commitment = try allocator.dupe(
+            u8,
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        ),
+        .trial_json = try allocator.dupe(u8, "{}"),
+        .requires_pair_grade = false,
+        .registration_sequence = 1,
+        .registration_event_digest = try allocator.dupe(
+            u8,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        ),
+    };
+    defer trial.deinit(allocator);
+    try trial.lanes.append(allocator, .{
+        .id = try allocator.dupe(u8, "lane-a"),
+        .unit_id = try allocator.dupe(u8, "unit-a"),
+        .scenario_id = try allocator.dupe(u8, "scenario-a"),
+        .pair_id = try allocator.dupe(u8, "pair-a"),
+        .arm_id = try allocator.dupe(u8, "arm-a"),
+        .status = .completed,
+        .materialization_claim_fingerprint = try allocator.dupe(u8, claim_a),
+    });
+    try trial.lanes.append(allocator, .{
+        .id = try allocator.dupe(u8, "lane-b"),
+        .unit_id = try allocator.dupe(u8, "unit-b"),
+        .scenario_id = try allocator.dupe(u8, "scenario-b"),
+        .pair_id = try allocator.dupe(u8, "pair-b"),
+        .arm_id = try allocator.dupe(u8, "arm-b"),
+        .status = .completed,
+        .materialization_claim_fingerprint = try allocator.dupe(u8, claim_b),
+    });
+    const reveal_json =
+        "{\"materialization_receipts\":[" ++
+        "{\"claim_fingerprint\":\"" ++ claim_a ++ "\",\"lane_id\":\"lane-a\"," ++
+        "\"schema\":\"hylo-lane-materialization-receipt/v2\"," ++
+        "\"trial_id\":\"trial-claim-join\"}," ++
+        "{\"claim_fingerprint\":\"" ++ claim_b ++ "\",\"lane_id\":\"lane-b\"," ++
+        "\"schema\":\"hylo-lane-materialization-receipt/v2\"," ++
+        "\"trial_id\":\"trial-claim-join\"}]}";
+    var reveal = try std.json.parseFromSlice(std.json.Value, allocator, reveal_json, .{});
+    defer reveal.deinit();
+    try validateV2MaterializationClaimJoin(allocator, &trial, try object(reveal.value));
+
+    const mismatch_json = try std.mem.replaceOwned(u8, allocator, reveal_json, claim_b, claim_a);
+    defer allocator.free(mismatch_json);
+    var mismatch = try std.json.parseFromSlice(std.json.Value, allocator, mismatch_json, .{});
+    defer mismatch.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationClaimMismatch,
+        validateV2MaterializationClaimJoin(allocator, &trial, try object(mismatch.value)),
+    );
+
+    const second_receipt =
+        ",{\"claim_fingerprint\":\"" ++ claim_b ++ "\",\"lane_id\":\"lane-b\"," ++
+        "\"schema\":\"hylo-lane-materialization-receipt/v2\"," ++
+        "\"trial_id\":\"trial-claim-join\"}";
+    const missing_json = try std.mem.replaceOwned(u8, allocator, reveal_json, second_receipt, "");
+    defer allocator.free(missing_json);
+    var missing = try std.json.parseFromSlice(std.json.Value, allocator, missing_json, .{});
+    defer missing.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptMissing,
+        validateV2MaterializationClaimJoin(allocator, &trial, try object(missing.value)),
+    );
+
+    const duplicate_json = try std.mem.replaceOwned(u8, allocator, reveal_json, "lane-b", "lane-a");
+    defer allocator.free(duplicate_json);
+    var duplicate = try std.json.parseFromSlice(std.json.Value, allocator, duplicate_json, .{});
+    defer duplicate.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptDuplicate,
+        validateV2MaterializationClaimJoin(allocator, &trial, try object(duplicate.value)),
+    );
+
+    const mixed_json = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        reveal_json,
+        "hylo-lane-materialization-receipt/v2",
+        "hylo-materialization-receipt/v1",
+    );
+    defer allocator.free(mixed_json);
+    var mixed = try std.json.parseFromSlice(std.json.Value, allocator, mixed_json, .{});
+    defer mixed.deinit();
+    try std.testing.expectError(
+        error.RevealMaterializationReceiptVersionMismatch,
+        validateV2MaterializationClaimJoin(allocator, &trial, try object(mixed.value)),
+    );
+    try std.testing.expect(trial.lanes.items[0].status == .completed);
+    try std.testing.expectEqualStrings(
+        claim_a,
+        trial.lanes.items[0].materialization_claim_fingerprint.?,
+    );
+}
+
 test "unsupported distinct-role claims fail closed at registration" {
     const trial = try std.mem.replaceOwned(
         u8,
@@ -7327,6 +10402,41 @@ test "sealed pair position commitments hide the registered execution order" {
     );
 }
 
+test "pair grade commitment validation selects exactly one route" {
+    try std.testing.expect(requiresLegacyPairPresentationCommitment(false, false));
+    try std.testing.expect(!requiresLegacyPairPresentationCommitment(false, true));
+    try std.testing.expect(!requiresLegacyPairPresentationCommitment(true, false));
+    try std.testing.expect(!requiresLegacyPairPresentationCommitment(true, true));
+
+    const left = "opaque-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const right = "opaque-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const commitment = try pairGradePositionMapCommitmentAlloc(
+        std.testing.allocator,
+        left,
+        right,
+        nonce,
+    );
+    defer std.testing.allocator.free(commitment);
+    try validatePairGradePositionMapCommitment(
+        std.testing.allocator,
+        left,
+        right,
+        nonce,
+        commitment,
+    );
+    try std.testing.expectError(
+        error.GradePresentationInvalid,
+        validatePairGradePositionMapCommitment(
+            std.testing.allocator,
+            left,
+            right,
+            nonce,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ),
+    );
+}
+
 test "human confirmations cannot be self-asserted at precommitted assurance" {
     const lane = LaneState{
         .id = @constCast("lane-human"),
@@ -7444,6 +10554,431 @@ test "human confirmations accept only a trusted human confirmer signature" {
     try std.testing.expectEqualStrings("human-key", key_id);
 }
 
+test "v2 grade carriers are exact portable public evidence while v1 remains compatible" {
+    const allocator = std.testing.allocator;
+    const ref_a =
+        "artifact:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ref_b =
+        "artifact:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const ref_c =
+        "artifact:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    const grade_output_refs = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        ValidGradeReceiptFixture,
+        "artifact:output",
+        ref_a,
+    );
+    defer allocator.free(grade_output_refs);
+    const strict_grade_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        grade_output_refs,
+        "artifact:trace",
+        ref_b,
+    );
+    defer allocator.free(strict_grade_bytes);
+    var strict_grade = try std.json.parseFromSlice(std.json.Value, allocator, strict_grade_bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer strict_grade.deinit();
+    const strict_grade_fingerprint = try digestValueAlloc(allocator, strict_grade.value);
+    defer allocator.free(strict_grade_fingerprint);
+    const strict_grade_payload_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"grade_receipt_ref\":\"artifact:{s}\"}}",
+        .{strict_grade_fingerprint},
+    );
+    defer allocator.free(strict_grade_payload_bytes);
+    var strict_grade_payload = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        strict_grade_payload_bytes,
+        .{},
+    );
+    defer strict_grade_payload.deinit();
+    var v2_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"schema\":\"hylo-trial/v2\"}",
+        .{},
+    );
+    defer v2_trial.deinit();
+    try validateAbsoluteGradeCarrierForTrial(
+        try object(v2_trial.value),
+        try object(strict_grade_payload.value),
+        try object(strict_grade.value),
+        strict_grade_fingerprint,
+    );
+
+    var v1_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"schema\":\"hylo-trial/v1\"}",
+        .{},
+    );
+    defer v1_trial.deinit();
+    var legacy_grade = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        ValidGradeReceiptFixture,
+        .{},
+    );
+    defer legacy_grade.deinit();
+    var legacy_payload = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"grade_receipt_ref\":\"/tmp/legacy-grade.json\"}",
+        .{},
+    );
+    defer legacy_payload.deinit();
+    try validateAbsoluteGradeCarrierForTrial(
+        try object(v1_trial.value),
+        try object(legacy_payload.value),
+        try object(legacy_grade.value),
+        strict_grade_fingerprint,
+    );
+
+    var private_grade = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        strict_grade_bytes,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer private_grade.deinit();
+    try (try testObjectPtr(&private_grade.value)).put(
+        private_grade.arena.allocator(),
+        "private_reasoning",
+        .{ .string = @constCast("hidden chain of thought") },
+    );
+    const private_unsigned = try canonicalJsonAlloc(allocator, private_grade.value);
+    defer allocator.free(private_unsigned);
+    const private_signed = try retrace_core.hctp_attestation.signReceiptAlloc(
+        allocator,
+        private_unsigned,
+        .{
+            .id = "deterministic-grader",
+            .version = "v1",
+            .binary_fingerprint = std.fmt.comptimePrint(
+                "sha256:{s}",
+                .{"1111111111111111111111111111111111111111111111111111111111111111"},
+            ),
+            .key_id = "grader-key",
+        },
+        "absolute_grader",
+        1,
+        [_]u8{0x61} ** 32,
+    );
+    defer allocator.free(private_signed);
+    var private_signed_value = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        private_signed,
+        .{},
+    );
+    defer private_signed_value.deinit();
+    try std.testing.expectError(
+        error.GradeReceiptInvalid,
+        validateV2AbsoluteGradeReceiptShape(try object(private_signed_value.value), true),
+    );
+
+    var hidden_evidence = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        strict_grade_bytes,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer hidden_evidence.deinit();
+    const hidden_root = try testObjectPtr(&hidden_evidence.value);
+    const hidden_dimensions_value = hidden_root.getPtr("dimensions") orelse
+        return error.TestFixtureInvalid;
+    if (hidden_dimensions_value.* != .array) return error.TestFixtureInvalid;
+    const hidden_dimension = try testObjectPtr(&hidden_dimensions_value.array.items[0]);
+    const hidden_refs = hidden_dimension.getPtr("evidence_refs") orelse
+        return error.TestFixtureInvalid;
+    if (hidden_refs.* != .array) return error.TestFixtureInvalid;
+    hidden_refs.array.items[0] = .{ .string = @constCast(
+        "artifact:sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:" ++
+            "hidden-text",
+    ) };
+    try std.testing.expectError(
+        error.GradeReceiptInvalid,
+        validateV2AbsoluteGradeReceiptShape(try object(hidden_evidence.value), true),
+    );
+
+    inline for (.{ "/tmp/grade.json", "file:///private/grade.json" }) |local_ref| {
+        const local_payload_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"grade_receipt_ref\":{f}}}",
+            .{std.json.fmt(local_ref, .{})},
+        );
+        defer allocator.free(local_payload_bytes);
+        var local_payload = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            local_payload_bytes,
+            .{},
+        );
+        defer local_payload.deinit();
+        try std.testing.expectError(
+            error.GradeReceiptInvalid,
+            validateAbsoluteGradeCarrierForTrial(
+                try object(v2_trial.value),
+                try object(local_payload.value),
+                try object(strict_grade.value),
+                strict_grade_fingerprint,
+            ),
+        );
+    }
+
+    const pair_rationale_ref = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        ValidPairGradeReceiptFixture,
+        "artifact:pair-rationale",
+        ref_c,
+    );
+    defer allocator.free(pair_rationale_ref);
+    const pair_left_ref = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        pair_rationale_ref,
+        "artifact:output-a0",
+        ref_a,
+    );
+    defer allocator.free(pair_left_ref);
+    const strict_pair_bytes = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        pair_left_ref,
+        "artifact:output-a1",
+        ref_b,
+    );
+    defer allocator.free(strict_pair_bytes);
+    var strict_pair = try std.json.parseFromSlice(std.json.Value, allocator, strict_pair_bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer strict_pair.deinit();
+    const strict_pair_fingerprint = try digestValueAlloc(allocator, strict_pair.value);
+    defer allocator.free(strict_pair_fingerprint);
+    const strict_pair_payload_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"pair_grade_receipt_ref\":\"artifact:{s}\"}}",
+        .{strict_pair_fingerprint},
+    );
+    defer allocator.free(strict_pair_payload_bytes);
+    var strict_pair_payload = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        strict_pair_payload_bytes,
+        .{},
+    );
+    defer strict_pair_payload.deinit();
+    try validatePairGradeCarrierForTrial(
+        try object(v2_trial.value),
+        try object(strict_pair_payload.value),
+        try object(strict_pair.value),
+        strict_pair_fingerprint,
+    );
+    var legacy_pair = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        ValidPairGradeReceiptFixture,
+        .{},
+    );
+    defer legacy_pair.deinit();
+    var empty_payload = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer empty_payload.deinit();
+    try validatePairGradeCarrierForTrial(
+        try object(v1_trial.value),
+        try object(empty_payload.value),
+        try object(legacy_pair.value),
+        strict_pair_fingerprint,
+    );
+
+    inline for (.{
+        .{ "rationale_ref", "/tmp/private-rationale.txt" },
+        .{ "evidence_refs", "file:///private/pair-evidence.json" },
+    }) |mutation| {
+        var invalid_pair = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            strict_pair_bytes,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        );
+        defer invalid_pair.deinit();
+        const invalid_root = try testObjectPtr(&invalid_pair.value);
+        const dimensions_value = invalid_root.getPtr("dimensions") orelse
+            return error.TestFixtureInvalid;
+        if (dimensions_value.* != .array) return error.TestFixtureInvalid;
+        const dimension = try testObjectPtr(&dimensions_value.array.items[0]);
+        if (std.mem.eql(u8, mutation[0], "rationale_ref")) {
+            try dimension.put(
+                invalid_pair.arena.allocator(),
+                mutation[0],
+                .{ .string = @constCast(mutation[1]) },
+            );
+        } else {
+            const refs = dimension.getPtr(mutation[0]) orelse return error.TestFixtureInvalid;
+            if (refs.* != .array) return error.TestFixtureInvalid;
+            refs.array.items[0] = .{ .string = @constCast(mutation[1]) };
+        }
+        try std.testing.expectError(
+            error.PairGradeReceiptInvalid,
+            validateV2PairGradeReceiptShape(try object(invalid_pair.value), true),
+        );
+    }
+}
+
+test "v2 grade presentation carriers are exact and content addressed" {
+    const fp_a =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fp_b =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const fp_c =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const fp_d =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const fp_e =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const fp_f =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const fp_1 =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const fp_2 =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const fp_3 =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const fp_4 =
+        "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    const fp_5 =
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    const receipt_text =
+        "{\"schema\":\"hylo-grade-presentation-receipt/v1\"," ++
+        "\"trial_id\":\"trial\",\"kind\":\"absolute\",\n" ++
+        " \"scope\":{\"lane_ids\":[\"lane\"],\"pair_ids\":[]," ++
+        "\"unit_ids\":[\"unit\"],\"unit_count\":1,\"lane_count\":1," ++
+        "\"pair_count\":0},\n" ++
+        " \"grader\":{\"role\":\"absolute_grader\",\"id\":\"grader\"," ++
+        "\"version\":\"v1\",\"binary_fingerprint\":\"" ++ fp_a ++
+        "\",\"key_id\":\"grader-key\"},\n" ++
+        " \"capability_scope\":{\"capability_digest\":\"" ++ fp_b ++
+        "\",\"trial_id\":\"trial\",\"lane_ids\":[\"lane\"],\"pair_ids\":[]," ++
+        "\"allowed_inputs\":[\"output\",\"trace\",\"rubric\"]," ++
+        "\"single_use\":true},\n" ++
+        " \"presentation\":{\"schema\":\"hylo-blind-absolute-presentation/v1\"," ++
+        "\"presentation_fingerprint\":\"" ++ fp_c ++
+        "\",\"grader_presentation_fingerprint\":\"" ++ fp_d ++
+        "\",\"identifier_alias_map_fingerprint\":\"" ++ fp_e ++
+        "\",\"identifier_aliases\":{\"trial_id\":\"opaque-a\"," ++
+        "\"unit_id\":\"opaque-b\",\"pair_ids\":[]," ++
+        "\"lane_ids\":[\"opaque-c\"],\"opaque_arm_id\":\"opaque-d\"}," ++
+        "\"run_receipt_fingerprints\":[\"" ++ fp_f ++
+        "\"],\"output_fingerprints\":[\"" ++ fp_1 ++
+        "\"],\"trace_fingerprints\":[\"" ++ fp_2 ++
+        "\"],\"rubric_fingerprint\":\"" ++ fp_3 ++
+        "\",\"position_map_commitment\":null,\"position_map_nonce\":null},\n" ++
+        " \"semantic_observation\":{" ++
+        "\"schema\":\"hylo-grade-semantic-observation-receipt/v1\"," ++
+        "\"observation_fingerprint\":\"" ++ fp_4 ++
+        "\",\"output_fingerprints\":[\"" ++ fp_1 ++
+        "\"],\"output_byte_counts\":[1],\"trace_fingerprints\":[\"" ++ fp_2 ++
+        "\"],\"trace_byte_counts\":[1],\"carrier_encoding\":\"base64\"," ++
+        "\"semantic_bytes_presented\":true},\n" ++
+        " \"delivery\":{\"method\":\"anonymous_fd\"," ++
+        "\"receiver_binding\":\"grader_key\"," ++
+        "\"receiver_role\":\"absolute_grader\",\"receiver_key_id\":\"grader-key\"," ++
+        "\"single_use\":true},\n" ++
+        " \"disclosure\":{\"semantic_arm_identity\":false,\"target_diff\":false," ++
+        "\"lane_execution_order\":false,\"prior_grades\":false," ++
+        "\"hidden_reference\":false,\"sibling_outputs\":false," ++
+        "\"registered_identifiers\":false},\n" ++
+        " \"execution\":{\"separate_process\":true,\"os_confinement\":false," ++
+        "\"inherited_capability_fds\":[0,1,2,3]},\n" ++
+        " \"producer\":{\"id\":\"materializer\",\"version\":\"v1\"," ++
+        "\"binary_fingerprint\":\"" ++ fp_5 ++
+        "\",\"key_id\":\"materializer-key\"},\"attestation\":null}";
+    var receipt = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        receipt_text,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer receipt.deinit();
+    try validateV2GradePresentationReceiptShape(try object(receipt.value));
+    const fingerprint = try digestValueAlloc(std.testing.allocator, receipt.value);
+    defer std.testing.allocator.free(fingerprint);
+    const payload_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"grade_presentation_receipt_ref\":\"artifact:{s}\"," ++
+            "\"grade_presentation_receipt_fingerprint\":{f}," ++
+            "\"grade_presentation_receipt\":{s}}}",
+        .{ fingerprint, std.json.fmt(fingerprint, .{}), receipt_text },
+    );
+    defer std.testing.allocator.free(payload_text);
+    var payload = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        payload_text,
+        .{},
+    );
+    defer payload.deinit();
+    try validateV2GradePresentationCarrier(try object(payload.value));
+
+    const disclosure = try testObjectPtr(
+        (try testObjectPtr(&receipt.value)).getPtr("disclosure") orelse
+            return error.TestFixtureInvalid,
+    );
+    try std.testing.expectEqual(false, try boolean(disclosure.get("hidden_reference").?));
+    try disclosure.put(
+        receipt.arena.allocator(),
+        "private_reasoning",
+        .{ .string = @constCast("hidden") },
+    );
+    try std.testing.expectError(
+        error.GradePresentationInvalid,
+        validateV2GradePresentationReceiptShape(try object(receipt.value)),
+    );
+
+    inline for (.{ "/tmp/presentation.json", "file:///private/presentation.json" }) |local_ref| {
+        const invalid_payload_text = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"grade_presentation_receipt_ref\":{f}," ++
+                "\"grade_presentation_receipt_fingerprint\":{f}," ++
+                "\"grade_presentation_receipt\":{s}}}",
+            .{ std.json.fmt(local_ref, .{}), std.json.fmt(fingerprint, .{}), receipt_text },
+        );
+        defer std.testing.allocator.free(invalid_payload_text);
+        var invalid_payload = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            invalid_payload_text,
+            .{},
+        );
+        defer invalid_payload.deinit();
+        try std.testing.expectError(
+            error.GradePresentationInvalid,
+            validateV2GradePresentationCarrier(try object(invalid_payload.value)),
+        );
+    }
+}
+
 test "nested FIR portfolio markers are rejected at the Ledger boundary" {
     var wrapped = try std.json.parseFromSlice(
         std.json.Value,
@@ -7455,6 +10990,245 @@ test "nested FIR portfolio markers are rejected at the Ledger boundary" {
     const root = try object(wrapped.value);
     const fir = try requiredObject(root, "fork_inquiry_receipt");
     try std.testing.expectError(error.HiddenRetryOrFork, rejectForkPortfolio(fir));
+}
+
+test "private v2 historical finish admits only canonical FIR token usage array" {
+    const fp_a =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const fp_b =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const fp_c =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const fp_d =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const fp_e =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const canonical_fir =
+        "{\"fork_inquiry_receipt\":{" ++
+        "\"answer\":{\"alternatives\":[],\"assumptions\":[],\"evidence_refs\":[]," ++
+        "\"final_text_ref\":\"artifact:final\",\"hindsight_available\":false," ++
+        "\"reconstructed_decision\":\"decision\",\"rejected_routes\":[]," ++
+        "\"route_flip_conditions\":[],\"selected_route\":\"route\"," ++
+        "\"uncertainty\":\"low\",\"unsupported_claims\":[]}," ++
+        "\"fork\":{\"anchor\":{\"anchor_digest_expected\":\"" ++ fp_a ++
+        "\",\"anchor_digest_observed\":\"" ++ fp_a ++
+        "\",\"exact\":true,\"temporal_horizon\":\"pre_decision\"," ++
+        "\"turns_after\":1,\"turns_before\":1,\"turns_dropped\":0}," ++
+        "\"approval_policy\":\"never\",\"codex_version\":\"test\"," ++
+        "\"ephemeral\":true,\"fork_thread_id\":\"fork\"," ++
+        "\"forked_from_id\":\"source\",\"hooks\":[]," ++
+        "\"lineage_mode\":\"rollout_transcript\",\"model\":\"model\"," ++
+        "\"model_provider\":\"provider\"," ++
+        "\"multi_agent_mode\":\"explicit-request-only\",\"permissions\":{}," ++
+        "\"sandbox\":{},\"service_tier\":\"default\"}," ++
+        "\"gate\":{\"anchor_valid\":true,\"answer_complete\":true," ++
+        "\"approval_or_tool_request_observed\":false," ++
+        "\"hindsight_label_valid\":true,\"lineage_valid\":true," ++
+        "\"permissions_valid\":true,\"receipt_valid\":true}," ++
+        "\"inquiry\":{\"client_user_message_id\":\"message\",\"ended_at\":2," ++
+        "\"evidence_allowed\":[],\"evidence_withheld\":[],\"mode\":\"replay\"," ++
+        "\"question\":\"question\",\"started_at\":1,\"status\":\"completed\"," ++
+        "\"token_usage\":[],\"turn_id\":\"turn\"}," ++
+        "\"inquiry_id\":\"inquiry\",\"lane_id\":\"lane\",\"lifecycle\":{" ++
+        "\"archived\":true,\"cleanup_status\":\"closed\",\"deleted\":true," ++
+        "\"event_log_ref\":\"artifact:events\",\"interrupted\":false}," ++
+        "\"receipt_id\":\"receipt\",\"receipt_version\":\"FIR-v1\"," ++
+        "\"source\":{\"capsule_id\":\"capsule\"," ++
+        "\"lineage_mode\":\"rollout_transcript\"," ++
+        "\"source_artifact_reconstructability\":\"transcript_only\"," ++
+        "\"source_episode_id\":\"episode\",\"source_rollout_path\":\"artifact:rollout\"," ++
+        "\"source_thread_id\":\"source\",\"source_thread_id_present\":true," ++
+        "\"source_turn_digest\":\"" ++ fp_b ++ "\"}," ++
+        "\"workspace_reconstruction\":{\"dependencies_exact\":false," ++
+        "\"dirty_state_exact\":false,\"generated_artifacts_exact\":false," ++
+        "\"head_exact\":false,\"limitations\":[],\"mode\":\"transcript_only\"," ++
+        "\"network_allowed\":false,\"path\":\"workspace\",\"tools_allowed\":false}" ++
+        "},\"replay_binding\":{\"historical_dcp_fingerprint\":\"" ++ fp_c ++
+        "\",\"historical_rip_fingerprint\":\"" ++ fp_d ++
+        "\",\"lane_id\":\"lane\",\"required_lineage\":\"either\"," ++
+        "\"source_profile_fingerprint\":\"" ++ fp_e ++
+        "\",\"trial_id\":\"trial\"}}";
+    var canonical = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        canonical_fir,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer canonical.deinit();
+    try validatePrivateFirReceiptBodyShape(canonical.value);
+
+    inline for (.{ "{}", "[{}]" }) |invalid_token_usage| {
+        const invalid_fir = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            canonical_fir,
+            "\"token_usage\":[]",
+            "\"token_usage\":" ++ invalid_token_usage,
+        );
+        defer std.testing.allocator.free(invalid_fir);
+        var invalid = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            invalid_fir,
+            .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+        );
+        defer invalid.deinit();
+        try std.testing.expectError(
+            error.PrivateTrialSemanticLeak,
+            validatePrivateFirReceiptBodyShape(invalid.value),
+        );
+    }
+}
+
+test "private v2 historical finish validates only an exact FIR public projection" {
+    const allocator = std.testing.allocator;
+    const fp_1 =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const fp_2 =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const fp_3 =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const fp_4 =
+        "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    const fp_5 =
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    const fp_e =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const fp_f =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const trial_text =
+        "{\"schema\":\"hylo-trial/v2\",\"trial_id\":\"trial-private-historical\"," ++
+        "\"units\":[{\"unit_id\":\"unit-private-historical\",\"source_profile\":{" ++
+        "\"kind\":\"historical_decision\",\"source_governance_fingerprint\":\"" ++
+        fp_1 ++ "\",\"decision_context_fingerprint\":\"" ++ fp_2 ++
+        "\",\"required_lineage\":\"rollout_transcript\"," ++
+        "\"source_profile_fingerprint\":\"" ++ fp_4 ++
+        "\",\"source_target_text_witness_fingerprint\":\"" ++ fp_5 ++
+        "\"}}],\"sealing\":{\"source_selection_receipt\":null}}";
+    var trial_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trial_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer trial_parsed.deinit();
+    const trial = try object(trial_parsed.value);
+    const lane = LaneState{
+        .id = @constCast("lane-private-historical"),
+        .unit_id = @constCast("unit-private-historical"),
+        .scenario_id = @constCast("scenario-private-historical"),
+        .pair_id = @constCast("pair-private-historical"),
+        .arm_id = @constCast("arm-private-historical"),
+    };
+    const projection_text =
+        "{\"schema\":\"hylo-fir-public-projection/v1\"," ++
+        "\"trial_id\":\"trial-private-historical\"," ++
+        "\"lane_id\":\"lane-private-historical\",\"fir_receipt_fingerprint\":\"" ++
+        fp_f ++ "\",\"source_governance_fingerprint\":\"" ++ fp_1 ++
+        "\",\"decision_context_fingerprint\":\"" ++ fp_2 ++
+        "\",\"replay_plan_fingerprint\":\"" ++ fp_3 ++
+        "\",\"source_profile_fingerprint\":\"" ++ fp_4 ++
+        "\",\"source_target_text_witness_fingerprint\":\"" ++ fp_5 ++
+        "\",\"episode_identity_fingerprint\":\"" ++ fp_e ++
+        "\",\"required_lineage\":\"rollout_transcript\",\"validated\":true}";
+    var projection_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        projection_text,
+        .{},
+    );
+    defer projection_parsed.deinit();
+    const projection_fingerprint = try digestValueAlloc(allocator, projection_parsed.value);
+    defer allocator.free(projection_fingerprint);
+    const native_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fingerprint\":{f},\"kind\":\"FIR-v1-public-projection\"," ++
+            "\"receipt\":{s},\"ref\":\"artifact:{s}\"}}",
+        .{ std.json.fmt(projection_fingerprint, .{}), projection_text, projection_fingerprint },
+    );
+    defer allocator.free(native_text);
+    var native_parsed = try std.json.parseFromSlice(std.json.Value, allocator, native_text, .{});
+    defer native_parsed.deinit();
+    const native = try object(native_parsed.value);
+    try validatePrivateFirNativeReceiptShape(native);
+    try validateFirPublicProjection(allocator, trial, &lane, native);
+
+    const smuggled_projection = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        projection_text,
+        "\"validated\":true}",
+        "\"validated\":true,\"answer\":{\"selected_route\":\"private\"}}",
+    );
+    defer allocator.free(smuggled_projection);
+    var smuggled_projection_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        smuggled_projection,
+        .{},
+    );
+    defer smuggled_projection_parsed.deinit();
+    const smuggled_fingerprint = try digestValueAlloc(allocator, smuggled_projection_parsed.value);
+    defer allocator.free(smuggled_fingerprint);
+    const smuggled_native_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fingerprint\":{f},\"kind\":\"FIR-v1-public-projection\"," ++
+            "\"receipt\":{s},\"ref\":\"artifact:{s}\"}}",
+        .{ std.json.fmt(smuggled_fingerprint, .{}), smuggled_projection, smuggled_fingerprint },
+    );
+    defer allocator.free(smuggled_native_text);
+    var smuggled_native_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        smuggled_native_text,
+        .{},
+    );
+    defer smuggled_native_parsed.deinit();
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        validatePrivateFirNativeReceiptShape(try object(smuggled_native_parsed.value)),
+    );
+
+    const forged_projection = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        projection_text,
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    );
+    defer allocator.free(forged_projection);
+    var forged_projection_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        forged_projection,
+        .{},
+    );
+    defer forged_projection_parsed.deinit();
+    const forged_fingerprint = try digestValueAlloc(allocator, forged_projection_parsed.value);
+    defer allocator.free(forged_fingerprint);
+    const forged_native_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fingerprint\":{f},\"kind\":\"FIR-v1-public-projection\"," ++
+            "\"receipt\":{s},\"ref\":\"artifact:{s}\"}}",
+        .{ std.json.fmt(forged_fingerprint, .{}), forged_projection, forged_fingerprint },
+    );
+    defer allocator.free(forged_native_text);
+    var forged_native_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        forged_native_text,
+        .{},
+    );
+    defer forged_native_parsed.deinit();
+    try std.testing.expectError(
+        error.RetraceSourceLineageInvalid,
+        validateFirPublicProjection(
+            allocator,
+            trial,
+            &lane,
+            try object(forged_native_parsed.value),
+        ),
+    );
 }
 
 test "historical-decision lanes reject a signed non-FIR native receipt before adapter dispatch" {
@@ -7546,6 +11320,206 @@ test "historical-decision lanes reject a signed non-FIR native receipt before ad
     try std.testing.expectError(
         error.RetraceFirInvalid,
         validateRunReceipt(std.testing.allocator, &trial, &lane, receipt.value),
+    );
+}
+
+test "private v2 runner contract rejects unsupported os confinement" {
+    const fp =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const contract_text =
+        "{\"atomic_claim\":true," ++
+        "\"executor_authority\":{\"authorized_observations\":[]," ++
+        "\"binary_fingerprint\":\"" ++ fp ++ "\",\"key_id\":\"executor-key\"," ++
+        "\"producer_id\":\"executor\"},\"executor_binary_fingerprint\":\"" ++ fp ++ "\"," ++
+        "\"fresh_thread\":true,\"fresh_workspace\":true," ++
+        "\"ledger_authority\":{\"binary_fingerprint\":\"" ++ fp ++
+        "\",\"key_id\":\"ledger-key\",\"producer_id\":\"ledger\"}," ++
+        "\"ledger_binary_fingerprint\":\"" ++ fp ++ "\"," ++
+        "\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1," ++
+        "\"maximum_retries_per_lane\":0,\"schema\":\"cas-hylo-runner/v1\"}";
+    var contract_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        contract_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer contract_parsed.deinit();
+    const contract = try testObjectPtr(&contract_parsed.value);
+    try validatePrivateTrialRunnerContractShape(contract.*);
+
+    const contract_allocator = contract_parsed.arena.allocator();
+    try contract.put(
+        contract_allocator,
+        "capability_delivery",
+        .{ .string = @constCast("anonymous_fd") },
+    );
+    try contract.put(
+        contract_allocator,
+        "executor_request_schema",
+        .{ .string = @constCast("cas-trial-executor-request/v1") },
+    );
+    try contract.put(
+        contract_allocator,
+        "receiver_binding",
+        .{ .string = @constCast("executor_key") },
+    );
+    try contract.put(contract_allocator, "single_use", .{ .bool = true });
+    var seal_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"cas_observations\":[],\"default_effect_decision\":\"deny\"," ++
+            "\"effect_mediation\":\"attested-executor\"," ++
+            "\"effect_policy_fingerprint\":\"" ++ fp ++
+            "\",\"os_confinement\":false,\"profile_id\":\"cas-capability-sealed-v1\"," ++
+            "\"schema\":\"cas-capability-seal/v1\"," ++
+            "\"target_data_mode\":\"cas-content-addressed-pre-post-equality\"}",
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer seal_parsed.deinit();
+    try contract.put(contract_allocator, "capability_seal", seal_parsed.value);
+    try validatePrivateTrialRunnerContractShape(contract.*);
+
+    const seal = try testObjectPtr(
+        contract.getPtr("capability_seal") orelse return error.TestFixtureInvalid,
+    );
+    try seal.put(seal_parsed.arena.allocator(), "os_confinement", .{ .bool = true });
+    try std.testing.expectError(
+        error.CapabilitySealContractInvalid,
+        validatePrivateTrialRunnerContractShape(contract.*),
+    );
+}
+
+test "private run receipt shape rejects root and nested semantic smuggling" {
+    const private_trial_text =
+        "{\"schema\":\"hylo-trial/v2\",\"units\":[{" ++
+        "\"unit_id\":\"unit-null-001\"," ++
+        "\"source_profile\":{\"kind\":\"direct\"}}],\"sealing\":{}}";
+    var private_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        private_trial_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer private_trial.deinit();
+    const trial_root = try object(private_trial.value);
+    const lane = LaneState{
+        .id = @constCast("lane-null-a0"),
+        .unit_id = @constCast("unit-null-001"),
+        .scenario_id = @constCast("scenario-holdout"),
+        .pair_id = @constCast("pair-null-001"),
+        .arm_id = @constCast("arm-0"),
+    };
+
+    var run = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        ValidRunReceiptFixture,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer run.deinit();
+    const run_allocator = run.arena.allocator();
+    const run_root = try testObjectPtr(&run.value);
+    try run_root.put(run_allocator, "schema", .{ .string = @constCast("hylo-run-receipt/v2") });
+    const producer = try testObjectPtr(
+        run_root.getPtr("producer") orelse return error.TestFixtureInvalid,
+    );
+    try producer.put(run_allocator, "receiver_role", .{ .string = @constCast("runner") });
+    try producer.put(run_allocator, "receiver_key_id", .{ .string = @constCast("runner-key") });
+    const materialization = try testObjectPtr(
+        run_root.getPtr("materialization") orelse return error.TestFixtureInvalid,
+    );
+    inline for (.{
+        "arm_value_fingerprint",
+        "target_snapshot_ref",
+        "target_snapshot_fingerprint",
+    }) |key| {
+        _ = materialization.orderedRemove(key);
+    }
+    try materialization.put(
+        run_allocator,
+        "visibility",
+        .{ .string = @constCast("commitment_only") },
+    );
+    try materialization.put(
+        run_allocator,
+        "treatment_commitment",
+        .{ .string = @constCast(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ) },
+    );
+    try materialization.put(
+        run_allocator,
+        "materialization_claim_fingerprint",
+        .{ .string = @constCast(
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        ) },
+    );
+    const isolation = try testObjectPtr(
+        run_root.getPtr("isolation") orelse return error.TestFixtureInvalid,
+    );
+    try isolation.put(run_allocator, "capability_sealed", .{ .bool = false });
+    try isolation.put(run_allocator, "os_confinement", .{ .bool = false });
+    const native = try testObjectPtr(
+        run_root.getPtr("native_receipt") orelse return error.TestFixtureInvalid,
+    );
+    const native_receipt = try testObjectPtr(
+        native.getPtr("receipt") orelse return error.TestFixtureInvalid,
+    );
+    const native_execution = try testObjectPtr(
+        native_receipt.getPtr("execution") orelse return error.TestFixtureInvalid,
+    );
+    try native_execution.put(
+        run_allocator,
+        "execution_audit_fingerprint",
+        .{ .string = @constCast(
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        ) },
+    );
+    try native_execution.put(
+        run_allocator,
+        "execution_audit_ref",
+        .{ .string = @constCast("artifact:audit") },
+    );
+    try native_execution.put(run_allocator, "executor", .{ .string = @constCast("executor") });
+    try native_execution.put(
+        run_allocator,
+        "executor_binary_fingerprint",
+        .{ .string = @constCast(
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        ) },
+    );
+    try native_execution.put(run_allocator, "internal_execution_verified", .{ .bool = true });
+    try native_execution.put(
+        run_allocator,
+        "observation_scope",
+        .{ .string = @constCast("registered-executor-audit") },
+    );
+    try validatePrivateRunReceiptShape(trial_root, &lane, run_root.*);
+
+    try isolation.put(run_allocator, "os_confinement", .{ .bool = true });
+    try std.testing.expectError(
+        error.IsolationInvalid,
+        validatePrivateRunReceiptShape(trial_root, &lane, run_root.*),
+    );
+    try isolation.put(run_allocator, "os_confinement", .{ .bool = false });
+
+    try run_root.put(run_allocator, "private_custody", .{
+        .object = try std.json.ObjectMap.init(run_allocator, &.{}, &.{}),
+    });
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        validatePrivateRunReceiptShape(trial_root, &lane, run_root.*),
+    );
+    _ = run_root.orderedRemove("private_custody");
+    const runtime = try testObjectPtr(
+        run_root.getPtr("runtime") orelse return error.TestFixtureInvalid,
+    );
+    try runtime.put(run_allocator, "target_materialization", .{
+        .object = try std.json.ObjectMap.init(run_allocator, &.{}, &.{}),
+    });
+    try std.testing.expectError(
+        error.PrivateTrialSemanticLeak,
+        validatePrivateRunReceiptShape(trial_root, &lane, run_root.*),
     );
 }
 

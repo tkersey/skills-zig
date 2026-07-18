@@ -42,6 +42,13 @@ extern "c" fn proc_pidinfo(
 const adapter = retrace_core.hctp_adapter;
 const attestation = retrace_core.hctp_attestation;
 const Version = core_cli.normalizeVersion(app_meta.version);
+const LegacyTrialSchema = "hylo-trial/v1";
+const LegacyRunReceiptSchema = "hylo-run-receipt/v1";
+const PrivateRunReceiptSchema = "hylo-run-receipt/v2";
+const FirPublicProjectionSchema = "hylo-fir-public-projection/v1";
+const FirPublicProjectionKind = "FIR-v1-public-projection";
+const LegacyExecutorRequestSchema = "cas-trial-executor-request/v1";
+const ReplayBoundExecutorRequestSchema = "cas-trial-executor-request/v2";
 const MaxInputBytes = 64 * 1024 * 1024;
 const MaxTargetCarrierBytes = 96 * 1024 * 1024;
 const ExecutorPollIntervalMs: i64 = 10;
@@ -69,7 +76,7 @@ comptime {
 const UsageText =
     \\cas_trial
     \\
-    \\One-claim HCTP-v1 lane runner and receipt normalizer.
+    \\One-claim HCTP lane runner and receipt normalizer.
     \\
     \\Usage:
     \\  cas_trial preflight --trial FILE --lane-id ID [--json]
@@ -77,6 +84,7 @@ const UsageText =
     \\  cas_trial run --trial FILE --lane-id ID --repo DIR --receipt-dir DIR
     \\      --registration-event-digest SHA256 --start-event-digest SHA256
     \\      --lease-fd N --input-fd N --presented-input-fingerprint SHA256
+    \\      [--materialization-fd N]
     \\      --executor PATH --ledger PATH [--source-profile-fd N]
     \\      [--signing-seed-fd N] [--producer-id ID]
     \\      [--producer-key-id ID] [--json]
@@ -90,7 +98,16 @@ const UsageText =
     \\  EXECUTOR --request REQUEST.json --result RESULT.json
     \\It receives no lane lease or hidden reference. CAS claims the lane before
     \\execution, creates a fresh workspace, hashes every evidence file, and emits
-    \\one hylo-run-receipt/v1. A persistent claim makes retry a hard error.
+    \\one version-matched hylo-run-receipt. A hylo-trial/v2 lane requires
+    \\--materialization-fd and emits commitment-only hylo-run-receipt/v2.
+    \\That receipt authenticates the exact protected claim bytes as
+    \\materialization_claim_fingerprint without publishing their contents.
+    \\For target_snapshot lanes it carries an exact
+    \\hylo-target-common-projection-opening/v1 as target_common_projection_opening.
+    \\Historical comparison lanes prepare replay privately inside `run` after
+    \\protected source-profile delivery. `compile-replay` is diagnostic-only;
+    \\its outputs grant no execution authority and are not inputs to `run`.
+    \\A persistent claim makes retry a hard error.
 ;
 
 const HelpSurface = core_cli.HelpSurface{
@@ -113,6 +130,7 @@ const Options = struct {
     lease_fd: ?std.posix.fd_t = null,
     input_fd: ?std.posix.fd_t = null,
     source_profile_fd: ?std.posix.fd_t = null,
+    materialization_fd: ?std.posix.fd_t = null,
     presented_input_fingerprint: ?[]const u8 = null,
     executor: ?[]const u8 = null,
     ledger: ?[]const u8 = null,
@@ -143,9 +161,64 @@ const LaneView = struct {
     execution: std.json.ObjectMap,
 };
 
+const TrialRouteProjection = struct {
+    source_profile_kind: []const u8,
+    compile_replay_required: bool,
+    replay_preparation_mode: []const u8,
+    source_profile_body_delivery: []const u8,
+    execution_route: []const u8,
+    required_lineage: ?[]const u8,
+};
+
+fn trialRouteProjection(view: LaneView) !TrialRouteProjection {
+    const profile = try object(view.source_profile);
+    const source_kind = try requiredString(profile, "kind");
+    if (std.mem.eql(u8, source_kind, "direct")) return .{
+        .source_profile_kind = source_kind,
+        .compile_replay_required = false,
+        .replay_preparation_mode = "none",
+        .source_profile_body_delivery = "none",
+        .execution_route = "direct",
+        .required_lineage = null,
+    };
+    if (!std.mem.eql(u8, source_kind, "historical_decision")) return error.SourceProfileInvalid;
+    const delivery = if (profile.get("profile_body_delivery")) |_|
+        try requiredString(profile, "profile_body_delivery")
+    else
+        "embedded";
+    if (!oneOf(delivery, &.{ "embedded", "source_profile_fd" })) return error.SourceProfileInvalid;
+    return .{
+        .source_profile_kind = source_kind,
+        .compile_replay_required = false,
+        .replay_preparation_mode = "integrated_run",
+        .source_profile_body_delivery = delivery,
+        .execution_route = "historical_replay",
+        .required_lineage = try requiredString(profile, "required_lineage"),
+    };
+}
+
 const SourceIdentity = struct {
     episode_fingerprint: []const u8,
     profile_fingerprint: []const u8,
+};
+
+const ReplayPreparation = struct {
+    dcp: []u8,
+    dcp_fingerprint: []u8,
+    rip: []u8,
+    rip_fingerprint: []u8,
+    source_profile_fingerprint: []u8,
+    source_profile_delivery: []const u8,
+    required_lineage: []u8,
+
+    fn deinit(self: ReplayPreparation, allocator: std.mem.Allocator) void {
+        allocator.free(self.dcp);
+        allocator.free(self.dcp_fingerprint);
+        allocator.free(self.rip);
+        allocator.free(self.rip_fingerprint);
+        allocator.free(self.source_profile_fingerprint);
+        allocator.free(self.required_lineage);
+    }
 };
 
 fn sourceIdentity(view: LaneView) !?SourceIdentity {
@@ -182,6 +255,8 @@ const FactorMaterialization = struct {
 
 const TargetMaterialization = struct {
     present: bool,
+    materialization_claim_fingerprint: ?[]u8 = null,
+    treatment_commitment: ?[]u8 = null,
     arm_value_fingerprint: ?[]const u8,
     snapshot_ref: ?[]const u8,
     snapshot_fingerprint: ?[]const u8,
@@ -196,6 +271,8 @@ const TargetMaterialization = struct {
     package_root: []const u8,
 
     fn deinit(self: TargetMaterialization, allocator: std.mem.Allocator) void {
+        if (self.materialization_claim_fingerprint) |fingerprint| allocator.free(fingerprint);
+        if (self.treatment_commitment) |commitment| allocator.free(commitment);
         if (self.arm_value_fingerprint) |fingerprint| allocator.free(fingerprint);
         if (self.snapshot_ref) |ref| allocator.free(ref);
         if (self.snapshot_fingerprint) |fingerprint| allocator.free(fingerprint);
@@ -207,6 +284,88 @@ const TargetMaterialization = struct {
         if (self.effect_policy_fingerprint) |fingerprint| allocator.free(fingerprint);
     }
 };
+
+const PublicTargetMaterialization = struct {
+    private_trial: bool,
+    materialization_claim_fingerprint: ?[]const u8,
+    arm_value_fingerprint: []const u8,
+    snapshot_ref: []u8,
+    snapshot_fingerprint: []const u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        materialization: TargetMaterialization,
+    ) !PublicTargetMaterialization {
+        if (materialization.treatment_commitment) |commitment| {
+            const claim_fingerprint = materialization.materialization_claim_fingerprint orelse
+                return error.TargetMaterializationClaimMismatch;
+            return .{
+                .private_trial = true,
+                .materialization_claim_fingerprint = claim_fingerprint,
+                .arm_value_fingerprint = commitment,
+                .snapshot_ref = try std.fmt.allocPrint(
+                    allocator,
+                    "private-custody:{s}",
+                    .{commitment},
+                ),
+                .snapshot_fingerprint = commitment,
+            };
+        }
+        return .{
+            .private_trial = false,
+            .materialization_claim_fingerprint = null,
+            .arm_value_fingerprint = materialization.arm_value_fingerprint orelse
+                return error.TargetMaterializationClaimMismatch,
+            .snapshot_ref = try allocator.dupe(
+                u8,
+                materialization.snapshot_ref orelse return error.TargetMaterializationClaimMismatch,
+            ),
+            .snapshot_fingerprint = materialization.snapshot_fingerprint orelse
+                return error.TargetMaterializationClaimMismatch,
+        };
+    }
+
+    fn deinit(self: PublicTargetMaterialization, allocator: std.mem.Allocator) void {
+        allocator.free(self.snapshot_ref);
+    }
+};
+
+fn writePrivateMaterializationProjection(
+    writer: *std.Io.Writer,
+    materialization: PublicTargetMaterialization,
+) !void {
+    if (!materialization.private_trial) return error.PrivateRunReceiptProjectionInvalid;
+    try writeStringMember(writer, "visibility", "commitment_only", true);
+    try writeStringMember(
+        writer,
+        "treatment_commitment",
+        materialization.arm_value_fingerprint,
+        true,
+    );
+    try writeStringMember(
+        writer,
+        "materialization_claim_fingerprint",
+        materialization.materialization_claim_fingerprint orelse
+            return error.TargetMaterializationClaimMismatch,
+        true,
+    );
+}
+
+fn isPrivateTrial(view: LaneView) !bool {
+    const schema = try requiredString(view.trial, "schema");
+    if (std.mem.eql(u8, schema, LegacyTrialSchema)) return false;
+    if (std.mem.eql(u8, schema, retrace_core.hctp_trial_custody.PublicTrialSchema)) return true;
+    return error.TrialSchemaInvalid;
+}
+
+fn runReceiptSchemaForTrial(view: LaneView) ![]const u8 {
+    return if (try isPrivateTrial(view)) PrivateRunReceiptSchema else LegacyRunReceiptSchema;
+}
+
+fn isRunReceiptSchema(schema: []const u8) bool {
+    return std.mem.eql(u8, schema, LegacyRunReceiptSchema) or
+        std.mem.eql(u8, schema, PrivateRunReceiptSchema);
+}
 
 const TargetCommonProjection = struct {
     bytes: []u8,
@@ -269,7 +428,35 @@ const CapabilitySealIdentity = struct {
 
 const RunnerContractValidation = struct {
     capability_seal: ?CapabilitySealIdentity = null,
+    executor_request_schema: []const u8 = LegacyExecutorRequestSchema,
 };
+
+fn admittedExecutorRequestSchema(contract: std.json.ObjectMap) ![]const u8 {
+    const value = contract.get("executor_request_schema") orelse return LegacyExecutorRequestSchema;
+    const schema = string(value) catch return error.ExecutorRequestSchemaInvalid;
+    if (!oneOf(schema, &.{ LegacyExecutorRequestSchema, ReplayBoundExecutorRequestSchema })) {
+        return error.ExecutorRequestSchemaInvalid;
+    }
+    return schema;
+}
+
+fn executorRequestSchemaForRoute(
+    private_trial: bool,
+    historical: bool,
+    admitted_schema: []const u8,
+) ![]const u8 {
+    if (!oneOf(admitted_schema, &.{
+        LegacyExecutorRequestSchema,
+        ReplayBoundExecutorRequestSchema,
+    })) {
+        return error.ExecutorRequestSchemaInvalid;
+    }
+    if (!historical) return LegacyExecutorRequestSchema;
+    if (private_trial and !std.mem.eql(u8, admitted_schema, ReplayBoundExecutorRequestSchema)) {
+        return error.ExecutorRequestSchemaV2Required;
+    }
+    return admitted_schema;
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -314,7 +501,45 @@ fn parseArgs(argv: []const []const u8) !Options {
         }
         const value = if (index + 1 < argv.len) argv[index + 1] else return error.MissingValue;
         index += 1;
-        if (std.mem.eql(u8, token, "--trial")) options.trial_path = value else if (std.mem.eql(u8, token, "--trial-id")) options.trial_id = value else if (std.mem.eql(u8, token, "--lane-id")) options.lane_id = value else if (std.mem.eql(u8, token, "--repo")) options.repo = value else if (std.mem.eql(u8, token, "--receipt-dir")) options.receipt_dir = value else if (std.mem.eql(u8, token, "--output-dir")) options.output_dir = value else if (std.mem.eql(u8, token, "--registration-event-digest")) options.registration_event_digest = value else if (std.mem.eql(u8, token, "--start-event-digest")) options.start_event_digest = value else if (std.mem.eql(u8, token, "--presented-input-fingerprint")) options.presented_input_fingerprint = value else if (std.mem.eql(u8, token, "--executor")) options.executor = value else if (std.mem.eql(u8, token, "--ledger")) options.ledger = value else if (std.mem.eql(u8, token, "--producer-id")) options.producer_id = value else if (std.mem.eql(u8, token, "--producer-key-id")) options.producer_key_id = value else if (std.mem.eql(u8, token, "--lease-fd")) options.lease_fd = try parseFd(value) else if (std.mem.eql(u8, token, "--input-fd")) options.input_fd = try parseFd(value) else if (std.mem.eql(u8, token, "--source-profile-fd")) options.source_profile_fd = try parseFd(value) else if (std.mem.eql(u8, token, "--signing-seed-fd")) options.signing_seed_fd = try parseFd(value) else return error.UnknownFlag;
+        if (std.mem.eql(u8, token, "--trial")) {
+            options.trial_path = value;
+        } else if (std.mem.eql(u8, token, "--trial-id")) {
+            options.trial_id = value;
+        } else if (std.mem.eql(u8, token, "--lane-id")) {
+            options.lane_id = value;
+        } else if (std.mem.eql(u8, token, "--repo")) {
+            options.repo = value;
+        } else if (std.mem.eql(u8, token, "--receipt-dir")) {
+            options.receipt_dir = value;
+        } else if (std.mem.eql(u8, token, "--output-dir")) {
+            options.output_dir = value;
+        } else if (std.mem.eql(u8, token, "--registration-event-digest")) {
+            options.registration_event_digest = value;
+        } else if (std.mem.eql(u8, token, "--start-event-digest")) {
+            options.start_event_digest = value;
+        } else if (std.mem.eql(u8, token, "--presented-input-fingerprint")) {
+            options.presented_input_fingerprint = value;
+        } else if (std.mem.eql(u8, token, "--executor")) {
+            options.executor = value;
+        } else if (std.mem.eql(u8, token, "--ledger")) {
+            options.ledger = value;
+        } else if (std.mem.eql(u8, token, "--producer-id")) {
+            options.producer_id = value;
+        } else if (std.mem.eql(u8, token, "--producer-key-id")) {
+            options.producer_key_id = value;
+        } else if (std.mem.eql(u8, token, "--lease-fd")) {
+            options.lease_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, token, "--input-fd")) {
+            options.input_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, token, "--source-profile-fd")) {
+            options.source_profile_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, token, "--materialization-fd")) {
+            options.materialization_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, token, "--signing-seed-fd")) {
+            options.signing_seed_fd = try parseFd(value);
+        } else {
+            return error.UnknownFlag;
+        }
     }
     return options;
 }
@@ -328,19 +553,22 @@ fn parseFd(raw: []const u8) !std.posix.fd_t {
 fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
     var loaded = try loadLane(allocator, options.trial_path orelse return error.MissingTrial, options.lane_id orelse return error.MissingLaneId);
     defer loaded.parsed.deinit();
-    var effective_profile = try effectiveSourceProfile(allocator, loaded.view.source_profile, options.source_profile_fd);
-    defer effective_profile.deinit();
-    var view = loaded.view;
-    view.source_profile = effective_profile.value;
-    const source_kind = try requiredString(try object(view.source_profile), "kind");
-    if (std.mem.eql(u8, source_kind, "historical_decision")) {
-        var profile = try adapter.validateHistoricalProfile(
+    if (options.source_profile_fd) |fd| {
+        closeOwnedFd(fd);
+        return error.SourceProfileFdForbidden;
+    }
+    const view = loaded.view;
+    const route = try trialRouteProjection(view);
+    if (std.mem.eql(u8, route.source_profile_kind, "historical_decision") and
+        std.mem.eql(u8, route.source_profile_body_delivery, "embedded"))
+    {
+        var report = try adapter.validateHistoricalProfile(
             allocator,
             view.source_profile,
             std.mem.eql(u8, view.purpose, "promotion") or std.mem.eql(u8, view.purpose, "practice_repair"),
         );
-        profile.deinit(allocator);
-    } else if (!std.mem.eql(u8, source_kind, "direct")) return error.SourceProfileInvalid;
+        report.deinit(allocator);
+    }
     const reset = try requiredObject(view.execution, "reset_policy");
     inline for (.{ "fresh_thread", "fresh_workspace", "clear_target_local_caches", "sibling_output_isolation" }) |key| {
         if (!try requiredBool(reset, key)) return error.ResetPolicyInvalid;
@@ -350,7 +578,16 @@ fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
         .status = "ready",
         .trial_id = view.trial_id,
         .lane_id = view.lane_id,
-        .source_kind = source_kind,
+        .source_profile_kind = route.source_profile_kind,
+        .compile_replay_required = route.compile_replay_required,
+        .replay_preparation_mode = route.replay_preparation_mode,
+        // `source_kind` shipped in cas-trial-preflight/v1 before the canonical
+        // route-projection capability. Keep it as an agreeing compatibility
+        // alias while canonical consumers use `source_profile_kind`.
+        .source_kind = route.source_profile_kind,
+        .source_profile_body_delivery = route.source_profile_body_delivery,
+        .execution_route = route.execution_route,
+        .required_lineage = route.required_lineage,
         .atomic_claim_required = true,
         .fresh_workspace_required = true,
         .lease_transport = "fd-only",
@@ -360,19 +597,40 @@ fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
 fn cmdCompileReplay(allocator: std.mem.Allocator, options: Options) !void {
     var loaded = try loadLane(allocator, options.trial_path orelse return error.MissingTrial, options.lane_id orelse return error.MissingLaneId);
     defer loaded.parsed.deinit();
-    var effective_profile = try effectiveSourceProfile(allocator, loaded.view.source_profile, options.source_profile_fd);
-    defer effective_profile.deinit();
-    var view = loaded.view;
-    view.source_profile = effective_profile.value;
+    const view = loaded.view;
+    try validatePathComponent(view.lane_id);
+    const projected = try object(view.source_profile);
+    const source_kind = try requiredString(projected, "kind");
+    if (std.mem.eql(u8, source_kind, "direct")) return error.DirectLaneCompileReplayForbidden;
+    if (!std.mem.eql(u8, source_kind, "historical_decision")) return error.SourceProfileInvalid;
+    const assurance = try requiredString(
+        try requiredObject(view.trial, "assurance"),
+        "required_level",
+    );
+    if (std.mem.eql(u8, assurance, "role_separated") or std.mem.eql(u8, assurance, "sealed")) {
+        return error.DiagnosticReplayAssuranceForbidden;
+    }
+    const sealing = try requiredObject(view.trial, "sealing");
+    if (std.mem.eql(u8, try requiredString(sealing, "case_visibility"), "case_blind") or
+        projected.get("profile_body_delivery") != null or
+        options.source_profile_fd != null)
+    {
+        if (options.source_profile_fd) |fd| closeOwnedFd(fd);
+        return error.DiagnosticReplayPrivateSourceForbidden;
+    }
     var profile_report = try adapter.validateHistoricalProfile(
         allocator,
         view.source_profile,
-        std.mem.eql(u8, view.purpose, "promotion") or std.mem.eql(u8, view.purpose, "practice_repair"),
+        std.mem.eql(u8, view.purpose, "promotion") or
+            std.mem.eql(u8, view.purpose, "practice_repair"),
     );
     defer profile_report.deinit(allocator);
     const profile = try object(view.source_profile);
-    const output_dir = options.output_dir orelse return error.MissingOutputDir;
-    try std.Io.Dir.cwd().createDirPath(defaultIo(), output_dir);
+    const output_dir = try validateCallerPrivateOutputRootAlloc(
+        allocator,
+        options.output_dir orelse return error.MissingOutputDir,
+    );
+    defer allocator.free(output_dir);
     const capsule_path = try std.fmt.allocPrint(allocator, "{s}/{s}.dcp.json", .{ output_dir, view.lane_id });
     defer allocator.free(capsule_path);
     const plan_path = try std.fmt.allocPrint(allocator, "{s}/{s}.rip.json", .{ output_dir, view.lane_id });
@@ -380,7 +638,13 @@ fn cmdCompileReplay(allocator: std.mem.Allocator, options: Options) !void {
     const context = profile.get("decision_context") orelse return error.DecisionContextMissing;
     const context_json = try attestation.canonicalJsonAlloc(allocator, context);
     defer allocator.free(context_json);
-    try durable_store.writeTextAtomic(allocator, capsule_path, context_json);
+    const capsule_fingerprint = try attestation.digestBytesAlloc(allocator, context_json);
+    defer allocator.free(capsule_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        capsule_fingerprint,
+        try requiredString(profile, "decision_context_fingerprint"),
+    )) return error.DecisionContextFingerprintMismatch;
     const prompt = try replayPromptAlloc(allocator, view);
     defer allocator.free(prompt);
     const plan = try adapter.compileReplayPlanAlloc(allocator, context, .{
@@ -392,16 +656,150 @@ fn cmdCompileReplay(allocator: std.mem.Allocator, options: Options) !void {
         .maximum_tokens_per_lane = try requiredU64(view.execution, "maximum_tokens_per_lane"),
     });
     defer allocator.free(plan);
-    try durable_store.writeTextAtomic(allocator, plan_path, plan);
+    const plan_fingerprint = try attestation.digestBytesAlloc(allocator, plan);
+    defer allocator.free(plan_fingerprint);
+    try persistPrivateReplayPair(
+        allocator,
+        capsule_path,
+        context_json,
+        capsule_fingerprint,
+        plan_path,
+        plan,
+        plan_fingerprint,
+    );
     try printJson(.{
         .schema = "cas-trial-replay-plan-receipt/v1",
         .trial_id = view.trial_id,
         .lane_id = view.lane_id,
-        .capsule_ref = capsule_path,
-        .plan_ref = plan_path,
+        .source_profile_kind = "historical_decision",
+        .source_profile_delivery = "embedded",
+        .output_boundary = "caller_private_root",
+        .capsule_fingerprint = capsule_fingerprint,
+        .plan_fingerprint = plan_fingerprint,
         .lane_count = 1,
         .fork_count = 1,
+        .semantic_source_profile_returned = false,
+        .execution_authority = false,
     });
+}
+
+fn validateCallerPrivateOutputRootAlloc(
+    allocator: std.mem.Allocator,
+    raw_path: []const u8,
+) ![]u8 {
+    const resolved = std.fs.path.resolve(allocator, &.{raw_path}) catch
+        return error.PrivateOutputBoundaryInvalid;
+    errdefer allocator.free(resolved);
+    durable_store.rejectSymlinkComponents(resolved) catch
+        return error.PrivateOutputBoundaryInvalid;
+    const stat = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        resolved,
+        .{ .follow_symlinks = false },
+    ) catch return error.PrivateOutputBoundaryInvalid;
+    if (stat.kind != .directory) return error.PrivateOutputBoundaryInvalid;
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), resolved, .{ .follow_symlinks = false }) catch
+        return error.PrivateOutputBoundaryInvalid;
+    defer dir.close(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(dir.handle, &native_stat) != 0 or
+        !std.c.S.ISDIR(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.mode & 0o777 != 0o700)
+    {
+        return error.PrivateOutputBoundaryInvalid;
+    }
+    return resolved;
+}
+
+fn persistPrivateReplayArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+    expected_fingerprint: []const u8,
+) !void {
+    try durable_store.writeTextCreateNewAtomic(allocator, path, bytes, .{
+        .reject_symlinks = true,
+        .file_mode = 0o600,
+        .sync = true,
+    });
+    validatePrivateReplayArtifact(allocator, path, expected_fingerprint) catch |err| {
+        deleteFileIfExists(path) catch return error.PrivateReplayArtifactRollbackFailed;
+        return err;
+    };
+}
+
+fn validatePrivateReplayArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_fingerprint: []const u8,
+) !void {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(defaultIo(), path, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openFile(defaultIo(), path, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
+    defer file.close(defaultIo());
+    const stat = try file.stat(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(file.handle, &native_stat) != 0 or
+        stat.kind != .file or
+        !std.c.S.ISREG(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.nlink != 1 or
+        stat.permissions.toMode() & 0o777 != 0o600)
+    {
+        return error.PrivateOutputBoundaryInvalid;
+    }
+    const observed = try openFileFingerprintAlloc(allocator, file, stat.size);
+    defer allocator.free(observed);
+    if (!std.mem.eql(u8, observed, expected_fingerprint)) return error.PrivateOutputBoundaryInvalid;
+}
+
+fn requirePrivateReplayOutputAbsent(path: []const u8) !void {
+    _ = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return error.PrivateReplayArtifactConflict,
+    };
+    return error.PrivateReplayArtifactConflict;
+}
+
+fn persistPrivateReplayPair(
+    allocator: std.mem.Allocator,
+    capsule_path: []const u8,
+    capsule: []const u8,
+    capsule_fingerprint: []const u8,
+    plan_path: []const u8,
+    plan: []const u8,
+    plan_fingerprint: []const u8,
+) !void {
+    try requirePrivateReplayOutputAbsent(capsule_path);
+    try requirePrivateReplayOutputAbsent(plan_path);
+    persistPrivateReplayArtifact(
+        allocator,
+        capsule_path,
+        capsule,
+        capsule_fingerprint,
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.PrivateReplayArtifactConflict,
+        else => return err,
+    };
+    persistPrivateReplayArtifact(allocator, plan_path, plan, plan_fingerprint) catch |err| {
+        deleteFileIfExists(capsule_path) catch return error.PrivateReplayArtifactRollbackFailed;
+        return switch (err) {
+            error.PathAlreadyExists => error.PrivateReplayArtifactConflict,
+            else => err,
+        };
+    };
 }
 
 fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
@@ -413,10 +811,39 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
     try validateFingerprint(registration_digest);
     try validateFingerprint(start_digest);
 
+    const paths = try lanePathsAlloc(
+        allocator,
+        receipt_dir,
+        options.claim_store_override,
+        loaded.view.trial_id,
+        loaded.view.lane_id,
+    );
+    defer paths.deinit(allocator);
+    const claim_path = try claimPathAlloc(allocator, paths.claim, registration_digest);
+    defer allocator.free(claim_path);
+    const projected_kind = try requiredString(try object(loaded.view.source_profile), "kind");
+    if (pathExists(claim_path) and std.mem.eql(u8, projected_kind, "historical_decision")) {
+        try validateHistoricalClaimBindingPresence(allocator, claim_path);
+    }
+    if (pathExists(paths.receipt) or pathExists(paths.workspace)) return error.LaneAlreadyClaimed;
+
     const lease_fd = options.lease_fd orelse return error.MissingLeaseFd;
     const input_fd = options.input_fd orelse return error.MissingInputFd;
     const signing_seed_fd = options.signing_seed_fd;
-    try validateSensitiveInputFds(lease_fd, input_fd, options.source_profile_fd, signing_seed_fd);
+    const private_trial = try isPrivateTrial(loaded.view);
+    if (private_trial and options.materialization_fd == null) {
+        return error.PrivateMaterializationFdRequired;
+    }
+    if (!private_trial and options.materialization_fd != null) {
+        return error.PrivateMaterializationFdForbidden;
+    }
+    try validateSensitiveInputFds(
+        lease_fd,
+        input_fd,
+        options.source_profile_fd,
+        options.materialization_fd,
+        signing_seed_fd,
+    );
     const lease = try readOwnedFdRawAlloc(allocator, lease_fd, 256);
     defer {
         std.crypto.secureZero(u8, lease);
@@ -432,11 +859,36 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
     if (!std.mem.eql(u8, input_fingerprint, options.presented_input_fingerprint orelse return error.MissingInputFingerprint)) {
         return error.PresentedInputMismatch;
     }
-    var effective_profile = try effectiveSourceProfile(allocator, loaded.view.source_profile, options.source_profile_fd);
+    const private_materialization_claim: ?[]u8 = if (options.materialization_fd) |fd|
+        try readOwnedFdRawAlloc(allocator, fd, MaxTargetCarrierBytes)
+    else
+        null;
+    defer if (private_materialization_claim) |claim| {
+        std.crypto.secureZero(u8, claim);
+        allocator.free(claim);
+    };
+    var effective_profile = try effectiveSourceProfile(
+        allocator,
+        loaded.view.source_profile,
+        options.source_profile_fd,
+        private_trial,
+    );
     defer effective_profile.deinit();
     var view = loaded.view;
     view.source_profile = effective_profile.value;
     const source_kind = try requiredString(try object(view.source_profile), "kind");
+    const projected_profile = try object(loaded.view.source_profile);
+    const source_profile_delivery: []const u8 = if (std.mem.eql(
+        u8,
+        source_kind,
+        "historical_decision",
+    ))
+        if (projected_profile.get("profile_body_delivery") != null)
+            try requiredString(projected_profile, "profile_body_delivery")
+        else
+            "embedded"
+    else
+        "none";
     if (std.mem.eql(u8, source_kind, "historical_decision")) {
         var profile_report = try adapter.validateHistoricalProfile(
             allocator,
@@ -479,6 +931,11 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         executor.fingerprint,
         ledger.fingerprint,
     );
+    const executor_request_schema = try executorRequestSchemaForRoute(
+        private_trial,
+        std.mem.eql(u8, source_kind, "historical_decision"),
+        runner_contract.executor_request_schema,
+    );
     var signing_seed: ?[32]u8 = if (std.mem.eql(u8, assurance, "precommitted")) blk: {
         if (signing_seed_fd) |fd| {
             closeOwnedFd(fd);
@@ -493,14 +950,6 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
     };
     defer if (signing_seed) |*seed| std.crypto.secureZero(u8, seed);
 
-    const paths = try lanePathsAlloc(
-        allocator,
-        receipt_dir,
-        options.claim_store_override,
-        view.trial_id,
-        view.lane_id,
-    );
-    defer paths.deinit(allocator);
     const target_materialization = try resolveTargetMaterializationAlloc(
         allocator,
         view,
@@ -513,6 +962,7 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         paths.target_materialization_workspace,
         paths.target_materialization_archive,
         paths.target_package_root,
+        private_materialization_claim,
     );
     defer target_materialization.deinit(allocator);
     if (sealed and
@@ -529,27 +979,61 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         paths.factor_materialization_archive,
     );
     defer factor_materialization.deinit(allocator);
+    const replay_preparation: ?ReplayPreparation = if (std.mem.eql(
+        u8,
+        source_kind,
+        "historical_decision",
+    ))
+        try prepareHistoricalReplayAlloc(allocator, view, source_profile_delivery)
+    else
+        null;
+    defer if (replay_preparation) |replay| replay.deinit(allocator);
     try durable_store.ensureDirectoryPathNoSymlinks(paths.root);
-    if (pathExists(paths.receipt) or pathExists(paths.workspace)) {
-        return error.LaneAlreadyClaimed;
-    }
     const input_path = try std.fmt.allocPrint(allocator, "{s}/presented-input.json", .{paths.workspace});
     defer allocator.free(input_path);
     const request = try buildExecutorRequestAlloc(
         allocator,
         view,
         paths.execution_root,
-        paths.decision_context,
         input_path,
         input_fingerprint,
         lease_digest,
         factor_materialization,
         target_materialization,
+        executor_request_schema,
+        replay_preparation,
+        paths.replay_dcp,
+        paths.replay_rip,
     );
     defer allocator.free(request);
-    const claim_path = try claimPathAlloc(allocator, paths.claim, registration_digest);
-    defer allocator.free(claim_path);
-    try claimLane(allocator, claim_path, view, registration_digest, start_digest, lease_digest);
+    if (pathExists(claim_path)) {
+        try validateExistingMaterializationClaimFingerprint(
+            allocator,
+            claim_path,
+            target_materialization.materialization_claim_fingerprint,
+        );
+        if (replay_preparation) |replay| {
+            try validateExistingHistoricalClaim(
+                allocator,
+                claim_path,
+                view,
+                replay,
+                executor_request_schema,
+            );
+        }
+        return error.LaneAlreadyClaimed;
+    }
+    try claimLaneWithReplay(
+        allocator,
+        claim_path,
+        view,
+        registration_digest,
+        start_digest,
+        lease_digest,
+        replay_preparation,
+        executor_request_schema,
+        target_materialization.materialization_claim_fingerprint,
+    );
     var milestones = FailureMilestones{};
     const executor_output_limit = options.executor_output_limit_override orelse MaxInputBytes;
     const receipt = runClaimedLaneAlloc(
@@ -572,6 +1056,7 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         signing_seed,
         factor_materialization,
         target_materialization,
+        replay_preparation,
         &milestones,
         executor_output_limit,
     ) catch |run_error| blk: {
@@ -596,6 +1081,7 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
             signing_seed,
             factor_materialization,
             target_materialization,
+            replay_preparation,
             milestones,
             run_error,
             executor_output_limit,
@@ -603,6 +1089,7 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         break :blk failure_receipt;
     };
     defer allocator.free(receipt);
+    try validatePublicRunReceiptProjection(allocator, receipt, view, target_materialization);
     try sealEvidenceArchive(allocator, paths.evidence);
     if (try regularFileExistsNoFollow(paths.failure_detail)) {
         const failure_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.failure_detail);
@@ -643,6 +1130,115 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
     }
 }
 
+fn validatePublicRunReceiptProjection(
+    allocator: std.mem.Allocator,
+    receipt: []const u8,
+    view: LaneView,
+    target_materialization: TargetMaterialization,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    if (!std.mem.eql(
+        u8,
+        try requiredString(root, "schema"),
+        try runReceiptSchemaForTrial(view),
+    )) return error.RunReceiptSchemaMismatch;
+    if (!(try isPrivateTrial(view))) return;
+
+    const materialization = try requiredObject(root, "materialization");
+    if (!std.mem.eql(u8, try requiredString(materialization, "visibility"), "commitment_only") or
+        !std.mem.eql(
+            u8,
+            try requiredString(materialization, "treatment_commitment"),
+            try requiredString(view.arm, "treatment_commitment"),
+        ))
+    {
+        return error.PrivateRunReceiptProjectionInvalid;
+    }
+    var iterator = materialization.iterator();
+    while (iterator.next()) |entry| {
+        if (!oneOf(entry.key_ptr.*, &.{
+            "visibility",
+            "treatment_commitment",
+            "materialization_claim_fingerprint",
+            "presented_input_ref",
+            "presented_input_fingerprint",
+            "source_episode_fingerprint",
+            "source_profile_fingerprint",
+            "historical_dcp_fingerprint",
+            "historical_rip_fingerprint",
+            "source_profile_body_delivery",
+            "hidden_reference_presented",
+            "sibling_output_presented",
+        })) return error.PrivateRunReceiptProjectionInvalid;
+    }
+    const materialization_claim_fingerprint = try requiredString(
+        materialization,
+        "materialization_claim_fingerprint",
+    );
+    try validateFingerprint(materialization_claim_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        materialization_claim_fingerprint,
+        target_materialization.materialization_claim_fingerprint orelse
+            return error.PrivateRunReceiptProjectionInvalid,
+    )) return error.PrivateRunReceiptProjectionInvalid;
+    inline for (.{
+        "semantic_role",
+        "arm_value_fingerprint",
+        "target_snapshot_ref",
+        "target_snapshot_fingerprint",
+        "target_materialization_archive_ref",
+        "target_materialization_archive_fingerprint",
+        "target_package_tree_before_fingerprint",
+        "target_package_tree_after_fingerprint",
+        "factor_materialization_ref",
+        "factor_materialization_fingerprint",
+        "factor_materialization_archive_ref",
+        "factor_materialization_archive_fingerprint",
+    }) |forbidden_key| {
+        if (std.mem.indexOf(u8, receipt, forbidden_key) != null) {
+            return error.PrivateRunReceiptSemanticLeak;
+        }
+    }
+    inline for (.{
+        target_materialization.arm_value_fingerprint,
+        target_materialization.snapshot_ref,
+        target_materialization.snapshot_fingerprint,
+        target_materialization.carrier_fingerprint,
+    }) |private_value| {
+        if (private_value) |value| {
+            if (value.len != 0 and std.mem.indexOf(u8, receipt, value) != null) {
+                return error.PrivateRunReceiptSemanticLeak;
+            }
+        }
+    }
+    inline for (.{
+        target_materialization.workspace_ref,
+        target_materialization.archive_ref,
+        target_materialization.package_root,
+    }) |private_ref| {
+        if (private_ref.len != 0 and std.mem.indexOf(u8, receipt, private_ref) != null) {
+            return error.PrivateRunReceiptSemanticLeak;
+        }
+    }
+
+    if (root.get("native_receipt")) |native_value| {
+        const native = try object(native_value);
+        const kind = try requiredString(native, "kind");
+        if (std.mem.eql(u8, kind, "FIR-v1")) {
+            return error.PrivateRunReceiptSemanticLeak;
+        }
+        if (std.mem.eql(u8, kind, FirPublicProjectionKind)) {
+            try validateFirPublicProjection(allocator, native, view);
+        }
+    }
+}
+
 fn runClaimedLaneAlloc(
     allocator: std.mem.Allocator,
     view: LaneView,
@@ -663,14 +1259,19 @@ fn runClaimedLaneAlloc(
     signing_seed: ?[32]u8,
     factor_materialization: FactorMaterialization,
     target_materialization: TargetMaterialization,
+    replay_preparation: ?ReplayPreparation,
     milestones: *FailureMilestones,
     executor_output_limit: usize,
 ) ![]u8 {
-    try durable_store.ensureDirectoryPathNoSymlinks(paths.workspace);
+    try ensurePrivateWorkspaceRoot(paths.workspace);
     try durable_store.ensureDirectoryPathNoSymlinks(paths.execution_root);
     try durable_store.ensureDirectoryPathNoSymlinks(paths.executor_output_root);
     try durable_store.ensureDirectoryPathNoSymlinks(paths.evidence);
     milestones.workspace_created = true;
+    if (replay_preparation) |replay| {
+        try persistHistoricalReplay(allocator, paths, replay);
+        milestones.replay_persisted = true;
+    }
     try persistTargetMaterialization(allocator, target_materialization);
     milestones.target_materialization_persisted = target_materialization.present;
     const target_package_baseline = try captureTargetPackageBaselineAlloc(allocator, target_materialization);
@@ -690,7 +1291,6 @@ fn runClaimedLaneAlloc(
     try durable_store.writeTextCreateNewAtomic(allocator, input_path, input, .{});
     try archiveFileAtPath(allocator, input_path, paths.presented_input_archive, input_fingerprint);
     milestones.input_persisted = true;
-    try persistDecisionContext(allocator, view, paths);
     try durable_store.writeTextCreateNewAtomic(allocator, paths.request, request, .{});
     milestones.request_persisted = true;
     const result = runExecutorForTrial(
@@ -762,6 +1362,7 @@ fn runClaimedLaneAlloc(
         target_materialization,
         target_package_observation,
         execution_tree_observed,
+        replay_preparation,
     );
     defer allocator.free(unsigned);
     return signTerminalReceiptAlloc(
@@ -774,28 +1375,6 @@ fn runClaimedLaneAlloc(
     );
 }
 
-fn persistDecisionContext(
-    allocator: std.mem.Allocator,
-    view: LaneView,
-    paths: LanePaths,
-) !void {
-    const profile = try object(view.source_profile);
-    if (std.mem.eql(u8, try requiredString(profile, "kind"), "direct")) return;
-    const context = profile.get("decision_context") orelse return error.DecisionContextMissing;
-    const canonical = try attestation.canonicalJsonAlloc(allocator, context);
-    defer allocator.free(canonical);
-    const expected_fingerprint = try requiredString(profile, "decision_context_fingerprint");
-    try requireBytesFingerprint(allocator, canonical, expected_fingerprint);
-    try durable_store.writeTextCreateNewAtomic(allocator, paths.decision_context, canonical, .{});
-    try archiveFileAtPath(
-        allocator,
-        paths.decision_context,
-        paths.decision_context_archive,
-        expected_fingerprint,
-    );
-    try makePathReadOnly(paths.decision_context);
-}
-
 const FailureDisposition = struct {
     status: []const u8,
     class: []const u8,
@@ -803,6 +1382,7 @@ const FailureDisposition = struct {
 
 const FailureMilestones = struct {
     workspace_created: bool = false,
+    replay_persisted: bool = false,
     target_materialization_persisted: bool = false,
     factor_materialization_persisted: bool = false,
     input_persisted: bool = false,
@@ -987,6 +1567,7 @@ fn buildClaimedFailureReceiptAlloc(
     signing_seed: ?[32]u8,
     factor_materialization: FactorMaterialization,
     target_materialization: TargetMaterialization,
+    replay_preparation: ?ReplayPreparation,
     milestones: FailureMilestones,
     run_error: anyerror,
     executor_output_limit: usize,
@@ -1022,7 +1603,22 @@ fn buildClaimedFailureReceiptAlloc(
         run_error == error.ExecutorOutputLimitExceeded;
     const detail = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"cas-trial-failure-detail/v1\",\"trial_id\":{f},\"lane_id\":{f},\"terminal_status\":{f},\"failure_class\":{f},\"runner_error\":{f},\"executor\":{f},\"executor_binary_fingerprint\":{f},\"milestones\":{{\"workspace_created\":{},\"target_materialization_persisted\":{},\"factor_materialization_persisted\":{},\"input_persisted\":{},\"request_persisted\":{},\"executor_returned\":{}}},\"executor_stdout_ref\":{f},\"executor_stdout_fingerprint\":{f},\"executor_stderr_ref\":{f},\"executor_stderr_fingerprint\":{f},\"output_capture\":{{\"limit_bytes_per_stream\":{},\"stdout_bytes_persisted\":{f},\"stderr_bytes_persisted\":{f},\"stdout_complete\":{},\"stderr_complete\":{},\"stdout_truncated\":{},\"stderr_truncated\":{}}},\"lease_secret_persisted\":false,\"signing_seed_persisted\":false}}\n",
+        "{{\"schema\":\"cas-trial-failure-detail/v1\",\"trial_id\":{f}," ++
+            "\"lane_id\":{f},\"terminal_status\":{f},\"failure_class\":{f}," ++
+            "\"runner_error\":{f},\"executor\":{f}," ++
+            "\"executor_binary_fingerprint\":{f},\"milestones\":{{" ++
+            "\"workspace_created\":{},\"replay_persisted\":{}," ++
+            "\"target_materialization_persisted\":{}," ++
+            "\"factor_materialization_persisted\":{},\"input_persisted\":{}," ++
+            "\"request_persisted\":{},\"executor_returned\":{}}}," ++
+            "\"executor_stdout_ref\":{f},\"executor_stdout_fingerprint\":{f}," ++
+            "\"executor_stderr_ref\":{f},\"executor_stderr_fingerprint\":{f}," ++
+            "\"output_capture\":{{\"limit_bytes_per_stream\":{}," ++
+            "\"stdout_bytes_persisted\":{f},\"stderr_bytes_persisted\":{f}," ++
+            "\"stdout_complete\":{},\"stderr_complete\":{}," ++
+            "\"stdout_truncated\":{},\"stderr_truncated\":{}}}," ++
+            "\"lease_secret_persisted\":false," ++
+            "\"signing_seed_persisted\":false}}\n",
         .{
             std.json.fmt(view.trial_id, .{}),
             std.json.fmt(view.lane_id, .{}),
@@ -1032,6 +1628,7 @@ fn buildClaimedFailureReceiptAlloc(
             std.json.fmt(executor, .{}),
             std.json.fmt(executor_fingerprint, .{}),
             milestones.workspace_created,
+            milestones.replay_persisted,
             milestones.target_materialization_persisted,
             milestones.factor_materialization_persisted,
             milestones.input_persisted,
@@ -1081,7 +1678,6 @@ fn buildClaimedFailureReceiptAlloc(
     defer allocator.free(failure_audit_fingerprint);
     const source_profile = try object(view.source_profile);
     const historical = std.mem.eql(u8, try requiredString(source_profile, "kind"), "historical_decision");
-    if (historical) try ensureHistoricalDecisionContextArchive(allocator, view, paths);
     const native = if (historical)
         try historicalTerminalNativeReceiptAlloc(
             allocator,
@@ -1090,7 +1686,8 @@ fn buildClaimedFailureReceiptAlloc(
             disposition,
             executor,
             executor_fingerprint,
-            paths.decision_context_archive,
+            replay_preparation orelse return error.HistoricalReplayCompilationRequired,
+            runner_contract.executor_request_schema,
             failure_audit_path,
             failure_audit_fingerprint,
         )
@@ -1106,17 +1703,21 @@ fn buildClaimedFailureReceiptAlloc(
             failure_audit_fingerprint,
             false,
         );
-    defer allocator.free(native.json);
-    defer allocator.free(native.fingerprint);
+    defer native.deinit(allocator);
     try archiveBytesAtPath(allocator, native.json, paths.failure_native_receipt, native.fingerprint);
     const seed_json = try canonicalFieldAlloc(allocator, view.pair.get("shared_seed") orelse .null);
     defer allocator.free(seed_json);
     const now = unixSeconds();
+    const public_materialization = try PublicTargetMaterialization.init(
+        allocator,
+        target_materialization,
+    );
+    defer public_materialization.deinit(allocator);
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeByte('{');
-    try writeStringMember(writer, "schema", "hylo-run-receipt/v1", true);
+    try writeStringMember(writer, "schema", try runReceiptSchemaForTrial(view), true);
     try writeStringMember(writer, "trial_id", view.trial_id, true);
     try writeStringMember(writer, "unit_id", view.unit_id, true);
     try writeStringMember(writer, "scenario_id", view.scenario_id, true);
@@ -1135,41 +1736,103 @@ fn buildClaimedFailureReceiptAlloc(
     try writeStringMember(writer, "receiver_role", "runner", true);
     try writeStringMember(writer, "receiver_key_id", producer_key_id, false);
     try writer.writeAll("},\"materialization\":{");
-    try writeStringMember(writer, "arm_value_fingerprint", target_materialization.arm_value_fingerprint orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeStringMember(writer, "target_snapshot_ref", target_materialization.snapshot_ref orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeStringMember(writer, "target_snapshot_fingerprint", target_materialization.snapshot_fingerprint orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeOptionalStringMember(
-        writer,
-        "target_materialization_archive_ref",
-        if (target_materialization.present and pathExists(target_materialization.archive_ref)) target_materialization.archive_ref else null,
-        true,
-    );
-    try writeOptionalStringMember(
-        writer,
-        "target_materialization_archive_fingerprint",
-        if (target_materialization.present and pathExists(target_materialization.archive_ref)) target_materialization.carrier_fingerprint else null,
-        true,
-    );
-    try writeOptionalStringMember(writer, "factor_materialization_ref", if (factor_materialization.present) factor_materialization.ref else null, true);
-    try writeOptionalStringMember(writer, "factor_materialization_fingerprint", if (factor_materialization.present) factor_materialization.fingerprint else null, true);
-    try writeOptionalStringMember(
-        writer,
-        "factor_materialization_archive_ref",
-        if (factor_materialization.present and pathExists(factor_materialization.archive_ref)) factor_materialization.archive_ref else null,
-        true,
-    );
-    try writeOptionalStringMember(
-        writer,
-        "factor_materialization_archive_fingerprint",
-        if (factor_materialization.present and pathExists(factor_materialization.archive_ref)) factor_materialization.fingerprint else null,
-        true,
-    );
+    if (public_materialization.private_trial) {
+        try writePrivateMaterializationProjection(writer, public_materialization);
+    } else {
+        try writeStringMember(
+            writer,
+            "arm_value_fingerprint",
+            public_materialization.arm_value_fingerprint,
+            true,
+        );
+        try writeStringMember(
+            writer,
+            "target_snapshot_ref",
+            public_materialization.snapshot_ref,
+            true,
+        );
+        try writeStringMember(
+            writer,
+            "target_snapshot_fingerprint",
+            public_materialization.snapshot_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_materialization_archive_ref",
+            if (target_materialization.present and
+                pathExists(target_materialization.archive_ref))
+                target_materialization.archive_ref
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_materialization_archive_fingerprint",
+            if (target_materialization.present and
+                pathExists(target_materialization.archive_ref))
+                target_materialization.carrier_fingerprint
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_ref",
+            if (factor_materialization.present) factor_materialization.ref else null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_fingerprint",
+            if (factor_materialization.present)
+                factor_materialization.fingerprint
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_archive_ref",
+            if (factor_materialization.present and
+                pathExists(factor_materialization.archive_ref))
+                factor_materialization.archive_ref
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_archive_fingerprint",
+            if (factor_materialization.present and
+                pathExists(factor_materialization.archive_ref))
+                factor_materialization.fingerprint
+            else
+                null,
+            true,
+        );
+    }
     try writeStringMember(writer, "presented_input_ref", paths.presented_input_archive, true);
     try writeStringMember(writer, "presented_input_fingerprint", input_fingerprint, true);
     if (try sourceIdentity(view)) |identity| {
         try writeStringMember(writer, "source_episode_fingerprint", identity.episode_fingerprint, true);
         try writeStringMember(writer, "source_profile_fingerprint", identity.profile_fingerprint, true);
     }
+    if (replay_preparation) |replay| if (std.mem.eql(
+        u8,
+        runner_contract.executor_request_schema,
+        ReplayBoundExecutorRequestSchema,
+    )) {
+        try writeStringMember(writer, "historical_dcp_fingerprint", replay.dcp_fingerprint, true);
+        try writeStringMember(writer, "historical_rip_fingerprint", replay.rip_fingerprint, true);
+        try writeStringMember(
+            writer,
+            "source_profile_body_delivery",
+            replay.source_profile_delivery,
+            true,
+        );
+    };
     try writer.writeAll("\"hidden_reference_presented\":false,\"sibling_output_presented\":false},\"runtime\":{");
     try writeStringMember(writer, "environment_fingerprint", try requiredString(view.execution, "environment_fingerprint"), true);
     try writeStringMember(writer, "replay_policy_fingerprint", try requiredString(view.execution, "replay_policy_fingerprint"), true);
@@ -1218,27 +1881,6 @@ fn buildClaimedFailureReceiptAlloc(
     );
 }
 
-fn ensureHistoricalDecisionContextArchive(
-    allocator: std.mem.Allocator,
-    view: LaneView,
-    paths: LanePaths,
-) !void {
-    const profile = try object(view.source_profile);
-    if (!std.mem.eql(u8, try requiredString(profile, "kind"), "historical_decision")) return;
-    const context = profile.get("decision_context") orelse return error.DecisionContextMissing;
-    const canonical = try attestation.canonicalJsonAlloc(allocator, context);
-    defer allocator.free(canonical);
-    const fingerprint = try requiredString(profile, "decision_context_fingerprint");
-    try requireBytesFingerprint(allocator, canonical, fingerprint);
-    if (pathExists(paths.decision_context_archive)) {
-        const observed = try fileFingerprintAlloc(allocator, paths.decision_context_archive);
-        defer allocator.free(observed);
-        if (!std.mem.eql(u8, observed, fingerprint)) return error.DecisionContextFingerprintMismatch;
-        return;
-    }
-    try archiveBytesAtPath(allocator, canonical, paths.decision_context_archive, fingerprint);
-}
-
 fn historicalTerminalNativeReceiptAlloc(
     allocator: std.mem.Allocator,
     view: LaneView,
@@ -1246,7 +1888,8 @@ fn historicalTerminalNativeReceiptAlloc(
     disposition: FailureDisposition,
     executor: []const u8,
     executor_fingerprint: []const u8,
-    decision_context_ref: []const u8,
+    replay: ReplayPreparation,
+    executor_request_schema: []const u8,
     execution_audit_ref: []const u8,
     execution_audit_fingerprint: []const u8,
 ) !NativeReceipt {
@@ -1255,11 +1898,6 @@ fn historicalTerminalNativeReceiptAlloc(
         return error.SourceTargetTextWitnessMissing;
     const target_text_witness_fingerprint = try attestation.digestValueAlloc(allocator, target_text_witness);
     defer allocator.free(target_text_witness_fingerprint);
-    const identity = try sourceIdentity(view);
-    const source_profile_fingerprint = if (identity) |source|
-        source.profile_fingerprint
-    else
-        optionalString(profile, "source_profile_fingerprint");
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
@@ -1275,10 +1913,22 @@ fn historicalTerminalNativeReceiptAlloc(
     try std.json.Stringify.value(lease_digest, .{}, writer);
     try writer.writeAll("},\"source\":{\"source_governance_fingerprint\":");
     try std.json.Stringify.value(try requiredString(profile, "source_governance_fingerprint"), .{}, writer);
-    try writer.writeAll(",\"decision_context_ref\":");
-    try std.json.Stringify.value(decision_context_ref, .{}, writer);
+    if (!std.mem.eql(u8, executor_request_schema, ReplayBoundExecutorRequestSchema)) {
+        try writer.writeAll(",\"decision_context_ref\":");
+        try std.json.Stringify.value(
+            try requiredString(profile, "decision_context_ref"),
+            .{},
+            writer,
+        );
+    }
     try writer.writeAll(",\"decision_context_fingerprint\":");
-    try std.json.Stringify.value(try requiredString(profile, "decision_context_fingerprint"), .{}, writer);
+    try std.json.Stringify.value(replay.dcp_fingerprint, .{}, writer);
+    if (std.mem.eql(u8, executor_request_schema, ReplayBoundExecutorRequestSchema)) {
+        try writer.writeAll(",\"replay_plan_fingerprint\":");
+        try std.json.Stringify.value(replay.rip_fingerprint, .{}, writer);
+        try writer.writeAll(",\"source_profile_body_delivery\":");
+        try std.json.Stringify.value(replay.source_profile_delivery, .{}, writer);
+    }
     try writer.writeAll(",\"temporal_horizon\":");
     try std.json.Stringify.value(try requiredString(profile, "temporal_horizon"), .{}, writer);
     try writer.writeAll(",\"source_target_text_policy\":");
@@ -1289,8 +1939,18 @@ fn historicalTerminalNativeReceiptAlloc(
     try std.json.Stringify.value(try requiredString(profile, "required_lineage"), .{}, writer);
     try writer.writeAll(",\"required_fir_version\":");
     try std.json.Stringify.value(try requiredString(profile, "required_fir_version"), .{}, writer);
-    try writer.writeAll(",\"source_profile_fingerprint\":");
-    try std.json.Stringify.value(source_profile_fingerprint, .{}, writer);
+    if (std.mem.eql(u8, executor_request_schema, ReplayBoundExecutorRequestSchema)) {
+        try writer.writeAll(",\"source_profile_fingerprint\":");
+        try std.json.Stringify.value(replay.source_profile_fingerprint, .{}, writer);
+    } else {
+        const identity = try sourceIdentity(view);
+        const source_profile_fingerprint = if (identity) |source|
+            source.profile_fingerprint
+        else
+            optionalString(profile, "source_profile_fingerprint");
+        try writer.writeAll(",\"source_profile_fingerprint\":");
+        try std.json.Stringify.value(source_profile_fingerprint, .{}, writer);
+    }
     try writer.writeAll("},\"execution\":{\"executor\":");
     try std.json.Stringify.value(executor, .{}, writer);
     try writer.writeAll(",\"executor_binary_fingerprint\":");
@@ -1554,7 +2214,8 @@ fn validateTerminalReceiptIdentity(
     });
     defer parsed.deinit();
     const root = try object(parsed.value);
-    if (!std.mem.eql(u8, try requiredString(root, "schema"), "hylo-run-receipt/v1") or
+    const schema = try requiredString(root, "schema");
+    if (!isRunReceiptSchema(schema) or
         !std.mem.eql(u8, try requiredString(root, "trial_id"), trial_id) or
         !std.mem.eql(u8, try requiredString(root, "lane_id"), lane_id) or
         !std.mem.eql(
@@ -1565,7 +2226,54 @@ fn validateTerminalReceiptIdentity(
     {
         return error.TerminalPayloadInvalid;
     }
+    if (std.mem.eql(u8, schema, PrivateRunReceiptSchema)) {
+        try validateFingerprint(try requiredString(
+            try requiredObject(root, "materialization"),
+            "materialization_claim_fingerprint",
+        ));
+    }
     try validateFingerprint(registration_digest);
+}
+
+fn validateTerminalMaterializationClaimBindingAlloc(
+    allocator: std.mem.Allocator,
+    receipt: []const u8,
+    claim_path: []const u8,
+) !void {
+    var receipt_parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer receipt_parsed.deinit();
+    const receipt_root = try object(receipt_parsed.value);
+    const schema = try requiredString(receipt_root, "schema");
+    if (std.mem.eql(u8, schema, LegacyRunReceiptSchema)) return;
+    if (!std.mem.eql(u8, schema, PrivateRunReceiptSchema)) return error.RunReceiptSchemaMismatch;
+    const receipt_fingerprint = try requiredString(
+        try requiredObject(receipt_root, "materialization"),
+        "materialization_claim_fingerprint",
+    );
+    try validateFingerprint(receipt_fingerprint);
+
+    const claim_bytes = durable_store.readRegularFileNoSymlink(
+        allocator,
+        claim_path,
+        MaxInputBytes,
+    ) catch return error.TargetMaterializationClaimMismatch;
+    defer allocator.free(claim_bytes);
+    var claim_parsed = std.json.parseFromSlice(std.json.Value, allocator, claim_bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.TargetMaterializationClaimMismatch;
+    defer claim_parsed.deinit();
+    const claim_fingerprint = try requiredString(
+        object(claim_parsed.value) catch return error.TargetMaterializationClaimMismatch,
+        "materialization_claim_fingerprint",
+    );
+    try validateFingerprint(claim_fingerprint);
+    if (!std.mem.eql(u8, claim_fingerprint, receipt_fingerprint)) {
+        return error.TargetMaterializationClaimMismatch;
+    }
 }
 
 fn persistTerminalPayload(
@@ -1623,7 +2331,7 @@ fn loadTerminalPayloadAlloc(
     defer parsed.deinit();
     const receipt_root = try object(parsed.value);
     const registration_digest = try requiredString(try requiredObject(receipt_root, "lineage"), "registration_event_digest");
-    if (!std.mem.eql(u8, try requiredString(receipt_root, "schema"), "hylo-run-receipt/v1") or
+    if (!isRunReceiptSchema(try requiredString(receipt_root, "schema")) or
         !std.mem.eql(u8, try requiredString(receipt_root, "trial_id"), trial_id) or
         !std.mem.eql(u8, try requiredString(receipt_root, "lane_id"), lane_id))
     {
@@ -1671,6 +2379,11 @@ fn persistTerminalControl(
     defer allocator.free(claim_path);
     const claim_fingerprint = try sealExistingControlArtifactAlloc(allocator, claim_path);
     defer allocator.free(claim_fingerprint);
+    try validateTerminalMaterializationClaimBindingAlloc(
+        allocator,
+        terminal_payload.receipt,
+        claim_path,
+    );
     const receipt_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.receipt);
     defer allocator.free(receipt_fingerprint);
     if (!std.mem.eql(u8, receipt_fingerprint, terminal_payload.payload_fingerprint)) {
@@ -1830,6 +2543,7 @@ fn verifyTerminalControlAlloc(
         return error.ControlArtifactInvalid;
     }
     try verifySealedControlArtifact(allocator, claim_path, try requiredString(control, "claim_fingerprint"));
+    try validateTerminalMaterializationClaimBindingAlloc(allocator, receipt, claim_path);
     try verifySealedControlArtifact(allocator, paths.receipt, try requiredString(control, "receipt_fingerprint"));
 
     const failure_ref = optionalString(control, "failure_detail_ref");
@@ -2106,7 +2820,7 @@ fn terminalReceiptRegistrationDigestAlloc(
     });
     defer parsed.deinit();
     const root = try object(parsed.value);
-    if (!std.mem.eql(u8, try requiredString(root, "schema"), "hylo-run-receipt/v1") or
+    if (!isRunReceiptSchema(try requiredString(root, "schema")) or
         !std.mem.eql(u8, try requiredString(root, "trial_id"), expected_trial_id) or
         !std.mem.eql(u8, try requiredString(root, "lane_id"), expected_lane_id))
     {
@@ -2272,6 +2986,18 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
     if (!pathExists(paths.evidence) or !pathExists(paths.presented_input_archive)) return error.CleanupEvidenceMissing;
     const cleanup = try buildCleanupReceiptAlloc(allocator, paths, trial_id, lane_id);
     defer allocator.free(cleanup);
+    if (pathExists(paths.workspace)) {
+        // Validate the entire CAS-owned tree before publishing a cleanup intent.
+        // Sealed target packages are intentionally read-only while retained, so
+        // cleanup must authenticate the boundary before restoring directory
+        // write permission for deletion.
+        try validatePrivateWorkspaceRemovalBoundary(allocator, paths.workspace);
+        try validateHistoricalReplayRemovalBoundary(
+            paths.replay_root,
+            paths.replay_dcp,
+            paths.replay_rip,
+        );
+    }
     const intent_path = try findControlArtifactPathAlloc(
         allocator,
         paths.claim,
@@ -2288,7 +3014,13 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
     const intent = try loadCleanupIntentAlloc(allocator, paths, trial_id, lane_id, terminal);
     defer intent.deinit(allocator);
     if (!std.mem.eql(u8, intent.cleanup, cleanup)) return error.CleanupArtifactConflict;
-    if (pathExists(paths.workspace)) try deleteTree(paths.workspace);
+    if (pathExists(paths.workspace)) try removePrivateWorkspaceTree(
+        allocator,
+        paths.workspace,
+        paths.replay_root,
+        paths.replay_dcp,
+        paths.replay_rip,
+    );
     if (pathExists(paths.workspace)) return error.CleanupStateUnverified;
     const cleanup_fingerprint = persistExpectedSealedArtifactAlloc(
         allocator,
@@ -2351,12 +3083,17 @@ fn effectiveSourceProfile(
     allocator: std.mem.Allocator,
     projected_value: std.json.Value,
     source_profile_fd: ?std.posix.fd_t,
+    private_trial: bool,
 ) !EffectiveSourceProfile {
     if (source_profile_fd) |fd| _ = try sensitiveInputEndpoint(fd);
     const projected = try object(projected_value);
     const kind = try requiredString(projected, "kind");
     if (std.mem.eql(u8, kind, "direct")) {
         if (source_profile_fd) |fd| {
+            if (private_trial) {
+                closeOwnedFd(fd);
+                return error.SourceProfileFdForbidden;
+            }
             const raw = try readOwnedFdRawAlloc(allocator, fd, MaxInputBytes);
             defer allocator.free(raw);
             if (std.mem.trim(u8, raw, " \t\r\n").len != 0) return error.SourceProfileFdForbidden;
@@ -2493,7 +3230,12 @@ fn loadLane(allocator: std.mem.Allocator, trial_path: []const u8, lane_id: []con
     });
     errdefer parsed.deinit();
     const trial = try object(parsed.value);
-    if (!std.mem.eql(u8, try requiredString(trial, "schema"), "hylo-trial/v1")) return error.TrialSchemaInvalid;
+    const schema = try requiredString(trial, "schema");
+    if (!std.mem.eql(u8, schema, "hylo-trial/v1") and
+        !std.mem.eql(u8, schema, retrace_core.hctp_trial_custody.PublicTrialSchema))
+    {
+        return error.TrialSchemaInvalid;
+    }
     const trial_id = try requiredString(trial, "trial_id");
     const purpose = try requiredString(trial, "purpose");
     const units = try requiredArray(trial, "units");
@@ -2554,6 +3296,187 @@ fn replayPromptAlloc(allocator: std.mem.Allocator, view: LaneView) ![]u8 {
     );
 }
 
+fn prepareHistoricalReplayAlloc(
+    allocator: std.mem.Allocator,
+    view: LaneView,
+    source_profile_delivery: []const u8,
+) !ReplayPreparation {
+    var profile_report = try adapter.validateHistoricalProfile(
+        allocator,
+        view.source_profile,
+        std.mem.eql(u8, view.purpose, "promotion") or
+            std.mem.eql(u8, view.purpose, "practice_repair"),
+    );
+    defer profile_report.deinit(allocator);
+    const profile = try object(view.source_profile);
+    const context = profile.get("decision_context") orelse return error.DecisionContextMissing;
+    const dcp = try attestation.canonicalJsonAlloc(allocator, context);
+    errdefer allocator.free(dcp);
+    const dcp_fingerprint = try attestation.digestBytesAlloc(allocator, dcp);
+    errdefer allocator.free(dcp_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        dcp_fingerprint,
+        try requiredString(profile, "decision_context_fingerprint"),
+    )) return error.DecisionContextFingerprintMismatch;
+    const prompt = try replayPromptAlloc(allocator, view);
+    defer allocator.free(prompt);
+    const rip = try adapter.compileReplayPlanAlloc(allocator, context, .{
+        .inquiry_id = view.trial_id,
+        .lane_id = view.lane_id,
+        .prompt_template = prompt,
+        .workspace_policy = profile_report.reconstructability,
+        .maximum_lane_duration_ms = try requiredU64(view.execution, "maximum_lane_duration_ms"),
+        .maximum_tokens_per_lane = try requiredU64(view.execution, "maximum_tokens_per_lane"),
+    });
+    errdefer allocator.free(rip);
+    const rip_fingerprint = try attestation.digestBytesAlloc(allocator, rip);
+    errdefer allocator.free(rip_fingerprint);
+    const observed_profile_fingerprint = try attestation.digestValueAlloc(
+        allocator,
+        view.source_profile,
+    );
+    errdefer allocator.free(observed_profile_fingerprint);
+    if (try sourceIdentity(view)) |identity| {
+        if (!std.mem.eql(u8, identity.profile_fingerprint, observed_profile_fingerprint)) {
+            return error.SourceProfileFingerprintMismatch;
+        }
+    }
+    return .{
+        .dcp = dcp,
+        .dcp_fingerprint = dcp_fingerprint,
+        .rip = rip,
+        .rip_fingerprint = rip_fingerprint,
+        .source_profile_fingerprint = observed_profile_fingerprint,
+        .source_profile_delivery = source_profile_delivery,
+        .required_lineage = try allocator.dupe(u8, try requiredString(profile, "required_lineage")),
+    };
+}
+
+fn ensurePrivateWorkspaceRoot(path: []const u8) !void {
+    try durable_store.ensureDirectoryPathNoSymlinks(path);
+    var workspace_dir = std.Io.Dir.openDirAbsolute(defaultIo(), path, .{
+        .follow_symlinks = false,
+    }) catch return error.PrivateOutputBoundaryInvalid;
+    defer workspace_dir.close(defaultIo());
+    if (std.c.fchmod(workspace_dir.handle, 0o700) != 0) {
+        return error.PrivateOutputBoundaryInvalid;
+    }
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(workspace_dir.handle, &native_stat) != 0 or
+        !std.c.S.ISDIR(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.mode & 0o777 != 0o700)
+    {
+        return error.PrivateOutputBoundaryInvalid;
+    }
+}
+
+fn rollbackHistoricalReplayRoot(
+    replay_root: []const u8,
+    dcp_path: []const u8,
+    rip_path: []const u8,
+) !void {
+    const replay_stat = std.Io.Dir.cwd().statFile(defaultIo(), replay_root, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return error.PrivateReplayArtifactRollbackFailed,
+    };
+    if (replay_stat.kind != .directory) return error.PrivateReplayArtifactRollbackFailed;
+    durable_store.rejectSymlinkComponents(replay_root) catch
+        return error.PrivateReplayArtifactRollbackFailed;
+    {
+        var replay_dir = std.Io.Dir.openDirAbsolute(defaultIo(), replay_root, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch return error.PrivateReplayArtifactRollbackFailed;
+        defer replay_dir.close(defaultIo());
+        var native_stat: std.c.Stat = undefined;
+        if (std.c.fstat(replay_dir.handle, &native_stat) != 0 or
+            !std.c.S.ISDIR(native_stat.mode) or
+            native_stat.uid != std.c.getuid() or
+            native_stat.mode & 0o022 != 0)
+        {
+            return error.PrivateReplayArtifactRollbackFailed;
+        }
+        var iterator = replay_dir.iterate();
+        while (iterator.next(defaultIo()) catch
+            return error.PrivateReplayArtifactRollbackFailed) |entry|
+        {
+            const artifact_path = if (std.mem.eql(u8, entry.name, std.fs.path.basename(dcp_path)))
+                dcp_path
+            else if (std.mem.eql(u8, entry.name, std.fs.path.basename(rip_path)))
+                rip_path
+            else
+                return error.PrivateReplayArtifactRollbackFailed;
+            if (entry.kind != .file) return error.PrivateReplayArtifactRollbackFailed;
+            validateExactPrivateRemovalFile(artifact_path, 0o600) catch
+                return error.PrivateReplayArtifactRollbackFailed;
+            replay_dir.deleteFile(defaultIo(), entry.name) catch
+                return error.PrivateReplayArtifactRollbackFailed;
+        }
+    }
+    std.Io.Dir.deleteDirAbsolute(defaultIo(), replay_root) catch
+        return error.PrivateReplayArtifactRollbackFailed;
+    _ = std.Io.Dir.cwd().statFile(defaultIo(), replay_root, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return error.PrivateReplayArtifactRollbackFailed,
+    };
+    return error.PrivateReplayArtifactRollbackFailed;
+}
+
+fn persistHistoricalReplayInOwnedRoot(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    replay: ReplayPreparation,
+) !void {
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.replay_root);
+    var replay_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        paths.replay_root,
+        .{ .follow_symlinks = false },
+    );
+    defer replay_dir.close(defaultIo());
+    if (std.c.fchmod(replay_dir.handle, 0o700) != 0) return error.PrivateOutputBoundaryInvalid;
+    var replay_stat: std.c.Stat = undefined;
+    if (std.c.fstat(replay_dir.handle, &replay_stat) != 0 or
+        !std.c.S.ISDIR(replay_stat.mode) or
+        replay_stat.uid != std.c.getuid() or
+        replay_stat.mode & 0o777 != 0o700)
+    {
+        return error.PrivateOutputBoundaryInvalid;
+    }
+    try persistPrivateReplayPair(
+        allocator,
+        paths.replay_dcp,
+        replay.dcp,
+        replay.dcp_fingerprint,
+        paths.replay_rip,
+        replay.rip,
+        replay.rip_fingerprint,
+    );
+}
+
+fn persistHistoricalReplay(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    replay: ReplayPreparation,
+) !void {
+    try ensurePrivateWorkspaceRoot(paths.workspace);
+    try requirePrivateReplayOutputAbsent(paths.replay_root);
+    persistHistoricalReplayInOwnedRoot(allocator, paths, replay) catch |err| {
+        rollbackHistoricalReplayRoot(
+            paths.replay_root,
+            paths.replay_dcp,
+            paths.replay_rip,
+        ) catch return error.PrivateReplayArtifactRollbackFailed;
+        return err;
+    };
+}
+
 const LanePaths = struct {
     root: []u8,
     claim: []u8,
@@ -2564,7 +3487,9 @@ const LanePaths = struct {
     executor_stderr: []u8,
     workspace: []u8,
     execution_root: []u8,
-    decision_context: []u8,
+    replay_root: []u8,
+    replay_dcp: []u8,
+    replay_rip: []u8,
     receipt: []u8,
     failure_detail: []u8,
     evidence: []u8,
@@ -2580,7 +3505,6 @@ const LanePaths = struct {
     failure_network_observation: []u8,
     failure_external_effect_observation: []u8,
     presented_input_archive: []u8,
-    decision_context_archive: []u8,
     factor_materialization_workspace: []u8,
     factor_materialization_archive: []u8,
     target_materialization_workspace: []u8,
@@ -2598,7 +3522,9 @@ const LanePaths = struct {
         allocator.free(self.executor_stderr);
         allocator.free(self.workspace);
         allocator.free(self.execution_root);
-        allocator.free(self.decision_context);
+        allocator.free(self.replay_root);
+        allocator.free(self.replay_dcp);
+        allocator.free(self.replay_rip);
         allocator.free(self.receipt);
         allocator.free(self.failure_detail);
         allocator.free(self.evidence);
@@ -2614,7 +3540,6 @@ const LanePaths = struct {
         allocator.free(self.failure_network_observation);
         allocator.free(self.failure_external_effect_observation);
         allocator.free(self.presented_input_archive);
-        allocator.free(self.decision_context_archive);
         allocator.free(self.factor_materialization_workspace);
         allocator.free(self.factor_materialization_archive);
         allocator.free(self.target_materialization_workspace);
@@ -2667,7 +3592,17 @@ fn lanePathsAlloc(
         .executor_stderr = try std.fmt.allocPrint(allocator, "{s}/executor-output/result.json.stderr", .{workspace}),
         .workspace = workspace,
         .execution_root = try std.fmt.allocPrint(allocator, "{s}/common-projection", .{workspace}),
-        .decision_context = try std.fmt.allocPrint(allocator, "{s}/decision-context.json", .{workspace}),
+        .replay_root = try std.fmt.allocPrint(allocator, "{s}/historical-replay", .{workspace}),
+        .replay_dcp = try std.fmt.allocPrint(
+            allocator,
+            "{s}/historical-replay/decision-context.dcp.json",
+            .{workspace},
+        ),
+        .replay_rip = try std.fmt.allocPrint(
+            allocator,
+            "{s}/historical-replay/replay-plan.rip.json",
+            .{workspace},
+        ),
         .receipt = try std.fmt.allocPrint(allocator, "{s}/run-receipt.json", .{root}),
         .failure_detail = try std.fmt.allocPrint(allocator, "{s}/failure-detail.json", .{root}),
         .evidence = try std.fmt.allocPrint(allocator, "{s}/evidence", .{root}),
@@ -2683,7 +3618,6 @@ fn lanePathsAlloc(
         .failure_network_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-network-observation.json", .{root}),
         .failure_external_effect_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-external-effect-observation.json", .{root}),
         .presented_input_archive = try std.fmt.allocPrint(allocator, "{s}/evidence/presented-input.json", .{root}),
-        .decision_context_archive = try std.fmt.allocPrint(allocator, "{s}/evidence/decision-context.json", .{root}),
         .factor_materialization_workspace = try std.fmt.allocPrint(allocator, "{s}/factor-materialization.json", .{workspace}),
         .factor_materialization_archive = try std.fmt.allocPrint(allocator, "{s}/evidence/factor-materialization.json", .{root}),
         .target_materialization_workspace = try std.fmt.allocPrint(allocator, "{s}/target-materialization.json", .{workspace}),
@@ -2735,26 +3669,202 @@ fn claimLane(
     start_digest: []const u8,
     lease_digest: []const u8,
 ) !void {
-    const payload = try std.fmt.allocPrint(
+    return claimLaneWithReplay(
         allocator,
-        "{{\"schema\":\"cas-trial-claim/v1\",\"trial_id\":{f},\"lane_id\":{f},\"claim_id\":{f},\"registration_event_digest\":{f},\"lane_started_event_digest\":{f},\"atomic\":true,\"claimed_before_execution\":true,\"claim_count\":1,\"expected_lane_lease_digest\":{f},\"lane_lease_digest\":{f}}}\n",
-        .{
-            std.json.fmt(view.trial_id, .{}),
-            std.json.fmt(view.lane_id, .{}),
-            std.json.fmt(view.lane_id, .{}),
-            std.json.fmt(registration_digest, .{}),
-            std.json.fmt(start_digest, .{}),
-            std.json.fmt(lease_digest, .{}),
-            std.json.fmt(lease_digest, .{}),
-        },
+        path,
+        view,
+        registration_digest,
+        start_digest,
+        lease_digest,
+        null,
+        LegacyExecutorRequestSchema,
+        null,
     );
-    defer allocator.free(payload);
+}
+
+fn claimLaneWithReplay(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    view: LaneView,
+    registration_digest: []const u8,
+    start_digest: []const u8,
+    lease_digest: []const u8,
+    replay_preparation: ?ReplayPreparation,
+    executor_request_schema: []const u8,
+    materialization_claim_fingerprint: ?[]const u8,
+) !void {
+    const base_payload = if (replay_preparation) |replay|
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"cas-trial-claim/v1\",\"trial_id\":{f}," ++
+                "\"lane_id\":{f},\"claim_id\":{f}," ++
+                "\"registration_event_digest\":{f}," ++
+                "\"lane_started_event_digest\":{f},\"atomic\":true," ++
+                "\"claimed_before_execution\":true,\"claim_count\":1," ++
+                "\"expected_lane_lease_digest\":{f},\"lane_lease_digest\":{f}," ++
+                "\"source_kind\":\"historical_decision\"," ++
+                "\"source_profile_fingerprint\":{f}," ++
+                "\"source_profile_body_delivery\":{f}," ++
+                "\"historical_dcp_fingerprint\":{f}," ++
+                "\"historical_rip_fingerprint\":{f}," ++
+                "\"required_lineage\":{f},\"executor_request_schema\":{f}}}\n",
+            .{
+                std.json.fmt(view.trial_id, .{}),
+                std.json.fmt(view.lane_id, .{}),
+                std.json.fmt(view.lane_id, .{}),
+                std.json.fmt(registration_digest, .{}),
+                std.json.fmt(start_digest, .{}),
+                std.json.fmt(lease_digest, .{}),
+                std.json.fmt(lease_digest, .{}),
+                std.json.fmt(replay.source_profile_fingerprint, .{}),
+                std.json.fmt(replay.source_profile_delivery, .{}),
+                std.json.fmt(replay.dcp_fingerprint, .{}),
+                std.json.fmt(replay.rip_fingerprint, .{}),
+                std.json.fmt(replay.required_lineage, .{}),
+                std.json.fmt(executor_request_schema, .{}),
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"cas-trial-claim/v1\",\"trial_id\":{f}," ++
+                "\"lane_id\":{f},\"claim_id\":{f}," ++
+                "\"registration_event_digest\":{f}," ++
+                "\"lane_started_event_digest\":{f},\"atomic\":true," ++
+                "\"claimed_before_execution\":true,\"claim_count\":1," ++
+                "\"expected_lane_lease_digest\":{f}," ++
+                "\"lane_lease_digest\":{f}}}\n",
+            .{
+                std.json.fmt(view.trial_id, .{}),
+                std.json.fmt(view.lane_id, .{}),
+                std.json.fmt(view.lane_id, .{}),
+                std.json.fmt(registration_digest, .{}),
+                std.json.fmt(start_digest, .{}),
+                std.json.fmt(lease_digest, .{}),
+                std.json.fmt(lease_digest, .{}),
+            },
+        );
+    defer allocator.free(base_payload);
+    var extended_payload: ?[]u8 = null;
+    defer if (extended_payload) |payload| allocator.free(payload);
+    const payload = if (materialization_claim_fingerprint) |fingerprint| blk: {
+        try validateFingerprint(fingerprint);
+        if (!std.mem.endsWith(u8, base_payload, "}\n")) return error.ControlArtifactInvalid;
+        extended_payload = try std.fmt.allocPrint(
+            allocator,
+            "{s},\"materialization_claim_fingerprint\":{f}}}\n",
+            .{ base_payload[0 .. base_payload.len - 2], std.json.fmt(fingerprint, .{}) },
+        );
+        break :blk extended_payload.?;
+    } else base_payload;
     durable_store.writeTextCreateNewAtomic(allocator, path, payload, .{}) catch |err| switch (err) {
         error.PathAlreadyExists => return error.LaneAlreadyClaimed,
         else => return err,
     };
     const fingerprint = try sealExistingControlArtifactAlloc(allocator, path);
     allocator.free(fingerprint);
+}
+
+fn validateExistingMaterializationClaimFingerprint(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected: ?[]const u8,
+) !void {
+    const expected_fingerprint = expected orelse return;
+    try validateFingerprint(expected_fingerprint);
+    const raw = durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes) catch
+        return error.TargetMaterializationClaimMismatch;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.TargetMaterializationClaimMismatch;
+    defer parsed.deinit();
+    const persisted = try requiredString(
+        object(parsed.value) catch return error.TargetMaterializationClaimMismatch,
+        "materialization_claim_fingerprint",
+    );
+    try validateFingerprint(persisted);
+    if (!std.mem.eql(u8, persisted, expected_fingerprint)) {
+        return error.TargetMaterializationClaimMismatch;
+    }
+}
+
+fn validateExistingHistoricalClaim(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    view: LaneView,
+    replay: ReplayPreparation,
+    executor_request_schema: []const u8,
+) !void {
+    try validateHistoricalClaimBindingPresence(allocator, path);
+    const raw = durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes) catch
+        return error.HistoricalClaimReplayBindingMismatch;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.HistoricalClaimReplayBindingMismatch;
+    defer parsed.deinit();
+    const claim = object(parsed.value) catch return error.HistoricalClaimReplayBindingMismatch;
+    if (!std.mem.eql(u8, try requiredString(claim, "trial_id"), view.trial_id) or
+        !std.mem.eql(u8, try requiredString(claim, "lane_id"), view.lane_id) or
+        !std.mem.eql(u8, try requiredString(claim, "source_kind"), "historical_decision") or
+        !std.mem.eql(
+            u8,
+            try requiredString(claim, "source_profile_fingerprint"),
+            replay.source_profile_fingerprint,
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(claim, "source_profile_body_delivery"),
+            replay.source_profile_delivery,
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(claim, "historical_dcp_fingerprint"),
+            replay.dcp_fingerprint,
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(claim, "historical_rip_fingerprint"),
+            replay.rip_fingerprint,
+        ) or
+        !std.mem.eql(u8, try requiredString(claim, "required_lineage"), replay.required_lineage) or
+        !std.mem.eql(
+            u8,
+            try requiredString(claim, "executor_request_schema"),
+            executor_request_schema,
+        ))
+    {
+        return error.HistoricalClaimReplayBindingMismatch;
+    }
+}
+
+fn validateHistoricalClaimBindingPresence(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    const raw = durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes) catch
+        return error.HistoricalClaimReplayBindingMismatch;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch return error.HistoricalClaimReplayBindingMismatch;
+    defer parsed.deinit();
+    const claim = object(parsed.value) catch return error.HistoricalClaimReplayBindingMismatch;
+    inline for (.{
+        "source_kind",
+        "source_profile_fingerprint",
+        "source_profile_body_delivery",
+        "historical_dcp_fingerprint",
+        "historical_rip_fingerprint",
+        "required_lineage",
+        "executor_request_schema",
+    }) |key| {
+        if (claim.get(key) == null) return error.HistoricalClaimReplayBindingMissing;
+    }
 }
 
 fn resolveTargetMaterializationAlloc(
@@ -2769,18 +3879,29 @@ fn resolveTargetMaterializationAlloc(
     workspace_ref: []const u8,
     archive_ref: []const u8,
     package_root: []const u8,
+    private_claim: ?[]const u8,
 ) !TargetMaterialization {
-    const claim_bytes = try runLedgerLaneMaterializationAlloc(
-        allocator,
-        ledger,
-        repo,
-        view.trial_id,
-        view.lane_id,
-        registration_digest,
-        start_digest,
-        lease_digest,
-    );
+    const private_trial = try isPrivateTrial(view);
+    const claim_bytes = if (private_claim) |bytes|
+        try allocator.dupe(u8, bytes)
+    else
+        try runLedgerLaneMaterializationAlloc(
+            allocator,
+            ledger,
+            repo,
+            view.trial_id,
+            view.lane_id,
+            registration_digest,
+            start_digest,
+            lease_digest,
+        );
     defer allocator.free(claim_bytes);
+    const materialization_claim_fingerprint = try materializationClaimFingerprintAlloc(
+        allocator,
+        private_trial,
+        claim_bytes,
+    );
+    errdefer if (materialization_claim_fingerprint) |fingerprint| allocator.free(fingerprint);
     var claim_parsed = try std.json.parseFromSlice(std.json.Value, allocator, claim_bytes, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
@@ -2789,7 +3910,14 @@ fn resolveTargetMaterializationAlloc(
     const claim = try object(claim_parsed.value);
     const local_trial_fingerprint = try attestation.digestValueAlloc(allocator, .{ .object = view.trial });
     defer allocator.free(local_trial_fingerprint);
-    if (!std.mem.eql(u8, try requiredString(claim, "schema"), "hylo-lane-materialization-claim/v1") or
+    if (!std.mem.eql(
+        u8,
+        try requiredString(claim, "schema"),
+        if (private_trial)
+            "hylo-lane-materialization-claim/v2"
+        else
+            "hylo-lane-materialization-claim/v1",
+    ) or
         !std.mem.eql(u8, try requiredString(claim, "trial_fingerprint"), local_trial_fingerprint) or
         !std.mem.eql(u8, try requiredString(claim, "trial_id"), view.trial_id) or
         !std.mem.eql(u8, try requiredString(claim, "lane_id"), view.lane_id) or
@@ -2814,17 +3942,92 @@ fn resolveTargetMaterializationAlloc(
     errdefer effect_policy.deinit(allocator);
     const envelope_value = claim.get("arm_materialization") orelse return error.TargetMaterializationMissing;
     const envelope = try object(envelope_value);
-    if (!std.mem.eql(u8, try requiredString(envelope, "schema"), "hylo-arm-materialization/v1") or
+    var treatment_commitment: ?[]u8 = null;
+    errdefer if (treatment_commitment) |value| allocator.free(value);
+    if (private_trial) {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(envelope, "schema"),
+            "hylo-arm-materialization/v2",
+        ) or
+            !std.mem.eql(u8, try requiredString(envelope, "arm_id"), view.arm_id))
+        {
+            return error.TargetMaterializationClaimMismatch;
+        }
+        const opening = try object(
+            claim.get("treatment_opening") orelse
+                return error.TargetMaterializationClaimMismatch,
+        );
+        if (opening.get("semantic_role") != null or
+            !std.mem.eql(
+                u8,
+                try requiredString(opening, "schema"),
+                retrace_core.hctp_trial_custody.TreatmentMaterializationOpeningSchema,
+            ) or
+            !std.mem.eql(u8, try requiredString(opening, "arm_id"), view.arm_id))
+        {
+            return error.SemanticArmIdentityDisclosed;
+        }
+        const observed_commitment = try retrace_core.hctp_trial_custody.treatmentCommitmentAlloc(
+            allocator,
+            opening,
+        );
+        const declared_commitment = try requiredString(view.arm, "treatment_commitment");
+        if (!std.mem.eql(u8, observed_commitment, declared_commitment) or
+            !std.mem.eql(
+                u8,
+                try requiredString(envelope, "treatment_commitment"),
+                declared_commitment,
+            ) or
+            !std.mem.eql(
+                u8,
+                try requiredString(envelope, "value_fingerprint"),
+                try requiredString(opening, "value_fingerprint"),
+            ) or
+            !std.mem.eql(
+                u8,
+                try requiredString(envelope, "materialization_ref"),
+                try requiredString(opening, "materialization_ref"),
+            ) or
+            !std.mem.eql(
+                u8,
+                try requiredString(envelope, "materialization_fingerprint"),
+                try requiredString(opening, "materialization_fingerprint"),
+            ))
+        {
+            allocator.free(observed_commitment);
+            return error.TargetMaterializationClaimMismatch;
+        }
+        treatment_commitment = observed_commitment;
+    } else if (!std.mem.eql(
+        u8,
+        try requiredString(envelope, "schema"),
+        "hylo-arm-materialization/v1",
+    ) or
         !std.mem.eql(u8, try requiredString(envelope, "arm_id"), view.arm_id) or
-        !std.mem.eql(u8, try requiredString(envelope, "value_fingerprint"), try requiredString(view.arm, "value_fingerprint")) or
-        !std.mem.eql(u8, try requiredString(envelope, "materialization_ref"), try requiredString(view.arm, "materialization_ref")) or
-        !std.mem.eql(u8, try requiredString(envelope, "materialization_fingerprint"), try requiredString(view.arm, "materialization_fingerprint")))
+        !std.mem.eql(
+            u8,
+            try requiredString(envelope, "value_fingerprint"),
+            try requiredString(view.arm, "value_fingerprint"),
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(envelope, "materialization_ref"),
+            try requiredString(view.arm, "materialization_ref"),
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(envelope, "materialization_fingerprint"),
+            try requiredString(view.arm, "materialization_fingerprint"),
+        ))
     {
         return error.TargetMaterializationClaimMismatch;
     }
     const factor_kind = try requiredString(try requiredObject(view.trial, "factor"), "kind");
     if (!std.mem.eql(u8, factor_kind, "target_snapshot")) return .{
         .present = false,
+        .materialization_claim_fingerprint = materialization_claim_fingerprint,
+        .treatment_commitment = treatment_commitment,
         .arm_value_fingerprint = try allocator.dupe(u8, try requiredString(envelope, "value_fingerprint")),
         .snapshot_ref = try allocator.dupe(u8, try requiredString(envelope, "materialization_ref")),
         .snapshot_fingerprint = try allocator.dupe(u8, try requiredString(envelope, "materialization_fingerprint")),
@@ -2845,7 +4048,11 @@ fn resolveTargetMaterializationAlloc(
     }
     const observed_snapshot_fingerprint = try attestation.digestValueAlloc(allocator, snapshot_value);
     defer allocator.free(observed_snapshot_fingerprint);
-    if (!std.mem.eql(u8, observed_snapshot_fingerprint, try requiredString(view.arm, "materialization_fingerprint"))) {
+    if (!std.mem.eql(
+        u8,
+        observed_snapshot_fingerprint,
+        try requiredString(envelope, "materialization_fingerprint"),
+    )) {
         return error.TargetMaterializationFingerprintMismatch;
     }
     const roots = try requiredArray(snapshot, "roots");
@@ -2923,6 +4130,8 @@ fn resolveTargetMaterializationAlloc(
     errdefer allocator.free(carrier_bytes);
     return .{
         .present = true,
+        .materialization_claim_fingerprint = materialization_claim_fingerprint,
+        .treatment_commitment = treatment_commitment,
         .arm_value_fingerprint = try allocator.dupe(u8, try requiredString(envelope, "value_fingerprint")),
         .snapshot_ref = try allocator.dupe(u8, try requiredString(envelope, "materialization_ref")),
         .snapshot_fingerprint = try allocator.dupe(u8, try requiredString(envelope, "materialization_fingerprint")),
@@ -2936,6 +4145,16 @@ fn resolveTargetMaterializationAlloc(
         .archive_ref = archive_ref,
         .package_root = package_root,
     };
+}
+
+fn materializationClaimFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    private_trial: bool,
+    exact_claim_bytes: []const u8,
+) !?[]u8 {
+    if (!private_trial) return null;
+    const fingerprint = try attestation.digestBytesAlloc(allocator, exact_claim_bytes);
+    return fingerprint;
 }
 
 fn resolveEffectPolicyAlloc(
@@ -2985,6 +4204,9 @@ fn resolveTargetCommonProjectionAlloc(
     claim: std.json.ObjectMap,
 ) !TargetCommonProjection {
     const factor = try requiredObject(view.trial, "factor");
+    if (try isPrivateTrial(view)) {
+        return resolvePrivateTargetCommonProjectionAlloc(allocator, factor, claim);
+    }
     const registered_value = factor.get("target_common_projection") orelse
         return error.TargetCommonProjectionMissing;
     const claimed_value = claim.get("target_common_projection") orelse
@@ -3009,6 +4231,70 @@ fn resolveTargetCommonProjectionAlloc(
         return error.TargetCommonProjectionMismatch;
     }
     return .{ .bytes = registered_bytes, .fingerprint = fingerprint };
+}
+
+fn resolvePrivateTargetCommonProjectionAlloc(
+    allocator: std.mem.Allocator,
+    factor: std.json.ObjectMap,
+    claim: std.json.ObjectMap,
+) !TargetCommonProjection {
+    // A v2 public trial carries only commitments. Semantic projection bytes are
+    // admitted through the lease-bound private claim and never recovered from
+    // a public factor field or its legacy claim alias.
+    if (factor.get("target_common_projection") != null or
+        factor.get("intervention_witness") != null or
+        factor.get("intervention_witness_fingerprint") != null or
+        claim.get("target_common_projection") != null)
+    {
+        return error.TargetCommonProjectionInvalid;
+    }
+
+    const opening_value = claim.get("target_common_projection_opening") orelse
+        return error.TargetCommonProjectionMissing;
+    const opening = object(opening_value) catch return error.TargetCommonProjectionInvalid;
+    if (opening.count() != 3 or
+        opening.get("nonce") == null or
+        opening.get("projection") == null or
+        opening.get("schema") == null or
+        !std.mem.eql(
+            u8,
+            requiredString(opening, "schema") catch return error.TargetCommonProjectionInvalid,
+            retrace_core.hctp_trial_custody.TargetCommonProjectionOpeningSchema,
+        ))
+    {
+        return error.TargetCommonProjectionInvalid;
+    }
+    retrace_core.hctp_trial_custody.validateNonce(
+        requiredString(opening, "nonce") catch return error.TargetCommonProjectionInvalid,
+    ) catch return error.TargetCommonProjectionInvalid;
+
+    const projection_value = opening.get("projection").?;
+    const projection = object(projection_value) catch return error.TargetCommonProjectionInvalid;
+    try validateTargetCommonProjectionShape(factor, projection);
+
+    const declared_commitment = requiredString(
+        factor,
+        "target_common_projection_commitment",
+    ) catch return error.TargetCommonProjectionInvalid;
+    validateFingerprint(declared_commitment) catch return error.TargetCommonProjectionInvalid;
+    const observed_commitment = try attestation.digestValueAlloc(allocator, opening_value);
+    defer allocator.free(observed_commitment);
+    if (!std.mem.eql(u8, observed_commitment, declared_commitment)) {
+        return error.TargetCommonProjectionMismatch;
+    }
+
+    const declared_fingerprint = requiredString(
+        factor,
+        "common_projection_fingerprint",
+    ) catch return error.TargetCommonProjectionInvalid;
+    validateFingerprint(declared_fingerprint) catch return error.TargetCommonProjectionInvalid;
+    const fingerprint = try attestation.digestValueAlloc(allocator, projection_value);
+    errdefer allocator.free(fingerprint);
+    if (!std.mem.eql(u8, fingerprint, declared_fingerprint)) {
+        return error.TargetCommonProjectionMismatch;
+    }
+    const bytes = try attestation.canonicalJsonAlloc(allocator, projection_value);
+    return .{ .bytes = bytes, .fingerprint = fingerprint };
 }
 
 fn validateTargetCommonProjectionShape(
@@ -3128,7 +4414,9 @@ fn runLedgerLaneMaterializationAlloc(
     defer process_allocator.free(result.stdout);
     defer process_allocator.free(result.stderr);
     try validateExecutableAtSpawn(allocator, ledger);
-    if (processExitCode(result.term) != 0) return error.LedgerMaterializationUnavailable;
+    if (processExitCode(result.term) != 0) {
+        return error.LedgerMaterializationUnavailable;
+    }
     return allocator.dupe(u8, result.stdout);
 }
 
@@ -4034,11 +5322,7 @@ fn resolveFactorMaterializationAlloc(
 ) !FactorMaterialization {
     const factor = try requiredObject(view.trial, "factor");
     const kind = try requiredString(factor, "kind");
-    const ref = try requiredString(view.arm, "materialization_ref");
-    const prefix = "git-blob-json:";
-    if (std.mem.eql(u8, kind, "target_snapshot") or
-        (std.mem.eql(u8, kind, "null") and !std.mem.startsWith(u8, ref, prefix)))
-    {
+    if (std.mem.eql(u8, kind, "target_snapshot")) {
         return .{
             .present = false,
             .ref = "",
@@ -4048,6 +5332,16 @@ fn resolveFactorMaterializationAlloc(
             .archive_ref = archive_ref,
         };
     }
+    const ref = try requiredString(view.arm, "materialization_ref");
+    const prefix = "git-blob-json:";
+    if (std.mem.eql(u8, kind, "null") and !std.mem.startsWith(u8, ref, prefix)) return .{
+        .present = false,
+        .ref = "",
+        .fingerprint = "",
+        .canonical_bytes = null,
+        .workspace_ref = workspace_ref,
+        .archive_ref = archive_ref,
+    };
     if (!std.mem.eql(u8, kind, "null") and !oneOf(kind, &.{
         "instruction_bundle",
         "evidence_set",
@@ -4127,12 +5421,15 @@ fn buildExecutorRequestAlloc(
     allocator: std.mem.Allocator,
     view: LaneView,
     workspace: []const u8,
-    decision_context_path: []const u8,
     input_path: []const u8,
     input_fingerprint: []const u8,
     lease_digest: []const u8,
     factor_materialization: FactorMaterialization,
     target_materialization: TargetMaterialization,
+    admitted_executor_request_schema: []const u8,
+    replay_preparation: ?ReplayPreparation,
+    replay_dcp_path: []const u8,
+    replay_rip_path: []const u8,
 ) ![]u8 {
     const factor = try requiredObject(view.trial, "factor");
     const allowed_roots = try canonicalFieldAlloc(
@@ -4145,6 +5442,14 @@ fn buildExecutorRequestAlloc(
         u8,
         try requiredString(source_profile, "kind"),
         "historical_decision",
+    );
+    if (historical != (replay_preparation != null)) {
+        return error.HistoricalReplayCompilationRequired;
+    }
+    const executor_request_schema = try executorRequestSchemaForRoute(
+        try isPrivateTrial(view),
+        historical,
+        admitted_executor_request_schema,
     );
     const source_episode_value: std.json.Value = if (historical) blk: {
         const governance_root = try requiredObject(source_profile, "source_governance");
@@ -4167,12 +5472,17 @@ fn buildExecutorRequestAlloc(
     defer allocator.free(source_episode_fingerprint);
     const source_profile_fingerprint = try canonicalFieldAlloc(
         allocator,
-        if (identity) |source| std.json.Value{ .string = source.profile_fingerprint } else .null,
+        if (replay_preparation) |replay|
+            std.json.Value{ .string = replay.source_profile_fingerprint }
+        else if (identity) |source|
+            std.json.Value{ .string = source.profile_fingerprint }
+        else
+            .null,
     );
     defer allocator.free(source_profile_fingerprint);
     const decision_context_ref = try canonicalFieldAlloc(
         allocator,
-        if (historical) std.json.Value{ .string = decision_context_path } else .null,
+        if (historical) std.json.Value{ .string = replay_dcp_path } else .null,
     );
     defer allocator.free(decision_context_ref);
     const decision_context_fingerprint = try canonicalFieldAlloc(
@@ -4243,7 +5553,12 @@ fn buildExecutorRequestAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeByte('{');
-    try writeStringMember(writer, "schema", "cas-trial-executor-request/v1", true);
+    try writeStringMember(
+        writer,
+        "schema",
+        executor_request_schema,
+        true,
+    );
     try writeStringMember(writer, "trial_id", view.trial_id, true);
     try writeStringMember(writer, "unit_id", view.unit_id, true);
     try writeStringMember(writer, "scenario_id", view.scenario_id, true);
@@ -4255,6 +5570,23 @@ fn buildExecutorRequestAlloc(
     try writeRawMember(writer, "source_profile_fingerprint", source_profile_fingerprint, true);
     try writeRawMember(writer, "decision_context_ref", decision_context_ref, true);
     try writeRawMember(writer, "decision_context_fingerprint", decision_context_fingerprint, true);
+    if (replay_preparation) |replay| if (std.mem.eql(
+        u8,
+        executor_request_schema,
+        ReplayBoundExecutorRequestSchema,
+    )) {
+        try writeStringMember(
+            writer,
+            "source_profile_body_delivery",
+            replay.source_profile_delivery,
+            true,
+        );
+        try writeStringMember(writer, "historical_dcp_ref", replay_dcp_path, true);
+        try writeStringMember(writer, "historical_dcp_fingerprint", replay.dcp_fingerprint, true);
+        try writeStringMember(writer, "historical_rip_ref", replay_rip_path, true);
+        try writeStringMember(writer, "historical_rip_fingerprint", replay.rip_fingerprint, true);
+        try writeStringMember(writer, "required_lineage", replay.required_lineage, true);
+    };
     try writeStringMember(writer, "workspace", workspace, true);
     try writeRawMember(writer, "common_projection_fingerprint", common_projection_fingerprint, true);
     try writeStringMember(writer, "presented_input_ref", input_path, true);
@@ -5216,6 +6548,7 @@ fn createRunnerObservationsAlloc(
     network_assertion: EvidenceFile,
     external_effect_assertion: EvidenceFile,
 ) !RunnerObservationReceipts {
+    const private_trial = try isPrivateTrial(view);
     const common_projection_observed = execution_tree_observed.common_projection_fingerprint;
     const assurance = try requiredString(try requiredObject(view.trial, "assurance"), "required_level");
     const sealed = std.mem.eql(u8, assurance, "sealed");
@@ -5275,23 +6608,67 @@ fn createRunnerObservationsAlloc(
     var filesystem: std.Io.Writer.Allocating = .init(allocator);
     defer filesystem.deinit();
     try filesystem.writer.writeByte('{');
-    try writeStringMember(&filesystem.writer, "schema", "cas-filesystem-observation/v1", true);
+    try writeStringMember(
+        &filesystem.writer,
+        "schema",
+        if (private_trial) "cas-filesystem-observation/v2" else "cas-filesystem-observation/v1",
+        true,
+    );
     try writeStringMember(&filesystem.writer, "trial_id", view.trial_id, true);
     try writeStringMember(&filesystem.writer, "lane_id", view.lane_id, true);
     try writeStringMember(&filesystem.writer, "effect_policy_fingerprint", effect_policy_fingerprint, true);
     try writeStringMember(&filesystem.writer, "policy", "workspace_write", true);
     try writeStringMember(&filesystem.writer, "mediation_owner", "attested-executor", true);
     try writeStringMember(&filesystem.writer, "default_effect_decision", "deny", true);
-    try writeStringMember(&filesystem.writer, "executor_assertion_ref", filesystem_assertion.ref, true);
-    try writeStringMember(&filesystem.writer, "executor_assertion_fingerprint", filesystem_assertion.fingerprint, true);
+    if (private_trial) {
+        try filesystem.writer.writeAll("\"executor_assertion_present\":");
+        try filesystem.writer.writeAll(if (filesystem_assertion.present) "true," else "false,");
+    } else {
+        try writeStringMember(
+            &filesystem.writer,
+            "executor_assertion_ref",
+            filesystem_assertion.ref,
+            true,
+        );
+        try writeStringMember(
+            &filesystem.writer,
+            "executor_assertion_fingerprint",
+            filesystem_assertion.fingerprint,
+            true,
+        );
+    }
     try filesystem.writer.writeAll("\"registered_policy_authenticated\":");
     try filesystem.writer.writeAll(if (effect_policy_authenticated) "true" else "false");
     try filesystem.writer.writeAll(",\"independently_enforced\":false,\"outside_workspace_write_denied\":false,\"evidence_refs_confined_to_workspace\":true,\"common_projection\":{");
-    try writeOptionalStringMember(&filesystem.writer, "expected_fingerprint", expected_common, true);
-    try writeOptionalStringMember(&filesystem.writer, "observed_fingerprint", common_projection_observed, true);
+    if (!private_trial) {
+        try writeOptionalStringMember(
+            &filesystem.writer,
+            "expected_fingerprint",
+            expected_common,
+            true,
+        );
+        try writeOptionalStringMember(
+            &filesystem.writer,
+            "observed_fingerprint",
+            common_projection_observed,
+            true,
+        );
+    }
     try filesystem.writer.writeAll("\"post_execution_rehash\":true,\"match\":true},\"target_package\":{");
-    try writeOptionalStringMember(&filesystem.writer, "before_fingerprint", target_package_observation.before_fingerprint, true);
-    try writeOptionalStringMember(&filesystem.writer, "after_fingerprint", target_package_observation.after_fingerprint, true);
+    if (!private_trial) {
+        try writeOptionalStringMember(
+            &filesystem.writer,
+            "before_fingerprint",
+            target_package_observation.before_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            &filesystem.writer,
+            "after_fingerprint",
+            target_package_observation.after_fingerprint,
+            true,
+        );
+    }
     try filesystem.writer.writeAll("\"observed\":");
     try filesystem.writer.writeAll(if (target_package_observed) "true" else "false");
     try filesystem.writer.writeAll(",\"match\":");
@@ -5299,7 +6676,16 @@ fn createRunnerObservationsAlloc(
     try filesystem.writer.writeAll("},\"execution_tree\":{");
     try writeStringMember(&filesystem.writer, "enumeration", "no-follow/v1", true);
     try writeStringMember(&filesystem.writer, "addition_policy", "fixed-executor-evidence-paths/v1", true);
-    try writeStringMember(&filesystem.writer, "observed_fingerprint", execution_tree_observed.exact_tree_fingerprint, true);
+    if (private_trial) {
+        try filesystem.writer.writeAll("\"observed\":true,");
+    } else {
+        try writeStringMember(
+            &filesystem.writer,
+            "observed_fingerprint",
+            execution_tree_observed.exact_tree_fingerprint,
+            true,
+        );
+    }
     try writeStringMember(&filesystem.writer, "output_carrier_fingerprint", execution_tree_observed.output_carrier_fingerprint, true);
     try filesystem.writer.writeAll("\"match\":true},\"os_confinement\":false}");
     const filesystem_fingerprint = try persistRunnerObservationAlloc(allocator, paths.filesystem_observation, filesystem.written());
@@ -5374,6 +6760,7 @@ fn buildRunReceiptAlloc(
     target_materialization: TargetMaterialization,
     target_package_observation: TargetPackageObservation,
     execution_tree_observed: ExecutionTreeObservation,
+    replay_preparation: ?ReplayPreparation,
 ) ![]u8 {
     var result_parsed = try std.json.parseFromSlice(std.json.Value, allocator, executor_result_text, .{
         .allocate = .alloc_always,
@@ -5514,25 +6901,29 @@ fn buildRunReceiptAlloc(
         status,
         executor,
         executor_fingerprint,
-        paths.decision_context_archive,
         execution_audit_archive.ref,
         execution_audit_archive.fingerprint,
+        replay_preparation,
+        runner_contract.executor_request_schema,
     );
-    defer allocator.free(native.json);
-    defer allocator.free(native.fingerprint);
-    defer if (native.metadata) |metadata| allocator.free(metadata);
-    try archiveBytesAtPath(allocator, native.json, paths.native_receipt, native.fingerprint);
+    defer native.deinit(allocator);
+    try archiveNativeReceiptAtPath(allocator, &native, paths.native_receipt);
     const violations = try canonicalFieldAlloc(allocator, effects.get("policy_violations").?);
     defer allocator.free(violations);
     const runtime_json = try canonicalFieldAlloc(allocator, result.get("runtime").?);
     defer allocator.free(runtime_json);
     const terminal_json = try canonicalFieldAlloc(allocator, result.get("terminal").?);
     defer allocator.free(terminal_json);
+    const public_materialization = try PublicTargetMaterialization.init(
+        allocator,
+        target_materialization,
+    );
+    defer public_materialization.deinit(allocator);
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeByte('{');
-    try writeStringMember(writer, "schema", "hylo-run-receipt/v1", true);
+    try writeStringMember(writer, "schema", try runReceiptSchemaForTrial(view), true);
     try writeStringMember(writer, "trial_id", view.trial_id, true);
     try writeStringMember(writer, "unit_id", view.unit_id, true);
     try writeStringMember(writer, "scenario_id", view.scenario_id, true);
@@ -5551,17 +6942,88 @@ fn buildRunReceiptAlloc(
     try writeStringMember(writer, "receiver_role", "runner", true);
     try writeStringMember(writer, "receiver_key_id", producer_key_id, false);
     try writer.writeAll("},\"materialization\":{");
-    try writeStringMember(writer, "arm_value_fingerprint", target_materialization.arm_value_fingerprint orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeStringMember(writer, "target_snapshot_ref", target_materialization.snapshot_ref orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeStringMember(writer, "target_snapshot_fingerprint", target_materialization.snapshot_fingerprint orelse return error.TargetMaterializationClaimMismatch, true);
-    try writeOptionalStringMember(writer, "target_materialization_archive_ref", if (target_materialization.present) target_materialization.archive_ref else null, true);
-    try writeOptionalStringMember(writer, "target_materialization_archive_fingerprint", target_materialization.carrier_fingerprint, true);
-    try writeOptionalStringMember(writer, "target_package_tree_before_fingerprint", target_package_observation.before_fingerprint, true);
-    try writeOptionalStringMember(writer, "target_package_tree_after_fingerprint", target_package_observation.after_fingerprint, true);
-    try writeOptionalStringMember(writer, "factor_materialization_ref", if (factor_materialization.present) factor_materialization.ref else null, true);
-    try writeOptionalStringMember(writer, "factor_materialization_fingerprint", if (factor_materialization.present) factor_materialization.fingerprint else null, true);
-    try writeOptionalStringMember(writer, "factor_materialization_archive_ref", if (factor_materialization.present) factor_materialization.archive_ref else null, true);
-    try writeOptionalStringMember(writer, "factor_materialization_archive_fingerprint", if (factor_materialization.present) factor_materialization.fingerprint else null, true);
+    if (public_materialization.private_trial) {
+        try writePrivateMaterializationProjection(writer, public_materialization);
+    } else {
+        try writeStringMember(
+            writer,
+            "arm_value_fingerprint",
+            public_materialization.arm_value_fingerprint,
+            true,
+        );
+        try writeStringMember(
+            writer,
+            "target_snapshot_ref",
+            public_materialization.snapshot_ref,
+            true,
+        );
+        try writeStringMember(
+            writer,
+            "target_snapshot_fingerprint",
+            public_materialization.snapshot_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_materialization_archive_ref",
+            if (target_materialization.present)
+                target_materialization.archive_ref
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_materialization_archive_fingerprint",
+            target_materialization.carrier_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_package_tree_before_fingerprint",
+            target_package_observation.before_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "target_package_tree_after_fingerprint",
+            target_package_observation.after_fingerprint,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_ref",
+            if (factor_materialization.present) factor_materialization.ref else null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_fingerprint",
+            if (factor_materialization.present)
+                factor_materialization.fingerprint
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_archive_ref",
+            if (factor_materialization.present)
+                factor_materialization.archive_ref
+            else
+                null,
+            true,
+        );
+        try writeOptionalStringMember(
+            writer,
+            "factor_materialization_archive_fingerprint",
+            if (factor_materialization.present)
+                factor_materialization.fingerprint
+            else
+                null,
+            true,
+        );
+    }
     _ = input_path;
     try writeStringMember(writer, "presented_input_ref", paths.presented_input_archive, true);
     try writeStringMember(writer, "presented_input_fingerprint", input_fingerprint, true);
@@ -5569,6 +7031,20 @@ fn buildRunReceiptAlloc(
         try writeStringMember(writer, "source_episode_fingerprint", identity.episode_fingerprint, true);
         try writeStringMember(writer, "source_profile_fingerprint", identity.profile_fingerprint, true);
     }
+    if (replay_preparation) |replay| if (std.mem.eql(
+        u8,
+        runner_contract.executor_request_schema,
+        ReplayBoundExecutorRequestSchema,
+    )) {
+        try writeStringMember(writer, "historical_dcp_fingerprint", replay.dcp_fingerprint, true);
+        try writeStringMember(writer, "historical_rip_fingerprint", replay.rip_fingerprint, true);
+        try writeStringMember(
+            writer,
+            "source_profile_body_delivery",
+            replay.source_profile_delivery,
+            true,
+        );
+    };
     try writer.writeAll("\"hidden_reference_presented\":false,\"sibling_output_presented\":false},\"runtime\":");
     try writer.writeAll(runtime_json);
     try writer.writeAll(",\"isolation\":{\"fresh_thread\":true,\"fresh_workspace\":true,");
@@ -5598,15 +7074,31 @@ fn buildRunReceiptAlloc(
     try writeStringMember(writer, "metrics_ref", metrics_archive.ref, true);
     try writeStringMember(writer, "metrics_fingerprint", metrics_archive.fingerprint, false);
     try writer.writeAll("},\"native_receipt\":{");
-    try writeStringMember(writer, "kind", native.kind, true);
-    try writeStringMember(writer, "ref", paths.native_receipt, true);
-    try writeStringMember(writer, "fingerprint", native.fingerprint, true);
-    if (native.metadata) |metadata| {
+    const public_native = native.public_projection;
+    try writeStringMember(
+        writer,
+        "kind",
+        if (public_native) |value| value.kind else native.kind,
+        true,
+    );
+    try writeStringMember(
+        writer,
+        "ref",
+        if (public_native) |value| value.ref else paths.native_receipt,
+        true,
+    );
+    try writeStringMember(
+        writer,
+        "fingerprint",
+        if (public_native) |value| value.fingerprint else native.fingerprint,
+        true,
+    );
+    if (public_native == null) if (native.metadata) |metadata| {
         try writer.writeAll(metadata);
         try writer.writeByte(',');
-    }
+    };
     try writer.writeAll("\"receipt\":");
-    try writer.writeAll(native.json);
+    try writer.writeAll(if (public_native) |value| value.json else native.json);
     try writer.writeAll("},\"attestation\":null}");
     return out.toOwnedSlice();
 }
@@ -5628,7 +7120,243 @@ const NativeReceipt = struct {
     json: []u8,
     fingerprint: []u8,
     metadata: ?[]u8 = null,
+    public_projection: ?PublicNativeReceipt = null,
+
+    fn deinit(self: NativeReceipt, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, self.json);
+        allocator.free(self.json);
+        allocator.free(self.fingerprint);
+        if (self.metadata) |metadata| allocator.free(metadata);
+        if (self.public_projection) |projection| projection.deinit(allocator);
+    }
 };
+
+const PublicNativeReceipt = struct {
+    kind: []const u8,
+    json: []u8,
+    fingerprint: []u8,
+    ref: []u8,
+
+    fn deinit(self: PublicNativeReceipt, allocator: std.mem.Allocator) void {
+        allocator.free(self.json);
+        allocator.free(self.fingerprint);
+        allocator.free(self.ref);
+    }
+};
+
+fn archiveNativeReceiptAtPath(
+    allocator: std.mem.Allocator,
+    native: *const NativeReceipt,
+    destination: []const u8,
+) !void {
+    const archived_json = if (native.public_projection) |projection|
+        projection.json
+    else
+        native.json;
+    const archived_fingerprint = if (native.public_projection) |projection|
+        projection.fingerprint
+    else
+        native.fingerprint;
+    try archiveBytesAtPath(
+        allocator,
+        archived_json,
+        destination,
+        archived_fingerprint,
+    );
+}
+
+fn firPublicProjectionAlloc(
+    allocator: std.mem.Allocator,
+    view: LaneView,
+    profile: std.json.ObjectMap,
+    replay: ReplayPreparation,
+    fir_fingerprint: []const u8,
+    target_text_witness_fingerprint: []const u8,
+    episode_identity_fingerprint: []const u8,
+) !PublicNativeReceipt {
+    const raw = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":{f},\"trial_id\":{f},\"lane_id\":{f}," ++
+            "\"fir_receipt_fingerprint\":{f}," ++
+            "\"source_governance_fingerprint\":{f}," ++
+            "\"decision_context_fingerprint\":{f}," ++
+            "\"replay_plan_fingerprint\":{f}," ++
+            "\"source_profile_fingerprint\":{f}," ++
+            "\"source_target_text_witness_fingerprint\":{f}," ++
+            "\"episode_identity_fingerprint\":{f}," ++
+            "\"required_lineage\":{f},\"validated\":true}}",
+        .{
+            std.json.fmt(FirPublicProjectionSchema, .{}),
+            std.json.fmt(view.trial_id, .{}),
+            std.json.fmt(view.lane_id, .{}),
+            std.json.fmt(fir_fingerprint, .{}),
+            std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
+            std.json.fmt(replay.dcp_fingerprint, .{}),
+            std.json.fmt(replay.rip_fingerprint, .{}),
+            std.json.fmt(replay.source_profile_fingerprint, .{}),
+            std.json.fmt(target_text_witness_fingerprint, .{}),
+            std.json.fmt(episode_identity_fingerprint, .{}),
+            std.json.fmt(replay.required_lineage, .{}),
+        },
+    );
+    defer allocator.free(raw);
+    const json = try canonicalJsonTextAlloc(allocator, raw);
+    errdefer allocator.free(json);
+    const fingerprint = try attestation.digestBytesAlloc(allocator, json);
+    errdefer allocator.free(fingerprint);
+    return .{
+        .kind = FirPublicProjectionKind,
+        .json = json,
+        .fingerprint = fingerprint,
+        .ref = try std.fmt.allocPrint(allocator, "artifact:{s}", .{fingerprint}),
+    };
+}
+
+fn requireExactFirProjectionKeys(
+    map: std.json.ObjectMap,
+    expected: []const []const u8,
+) !void {
+    if (map.count() != expected.len) return error.PrivateRunReceiptSemanticLeak;
+    for (expected) |key| {
+        if (map.get(key) == null) return error.PrivateRunReceiptSemanticLeak;
+    }
+}
+
+fn validateFirPublicProjection(
+    allocator: std.mem.Allocator,
+    native_receipt: std.json.ObjectMap,
+    view: LaneView,
+) !void {
+    try requireExactFirProjectionKeys(
+        native_receipt,
+        &.{ "fingerprint", "kind", "receipt", "ref" },
+    );
+    if (!std.mem.eql(
+        u8,
+        try requiredString(native_receipt, "kind"),
+        FirPublicProjectionKind,
+    )) return error.PrivateRunReceiptSemanticLeak;
+    const projection_value = native_receipt.get("receipt") orelse return error.RequiredFieldMissing;
+    const projection_fingerprint = try attestation.digestValueAlloc(
+        allocator,
+        projection_value,
+    );
+    defer allocator.free(projection_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        projection_fingerprint,
+        try requiredString(native_receipt, "fingerprint"),
+    )) return error.NativeReceiptFingerprintMismatch;
+    const expected_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{projection_fingerprint},
+    );
+    defer allocator.free(expected_ref);
+    if (!std.mem.eql(
+        u8,
+        expected_ref,
+        try requiredString(native_receipt, "ref"),
+    )) return error.PrivateRunReceiptSemanticLeak;
+
+    const projection = try object(projection_value);
+    try requireExactFirProjectionKeys(projection, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "lane_id",
+        "replay_plan_fingerprint",
+        "required_lineage",
+        "schema",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+        "trial_id",
+        "validated",
+    });
+    if (!std.mem.eql(u8, try requiredString(projection, "schema"), FirPublicProjectionSchema) or
+        !std.mem.eql(u8, try requiredString(projection, "trial_id"), view.trial_id) or
+        !std.mem.eql(u8, try requiredString(projection, "lane_id"), view.lane_id) or
+        !try requiredBool(projection, "validated"))
+    {
+        return error.PrivateRunReceiptSemanticLeak;
+    }
+    inline for (.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "replay_plan_fingerprint",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+    }) |key| try validateFingerprint(try requiredString(projection, key));
+
+    const profile = try object(view.source_profile);
+    if (!std.mem.eql(u8, try requiredString(profile, "kind"), "historical_decision") or
+        !std.mem.eql(
+            u8,
+            try requiredString(projection, "source_governance_fingerprint"),
+            try requiredString(profile, "source_governance_fingerprint"),
+        ) or !std.mem.eql(
+        u8,
+        try requiredString(projection, "decision_context_fingerprint"),
+        try requiredString(profile, "decision_context_fingerprint"),
+    ) or !std.mem.eql(
+        u8,
+        try requiredString(projection, "required_lineage"),
+        try requiredString(profile, "required_lineage"),
+    )) return error.FirReplayBindingMismatch;
+    if (try sourceIdentity(view)) |identity| {
+        if (!std.mem.eql(
+            u8,
+            try requiredString(projection, "source_profile_fingerprint"),
+            identity.profile_fingerprint,
+        )) return error.FirReplayBindingMismatch;
+    }
+}
+
+fn validateHistoricalFirReplayBinding(
+    fir_value: std.json.Value,
+    view: LaneView,
+    replay: ReplayPreparation,
+) !void {
+    const root = try object(fir_value);
+    const binding = try requiredObject(root, "replay_binding");
+    if (!std.mem.eql(u8, try requiredString(binding, "trial_id"), view.trial_id) or
+        !std.mem.eql(u8, try requiredString(binding, "lane_id"), view.lane_id) or
+        !std.mem.eql(
+            u8,
+            try requiredString(binding, "source_profile_fingerprint"),
+            replay.source_profile_fingerprint,
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(binding, "historical_dcp_fingerprint"),
+            replay.dcp_fingerprint,
+        ) or
+        !std.mem.eql(
+            u8,
+            try requiredString(binding, "historical_rip_fingerprint"),
+            replay.rip_fingerprint,
+        ) or
+        !std.mem.eql(u8, try requiredString(binding, "required_lineage"), replay.required_lineage))
+    {
+        return error.FirReplayBindingMismatch;
+    }
+}
+
+fn validateHistoricalFirReplayBindingForSchema(
+    executor_request_schema: []const u8,
+    fir_value: std.json.Value,
+    view: LaneView,
+    replay: ReplayPreparation,
+) !void {
+    if (std.mem.eql(u8, executor_request_schema, LegacyExecutorRequestSchema)) return;
+    if (!std.mem.eql(u8, executor_request_schema, ReplayBoundExecutorRequestSchema)) {
+        return error.ExecutorRequestSchemaInvalid;
+    }
+    try validateHistoricalFirReplayBinding(fir_value, view, replay);
+}
 
 fn nativeReceiptAlloc(
     allocator: std.mem.Allocator,
@@ -5638,9 +7366,10 @@ fn nativeReceiptAlloc(
     status: []const u8,
     executor: []const u8,
     executor_fingerprint: []const u8,
-    decision_context_ref: []const u8,
     execution_audit_ref: []const u8,
     execution_audit_fingerprint: []const u8,
+    replay_preparation: ?ReplayPreparation,
+    executor_request_schema: []const u8,
 ) !NativeReceipt {
     const profile = try object(view.source_profile);
     const kind = try requiredString(profile, "kind");
@@ -5651,6 +7380,13 @@ fn nativeReceiptAlloc(
             return error.SourceTargetTextContamination;
         }
         const fir_value = result.get("fir_receipt") orelse return error.FirReceiptMissing;
+        const replay = replay_preparation orelse return error.HistoricalReplayCompilationRequired;
+        try validateHistoricalFirReplayBindingForSchema(
+            executor_request_schema,
+            fir_value,
+            view,
+            replay,
+        );
         var profile_report = try adapter.validateHistoricalProfile(
             allocator,
             view.source_profile,
@@ -5667,30 +7403,98 @@ fn nativeReceiptAlloc(
         );
         defer fir_report.deinit(allocator);
         const fir_json = try attestation.canonicalJsonAlloc(allocator, fir_value);
-        defer allocator.free(fir_json);
-        const metadata = try std.fmt.allocPrint(
-            allocator,
-            "\"source_governance_fingerprint\":{f},\"decision_context_ref\":{f},\"decision_context_fingerprint\":{f},\"source_target_text_policy\":{f},\"source_target_text_witness_fingerprint\":{f},\"episode_identity_fingerprint\":{f},\"target_instruction_count\":1,\"executor\":{f},\"executor_binary_fingerprint\":{f},\"execution_audit_ref\":{f},\"execution_audit_fingerprint\":{f}",
-            .{
-                std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
-                std.json.fmt(decision_context_ref, .{}),
-                std.json.fmt(try requiredString(profile, "decision_context_fingerprint"), .{}),
-                std.json.fmt(try requiredString(profile, "source_target_text_policy"), .{}),
-                std.json.fmt(profile_report.target_text_witness_fingerprint, .{}),
-                std.json.fmt(fir_report.episode_identity_fingerprint.?, .{}),
-                std.json.fmt(executor, .{}),
-                std.json.fmt(executor_fingerprint, .{}),
-                std.json.fmt(execution_audit_ref, .{}),
-                std.json.fmt(execution_audit_fingerprint, .{}),
-            },
-        );
+        defer {
+            std.crypto.secureZero(u8, fir_json);
+            allocator.free(fir_json);
+        }
+        const fir_fingerprint = try attestation.digestBytesAlloc(allocator, fir_json);
+        errdefer allocator.free(fir_fingerprint);
+        const private_json = try allocator.dupe(u8, fir_json);
+        errdefer {
+            std.crypto.secureZero(u8, private_json);
+            allocator.free(private_json);
+        }
+        const private_trial = try isPrivateTrial(view);
+        const metadata = if (private_trial)
+            null
+        else if (std.mem.eql(u8, executor_request_schema, ReplayBoundExecutorRequestSchema))
+            try std.fmt.allocPrint(
+                allocator,
+                "\"source_governance_fingerprint\":{f}," ++
+                    "\"decision_context_fingerprint\":{f}," ++
+                    "\"replay_plan_fingerprint\":{f}," ++
+                    "\"source_profile_fingerprint\":{f}," ++
+                    "\"source_profile_body_delivery\":{f}," ++
+                    "\"source_target_text_policy\":{f}," ++
+                    "\"source_target_text_witness_fingerprint\":{f}," ++
+                    "\"episode_identity_fingerprint\":{f}," ++
+                    "\"target_instruction_count\":1,\"executor\":{f}," ++
+                    "\"executor_binary_fingerprint\":{f}," ++
+                    "\"execution_audit_ref\":{f}," ++
+                    "\"execution_audit_fingerprint\":{f}",
+                .{
+                    std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
+                    std.json.fmt(replay.dcp_fingerprint, .{}),
+                    std.json.fmt(replay.rip_fingerprint, .{}),
+                    std.json.fmt(replay.source_profile_fingerprint, .{}),
+                    std.json.fmt(replay.source_profile_delivery, .{}),
+                    std.json.fmt(try requiredString(profile, "source_target_text_policy"), .{}),
+                    std.json.fmt(profile_report.target_text_witness_fingerprint, .{}),
+                    std.json.fmt(fir_report.episode_identity_fingerprint.?, .{}),
+                    std.json.fmt(executor, .{}),
+                    std.json.fmt(executor_fingerprint, .{}),
+                    std.json.fmt(execution_audit_ref, .{}),
+                    std.json.fmt(execution_audit_fingerprint, .{}),
+                },
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "\"source_governance_fingerprint\":{f}," ++
+                    "\"decision_context_fingerprint\":{f}," ++
+                    "\"source_target_text_policy\":{f}," ++
+                    "\"source_target_text_witness_fingerprint\":{f}," ++
+                    "\"episode_identity_fingerprint\":{f}," ++
+                    "\"target_instruction_count\":1,\"executor\":{f}," ++
+                    "\"executor_binary_fingerprint\":{f}," ++
+                    "\"execution_audit_ref\":{f}," ++
+                    "\"execution_audit_fingerprint\":{f}",
+                .{
+                    std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
+                    std.json.fmt(replay.dcp_fingerprint, .{}),
+                    std.json.fmt(try requiredString(profile, "source_target_text_policy"), .{}),
+                    std.json.fmt(profile_report.target_text_witness_fingerprint, .{}),
+                    std.json.fmt(fir_report.episode_identity_fingerprint.?, .{}),
+                    std.json.fmt(executor, .{}),
+                    std.json.fmt(executor_fingerprint, .{}),
+                    std.json.fmt(execution_audit_ref, .{}),
+                    std.json.fmt(execution_audit_fingerprint, .{}),
+                },
+            );
+        errdefer if (metadata) |value| allocator.free(value);
+        const public_projection = if (private_trial)
+            try firPublicProjectionAlloc(
+                allocator,
+                view,
+                profile,
+                replay,
+                fir_fingerprint,
+                profile_report.target_text_witness_fingerprint,
+                fir_report.episode_identity_fingerprint orelse
+                    return error.RetraceSourceLineageInvalid,
+            )
+        else
+            null;
+        errdefer if (public_projection) |value| value.deinit(allocator);
         return .{
             .kind = "FIR-v1",
-            .fingerprint = try attestation.digestBytesAlloc(allocator, fir_json),
-            .json = try allocator.dupe(u8, fir_json),
+            .fingerprint = fir_fingerprint,
+            .json = private_json,
             .metadata = metadata,
+            .public_projection = public_projection,
         };
     }
+    if (replay_preparation != null) return error.DirectLaneCompileReplayForbidden;
     return casNativeReceiptAlloc(
         allocator,
         view,
@@ -5813,6 +7617,7 @@ fn validateRunnerContract(
     {
         return error.RunnerContractInvalid;
     }
+    const executor_request_schema = try admittedExecutorRequestSchema(contract);
 
     const runner_authority = try requiredObject(execution, "runner_authority");
     if (!std.mem.eql(u8, try requiredString(runner_authority, "binary_fingerprint"), runner_binary_fingerprint)) {
@@ -5845,7 +7650,7 @@ fn validateRunnerContract(
 
     if (!sealed) {
         if (contract.get("capability_seal") != null) return error.RunnerContractInvalid;
-        return .{};
+        return .{ .executor_request_schema = executor_request_schema };
     }
 
     const capability_seal = try requiredObject(contract, "capability_seal");
@@ -5868,10 +7673,13 @@ fn validateRunnerContract(
         try requiredArray(capability_seal, "cas_observations"),
         &.{ "target-package-tree", "execution-tree", "output-carrier", "process-group" },
     );
-    return .{ .capability_seal = .{
-        .profile_id = try requiredString(capability_seal, "profile_id"),
-        .effect_policy_fingerprint = effect_policy_fingerprint,
-    } };
+    return .{
+        .capability_seal = .{
+            .profile_id = try requiredString(capability_seal, "profile_id"),
+            .effect_policy_fingerprint = effect_policy_fingerprint,
+        },
+        .executor_request_schema = executor_request_schema,
+    };
 }
 
 fn requireExactCapabilityObservations(observed: std.json.Array, expected: []const []const u8) !void {
@@ -6283,11 +8091,18 @@ fn validateSensitiveInputFds(
     lease_fd: std.posix.fd_t,
     input_fd: std.posix.fd_t,
     source_profile_fd: ?std.posix.fd_t,
+    materialization_fd: ?std.posix.fd_t,
     signing_seed_fd: ?std.posix.fd_t,
 ) !void {
-    var endpoints: [4]SensitiveInputEndpoint = undefined;
+    var endpoints: [5]SensitiveInputEndpoint = undefined;
     var count: usize = 0;
-    for ([_]?std.posix.fd_t{ lease_fd, input_fd, source_profile_fd, signing_seed_fd }) |maybe_fd| {
+    for ([_]?std.posix.fd_t{
+        lease_fd,
+        input_fd,
+        source_profile_fd,
+        materialization_fd,
+        signing_seed_fd,
+    }) |maybe_fd| {
         const fd = maybe_fd orelse continue;
         endpoints[count] = try sensitiveInputEndpoint(fd);
         for (endpoints[0..count]) |prior| {
@@ -6728,14 +8543,204 @@ fn deleteTree(path: []const u8) !void {
     return std.Io.Dir.cwd().deleteTree(defaultIo(), path);
 }
 
+fn validatePrivateWorkspaceRemovalBoundary(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    return validatePrivateWorkspaceRemovalDirectory(allocator, path, true);
+}
+
+fn validatePrivateWorkspaceRemovalDirectory(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    private_root: bool,
+) !void {
+    if (!std.fs.path.isAbsolute(path)) return error.CleanupPrivateBoundaryInvalid;
+    durable_store.rejectSymlinkComponents(path) catch
+        return error.CleanupPrivateBoundaryInvalid;
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.CleanupPrivateBoundaryInvalid;
+    defer dir.close(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(dir.handle, &native_stat) != 0 or
+        !std.c.S.ISDIR(native_stat.mode) or
+        native_stat.uid != std.c.getuid())
+    {
+        return error.CleanupPrivateBoundaryInvalid;
+    }
+    const mode = native_stat.mode & 0o777;
+    if (private_root) {
+        if ((mode != 0o700 and mode != 0o755) or mode & 0o022 != 0) {
+            return error.CleanupPrivateBoundaryInvalid;
+        }
+    } else if (mode & 0o022 != 0) return error.CleanupPrivateBoundaryInvalid;
+
+    var iterator = dir.iterate();
+    while (try iterator.next(defaultIo())) |entry| {
+        const child = try std.fs.path.join(allocator, &.{ path, entry.name });
+        defer allocator.free(child);
+        switch (entry.kind) {
+            .directory => try validatePrivateWorkspaceRemovalDirectory(allocator, child, false),
+            .file => try validatePrivateWorkspaceRemovalFile(child),
+            .sym_link => return error.CleanupPrivateBoundaryInvalid,
+            else => return error.CleanupPrivateBoundaryInvalid,
+        }
+    }
+    if (private_root and mode == 0o755) {
+        if (std.c.fchmod(dir.handle, 0o700) != 0) return error.CleanupPrivateBoundaryInvalid;
+        if (std.c.fstat(dir.handle, &native_stat) != 0 or
+            !std.c.S.ISDIR(native_stat.mode) or
+            native_stat.uid != std.c.getuid() or
+            native_stat.mode & 0o777 != 0o700)
+        {
+            return error.CleanupPrivateBoundaryInvalid;
+        }
+    }
+}
+
+fn validateHistoricalReplayRemovalBoundary(
+    replay_root: []const u8,
+    dcp_path: []const u8,
+    rip_path: []const u8,
+) !void {
+    const replay_stat = std.Io.Dir.cwd().statFile(defaultIo(), replay_root, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return error.CleanupPrivateBoundaryInvalid,
+    };
+    if (replay_stat.kind != .directory) return error.CleanupPrivateBoundaryInvalid;
+    durable_store.rejectSymlinkComponents(replay_root) catch
+        return error.CleanupPrivateBoundaryInvalid;
+    var replay_dir = std.Io.Dir.openDirAbsolute(defaultIo(), replay_root, .{
+        .follow_symlinks = false,
+    }) catch return error.CleanupPrivateBoundaryInvalid;
+    defer replay_dir.close(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(replay_dir.handle, &native_stat) != 0 or
+        !std.c.S.ISDIR(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.mode & 0o777 != 0o700)
+    {
+        return error.CleanupPrivateBoundaryInvalid;
+    }
+    try validateExactPrivateRemovalFile(dcp_path, 0o600);
+    try validateExactPrivateRemovalFile(rip_path, 0o600);
+}
+
+fn validateExactPrivateRemovalFile(path: []const u8, mode: std.posix.mode_t) !void {
+    durable_store.rejectSymlinkComponents(path) catch
+        return error.CleanupPrivateBoundaryInvalid;
+    var file = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return error.CleanupPrivateBoundaryInvalid;
+    defer file.close(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(file.handle, &native_stat) != 0 or
+        !std.c.S.ISREG(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.nlink != 1 or
+        native_stat.mode & 0o777 != mode)
+    {
+        return error.CleanupPrivateBoundaryInvalid;
+    }
+}
+
+fn validatePrivateWorkspaceRemovalFile(path: []const u8) !void {
+    durable_store.rejectSymlinkComponents(path) catch
+        return error.CleanupPrivateBoundaryInvalid;
+    var file = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch return error.CleanupPrivateBoundaryInvalid;
+    defer file.close(defaultIo());
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(file.handle, &native_stat) != 0 or
+        !std.c.S.ISREG(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.nlink != 1 or
+        native_stat.mode & 0o022 != 0)
+    {
+        return error.CleanupPrivateBoundaryInvalid;
+    }
+}
+
+fn restorePrivateWorkspaceDirectoryModes(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    durable_store.rejectSymlinkComponents(path) catch
+        return error.CleanupPrivateBoundaryInvalid;
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), path, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    }) catch return error.CleanupPrivateBoundaryInvalid;
+    defer dir.close(defaultIo());
+    var iterator = dir.iterate();
+    while (try iterator.next(defaultIo())) |entry| {
+        const child = try std.fs.path.join(allocator, &.{ path, entry.name });
+        defer allocator.free(child);
+        switch (entry.kind) {
+            .directory => try restorePrivateWorkspaceDirectoryModes(allocator, child),
+            .file => {},
+            .sym_link => return error.CleanupPrivateBoundaryInvalid,
+            else => return error.CleanupPrivateBoundaryInvalid,
+        }
+    }
+    if (std.c.fchmod(dir.handle, 0o700) != 0) return error.CleanupPrivateBoundaryInvalid;
+    var native_stat: std.c.Stat = undefined;
+    if (std.c.fstat(dir.handle, &native_stat) != 0 or
+        !std.c.S.ISDIR(native_stat.mode) or
+        native_stat.uid != std.c.getuid() or
+        native_stat.mode & 0o777 != 0o700)
+    {
+        return error.CleanupPrivateBoundaryInvalid;
+    }
+}
+
+fn removePrivateWorkspaceTree(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    replay_root: []const u8,
+    dcp_path: []const u8,
+    rip_path: []const u8,
+) !void {
+    try validatePrivateWorkspaceRemovalBoundary(allocator, path);
+    try validateHistoricalReplayRemovalBoundary(replay_root, dcp_path, rip_path);
+    try restorePrivateWorkspaceDirectoryModes(allocator, path);
+    try deleteTree(path);
+}
+
 fn validatePathComponent(value: []const u8) !void {
-    if (value.len == 0 or std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return error.InvalidId;
-    for (value) |byte| if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.')) return error.InvalidId;
+    if (value.len == 0 or
+        std.mem.eql(u8, value, ".") or
+        std.mem.eql(u8, value, ".."))
+    {
+        return error.InvalidId;
+    }
+    for (value) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or
+            byte == '-' or
+            byte == '_' or
+            byte == '.'))
+        {
+            return error.InvalidId;
+        }
+    }
 }
 
 fn validateFingerprint(value: []const u8) !void {
-    if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) return error.InvalidFingerprint;
-    for (value[7..]) |byte| if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidFingerprint;
+    if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) {
+        return error.InvalidFingerprint;
+    }
+    for (value[7..]) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) {
+            return error.InvalidFingerprint;
+        }
+    }
 }
 
 fn object(value: std.json.Value) !std.json.ObjectMap {
@@ -6851,7 +8856,12 @@ fn writeCapabilitySealMembers(writer: anytype, identity: ?CapabilitySealIdentity
     if (identity) |seal| {
         try writer.writeByte(',');
         try writeStringMember(writer, "capability_profile_id", seal.profile_id, true);
-        try writeStringMember(writer, "capability_effect_policy_fingerprint", seal.effect_policy_fingerprint, true);
+        try writeStringMember(
+            writer,
+            "capability_effect_policy_fingerprint",
+            seal.effect_policy_fingerprint,
+            true,
+        );
     } else {
         try writer.writeByte(',');
     }
@@ -6881,6 +8891,68 @@ fn writeOptionalStringMember(
     if (comma) try writer.writeByte(',');
 }
 
+fn testReplayPreparationAlloc(allocator: std.mem.Allocator) !ReplayPreparation {
+    const dcp = try allocator.dupe(u8, "{\"packet_version\":\"DCP-v2\"}");
+    errdefer allocator.free(dcp);
+    const dcp_fingerprint = try attestation.digestBytesAlloc(allocator, dcp);
+    errdefer allocator.free(dcp_fingerprint);
+    const rip = try allocator.dupe(u8, "{\"plan_version\":\"RIP-v1\"}");
+    errdefer allocator.free(rip);
+    const rip_fingerprint = try attestation.digestBytesAlloc(allocator, rip);
+    errdefer allocator.free(rip_fingerprint);
+    return .{
+        .dcp = dcp,
+        .dcp_fingerprint = dcp_fingerprint,
+        .rip = rip,
+        .rip_fingerprint = rip_fingerprint,
+        .source_profile_fingerprint = try allocator.dupe(
+            u8,
+            "sha256:" ++ "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+        .source_profile_delivery = "source_profile_fd",
+        .required_lineage = try allocator.dupe(u8, "rollout_transcript"),
+    };
+}
+
+fn operatorHistoricalProfileForTestAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.operator_recipe_source_manifest,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const cases = try requiredArray(try object(parsed.value), "cases");
+    for (cases.items) |case_value| {
+        const source_case = try object(case_value);
+        const profile = source_case.get("source_profile") orelse continue;
+        if (std.mem.eql(
+            u8,
+            try requiredString(try object(profile), "kind"),
+            "historical_decision",
+        )) {
+            return attestation.canonicalJsonAlloc(allocator, profile);
+        }
+    }
+    return error.HistoricalDecisionProfileRequired;
+}
+
+test "help names the exact private target projection opening contract" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        UsageText,
+        "hylo-target-common-projection-opening/v1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        UsageText,
+        "target_common_projection_opening",
+    ) != null);
+}
+
 test "lane lookup preserves the opaque manifest binding" {
     const raw = hctp_fixtures.valid_null_trial;
     var tmp = std.testing.tmpDir(.{});
@@ -6892,6 +8964,1373 @@ test "lane lookup preserves the opaque manifest binding" {
     defer loaded.parsed.deinit();
     try std.testing.expectEqualStrings("pair-null-001", loaded.view.pair_id);
     try std.testing.expectEqualStrings("arm-1", loaded.view.arm_id);
+}
+
+test "route projection branches direct and historical lanes without private material" {
+    const allocator = std.testing.allocator;
+    var direct_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer direct_parsed.deinit();
+    const direct_trial = try object(direct_parsed.value);
+    const direct_unit = try object((try requiredArray(direct_trial, "units")).items[0]);
+    const direct_pair = try object((try requiredArray(direct_unit, "pairs")).items[0]);
+    const direct = LaneView{
+        .trial = direct_trial,
+        .trial_id = try requiredString(direct_trial, "trial_id"),
+        .purpose = try requiredString(direct_trial, "purpose"),
+        .unit_id = try requiredString(direct_unit, "unit_id"),
+        .scenario_id = try requiredString(direct_unit, "scenario_id"),
+        .pair_id = try requiredString(direct_pair, "pair_id"),
+        .pair = direct_pair,
+        .lane_id = "lane-null-a0",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(direct_trial, "arms")).items[0]),
+        .source_profile = direct_unit.get("source_profile").?,
+        .execution = try requiredObject(direct_trial, "execution"),
+    };
+    const direct_route = try trialRouteProjection(direct);
+    try std.testing.expectEqualStrings("direct", direct_route.source_profile_kind);
+    try std.testing.expect(!direct_route.compile_replay_required);
+    try std.testing.expectEqualStrings("none", direct_route.replay_preparation_mode);
+    try std.testing.expectEqualStrings("none", direct_route.source_profile_body_delivery);
+    try std.testing.expectEqualStrings("direct", direct_route.execution_route);
+    try std.testing.expect(direct_route.required_lineage == null);
+
+    var projected = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"kind\":\"historical_decision\"," ++
+            "\"profile_body_delivery\":\"source_profile_fd\"," ++
+            "\"required_lineage\":\"rollout_transcript\"}",
+        .{},
+    );
+    defer projected.deinit();
+    var historical = direct;
+    historical.source_profile = projected.value;
+    const historical_route = try trialRouteProjection(historical);
+    try std.testing.expectEqualStrings("historical_decision", historical_route.source_profile_kind);
+    try std.testing.expect(!historical_route.compile_replay_required);
+    try std.testing.expectEqualStrings("integrated_run", historical_route.replay_preparation_mode);
+    try std.testing.expectEqualStrings(
+        "source_profile_fd",
+        historical_route.source_profile_body_delivery,
+    );
+    try std.testing.expectEqualStrings("historical_replay", historical_route.execution_route);
+    try std.testing.expectEqualStrings("rollout_transcript", historical_route.required_lineage.?);
+}
+
+test "v2 target projection requires an exact committed private opening" {
+    const allocator = std.testing.allocator;
+    const projection_text =
+        "{\"schema\":\"hylo-target-common-projection/v1\"," ++
+        "\"verifier\":{\"id\":\"git-target-common-projection\"," ++
+        "\"version\":\"v1\"}," ++
+        "\"baseline_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"excluded_roots\":[\"target.txt\"],\"entries\":[]}";
+    var projection_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        projection_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer projection_parsed.deinit();
+    const projection_fingerprint = try attestation.digestValueAlloc(
+        allocator,
+        projection_parsed.value,
+    );
+    defer allocator.free(projection_fingerprint);
+    const opening_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"nonce\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"projection\":{s}," ++
+            "\"schema\":\"hylo-target-common-projection-opening/v1\"}}",
+        .{projection_text},
+    );
+    defer allocator.free(opening_text);
+    var opening_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        opening_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer opening_parsed.deinit();
+    const opening_commitment = try attestation.digestValueAlloc(allocator, opening_parsed.value);
+    defer allocator.free(opening_commitment);
+    const trial_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-trial/v2\"," ++
+            "\"trial_id\":\"trial-private-target\",\"purpose\":\"promotion\"," ++
+            "\"arms\":[{{\"arm_id\":\"arm-opaque-0\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "1111111111111111111111111111111111111111111111111111111111111111\"}}," ++
+            "{{\"arm_id\":\"arm-opaque-1\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "2222222222222222222222222222222222222222222222222222222222222222\"}}]," ++
+            "\"factor\":{{\"kind\":\"target_snapshot\"," ++
+            "\"allowed_difference_roots\":[\"target.txt\"]," ++
+            "\"common_projection_fingerprint\":{f}," ++
+            "\"target_common_projection_commitment\":{f}}}," ++
+            "\"units\":[{{\"unit_id\":\"unit-private-target\"," ++
+            "\"scenario_id\":\"scenario-private-target\"," ++
+            "\"source_profile\":{{\"kind\":\"direct\"}}," ++
+            "\"pairs\":[{{\"pair_id\":\"pair-private-target\"," ++
+            "\"lanes\":{{\"arm-opaque-0\":" ++
+            "{{\"lane_id\":\"lane-private-target-0\"}}," ++
+            "\"arm-opaque-1\":{{\"lane_id\":\"lane-private-target-1\"}}}}}}]}}]," ++
+            "\"execution\":{{}}}}",
+        .{ std.json.fmt(projection_fingerprint, .{}), std.json.fmt(opening_commitment, .{}) },
+    );
+    defer allocator.free(trial_text);
+    var trial_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        trial_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer trial_parsed.deinit();
+    var trial = try object(trial_parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const pair = try object((try requiredArray(unit, "pairs")).items[0]);
+    const view = LaneView{
+        .trial = trial,
+        .trial_id = try requiredString(trial, "trial_id"),
+        .purpose = try requiredString(trial, "purpose"),
+        .unit_id = try requiredString(unit, "unit_id"),
+        .scenario_id = try requiredString(unit, "scenario_id"),
+        .pair_id = try requiredString(pair, "pair_id"),
+        .pair = pair,
+        .lane_id = "lane-private-target-0",
+        .arm_id = "arm-opaque-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = unit.get("source_profile").?,
+        .execution = try requiredObject(trial, "execution"),
+    };
+
+    const valid_claim_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"target_common_projection_opening\":{s}}}",
+        .{opening_text},
+    );
+    defer allocator.free(valid_claim_text);
+    var valid_claim_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        valid_claim_text,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer valid_claim_parsed.deinit();
+    const valid_claim = try object(valid_claim_parsed.value);
+    const materialization = try resolveTargetCommonProjectionAlloc(allocator, view, valid_claim);
+    defer materialization.deinit(allocator);
+    const canonical_projection = try attestation.canonicalJsonAlloc(
+        allocator,
+        projection_parsed.value,
+    );
+    defer allocator.free(canonical_projection);
+    try std.testing.expectEqualStrings(canonical_projection, materialization.bytes);
+    try std.testing.expectEqualStrings(projection_fingerprint, materialization.fingerprint);
+
+    var missing_claim_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer missing_claim_parsed.deinit();
+    try std.testing.expectError(
+        error.TargetCommonProjectionMissing,
+        resolveTargetCommonProjectionAlloc(allocator, view, try object(missing_claim_parsed.value)),
+    );
+
+    const mismatched_opening_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"target_common_projection_opening\":{{\"nonce\":\"" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"projection\":{s}," ++
+            "\"schema\":\"hylo-target-common-projection-opening/v1\"}}}}",
+        .{projection_text},
+    );
+    defer allocator.free(mismatched_opening_text);
+    var mismatched_opening_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        mismatched_opening_text,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer mismatched_opening_parsed.deinit();
+    try std.testing.expectError(
+        error.TargetCommonProjectionMismatch,
+        resolveTargetCommonProjectionAlloc(
+            allocator,
+            view,
+            try object(mismatched_opening_parsed.value),
+        ),
+    );
+
+    const alternate_projection_text =
+        "{\"schema\":\"hylo-target-common-projection/v1\"," ++
+        "\"verifier\":{\"id\":\"git-target-common-projection\"," ++
+        "\"version\":\"v1\"}," ++
+        "\"baseline_revision\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"," ++
+        "\"excluded_roots\":[\"target.txt\"],\"entries\":[]}";
+    const alternate_opening_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"nonce\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"projection\":{s}," ++
+            "\"schema\":\"hylo-target-common-projection-opening/v1\"}}",
+        .{alternate_projection_text},
+    );
+    defer allocator.free(alternate_opening_text);
+    var alternate_opening_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        alternate_opening_text,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer alternate_opening_parsed.deinit();
+    const alternate_commitment = try attestation.digestValueAlloc(
+        allocator,
+        alternate_opening_parsed.value,
+    );
+    defer allocator.free(alternate_commitment);
+    const factor_value = trial.getPtr("factor") orelse return error.RequiredFieldMissing;
+    const factor = switch (factor_value.*) {
+        .object => |*map| map,
+        else => return error.ObjectRequired,
+    };
+    try factor.put(
+        trial_parsed.arena.allocator(),
+        "target_common_projection_commitment",
+        .{ .string = alternate_commitment },
+    );
+    const alternate_claim_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"target_common_projection_opening\":{s}}}",
+        .{alternate_opening_text},
+    );
+    defer allocator.free(alternate_claim_text);
+    var alternate_claim_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        alternate_claim_text,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer alternate_claim_parsed.deinit();
+    try std.testing.expectError(
+        error.TargetCommonProjectionMismatch,
+        resolveTargetCommonProjectionAlloc(
+            allocator,
+            view,
+            try object(alternate_claim_parsed.value),
+        ),
+    );
+    try factor.put(
+        trial_parsed.arena.allocator(),
+        "target_common_projection_commitment",
+        .{ .string = opening_commitment },
+    );
+
+    const smuggled_opening_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"target_common_projection_opening\":{{\"nonce\":\"" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"projection\":{s}," ++
+            "\"schema\":\"hylo-target-common-projection-opening/v1\"," ++
+            "\"witness\":{{}}}}}}",
+        .{projection_text},
+    );
+    defer allocator.free(smuggled_opening_text);
+    var smuggled_opening_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        smuggled_opening_text,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer smuggled_opening_parsed.deinit();
+    try std.testing.expectError(
+        error.TargetCommonProjectionInvalid,
+        resolveTargetCommonProjectionAlloc(
+            allocator,
+            view,
+            try object(smuggled_opening_parsed.value),
+        ),
+    );
+
+    const legacy_alias_text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"target_common_projection\":{s},\"target_common_projection_opening\":{s}}}",
+        .{ projection_text, opening_text },
+    );
+    defer allocator.free(legacy_alias_text);
+    var legacy_alias_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        legacy_alias_text,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer legacy_alias_parsed.deinit();
+    try std.testing.expectError(
+        error.TargetCommonProjectionInvalid,
+        resolveTargetCommonProjectionAlloc(allocator, view, try object(legacy_alias_parsed.value)),
+    );
+
+    try factor.put(
+        trial_parsed.arena.allocator(),
+        "target_common_projection",
+        projection_parsed.value,
+    );
+    try std.testing.expectError(
+        error.TargetCommonProjectionInvalid,
+        resolveTargetCommonProjectionAlloc(allocator, view, valid_claim),
+    );
+    _ = factor.orderedRemove("target_common_projection");
+    try factor.put(
+        trial_parsed.arena.allocator(),
+        "intervention_witness",
+        projection_parsed.value,
+    );
+    try std.testing.expectError(
+        error.TargetCommonProjectionInvalid,
+        resolveTargetCommonProjectionAlloc(allocator, view, valid_claim),
+    );
+    _ = factor.orderedRemove("intervention_witness");
+}
+
+test "v2 public run receipts expose only admitted nonsemantic materialization evidence" {
+    const allocator = std.testing.allocator;
+    const treatment_commitment =
+        "sha256:" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const raw_value_fingerprint =
+        "sha256:" ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const raw_snapshot_fingerprint =
+        "sha256:" ++ "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const raw_carrier_fingerprint =
+        "sha256:" ++ "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const materialization_claim_fingerprint =
+        "sha256:" ++ "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const raw_carrier_owned = try allocator.dupe(u8, raw_carrier_fingerprint);
+    defer allocator.free(raw_carrier_owned);
+    const treatment_commitment_owned = try allocator.dupe(u8, treatment_commitment);
+    defer allocator.free(treatment_commitment_owned);
+    var private_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"schema\":\"hylo-trial/v2\"," ++
+            "\"arm\":{\"arm_id\":\"arm-opaque-0\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}",
+        .{ .allocate = .alloc_always },
+    );
+    defer private_parsed.deinit();
+    const private_trial = try object(private_parsed.value);
+    const private_view = LaneView{
+        .trial = private_trial,
+        .trial_id = "trial-private",
+        .purpose = "practice_repair",
+        .unit_id = "unit-private",
+        .scenario_id = "scenario-private",
+        .pair_id = "pair-private",
+        .pair = private_trial,
+        .lane_id = "lane-private",
+        .arm_id = "arm-opaque-0",
+        .arm = try requiredObject(private_trial, "arm"),
+        .source_profile = .null,
+        .execution = private_trial,
+    };
+    const private_materialization = TargetMaterialization{
+        .present = true,
+        .materialization_claim_fingerprint = try allocator.dupe(
+            u8,
+            materialization_claim_fingerprint,
+        ),
+        .treatment_commitment = treatment_commitment_owned,
+        .arm_value_fingerprint = raw_value_fingerprint,
+        .snapshot_ref = "private-target/snapshot.json",
+        .snapshot_fingerprint = raw_snapshot_fingerprint,
+        .carrier_bytes = null,
+        .carrier_fingerprint = raw_carrier_owned,
+        .workspace_ref = "private-target/workspace.json",
+        .archive_ref = "private-target/archive.json",
+        .package_root = "private-target/package",
+    };
+    defer allocator.free(private_materialization.materialization_claim_fingerprint.?);
+    const public_projection = try PublicTargetMaterialization.init(
+        allocator,
+        private_materialization,
+    );
+    defer public_projection.deinit(allocator);
+    var projection_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer projection_writer.deinit();
+    try writePrivateMaterializationProjection(&projection_writer.writer, public_projection);
+    try std.testing.expectEqualStrings(
+        "\"visibility\":\"commitment_only\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+            "\"materialization_claim_fingerprint\":\"sha256:" ++
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",",
+        projection_writer.written(),
+    );
+    const valid =
+        "{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{" ++
+        "\"visibility\":\"commitment_only\"," ++
+        "\"treatment_commitment\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"materialization_claim_fingerprint\":\"sha256:" ++
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"," ++
+        "\"presented_input_ref\":\"visible-input.json\"," ++
+        "\"presented_input_fingerprint\":\"sha256:" ++
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"," ++
+        "\"hidden_reference_presented\":false," ++
+        "\"sibling_output_presented\":false}}";
+    try validatePublicRunReceiptProjection(allocator, valid, private_view, private_materialization);
+    try std.testing.expect(std.mem.indexOf(u8, valid, treatment_commitment) != null);
+    inline for (.{
+        raw_value_fingerprint,
+        raw_snapshot_fingerprint,
+        raw_carrier_fingerprint,
+        "private-target/snapshot.json",
+        "private-target/workspace.json",
+        "private-target/archive.json",
+        "private-target/package",
+    }) |private_value| {
+        try std.testing.expect(std.mem.indexOf(u8, valid, private_value) == null);
+    }
+
+    const forbidden_key =
+        "{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{" ++
+        "\"visibility\":\"commitment_only\"," ++
+        "\"treatment_commitment\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"materialization_claim_fingerprint\":\"sha256:" ++
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"," ++
+        "\"target_snapshot_fingerprint\":\"sha256:" ++
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}";
+    try std.testing.expectError(
+        error.PrivateRunReceiptProjectionInvalid,
+        validatePublicRunReceiptProjection(
+            allocator,
+            forbidden_key,
+            private_view,
+            private_materialization,
+        ),
+    );
+    const indirect_raw_ref =
+        "{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{" ++
+        "\"visibility\":\"commitment_only\"," ++
+        "\"treatment_commitment\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"materialization_claim_fingerprint\":\"sha256:" ++
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}," ++
+        "\"evidence\":{\"private_ref\":\"private-target/archive.json\"}}";
+    try std.testing.expectError(
+        error.PrivateRunReceiptSemanticLeak,
+        validatePublicRunReceiptProjection(
+            allocator,
+            indirect_raw_ref,
+            private_view,
+            private_materialization,
+        ),
+    );
+
+    var legacy_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"schema\":\"hylo-trial/v1\"}",
+        .{ .allocate = .alloc_always },
+    );
+    defer legacy_parsed.deinit();
+    const legacy_trial = try object(legacy_parsed.value);
+    var legacy_view = private_view;
+    legacy_view.trial = legacy_trial;
+    const legacy =
+        "{\"schema\":\"hylo-run-receipt/v1\",\"materialization\":{" ++
+        "\"arm_value_fingerprint\":\"sha256:" ++
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"," ++
+        "\"target_snapshot_ref\":\"private-target/snapshot.json\"," ++
+        "\"target_snapshot_fingerprint\":\"sha256:" ++
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}";
+    try validatePublicRunReceiptProjection(allocator, legacy, legacy_view, private_materialization);
+}
+
+test "v2 materialization claim fingerprint preserves exact protected bytes" {
+    const allocator = std.testing.allocator;
+    const compact = "{\"schema\":\"hylo-lane-materialization-claim/v2\"}";
+    const terminated = compact ++ "\n";
+    const compact_fingerprint = (try materializationClaimFingerprintAlloc(
+        allocator,
+        true,
+        compact,
+    )).?;
+    defer allocator.free(compact_fingerprint);
+    const terminated_fingerprint = (try materializationClaimFingerprintAlloc(
+        allocator,
+        true,
+        terminated,
+    )).?;
+    defer allocator.free(terminated_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, compact_fingerprint, terminated_fingerprint));
+    try std.testing.expect((try materializationClaimFingerprintAlloc(
+        allocator,
+        false,
+        compact,
+    )) == null);
+}
+
+test "v2 historical receipts expose only an exact nonsemantic FIR projection" {
+    const allocator = std.testing.allocator;
+    const treatment_commitment =
+        "sha256:" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const private_target_fingerprint =
+        "sha256:" ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const materialization_claim_fingerprint =
+        "sha256:" ++ "9999999999999999999999999999999999999999999999999999999999999999";
+    const treatment_commitment_owned = try allocator.dupe(u8, treatment_commitment);
+    defer allocator.free(treatment_commitment_owned);
+    var private_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"schema\":\"hylo-trial/v2\"," ++
+            "\"arm\":{\"arm_id\":\"arm-opaque-0\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}," ++
+            "\"source_profile\":{\"kind\":\"historical_decision\"," ++
+            "\"source_governance_fingerprint\":\"sha256:" ++
+            "1111111111111111111111111111111111111111111111111111111111111111\"," ++
+            "\"decision_context_fingerprint\":\"sha256:" ++
+            "2222222222222222222222222222222222222222222222222222222222222222\"," ++
+            "\"required_lineage\":\"rollout_transcript\"}}",
+        .{ .allocate = .alloc_always },
+    );
+    defer private_parsed.deinit();
+    const private_trial = try object(private_parsed.value);
+    const private_view = LaneView{
+        .trial = private_trial,
+        .trial_id = "trial-private-historical",
+        .purpose = "practice_repair",
+        .unit_id = "unit-private-historical",
+        .scenario_id = "scenario-private-historical",
+        .pair_id = "pair-private-historical",
+        .pair = private_trial,
+        .lane_id = "lane-private-historical",
+        .arm_id = "arm-opaque-0",
+        .arm = try requiredObject(private_trial, "arm"),
+        .source_profile = private_trial.get("source_profile").?,
+        .execution = private_trial,
+    };
+    const private_materialization = TargetMaterialization{
+        .present = true,
+        .materialization_claim_fingerprint = try allocator.dupe(
+            u8,
+            materialization_claim_fingerprint,
+        ),
+        .treatment_commitment = treatment_commitment_owned,
+        .arm_value_fingerprint = private_target_fingerprint,
+        .snapshot_ref = "private-target/snapshot.json",
+        .snapshot_fingerprint = "sha256:" ++
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .carrier_bytes = null,
+        .carrier_fingerprint = null,
+        .workspace_ref = "private-target/workspace.json",
+        .archive_ref = "private-target/archive.json",
+        .package_root = "private-target/package",
+    };
+    defer allocator.free(private_materialization.materialization_claim_fingerprint.?);
+    const projection_text =
+        "{\"schema\":\"hylo-fir-public-projection/v1\"," ++
+        "\"trial_id\":\"trial-private-historical\"," ++
+        "\"lane_id\":\"lane-private-historical\"," ++
+        "\"fir_receipt_fingerprint\":\"sha256:" ++
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"," ++
+        "\"source_governance_fingerprint\":\"sha256:" ++
+        "1111111111111111111111111111111111111111111111111111111111111111\"," ++
+        "\"decision_context_fingerprint\":\"sha256:" ++
+        "2222222222222222222222222222222222222222222222222222222222222222\"," ++
+        "\"replay_plan_fingerprint\":\"sha256:" ++
+        "3333333333333333333333333333333333333333333333333333333333333333\"," ++
+        "\"source_profile_fingerprint\":\"sha256:" ++
+        "4444444444444444444444444444444444444444444444444444444444444444\"," ++
+        "\"source_target_text_witness_fingerprint\":\"sha256:" ++
+        "5555555555555555555555555555555555555555555555555555555555555555\"," ++
+        "\"episode_identity_fingerprint\":\"sha256:" ++
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"," ++
+        "\"required_lineage\":\"rollout_transcript\",\"validated\":true}";
+    var projection_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        projection_text,
+        .{},
+    );
+    defer projection_parsed.deinit();
+    const projection_fingerprint = try attestation.digestValueAlloc(
+        allocator,
+        projection_parsed.value,
+    );
+    defer allocator.free(projection_fingerprint);
+    const independent_lineage = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{{" ++
+            "\"visibility\":\"commitment_only\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+            "\"materialization_claim_fingerprint\":{f}}}," ++
+            "\"native_receipt\":{{\"fingerprint\":{f}," ++
+            "\"kind\":\"FIR-v1-public-projection\",\"receipt\":{s}," ++
+            "\"ref\":\"artifact:{s}\"}}}}",
+        .{
+            std.json.fmt(materialization_claim_fingerprint, .{}),
+            std.json.fmt(projection_fingerprint, .{}),
+            projection_text,
+            projection_fingerprint,
+        },
+    );
+    defer allocator.free(independent_lineage);
+    try validatePublicRunReceiptProjection(
+        allocator,
+        independent_lineage,
+        private_view,
+        private_materialization,
+    );
+
+    const full_fir =
+        "{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{" ++
+        "\"visibility\":\"commitment_only\"," ++
+        "\"treatment_commitment\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+        "\"materialization_claim_fingerprint\":\"sha256:" ++
+        "9999999999999999999999999999999999999999999999999999999999999999\"}," ++
+        "\"native_receipt\":{\"kind\":\"FIR-v1\"," ++
+        "\"receipt\":{\"fork_inquiry_receipt\":{" ++
+        "\"answer\":{\"selected_route\":\"private\"}," ++
+        "\"inquiry\":{\"question\":\"private\"}}}}}";
+    try std.testing.expectError(
+        error.PrivateRunReceiptSemanticLeak,
+        validatePublicRunReceiptProjection(
+            allocator,
+            full_fir,
+            private_view,
+            private_materialization,
+        ),
+    );
+
+    const smuggled_projection_text =
+        projection_text[0 .. projection_text.len - 1] ++
+        ",\"answer\":{\"selected_route\":\"private\"}}";
+    var smuggled_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        smuggled_projection_text,
+        .{},
+    );
+    defer smuggled_parsed.deinit();
+    const smuggled_fingerprint = try attestation.digestValueAlloc(allocator, smuggled_parsed.value);
+    defer allocator.free(smuggled_fingerprint);
+    const smuggled_receipt = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-run-receipt/v2\",\"materialization\":{{" ++
+            "\"visibility\":\"commitment_only\"," ++
+            "\"treatment_commitment\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+            "\"materialization_claim_fingerprint\":{f}}}," ++
+            "\"native_receipt\":{{\"fingerprint\":{f}," ++
+            "\"kind\":\"FIR-v1-public-projection\",\"receipt\":{s}," ++
+            "\"ref\":\"artifact:{s}\"}}}}",
+        .{
+            std.json.fmt(materialization_claim_fingerprint, .{}),
+            std.json.fmt(smuggled_fingerprint, .{}),
+            smuggled_projection_text,
+            smuggled_fingerprint,
+        },
+    );
+    defer allocator.free(smuggled_receipt);
+    try std.testing.expectError(
+        error.PrivateRunReceiptSemanticLeak,
+        validatePublicRunReceiptProjection(
+            allocator,
+            smuggled_receipt,
+            private_view,
+            private_materialization,
+        ),
+    );
+}
+
+test "private historical native receipt archive contains only the FIR public projection" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const receipt_dir = try std.fs.path.join(allocator, &.{ root, "caller-receipts" });
+    defer allocator.free(receipt_dir);
+    const paths = try lanePathsAlloc(
+        allocator,
+        receipt_dir,
+        root,
+        "trial-private-historical",
+        "lane-private-historical",
+    );
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.evidence);
+
+    const private_json = try allocator.dupe(
+        u8,
+        "{\"schema\":\"FIR-v1\",\"answer\":{\"selected_route\":\"private-route\"}}",
+    );
+    const private_fingerprint = try attestation.digestBytesAlloc(allocator, private_json);
+    const projection_raw = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":{f},\"trial_id\":\"trial-private-historical\"," ++
+            "\"lane_id\":\"lane-private-historical\"," ++
+            "\"fir_receipt_fingerprint\":{f}," ++
+            "\"source_governance_fingerprint\":\"sha256:" ++
+            "1111111111111111111111111111111111111111111111111111111111111111\"," ++
+            "\"decision_context_fingerprint\":\"sha256:" ++
+            "2222222222222222222222222222222222222222222222222222222222222222\"," ++
+            "\"replay_plan_fingerprint\":\"sha256:" ++
+            "3333333333333333333333333333333333333333333333333333333333333333\"," ++
+            "\"source_profile_fingerprint\":\"sha256:" ++
+            "4444444444444444444444444444444444444444444444444444444444444444\"," ++
+            "\"source_target_text_witness_fingerprint\":\"sha256:" ++
+            "5555555555555555555555555555555555555555555555555555555555555555\"," ++
+            "\"episode_identity_fingerprint\":\"sha256:" ++
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"," ++
+            "\"required_lineage\":\"rollout_transcript\",\"validated\":true}}",
+        .{ std.json.fmt(FirPublicProjectionSchema, .{}), std.json.fmt(private_fingerprint, .{}) },
+    );
+    defer allocator.free(projection_raw);
+    const projection_json = try canonicalJsonTextAlloc(allocator, projection_raw);
+    const projection_fingerprint = try attestation.digestBytesAlloc(allocator, projection_json);
+    const projection_ref = try std.fmt.allocPrint(
+        allocator,
+        "artifact:{s}",
+        .{projection_fingerprint},
+    );
+    const native = NativeReceipt{
+        .kind = "FIR-v1",
+        .json = private_json,
+        .fingerprint = private_fingerprint,
+        .public_projection = .{
+            .kind = FirPublicProjectionKind,
+            .json = projection_json,
+            .fingerprint = projection_fingerprint,
+            .ref = projection_ref,
+        },
+    };
+    defer native.deinit(allocator);
+
+    try archiveNativeReceiptAtPath(allocator, &native, paths.native_receipt);
+    const archived = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        paths.native_receipt,
+        MaxInputBytes,
+    );
+    defer allocator.free(archived);
+    try std.testing.expectEqualStrings(native.public_projection.?.json, archived);
+    try std.testing.expect(!std.mem.eql(u8, native.json, archived));
+    try std.testing.expect(std.mem.indexOf(u8, archived, "selected_route") == null);
+    try std.testing.expect(std.mem.indexOf(u8, archived, "private-route") == null);
+    try requireBytesFingerprint(
+        allocator,
+        archived,
+        native.public_projection.?.fingerprint,
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, archived, .{});
+    defer parsed.deinit();
+    const projection = try object(parsed.value);
+    try requireExactFirProjectionKeys(projection, &.{
+        "decision_context_fingerprint",
+        "episode_identity_fingerprint",
+        "fir_receipt_fingerprint",
+        "lane_id",
+        "replay_plan_fingerprint",
+        "required_lineage",
+        "schema",
+        "source_governance_fingerprint",
+        "source_profile_fingerprint",
+        "source_target_text_witness_fingerprint",
+        "trial_id",
+        "validated",
+    });
+    try std.testing.expectEqualStrings(
+        FirPublicProjectionSchema,
+        try requiredString(projection, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        native.fingerprint,
+        try requiredString(projection, "fir_receipt_fingerprint"),
+    );
+}
+
+test "standalone replay compilation rejects direct lanes before output mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "trial.json",
+        .data = hctp_fixtures.valid_null_trial,
+    });
+    const trial_path = try tmp.dir.realPathFileAlloc(std.testing.io, "trial.json", allocator);
+    defer allocator.free(trial_path);
+    const output_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(output_root);
+    try std.testing.expectError(
+        error.DirectLaneCompileReplayForbidden,
+        cmdCompileReplay(allocator, .{
+            .command = .compile_replay,
+            .trial_path = trial_path,
+            .lane_id = "lane-null-a0",
+            .output_dir = output_root,
+        }),
+    );
+    const dcp_path = try std.fmt.allocPrint(allocator, "{s}/lane-null-a0.dcp.json", .{output_root});
+    defer allocator.free(dcp_path);
+    try std.testing.expect(!pathExists(dcp_path));
+}
+
+test "standalone replay compilation rejects a traversing lane before parent mutation" {
+    const allocator = std.testing.allocator;
+    const profile = try sanitizedHistoricalProfileForTestAlloc(allocator, false);
+    defer allocator.free(profile);
+    const historical = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        "{\"kind\": \"direct\"}",
+        profile,
+    );
+    defer allocator.free(historical);
+    const traversing = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        historical,
+        "lane-null-a0",
+        "../escaped",
+    );
+    defer allocator.free(traversing);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const trial_path = try std.fs.path.join(allocator, &.{ root, "trial.json" });
+    defer allocator.free(trial_path);
+    try durable_store.writeTextAtomic(allocator, trial_path, traversing);
+    const output_root = try std.fs.path.join(allocator, &.{ root, "private" });
+    defer allocator.free(output_root);
+    try durable_store.ensureDirectoryPathNoSymlinks(output_root);
+    var output_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        output_root,
+        .{ .follow_symlinks = false },
+    );
+    defer output_dir.close(defaultIo());
+    try output_dir.setPermissions(defaultIo(), .fromMode(0o700));
+    const escaped = try std.fs.path.join(allocator, &.{ root, "escaped.dcp.json" });
+    defer allocator.free(escaped);
+    try std.testing.expectError(error.InvalidId, cmdCompileReplay(allocator, .{
+        .command = .compile_replay,
+        .trial_path = trial_path,
+        .lane_id = "../escaped",
+        .output_dir = output_root,
+    }));
+    try std.testing.expect(!pathExists(escaped));
+}
+
+test "standalone replay compilation rejects a mismatched frozen DCP before output" {
+    const allocator = std.testing.allocator;
+    const profile = try operatorHistoricalProfileForTestAlloc(allocator);
+    defer allocator.free(profile);
+    const tampered_profile = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        profile,
+        "sha256:5409e6ade601d0efb0f643ea2f8db7bbbf9d830acf37a57cfa6964a52ba98b01",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    );
+    defer allocator.free(tampered_profile);
+    const trial = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        "{\"kind\": \"direct\"}",
+        tampered_profile,
+    );
+    defer allocator.free(trial);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const trial_path = try std.fs.path.join(allocator, &.{ root, "trial.json" });
+    defer allocator.free(trial_path);
+    try durable_store.writeTextAtomic(allocator, trial_path, trial);
+    try std.testing.expectError(
+        error.DecisionContextFingerprintMismatch,
+        cmdCompileReplay(allocator, .{
+            .command = .compile_replay,
+            .trial_path = trial_path,
+            .lane_id = "lane-null-a0",
+            .output_dir = root,
+        }),
+    );
+    const dcp_path = try std.fs.path.join(allocator, &.{ root, "lane-null-a0.dcp.json" });
+    defer allocator.free(dcp_path);
+    const rip_path = try std.fs.path.join(allocator, &.{ root, "lane-null-a0.rip.json" });
+    defer allocator.free(rip_path);
+    try std.testing.expect(!pathExists(dcp_path));
+    try std.testing.expect(!pathExists(rip_path));
+}
+
+test "standalone replay compilation rejects blinded and separated execution routes" {
+    const allocator = std.testing.allocator;
+    const historical = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        "{\"kind\": \"direct\"}",
+        "{\"kind\":\"historical_decision\"}",
+    );
+    defer allocator.free(historical);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const output_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(output_root);
+
+    const role_separated = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        historical,
+        "\"required_level\": \"precommitted\"",
+        "\"required_level\": \"role_separated\"",
+    );
+    defer allocator.free(role_separated);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "role.json", .data = role_separated });
+    const role_path = try tmp.dir.realPathFileAlloc(std.testing.io, "role.json", allocator);
+    defer allocator.free(role_path);
+    try std.testing.expectError(
+        error.DiagnosticReplayAssuranceForbidden,
+        cmdCompileReplay(allocator, .{
+            .command = .compile_replay,
+            .trial_path = role_path,
+            .lane_id = "lane-null-a0",
+            .output_dir = output_root,
+        }),
+    );
+
+    const sealed = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        historical,
+        "\"required_level\": \"precommitted\"",
+        "\"required_level\": \"sealed\"",
+    );
+    defer allocator.free(sealed);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sealed.json", .data = sealed });
+    const sealed_path = try tmp.dir.realPathFileAlloc(std.testing.io, "sealed.json", allocator);
+    defer allocator.free(sealed_path);
+    try std.testing.expectError(
+        error.DiagnosticReplayAssuranceForbidden,
+        cmdCompileReplay(allocator, .{
+            .command = .compile_replay,
+            .trial_path = sealed_path,
+            .lane_id = "lane-null-a0",
+            .output_dir = output_root,
+        }),
+    );
+
+    const case_blind = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        historical,
+        "\"case_visibility\": \"open\"",
+        "\"case_visibility\": \"case_blind\"",
+    );
+    defer allocator.free(case_blind);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "blind.json", .data = case_blind });
+    const blind_path = try tmp.dir.realPathFileAlloc(std.testing.io, "blind.json", allocator);
+    defer allocator.free(blind_path);
+    try std.testing.expectError(
+        error.DiagnosticReplayPrivateSourceForbidden,
+        cmdCompileReplay(allocator, .{
+            .command = .compile_replay,
+            .trial_path = blind_path,
+            .lane_id = "lane-null-a0",
+            .output_dir = output_root,
+        }),
+    );
+}
+
+test "private replay output requires caller-owned 0700 root and persists create-new 0600 files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const resolved = try validateCallerPrivateOutputRootAlloc(allocator, root);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(root, resolved);
+    const path = try std.fs.path.join(allocator, &.{ root, "replay.json" });
+    defer allocator.free(path);
+    const bytes = "{\"private\":true}\n";
+    const fingerprint = try attestation.digestBytesAlloc(allocator, bytes);
+    defer allocator.free(fingerprint);
+    try persistPrivateReplayArtifact(allocator, path, bytes, fingerprint);
+    const stat = try std.Io.Dir.cwd().statFile(defaultIo(), path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        persistPrivateReplayArtifact(allocator, path, bytes, fingerprint),
+    );
+    const link = try std.fs.path.join(allocator, &.{ root, "linked-root" });
+    defer allocator.free(link);
+    try std.Io.Dir.cwd().symLink(defaultIo(), root, link, .{});
+    try std.testing.expectError(
+        error.PrivateOutputBoundaryInvalid,
+        validateCallerPrivateOutputRootAlloc(allocator, link),
+    );
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o755));
+    try std.testing.expectError(
+        error.PrivateOutputBoundaryInvalid,
+        validateCallerPrivateOutputRootAlloc(allocator, root),
+    );
+}
+
+test "private replay pair conflict leaves the existing plan unchanged and no capsule" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const capsule_path = try std.fs.path.join(allocator, &.{ root, "lane.dcp.json" });
+    defer allocator.free(capsule_path);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "lane.rip.json" });
+    defer allocator.free(plan_path);
+    const existing_plan = "{\"existing\":true}\n";
+    try durable_store.writeTextCreateNewAtomic(allocator, plan_path, existing_plan, .{
+        .reject_symlinks = true,
+        .file_mode = 0o600,
+        .sync = true,
+    });
+    const capsule = "{\"private\":\"capsule\"}\n";
+    const plan = "{\"private\":\"plan\"}\n";
+    const capsule_fingerprint = try attestation.digestBytesAlloc(allocator, capsule);
+    defer allocator.free(capsule_fingerprint);
+    const plan_fingerprint = try attestation.digestBytesAlloc(allocator, plan);
+    defer allocator.free(plan_fingerprint);
+    try std.testing.expectError(
+        error.PrivateReplayArtifactConflict,
+        persistPrivateReplayPair(
+            allocator,
+            capsule_path,
+            capsule,
+            capsule_fingerprint,
+            plan_path,
+            plan,
+            plan_fingerprint,
+        ),
+    );
+    try std.testing.expect(!pathExists(capsule_path));
+    const observed_plan = try readFileAlloc(allocator, plan_path, 4096);
+    defer allocator.free(observed_plan);
+    try std.testing.expectEqualStrings(existing_plan, observed_plan);
+}
+
+test "private replay pair validation failure rolls back both artifacts" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const capsule_path = try std.fs.path.join(allocator, &.{ root, "lane.dcp.json" });
+    defer allocator.free(capsule_path);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "lane.rip.json" });
+    defer allocator.free(plan_path);
+    const capsule = "{\"private\":\"capsule\"}\n";
+    const plan = "{\"private\":\"plan\"}\n";
+    const capsule_fingerprint = try attestation.digestBytesAlloc(allocator, capsule);
+    defer allocator.free(capsule_fingerprint);
+    const wrong_plan_fingerprint = "sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectError(
+        error.PrivateOutputBoundaryInvalid,
+        persistPrivateReplayPair(
+            allocator,
+            capsule_path,
+            capsule,
+            capsule_fingerprint,
+            plan_path,
+            plan,
+            wrong_plan_fingerprint,
+        ),
+    );
+    try std.testing.expect(!pathExists(capsule_path));
+    try std.testing.expect(!pathExists(plan_path));
+}
+
+test "integrated historical replay persistence preserves the private pair boundary" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try lanePathsAlloc(allocator, root, root, "trial-atomic", "lane-success");
+    defer paths.deinit(allocator);
+    const replay = try testReplayPreparationAlloc(allocator);
+    defer replay.deinit(allocator);
+
+    try persistHistoricalReplay(allocator, paths, replay);
+
+    const replay_stat = try std.Io.Dir.cwd().statFile(defaultIo(), paths.replay_root, .{
+        .follow_symlinks = false,
+    });
+    try std.testing.expectEqual(.directory, replay_stat.kind);
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        replay_stat.permissions.toMode() & 0o777,
+    );
+    try validatePrivateReplayArtifact(
+        allocator,
+        paths.replay_dcp,
+        replay.dcp_fingerprint,
+    );
+    try validatePrivateReplayArtifact(
+        allocator,
+        paths.replay_rip,
+        replay.rip_fingerprint,
+    );
+    try removePrivateWorkspaceTree(
+        allocator,
+        paths.workspace,
+        paths.replay_root,
+        paths.replay_dcp,
+        paths.replay_rip,
+    );
+    try std.testing.expect(!pathExists(paths.workspace));
+}
+
+test "integrated historical replay failure removes the pair and replay root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.setPermissions(std.testing.io, .fromMode(0o700));
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const paths = try lanePathsAlloc(allocator, root, root, "trial-atomic", "lane-failure");
+    defer paths.deinit(allocator);
+    var replay = try testReplayPreparationAlloc(allocator);
+    defer replay.deinit(allocator);
+    replay.rip_fingerprint["sha256:".len] = if (replay.rip_fingerprint["sha256:".len] == 'a')
+        'b'
+    else
+        'a';
+
+    try std.testing.expectError(
+        error.PrivateOutputBoundaryInvalid,
+        persistHistoricalReplay(allocator, paths, replay),
+    );
+    try std.testing.expect(!pathExists(paths.replay_dcp));
+    try std.testing.expect(!pathExists(paths.replay_rip));
+    try std.testing.expect(!pathExists(paths.replay_root));
+    try removePrivateWorkspaceTree(
+        allocator,
+        paths.workspace,
+        paths.replay_root,
+        paths.replay_dcp,
+        paths.replay_rip,
+    );
+    try std.testing.expect(!pathExists(paths.workspace));
+}
+
+test "executor request defaults historical v1 and binds replay only after v2 admission" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const trial = try object(parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const pair = try object((try requiredArray(unit, "pairs")).items[0]);
+    const base_view = LaneView{
+        .trial = trial,
+        .trial_id = "trial-null-001",
+        .purpose = "calibration_null",
+        .unit_id = "unit-null-001",
+        .scenario_id = "scenario-holdout",
+        .pair_id = "pair-null-001",
+        .pair = pair,
+        .lane_id = "lane-null-a0",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = unit.get("source_profile").?,
+        .execution = try requiredObject(trial, "execution"),
+    };
+    const no_factor = FactorMaterialization{
+        .present = false,
+        .ref = "",
+        .fingerprint = "",
+        .canonical_bytes = null,
+        .workspace_ref = "",
+        .archive_ref = "",
+    };
+    const target = TargetMaterialization{
+        .present = false,
+        .arm_value_fingerprint = "sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .snapshot_ref = "artifact:baseline",
+        .snapshot_fingerprint = "sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .carrier_bytes = null,
+        .carrier_fingerprint = null,
+        .workspace_ref = "target.json",
+        .archive_ref = "target-archive.json",
+        .package_root = "target-package",
+    };
+    const input_fingerprint = "sha256:" ++
+        "6666666666666666666666666666666666666666666666666666666666666666";
+    const lease_digest = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+    const direct = try buildExecutorRequestAlloc(
+        allocator,
+        base_view,
+        "workspace",
+        "input.json",
+        input_fingerprint,
+        lease_digest,
+        no_factor,
+        target,
+        LegacyExecutorRequestSchema,
+        null,
+        "unused.dcp.json",
+        "unused.rip.json",
+    );
+    defer allocator.free(direct);
+    try std.testing.expect(
+        std.mem.indexOf(u8, direct, "\"schema\":\"cas-trial-executor-request/v1\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, direct, "historical_dcp_ref") == null);
+
+    var historical_profile = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"kind\":\"historical_decision\",\"source_governance\":" ++
+            "{\"source_governance_gate\":{\"source_episode_id\":" ++
+            "\"session:test#turn:one\"}},\"decision_context_fingerprint\":" ++
+            "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+        .{},
+    );
+    defer historical_profile.deinit();
+    var historical_view = base_view;
+    historical_view.source_profile = historical_profile.value;
+    const replay = try testReplayPreparationAlloc(allocator);
+    defer replay.deinit(allocator);
+
+    const legacy_historical = try buildExecutorRequestAlloc(
+        allocator,
+        historical_view,
+        "workspace",
+        "input.json",
+        input_fingerprint,
+        lease_digest,
+        no_factor,
+        target,
+        LegacyExecutorRequestSchema,
+        replay,
+        "private.dcp.json",
+        "private.rip.json",
+    );
+    defer allocator.free(legacy_historical);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        legacy_historical,
+        "\"schema\":\"cas-trial-executor-request/v1\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        legacy_historical,
+        "\"decision_context_ref\":\"private.dcp.json\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_historical, "historical_dcp_ref") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, legacy_historical, "source_profile_body_delivery") == null,
+    );
+
+    const historical = try buildExecutorRequestAlloc(
+        allocator,
+        historical_view,
+        "workspace",
+        "input.json",
+        input_fingerprint,
+        lease_digest,
+        no_factor,
+        target,
+        ReplayBoundExecutorRequestSchema,
+        replay,
+        "private.dcp.json",
+        "private.rip.json",
+    );
+    defer allocator.free(historical);
+    try std.testing.expect(
+        std.mem.indexOf(u8, historical, "\"schema\":\"cas-trial-executor-request/v2\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, historical, "\"historical_dcp_ref\":\"private.dcp.json\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, historical, replay.dcp_fingerprint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical, replay.rip_fingerprint) != null);
+
+    try std.testing.expectEqualStrings(
+        LegacyExecutorRequestSchema,
+        try executorRequestSchemaForRoute(false, true, LegacyExecutorRequestSchema),
+    );
+    try std.testing.expectEqualStrings(
+        ReplayBoundExecutorRequestSchema,
+        try executorRequestSchemaForRoute(false, true, ReplayBoundExecutorRequestSchema),
+    );
+    try std.testing.expectEqualStrings(
+        LegacyExecutorRequestSchema,
+        try executorRequestSchemaForRoute(true, false, ReplayBoundExecutorRequestSchema),
+    );
+    try std.testing.expectError(
+        error.ExecutorRequestSchemaV2Required,
+        executorRequestSchemaForRoute(true, true, LegacyExecutorRequestSchema),
+    );
+}
+
+test "runner contract executor request negotiation defaults to v1 and rejects unknown schemas" {
+    var absent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{}", .{});
+    defer absent.deinit();
+    try std.testing.expectEqualStrings(
+        LegacyExecutorRequestSchema,
+        try admittedExecutorRequestSchema(try object(absent.value)),
+    );
+
+    var explicit = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"executor_request_schema\":\"cas-trial-executor-request/v2\"}",
+        .{},
+    );
+    defer explicit.deinit();
+    try std.testing.expectEqualStrings(
+        ReplayBoundExecutorRequestSchema,
+        try admittedExecutorRequestSchema(try object(explicit.value)),
+    );
+
+    var unknown = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"executor_request_schema\":\"cas-trial-executor-request/v3\"}",
+        .{},
+    );
+    defer unknown.deinit();
+    try std.testing.expectError(
+        error.ExecutorRequestSchemaInvalid,
+        admittedExecutorRequestSchema(try object(unknown.value)),
+    );
 }
 
 fn factorTrialAlloc(
@@ -6968,7 +10407,6 @@ test "non-target factor resolves immutable Git JSON and archives canonical bytes
         allocator,
         loaded.view,
         workspace,
-        "unused-decision-context.json",
         "presented-input.json",
         "sha256:6666666666666666666666666666666666666666666666666666666666666666",
         "sha256:7777777777777777777777777777777777777777777777777777777777777777",
@@ -6984,6 +10422,10 @@ test "non-target factor resolves immutable Git JSON and archives canonical bytes
             .archive_ref = "unused-target-archive",
             .package_root = "unused-target-package",
         },
+        LegacyExecutorRequestSchema,
+        null,
+        "unused-replay-dcp.json",
+        "unused-replay-rip.json",
     );
     defer allocator.free(request);
     var request_parsed = try std.json.parseFromSlice(std.json.Value, allocator, request, .{});
@@ -7206,9 +10648,13 @@ test "registration-keyed terminal payload lookup ignores independent lane histor
         );
     }
 
-    const current_registration = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const current_registration = "sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const current_receipt =
-        "{\"schema\":\"hylo-run-receipt/v1\",\"trial_id\":\"trial-registration-history\",\"lane_id\":\"lane-registration-history\",\"lineage\":{\"registration_event_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}";
+        "{\"schema\":\"hylo-run-receipt/v1\",\"trial_id\":" ++
+        "\"trial-registration-history\",\"lane_id\":\"lane-registration-history\"," ++
+        "\"lineage\":{\"registration_event_digest\":\"sha256:" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}";
     try persistTerminalPayload(
         allocator,
         paths,
@@ -7230,6 +10676,188 @@ test "registration-keyed terminal payload lookup ignores independent lane histor
     try std.testing.expectError(
         error.ControlArtifactConflict,
         findUniqueRegistrationDigestAlloc(allocator, paths.claim, .terminal_payload),
+    );
+}
+
+test "v2 terminal recovery binds the signed materialization claim fingerprint" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const trial = try object(parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const view = LaneView{
+        .trial = trial,
+        .trial_id = "trial-v2-claim-binding",
+        .purpose = "practice_repair",
+        .unit_id = "unit-v2-claim-binding",
+        .scenario_id = "scenario-v2-claim-binding",
+        .pair_id = "pair-v2-claim-binding",
+        .pair = try object((try requiredArray(unit, "pairs")).items[0]),
+        .lane_id = "lane-v2-claim-binding",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = unit.get("source_profile").?,
+        .execution = try requiredObject(trial, "execution"),
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const receipt_dir = try std.fs.path.join(allocator, &.{ root, "receipts" });
+    defer allocator.free(receipt_dir);
+    const paths = try lanePathsAlloc(
+        allocator,
+        receipt_dir,
+        root,
+        view.trial_id,
+        view.lane_id,
+    );
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.claim);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.evidence);
+    try sealEvidenceArchive(allocator, paths.evidence);
+
+    const registration = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const start = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const lease = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const exact_private_claim = "{\"schema\":\"hylo-lane-materialization-claim/v2\"}\n";
+    const materialization_claim_fingerprint = (try materializationClaimFingerprintAlloc(
+        allocator,
+        true,
+        exact_private_claim,
+    )).?;
+    defer allocator.free(materialization_claim_fingerprint);
+    const claim_path = try claimPathAlloc(allocator, paths.claim, registration);
+    defer allocator.free(claim_path);
+    try claimLaneWithReplay(
+        allocator,
+        claim_path,
+        view,
+        registration,
+        start,
+        lease,
+        null,
+        LegacyExecutorRequestSchema,
+        materialization_claim_fingerprint,
+    );
+
+    const unsigned = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"hylo-run-receipt/v2\",\"trial_id\":{f},\"lane_id\":{f}," ++
+            "\"lineage\":{{\"registration_event_digest\":{f}}}," ++
+            "\"materialization\":{{\"materialization_claim_fingerprint\":{f}}}," ++
+            "\"attestation\":null}}",
+        .{
+            std.json.fmt(view.trial_id, .{}),
+            std.json.fmt(view.lane_id, .{}),
+            std.json.fmt(registration, .{}),
+            std.json.fmt(materialization_claim_fingerprint, .{}),
+        },
+    );
+    defer allocator.free(unsigned);
+    const signing_seed = [_]u8{0x72} ** 32;
+    const signed = try signTerminalReceiptAlloc(
+        allocator,
+        unsigned,
+        "cas-trial",
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "runner-key",
+        signing_seed,
+    );
+    defer allocator.free(signed);
+    var signed_parsed = try std.json.parseFromSlice(std.json.Value, allocator, signed, .{});
+    defer signed_parsed.deinit();
+    const signed_root = try object(signed_parsed.value);
+    try std.testing.expectEqualStrings(
+        materialization_claim_fingerprint,
+        try requiredString(
+            try requiredObject(signed_root, "materialization"),
+            "materialization_claim_fingerprint",
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "hylo-attestation/v1",
+        try requiredString(
+            try object(signed_root.get("attestation") orelse return error.AttestationMissing),
+            "schema",
+        ),
+    );
+
+    try persistTerminalPayload(
+        allocator,
+        paths,
+        view.trial_id,
+        view.lane_id,
+        registration,
+        signed,
+    );
+    const initial = try reconcileTerminalProjectionAlloc(
+        allocator,
+        paths,
+        view.trial_id,
+        view.lane_id,
+        registration,
+    );
+    defer initial.deinit(allocator);
+    const initial_control_path = (try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        registration,
+        .terminal,
+    )) orelse return error.TerminalControlMissing;
+    defer allocator.free(initial_control_path);
+    try deleteFileIfExists(initial_control_path);
+    try deleteFileIfExists(paths.receipt);
+    const recovered = try reconcileTerminalProjectionAlloc(
+        allocator,
+        paths,
+        view.trial_id,
+        view.lane_id,
+        registration,
+    );
+    defer recovered.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        initial.terminal_control_fingerprint,
+        recovered.terminal_control_fingerprint,
+    );
+
+    const recovered_control_path = (try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        registration,
+        .terminal,
+    )) orelse return error.TerminalControlMissing;
+    defer allocator.free(recovered_control_path);
+    try deleteFileIfExists(recovered_control_path);
+    try deleteFileIfExists(paths.receipt);
+    try deleteFileIfExists(claim_path);
+    const substituted_fingerprint = "sha256:" ++
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    try claimLaneWithReplay(
+        allocator,
+        claim_path,
+        view,
+        registration,
+        start,
+        lease,
+        null,
+        LegacyExecutorRequestSchema,
+        substituted_fingerprint,
+    );
+    try std.testing.expectError(
+        error.TargetMaterializationClaimMismatch,
+        reconcileTerminalProjectionAlloc(
+            allocator,
+            paths,
+            view.trial_id,
+            view.lane_id,
+            registration,
+        ),
     );
 }
 
@@ -7295,11 +10923,151 @@ test "claim-only lane remains nonterminal and cleanup fails closed" {
     try std.testing.expect(!pathExists(paths.workspace));
 }
 
+test "historical claims bind replay fingerprints and legacy claims cannot be upgraded" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const trial = try object(parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const pair = try object((try requiredArray(unit, "pairs")).items[0]);
+    var profile = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"kind\":\"historical_decision\",\"required_lineage\":\"rollout_transcript\"}",
+        .{},
+    );
+    defer profile.deinit();
+    const view = LaneView{
+        .trial = trial,
+        .trial_id = "trial-null-001",
+        .purpose = "calibration_null",
+        .unit_id = "unit-null-001",
+        .scenario_id = "scenario-holdout",
+        .pair_id = "pair-null-001",
+        .pair = pair,
+        .lane_id = "lane-null-a0",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = profile.value,
+        .execution = try requiredObject(trial, "execution"),
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const claim_root = try std.fs.path.join(allocator, &.{ root, "claims" });
+    defer allocator.free(claim_root);
+    const registration = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const claim_path = try claimPathAlloc(allocator, claim_root, registration);
+    defer allocator.free(claim_path);
+    const replay = try testReplayPreparationAlloc(allocator);
+    defer replay.deinit(allocator);
+    try claimLaneWithReplay(
+        allocator,
+        claim_path,
+        view,
+        registration,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        replay,
+        ReplayBoundExecutorRequestSchema,
+        null,
+    );
+    try validateExistingHistoricalClaim(
+        allocator,
+        claim_path,
+        view,
+        replay,
+        ReplayBoundExecutorRequestSchema,
+    );
+    const claim_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        claim_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(claim_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, claim_bytes, replay.dcp_fingerprint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, claim_bytes, replay.rip_fingerprint) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, claim_bytes, "cas-trial-executor-request/v2") != null,
+    );
+
+    const v1_registration = "sha256:" ++
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    const v1_path = try claimPathAlloc(allocator, claim_root, v1_registration);
+    defer allocator.free(v1_path);
+    try claimLaneWithReplay(
+        allocator,
+        v1_path,
+        view,
+        v1_registration,
+        "sha256:cececececececececececececececececececececececececececececececece",
+        "sha256:cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf",
+        replay,
+        LegacyExecutorRequestSchema,
+        null,
+    );
+    try validateExistingHistoricalClaim(
+        allocator,
+        v1_path,
+        view,
+        replay,
+        LegacyExecutorRequestSchema,
+    );
+    const v1_claim_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        v1_path,
+        MaxInputBytes,
+    );
+    defer allocator.free(v1_claim_bytes);
+    try std.testing.expect(
+        std.mem.indexOf(u8, v1_claim_bytes, LegacyExecutorRequestSchema) != null,
+    );
+
+    const legacy_registration = "sha256:" ++
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const legacy_path = try claimPathAlloc(allocator, claim_root, legacy_registration);
+    defer allocator.free(legacy_path);
+    try claimLane(
+        allocator,
+        legacy_path,
+        view,
+        legacy_registration,
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "sha256:abababababababababababababababababababababababababababababababab",
+    );
+    try std.testing.expectError(
+        error.HistoricalClaimReplayBindingMissing,
+        validateExistingHistoricalClaim(
+            allocator,
+            legacy_path,
+            view,
+            replay,
+            LegacyExecutorRequestSchema,
+        ),
+    );
+}
+
 fn bindTestRunnerContractAlloc(
     allocator: std.mem.Allocator,
     trial: []const u8,
     executor: []const u8,
     ledger: []const u8,
+) ![]u8 {
+    return bindTestRunnerContractForSchemaAlloc(allocator, trial, executor, ledger, null);
+}
+
+fn bindTestRunnerContractForSchemaAlloc(
+    allocator: std.mem.Allocator,
+    trial: []const u8,
+    executor: []const u8,
+    ledger: []const u8,
+    executor_request_schema: ?[]const u8,
 ) ![]u8 {
     const runner_fingerprint = try currentExecutableFingerprintAlloc(allocator);
     defer allocator.free(runner_fingerprint);
@@ -7307,10 +11075,36 @@ fn bindTestRunnerContractAlloc(
     defer allocator.free(executor_fingerprint);
     const ledger_fingerprint = try fileFingerprintAlloc(allocator, ledger);
     defer allocator.free(ledger_fingerprint);
+    const request_schema_member = if (executor_request_schema) |schema|
+        try std.fmt.allocPrint(
+            allocator,
+            "\"executor_request_schema\":{f},",
+            .{std.json.fmt(schema, .{})},
+        )
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(request_schema_member);
     const contract = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"cas-hylo-runner/v1\",\"executor_binary_fingerprint\":{f},\"ledger_binary_fingerprint\":{f},\"executor_authority\":{{\"producer_id\":\"cas-trial-executor\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f},\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\",\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}},\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}},\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true,\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1,\"maximum_retries_per_lane\":0}}",
-        .{ std.json.fmt(executor_fingerprint, .{}), std.json.fmt(ledger_fingerprint, .{}), std.json.fmt(executor_fingerprint, .{}), std.json.fmt(ledger_fingerprint, .{}) },
+        "{{\"schema\":\"cas-hylo-runner/v1\",{s}" ++
+            "\"executor_binary_fingerprint\":{f}," ++
+            "\"ledger_binary_fingerprint\":{f}," ++
+            "\"executor_authority\":{{\"producer_id\":\"cas-trial-executor\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}," ++
+            "\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\"," ++
+            "\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}}," ++
+            "\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}}," ++
+            "\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true," ++
+            "\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1," ++
+            "\"maximum_retries_per_lane\":0}}",
+        .{
+            request_schema_member,
+            std.json.fmt(executor_fingerprint, .{}),
+            std.json.fmt(ledger_fingerprint, .{}),
+            std.json.fmt(executor_fingerprint, .{}),
+            std.json.fmt(ledger_fingerprint, .{}),
+        },
     );
     defer allocator.free(contract);
     const contract_fingerprint = try digestJsonTextAlloc(allocator, contract);
@@ -7519,7 +11313,26 @@ test "capability seal binds attested executor policy and CAS observations" {
     const effect_policy_fingerprint = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const contract = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"cas-hylo-runner/v1\",\"executor_binary_fingerprint\":{f},\"ledger_binary_fingerprint\":{f},\"executor_authority\":{{\"producer_id\":\"cas-trial-executor\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f},\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\",\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}},\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}},\"capability_seal\":{{\"schema\":\"cas-capability-seal/v1\",\"profile_id\":\"cas-capability-sealed-v1\",\"target_data_mode\":\"cas-content-addressed-pre-post-equality\",\"effect_policy_fingerprint\":{f},\"effect_mediation\":\"attested-executor\",\"default_effect_decision\":\"deny\",\"cas_observations\":[\"target-package-tree\",\"execution-tree\",\"output-carrier\",\"process-group\"],\"os_confinement\":false}},\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true,\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1,\"maximum_retries_per_lane\":0}}",
+        "{{\"schema\":\"cas-hylo-runner/v1\"," ++
+            "\"executor_request_schema\":\"cas-trial-executor-request/v2\"," ++
+            "\"executor_binary_fingerprint\":{f},\"ledger_binary_fingerprint\":{f}," ++
+            "\"executor_authority\":{{\"producer_id\":\"cas-trial-executor\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}," ++
+            "\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\"," ++
+            "\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}}," ++
+            "\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}}," ++
+            "\"capability_seal\":{{\"schema\":\"cas-capability-seal/v1\"," ++
+            "\"profile_id\":\"cas-capability-sealed-v1\"," ++
+            "\"target_data_mode\":\"cas-content-addressed-pre-post-equality\"," ++
+            "\"effect_policy_fingerprint\":{f}," ++
+            "\"effect_mediation\":\"attested-executor\"," ++
+            "\"default_effect_decision\":\"deny\"," ++
+            "\"cas_observations\":[\"target-package-tree\",\"execution-tree\"," ++
+            "\"output-carrier\",\"process-group\"],\"os_confinement\":false}}," ++
+            "\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true," ++
+            "\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1," ++
+            "\"maximum_retries_per_lane\":0}}",
         .{
             std.json.fmt(executor_fingerprint, .{}),
             std.json.fmt(ledger_fingerprint, .{}),
@@ -7559,6 +11372,10 @@ test "capability seal binds attested executor policy and CAS observations" {
     const identity = validation.capability_seal orelse return error.CapabilitySealMissing;
     try std.testing.expectEqualStrings("cas-capability-sealed-v1", identity.profile_id);
     try std.testing.expectEqualStrings(effect_policy_fingerprint, identity.effect_policy_fingerprint);
+    try std.testing.expectEqualStrings(
+        ReplayBoundExecutorRequestSchema,
+        validation.executor_request_schema,
+    );
 }
 
 test "executable staging rejects noncanonical origins and stage drift" {
@@ -8060,6 +11877,7 @@ test "target and common projection remain registration-captured when INDEX mutat
             "unused-target-workspace.json",
             "unused-target-archive.json",
             "unused-target-package",
+            null,
         ),
     );
     try durable_store.writeTextAtomic(allocator, claim_path, claim);
@@ -8091,6 +11909,7 @@ test "target and common projection remain registration-captured when INDEX mutat
         workspace_ref,
         archive_ref,
         package_root,
+        null,
     );
     defer materialization.deinit(allocator);
     try persistTargetMaterialization(allocator, materialization);
@@ -8116,7 +11935,6 @@ test "target and common projection remain registration-captured when INDEX mutat
         allocator,
         loaded.view,
         execution_root,
-        "unused-decision-context.json",
         "unused-presented-input.json",
         input_fingerprint,
         lease_digest,
@@ -8129,6 +11947,10 @@ test "target and common projection remain registration-captured when INDEX mutat
             .archive_ref = "",
         },
         materialization,
+        LegacyExecutorRequestSchema,
+        null,
+        "unused-replay-dcp.json",
+        "unused-replay-rip.json",
     );
     defer allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, repo) == null);
@@ -8367,7 +12189,18 @@ fn sanitizedHistoricalProfileForTestAlloc(
     defer allocator.free(fingerprint);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"kind\":\"historical_decision\",\"source_governance_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"decision_context_fingerprint\":{f},\"decision_context\":{s},\"temporal_horizon\":\"pre_decision\",\"source_target_text_policy\":\"strip_and_replace\",\"retrace_mode\":\"replay\",\"required_lineage\":\"either\",\"required_fir_version\":\"FIR-v1\",\"reconstructability\":\"transcript_only\",\"limitations\":[],\"source_target_text_witness\":{{\"sanitization\":{{\"applied\":true,\"sanitized_context_fingerprint\":{f}}}}}}}",
+        "{{\"kind\":\"historical_decision\"," ++
+            "\"source_governance_fingerprint\":\"sha256:" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+            "\"decision_context_ref\":\"artifact:dcp\"," ++
+            "\"decision_context_fingerprint\":{f},\"decision_context\":{s}," ++
+            "\"temporal_horizon\":\"pre_decision\"," ++
+            "\"source_target_text_policy\":\"strip_and_replace\"," ++
+            "\"retrace_mode\":\"replay\",\"required_lineage\":\"either\"," ++
+            "\"required_fir_version\":\"FIR-v1\"," ++
+            "\"reconstructability\":\"transcript_only\",\"limitations\":[]," ++
+            "\"source_target_text_witness\":{{\"sanitization\":" ++
+            "{{\"applied\":true,\"sanitized_context_fingerprint\":{f}}}}}}}",
         .{ std.json.fmt(fingerprint, .{}), context, std.json.fmt(fingerprint, .{}) },
     );
 }
@@ -8415,7 +12248,12 @@ test "historical source-profile FD replaces the projected sealed profile" {
     const writer = std.Io.File{ .handle = pipe_fds[1], .flags = .{ .nonblocking = false } };
     try writer.writeStreamingAll(std.testing.io, full_profile);
     writer.close(std.testing.io);
-    var effective = try effectiveSourceProfile(std.testing.allocator, projected.value, pipe_fds[0]);
+    var effective = try effectiveSourceProfile(
+        std.testing.allocator,
+        projected.value,
+        pipe_fds[0],
+        false,
+    );
     defer effective.deinit();
     try std.testing.expectEqualStrings(
         "historical_decision",
@@ -8440,7 +12278,7 @@ test "historical source-profile FD replaces the projected sealed profile" {
     tampered_writer.close(std.testing.io);
     try std.testing.expectError(
         error.SourceProfileFingerprintMismatch,
-        effectiveSourceProfile(std.testing.allocator, tampered.value, tampered_fds[0]),
+        effectiveSourceProfile(std.testing.allocator, tampered.value, tampered_fds[0], false),
     );
 }
 
@@ -8477,7 +12315,27 @@ test "historical post-claim failure preserves DCP lineage without impersonating 
     try durable_store.writeTextCreateNewAtomic(allocator, audit_path, audit, .{});
     const audit_fingerprint = try fileFingerprintAlloc(allocator, audit_path);
     defer allocator.free(audit_fingerprint);
-    try ensureHistoricalDecisionContextArchive(allocator, loaded.view, paths);
+    const profile_root = try object(loaded.view.source_profile);
+    const replay = ReplayPreparation{
+        .dcp = try allocator.dupe(u8, "{}"),
+        .dcp_fingerprint = try allocator.dupe(
+            u8,
+            try requiredString(profile_root, "decision_context_fingerprint"),
+        ),
+        .rip = try allocator.dupe(u8, "{}"),
+        .rip_fingerprint = try allocator.dupe(
+            u8,
+            "sha256:" ++
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+        .source_profile_fingerprint = try attestation.digestValueAlloc(
+            allocator,
+            loaded.view.source_profile,
+        ),
+        .source_profile_delivery = "embedded",
+        .required_lineage = try allocator.dupe(u8, "either"),
+    };
+    defer replay.deinit(allocator);
     const native = try historicalTerminalNativeReceiptAlloc(
         allocator,
         loaded.view,
@@ -8485,12 +12343,12 @@ test "historical post-claim failure preserves DCP lineage without impersonating 
         .{ .status = "failed", .class = "executor_exit_nonzero" },
         "/usr/bin/false",
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        paths.decision_context_archive,
+        replay,
+        ReplayBoundExecutorRequestSchema,
         audit_path,
         audit_fingerprint,
     );
-    defer allocator.free(native.json);
-    defer allocator.free(native.fingerprint);
+    defer native.deinit(allocator);
     try std.testing.expectEqualStrings("cas-historical-terminal-receipt", native.kind);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, native.json, .{});
     defer parsed.deinit();
@@ -8507,10 +12365,130 @@ test "historical post-claim failure preserves DCP lineage without impersonating 
     try std.testing.expect(fir.get("receipt_ref").? == .null);
     try std.testing.expect(fir.get("receipt_fingerprint").? == .null);
     try std.testing.expectEqualStrings("executor_exit_nonzero", try requiredString(fir, "reason"));
-    try std.testing.expect(pathExists(paths.decision_context_archive));
+    try std.testing.expect(source.get("decision_context_ref") == null);
+    try std.testing.expectEqualStrings(
+        replay.dcp_fingerprint,
+        try requiredString(source, "decision_context_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        replay.rip_fingerprint,
+        try requiredString(source, "replay_plan_fingerprint"),
+    );
+
+    const legacy_native = try historicalTerminalNativeReceiptAlloc(
+        allocator,
+        loaded.view,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .{ .status = "failed", .class = "executor_exit_nonzero" },
+        "/usr/bin/false",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        replay,
+        LegacyExecutorRequestSchema,
+        audit_path,
+        audit_fingerprint,
+    );
+    defer allocator.free(legacy_native.json);
+    defer allocator.free(legacy_native.fingerprint);
+    var legacy_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        legacy_native.json,
+        .{},
+    );
+    defer legacy_parsed.deinit();
+    const legacy_source = try requiredObject(try object(legacy_parsed.value), "source");
+    try std.testing.expectEqualStrings(
+        try requiredString(profile_root, "decision_context_ref"),
+        try requiredString(legacy_source, "decision_context_ref"),
+    );
+    try std.testing.expect(legacy_source.get("replay_plan_fingerprint") == null);
+    try std.testing.expect(legacy_source.get("source_profile_body_delivery") == null);
+    try std.testing.expect(legacy_source.get("source_profile_fingerprint").? == .null);
 }
 
-test "direct source-profile FD accepts only clean EOF" {
+test "historical FIR replay binding is required only by admitted executor request v2" {
+    const allocator = std.testing.allocator;
+    var trial_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer trial_parsed.deinit();
+    const trial = try object(trial_parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const pair = try object((try requiredArray(unit, "pairs")).items[0]);
+    const view = LaneView{
+        .trial = trial,
+        .trial_id = "trial-null-001",
+        .purpose = "calibration_null",
+        .unit_id = "unit-null-001",
+        .scenario_id = "scenario-holdout",
+        .pair_id = "pair-null-001",
+        .pair = pair,
+        .lane_id = "lane-null-a0",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = unit.get("source_profile").?,
+        .execution = try requiredObject(trial, "execution"),
+    };
+    const replay = try testReplayPreparationAlloc(allocator);
+    defer replay.deinit(allocator);
+    const fir = try std.fmt.allocPrint(
+        allocator,
+        "{{\"replay_binding\":{{\"trial_id\":{f},\"lane_id\":{f}," ++
+            "\"source_profile_fingerprint\":{f}," ++
+            "\"historical_dcp_fingerprint\":{f}," ++
+            "\"historical_rip_fingerprint\":{f}," ++
+            "\"required_lineage\":{f}}}}}",
+        .{
+            std.json.fmt(view.trial_id, .{}),
+            std.json.fmt(view.lane_id, .{}),
+            std.json.fmt(replay.source_profile_fingerprint, .{}),
+            std.json.fmt(replay.dcp_fingerprint, .{}),
+            std.json.fmt(replay.rip_fingerprint, .{}),
+            std.json.fmt(replay.required_lineage, .{}),
+        },
+    );
+    defer allocator.free(fir);
+    var fir_parsed = try std.json.parseFromSlice(std.json.Value, allocator, fir, .{});
+    defer fir_parsed.deinit();
+    try validateHistoricalFirReplayBindingForSchema(
+        ReplayBoundExecutorRequestSchema,
+        fir_parsed.value,
+        view,
+        replay,
+    );
+    var legacy_fir = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer legacy_fir.deinit();
+    try validateHistoricalFirReplayBindingForSchema(
+        LegacyExecutorRequestSchema,
+        legacy_fir.value,
+        view,
+        replay,
+    );
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        fir,
+        replay.rip_fingerprint,
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    );
+    defer allocator.free(tampered);
+    var tampered_parsed = try std.json.parseFromSlice(std.json.Value, allocator, tampered, .{});
+    defer tampered_parsed.deinit();
+    try std.testing.expectError(
+        error.FirReplayBindingMismatch,
+        validateHistoricalFirReplayBindingForSchema(
+            ReplayBoundExecutorRequestSchema,
+            tampered_parsed.value,
+            view,
+            replay,
+        ),
+    );
+}
+
+test "direct source-profile FD clean EOF remains v1-compatible while v2 stays strict" {
     var direct = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -8518,12 +12496,30 @@ test "direct source-profile FD accepts only clean EOF" {
         .{},
     );
     defer direct.deinit();
-    var pipe_fds: [2]std.posix.fd_t = undefined;
-    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
-    closeOwnedFd(pipe_fds[1]);
-    var effective = try effectiveSourceProfile(std.testing.allocator, direct.value, pipe_fds[0]);
-    defer effective.deinit();
-    try std.testing.expectEqualStrings("direct", try requiredString(try object(effective.value), "kind"));
+    var legacy_pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&legacy_pipe_fds) != 0) return error.TestFdSetupFailed;
+    closeOwnedFd(legacy_pipe_fds[1]);
+    var effective = try effectiveSourceProfile(
+        std.testing.allocator,
+        direct.value,
+        legacy_pipe_fds[0],
+        false,
+    );
+    effective.deinit();
+
+    const semantic_fd = try testPipeWithBytes("{\"kind\":\"direct\"}");
+    try std.testing.expectError(
+        error.SourceProfileFdForbidden,
+        effectiveSourceProfile(std.testing.allocator, direct.value, semantic_fd, false),
+    );
+
+    var private_pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&private_pipe_fds) != 0) return error.TestFdSetupFailed;
+    closeOwnedFd(private_pipe_fds[1]);
+    try std.testing.expectError(
+        error.SourceProfileFdForbidden,
+        effectiveSourceProfile(std.testing.allocator, direct.value, private_pipe_fds[0], true),
+    );
 }
 
 test "claimed executor failure persists one signed terminal receipt and cleanup preserves proof" {
@@ -8736,15 +12732,22 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
         "lane-null-a0",
     );
     defer allocator.free(cleanup_preview);
-    try persistCleanupIntent(
-        allocator,
-        paths,
-        "trial-null-001",
-        "lane-null-a0",
-        recovered_terminal,
-        cleanup_preview,
+    inline for (.{
+        "source_profile",
+        "decision_context",
+        "historical_dcp_ref",
+        "historical_rip_ref",
+        "route-private-source",
+    }) |private_field| {
+        try std.testing.expect(std.mem.indexOf(u8, cleanup_preview, private_field) == null);
+    }
+    const direct_workspace_stat = try std.Io.Dir.cwd().statFile(defaultIo(), paths.workspace, .{
+        .follow_symlinks = false,
+    });
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        direct_workspace_stat.permissions.toMode() & 0o777,
     );
-    try deleteTree(paths.workspace);
     try cmdCleanup(allocator, .{
         .command = .cleanup,
         .trial_id = "trial-null-001",
@@ -8773,6 +12776,24 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
         .cleanup,
     )) orelse return error.CleanupControlMismatch;
     defer allocator.free(cleanup_control_path);
+    // A lost cleanup receipt/control after workspace deletion recovers the
+    // retained intent without reintroducing or re-executing lane work.
+    try deleteFileIfExists(cleanup_control_path);
+    try deleteFileIfExists(paths.cleanup_receipt);
+    try cmdCleanup(allocator, .{
+        .command = .cleanup,
+        .trial_id = "trial-null-001",
+        .lane_id = "lane-null-a0",
+        .receipt_dir = receipt_dir,
+        .claim_store_override = root,
+    });
+    try std.testing.expect(try verifyCleanupControlIfPresent(
+        allocator,
+        paths,
+        "trial-null-001",
+        "lane-null-a0",
+        terminal_control,
+    ));
     try deleteFileIfExists(cleanup_control_path);
     try durable_store.writeTextAtomic(allocator, paths.cleanup_receipt, "{\"conflict\":true}");
     try std.testing.expectError(error.CleanupArtifactConflict, cmdCleanup(allocator, .{
@@ -8803,6 +12824,248 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
             terminal_control,
         ),
     );
+}
+
+test "cleanup removes a private read-only workspace and rejects boundary mode or symlink drift" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    const package = try std.fs.path.join(allocator, &.{ workspace, "target-package" });
+    defer allocator.free(package);
+    const nested = try std.fs.path.join(allocator, &.{ package, "nested" });
+    defer allocator.free(nested);
+    const target = try std.fs.path.join(allocator, &.{ nested, "target.txt" });
+    defer allocator.free(target);
+    try durable_store.ensureDirectoryPathNoSymlinks(nested);
+    try durable_store.writeTextAtomic(allocator, target, "private-target\n");
+    var target_file = try std.Io.Dir.openFileAbsolute(defaultIo(), target, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    try target_file.setPermissions(defaultIo(), .fromMode(0o400));
+    target_file.close(defaultIo());
+    var nested_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        nested,
+        .{ .follow_symlinks = false },
+    );
+    try nested_dir.setPermissions(defaultIo(), .fromMode(0o500));
+    nested_dir.close(defaultIo());
+    var package_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        package,
+        .{ .follow_symlinks = false },
+    );
+    try package_dir.setPermissions(defaultIo(), .fromMode(0o500));
+    package_dir.close(defaultIo());
+    var workspace_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        workspace,
+        .{ .follow_symlinks = false },
+    );
+    try workspace_dir.setPermissions(defaultIo(), .fromMode(0o700));
+    workspace_dir.close(defaultIo());
+
+    const replay_root = try std.fs.path.join(allocator, &.{ workspace, "historical-replay" });
+    defer allocator.free(replay_root);
+    const replay_dcp = try std.fs.path.join(
+        allocator,
+        &.{ replay_root, "decision-context.dcp.json" },
+    );
+    defer allocator.free(replay_dcp);
+    const replay_rip = try std.fs.path.join(allocator, &.{ replay_root, "replay-plan.rip.json" });
+    defer allocator.free(replay_rip);
+    try removePrivateWorkspaceTree(allocator, workspace, replay_root, replay_dcp, replay_rip);
+    try std.testing.expect(!pathExists(workspace));
+
+    const rejected_workspace = try std.fs.path.join(allocator, &.{ root, "rejected-workspace" });
+    defer allocator.free(rejected_workspace);
+    try durable_store.ensureDirectoryPathNoSymlinks(rejected_workspace);
+    var rejected_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        rejected_workspace,
+        .{ .follow_symlinks = false },
+    );
+    try rejected_dir.setPermissions(defaultIo(), .fromMode(0o700));
+    rejected_dir.close(defaultIo());
+    const outside = try std.fs.path.join(allocator, &.{ root, "outside.json" });
+    defer allocator.free(outside);
+    try durable_store.writeTextAtomic(allocator, outside, "outside\n");
+    const link = try std.fs.path.join(allocator, &.{ rejected_workspace, "link.json" });
+    defer allocator.free(link);
+    try std.Io.Dir.cwd().symLink(defaultIo(), outside, link, .{});
+    const rejected_replay = try std.fs.path.join(
+        allocator,
+        &.{ rejected_workspace, "historical-replay" },
+    );
+    defer allocator.free(rejected_replay);
+    const rejected_dcp = try std.fs.path.join(
+        allocator,
+        &.{ rejected_replay, "decision-context.dcp.json" },
+    );
+    defer allocator.free(rejected_dcp);
+    const rejected_rip = try std.fs.path.join(
+        allocator,
+        &.{ rejected_replay, "replay-plan.rip.json" },
+    );
+    defer allocator.free(rejected_rip);
+    try std.testing.expectError(
+        error.CleanupPrivateBoundaryInvalid,
+        removePrivateWorkspaceTree(
+            allocator,
+            rejected_workspace,
+            rejected_replay,
+            rejected_dcp,
+            rejected_rip,
+        ),
+    );
+    try std.testing.expect(pathExists(rejected_workspace));
+    const outside_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        outside,
+        MaxInputBytes,
+    );
+    defer allocator.free(outside_bytes);
+    try std.testing.expectEqualStrings("outside\n", outside_bytes);
+
+    const legacy_workspace = try std.fs.path.join(allocator, &.{ root, "legacy-workspace" });
+    defer allocator.free(legacy_workspace);
+    try durable_store.ensureDirectoryPathNoSymlinks(legacy_workspace);
+    const legacy_marker = try std.fs.path.join(allocator, &.{ legacy_workspace, "marker.json" });
+    defer allocator.free(legacy_marker);
+    try durable_store.writeTextAtomic(allocator, legacy_marker, "legacy\n");
+    var legacy_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        legacy_workspace,
+        .{ .follow_symlinks = false },
+    );
+    try legacy_dir.setPermissions(defaultIo(), .fromMode(0o755));
+    legacy_dir.close(defaultIo());
+    const legacy_replay = try std.fs.path.join(
+        allocator,
+        &.{ legacy_workspace, "historical-replay" },
+    );
+    defer allocator.free(legacy_replay);
+    const legacy_dcp = try std.fs.path.join(
+        allocator,
+        &.{ legacy_replay, "decision-context.dcp.json" },
+    );
+    defer allocator.free(legacy_dcp);
+    const legacy_rip = try std.fs.path.join(allocator, &.{ legacy_replay, "replay-plan.rip.json" });
+    defer allocator.free(legacy_rip);
+    try removePrivateWorkspaceTree(
+        allocator,
+        legacy_workspace,
+        legacy_replay,
+        legacy_dcp,
+        legacy_rip,
+    );
+    try std.testing.expect(!pathExists(legacy_workspace));
+
+    const unsafe_workspace = try std.fs.path.join(allocator, &.{ root, "unsafe-workspace" });
+    defer allocator.free(unsafe_workspace);
+    try durable_store.ensureDirectoryPathNoSymlinks(unsafe_workspace);
+    const unsafe_marker = try std.fs.path.join(allocator, &.{ unsafe_workspace, "marker.json" });
+    defer allocator.free(unsafe_marker);
+    try durable_store.writeTextAtomic(allocator, unsafe_marker, "retain\n");
+    var unsafe_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        unsafe_workspace,
+        .{ .follow_symlinks = false },
+    );
+    try unsafe_dir.setPermissions(defaultIo(), .fromMode(0o775));
+    unsafe_dir.close(defaultIo());
+    const unsafe_replay = try std.fs.path.join(
+        allocator,
+        &.{ unsafe_workspace, "historical-replay" },
+    );
+    defer allocator.free(unsafe_replay);
+    const unsafe_dcp = try std.fs.path.join(
+        allocator,
+        &.{ unsafe_replay, "decision-context.dcp.json" },
+    );
+    defer allocator.free(unsafe_dcp);
+    const unsafe_rip = try std.fs.path.join(allocator, &.{ unsafe_replay, "replay-plan.rip.json" });
+    defer allocator.free(unsafe_rip);
+    try std.testing.expectError(
+        error.CleanupPrivateBoundaryInvalid,
+        removePrivateWorkspaceTree(
+            allocator,
+            unsafe_workspace,
+            unsafe_replay,
+            unsafe_dcp,
+            unsafe_rip,
+        ),
+    );
+    try std.testing.expect(pathExists(unsafe_workspace));
+    try std.testing.expect(pathExists(unsafe_marker));
+
+    const historical_workspace = try std.fs.path.join(
+        allocator,
+        &.{ root, "historical-workspace" },
+    );
+    defer allocator.free(historical_workspace);
+    const historical_replay = try std.fs.path.join(
+        allocator,
+        &.{ historical_workspace, "historical-replay" },
+    );
+    defer allocator.free(historical_replay);
+    const historical_dcp = try std.fs.path.join(
+        allocator,
+        &.{ historical_replay, "decision-context.dcp.json" },
+    );
+    defer allocator.free(historical_dcp);
+    const historical_rip = try std.fs.path.join(
+        allocator,
+        &.{ historical_replay, "replay-plan.rip.json" },
+    );
+    defer allocator.free(historical_rip);
+    try durable_store.ensureDirectoryPathNoSymlinks(historical_replay);
+    try durable_store.writeTextAtomic(allocator, historical_dcp, "private-dcp\n");
+    try durable_store.writeTextAtomic(allocator, historical_rip, "private-rip\n");
+    var historical_root_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        historical_workspace,
+        .{ .follow_symlinks = false },
+    );
+    try historical_root_dir.setPermissions(defaultIo(), .fromMode(0o700));
+    historical_root_dir.close(defaultIo());
+    var historical_replay_dir = try std.Io.Dir.openDirAbsolute(
+        defaultIo(),
+        historical_replay,
+        .{ .follow_symlinks = false },
+    );
+    try historical_replay_dir.setPermissions(defaultIo(), .fromMode(0o700));
+    historical_replay_dir.close(defaultIo());
+    var historical_dcp_file = try std.Io.Dir.openFileAbsolute(defaultIo(), historical_dcp, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    try historical_dcp_file.setPermissions(defaultIo(), .fromMode(0o644));
+    historical_dcp_file.close(defaultIo());
+    var historical_rip_file = try std.Io.Dir.openFileAbsolute(defaultIo(), historical_rip, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    try historical_rip_file.setPermissions(defaultIo(), .fromMode(0o600));
+    historical_rip_file.close(defaultIo());
+    try std.testing.expectError(
+        error.CleanupPrivateBoundaryInvalid,
+        removePrivateWorkspaceTree(
+            allocator,
+            historical_workspace,
+            historical_replay,
+            historical_dcp,
+            historical_rip,
+        ),
+    );
+    try std.testing.expect(pathExists(historical_workspace));
+    try std.testing.expect(pathExists(historical_dcp));
 }
 
 test "claimed output overflow persists one signed bounded aborted receipt" {
@@ -9086,7 +13349,7 @@ test "sensitive inputs reject aliases by endpoint identity" {
     defer closeOwnedFd(alias);
     try std.testing.expectError(
         error.SensitiveFdAliased,
-        validateSensitiveInputFds(lease_pipe[0], alias, null, null),
+        validateSensitiveInputFds(lease_pipe[0], alias, null, null, null),
     );
 }
 

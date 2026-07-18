@@ -103,7 +103,21 @@ case "$mode" in
             current_app="__hctp"
             return
             ;;
-          *"hylo_cli_tests_root"*|*"hylo_test_filter"*|*"run_hylo_proof_tests"*|*"test-hylo"*)
+          *"hylo_operator_recipe"*|*"hylo-operator-recipe"*)
+            current_app="__hctp"
+            return
+            ;;
+          *"ledger_test_filter"*|*"ledger-test-filter"*|*"Override the Ledger test filter"*)
+            current_app="__ledger_test"
+            return
+            ;;
+          *"hylo_cli_tests_root"*)
+            if [[ "$current_app" != "__hctp" ]]; then
+              current_app="ledger"
+            fi
+            return
+            ;;
+          *"hylo_test_filter"*|*"run_hylo_proof_tests"*|*"test-hylo"*)
             current_app="ledger"
             return
             ;;
@@ -214,6 +228,9 @@ case "$mode" in
         if [[ "$current_app" == "__hctp" ]]; then
           mark_app seq
           mark_app cas
+          mark_app ledger
+          matched=1
+        elif [[ "$current_app" == "__ledger_test" ]]; then
           mark_app ledger
           matched=1
         elif [[ "$current_app" == "__retrace_core" ]]; then

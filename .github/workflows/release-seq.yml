@@ -64,6 +64,14 @@ jobs:
       - name: Build seq binary
         working-directory: apps/seq
         run: zig build -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Verify platform-gated seq command and capability surface
+        run: apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
+      - name: Exercise packaged Seq HCTP source compile and validation
+        if: matrix.target == 'darwin-arm64'
+        run: >-
+          zig build test-hylo-operator-recipe-seq-release-runtime
+          -Dhylo-operator-seq-path="${PWD}/apps/seq/zig-out/bin/seq"
+          --summary all
       - name: Package seq artifact
         run: |
           mkdir -p dist/seq

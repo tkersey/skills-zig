@@ -1,9 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const durable_store = @import("durable_store");
 const retrace_core = @import("retrace_core");
 
 const adapter = retrace_core.hctp_adapter;
 const attestation = retrace_core.hctp_attestation;
+const route_admission = retrace_core.hctp_route_admission;
+const trial_custody = retrace_core.hctp_trial_custody;
 const portable_credentials = retrace_core.portable_credentials;
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const MaxInputBytes = 64 * 1024 * 1024;
@@ -31,6 +34,7 @@ const Options = struct {
     lane_id: ?[]const u8 = null,
     visible_output_fd: ?std.posix.fd_t = null,
     source_profile_output_fd: ?std.posix.fd_t = null,
+    source_selection_opening_fd: ?std.posix.fd_t = null,
     signing_seed_fd: ?std.posix.fd_t = null,
     source_owner_id: []const u8 = "seq-source-owner",
     source_owner_key_id: []const u8 = "source-owner-key",
@@ -62,12 +66,15 @@ pub fn usage() []const u8 {
     \\       seq hctp-source govern --evidence FILE --output FILE
     \\       seq hctp-source materialize --sealed-case FILE --trial FILE --lane-id ID
     \\           --seal-key-fd N --visible-output-fd N [--source-profile-output-fd N]
+    \\           [--source-selection-opening-fd N]
     \\           --signing-seed-fd N --output FILE
     \\
     \\Compilation derives the complete denominator and independence clusters.
     \\Case-blind payloads are XChaCha20-Poly1305 sealed; plaintext is omitted
     \\from the receipt. Materialization writes visible input only to a protected
-    \\FD and emits a role-attested, lane-scoped receipt.
+    \\FD and emits a role-attested, lane-scoped receipt. Public hylo-trial/v2
+    \\materialization requires the exact private hylo-source-selection-opening/v1
+    \\on --source-selection-opening-fd; v1 retains its embedded receipt carrier.
     ;
 }
 
@@ -90,7 +97,51 @@ fn parseArgs(args: []const []const u8) !Options {
         if (index + 1 >= args.len) return error.MissingArgValue;
         const value = args[index + 1];
         index += 1;
-        if (std.mem.eql(u8, flag, "--manifest")) options.manifest = value else if (std.mem.eql(u8, flag, "--manifest-fd")) options.manifest_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--output")) options.output = value else if (std.mem.eql(u8, flag, "--sealed-dir")) options.sealed_dir = value else if (std.mem.eql(u8, flag, "--seal-key-fd")) options.seal_key_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--seal-key-output-fd")) options.seal_key_output_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--source-signing-seed-fd")) options.source_signing_seed_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--evidence")) options.evidence = value else if (std.mem.eql(u8, flag, "--receipt")) options.receipt = value else if (std.mem.eql(u8, flag, "--sealed-case")) options.sealed_case = value else if (std.mem.eql(u8, flag, "--trial")) options.trial = value else if (std.mem.eql(u8, flag, "--lane-id")) options.lane_id = value else if (std.mem.eql(u8, flag, "--visible-output-fd")) options.visible_output_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--source-profile-output-fd")) options.source_profile_output_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--signing-seed-fd")) options.signing_seed_fd = try parseFd(value) else if (std.mem.eql(u8, flag, "--source-owner-id")) options.source_owner_id = value else if (std.mem.eql(u8, flag, "--source-owner-key-id")) options.source_owner_key_id = value else if (std.mem.eql(u8, flag, "--materializer-id")) options.materializer_id = value else if (std.mem.eql(u8, flag, "--materializer-key-id")) options.materializer_key_id = value else if (std.mem.eql(u8, flag, "--controller-id")) options.controller_id = value else return error.UnknownArgument;
+        if (std.mem.eql(u8, flag, "--manifest")) {
+            options.manifest = value;
+        } else if (std.mem.eql(u8, flag, "--manifest-fd")) {
+            options.manifest_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--output")) {
+            options.output = value;
+        } else if (std.mem.eql(u8, flag, "--sealed-dir")) {
+            options.sealed_dir = value;
+        } else if (std.mem.eql(u8, flag, "--seal-key-fd")) {
+            options.seal_key_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--seal-key-output-fd")) {
+            options.seal_key_output_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--source-signing-seed-fd")) {
+            options.source_signing_seed_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--evidence")) {
+            options.evidence = value;
+        } else if (std.mem.eql(u8, flag, "--receipt")) {
+            options.receipt = value;
+        } else if (std.mem.eql(u8, flag, "--sealed-case")) {
+            options.sealed_case = value;
+        } else if (std.mem.eql(u8, flag, "--trial")) {
+            options.trial = value;
+        } else if (std.mem.eql(u8, flag, "--lane-id")) {
+            options.lane_id = value;
+        } else if (std.mem.eql(u8, flag, "--visible-output-fd")) {
+            options.visible_output_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--source-profile-output-fd")) {
+            options.source_profile_output_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--source-selection-opening-fd")) {
+            options.source_selection_opening_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--signing-seed-fd")) {
+            options.signing_seed_fd = try parseFd(value);
+        } else if (std.mem.eql(u8, flag, "--source-owner-id")) {
+            options.source_owner_id = value;
+        } else if (std.mem.eql(u8, flag, "--source-owner-key-id")) {
+            options.source_owner_key_id = value;
+        } else if (std.mem.eql(u8, flag, "--materializer-id")) {
+            options.materializer_id = value;
+        } else if (std.mem.eql(u8, flag, "--materializer-key-id")) {
+            options.materializer_key_id = value;
+        } else if (std.mem.eql(u8, flag, "--controller-id")) {
+            options.controller_id = value;
+        } else {
+            return error.UnknownArgument;
+        }
     }
     return options;
 }
@@ -111,6 +162,7 @@ const CaseInfo = struct {
     hidden_fingerprint: []u8,
     source_episode_fingerprint: []u8,
     source_profile_fingerprint: []u8,
+    source_route_admission_json: ?[]u8 = null,
     target_text_witness: ?[]u8,
     source_profile_json: []u8,
     normalized_request: []u8,
@@ -122,6 +174,7 @@ const CaseInfo = struct {
         allocator.free(self.hidden_fingerprint);
         allocator.free(self.source_episode_fingerprint);
         allocator.free(self.source_profile_fingerprint);
+        if (self.source_route_admission_json) |admission| allocator.free(admission);
         if (self.target_text_witness) |witness| allocator.free(witness);
         allocator.free(self.source_profile_json);
         allocator.free(self.normalized_request);
@@ -131,6 +184,19 @@ const CaseInfo = struct {
 };
 
 fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
+    return compile(allocator, options, true);
+}
+
+/// Test-only carrier for cross-component conformance. It shares the exact
+/// product compiler and suppresses only the human-facing stdout receipt.
+pub fn compileForTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (!builtin.is_test) return error.TestOnlySourceCompilerUnavailable;
+    const options = try parseArgs(args);
+    if (options.action != .compile) return error.InvalidHctpSourceAction;
+    return compile(allocator, options, false);
+}
+
+fn compile(allocator: std.mem.Allocator, options: Options, emit_receipt: bool) !void {
     if ((options.manifest == null) == (options.manifest_fd == null)) {
         return if (options.manifest == null) error.MissingManifest else error.ManifestSourceConflict;
     }
@@ -217,6 +283,7 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
         try validateSourceProfile(allocator, source_profile, split);
         const source_profile_object = try object(source_profile);
         const target_text_witness = try targetTextWitnessAlloc(allocator, source_profile_object);
+        try rejectCallerSuppliedSourceAuthority(case);
         const normalized = try normalizeRequestAlloc(allocator, visible_json);
         const dependencies = try dependencyKeysAlloc(allocator, case);
         const source_episode_fingerprint = try sourceEpisodeFingerprintAlloc(
@@ -225,6 +292,42 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
             source_profile,
             split,
         );
+        const source_profile_fingerprint = try attestation.digestValueAlloc(
+            allocator,
+            source_profile,
+        );
+        errdefer allocator.free(source_profile_fingerprint);
+        const source_route_admission_json = if (case.get("replay_episode")) |episode|
+            try route_admission.deriveAlloc(allocator, episode, source_profile, .{
+                .campaign_id = campaign_id,
+                .unit_id = unit_id,
+                .scenario_id = scenario_id,
+                .source_episode_id = try requiredString(case, "source_episode_id"),
+                .split = split,
+                .require_authoritative_historical = std.mem.eql(u8, split, "holdout"),
+            })
+        else
+            null;
+        errdefer if (source_route_admission_json) |admission| allocator.free(admission);
+        if (source_route_admission_json) |admission_json| {
+            var admission = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                admission_json,
+                .{
+                    .allocate = .alloc_always,
+                    .duplicate_field_behavior = .@"error",
+                },
+            );
+            defer admission.deinit();
+            try route_admission.validateValue(allocator, admission.value, .{
+                .campaign_id = campaign_id,
+                .unit_id = unit_id,
+                .scenario_id = scenario_id,
+                .source_profile_fingerprint = source_profile_fingerprint,
+                .source_episode_projection_fingerprint = source_episode_fingerprint,
+            });
+        }
         infos[index] = .{
             .object = case,
             .unit_id = unit_id,
@@ -234,7 +337,8 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
             .visible_fingerprint = try attestation.digestValueAlloc(allocator, visible),
             .hidden_fingerprint = try attestation.digestValueAlloc(allocator, hidden),
             .source_episode_fingerprint = source_episode_fingerprint,
-            .source_profile_fingerprint = try attestation.digestValueAlloc(allocator, source_profile),
+            .source_profile_fingerprint = source_profile_fingerprint,
+            .source_route_admission_json = source_route_admission_json,
             .target_text_witness = target_text_witness,
             .source_profile_json = source_profile_json,
             .normalized_request = normalized,
@@ -297,6 +401,10 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
         defer allocator.free(source_json);
         if (containsPersistedSecret(source_json)) return error.FinalSanitizationFailed;
         try body.writer.writeAll(source_json);
+        if (info.source_route_admission_json) |admission| {
+            try body.writer.writeAll(",\"source_route_admission\":");
+            try body.writer.writeAll(admission);
+        }
         if (std.mem.eql(u8, info.visibility, "case_blind")) {
             const sealed = try sealCaseAlloc(allocator, info, seal_key, options.sealed_dir.?);
             defer allocator.free(sealed.json);
@@ -351,6 +459,7 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
     try durable_store.writeTextAtomic(allocator, output_path, final_json);
     const source_public_key = try attestation.publicKeyBase64Alloc(allocator, source_seed);
     defer allocator.free(source_public_key);
+    if (!emit_receipt) return;
     try printReceipt(.{
         .schema = "hylo-source-compile-result/v1",
         .campaign_id = campaign_id,
@@ -381,8 +490,37 @@ fn cmdValidate(allocator: std.mem.Allocator, options: Options) !void {
     try printReceipt(.{ .schema = "hylo-source-validation/v1", .status = "valid", .receipt_fingerprint = try requiredString(try object(parsed.value), "receipt_fingerprint") });
 }
 
-fn validateSourceReceiptValue(allocator: std.mem.Allocator, value: std.json.Value, trial: std.json.ObjectMap) !void {
+/// Exercises the same receipt/trial parser and semantic validator as
+/// `seq hctp-source validate` without requiring filesystem carriers.
+pub fn validateReceiptAgainstTrial(
+    allocator: std.mem.Allocator,
+    receipt_json: []const u8,
+    trial_json: []const u8,
+) !void {
+    var receipt = try std.json.parseFromSlice(std.json.Value, allocator, receipt_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer receipt.deinit();
+    var trial = try std.json.parseFromSlice(std.json.Value, allocator, trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial.deinit();
+    try validateSourceReceiptValue(allocator, receipt.value, try object(trial.value));
+}
+
+pub fn validateSourceReceiptValue(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    trial: std.json.ObjectMap,
+) !void {
     const root = try object(value);
+    const exact_public_profiles = std.mem.eql(
+        u8,
+        try requiredString(trial, "schema"),
+        trial_custody.PublicTrialSchema,
+    );
     if (!std.mem.eql(u8, try requiredString(root, "schema"), source_receipt_schema)) return error.SourceReceiptInvalid;
     const campaign_id = try requiredString(root, "campaign_id");
     try validateId(campaign_id);
@@ -392,6 +530,7 @@ fn validateSourceReceiptValue(allocator: std.mem.Allocator, value: std.json.Valu
     const actual = try fingerprintOmittingAlloc(allocator, root, "receipt_fingerprint");
     defer allocator.free(actual);
     if (!std.mem.eql(u8, declared, actual)) return error.SourceReceiptFingerprintMismatch;
+    try validateSourceReceiptTrialBinding(allocator, value, trial);
     const cases = try requiredArray(root, "cases");
     if (cases.items.len == 0) return error.SourceManifestEmpty;
     var seen_units = std.StringHashMap(void).init(allocator);
@@ -435,7 +574,9 @@ fn validateSourceReceiptValue(allocator: std.mem.Allocator, value: std.json.Valu
         const profile_json = try attestation.canonicalJsonAlloc(allocator, .{ .object = profile });
         defer allocator.free(profile_json);
         if (containsPersistedSecret(profile_json)) return error.FinalSanitizationFailed;
-        if (optionalString(profile, "source_profile_fingerprint")) |committed_profile| {
+        if (exact_public_profiles) {
+            try validateProjectedSourceProfile(profile, visibility, source_profile_fingerprint);
+        } else if (optionalString(profile, "source_profile_fingerprint")) |committed_profile| {
             if (!std.mem.eql(u8, committed_profile, source_profile_fingerprint)) {
                 return error.SourceProfileFingerprintMismatch;
             }
@@ -481,6 +622,16 @@ fn validateSourceReceiptValue(allocator: std.mem.Allocator, value: std.json.Valu
             const observed = try attestation.digestValueAlloc(allocator, visible);
             defer allocator.free(observed);
             if (!std.mem.eql(u8, observed, visible_fingerprint)) return error.SealedCaseFingerprintMismatch;
+        }
+        if (case.get("source_route_admission")) |admission| {
+            try route_admission.validateValue(allocator, admission, .{
+                .campaign_id = campaign_id,
+                .unit_id = unit_id,
+                .scenario_id = scenario_id,
+                .source_profile_fingerprint = source_profile_fingerprint,
+                .source_episode_projection_fingerprint = source_episode_fingerprint,
+            });
+            try validateSourceRouteProfileKind(admission, profile);
         }
     }
     const denominator = try requiredObject(root, "denominator");
@@ -536,6 +687,204 @@ fn validateSourceReceiptValue(allocator: std.mem.Allocator, value: std.json.Valu
         try requiredU64(redaction, "secret_patterns_detected") != 0 or
         try requiredBool(redaction, "plaintext_sealed_cases_persisted")) return error.FinalSanitizationFailed;
     try validateSourceOwnerAttestation(allocator, root, trial);
+}
+
+fn sourceReceiptForMaterialization(
+    allocator: std.mem.Allocator,
+    trial: std.json.ObjectMap,
+    source_selection_opening_value: ?std.json.Value,
+) !std.json.Value {
+    const sealing = requiredObject(trial, "sealing") catch return error.SourceReceiptTrialMismatch;
+    const trial_schema = requiredString(trial, "schema") catch
+        return error.SourceReceiptTrialMismatch;
+    if (std.mem.eql(u8, trial_schema, trial_custody.PublicTrialSchema)) {
+        if (sealing.get("source_selection_receipt") != null) {
+            return error.SourceReceiptEmbeddedForbidden;
+        }
+        const opening_value = source_selection_opening_value orelse
+            return error.SourceSelectionOpeningFdRequired;
+        const opening = object(opening_value) catch return error.SourceSelectionOpeningInvalid;
+        if (!hasExactKeys(opening, &.{ "nonce", "receipt", "schema" }) or
+            !std.mem.eql(
+                u8,
+                requiredString(opening, "schema") catch return error.SourceSelectionOpeningInvalid,
+                trial_custody.SourceSelectionOpeningSchema,
+            ))
+        {
+            return error.SourceSelectionOpeningInvalid;
+        }
+        trial_custody.validateNonce(
+            requiredString(opening, "nonce") catch return error.SourceSelectionOpeningInvalid,
+        ) catch return error.SourceSelectionOpeningInvalid;
+        const observed_commitment = try trial_custody.digestValueAlloc(allocator, opening_value);
+        defer allocator.free(observed_commitment);
+        const expected_commitment = requiredString(
+            sealing,
+            "source_selection_receipt_commitment",
+        ) catch return error.SourceReceiptTrialMismatch;
+        validateFingerprint(expected_commitment) catch return error.SourceReceiptTrialMismatch;
+        if (!std.mem.eql(u8, observed_commitment, expected_commitment)) {
+            return error.SourceSelectionOpeningCommitmentMismatch;
+        }
+        const receipt = opening.get("receipt") orelse return error.SourceSelectionOpeningInvalid;
+        try validateSourceReceiptTrialBinding(allocator, receipt, trial);
+        return receipt;
+    }
+    if (!std.mem.eql(u8, trial_schema, "hylo-trial/v1")) {
+        return error.SourceReceiptTrialMismatch;
+    }
+    if (source_selection_opening_value != null) {
+        return error.SourceSelectionOpeningFdForbidden;
+    }
+    const receipt = sealing.get("source_selection_receipt") orelse
+        return error.SourceReceiptInvalid;
+    try validateSourceReceiptTrialBinding(allocator, receipt, trial);
+    return receipt;
+}
+
+fn validateSourceReceiptTrialBinding(
+    allocator: std.mem.Allocator,
+    receipt_value: std.json.Value,
+    trial: std.json.ObjectMap,
+) !void {
+    const receipt = object(receipt_value) catch return error.SourceReceiptTrialMismatch;
+    const sealing = requiredObject(trial, "sealing") catch return error.SourceReceiptTrialMismatch;
+    const declared = requiredString(receipt, "receipt_fingerprint") catch
+        return error.SourceReceiptTrialMismatch;
+    const trial_declared = requiredString(sealing, "source_selection_receipt_fingerprint") catch
+        return error.SourceReceiptTrialMismatch;
+    const trial_schema = requiredString(trial, "schema") catch
+        return error.SourceReceiptTrialMismatch;
+    if (std.mem.eql(u8, trial_schema, "hylo-trial/v2")) {
+        if (!std.mem.eql(u8, declared, trial_declared) or
+            sealing.get("source_selection_receipt") != null)
+        {
+            return error.SourceReceiptTrialMismatch;
+        }
+        if ((requiredString(sealing, "source_selection_receipt_ref") catch
+            return error.SourceReceiptTrialMismatch).len == 0)
+        {
+            return error.SourceReceiptTrialMismatch;
+        }
+        validateFingerprint(
+            requiredString(sealing, "source_selection_receipt_commitment") catch
+                return error.SourceReceiptTrialMismatch,
+        ) catch return error.SourceReceiptTrialMismatch;
+        const cases = requiredArray(receipt, "cases") catch return error.SourceReceiptTrialMismatch;
+        const units = requiredArray(trial, "units") catch return error.SourceReceiptTrialMismatch;
+        if (cases.items.len != units.items.len) return error.SourceReceiptTrialMismatch;
+        const case_visibility = requiredString(sealing, "case_visibility") catch
+            return error.SourceReceiptTrialMismatch;
+        try validateReceiptCommitmentCoverage(
+            allocator,
+            cases,
+            sealing,
+            "visible_input_fingerprint",
+            "visible_input_commitments",
+        );
+        try validateReceiptCommitmentCoverage(
+            allocator,
+            cases,
+            sealing,
+            "hidden_reference_fingerprint",
+            "hidden_reference_commitments",
+        );
+        for (units.items) |unit_value| {
+            const unit = object(unit_value) catch return error.SourceReceiptTrialMismatch;
+            var matched: ?std.json.ObjectMap = null;
+            for (cases.items) |case_value| {
+                const case = object(case_value) catch return error.SourceReceiptTrialMismatch;
+                if (!std.mem.eql(
+                    u8,
+                    requiredString(case, "unit_id") catch return error.SourceReceiptTrialMismatch,
+                    requiredString(unit, "unit_id") catch return error.SourceReceiptTrialMismatch,
+                )) continue;
+                if (matched != null) return error.SourceReceiptTrialMismatch;
+                matched = case;
+            }
+            const case = matched orelse return error.SourceReceiptTrialMismatch;
+            if (!std.mem.eql(
+                u8,
+                requiredString(case, "case_visibility") catch
+                    return error.SourceReceiptTrialMismatch,
+                case_visibility,
+            )) return error.SourceReceiptTrialMismatch;
+            inline for (.{ "scenario_id", "split", "independence_cluster_id" }) |key| {
+                if (!std.mem.eql(
+                    u8,
+                    requiredString(case, key) catch return error.SourceReceiptTrialMismatch,
+                    requiredString(unit, key) catch return error.SourceReceiptTrialMismatch,
+                )) return error.SourceReceiptTrialMismatch;
+            }
+            const case_profile = case.get("source_profile") orelse
+                return error.SourceReceiptTrialMismatch;
+            const unit_profile = unit.get("source_profile") orelse
+                return error.SourceReceiptTrialMismatch;
+            const case_profile_json = try attestation.canonicalJsonAlloc(allocator, case_profile);
+            defer allocator.free(case_profile_json);
+            const unit_profile_json = try attestation.canonicalJsonAlloc(allocator, unit_profile);
+            defer allocator.free(unit_profile_json);
+            if (!std.mem.eql(u8, case_profile_json, unit_profile_json)) {
+                return error.SourceReceiptTrialMismatch;
+            }
+        }
+        return;
+    }
+    if (!std.mem.eql(u8, trial_schema, "hylo-trial/v1")) {
+        return error.SourceReceiptTrialMismatch;
+    }
+    const embedded_value = sealing.get("source_selection_receipt") orelse
+        return error.SourceReceiptTrialMismatch;
+    if (embedded_value == .null) return error.SourceReceiptTrialMismatch;
+    const embedded = object(embedded_value) catch return error.SourceReceiptTrialMismatch;
+    const embedded_declared = requiredString(embedded, "receipt_fingerprint") catch
+        return error.SourceReceiptTrialMismatch;
+    if (!std.mem.eql(u8, declared, embedded_declared) or
+        !std.mem.eql(u8, declared, trial_declared))
+    {
+        return error.SourceReceiptTrialMismatch;
+    }
+    const receipt_json = try attestation.canonicalJsonAlloc(allocator, receipt_value);
+    defer allocator.free(receipt_json);
+    const embedded_json = try attestation.canonicalJsonAlloc(allocator, embedded_value);
+    defer allocator.free(embedded_json);
+    if (!std.mem.eql(u8, receipt_json, embedded_json)) return error.SourceReceiptTrialMismatch;
+}
+
+fn validateReceiptCommitmentCoverage(
+    allocator: std.mem.Allocator,
+    cases: std.json.Array,
+    sealing: std.json.ObjectMap,
+    case_key: []const u8,
+    sealing_key: []const u8,
+) !void {
+    var expected = std.StringHashMap(void).init(allocator);
+    defer expected.deinit();
+    for (cases.items) |case_value| {
+        const case = object(case_value) catch return error.SourceReceiptTrialMismatch;
+        const commitment = requiredString(case, case_key) catch
+            return error.SourceReceiptTrialMismatch;
+        validateFingerprint(commitment) catch return error.SourceReceiptTrialMismatch;
+        _ = expected.getOrPut(commitment) catch return error.OutOfMemory;
+    }
+
+    const commitments = requiredArray(sealing, sealing_key) catch
+        return error.SourceReceiptTrialMismatch;
+    var observed = std.StringHashMap(void).init(allocator);
+    defer observed.deinit();
+    for (commitments.items) |value| {
+        const commitment = switch (value) {
+            .string => |text| text,
+            else => return error.SourceReceiptTrialMismatch,
+        };
+        validateFingerprint(commitment) catch return error.SourceReceiptTrialMismatch;
+        if (expected.get(commitment) == null or (observed.getOrPut(commitment) catch
+            return error.OutOfMemory).found_existing)
+        {
+            return error.SourceReceiptTrialMismatch;
+        }
+    }
+    if (observed.count() != expected.count()) return error.SourceReceiptTrialMismatch;
 }
 
 fn findSourceCase(receipt_value: std.json.Value, unit_id: []const u8, scenario_id: []const u8) !std.json.ObjectMap {
@@ -657,6 +1006,20 @@ fn validateRunnerOutputEndpoint(fd: std.posix.fd_t) !void {
     if (!isAnonymousSensitiveEndpoint(fd, .output)) return error.MaterializationEndpointUnbound;
 }
 
+fn validateMaterializationAssurance(trial: std.json.ObjectMap) !void {
+    const trial_schema = try requiredString(trial, "schema");
+    const assurance = try requiredObject(trial, "assurance");
+    const level = try requiredString(assurance, "required_level");
+    if (std.mem.eql(u8, level, "sealed")) return;
+    if (std.mem.eql(u8, trial_schema, trial_custody.PublicTrialSchema) and
+        std.mem.eql(u8, level, "role_separated") and
+        arrayContains(try requiredArray(assurance, "required_distinct_roles"), "materializer"))
+    {
+        return;
+    }
+    return error.SealedAssuranceRequired;
+}
+
 fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
     const sealed_path = options.sealed_case orelse return error.MissingSealedCase;
     const trial_path = options.trial orelse return error.MissingTrial;
@@ -668,7 +1031,7 @@ fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
     try validateKeyInputEndpoint(seal_key_fd);
     try validateKeyInputEndpoint(signing_seed_fd);
     try validateRunnerOutputEndpoint(visible_output_fd);
-    var capability_fds: [4]std.posix.fd_t = undefined;
+    var capability_fds: [5]std.posix.fd_t = undefined;
     var capability_count: usize = 0;
     for ([_]std.posix.fd_t{ seal_key_fd, signing_seed_fd, visible_output_fd }) |fd| {
         capability_fds[capability_count] = fd;
@@ -679,11 +1042,12 @@ fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
         capability_fds[capability_count] = fd;
         capability_count += 1;
     }
+    if (options.source_selection_opening_fd) |fd| {
+        try validateSourceSelectionOpeningInputEndpoint(fd);
+        capability_fds[capability_count] = fd;
+        capability_count += 1;
+    }
     try validateDistinctSensitiveEndpoints(capability_fds[0..capability_count]);
-    var key = try readKey(seal_key_fd);
-    defer std.crypto.secureZero(u8, &key);
-    var seed = try readKey(signing_seed_fd);
-    defer std.crypto.secureZero(u8, &seed);
     const sealed_raw = try readFileAlloc(allocator, sealed_path);
     defer allocator.free(sealed_raw);
     var sealed_parsed = try std.json.parseFromSlice(std.json.Value, allocator, sealed_raw, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" });
@@ -696,8 +1060,7 @@ fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
     defer trial_parsed.deinit();
     const trial = try object(trial_parsed.value);
     if (std.mem.eql(u8, options.controller_id, options.materializer_id)) return error.SealedSamePrincipalForbidden;
-    const assurance = try requiredObject(trial, "assurance");
-    if (!std.mem.eql(u8, try requiredString(assurance, "required_level"), "sealed")) return error.SealedAssuranceRequired;
+    try validateMaterializationAssurance(trial);
     const sealing = try requiredObject(trial, "sealing");
     if (!std.mem.eql(u8, try requiredString(sealing, "case_visibility"), "case_blind")) return error.CaseBlindRequired;
     const materializer_contract_value = sealing.get("case_materializer_contract") orelse
@@ -720,7 +1083,40 @@ fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
     )) return error.CaseMaterializerInvalid;
     const lane = try findTrialLane(trial, lane_id);
     if (!std.mem.eql(u8, lane.unit_id, try requiredString(envelope, "unit_id"))) return error.MaterializationScopeInvalid;
-    const source_receipt_value = sealing.get("source_selection_receipt") orelse return error.SourceReceiptInvalid;
+    var source_selection_opening_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (source_selection_opening_parsed) |*parsed| parsed.deinit();
+    const trial_schema = try requiredString(trial, "schema");
+    if (std.mem.eql(u8, trial_schema, trial_custody.PublicTrialSchema)) {
+        if (sealing.get("source_selection_receipt") != null) {
+            return error.SourceReceiptEmbeddedForbidden;
+        }
+        const source_selection_opening_fd = options.source_selection_opening_fd orelse
+            return error.SourceSelectionOpeningFdRequired;
+        const opening_raw = try readSourceSelectionOpeningFdAlloc(
+            allocator,
+            source_selection_opening_fd,
+            MaxInputBytes,
+        );
+        defer {
+            std.crypto.secureZero(u8, opening_raw);
+            allocator.free(opening_raw);
+        }
+        source_selection_opening_parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            opening_raw,
+            .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+        ) catch return error.SourceSelectionOpeningInvalid;
+    } else if (std.mem.eql(u8, trial_schema, "hylo-trial/v1")) {
+        if (options.source_selection_opening_fd != null) {
+            return error.SourceSelectionOpeningFdForbidden;
+        }
+    } else return error.SourceReceiptTrialMismatch;
+    const source_receipt_value = try sourceReceiptForMaterialization(
+        allocator,
+        trial,
+        if (source_selection_opening_parsed) |parsed| parsed.value else null,
+    );
     try validateSourceReceiptValue(allocator, source_receipt_value, trial);
     const source_case = try findSourceCase(source_receipt_value, lane.unit_id, lane.scenario_id);
     const registered_sealed = try requiredObject(source_case, "sealed_case");
@@ -754,6 +1150,10 @@ fn cmdMaterialize(allocator: std.mem.Allocator, options: Options) !void {
     if (source_profile_output_fd) |fd| try validateRunnerOutputEndpoint(fd);
     const producer_binary = try currentExecutableFingerprintAlloc(allocator);
     defer allocator.free(producer_binary);
+    var key = try readKey(seal_key_fd);
+    defer std.crypto.secureZero(u8, &key);
+    var seed = try readKey(signing_seed_fd);
+    defer std.crypto.secureZero(u8, &seed);
     try validateMaterializerAuthority(allocator, trial, options.materializer_id, options.materializer_key_id, seed);
     const payload = try decryptCaseAlloc(allocator, envelope, key);
     defer allocator.free(payload);
@@ -882,6 +1282,23 @@ fn validateSourceProfile(allocator: std.mem.Allocator, value: std.json.Value, sp
     report.deinit(allocator);
 }
 
+fn rejectCallerSuppliedSourceAuthority(case: std.json.ObjectMap) !void {
+    if (case.get("source_route_admission") != null) {
+        return error.CallerSuppliedSourceRouteAdmissionForbidden;
+    }
+}
+
+fn validateSourceRouteProfileKind(
+    admission_value: std.json.Value,
+    source_profile: std.json.ObjectMap,
+) !void {
+    if (!std.mem.eql(
+        u8,
+        try requiredString(try object(admission_value), "source_profile_kind"),
+        try requiredString(source_profile, "kind"),
+    )) return error.SourceRouteAdmissionBindingMismatch;
+}
+
 fn prepareSourceProfileAlloc(
     allocator: std.mem.Allocator,
     value: std.json.Value,
@@ -993,6 +1410,103 @@ fn validateMaterializedTargetTextWitnessCommitment(
     }
 }
 
+fn validateProjectedSourceProfile(
+    profile: std.json.ObjectMap,
+    case_visibility: []const u8,
+    expected_fingerprint: []const u8,
+) !void {
+    const case_blind = std.mem.eql(u8, case_visibility, "case_blind");
+    const kind = try requiredString(profile, "kind");
+    if (std.mem.eql(u8, kind, "direct")) {
+        const exact = if (case_blind)
+            hasExactKeys(profile, &.{ "kind", "sealed_payload", "source_profile_fingerprint" })
+        else
+            hasExactKeys(profile, &.{ "kind", "source_profile_fingerprint" });
+        if (!exact) return error.SourceProfileProjectionInvalid;
+        if (case_blind and !try requiredBool(profile, "sealed_payload")) {
+            return error.SourceProfileProjectionInvalid;
+        }
+    } else if (std.mem.eql(u8, kind, "historical_decision")) {
+        const exact = if (case_blind)
+            hasExactKeys(profile, &.{
+                "kind",
+                "source_governance_fingerprint",
+                "decision_context_fingerprint",
+                "temporal_horizon",
+                "source_target_text_policy",
+                "retrace_mode",
+                "required_lineage",
+                "required_fir_version",
+                "reconstructability",
+                "limitations",
+                "source_profile_fingerprint",
+                "profile_body_delivery",
+                "sealed_payload",
+                "source_target_text_witness_fingerprint",
+            })
+        else
+            hasExactKeys(profile, &.{
+                "kind",
+                "source_governance_fingerprint",
+                "decision_context_fingerprint",
+                "temporal_horizon",
+                "source_target_text_policy",
+                "retrace_mode",
+                "required_lineage",
+                "required_fir_version",
+                "reconstructability",
+                "limitations",
+                "source_profile_fingerprint",
+                "profile_body_delivery",
+                "source_target_text_witness_fingerprint",
+            });
+        if (!exact) return error.SourceProfileProjectionInvalid;
+        if (case_blind and !try requiredBool(profile, "sealed_payload")) {
+            return error.SourceProfileProjectionInvalid;
+        }
+        try validateFingerprint(try requiredString(profile, "source_governance_fingerprint"));
+        try validateFingerprint(try requiredString(profile, "decision_context_fingerprint"));
+        try validateFingerprint(try requiredString(
+            profile,
+            "source_target_text_witness_fingerprint",
+        ));
+        if (!std.mem.eql(u8, try requiredString(profile, "temporal_horizon"), "pre_decision") or
+            !std.mem.eql(u8, try requiredString(profile, "retrace_mode"), "replay") or
+            !std.mem.eql(u8, try requiredString(profile, "required_fir_version"), "FIR-v1") or
+            !std.mem.eql(
+                u8,
+                try requiredString(profile, "profile_body_delivery"),
+                "source_profile_fd",
+            ) or
+            !oneOf(
+                try requiredString(profile, "source_target_text_policy"),
+                &.{ "absent", "preserve", "strip_and_replace" },
+            ) or
+            !oneOf(
+                try requiredString(profile, "required_lineage"),
+                &.{ "thread_fork", "rollout_transcript", "either" },
+            ) or
+            !oneOf(
+                try requiredString(profile, "reconstructability"),
+                &.{ "exact", "head_only", "transcript_only" },
+            ))
+        {
+            return error.SourceProfileProjectionInvalid;
+        }
+        const limitations = try requiredArray(profile, "limitations");
+        for (limitations.items) |limitation| switch (limitation) {
+            .string => |text| if (text.len == 0) return error.SourceProfileProjectionInvalid,
+            else => return error.SourceProfileProjectionInvalid,
+        };
+    } else return error.SourceProfileProjectionInvalid;
+
+    const committed = try requiredString(profile, "source_profile_fingerprint");
+    try validateFingerprint(committed);
+    if (!std.mem.eql(u8, committed, expected_fingerprint)) {
+        return error.SourceProfileFingerprintMismatch;
+    }
+}
+
 fn sourceProfileProjectionAlloc(allocator: std.mem.Allocator, info: CaseInfo) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, info.source_profile_json, .{
         .allocate = .alloc_always,
@@ -1003,35 +1517,49 @@ fn sourceProfileProjectionAlloc(allocator: std.mem.Allocator, info: CaseInfo) ![
     const profile = try object(value);
     const kind = try requiredString(profile, "kind");
     const case_blind = std.mem.eql(u8, info.visibility, "case_blind");
-    if (!case_blind and (std.mem.eql(u8, kind, "direct") or
-        !std.mem.eql(u8, try requiredString(profile, "source_target_text_policy"), "strip_and_replace")))
-    {
-        return allocator.dupe(u8, info.source_profile_json);
-    }
     if (std.mem.eql(u8, kind, "direct")) {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"kind\":\"direct\",\"source_profile_fingerprint\":{f},\"sealed_payload\":true}}",
-            .{std.json.fmt(info.source_profile_fingerprint, .{})},
-        );
+        return if (case_blind)
+            std.fmt.allocPrint(
+                allocator,
+                "{{\"kind\":\"direct\",\"source_profile_fingerprint\":{f}," ++
+                    "\"sealed_payload\":true}}",
+                .{std.json.fmt(info.source_profile_fingerprint, .{})},
+            )
+        else
+            std.fmt.allocPrint(
+                allocator,
+                "{{\"kind\":\"direct\",\"source_profile_fingerprint\":{f}}}",
+                .{std.json.fmt(info.source_profile_fingerprint, .{})},
+            );
     }
+    if (!std.mem.eql(u8, kind, "historical_decision")) return error.SourceProfileInvalid;
     const limitations_json = try attestation.canonicalJsonAlloc(
         allocator,
         profile.get("limitations") orelse return error.SourceProfileMissing,
     );
     defer allocator.free(limitations_json);
+    const target_text_witness_fingerprint = try attestation.digestBytesAlloc(
+        allocator,
+        info.target_text_witness orelse return error.TargetTextWitnessMissing,
+    );
+    defer allocator.free(target_text_witness_fingerprint);
     if (case_blind) {
         // The controller receives only content commitments.  Full SGG/DCP
         // bodies and their potentially case-identifying locators remain in the
         // encrypted payload delivered directly to the runner.
-        const target_text_witness_fingerprint = try attestation.digestBytesAlloc(
-            allocator,
-            info.target_text_witness.?,
-        );
-        defer allocator.free(target_text_witness_fingerprint);
         return std.fmt.allocPrint(
             allocator,
-            "{{\"kind\":\"historical_decision\",\"source_governance_fingerprint\":{f},\"decision_context_fingerprint\":{f},\"temporal_horizon\":{f},\"source_target_text_policy\":{f},\"retrace_mode\":{f},\"required_lineage\":{f},\"required_fir_version\":{f},\"reconstructability\":{f},\"limitations\":{s},\"source_profile_fingerprint\":{f},\"profile_body_delivery\":\"source_profile_fd\",\"sealed_payload\":true,\"source_target_text_witness_fingerprint\":{f}}}",
+            "{{\"kind\":\"historical_decision\"," ++
+                "\"source_governance_fingerprint\":{f}," ++
+                "\"decision_context_fingerprint\":{f}," ++
+                "\"temporal_horizon\":{f}," ++
+                "\"source_target_text_policy\":{f}," ++
+                "\"retrace_mode\":{f},\"required_lineage\":{f}," ++
+                "\"required_fir_version\":{f},\"reconstructability\":{f}," ++
+                "\"limitations\":{s},\"source_profile_fingerprint\":{f}," ++
+                "\"profile_body_delivery\":\"source_profile_fd\"," ++
+                "\"sealed_payload\":true," ++
+                "\"source_target_text_witness_fingerprint\":{f}}}",
             .{
                 std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
                 std.json.fmt(try requiredString(profile, "decision_context_fingerprint"), .{}),
@@ -1047,17 +1575,22 @@ fn sourceProfileProjectionAlloc(allocator: std.mem.Allocator, info: CaseInfo) ![
             },
         );
     }
-    // strip_and_replace is runner-materialized at every visibility level.  A
-    // signed, non-self-referential projection commits to the separately
-    // supplied sanitized profile body; CAS verifies the body digest before it
-    // can execute the lane.
+    // Historical profile bodies remain on their protected runner carrier at
+    // every visibility level.  The public receipt contains only the frozen
+    // route constraints and content commitments needed to bind that carrier.
     return std.fmt.allocPrint(
         allocator,
-        "{{\"kind\":\"historical_decision\",\"source_governance_ref\":{f},\"source_governance_fingerprint\":{f},\"decision_context_ref\":{f},\"decision_context_fingerprint\":{f},\"temporal_horizon\":{f},\"source_target_text_policy\":{f},\"retrace_mode\":{f},\"required_lineage\":{f},\"required_fir_version\":{f},\"reconstructability\":{f},\"limitations\":{s},\"source_profile_fingerprint\":{f},\"profile_body_delivery\":\"source_profile_fd\",\"source_target_text_witness\":{s}}}",
+        "{{\"kind\":\"historical_decision\"," ++
+            "\"source_governance_fingerprint\":{f}," ++
+            "\"decision_context_fingerprint\":{f}," ++
+            "\"temporal_horizon\":{f},\"source_target_text_policy\":{f}," ++
+            "\"retrace_mode\":{f},\"required_lineage\":{f}," ++
+            "\"required_fir_version\":{f},\"reconstructability\":{f}," ++
+            "\"limitations\":{s},\"source_profile_fingerprint\":{f}," ++
+            "\"profile_body_delivery\":\"source_profile_fd\"," ++
+            "\"source_target_text_witness_fingerprint\":{f}}}",
         .{
-            std.json.fmt(try requiredString(profile, "source_governance_ref"), .{}),
             std.json.fmt(try requiredString(profile, "source_governance_fingerprint"), .{}),
-            std.json.fmt(try requiredString(profile, "decision_context_ref"), .{}),
             std.json.fmt(try requiredString(profile, "decision_context_fingerprint"), .{}),
             std.json.fmt(try requiredString(profile, "temporal_horizon"), .{}),
             std.json.fmt(try requiredString(profile, "source_target_text_policy"), .{}),
@@ -1067,7 +1600,7 @@ fn sourceProfileProjectionAlloc(allocator: std.mem.Allocator, info: CaseInfo) ![
             std.json.fmt(try requiredString(profile, "reconstructability"), .{}),
             limitations_json,
             std.json.fmt(info.source_profile_fingerprint, .{}),
-            info.target_text_witness.?,
+            std.json.fmt(target_text_witness_fingerprint, .{}),
         },
     );
 }
@@ -1622,6 +2155,12 @@ fn validateManifestInputEndpoint(fd: std.posix.fd_t) !void {
     if (!isAnonymousSensitiveEndpoint(fd, .input)) return error.ManifestEndpointUnbound;
 }
 
+fn validateSourceSelectionOpeningInputEndpoint(fd: std.posix.fd_t) !void {
+    if (!isAnonymousSensitiveEndpoint(fd, .input)) {
+        return error.SourceSelectionOpeningEndpointUnbound;
+    }
+}
+
 fn validateKeyInputEndpoint(fd: std.posix.fd_t) !void {
     if (!isAnonymousSensitiveEndpoint(fd, .input)) return error.KeyEndpointUnbound;
 }
@@ -1722,6 +2261,23 @@ fn readKey(fd: std.posix.fd_t) ![32]u8 {
 
 fn readFdAlloc(allocator: std.mem.Allocator, fd: std.posix.fd_t, limit: usize) ![]u8 {
     try validateManifestInputEndpoint(fd);
+    return readAnonymousInputFdAlloc(allocator, fd, limit);
+}
+
+fn readSourceSelectionOpeningFdAlloc(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    limit: usize,
+) ![]u8 {
+    try validateSourceSelectionOpeningInputEndpoint(fd);
+    return readAnonymousInputFdAlloc(allocator, fd, limit);
+}
+
+fn readAnonymousInputFdAlloc(
+    allocator: std.mem.Allocator,
+    fd: std.posix.fd_t,
+    limit: usize,
+) ![]u8 {
     var raw: std.ArrayList(u8) = .empty;
     errdefer {
         std.crypto.secureZero(u8, raw.items);
@@ -1818,6 +2374,12 @@ fn objectPtr(value: *std.json.Value) !*std.json.ObjectMap {
         .object => |*value_object| value_object,
         else => error.ExpectedObject,
     };
+}
+
+fn hasExactKeys(map: std.json.ObjectMap, expected: []const []const u8) bool {
+    if (map.count() != expected.len) return false;
+    for (expected) |key| _ = map.get(key) orelse return false;
+    return true;
 }
 
 fn requiredObject(parent: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
@@ -2108,7 +2670,10 @@ test "dependency clusters cannot cross practice holdout or challenge" {
 }
 
 test "source-owner attestation binds the selection core" {
-    const core = "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"}";
+    const core =
+        "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"," ++
+        "\"cases\":[{\"source_route_admission\":{\"schema\":\"hylo-source-route-admission/v1\"," ++
+        "\"execution_route\":\"direct\"}}]}";
     const seed = [_]u8{0x51} ** 32;
     const signed = try sourceOwnerAttestationAlloc(
         std.testing.allocator,
@@ -2143,6 +2708,29 @@ test "source-owner attestation binds the selection core" {
         error.SourceOwnerAttestationInvalid,
         validateSourceOwnerAttestation(std.testing.allocator, try object(tampered_parsed.value), trial),
     );
+    const route_tampered = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        body,
+        "\"execution_route\":\"direct\"",
+        "\"execution_route\":\"diagnostic_only\"",
+    );
+    defer std.testing.allocator.free(route_tampered);
+    var route_tampered_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        route_tampered,
+        .{ .allocate = .alloc_always },
+    );
+    defer route_tampered_parsed.deinit();
+    try std.testing.expectError(
+        error.SourceOwnerAttestationInvalid,
+        validateSourceOwnerAttestation(
+            std.testing.allocator,
+            try object(route_tampered_parsed.value),
+            trial,
+        ),
+    );
 
     const untrusted_trial_json = try std.mem.replaceOwned(
         u8,
@@ -2164,6 +2752,610 @@ test "source-owner attestation binds the selection core" {
     );
 }
 
+test "caller cannot assert a source-route admission" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"source_route_admission\":{\"schema\":\"hylo-source-route-admission/v1\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.CallerSuppliedSourceRouteAdmissionForbidden,
+        rejectCallerSuppliedSourceAuthority(try object(parsed.value)),
+    );
+}
+
+test "source-route admission kind must match the validated source profile" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"admission\":{\"source_profile_kind\":\"historical_decision\"}," ++
+            "\"profile\":{\"kind\":\"direct\"}}",
+        .{},
+    );
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    try std.testing.expectError(
+        error.SourceRouteAdmissionBindingMismatch,
+        validateSourceRouteProfileKind(
+            root.get("admission").?,
+            try requiredObject(root, "profile"),
+        ),
+    );
+}
+
+test "source receipt validation requires exact trial-embedded bytes and fingerprint" {
+    const fingerprint = "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const receipt_json =
+        "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"," ++
+        "\"cases\":[],\"receipt_fingerprint\":\"" ++ fingerprint ++ "\"}";
+    const trial_json =
+        "{\"schema\":\"hylo-trial/v1\",\"sealing\":{" ++
+        "\"source_selection_receipt_fingerprint\":\"" ++ fingerprint ++ "\"," ++
+        "\"source_selection_receipt\":" ++ receipt_json ++ "}}";
+    var receipt = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        receipt_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer receipt.deinit();
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{
+        .allocate = .alloc_always,
+    });
+    defer trial.deinit();
+    try validateSourceReceiptTrialBinding(
+        std.testing.allocator,
+        receipt.value,
+        try object(trial.value),
+    );
+
+    const changed_trial_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        "\"cases\":[]",
+        "\"cases\":[{\"unit_id\":\"changed\"}]",
+    );
+    defer std.testing.allocator.free(changed_trial_json);
+    var changed_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        changed_trial_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer changed_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        validateSourceReceiptTrialBinding(
+            std.testing.allocator,
+            receipt.value,
+            try object(changed_trial.value),
+        ),
+    );
+
+    const changed_fingerprint_trial_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        "source_selection_receipt_fingerprint\":\"sha256:1515",
+        "source_selection_receipt_fingerprint\":\"sha256:2525",
+    );
+    defer std.testing.allocator.free(changed_fingerprint_trial_json);
+    var changed_fingerprint_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        changed_fingerprint_trial_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer changed_fingerprint_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        validateSourceReceiptTrialBinding(
+            std.testing.allocator,
+            receipt.value,
+            try object(changed_fingerprint_trial.value),
+        ),
+    );
+
+    const unknown_schema_trial_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        "hylo-trial/v1",
+        "hylo-trial/v3",
+    );
+    defer std.testing.allocator.free(unknown_schema_trial_json);
+    var unknown_schema_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        unknown_schema_trial_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer unknown_schema_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        validateSourceReceiptTrialBinding(
+            std.testing.allocator,
+            receipt.value,
+            try object(unknown_schema_trial.value),
+        ),
+    );
+}
+
+test "source receipt validation rejects source episode fingerprint drift" {
+    const receipt_fingerprint =
+        "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const source_episode_fingerprint =
+        "sha256:1818181818181818181818181818181818181818181818181818181818181818";
+    const changed_source_episode_fingerprint =
+        "sha256:2828282828282828282828282828282828282828282828282828282828282828";
+    const receipt_json =
+        "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"," ++
+        "\"cases\":[{\"source_episode_fingerprint\":\"" ++ source_episode_fingerprint ++ "\"}]," ++
+        "\"receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\"}";
+    const trial_json =
+        "{\"schema\":\"hylo-trial/v1\",\"sealing\":{" ++
+        "\"source_selection_receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\"," ++
+        "\"source_selection_receipt\":" ++ receipt_json ++ "}}";
+
+    var receipt = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        receipt_json,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer receipt.deinit();
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial.deinit();
+    try validateSourceReceiptTrialBinding(
+        std.testing.allocator,
+        receipt.value,
+        try object(trial.value),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(
+        u8,
+        trial_json,
+        source_episode_fingerprint,
+    ));
+    const changed_trial_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        source_episode_fingerprint,
+        changed_source_episode_fingerprint,
+    );
+    defer std.testing.allocator.free(changed_trial_json);
+    var changed_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        changed_trial_json,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer changed_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        validateSourceReceiptTrialBinding(
+            std.testing.allocator,
+            receipt.value,
+            try object(changed_trial.value),
+        ),
+    );
+}
+
+test "v2 public trial source binding joins units and commitment coverage" {
+    const receipt_fingerprint =
+        "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const visible_fingerprint =
+        "sha256:1616161616161616161616161616161616161616161616161616161616161616";
+    const hidden_fingerprint =
+        "sha256:1717171717171717171717171717171717171717171717171717171717171717";
+    const source_episode_fingerprint =
+        "sha256:1818181818181818181818181818181818181818181818181818181818181818";
+    const source_profile_fingerprint =
+        "sha256:1919191919191919191919191919191919191919191919191919191919191919";
+    const receipt_json =
+        "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"," ++
+        "\"cases\":[{\"unit_id\":\"unit-one\",\"scenario_id\":\"scenario-one\"," ++
+        "\"split\":\"practice\",\"independence_cluster_id\":\"cluster-one\"," ++
+        "\"case_visibility\":\"case_blind\"," ++
+        "\"visible_input_fingerprint\":\"" ++ visible_fingerprint ++
+        "\",\"hidden_reference_fingerprint\":\"" ++ hidden_fingerprint ++
+        "\",\"source_episode_fingerprint\":\"" ++ source_episode_fingerprint ++
+        "\",\"source_profile_fingerprint\":\"" ++ source_profile_fingerprint ++
+        "\",\"source_profile\":{\"kind\":\"direct\",\"sealed_payload\":true," ++
+        "\"source_profile_fingerprint\":\"" ++ source_profile_fingerprint ++ "\"}}]," ++
+        "\"receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\"}";
+    const trial_json =
+        "{\"schema\":\"hylo-trial/v2\",\"sealing\":{\"case_visibility\":\"case_blind\"," ++
+        "\"visible_input_commitments\":[\"" ++ visible_fingerprint ++ "\"]," ++
+        "\"hidden_reference_commitments\":[\"" ++ hidden_fingerprint ++ "\"]," ++
+        "\"source_selection_receipt_ref\":\"artifact:source-selection\"," ++
+        "\"source_selection_receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\"," ++
+        "\"source_selection_receipt_commitment\":\"" ++
+        "sha256:2020202020202020202020202020202020202020202020202020202020202020\"}," ++
+        "\"units\":[{\"unit_id\":\"unit-one\",\"scenario_id\":\"scenario-one\"," ++
+        "\"split\":\"practice\",\"independence_cluster_id\":\"cluster-one\"," ++
+        "\"source_profile\":{\"kind\":\"direct\",\"sealed_payload\":true," ++
+        "\"source_profile_fingerprint\":\"" ++ source_profile_fingerprint ++ "\"}}]}";
+
+    var receipt = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        receipt_json,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer receipt.deinit();
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial.deinit();
+    try validateSourceReceiptTrialBinding(
+        std.testing.allocator,
+        receipt.value,
+        try object(trial.value),
+    );
+
+    const changed_visible_fingerprint =
+        "sha256:2121212121212121212121212121212121212121212121212121212121212121";
+    const changed_hidden_fingerprint =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const changed_profile_fingerprint =
+        "sha256:2323232323232323232323232323232323232323232323232323232323232323";
+    const mutations = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "\"unit_id\":\"unit-one\"", .to = "\"unit_id\":\"unit-two\"" },
+        .{ .from = "\"scenario_id\":\"scenario-one\"", .to = "\"scenario_id\":\"scenario-two\"" },
+        .{ .from = "\"split\":\"practice\"", .to = "\"split\":\"holdout\"" },
+        .{
+            .from = "\"independence_cluster_id\":\"cluster-one\"",
+            .to = "\"independence_cluster_id\":\"cluster-two\"",
+        },
+        .{ .from = visible_fingerprint, .to = changed_visible_fingerprint },
+        .{ .from = hidden_fingerprint, .to = changed_hidden_fingerprint },
+        .{ .from = source_profile_fingerprint, .to = changed_profile_fingerprint },
+        .{ .from = "\"case_visibility\":\"case_blind\"", .to = "\"case_visibility\":\"open\"" },
+    };
+    for (mutations) |mutation| {
+        const changed = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            trial_json,
+            mutation.from,
+            mutation.to,
+        );
+        defer std.testing.allocator.free(changed);
+        var changed_trial = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            changed,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        );
+        defer changed_trial.deinit();
+        try std.testing.expectError(
+            error.SourceReceiptTrialMismatch,
+            validateSourceReceiptTrialBinding(
+                std.testing.allocator,
+                receipt.value,
+                try object(changed_trial.value),
+            ),
+        );
+    }
+}
+
+test "v2 public trial source-only evidence remains bound by the receipt fingerprint" {
+    const original_fingerprint =
+        "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const changed_fingerprint =
+        "sha256:2525252525252525252525252525252525252525252525252525252525252525";
+    const receipt_json =
+        "{\"receipt_fingerprint\":\"" ++ changed_fingerprint ++ "\",\"cases\":[]}";
+    const trial_json =
+        "{\"schema\":\"hylo-trial/v2\",\"sealing\":{\"case_visibility\":\"open\"," ++
+        "\"visible_input_commitments\":[],\"hidden_reference_commitments\":[]," ++
+        "\"source_selection_receipt_ref\":\"artifact:source-selection\"," ++
+        "\"source_selection_receipt_fingerprint\":\"" ++ original_fingerprint ++ "\"," ++
+        "\"source_selection_receipt_commitment\":\"" ++
+        "sha256:2020202020202020202020202020202020202020202020202020202020202020\"}," ++
+        "\"units\":[]}";
+    var receipt = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        receipt_json,
+        .{},
+    );
+    defer receipt.deinit();
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{});
+    defer trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        validateSourceReceiptTrialBinding(
+            std.testing.allocator,
+            receipt.value,
+            try object(trial.value),
+        ),
+    );
+}
+
+test "v2 materialization requires an exact private source-selection opening" {
+    const receipt_fingerprint =
+        "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const visible_fingerprint =
+        "sha256:1616161616161616161616161616161616161616161616161616161616161616";
+    const hidden_fingerprint =
+        "sha256:1717171717171717171717171717171717171717171717171717171717171717";
+    const source_profile_fingerprint =
+        "sha256:1919191919191919191919191919191919191919191919191919191919191919";
+    const receipt_json =
+        "{\"schema\":\"hylo-source-selection-receipt/v1\",\"campaign_id\":\"campaign-one\"," ++
+        "\"cases\":[{\"unit_id\":\"unit-one\",\"scenario_id\":\"scenario-one\"," ++
+        "\"split\":\"practice\",\"independence_cluster_id\":\"cluster-one\"," ++
+        "\"case_visibility\":\"case_blind\"," ++
+        "\"visible_input_fingerprint\":\"" ++ visible_fingerprint ++
+        "\",\"hidden_reference_fingerprint\":\"" ++ hidden_fingerprint ++
+        "\",\"source_profile\":{\"kind\":\"direct\",\"sealed_payload\":true," ++
+        "\"source_profile_fingerprint\":\"" ++ source_profile_fingerprint ++ "\"}}]," ++
+        "\"receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\"}";
+    const opening_json =
+        "{\"nonce\":\"" ++
+        "0000000000000000000000000000000000000000000000000000000000000000\"," ++
+        "\"receipt\":" ++
+        receipt_json ++ ",\"schema\":\"hylo-source-selection-opening/v1\"}";
+    var opening = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        opening_json,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer opening.deinit();
+    const opening_commitment = try trial_custody.digestValueAlloc(
+        std.testing.allocator,
+        opening.value,
+    );
+    defer std.testing.allocator.free(opening_commitment);
+    const trial_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"hylo-trial/v2\",\"sealing\":{{\"case_visibility\":\"case_blind\"," ++
+            "\"visible_input_commitments\":[\"{s}\"],\"hidden_reference_commitments\":[\"{s}\"]," ++
+            "\"source_selection_receipt_ref\":\"artifact:source-selection\"," ++
+            "\"source_selection_receipt_fingerprint\":\"{s}\"," ++
+            "\"source_selection_receipt_commitment\":\"{s}\"}}," ++
+            "\"units\":[{{\"unit_id\":\"unit-one\",\"scenario_id\":\"scenario-one\"," ++
+            "\"split\":\"practice\",\"independence_cluster_id\":\"cluster-one\"," ++
+            "\"source_profile\":{{\"kind\":\"direct\",\"sealed_payload\":true," ++
+            "\"source_profile_fingerprint\":\"{s}\"}}}}]}}",
+        .{
+            visible_fingerprint,
+            hidden_fingerprint,
+            receipt_fingerprint,
+            opening_commitment,
+            source_profile_fingerprint,
+        },
+    );
+    defer std.testing.allocator.free(trial_json);
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial.deinit();
+    const trial_object = try object(trial.value);
+    const receipt = try sourceReceiptForMaterialization(
+        std.testing.allocator,
+        trial_object,
+        opening.value,
+    );
+    try std.testing.expectEqualStrings(
+        receipt_fingerprint,
+        try requiredString(try object(receipt), "receipt_fingerprint"),
+    );
+    try std.testing.expectError(
+        error.SourceSelectionOpeningFdRequired,
+        sourceReceiptForMaterialization(std.testing.allocator, trial_object, null),
+    );
+
+    const commitment_mismatch = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        opening_commitment,
+        "sha256:2020202020202020202020202020202020202020202020202020202020202020",
+    );
+    defer std.testing.allocator.free(commitment_mismatch);
+    var commitment_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        commitment_mismatch,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer commitment_trial.deinit();
+    try std.testing.expectError(
+        error.SourceSelectionOpeningCommitmentMismatch,
+        sourceReceiptForMaterialization(
+            std.testing.allocator,
+            try object(commitment_trial.value),
+            opening.value,
+        ),
+    );
+
+    const fingerprint_mismatch = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        receipt_fingerprint,
+        "sha256:2525252525252525252525252525252525252525252525252525252525252525",
+    );
+    defer std.testing.allocator.free(fingerprint_mismatch);
+    var fingerprint_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        fingerprint_mismatch,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer fingerprint_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        sourceReceiptForMaterialization(
+            std.testing.allocator,
+            try object(fingerprint_trial.value),
+            opening.value,
+        ),
+    );
+
+    const case_mismatch = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        trial_json,
+        "\"scenario_id\":\"scenario-one\"",
+        "\"scenario_id\":\"scenario-two\"",
+    );
+    defer std.testing.allocator.free(case_mismatch);
+    var case_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        case_mismatch,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer case_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptTrialMismatch,
+        sourceReceiptForMaterialization(
+            std.testing.allocator,
+            try object(case_trial.value),
+            opening.value,
+        ),
+    );
+}
+
+test "v2 materialization rejects embedded receipt and opening smuggling" {
+    const receipt_fingerprint =
+        "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const receipt_json =
+        "{\"receipt_fingerprint\":\"" ++ receipt_fingerprint ++ "\",\"cases\":[]}";
+    const opening_json =
+        "{\"nonce\":\"" ++
+        "0000000000000000000000000000000000000000000000000000000000000000\"," ++
+        "\"receipt\":" ++
+        receipt_json ++ ",\"schema\":\"hylo-source-selection-opening/v1\"}";
+    var opening = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        opening_json,
+        .{},
+    );
+    defer opening.deinit();
+    const commitment = try trial_custody.digestValueAlloc(std.testing.allocator, opening.value);
+    defer std.testing.allocator.free(commitment);
+    const embedded_trial_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"hylo-trial/v2\",\"sealing\":{{\"source_selection_receipt\":{s}," ++
+            "\"source_selection_receipt_commitment\":\"{s}\"," ++
+            "\"source_selection_receipt_fingerprint\":\"{s}\"}}}}",
+        .{ receipt_json, commitment, receipt_fingerprint },
+    );
+    defer std.testing.allocator.free(embedded_trial_json);
+    var embedded_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        embedded_trial_json,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer embedded_trial.deinit();
+    try std.testing.expectError(
+        error.SourceReceiptEmbeddedForbidden,
+        sourceReceiptForMaterialization(
+            std.testing.allocator,
+            try object(embedded_trial.value),
+            opening.value,
+        ),
+    );
+
+    const smuggled_opening_json =
+        "{\"nonce\":\"" ++
+        "0000000000000000000000000000000000000000000000000000000000000000\"," ++
+        "\"receipt\":" ++
+        receipt_json ++ ",\"schema\":\"hylo-source-selection-opening/v1\"," ++
+        "\"source_selection_receipt\":{\"smuggled\":true}}";
+    var smuggled = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        smuggled_opening_json,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer smuggled.deinit();
+    const public_trial_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"hylo-trial/v2\",\"sealing\":{{" ++
+            "\"source_selection_receipt_commitment\":\"{s}\"," ++
+            "\"source_selection_receipt_fingerprint\":\"{s}\"}}}}",
+        .{ commitment, receipt_fingerprint },
+    );
+    defer std.testing.allocator.free(public_trial_json);
+    var public_trial = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        public_trial_json,
+        .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error" },
+    );
+    defer public_trial.deinit();
+    try std.testing.expectError(
+        error.SourceSelectionOpeningInvalid,
+        sourceReceiptForMaterialization(
+            std.testing.allocator,
+            try object(public_trial.value),
+            smuggled.value,
+        ),
+    );
+}
+
+test "v1 materialization preserves embedded receipt and forbids the v2 opening carrier" {
+    const fingerprint = "sha256:1515151515151515151515151515151515151515151515151515151515151515";
+    const receipt_json =
+        "{\"receipt_fingerprint\":\"" ++ fingerprint ++ "\",\"cases\":[]}";
+    const trial_json =
+        "{\"schema\":\"hylo-trial/v1\",\"sealing\":{" ++
+        "\"source_selection_receipt_fingerprint\":\"" ++ fingerprint ++ "\"," ++
+        "\"source_selection_receipt\":" ++ receipt_json ++ "}}";
+    var trial = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, trial_json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer trial.deinit();
+    const trial_object = try object(trial.value);
+    _ = try sourceReceiptForMaterialization(std.testing.allocator, trial_object, null);
+    var opening = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"nonce\":\"0000000000000000000000000000000000000000000000000000000000000000\"," ++
+            "\"receipt\":{},\"schema\":\"hylo-source-selection-opening/v1\"}",
+        .{},
+    );
+    defer opening.deinit();
+    try std.testing.expectError(
+        error.SourceSelectionOpeningFdForbidden,
+        sourceReceiptForMaterialization(std.testing.allocator, trial_object, opening.value),
+    );
+}
+
 test "case-blind historical projection omits embedded decision evidence" {
     const profile_raw =
         "{\"kind\":\"historical_decision\",\"source_governance_ref\":\"artifact:sgg\"," ++
@@ -2172,7 +3364,10 @@ test "case-blind historical projection omits embedded decision evidence" {
         "\"decision_context_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"," ++
         "\"decision_context\":{\"secret-question\":\"controller-must-not-see\"},\"temporal_horizon\":\"pre_decision\"," ++
         "\"source_target_text_policy\":\"absent\",\"retrace_mode\":\"replay\",\"required_lineage\":\"either\"," ++
-        "\"required_fir_version\":\"FIR-v1\",\"reconstructability\":\"transcript_only\",\"limitations\":[]}";
+        "\"required_fir_version\":\"FIR-v1\"," ++
+        "\"reconstructability\":\"transcript_only\",\"limitations\":[]," ++
+        "\"historical_answer\":\"private-answer\",\"grade_opening\":\"private-opening\"," ++
+        "\"source_target_text\":\"private-target-text\"}";
     const raw = "{\"source_profile\":" ++ profile_raw ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -2202,10 +3397,15 @@ test "case-blind historical projection omits embedded decision evidence" {
     try std.testing.expect(std.mem.indexOf(u8, projected, "session:private") == null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "episode-private") == null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "source_turn_digest") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-opening") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-target-text") == null);
 }
 
 test "case-blind direct projection needs no private profile body delivery" {
-    const profile_raw = "{\"kind\":\"direct\"}";
+    const profile_raw =
+        "{\"kind\":\"direct\",\"historical_answer\":\"private-answer\"," ++
+        "\"grade_opening\":\"private-opening\",\"source_target_text\":\"private-target-text\"}";
     const raw = "{\"source_profile\":" ++ profile_raw ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{
         .allocate = .alloc_always,
@@ -2232,6 +3432,48 @@ test "case-blind direct projection needs no private profile body delivery" {
     try std.testing.expect(std.mem.indexOf(u8, projected, "\"source_profile_fingerprint\":\"sha256:cccc") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "\"sealed_payload\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, projected, "profile_body_delivery") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-opening") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projected, "private-target-text") == null);
+}
+
+test "open and result-blind direct projections strip arbitrary fields" {
+    const profile_raw =
+        "{\"kind\":\"direct\",\"historical_answer\":\"private-answer\"," ++
+        "\"grade_opening\":\"private-opening\",\"source_target_text\":\"private-target-text\"}";
+    const raw = "{\"source_profile\":" ++ profile_raw ++ "}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    inline for (.{ "open", "result_blind" }) |visibility| {
+        const projected = try sourceProfileProjectionAlloc(std.testing.allocator, .{
+            .object = try object(parsed.value),
+            .unit_id = "unit-one",
+            .scenario_id = "scenario-one",
+            .split = "practice",
+            .visibility = visibility,
+            .visible_fingerprint = undefined,
+            .hidden_fingerprint = undefined,
+            .source_episode_fingerprint = @constCast(
+                "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+            ),
+            .source_profile_fingerprint = @constCast(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+            .target_text_witness = null,
+            .source_profile_json = @constCast(profile_raw),
+            .normalized_request = undefined,
+            .dependency_keys = &.{},
+            .cluster_root = 0,
+        });
+        defer std.testing.allocator.free(projected);
+        try std.testing.expectEqualStrings(
+            "{\"kind\":\"direct\",\"source_profile_fingerprint\":\"" ++
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}",
+            projected,
+        );
+    }
 }
 
 test "sealed materialization validates the full target-text witness against its opaque commitment" {
@@ -2265,15 +3507,19 @@ test "sealed materialization validates the full target-text witness against its 
     );
 }
 
-test "open and result-blind strip profiles publish a non-self-referential body commitment" {
+test "open and result-blind historical profiles publish only nonsemantic commitments" {
     const profile_raw =
         "{\"kind\":\"historical_decision\",\"source_governance_ref\":\"artifact:sgg\"," ++
         "\"source_governance_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
         "\"source_governance\":{\"secret-question\":\"runner-only\"},\"decision_context_ref\":\"artifact:dcp\"," ++
         "\"decision_context_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"," ++
         "\"decision_context\":{\"secret-question\":\"runner-only\"},\"temporal_horizon\":\"pre_decision\"," ++
-        "\"source_target_text_policy\":\"strip_and_replace\",\"retrace_mode\":\"replay\",\"required_lineage\":\"either\"," ++
-        "\"required_fir_version\":\"FIR-v1\",\"reconstructability\":\"transcript_only\",\"limitations\":[]}";
+        "\"source_target_text_policy\":\"absent\"," ++
+        "\"retrace_mode\":\"replay\",\"required_lineage\":\"either\"," ++
+        "\"required_fir_version\":\"FIR-v1\"," ++
+        "\"reconstructability\":\"transcript_only\",\"limitations\":[]," ++
+        "\"historical_answer\":\"private-answer\",\"grade_opening\":\"private-opening\"," ++
+        "\"source_target_text\":\"private-target-text\"}";
     const raw = "{\"source_profile\":" ++ profile_raw ++ "}";
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{ .allocate = .alloc_always });
     defer parsed.deinit();
@@ -2299,6 +3545,65 @@ test "open and result-blind strip profiles publish a non-self-referential body c
         try std.testing.expect(std.mem.indexOf(u8, projected, "\"source_profile_fingerprint\":\"sha256:cccc") != null);
         try std.testing.expect(std.mem.indexOf(u8, projected, "runner-only") == null);
         try std.testing.expect(std.mem.indexOf(u8, projected, "\"decision_context\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, projected, "source_governance_ref") == null);
+        try std.testing.expect(std.mem.indexOf(u8, projected, "decision_context_ref") == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            projected,
+            "\"source_target_text_witness\":",
+        ) == null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            projected,
+            "source_target_text_witness_fingerprint",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, projected, "private-answer") == null);
+        try std.testing.expect(std.mem.indexOf(u8, projected, "private-opening") == null);
+        try std.testing.expect(std.mem.indexOf(u8, projected, "private-target-text") == null);
+    }
+}
+
+test "public source profile validation rejects arbitrary extras at every visibility" {
+    const fingerprint = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    inline for (.{ "open", "result_blind", "case_blind" }) |visibility| {
+        const sealed = if (std.mem.eql(u8, visibility, "case_blind"))
+            ",\"sealed_payload\":true"
+        else
+            "";
+        const valid_json = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"kind\":\"direct\",\"source_profile_fingerprint\":\"{s}\"{s}}}",
+            .{ fingerprint, sealed },
+        );
+        defer std.testing.allocator.free(valid_json);
+        var valid = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            valid_json,
+            .{},
+        );
+        defer valid.deinit();
+        try validateProjectedSourceProfile(try object(valid.value), visibility, fingerprint);
+
+        const leaked_json = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            valid_json,
+            "}",
+            ",\"historical_answer\":\"private-answer\"}",
+        );
+        defer std.testing.allocator.free(leaked_json);
+        var leaked = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            leaked_json,
+            .{},
+        );
+        defer leaked.deinit();
+        try std.testing.expectError(
+            error.SourceProfileProjectionInvalid,
+            validateProjectedSourceProfile(try object(leaked.value), visibility, fingerprint),
+        );
     }
 }
 
@@ -2363,6 +3668,20 @@ test "source case lookup binds unit and scenario together" {
     );
 }
 
+test "materialize parses the protected source-selection opening descriptor" {
+    const options = try parseArgs(&.{
+        "materialize",
+        "--source-selection-opening-fd",
+        "7",
+    });
+    try std.testing.expectEqual(Action.materialize, options.action);
+    try std.testing.expectEqual(@as(std.posix.fd_t, 7), options.source_selection_opening_fd.?);
+    try std.testing.expectError(
+        error.InvalidFd,
+        parseArgs(&.{ "materialize", "--source-selection-opening-fd", "2" }),
+    );
+}
+
 test "binary keys preserve leading and trailing whitespace bytes" {
     var fds: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
@@ -2404,6 +3723,30 @@ test "manifest descriptor reads are bounded through EOF" {
     try std.testing.expectError(error.FdInputTooLarge, readFdAlloc(std.testing.allocator, fds[0], 2));
 }
 
+test "source-selection opening descriptor is read only from its protected pipe" {
+    var fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    defer _ = std.c.close(fds[0]);
+    const opening =
+        "{\"nonce\":\"0000000000000000000000000000000000000000000000000000000000000000\"," ++
+        "\"receipt\":{},\"schema\":\"hylo-source-selection-opening/v1\"}";
+    try std.testing.expectEqual(
+        @as(isize, opening.len),
+        std.c.write(fds[1], opening.ptr, opening.len),
+    );
+    _ = std.c.close(fds[1]);
+    const observed = try readSourceSelectionOpeningFdAlloc(
+        std.testing.allocator,
+        fds[0],
+        opening.len,
+    );
+    defer {
+        std.crypto.secureZero(u8, observed);
+        std.testing.allocator.free(observed);
+    }
+    try std.testing.expectEqualStrings(opening, observed);
+}
+
 test "sensitive endpoints require anonymous directional distinct pipes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2414,6 +3757,10 @@ test "sensitive endpoints require anonymous directional distinct pipes" {
         validateRunnerOutputEndpoint(file.handle),
     );
     try std.testing.expectError(error.ManifestEndpointUnbound, validateManifestInputEndpoint(file.handle));
+    try std.testing.expectError(
+        error.SourceSelectionOpeningEndpointUnbound,
+        validateSourceSelectionOpeningInputEndpoint(file.handle),
+    );
     try std.testing.expectError(error.KeyEndpointUnbound, validateKeyInputEndpoint(file.handle));
 
     var first: [2]std.c.fd_t = undefined;
@@ -2421,6 +3768,7 @@ test "sensitive endpoints require anonymous directional distinct pipes" {
     defer _ = std.c.close(first[0]);
     defer _ = std.c.close(first[1]);
     try validateManifestInputEndpoint(first[0]);
+    try validateSourceSelectionOpeningInputEndpoint(first[0]);
     try validateKeyInputEndpoint(first[0]);
     try validatePrivateKeyCapability(first[1]);
     try validateRunnerOutputEndpoint(first[1]);
@@ -2545,4 +3893,58 @@ test "sealed materializer requires distinct registered role keys" {
             "shared-key",
         ),
     );
+}
+
+test "v2 role-separated materialization requires the registered materializer role" {
+    const accepted_v2 =
+        "{\"schema\":\"hylo-trial/v2\",\"assurance\":{" ++
+        "\"required_level\":\"role_separated\"," ++
+        "\"required_distinct_roles\":[\"runner\",\"materializer\"]}}";
+    var accepted = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        accepted_v2,
+        .{},
+    );
+    defer accepted.deinit();
+    try validateMaterializationAssurance(try object(accepted.value));
+
+    const missing_materializer =
+        "{\"schema\":\"hylo-trial/v2\",\"assurance\":{" ++
+        "\"required_level\":\"role_separated\"," ++
+        "\"required_distinct_roles\":[\"runner\",\"absolute_grader\"]}}";
+    var missing = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        missing_materializer,
+        .{},
+    );
+    defer missing.deinit();
+    try std.testing.expectError(
+        error.SealedAssuranceRequired,
+        validateMaterializationAssurance(try object(missing.value)),
+    );
+
+    const legacy_role_separated =
+        "{\"schema\":\"hylo-trial/v1\",\"assurance\":{" ++
+        "\"required_level\":\"role_separated\"," ++
+        "\"required_distinct_roles\":[\"runner\",\"materializer\"]}}";
+    var legacy = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        legacy_role_separated,
+        .{},
+    );
+    defer legacy.deinit();
+    try std.testing.expectError(
+        error.SealedAssuranceRequired,
+        validateMaterializationAssurance(try object(legacy.value)),
+    );
+
+    const sealed_v2 =
+        "{\"schema\":\"hylo-trial/v2\",\"assurance\":{" ++
+        "\"required_level\":\"sealed\",\"required_distinct_roles\":[\"runner\",\"materializer\"]}}";
+    var sealed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sealed_v2, .{});
+    defer sealed.deinit();
+    try validateMaterializationAssurance(try object(sealed.value));
 }

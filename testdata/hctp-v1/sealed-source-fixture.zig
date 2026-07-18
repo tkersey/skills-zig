@@ -83,6 +83,131 @@ fn parseFd(raw: []const u8) !std.posix.fd_t {
     return value;
 }
 
+fn historicalSourceProfileAlloc(
+    allocator: std.mem.Allocator,
+    source_episode_id: []const u8,
+) ![]u8 {
+    const dcp_template = try std.fmt.allocPrint(
+        allocator,
+        "{{\"decision_context_packet\":{{\"packet_version\":\"DCP-v2\"," ++
+            "\"packet_id\":\"DCP-placeholder\",\"source\":{{" ++
+            "\"session_id\":\"session-sealed-fixture\"," ++
+            "\"decision_id\":\"decision-sealed-fixture\"," ++
+            "\"source_episode_id\":{f}}},\"artifact_state\":{{" ++
+            "\"reconstructability\":\"transcript_only\"}},\"episode\":{{" ++
+            "\"question\":\"Which bounded route should be selected?\"," ++
+            "\"selected_route\":\"route-private-source\",\"rejected_routes\":[]," ++
+            "\"explicit_rationale\":[],\"explicit_assumptions\":[]," ++
+            "\"evidence_refs\":[],\"tools_and_artifacts\":[]," ++
+            "\"skills_and_instructions\":[],\"outcome_refs\":[]}},\"turns\":{{" ++
+            "\"total_turns\":3,\"decision_turn_index\":2," ++
+            "\"decision_turn_id\":\"turn-two\",\"first_outcome_turn_index\":3," ++
+            "\"source_turn_digest\":" ++
+            "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}," ++
+            "\"anchors\":{{\"pre_decision\":{{\"available\":true," ++
+            "\"keep_through_turn_index\":1,\"drop_last_n_turns\":2," ++
+            "\"anchor_digest\":" ++
+            "\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}," ++
+            "\"post_decision_pre_outcome\":{{\"available\":true," ++
+            "\"keep_through_turn_index\":2,\"drop_last_n_turns\":1," ++
+            "\"anchor_digest\":" ++
+            "\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}," ++
+            "\"outcome_aware\":{{\"available\":true," ++
+            "\"keep_through_turn_index\":3,\"drop_last_n_turns\":0," ++
+            "\"anchor_digest\":" ++
+            "\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}}}}," ++
+            "\"contamination\":{{\"injected_skill_blocks\":false," ++
+            "\"generated_reports\":false,\"current_audit_prompt\":false," ++
+            "\"quoted_material\":false}},\"limitations\":[]}}}}",
+        .{std.json.fmt(source_episode_id, .{})},
+    );
+    defer allocator.free(dcp_template);
+    const packet_id = try retrace_core.dcp_schema.packetIdForTextExcludingPacketId(
+        allocator,
+        dcp_template,
+    );
+    defer allocator.free(packet_id);
+    const dcp = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        dcp_template,
+        "DCP-placeholder",
+        packet_id,
+    );
+    defer allocator.free(dcp);
+    var dcp_parsed = try std.json.parseFromSlice(std.json.Value, allocator, dcp, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer dcp_parsed.deinit();
+    const dcp_fingerprint = try attestation.digestValueAlloc(allocator, dcp_parsed.value);
+    defer allocator.free(dcp_fingerprint);
+    const packet = try requiredObject(try jsonObject(dcp_parsed.value), "decision_context_packet");
+    const contamination = try requiredObject(packet, "contamination");
+    const contamination_json = try retrace_core.dcp_schema.canonicalJsonAlloc(
+        allocator,
+        .{ .object = contamination },
+        false,
+    );
+    defer allocator.free(contamination_json);
+    const contamination_fingerprint = try attestation.digestBytesAlloc(
+        allocator,
+        contamination_json,
+    );
+    defer allocator.free(contamination_fingerprint);
+    const governance = try std.fmt.allocPrint(
+        allocator,
+        "{{\"source_governance_gate\":{{\"gate_version\":\"SGG-v1\"," ++
+            "\"source_ref\":{f},\"source_episode_id\":{f}," ++
+            "\"evidence_fingerprint\":" ++
+            "\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"," ++
+            "\"verdict\":{{\"state\":\"authoritative\",\"replay_allowed\":true," ++
+            "\"allowed_modes\":[\"replay\"]}},\"limitations\":[]}}}}",
+        .{ std.json.fmt(source_episode_id, .{}), std.json.fmt(source_episode_id, .{}) },
+    );
+    defer allocator.free(governance);
+    var governance_parsed = try std.json.parseFromSlice(std.json.Value, allocator, governance, .{});
+    defer governance_parsed.deinit();
+    const governance_fingerprint = try attestation.digestValueAlloc(
+        allocator,
+        governance_parsed.value,
+    );
+    defer allocator.free(governance_fingerprint);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"kind\":\"historical_decision\"," ++
+            "\"source_governance_ref\":\"artifact:sealed-sgg\"," ++
+            "\"source_governance_fingerprint\":{f},\"source_governance\":{s}," ++
+            "\"decision_context_ref\":\"artifact:sealed-dcp\"," ++
+            "\"decision_context_fingerprint\":{f},\"decision_context\":{s}," ++
+            "\"temporal_horizon\":\"pre_decision\"," ++
+            "\"source_target_text_policy\":\"absent\"," ++
+            "\"source_target_text_witness\":{{" ++
+            "\"schema\":\"hylo-source-target-text-witness/v1\"," ++
+            "\"source_ref\":{f},\"source_episode_id\":{f}," ++
+            "\"source_turn_digest\":" ++
+            "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"," ++
+            "\"dcp_contamination_fingerprint\":{f}," ++
+            "\"evidence_ref\":\"seq:sealed-target-text-derivation\"," ++
+            "\"contamination\":{{\"source_target_text_present\":false," ++
+            "\"within_pre_decision_anchor\":false}},\"sanitization\":{{" ++
+            "\"applied\":false,\"sanitized_context_fingerprint\":null," ++
+            "\"target_instruction_count\":1}}}},\"retrace_mode\":\"replay\"," ++
+            "\"required_lineage\":\"either\",\"required_fir_version\":\"FIR-v1\"," ++
+            "\"reconstructability\":\"transcript_only\"," ++
+            "\"limitations\":[\"case-blind historical fixture\"]}}",
+        .{
+            std.json.fmt(governance_fingerprint, .{}),
+            governance,
+            std.json.fmt(dcp_fingerprint, .{}),
+            dcp,
+            std.json.fmt(source_episode_id, .{}),
+            std.json.fmt(source_episode_id, .{}),
+            std.json.fmt(contamination_fingerprint, .{}),
+        },
+    );
+}
+
 fn sourceManifestAlloc(allocator: std.mem.Allocator, secrets: *const CaseSecrets) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -92,15 +217,35 @@ fn sourceManifestAlloc(allocator: std.mem.Allocator, secrets: *const CaseSecrets
         const visible_hex = std.fmt.bytesToHex(visible, .lower);
         const hidden_hex = std.fmt.bytesToHex(secrets.hidden[index], .lower);
         if (index < 5) {
-            try out.writer.print("{{\"unit_id\":\"unit-holdout-{d}\",\"scenario_id\":\"scenario-holdout-{d}\",\"split\":\"holdout\",\"source_episode_id\":\"episode-independent-{d}\",\"visible_input\":{{\"request\":\"sealed-case-{s}\",\"case_number\":{d}}},\"hidden_reference\":{{\"expected\":\"oracle-{s}\",\"oracle_number\":{d}}},\"source_profile\":{{\"kind\":\"direct\"}}}}", .{
-                index + 1,
-                index + 1,
-                index + 1,
-                visible_hex,
-                index + 1,
-                hidden_hex,
-                index + 1,
-            });
+            const source_episode_id = try std.fmt.allocPrint(
+                allocator,
+                "episode-independent-{d}",
+                .{index + 1},
+            );
+            defer allocator.free(source_episode_id);
+            const source_profile = if (index == 0)
+                try historicalSourceProfileAlloc(allocator, source_episode_id)
+            else
+                try allocator.dupe(u8, "{\"kind\":\"direct\"}");
+            defer allocator.free(source_profile);
+            try out.writer.print(
+                "{{\"unit_id\":\"unit-holdout-{d}\"," ++
+                    "\"scenario_id\":\"scenario-holdout-{d}\",\"split\":\"holdout\"," ++
+                    "\"source_episode_id\":{f},\"visible_input\":{{" ++
+                    "\"request\":\"sealed-case-{s}\",\"case_number\":{d}}}," ++
+                    "\"hidden_reference\":{{\"expected\":\"oracle-{s}\"," ++
+                    "\"oracle_number\":{d}}},\"source_profile\":{s}}}",
+                .{
+                    index + 1,
+                    index + 1,
+                    std.json.fmt(source_episode_id, .{}),
+                    visible_hex,
+                    index + 1,
+                    hidden_hex,
+                    index + 1,
+                    source_profile,
+                },
+            );
         } else {
             try out.writer.print("{{\"unit_id\":\"unit-practice-1\",\"scenario_id\":\"scenario-practice-1\",\"split\":\"practice\",\"source_episode_id\":\"episode-practice-bootstrap\",\"visible_input\":{{\"request\":\"sealed-case-{s}\",\"case_number\":6}},\"hidden_reference\":{{\"expected\":\"oracle-{s}\",\"oracle_number\":6}},\"source_profile\":{{\"kind\":\"direct\"}}}}", .{ visible_hex, hidden_hex });
         }

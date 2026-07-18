@@ -1181,7 +1181,30 @@ fn sealedTrialAlloc(
 
     const runner_contract_text = try std.fmt.allocPrint(
         allocator,
-        "{{\"schema\":\"cas-hylo-runner/v1\",\"executor_binary_fingerprint\":{f},\"ledger_binary_fingerprint\":{f},\"executor_authority\":{{\"producer_id\":\"cas-trial-executor\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f},\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\",\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}},\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\",\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}},\"capability_seal\":{{\"schema\":\"cas-capability-seal/v1\",\"profile_id\":\"cas-capability-sealed-v1\",\"target_data_mode\":\"cas-content-addressed-pre-post-equality\",\"effect_policy_fingerprint\":{f},\"effect_mediation\":\"attested-executor\",\"default_effect_decision\":\"deny\",\"cas_observations\":[\"target-package-tree\",\"execution-tree\",\"output-carrier\",\"process-group\"],\"os_confinement\":false}},\"capability_delivery\":\"anonymous_fd\",\"receiver_binding\":\"runner_key\",\"single_use\":true,\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true,\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1,\"maximum_retries_per_lane\":0}}",
+        "{{\"schema\":\"cas-hylo-runner/v1\"," ++
+            "\"executor_binary_fingerprint\":{f}," ++
+            "\"ledger_binary_fingerprint\":{f}," ++
+            "\"executor_request_schema\":\"cas-trial-executor-request/v2\"," ++
+            "\"executor_authority\":{{" ++
+            "\"producer_id\":\"cas-trial-executor\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}," ++
+            "\"authorized_observations\":[\"runtime\",\"isolation\",\"effects\"," ++
+            "\"terminal\",\"evidence\",\"execution_audit\",\"native_receipt\"]}}," ++
+            "\"ledger_authority\":{{\"producer_id\":\"hylo-ledger\"," ++
+            "\"key_id\":\"runner-key\",\"binary_fingerprint\":{f}}}," ++
+            "\"capability_seal\":{{\"schema\":\"cas-capability-seal/v1\"," ++
+            "\"profile_id\":\"cas-capability-sealed-v1\"," ++
+            "\"target_data_mode\":\"cas-content-addressed-pre-post-equality\"," ++
+            "\"effect_policy_fingerprint\":{f}," ++
+            "\"effect_mediation\":\"attested-executor\"," ++
+            "\"default_effect_decision\":\"deny\"," ++
+            "\"cas_observations\":[\"target-package-tree\",\"execution-tree\"," ++
+            "\"output-carrier\",\"process-group\"],\"os_confinement\":false}}," ++
+            "\"capability_delivery\":\"anonymous_fd\"," ++
+            "\"receiver_binding\":\"runner_key\",\"single_use\":true," ++
+            "\"atomic_claim\":true,\"fresh_workspace\":true,\"fresh_thread\":true," ++
+            "\"materializes_opaque_arm\":true,\"maximum_handles_per_lane\":1," ++
+            "\"maximum_retries_per_lane\":0}}",
         .{ std.json.fmt(executor_fingerprint, .{}), std.json.fmt(ledger_fingerprint, .{}), std.json.fmt(executor_fingerprint, .{}), std.json.fmt(ledger_fingerprint, .{}), std.json.fmt(SealedEffectPolicyFingerprint, .{}) },
     );
     defer allocator.free(runner_contract_text);
@@ -2573,13 +2596,312 @@ fn authoritativeClaimStoreAlloc(allocator: std.mem.Allocator) ![]u8 {
     var passwd: std.c.passwd = undefined;
     var storage: [64 * 1024]u8 = undefined;
     var result: ?*std.c.passwd = null;
-    if (std.c.getpwuid_r(std.c.getuid(), &passwd, &storage, storage.len, &result) != 0 or result == null) {
+    if (std.c.getpwuid_r(
+        std.c.getuid(),
+        &passwd,
+        &storage,
+        storage.len,
+        &result,
+    ) != 0 or result == null) {
         return error.RunnerIdentityLookupFailed;
     }
     const home_pointer = passwd.dir orelse return error.RunnerHomeMissing;
     const home = std.mem.span(home_pointer);
     if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.RunnerHomeInvalid;
     return std.fs.path.resolve(allocator, &.{ home, ".codex", "cas", "hctp-claims-v1" });
+}
+
+fn authoritativeWorkspaceStoreAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var passwd: std.c.passwd = undefined;
+    var storage: [64 * 1024]u8 = undefined;
+    var result: ?*std.c.passwd = null;
+    if (std.c.getpwuid_r(
+        std.c.getuid(),
+        &passwd,
+        &storage,
+        storage.len,
+        &result,
+    ) != 0 or result == null) {
+        return error.RunnerIdentityLookupFailed;
+    }
+    const home_pointer = passwd.dir orelse return error.RunnerHomeMissing;
+    const home = std.mem.span(home_pointer);
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.RunnerHomeInvalid;
+    return std.fs.path.resolve(allocator, &.{ home, ".codex", "cas", "hctp-workspaces-v1" });
+}
+
+fn expectPrivatePathMode(
+    path: []const u8,
+    kind: std.Io.File.Kind,
+    mode: std.posix.mode_t,
+) !void {
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(kind, stat.kind);
+    try std.testing.expectEqual(mode, stat.permissions.toMode() & 0o777);
+}
+
+fn assertCaseBlindHistoricalLaneAndCleanup(
+    allocator: std.mem.Allocator,
+    binaries: IntegrationBinaries,
+    root: []const u8,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    public_source_receipt: []const u8,
+    public_trial: []const u8,
+) !void {
+    const receipt_dir = try std.fs.path.resolve(
+        allocator,
+        &.{ root, ".hctp-role-driver", "runner-receipts" },
+    );
+    defer allocator.free(receipt_dir);
+    const receipt_store_fingerprint = try digestBytesAlloc(allocator, receipt_dir);
+    defer allocator.free(receipt_store_fingerprint);
+    const workspace_store = try authoritativeWorkspaceStoreAlloc(allocator);
+    defer allocator.free(workspace_store);
+    const workspace = try std.fs.path.join(
+        allocator,
+        &.{ workspace_store, receipt_store_fingerprint["sha256:".len..], trial_id, lane_id },
+    );
+    defer allocator.free(workspace);
+    const replay_root = try std.fs.path.join(allocator, &.{ workspace, "historical-replay" });
+    defer allocator.free(replay_root);
+    const dcp_path = try std.fs.path.join(
+        allocator,
+        &.{ replay_root, "decision-context.dcp.json" },
+    );
+    defer allocator.free(dcp_path);
+    const rip_path = try std.fs.path.join(allocator, &.{ replay_root, "replay-plan.rip.json" });
+    defer allocator.free(rip_path);
+    try expectPrivatePathMode(workspace, .directory, 0o700);
+    try expectPrivatePathMode(replay_root, .directory, 0o700);
+    try expectPrivatePathMode(dcp_path, .file, 0o600);
+    try expectPrivatePathMode(rip_path, .file, 0o600);
+
+    const request_path = try std.fs.path.join(allocator, &.{ workspace, "request.json" });
+    defer allocator.free(request_path);
+    const request_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        request_path,
+        MaxBytes,
+    );
+    defer allocator.free(request_bytes);
+    var request_parsed = try parseJson(allocator, request_bytes);
+    defer request_parsed.deinit();
+    const request = try object(request_parsed.value);
+    try std.testing.expectEqualStrings(
+        "cas-trial-executor-request/v2",
+        try requiredString(request, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        "source_profile_fd",
+        try requiredString(request, "source_profile_body_delivery"),
+    );
+    try std.testing.expectEqualStrings(dcp_path, try requiredString(request, "historical_dcp_ref"));
+    try std.testing.expectEqualStrings(rip_path, try requiredString(request, "historical_rip_ref"));
+    const dcp_fingerprint = try fileFingerprintAlloc(allocator, dcp_path);
+    defer allocator.free(dcp_fingerprint);
+    const rip_fingerprint = try fileFingerprintAlloc(allocator, rip_path);
+    defer allocator.free(rip_fingerprint);
+    try std.testing.expectEqualStrings(
+        dcp_fingerprint,
+        try requiredString(request, "historical_dcp_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        rip_fingerprint,
+        try requiredString(request, "historical_rip_fingerprint"),
+    );
+
+    const run_receipt_path = try std.fs.path.join(
+        allocator,
+        &.{ receipt_dir, trial_id, lane_id, "run-receipt.json" },
+    );
+    defer allocator.free(run_receipt_path);
+    const run_receipt_bytes = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        run_receipt_path,
+        MaxBytes,
+    );
+    defer allocator.free(run_receipt_bytes);
+    var run_receipt_parsed = try parseJson(allocator, run_receipt_bytes);
+    defer run_receipt_parsed.deinit();
+    const run_receipt = try object(run_receipt_parsed.value);
+    const materialization = try requiredObject(run_receipt, "materialization");
+    const profile_fingerprint = try requiredString(request, "source_profile_fingerprint");
+    const lineage = try requiredString(request, "required_lineage");
+    try std.testing.expectEqualStrings(
+        profile_fingerprint,
+        try requiredString(materialization, "source_profile_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        dcp_fingerprint,
+        try requiredString(materialization, "historical_dcp_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        rip_fingerprint,
+        try requiredString(materialization, "historical_rip_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        "source_profile_fd",
+        try requiredString(materialization, "source_profile_body_delivery"),
+    );
+    const native = try requiredObject(run_receipt, "native_receipt");
+    try std.testing.expectEqualStrings("FIR-v1", try requiredString(native, "kind"));
+    try std.testing.expectEqualStrings(
+        profile_fingerprint,
+        try requiredString(native, "source_profile_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        dcp_fingerprint,
+        try requiredString(native, "decision_context_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        rip_fingerprint,
+        try requiredString(native, "replay_plan_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        "source_profile_fd",
+        try requiredString(native, "source_profile_body_delivery"),
+    );
+    const fir = try object(try required(native, "receipt"));
+    const replay_binding = try requiredObject(fir, "replay_binding");
+    try std.testing.expectEqualStrings(trial_id, try requiredString(replay_binding, "trial_id"));
+    try std.testing.expectEqualStrings(lane_id, try requiredString(replay_binding, "lane_id"));
+    try std.testing.expectEqualStrings(
+        profile_fingerprint,
+        try requiredString(replay_binding, "source_profile_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        dcp_fingerprint,
+        try requiredString(replay_binding, "historical_dcp_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        rip_fingerprint,
+        try requiredString(replay_binding, "historical_rip_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        lineage,
+        try requiredString(replay_binding, "required_lineage"),
+    );
+
+    const materialization_receipt_path = try std.fs.path.join(
+        allocator,
+        &.{ root, ".hctp-role-driver", "lanes", trial_id, lane_id, "materialization-receipt.json" },
+    );
+    defer allocator.free(materialization_receipt_path);
+    const materialization_receipt = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        materialization_receipt_path,
+        MaxBytes,
+    );
+    defer allocator.free(materialization_receipt);
+    var materialization_parsed = try parseJson(allocator, materialization_receipt);
+    defer materialization_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        profile_fingerprint,
+        try requiredString(try object(materialization_parsed.value), "source_profile_fingerprint"),
+    );
+
+    const claim_store = try authoritativeClaimStoreAlloc(allocator);
+    defer allocator.free(claim_store);
+    const registration_digest = try requiredString(
+        try requiredObject(run_receipt, "lineage"),
+        "registration_event_digest",
+    );
+    const claim_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}/{s}/{s}.json",
+        .{ claim_store, trial_id, lane_id, registration_digest["sha256:".len..] },
+    );
+    defer allocator.free(claim_path);
+    const claim_bytes = try durable_store.readRegularFileNoSymlink(allocator, claim_path, MaxBytes);
+    defer allocator.free(claim_bytes);
+    var claim_parsed = try parseJson(allocator, claim_bytes);
+    defer claim_parsed.deinit();
+    const claim = try object(claim_parsed.value);
+    try std.testing.expectEqualStrings(
+        profile_fingerprint,
+        try requiredString(claim, "source_profile_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        dcp_fingerprint,
+        try requiredString(claim, "historical_dcp_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(
+        rip_fingerprint,
+        try requiredString(claim, "historical_rip_fingerprint"),
+    );
+    try std.testing.expectEqualStrings(lineage, try requiredString(claim, "required_lineage"));
+    try std.testing.expectEqualStrings(
+        "cas-trial-executor-request/v2",
+        try requiredString(claim, "executor_request_schema"),
+    );
+
+    inline for (.{
+        public_source_receipt,
+        public_trial,
+        materialization_receipt,
+    }) |public_artifact| {
+        inline for (.{
+            "\"decision_context\":",
+            "\"source_governance\":",
+            "route-private-source",
+            "\"historical_dcp_ref\":",
+            "\"historical_rip_ref\":",
+        }) |forbidden| {
+            try std.testing.expect(
+                std.mem.indexOf(u8, public_artifact, forbidden) == null,
+            );
+        }
+    }
+
+    const cleanup_command = try std.fmt.allocPrint(
+        allocator,
+        "'{s}' cleanup --trial-id '{s}' --lane-id '{s}' --receipt-dir '{s}' --json",
+        .{ binaries.cas, trial_id, lane_id, receipt_dir },
+    );
+    defer allocator.free(cleanup_command);
+    const cleanup = try runIsolatedCommandAlloc(
+        allocator,
+        root,
+        "sealed-historical-cleanup",
+        cleanup_command,
+    );
+    defer allocator.free(cleanup);
+    var cleanup_parsed = try parseJson(allocator, cleanup);
+    defer cleanup_parsed.deinit();
+    const cleanup_receipt = try object(cleanup_parsed.value);
+    try std.testing.expect(try requiredBool(cleanup_receipt, "workspace_removed"));
+    try std.testing.expect(try requiredBool(cleanup_receipt, "claim_preserved"));
+    try std.testing.expect(try requiredBool(cleanup_receipt, "receipt_preserved"));
+    try std.testing.expect(try requiredBool(cleanup_receipt, "evidence_preserved"));
+    inline for (.{
+        "\"decision_context\":",
+        "\"source_governance\":",
+        "route-private-source",
+        "\"historical_dcp_ref\":",
+        "\"historical_rip_ref\":",
+    }) |forbidden| try std.testing.expect(std.mem.indexOf(u8, cleanup, forbidden) == null);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(std.testing.io, workspace, .{ .follow_symlinks = false }),
+    );
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, claim_path, .{ .follow_symlinks = false });
+    _ = try std.Io.Dir.cwd().statFile(
+        std.testing.io,
+        run_receipt_path,
+        .{ .follow_symlinks = false },
+    );
+    const evidence_path = try std.fs.path.join(
+        allocator,
+        &.{ receipt_dir, trial_id, lane_id, "evidence" },
+    );
+    defer allocator.free(evidence_path);
+    _ = try std.Io.Dir.cwd().statFile(std.testing.io, evidence_path, .{ .follow_symlinks = false });
+    _ = try std.Io.Dir.cwd().statFile(
+        std.testing.io,
+        try requiredString(cleanup_receipt, "cleanup_ref"),
+        .{ .follow_symlinks = false },
+    );
 }
 
 fn persistVerifiedCasClaim(
@@ -2628,7 +2950,14 @@ fn runSealedLaneRecoveryProbe(
     const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", allocator);
     const suffix = if (mode == .terminal_adoption) "terminal" else "claimed";
     const root_digest = try digestBytesAlloc(allocator, root);
-    const identity_suffix = root_digest["sha256:".len .. "sha256:".len + 12];
+    // Keep the random test identity opaque without allowing a digest prefix such
+    // as `2026...` to resemble a date token under the grader-visible ID law.
+    const identity_suffix = try std.fmt.allocPrint(
+        allocator,
+        "x{s}",
+        .{root_digest["sha256:".len .. "sha256:".len + 12]},
+    );
+    defer allocator.free(identity_suffix);
     const trial_id = try std.fmt.allocPrint(
         allocator,
         "trial-sealed-recovery-{s}-{s}",
@@ -3234,6 +3563,20 @@ test "HCTP sealed promotion Section 36 case 67 positive witness: supported holdo
     for (holdout_cases.items) |case_value| {
         try std.testing.expectEqualStrings("holdout", try requiredString(try object(case_value), "split"));
     }
+    const historical_holdout_profile = try requiredObject(
+        try object(holdout_cases.items[0]),
+        "source_profile",
+    );
+    try std.testing.expectEqualStrings(
+        "historical_decision",
+        try requiredString(historical_holdout_profile, "kind"),
+    );
+    try std.testing.expectEqualStrings(
+        "source_profile_fd",
+        try requiredString(historical_holdout_profile, "profile_body_delivery"),
+    );
+    try std.testing.expect(historical_holdout_profile.get("decision_context") == null);
+    try std.testing.expect(historical_holdout_profile.get("source_governance") == null);
 
     const bootstrap_template = try sealedTrialAlloc(
         allocator,
@@ -3276,6 +3619,16 @@ test "HCTP sealed promotion Section 36 case 67 positive witness: supported holdo
     try std.testing.expect(std.mem.indexOf(u8, trial_text, "\"request\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, trial_text, "\"expected\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, trial_text, "role-bound single-use FD capabilities") != null);
+    var sealed_trial_parsed = try parseJson(allocator, trial_text);
+    defer sealed_trial_parsed.deinit();
+    const sealed_runner_contract = try requiredObject(
+        try requiredObject(try object(sealed_trial_parsed.value), "execution"),
+        "runner_contract",
+    );
+    try std.testing.expectEqualStrings(
+        "cas-trial-executor-request/v2",
+        try requiredString(sealed_runner_contract, "executor_request_schema"),
+    );
     var validation = try hctp.validateTrialAlloc(allocator, trial_text);
     defer validation.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 5), validation.unit_count);
@@ -3428,6 +3781,15 @@ test "HCTP sealed promotion Section 36 case 67 positive witness: supported holdo
         promotion_reveal,
         true,
         true,
+    );
+    try assertCaseBlindHistoricalLaneAndCleanup(
+        allocator,
+        binaries,
+        root,
+        "trial-sealed-positive",
+        "lane-holdout-1-x",
+        source_evidence.holdout_receipt,
+        trial_text,
     );
     var result_parsed = try parseJson(allocator, result);
     defer result_parsed.deinit();

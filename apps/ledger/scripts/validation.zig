@@ -3,6 +3,7 @@ const actuating_review_policy_cli = @import("actuating_review_policy.zig");
 const actuating_review_resolution_cli = @import("actuating_review_resolution.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
+const hctp = @import("hctp.zig");
 const retrace_core = @import("retrace_core");
 const std = @import("std");
 
@@ -40,6 +41,7 @@ const UsageText =
     \\  hylo-counterfactual-cut-receipt  Validate a causal cut receipt
     \\  hylo-redaction-receipt    Validate a semantic redaction receipt
     \\  hylo-custody-manifest     Validate sealed-evidence custody metadata
+    \\  hylo-trial                Validate a portable hylo-trial/v1 or v2 artifact
     \\  source-memory-checkpoint  Validate a source-memory-checkpoint/v1 receipt
     \\
     \\options:
@@ -68,6 +70,7 @@ const Contract = enum {
     hylo_counterfactual_cut_receipt,
     hylo_redaction_receipt,
     hylo_custody_manifest,
+    hylo_trial,
     source_memory_checkpoint,
 
     fn parse(raw: []const u8) ?Contract {
@@ -84,6 +87,7 @@ const Contract = enum {
         if (std.mem.eql(u8, raw, "hylo-counterfactual-cut-receipt")) return .hylo_counterfactual_cut_receipt;
         if (std.mem.eql(u8, raw, "hylo-redaction-receipt")) return .hylo_redaction_receipt;
         if (std.mem.eql(u8, raw, "hylo-custody-manifest")) return .hylo_custody_manifest;
+        if (std.mem.eql(u8, raw, "hylo-trial")) return .hylo_trial;
         if (std.mem.eql(u8, raw, "source-memory-checkpoint")) return .source_memory_checkpoint;
         return null;
     }
@@ -103,6 +107,7 @@ const Contract = enum {
             .hylo_counterfactual_cut_receipt => "hylo-counterfactual-cut-receipt",
             .hylo_redaction_receipt => "hylo-redaction-receipt",
             .hylo_custody_manifest => "hylo-custody-manifest",
+            .hylo_trial => "hylo-trial",
             .source_memory_checkpoint => "source-memory-checkpoint",
         };
     }
@@ -164,6 +169,18 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     var issues = Issues{};
     defer issues.deinit(allocator);
 
+    if (args.contract == .hylo_trial) {
+        var validation = hctp.validateTrialAlloc(allocator, input) catch |err| {
+            try issues.add(allocator, "hylo-trial-contract-invalid");
+            try issues.add(allocator, @errorName(err));
+            try emitDecision(allocator, args.contract, &issues);
+            return 2;
+        };
+        validation.deinit(allocator);
+        try emitDecision(allocator, args.contract, &issues);
+        return 0;
+    }
+
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch {
         try issues.add(allocator, "malformed-json");
         try emitDecision(allocator, args.contract, &issues);
@@ -192,6 +209,7 @@ fn validateContract(allocator: std.mem.Allocator, contract: Contract, value: std
         .hylo_counterfactual_cut_receipt => try validateHyloCounterfactualCutReceipt(allocator, value, issues),
         .hylo_redaction_receipt => try validateHyloRedactionReceipt(allocator, value, issues),
         .hylo_custody_manifest => try validateHyloCustodyManifest(allocator, value, issues),
+        .hylo_trial => try validateHyloTrial(allocator, value, issues),
         .source_memory_checkpoint => try validateSourceMemoryCheckpoint(allocator, value, issues),
     }
 }
@@ -228,6 +246,7 @@ fn parseArgs(argv: []const []const u8) !Args {
 fn inputLimitForContract(contract: Contract) usize {
     return switch (contract) {
         .hylo_replay_episode, .hylo_stimulus, .hylo_target_bundle => replay_episode.max_portable_artifact_bytes,
+        .hylo_trial => hctp.MaxTrialArtifactBytes,
         else => MaxInputBytes,
     };
 }
@@ -402,6 +421,8 @@ fn validateHyloCustodyManifest(allocator: std.mem.Allocator, root: std.json.Valu
     if (!fieldEqualsString(object_value, "schema", "hylo-custody-manifest/v1")) try issues.add(allocator, "custody-manifest-schema");
     if (!try replay_episode.validateCustodyManifest(root, allocator)) try issues.add(allocator, "custody-manifest-contract-invalid");
 }
+
+fn validateHyloTrial(_: std.mem.Allocator, _: std.json.Value, _: *Issues) !void {}
 
 fn validatePolicySynthesisReceipt(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
     const root_object = asObject(root) orelse {
@@ -1077,11 +1098,77 @@ test "Hylo Slice 1 validation routes are complete and delegated" {
     }
 }
 
+test "portable hylo-trial validation accepts fixture and blocks malformed input" {
+    const fixtures = @import("hctp_fixtures");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "valid-trial.json",
+        .data = fixtures.valid_trial,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "malformed-trial.json",
+        .data = "{\"schema\":\"hylo-trial/v1\"",
+    });
+
+    const opening = std.mem.indexOfScalar(u8, fixtures.valid_trial, '{') orelse
+        return error.InvalidFixture;
+    const duplicate_trial = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{{\"schema\":\"hylo-trial/v1\",{s}",
+        .{ fixtures.valid_trial[0..opening], fixtures.valid_trial[opening + 1 ..] },
+    );
+    defer std.testing.allocator.free(duplicate_trial);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "duplicate-trial.json",
+        .data = duplicate_trial,
+    });
+
+    const valid_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "valid-trial.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(valid_path);
+    const malformed_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "malformed-trial.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(malformed_path);
+    const duplicate_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "duplicate-trial.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(duplicate_path);
+
+    try std.testing.expectEqual(@as(u8, 0), try runWithArgv(
+        std.testing.allocator,
+        std.testing.io,
+        &.{ "ledger", "validate", "hylo-trial", "--input", valid_path },
+    ));
+    for ([_][]const u8{ malformed_path, duplicate_path }) |path| {
+        try std.testing.expectEqual(@as(u8, 2), try runWithArgv(
+            std.testing.allocator,
+            std.testing.io,
+            &.{ "ledger", "validate", "hylo-trial", "--input", path },
+        ));
+    }
+
+    try std.testing.expectEqualStrings("hylo-trial", Contract.hylo_trial.name());
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "hylo-trial") != null);
+}
+
 test "Hylo portable artifact validators share the producer ceiling" {
     try std.testing.expect(replay_episode.max_portable_artifact_bytes > MaxInputBytes);
+    try std.testing.expect(hctp.MaxTrialArtifactBytes > MaxInputBytes);
     for (std.enums.values(Contract)) |contract| {
         const expected = switch (contract) {
             .hylo_replay_episode, .hylo_stimulus, .hylo_target_bundle => replay_episode.max_portable_artifact_bytes,
+            .hylo_trial => hctp.MaxTrialArtifactBytes,
             else => MaxInputBytes,
         };
         try std.testing.expectEqual(expected, inputLimitForContract(contract));

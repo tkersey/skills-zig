@@ -6,6 +6,23 @@ script_source="$repo_root/.github/scripts/release_apps.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+build_graph="$repo_root/build.zig"
+if grep -Fq \
+  'run_hylo_operator_recipe.step.dependOn(&run_hylo_operator_recipe_executable.step);' \
+  "$build_graph"; then
+  echo "portable Hylo operator-recipe target must not depend on the product lifecycle" >&2
+  exit 1
+fi
+for required_edge in \
+  'test_hctp_cas_fir_integration.dependOn(test_hctp_integration);' \
+  'run_hylo_operator_recipe_executable.step.dependOn(test_hctp_cas_fir_integration);' \
+  'run.step.dependOn(&run_hylo_operator_recipe_executable.step);'; do
+  if ! grep -Fq "$required_edge" "$build_graph"; then
+    echo "Hylo operator-recipe runtime graph missing ordered edge: $required_edge" >&2
+    exit 1
+  fi
+done
+
 for app in seq cas ledger; do
   workflow="$repo_root/.github/workflows/release-${app}.yml"
   if ! grep -Fq 'zig_target:' "$workflow" ||
@@ -126,6 +143,44 @@ assert_hctp_build_diff() {
   assert_observed "representative HCTP build diff" "seq,cas,ledger"
 }
 
+assert_hylo_operator_terminal_build_diff() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const ledger_test_filter = b.option(' \
+    '    []const u8,' \
+    '    "ledger-test-filter",' \
+    '    "Override the Ledger test filter",' \
+    ');' \
+    'const ledger_tests = b.addTest(.{' \
+    '    .root_module = ledger_root,' \
+    '    .filters = if (ledger_test_filter) |filter| &.{filter} else &.{},' \
+    '});' \
+    'const run_ledger_tests = std.Build.Step.Run.create(b, "run ledger tests (terminal)");' \
+    'run_ledger_tests.addArtifactArg(ledger_tests);' \
+    'run_ledger_tests.stdio = .inherit;' \
+    'const run_hylo_operator_recipe = addTestStepWithOptions(' \
+    '    b,' \
+    '    hylo_operator_recipe_root,' \
+    '    "test-hylo-operator-recipe",' \
+    '    "Run the portable Hylo operator-recipe contract and validator lane",' \
+    '    .{ .filters = &.{"operator recipe portable"} },' \
+    ');' \
+    'const run_hylo_operator_recipe_executable = addTestStepWithOptions(' \
+    '    b,' \
+    '    hylo_cli_tests_root,' \
+    '    "test-hylo-operator-recipe-executable",' \
+    '    "Run the executable operator recipe",' \
+    '    .{ .filters = &.{"operator recipe executable"} },' \
+    ');' \
+    'if (run_hylo_operator_recipe_macos_runtime) |run| {' \
+    '    run.step.dependOn(&run_hylo_operator_recipe_executable.step);' \
+    '}' >> "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "representative Hylo operator terminal test graph"
+  assert_observed "representative Hylo operator terminal test graph" "seq,cas,ledger"
+}
+
 assert_cas_trial_macos_runtime_build_hunk() {
   git -C "$tmp" reset --hard --quiet "$base"
   git -C "$tmp" clean -fdq
@@ -196,8 +251,9 @@ assert_case ".github/scripts/verify_cas_archive.sh" "cas"
 assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
 assert_version_case "apps/img/VERSION" "img"
 assert_hctp_build_diff
+assert_hylo_operator_terminal_build_diff
 assert_cas_trial_macos_runtime_build_hunk
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 16/16 cases passed"
+echo "release app classifier: 17/17 cases passed"

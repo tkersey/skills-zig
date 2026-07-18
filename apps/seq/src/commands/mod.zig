@@ -3292,9 +3292,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         try writer.writeByte('\n');
         if (lib.HctpProductAvailable) {
             try writeEnabledCapability(writer, "hctp_source_selection_v1");
+            try writeEnabledCapability(writer, "hctp_source_route_admission_v1");
             try writeEnabledCapability(writer, "hctp_independence_clusters_v1");
             try writeEnabledCapability(writer, "hctp_sealed_case_v1");
             try writeEnabledCapability(writer, "hctp_materializer_v1");
+            try writeEnabledCapability(writer, "hctp_source_materialization_v1");
+            try writeEnabledCapability(writer, "hctp_source_selection_opening_fd_v1");
+            try writeEnabledCapability(writer, "hctp_historical_profile_v1");
+            try writeEnabledCapability(writer, "hctp_case_blind_source_profile_fd_v1");
             try writeEnabledCapability(writer, "hylo_extract_v1");
         }
         try writer.writeAll(
@@ -3403,9 +3408,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
     const hctp_features: []const CapabilityFeature = if (lib.HctpProductAvailable)
         &.{
             .{ .name = "hctp_source_selection_v1", .enabled = true },
+            .{ .name = "hctp_source_route_admission_v1", .enabled = true },
             .{ .name = "hctp_independence_clusters_v1", .enabled = true },
             .{ .name = "hctp_sealed_case_v1", .enabled = true },
             .{ .name = "hctp_materializer_v1", .enabled = true },
+            .{ .name = "hctp_source_materialization_v1", .enabled = true },
+            .{ .name = "hctp_source_selection_opening_fd_v1", .enabled = true },
+            .{ .name = "hctp_historical_profile_v1", .enabled = true },
+            .{ .name = "hctp_case_blind_source_profile_fd_v1", .enabled = true },
             .{ .name = "hylo_extract_v1", .enabled = true },
         }
     else
@@ -26530,9 +26540,14 @@ test "capabilities advertises resolve intent closed audit flags" {
     const feature_object = parsed.value.object.get("seq_capabilities").?.object.get("features").?.object;
     const hctp_capabilities = [_][]const u8{
         "hctp_source_selection_v1",
+        "hctp_source_route_admission_v1",
         "hctp_independence_clusters_v1",
         "hctp_sealed_case_v1",
         "hctp_materializer_v1",
+        "hctp_source_materialization_v1",
+        "hctp_source_selection_opening_fd_v1",
+        "hctp_historical_profile_v1",
+        "hctp_case_blind_source_profile_fd_v1",
         "hylo_extract_v1",
     };
     for (hctp_capabilities) |feature| {

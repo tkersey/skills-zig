@@ -3,6 +3,20 @@ const cas_session_inquiry = @import("cas_session_inquiry");
 const durable_store = @import("durable_store");
 
 const MaxBytes = 96 * 1024 * 1024;
+const LegacySourceTurnDigest =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const LegacyAnchorDigest =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+const HistoricalLineage = struct {
+    source_turn_digest: []u8,
+    anchor_digest: []u8,
+
+    fn deinit(self: HistoricalLineage, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_turn_digest);
+        allocator.free(self.anchor_digest);
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -22,6 +36,13 @@ pub fn main(init: std.process.Init) !void {
     });
     defer parsed.deinit();
     const request = try object(parsed.value);
+    const request_schema = try requiredString(request, "schema");
+    const replay_bound_request = std.mem.eql(u8, request_schema, "cas-trial-executor-request/v2");
+    if (!replay_bound_request and
+        !std.mem.eql(u8, request_schema, "cas-trial-executor-request/v1"))
+    {
+        return error.ExecutorRequestSchemaInvalid;
+    }
     const workspace = try requiredString(request, "workspace");
     const executable_fingerprint = try fileFingerprintAlloc(allocator, argv[0]);
     defer allocator.free(executable_fingerprint);
@@ -66,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return error.FactorMaterializationReferenceInvalid,
     };
+    var admitted_lineage: ?HistoricalLineage = null;
+    defer if (admitted_lineage) |lineage| lineage.deinit(allocator);
     if (request.get("source_episode_id") != null and request.get("source_episode_id").? != .null) {
         const context_ref = try requiredString(request, "decision_context_ref");
         const context_fingerprint = try fileFingerprintAlloc(allocator, context_ref);
@@ -75,6 +98,23 @@ pub fn main(init: std.process.Init) !void {
             context_fingerprint,
             try requiredString(request, "decision_context_fingerprint"),
         )) return error.DecisionContextFingerprintMismatch;
+        if (replay_bound_request) {
+            try validateReplayBoundDcpBinding(request);
+            inline for (.{
+                .{ "historical_dcp_ref", "historical_dcp_fingerprint" },
+                .{ "historical_rip_ref", "historical_rip_fingerprint" },
+            }) |binding| {
+                const observed = try fileFingerprintAlloc(
+                    allocator,
+                    try requiredString(request, binding[0]),
+                );
+                defer allocator.free(observed);
+                if (!std.mem.eql(u8, observed, try requiredString(request, binding[1]))) {
+                    return error.HistoricalReplayFingerprintMismatch;
+                }
+            }
+            admitted_lineage = try historicalLineageFromDcpAlloc(allocator, context_ref);
+        }
     }
 
     const output_path = try writeEvidence(allocator, workspace, "output.json", "{\"answer\":\"bounded\"}\n");
@@ -117,6 +157,14 @@ pub fn main(init: std.process.Init) !void {
         .null => "direct:fixture",
         else => return error.SourceEpisodeIdInvalid,
     };
+    const source_turn_digest = if (admitted_lineage) |lineage|
+        lineage.source_turn_digest
+    else
+        LegacySourceTurnDigest;
+    const anchor_digest = if (admitted_lineage) |lineage|
+        lineage.anchor_digest
+    else
+        LegacyAnchorDigest;
     const fir_json = try cas_session_inquiry.packagedFirReceiptJsonAlloc(allocator, .{
         .receipt_id = "FIR-fixture-1",
         .inquiry_id = trial_id,
@@ -127,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         .source_thread_id_present = false,
         .source_rollout_path = "fixture:rollout",
         .source_artifact_reconstructability = "transcript_only",
-        .source_turn_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .source_turn_digest = source_turn_digest,
         .lineage_mode = "rollout_transcript",
         .fork_thread_id = "fixture-fork",
         .forked_from_id = "",
@@ -135,8 +183,8 @@ pub fn main(init: std.process.Init) !void {
         .turns_before = 3,
         .turns_dropped = 2,
         .turns_after = 1,
-        .anchor_digest_expected = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        .anchor_digest_observed = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        .anchor_digest_expected = anchor_digest,
+        .anchor_digest_observed = anchor_digest,
         .anchor_exact = true,
         .model = "fixture-model",
         .model_provider = "fixture-provider",
@@ -177,6 +225,11 @@ pub fn main(init: std.process.Init) !void {
         .receipt_valid = true,
     });
     defer allocator.free(fir_json);
+    const bound_fir_json = if (replay_bound_request)
+        try historicalFirBindingAlloc(allocator, fir_json, request)
+    else
+        try allocator.dupe(u8, fir_json);
+    defer allocator.free(bound_fir_json);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -241,11 +294,80 @@ pub fn main(init: std.process.Init) !void {
     try out.writer.writeAll(",\"metrics_path\":");
     try writeString(&out.writer, metrics_path.path);
     try out.writer.writeAll("},\"target_instruction_count\":1,\"source_target_text_presented\":false,\"fir_receipt\":");
-    try out.writer.writeAll(fir_json);
+    try out.writer.writeAll(bound_fir_json);
     try out.writer.writeAll("}\n");
     const result = try out.toOwnedSlice();
     defer allocator.free(result);
     try durable_store.writeTextAtomic(allocator, argv[4], result);
+}
+
+fn historicalFirBindingAlloc(
+    allocator: std.mem.Allocator,
+    fir_json: []const u8,
+    request: std.json.ObjectMap,
+) ![]u8 {
+    const trimmed = std.mem.trimEnd(u8, fir_json, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[trimmed.len - 1] != '}') return error.FirReceiptInvalid;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s},\"replay_binding\":{{\"trial_id\":{f},\"lane_id\":{f}," ++
+            "\"source_profile_fingerprint\":{f}," ++
+            "\"historical_dcp_fingerprint\":{f}," ++
+            "\"historical_rip_fingerprint\":{f},\"required_lineage\":{f}}}}}",
+        .{
+            trimmed[0 .. trimmed.len - 1],
+            std.json.fmt(try requiredString(request, "trial_id"), .{}),
+            std.json.fmt(try requiredString(request, "lane_id"), .{}),
+            std.json.fmt(try requiredString(request, "source_profile_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "historical_dcp_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "historical_rip_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "required_lineage"), .{}),
+        },
+    );
+}
+
+fn validateReplayBoundDcpBinding(request: std.json.ObjectMap) !void {
+    if (!std.mem.eql(
+        u8,
+        try requiredString(request, "decision_context_ref"),
+        try requiredString(request, "historical_dcp_ref"),
+    ) or !std.mem.eql(
+        u8,
+        try requiredString(request, "decision_context_fingerprint"),
+        try requiredString(request, "historical_dcp_fingerprint"),
+    )) return error.HistoricalReplayFingerprintMismatch;
+}
+
+fn historicalLineageFromDcpAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !HistoricalLineage {
+    const bytes = try durable_store.readFileAlloc(allocator, path, MaxBytes);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    const packet = if (root.get("decision_context_packet")) |wrapped|
+        try object(wrapped)
+    else
+        root;
+    const turns = try requiredObject(packet, "turns");
+    const anchors = try requiredObject(packet, "anchors");
+    const pre_decision = try requiredObject(anchors, "pre_decision");
+    if (!try requiredBool(pre_decision, "available")) return error.PreDecisionAnchorUnavailable;
+    return .{
+        .source_turn_digest = try allocator.dupe(
+            u8,
+            try requiredString(turns, "source_turn_digest"),
+        ),
+        .anchor_digest = try allocator.dupe(
+            u8,
+            try requiredString(pre_decision, "anchor_digest"),
+        ),
+    };
 }
 
 const Evidence = struct {
@@ -280,6 +402,17 @@ fn object(value: std.json.Value) !std.json.ObjectMap {
     };
 }
 
+fn requiredObject(map: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
+    return object(map.get(key) orelse return error.RequiredFieldMissing);
+}
+
+fn requiredBool(map: std.json.ObjectMap, key: []const u8) !bool {
+    return switch (map.get(key) orelse return error.RequiredFieldMissing) {
+        .bool => |value| value,
+        else => error.BoolRequired,
+    };
+}
+
 fn requiredString(map: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return switch (map.get(key) orelse return error.RequiredFieldMissing) {
         .string => |text| text,
@@ -296,4 +429,74 @@ fn optionalString(map: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 fn writeString(writer: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+test "v2 fixture derives non-colliding FIR lineage from the admitted DCP" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "dcp.json" });
+    defer allocator.free(path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        path,
+        "{\"decision_context_packet\":{\"turns\":{\"source_turn_digest\":" ++
+            "\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}," ++
+            "\"anchors\":{\"pre_decision\":{\"available\":true," ++
+            "\"anchor_digest\":" ++
+            "\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"}}}}",
+    );
+    const lineage = try historicalLineageFromDcpAlloc(allocator, path);
+    defer lineage.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        lineage.source_turn_digest,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        lineage.anchor_digest,
+    );
+    try std.testing.expect(!std.mem.eql(u8, lineage.source_turn_digest, LegacySourceTurnDigest));
+    try std.testing.expect(!std.mem.eql(u8, lineage.anchor_digest, LegacyAnchorDigest));
+}
+
+test "v2 fixture rejects unavailable or mismatched admitted DCP lineage" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "unavailable-dcp.json" });
+    defer allocator.free(path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        path,
+        "{\"decision_context_packet\":{\"turns\":{\"source_turn_digest\":" ++
+            "\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}," ++
+            "\"anchors\":{\"pre_decision\":{\"available\":false," ++
+            "\"anchor_digest\":null}}}}",
+    );
+    try std.testing.expectError(
+        error.PreDecisionAnchorUnavailable,
+        historicalLineageFromDcpAlloc(allocator, path),
+    );
+
+    var mismatch = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"decision_context_ref\":\"private/context.dcp.json\"," ++
+            "\"decision_context_fingerprint\":" ++
+            "\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"," ++
+            "\"historical_dcp_ref\":\"private/other.dcp.json\"," ++
+            "\"historical_dcp_fingerprint\":" ++
+            "\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}",
+        .{},
+    );
+    defer mismatch.deinit();
+    try std.testing.expectError(
+        error.HistoricalReplayFingerprintMismatch,
+        validateReplayBoundDcpBinding(try object(mismatch.value)),
+    );
 }

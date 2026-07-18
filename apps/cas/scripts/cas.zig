@@ -17,8 +17,15 @@ const CapabilitiesJson: []const u8 = if (HctpProductAvailable) CapabilitiesJsonM
 const CapabilitiesTextMacos =
     \\session_inquiry_v1=true
     \\hylo_trial_runner_v1=true
+    \\hylo_trial_runner_v2=true
     \\hylo_fd_lane_lease_v1=true
     \\hylo_signed_run_receipt_v1=true
+    \\hylo_signed_run_receipt_v2=true
+    \\hylo_private_lane_materialization_fd_v1=true
+    \\hylo_target_common_projection_opening_v1=true
+    \\hylo_private_receipt_redaction_v1=true
+    \\hylo_trial_route_projection_v1=true
+    \\hylo_internal_historical_replay_v1=true
     \\dcp_v1=true
     \\dcp_v2=true
     \\cas_rer_workflow_binding_v1=false
@@ -43,8 +50,15 @@ const CapabilitiesJsonMacos =
     \\    "features": {
     \\      "session_inquiry_v1": true,
     \\      "hylo_trial_runner_v1": true,
+    \\      "hylo_trial_runner_v2": true,
     \\      "hylo_fd_lane_lease_v1": true,
     \\      "hylo_signed_run_receipt_v1": true,
+    \\      "hylo_signed_run_receipt_v2": true,
+    \\      "hylo_private_lane_materialization_fd_v1": true,
+    \\      "hylo_target_common_projection_opening_v1": true,
+    \\      "hylo_private_receipt_redaction_v1": true,
+    \\      "hylo_trial_route_projection_v1": true,
+    \\      "hylo_internal_historical_replay_v1": true,
     \\      "dcp_v1": true,
     \\      "dcp_v2": true,
     \\      "rip_v1": true,
@@ -121,6 +135,7 @@ const UsageTextMacos =
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas session_inquiry preflight --json
     \\  cas trial preflight --trial trial.json --lane-id LANE --json
+    \\  cas trial run --trial trial.json --lane-id LANE ... --materialization-fd 5
     \\  cas smoke_check --cwd /path/to/repo --json
     \\
     \\Options:
@@ -403,7 +418,18 @@ test "capabilities advertise opaque request binding and retire semantic workflow
     try std.testing.expect(features.get("cas_review_history_v2").?.bool);
     try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
     try std.testing.expect(features.get("dcp_v2").?.bool);
-    const hctp_capabilities = [_][]const u8{ "hylo_trial_runner_v1", "hylo_fd_lane_lease_v1", "hylo_signed_run_receipt_v1" };
+    const hctp_capabilities = [_][]const u8{
+        "hylo_trial_runner_v1",
+        "hylo_trial_runner_v2",
+        "hylo_fd_lane_lease_v1",
+        "hylo_signed_run_receipt_v1",
+        "hylo_signed_run_receipt_v2",
+        "hylo_private_lane_materialization_fd_v1",
+        "hylo_target_common_projection_opening_v1",
+        "hylo_private_receipt_redaction_v1",
+        "hylo_trial_route_projection_v1",
+        "hylo_internal_historical_replay_v1",
+    };
     for (hctp_capabilities) |feature| {
         const advertised = features.get(feature);
         try std.testing.expectEqual(HctpProductAvailable, advertised != null);

@@ -93,6 +93,11 @@ const decision_capsule_flags = [_]FlagSpec{
 
 const hctp_source_flags = [_]FlagSpec{
     .{ .name = "--manifest", .value_kind = .path, .help = "Source selection manifest" },
+    .{
+        .name = "--manifest-fd",
+        .value_kind = .int,
+        .help = "Protected source selection manifest descriptor",
+    },
     .{ .name = "--output", .value_kind = .path, .help = "Receipt or governance output" },
     .{ .name = "--sealed-dir", .value_kind = .path, .help = "Encrypted sealed-case artifact directory" },
     .{ .name = "--seal-key-fd", .value_kind = .int, .help = "Protected materialization key descriptor" },
@@ -105,6 +110,11 @@ const hctp_source_flags = [_]FlagSpec{
     .{ .name = "--lane-id", .value_kind = .string, .help = "Registered opaque lane" },
     .{ .name = "--visible-output-fd", .value_kind = .int, .help = "Runner-owned private visible-input pipe" },
     .{ .name = "--source-profile-output-fd", .value_kind = .int, .help = "Runner-owned private historical-profile pipe" },
+    .{
+        .name = "--source-selection-opening-fd",
+        .value_kind = .int,
+        .help = "Protected v2 source-selection opening descriptor",
+    },
     .{ .name = "--signing-seed-fd", .value_kind = .int, .help = "Protected materializer signing seed descriptor" },
     .{ .name = "--source-owner-id", .value_kind = .string, .help = "Registered source-owner producer id" },
     .{ .name = "--source-owner-key-id", .value_kind = .string, .help = "Registered source-owner signing key id" },
