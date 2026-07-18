@@ -14606,11 +14606,17 @@ fn stringLessThan(_: void, left: []const u8, right: []const u8) bool {
 }
 
 fn isLowerHex(value: []const u8) bool {
-    for (value) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
     return true;
 }
 
-fn jsonPointerSegmentAlloc(allocator: std.mem.Allocator, parent: []const u8, segment: []const u8) ![]u8 {
+fn jsonPointerSegmentAlloc(
+    allocator: std.mem.Allocator,
+    parent: []const u8,
+    segment: []const u8,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll(parent);
