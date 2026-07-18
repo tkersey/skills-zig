@@ -87,7 +87,7 @@ jobs:
               'compile-replay` is diagnostic-only' \
               'hylo-target-common-projection-opening/v1 as target_common_projection_opening'
             do
-              if ! rg -Fq -- "$required_help" <<<"$trial_help"; then
+              if ! grep -Fq -- "$required_help" <<<"$trial_help"; then
                 echo "macOS CAS trial help missing ${required_help}" >&2
                 exit 1
               fi
@@ -127,7 +127,7 @@ jobs:
               fi
             done
             help="$(./zig-out/bin/cas --help)"
-            if rg -q -- 'trial' <<<"$help"; then
+            if grep -Fq -- 'trial' <<<"$help"; then
               echo "non-macOS CAS help exposes the trial product" >&2
               exit 1
             fi
