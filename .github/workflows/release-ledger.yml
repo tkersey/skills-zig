@@ -83,7 +83,7 @@ jobs:
               lane-materialization \
               reveal-trial
             do
-              if ! rg -q -- "$surface" <<<"$help"; then
+              if ! grep -Fq -- "$surface" <<<"$help"; then
                 echo "macOS Hylo help missing ${surface}" >&2
                 exit 1
               fi
@@ -93,13 +93,13 @@ jobs:
               '--custody-input-fd N' \
               '--materialization-output-fd N'
             do
-              if ! rg -q -- "$protected_fd" <<<"$help"; then
+              if ! grep -Fq -- "$protected_fd" <<<"$help"; then
                 echo "macOS Hylo help missing canonical protected FD: ${protected_fd}" >&2
                 exit 1
               fi
             done
             for compatibility_fd in '--reveal-output-fd N' '--reveal-material-fd N'; do
-              if ! rg -q -- "$compatibility_fd" <<<"$help"; then
+              if ! grep -Fq -- "$compatibility_fd" <<<"$help"; then
                 echo "macOS Hylo help missing compatibility FD: ${compatibility_fd}" >&2
                 exit 1
               fi
