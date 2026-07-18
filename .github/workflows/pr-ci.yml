@@ -23,6 +23,7 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
+      - ".github/workflows/hylo-published-operator-contract.yml"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
@@ -84,6 +85,7 @@ jobs:
               - ".github/workflows/pr-ci.yml"
               - ".github/workflows/release-*.yml"
               - ".github/workflows/auto-release.yml"
+              - ".github/workflows/hylo-published-operator-contract.yml"
               - "scripts/perf/**"
               - "docs/release/**"
 
@@ -296,36 +298,6 @@ jobs:
           zig build test-hylo-operator-recipe-seq-release-runtime \
             -Dhylo-operator-seq-path="${PWD}/apps/seq/zig-out/bin/seq" \
             --summary all
-      - name: Build ReleaseFast Hylo operator binaries
-        run: zig build build-cas build-ledger -Doptimize=ReleaseFast -j1 --summary all
-      - name: Check out trusted Hylo operator documentation
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: tkersey/dotfiles
-          ref: main
-          path: dotfiles
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-      - name: Log native and documentation revisions
-        run: |
-          set -euo pipefail
-          echo "skills-zig=$(git rev-parse HEAD)"
-          echo "dotfiles=$(git -C dotfiles rev-parse HEAD)"
-      - name: Verify the dotfiles operator contract against the native manifest
-        working-directory: dotfiles
-        env:
-          HYLO_OPERATOR_SURFACE_MANIFEST: ${{ github.workspace }}/testdata/hctp-v1/operator-recipe/operator-surface-manifest.json
-        run: uv run python codex/skills/hylo/tests/test_operator_recipe_contract.py
-      - name: Probe the live ReleaseFast Hylo operator surface
-        working-directory: dotfiles
-        run: |
-          uv run python codex/skills/hylo/scripts/check-operator-surface \
-            --mode operator \
-            --surface-manifest "${GITHUB_WORKSPACE}/testdata/hctp-v1/operator-recipe/operator-surface-manifest.json" \
-            --seq "${GITHUB_WORKSPACE}/apps/seq/zig-out/bin/seq" \
-            --ledger "${GITHUB_WORKSPACE}/zig-out/bin/ledger" \
-            --cas "${GITHUB_WORKSPACE}/zig-out/bin/cas" \
-            --json
 
   cas-fuzz-linux:
     needs: changes
