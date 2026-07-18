@@ -23,6 +23,7 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
+      - ".github/workflows/hylo-published-operator-contract.yml"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
@@ -84,6 +85,7 @@ jobs:
               - ".github/workflows/pr-ci.yml"
               - ".github/workflows/release-*.yml"
               - ".github/workflows/auto-release.yml"
+              - ".github/workflows/hylo-published-operator-contract.yml"
               - "scripts/perf/**"
               - "docs/release/**"
 
@@ -177,6 +179,8 @@ jobs:
         run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
       - name: Test seq
         run: zig build test-seq --summary all
+      - name: Verify non-macOS seq command and capability admission
+        run: apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
 
   seq-fuzz-linux:
     needs: changes
@@ -232,6 +236,29 @@ jobs:
           version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
+      - name: Verify packaged Linux CAS dispatcher layout
+        run: |
+          set -euo pipefail
+          package_dir="${RUNNER_TEMP}/cas-release"
+          archive="${RUNNER_TEMP}/cas-pr-linux-x86_64.tar.gz"
+          mkdir -p "${package_dir}"
+          cp zig-out/bin/cas "${package_dir}/cas"
+          cp zig-out/bin/cas_account "${package_dir}/cas_account"
+          cp zig-out/bin/cas_smoke_check "${package_dir}/cas_smoke_check"
+          cp zig-out/bin/cas_smoke_check "${package_dir}/cas-smoke-check"
+          cp zig-out/bin/cas_instance_runner "${package_dir}/cas_instance_runner"
+          cp zig-out/bin/cas_instance_runner "${package_dir}/cas-instance-runner"
+          cp zig-out/bin/cas_review_session "${package_dir}/cas_review_session"
+          cp zig-out/bin/cas_review_session "${package_dir}/cas-review-session"
+          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas_session_inquiry"
+          cp zig-out/bin/cas_session_inquiry "${package_dir}/cas-session-inquiry"
+          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas_conformance_suite"
+          cp zig-out/bin/cas_conformance_suite "${package_dir}/cas-conformance-suite"
+          cp zig-out/bin/cas_goal "${package_dir}/cas_goal"
+          cp zig-out/bin/cas_goal "${package_dir}/cas-goal"
+          cp zig-out/bin/cas-perf-budget-governor "${package_dir}/cas-perf-budget-governor"
+          tar -czf "${archive}" -C "${package_dir}" .
+          .github/scripts/verify_cas_archive.sh linux-x86_64 "${archive}"
       - name: Test generic CAS surfaces
         run: zig build test-cas
 
@@ -245,7 +272,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Test macOS CAS trial product and lifecycle laws
-        run: zig build test-cas-trial test-cas-trial-macos-runtime --summary all
+        run: zig build test-cas-trial test-cas-trial-macos-runtime -j1 --summary all
       - name: Test CAS archive verifier with macOS tar
         run: .github/scripts/test_verify_cas_archive.sh
 
@@ -254,12 +281,23 @@ jobs:
     if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.cas == 'true' || needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
-      - name: Test macOS HCTP product, conformance, and sealed commitments
-        run: zig build test-hylo test-hctp-conformance test-hctp-sealed-commitments --summary all
+      - name: Test macOS HCTP product and operator-recipe conformance
+        run: zig build test-hylo test-hctp-conformance -j1 --summary all
+      - name: Test sealed commitments after the operator-recipe aggregate
+        run: zig build test-hctp-sealed-commitments --summary all
+      - name: Verify macOS seq command and capability admission
+        run: |
+          (cd apps/seq && zig build -Doptimize=ReleaseFast --summary all)
+          apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
+          zig build test-hylo-operator-recipe-seq-release-runtime \
+            -Dhylo-operator-seq-path="${PWD}/apps/seq/zig-out/bin/seq" \
+            --summary all
 
   cas-fuzz-linux:
     needs: changes
@@ -300,7 +338,7 @@ jobs:
       - name: Build ledger
         run: zig build build-ledger -Doptimize=ReleaseFast
       - name: Test generic ledger and portable validators
-        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia --summary all
+        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia test-hylo-operator-recipe --summary all
 
   memory-note:
     needs: changes

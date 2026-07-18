@@ -50,6 +50,88 @@ jobs:
           version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Verify platform-gated CAS trial surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          capabilities="$(./zig-out/bin/cas capabilities --json)"
+          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
+            for feature in \
+              hylo_trial_runner_v1 \
+              hylo_trial_runner_v2 \
+              hylo_fd_lane_lease_v1 \
+              hylo_signed_run_receipt_v1 \
+              hylo_signed_run_receipt_v2 \
+              hylo_private_lane_materialization_fd_v1 \
+              hylo_target_common_projection_opening_v1 \
+              hylo_private_receipt_redaction_v1 \
+              hylo_trial_route_projection_v1 \
+              hylo_internal_historical_replay_v1
+            do
+              if ! jq -e --arg feature "$feature" \
+                '.cas_capabilities.features[$feature] == true' \
+                <<<"$capabilities" >/dev/null
+              then
+                echo "macOS CAS capabilities missing ${feature}=true" >&2
+                exit 1
+              fi
+            done
+            trial_help="$(./zig-out/bin/cas_trial --help)"
+            for required_help in \
+              'compile-replay' \
+              '--source-profile-fd N' \
+              '--materialization-fd N' \
+              'hylo-trial/v2' \
+              'commitment-only hylo-run-receipt/v2' \
+              'materialization_claim_fingerprint' \
+              'compile-replay` is diagnostic-only' \
+              'hylo-target-common-projection-opening/v1 as target_common_projection_opening'
+            do
+              if ! rg -Fq -- "$required_help" <<<"$trial_help"; then
+                echo "macOS CAS trial help missing ${required_help}" >&2
+                exit 1
+              fi
+            done
+            ./zig-out/bin/cas_trial preflight \
+              --trial testdata/hctp-v1/valid-null-trial.json \
+              --lane-id lane-null-a0 --json > direct-preflight.json
+            jq -e '
+              .source_profile_kind == "direct" and
+              .compile_replay_required == false and
+              .replay_preparation_mode == "none" and
+              .source_kind == .source_profile_kind and
+              (has("historical_replay_required") | not) and
+              .source_profile_body_delivery == "none" and
+              .execution_route == "direct" and
+              .required_lineage == null
+            ' direct-preflight.json >/dev/null
+          else
+            for feature in \
+              hylo_trial_runner_v1 \
+              hylo_trial_runner_v2 \
+              hylo_fd_lane_lease_v1 \
+              hylo_signed_run_receipt_v1 \
+              hylo_signed_run_receipt_v2 \
+              hylo_private_lane_materialization_fd_v1 \
+              hylo_target_common_projection_opening_v1 \
+              hylo_private_receipt_redaction_v1 \
+              hylo_trial_route_projection_v1 \
+              hylo_internal_historical_replay_v1
+            do
+              if jq -e --arg feature "$feature" \
+                '.cas_capabilities.features | has($feature)' \
+                <<<"$capabilities" >/dev/null
+              then
+                echo "non-macOS CAS capabilities expose ${feature}" >&2
+                exit 1
+              fi
+            done
+            help="$(./zig-out/bin/cas --help)"
+            if rg -q -- 'trial' <<<"$help"; then
+              echo "non-macOS CAS help exposes the trial product" >&2
+              exit 1
+            fi
+          fi
       - name: Verify Linux dispatcher can launch its sibling executable
         if: matrix.target == 'linux-x86_64'
         run: zig build test-cas-dispatch-runtime-linux -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast --summary all
@@ -60,15 +142,20 @@ jobs:
           mkdir -p dist/cas
           cp zig-out/bin/cas dist/cas/cas
           cp zig-out/bin/cas_account dist/cas/cas_account
+          cp zig-out/bin/cas_smoke_check dist/cas/cas_smoke_check
           cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
+          cp zig-out/bin/cas_instance_runner dist/cas/cas_instance_runner
           cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
+          cp zig-out/bin/cas_review_session dist/cas/cas_review_session
           cp zig-out/bin/cas_review_session dist/cas/cas-review-session
           cp zig-out/bin/cas_session_inquiry dist/cas/cas_session_inquiry
           cp zig-out/bin/cas_session_inquiry dist/cas/cas-session-inquiry
           if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
             cp zig-out/bin/cas_trial dist/cas/cas_trial
           fi
+          cp zig-out/bin/cas_conformance_suite dist/cas/cas_conformance_suite
           cp zig-out/bin/cas_conformance_suite dist/cas/cas-conformance-suite
+          cp zig-out/bin/cas_goal dist/cas/cas_goal
           cp zig-out/bin/cas_goal dist/cas/cas-goal
           cp zig-out/bin/cas-perf-budget-governor dist/cas/cas-perf-budget-governor
           tar -czf "${TAR_NAME}" -C dist/cas .

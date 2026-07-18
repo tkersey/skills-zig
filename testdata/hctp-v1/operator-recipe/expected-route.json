@@ -1,0 +1,117 @@
+{
+  "schema": "hylo-operator-recipe-expectation/v1",
+  "portable_sequence": [
+    "source_compile",
+    "campaign_validate",
+    "campaign_created",
+    "target_bundle_admitted",
+    "scenario_manifest_complete",
+    "owner_applied_candidate_precondition",
+    "campaign_doctor",
+    "trial_compile",
+    "trial_validate",
+    "source_validate",
+    "trial_register",
+    "direct_lane_preflight",
+    "direct_lane_source_materialize",
+    "direct_lane_start",
+    "direct_lane_recover_start",
+    "direct_lane_materialization",
+    "direct_lane_run",
+    "direct_lane_finish",
+    "direct_lane_recover_finish",
+    "direct_lane_grade",
+    "historical_lane_preflight",
+    "historical_lane_source_materialize",
+    "historical_lane_start",
+    "historical_lane_recover_start",
+    "historical_lane_materialization",
+    "historical_lane_run",
+    "historical_lane_finish",
+    "historical_lane_recover_finish",
+    "historical_lane_grade",
+    "pair_grade",
+    "custody_reveal",
+    "trial_result",
+    "trial_close",
+    "proof_artifact_set",
+    "proof_export",
+    "proof_verify"
+  ],
+  "trial_boundary": {
+    "public_schema": "hylo-trial/v2",
+    "private_schema": "hylo-trial-custody/v1",
+    "registration_requires_custody_fd": true,
+    "lane_materialization_requires_custody_and_lease_fds": true,
+    "cas_run_requires_lease_input_and_materialization_fds": true
+  },
+  "execution_authorities": {
+    "runner_contract_schema": "cas-hylo-runner/v1",
+    "runtime_rebinding_required": true,
+    "runner": {
+      "producer_id": "cas-trial",
+      "key_id": "runner-key",
+      "binary_binding": "cas_trial_path",
+      "version_binding": "cas_version"
+    },
+    "executor": {
+      "producer_id": "cas-trial-executor",
+      "key_id": "executor-authority-key",
+      "binary_binding": "fixture_executor_path"
+    },
+    "ledger": {
+      "producer_id": "hylo-ledger",
+      "key_id": "executor-authority-key",
+      "binary_binding": "ledger_path"
+    }
+  },
+  "routes": {
+    "direct": {
+      "comparison_eligible": true,
+      "crf_replay_eligible_required": true,
+      "compile_replay_required": false,
+      "source_profile_body_delivery": "none",
+      "replay_preparation_mode": "none",
+      "execution_route": "direct",
+      "required_lineage": null,
+      "compile_replay_owner": null
+    },
+    "historical_decision": {
+      "comparison_eligible": true,
+      "crf_replay_eligible_required": false,
+      "compile_replay_required": false,
+      "source_profile_body_delivery": "source_profile_fd",
+      "case_blind_source_profile_body_delivery": "source_profile_fd",
+      "replay_preparation_mode": "integrated_run",
+      "execution_route": "historical_replay",
+      "required_lineage": "either",
+      "compile_replay_owner": "cas_trial_run"
+    },
+    "diagnostic_only": {
+      "comparison_eligible": false,
+      "compile_replay_required": false,
+      "execution_route": "diagnostic_only",
+      "registration_allowed": false
+    }
+  },
+  "allocation": {
+    "method": "balanced_ab_ba",
+    "semantic_baseline_must_run_first": false,
+    "compatibility_fold_requires_prior_baseline": true
+  },
+  "sealed_product_boundary": {
+    "admitted_broker_required": true,
+    "repository_driver_installed": false,
+    "fail_before": [
+      "secret_generation",
+      "campaign_mutation",
+      "trial_mutation"
+    ],
+    "os_confinement": false
+  },
+  "candidate_lifecycle": {
+    "evaluate_requires_existing_candidate": true,
+    "run_grants_mutation_authority": false,
+    "new_candidate_requires_new_trial": true
+  }
+}

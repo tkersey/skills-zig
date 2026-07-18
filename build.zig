@@ -364,6 +364,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = ledger_meta },
         },
     });
+    const hctp_source_for_hylo_tests = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/hctp_source.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
     const ledger_root = b.createModule(.{
         .root_source_file = b.path("apps/ledger/scripts/ledger.zig"),
         .target = target,
@@ -375,6 +384,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "hctp_source", .module = hctp_source_for_hylo_tests },
             .{ .name = "retrace_core", .module = retrace_core },
         },
     });
@@ -382,11 +392,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("apps/ledger/scripts/hylo.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "hctp_source", .module = hctp_source_for_hylo_tests },
             .{ .name = "retrace_core", .module = retrace_core },
         },
     });
@@ -404,6 +416,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hylo_operator_recipe_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hylo_operator_recipe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hylo_operator_recipe_seq_release_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hylo_operator_recipe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
             .{ .name = "retrace_core", .module = retrace_core },
         },
@@ -502,7 +534,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("testdata/hctp-v1/sealed-cas-fixture-executor.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "durable_store", .module = durable_store }},
+        .imports = &.{
+            .{ .name = "cas_session_inquiry", .module = cas_session_inquiry_root },
+            .{ .name = "durable_store", .module = durable_store },
+        },
     });
     const hctp_sealed_source_fixture_root = b.createModule(.{
         .root_source_file = b.path("testdata/hctp-v1/sealed-source-fixture.zig"),
@@ -610,6 +645,123 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
+    const hylo_operator_recipe_paths_disabled = b.addOptions();
+    hylo_operator_recipe_paths_disabled.addOption(bool, "cli_subprocess_enabled", false);
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "ledger_path", "");
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "seq_path", "");
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "cas_trial_path", "");
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "fixture_executor_path", "");
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "cas_version", "");
+    hylo_operator_recipe_paths_disabled.addOption([]const u8, "seq_version", "");
+    ledger_root.addOptions(
+        "hylo_operator_recipe_paths",
+        hylo_operator_recipe_paths_disabled,
+    );
+    hctp_conformance_backend_root.addOptions(
+        "hylo_operator_recipe_paths",
+        hylo_operator_recipe_paths_disabled,
+    );
+    const hylo_operator_recipe_cli_paths = b.addOptions();
+    hylo_operator_recipe_cli_paths.addOption(
+        bool,
+        "cli_subprocess_enabled",
+        hctp_product_available,
+    );
+    const hylo_operator_ledger_path = b.option(
+        []const u8,
+        "hylo-operator-ledger-path",
+        "Use an already-built Ledger product binary in the operator-recipe CLI gate",
+    );
+    if (hylo_operator_ledger_path) |path| {
+        hylo_operator_recipe_cli_paths.addOption([]const u8, "ledger_path", path);
+    } else {
+        hylo_operator_recipe_cli_paths.addOptionPath("ledger_path", ledger.getEmittedBin());
+    }
+    hylo_operator_recipe_cli_paths.addOptionPath("seq_path", seq.getEmittedBin());
+    if (hctp_product_available) {
+        hylo_operator_recipe_cli_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
+        hylo_operator_recipe_cli_paths.addOptionPath(
+            "fixture_executor_path",
+            hctp_cas_fixture_executor.getEmittedBin(),
+        );
+    } else {
+        hylo_operator_recipe_cli_paths.addOption([]const u8, "cas_trial_path", "");
+        hylo_operator_recipe_cli_paths.addOption([]const u8, "fixture_executor_path", "");
+    }
+    hylo_operator_recipe_cli_paths.addOption(
+        []const u8,
+        "cas_version",
+        std.mem.trim(u8, @embedFile("apps/cas/VERSION"), " \t\r\n"),
+    );
+    hylo_operator_recipe_cli_paths.addOption(
+        []const u8,
+        "seq_version",
+        std.mem.trim(u8, @embedFile("apps/seq/VERSION"), " \t\r\n"),
+    );
+    hylo_cli_tests_root.addOptions(
+        "hylo_operator_recipe_paths",
+        hylo_operator_recipe_cli_paths,
+    );
+    const hylo_operator_recipe_paths = b.addOptions();
+    hylo_operator_recipe_paths.addOption(bool, "hctp_product_available", hctp_product_available);
+    const hylo_operator_seq_path = b.option(
+        []const u8,
+        "hylo-operator-seq-path",
+        "Use an already-built Seq product binary in the operator-recipe runtime gate",
+    );
+    if (hylo_operator_seq_path) |path| {
+        hylo_operator_recipe_paths.addOption([]const u8, "seq_path", path);
+    } else {
+        hylo_operator_recipe_paths.addOptionPath("seq_path", seq.getEmittedBin());
+    }
+    hylo_operator_recipe_paths.addOptionPath("ledger_path", ledger.getEmittedBin());
+    hylo_operator_recipe_paths.addOptionPath("cas_path", cas.getEmittedBin());
+    if (hctp_product_available) {
+        hylo_operator_recipe_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
+        hylo_operator_recipe_paths.addOptionPath(
+            "fixture_executor_path",
+            hctp_cas_fixture_executor.getEmittedBin(),
+        );
+    } else {
+        hylo_operator_recipe_paths.addOption([]const u8, "cas_trial_path", "");
+        hylo_operator_recipe_paths.addOption([]const u8, "fixture_executor_path", "");
+    }
+    hylo_operator_recipe_paths.addOption(
+        []const u8,
+        "cas_version",
+        std.mem.trim(u8, @embedFile("apps/cas/VERSION"), " \t\r\n"),
+    );
+    hylo_operator_recipe_paths.addOption(
+        []const u8,
+        "seq_version",
+        std.mem.trim(u8, @embedFile("apps/seq/VERSION"), " \t\r\n"),
+    );
+    hylo_operator_recipe_root.addOptions("hylo_operator_recipe_paths", hylo_operator_recipe_paths);
+    const hylo_operator_recipe_seq_release_paths = b.addOptions();
+    hylo_operator_recipe_seq_release_paths.addOption(
+        bool,
+        "hctp_product_available",
+        hctp_product_available,
+    );
+    if (hylo_operator_seq_path) |path| {
+        hylo_operator_recipe_seq_release_paths.addOption([]const u8, "seq_path", path);
+    } else {
+        hylo_operator_recipe_seq_release_paths.addOptionPath("seq_path", seq.getEmittedBin());
+    }
+    hylo_operator_recipe_seq_release_paths.addOption([]const u8, "ledger_path", "");
+    hylo_operator_recipe_seq_release_paths.addOption([]const u8, "cas_path", "");
+    hylo_operator_recipe_seq_release_paths.addOption([]const u8, "cas_trial_path", "");
+    hylo_operator_recipe_seq_release_paths.addOption([]const u8, "fixture_executor_path", "");
+    hylo_operator_recipe_seq_release_paths.addOption([]const u8, "cas_version", "");
+    hylo_operator_recipe_seq_release_paths.addOption(
+        []const u8,
+        "seq_version",
+        std.mem.trim(u8, @embedFile("apps/seq/VERSION"), " \t\r\n"),
+    );
+    hylo_operator_recipe_seq_release_root.addOptions(
+        "hylo_operator_recipe_paths",
+        hylo_operator_recipe_seq_release_paths,
+    );
     const hctp_sealed_role_driver_paths = b.addOptions();
     hctp_sealed_role_driver_paths.addOptionPath("seq_path", seq.getEmittedBin());
     hctp_sealed_role_driver_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
@@ -875,12 +1027,22 @@ pub fn build(b: *std.Build) void {
         "test-synesthesia",
         "Run internal ledger synesthesia-source tests",
     );
-    const run_ledger_tests = addTestStep(
-        b,
-        ledger_root,
-        "test-ledger",
-        "Run ledger tests",
+    const ledger_test_filter = b.option(
+        []const u8,
+        "ledger-test-filter",
+        "Override the Ledger test filter",
     );
+    const ledger_tests = b.addTest(.{
+        .root_module = ledger_root,
+        .filters = if (ledger_test_filter) |filter| &.{filter} else &.{},
+    });
+    const run_ledger_tests = std.Build.Step.Run.create(b, "run ledger tests (terminal)");
+    run_ledger_tests.addArtifactArg(ledger_tests);
+    run_ledger_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
+    run_ledger_tests.stdio = .inherit;
+    if (b.args) |args| run_ledger_tests.addArgs(args);
+    const test_ledger = b.step("test-ledger", "Run ledger tests");
+    test_ledger.dependOn(&run_ledger_tests.step);
     const hylo_test_filter = b.option(
         []const u8,
         "hylo-test-filter",
@@ -905,6 +1067,61 @@ pub fn build(b: *std.Build) void {
         "test-hylo-fold",
         "Run HCTP-v1 fold tests",
     );
+    const run_hylo_operator_recipe = addTestStepWithOptions(
+        b,
+        hylo_operator_recipe_root,
+        "test-hylo-operator-recipe",
+        "Run the portable Hylo operator-recipe contract and validator lane",
+        .{ .filters = &.{"operator recipe portable"} },
+    );
+    const run_hylo_operator_recipe_executable = addTestStepWithOptions(
+        b,
+        hylo_cli_tests_root,
+        "test-hylo-operator-recipe-executable",
+        "Run one compiled trial through custody-backed registration and terminal " ++
+            "direct and historical lanes",
+        .{ .filters = &.{"operator recipe executable"} },
+    );
+    const check_hylo_operator_recipe_executable_artifact = b.addTest(.{
+        .root_module = hylo_cli_tests_root,
+        .filters = &.{"operator recipe executable"},
+    });
+    const check_hylo_operator_recipe_executable = b.step(
+        "check-hylo-operator-recipe-executable",
+        "Compile the Hylo operator-recipe executable test without running it",
+    );
+    check_hylo_operator_recipe_executable.dependOn(
+        &check_hylo_operator_recipe_executable_artifact.step,
+    );
+    const run_hylo_operator_recipe_admission = addTestStepWithOptions(
+        b,
+        hylo_cli_tests_root,
+        "test-hylo-operator-recipe-admission",
+        "Run compiler carrier, custody, authority, campaign, and registration-admission checks",
+        .{ .filters = &.{
+            "hylo trial compiler",
+            "hylo trial registration admission ordering",
+        } },
+    );
+    run_hylo_operator_recipe.step.dependOn(&run_hylo_operator_recipe_admission.step);
+    if (hctp_product_available) {
+        _ = addTestStepWithOptions(
+            b,
+            hylo_operator_recipe_seq_release_root,
+            "test-hylo-operator-recipe-seq-release-runtime",
+            "Run source compile and exact receipt validation against the selected " ++
+                "Seq product binary",
+            .{ .filters = &.{"operator recipe macOS runtime: released source compiler"} },
+        );
+        _ = addTestStepWithOptions(
+            b,
+            hylo_cli_tests_root,
+            "test-hylo-operator-recipe-ledger-release-runtime",
+            "Run compile, exact source binding, custody-backed registration, and " ++
+                "direct and historical lanes through the selected product binaries",
+            .{ .filters = &.{"operator recipe CLI subprocess"} },
+        );
+    }
     const run_hctp_conformance_registration = addTestStep(
         b,
         hctp_conformance_registration_root,
@@ -1003,11 +1220,16 @@ pub fn build(b: *std.Build) void {
     });
     hctp_cas_fir_integration_tests.root_module.linkSystemLibrary("c", .{});
     const run_hctp_cas_fir_integration = b.addRunArtifact(hctp_cas_fir_integration_tests);
+    const hctp_cas_fixture_executor_tests = b.addTest(.{
+        .root_module = hctp_cas_fixture_executor_root,
+    });
+    const run_hctp_cas_fixture_executor_tests = b.addRunArtifact(hctp_cas_fixture_executor_tests);
     const test_hctp_cas_fir_integration = b.step(
         "test-hctp-cas-fir-integration",
         "Run packaged CAS FIR through Retrace normalization and the production CAS trial adapter",
     );
     test_hctp_cas_fir_integration.dependOn(&run_hctp_cas_fir_integration.step);
+    test_hctp_cas_fir_integration.dependOn(&run_hctp_cas_fixture_executor_tests.step);
     const hctp_cas_factor_materialization_tests = b.addTest(.{
         .root_module = hctp_integration_root,
         .filters = &.{"HCTP CAS factor materialization"},
@@ -1036,6 +1258,21 @@ pub fn build(b: *std.Build) void {
         "Run the actual CAS-to-Hylo and Retrace-to-Hylo HCTP integration proof",
     );
     test_hctp_integration.dependOn(&run_hctp_integration.step);
+    const run_hylo_operator_recipe_macos_runtime: ?*std.Build.Step.Run = if (hctp_product_available)
+        addTestStepWithOptions(
+            b,
+            hylo_operator_recipe_root,
+            "test-hylo-operator-recipe-macos-runtime",
+            "Run installed-surface probes plus direct and historical HCTP integration lanes",
+            .{ .filters = &.{"operator recipe macOS runtime"} },
+        )
+    else
+        null;
+    if (run_hylo_operator_recipe_macos_runtime) |run| {
+        test_hctp_cas_fir_integration.dependOn(test_hctp_integration);
+        run_hylo_operator_recipe_executable.step.dependOn(test_hctp_cas_fir_integration);
+        run.step.dependOn(&run_hylo_operator_recipe_executable.step);
+    }
     const hctp_sealed_commitment_tests = b.addTest(.{
         .root_module = hctp_integration_root,
         .filters = &.{"HCTP sealed promotion Section 36 case 67 positive witness: supported holdout improvement is published"},
@@ -1058,6 +1295,8 @@ pub fn build(b: *std.Build) void {
     test_hctp_conformance.dependOn(&run_hctp_conformance_manifest.step);
     test_hctp_conformance.dependOn(&run_hctp_conformance_hylo.step);
     test_hctp_conformance.dependOn(test_hctp_conformance_backends);
+    test_hctp_conformance.dependOn(&run_hylo_operator_recipe.step);
+    if (run_hylo_operator_recipe_macos_runtime) |run| test_hctp_conformance.dependOn(&run.step);
     const test_hylo = b.step("test-hylo", "Run HCTP-v1 contract and fold tests");
     test_hylo.dependOn(&run_hctp_contract_tests.step);
     test_hylo.dependOn(&run_hctp_fold_tests.step);

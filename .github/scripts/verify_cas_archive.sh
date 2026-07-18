@@ -27,44 +27,114 @@ trap 'rm -rf "$scratch"' EXIT
 members="$scratch/members"
 LC_ALL=C tar -tzf "$archive" > "$members"
 
-root_count="$(
-  awk '$0 == "cas_trial" || $0 == "./cas_trial" { count += 1 } END { print count + 0 }' "$members"
-)"
-cas_trial_count="$(
-  awk '{
-    path = $0
-    sub(/\/$/, "", path)
-    count = split(path, parts, "/")
-    if (parts[count] == "cas_trial") matches += 1
-  } END { print matches + 0 }' "$members"
-)"
-
+expected_members=(
+  cas
+  cas_account
+  cas_smoke_check
+  cas_instance_runner
+  cas_review_session
+  cas_session_inquiry
+  cas_conformance_suite
+  cas_goal
+  cas-smoke-check
+  cas-instance-runner
+  cas-review-session
+  cas-session-inquiry
+  cas-conformance-suite
+  cas-goal
+  cas-perf-budget-governor
+)
 if [[ "$target" == "darwin-arm64" ]]; then
-  if [[ "$root_count" -ne 1 || "$cas_trial_count" -ne 1 ]]; then
-    echo "Darwin CAS archive must contain exactly one root cas_trial and no nested copies; observed root=$root_count total=$cas_trial_count" >&2
-    exit 1
-  fi
+  expected_members+=(cas_trial)
+fi
 
-  root_member="$(awk '$0 == "cas_trial" || $0 == "./cas_trial" { print; exit }' "$members")"
-  payload_dir="$scratch/payload"
-  mkdir -p "$payload_dir"
-  if ! LC_ALL=C tar -xzf "$archive" -C "$payload_dir" "$root_member" >/dev/null; then
-    echo "Darwin CAS archive cas_trial must be a self-contained root entry" >&2
-    exit 1
-  fi
+expected_normalized="$scratch/expected-normalized"
+actual_normalized="$scratch/actual-normalized"
+printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort > "$expected_normalized"
+awk '
+  {
+    path = $0
+    while (sub(/^\.\//, "", path)) {}
+    sub(/\/$/, "", path)
+    if (path != "") print path
+  }
+' "$members" | LC_ALL=C sort > "$actual_normalized"
 
-  payload="$payload_dir/cas_trial"
-  if [[ -L "$payload" || ! -f "$payload" || ! -x "$payload" ]]; then
-    echo "Darwin CAS archive cas_trial must be a regular executable" >&2
-    exit 1
-  fi
-  if [[ -n "$(find "$payload" -type f -links +1 -print -quit)" ]]; then
-    echo "Darwin CAS archive cas_trial must not be a hard link" >&2
-    exit 1
-  fi
-elif [[ "$cas_trial_count" -ne 0 ]]; then
-  echo "Non-Darwin CAS archive must not contain cas_trial; observed $cas_trial_count" >&2
+if ! cmp -s "$expected_normalized" "$actual_normalized"; then
+  echo "CAS archive root member set does not match the ${target} release contract" >&2
+  diff -u "$expected_normalized" "$actual_normalized" >&2 || true
   exit 1
 fi
 
-printf 'CAS archive verified: target=%s cas_trial=%s\n' "$target" "$cas_trial_count"
+archive_members=()
+for name in "${expected_members[@]}"; do
+  member="$(
+    awk -v wanted="$name" '
+      {
+        path = $0
+        while (sub(/^\.\//, "", path)) {}
+        sub(/\/$/, "", path)
+        if (path == wanted) print $0
+      }
+    ' "$members"
+  )"
+  if [[ -z "$member" ]]; then
+    echo "CAS archive missing required root member: $name" >&2
+    exit 1
+  fi
+  archive_members+=("$member")
+done
+
+payload_dir="$scratch/payload"
+mkdir -p "$payload_dir"
+if ! LC_ALL=C tar -xzf "$archive" -C "$payload_dir" "${archive_members[@]}" >/dev/null; then
+  echo "CAS archive required members must be self-contained root entries" >&2
+  exit 1
+fi
+
+for name in "${expected_members[@]}"; do
+  payload="$payload_dir/$name"
+  if [[ -L "$payload" || ! -f "$payload" || ! -x "$payload" ]]; then
+    echo "CAS archive member must be a regular executable: $name" >&2
+    exit 1
+  fi
+  if [[ -n "$(find "$payload" -type f -links +1 -print -quit)" ]]; then
+    echo "CAS archive member must not be a hard link: $name" >&2
+    exit 1
+  fi
+done
+
+dispatch_cases=(
+  account:cas_account
+  conformance:cas_conformance_suite
+  goal:cas_goal
+  instance_runner:cas_instance_runner
+  review_session:cas_review_session
+  session_inquiry:cas_session_inquiry
+  smoke_check:cas_smoke_check
+)
+if [[ "$target" == "darwin-arm64" ]]; then
+  dispatch_cases+=(trial:cas_trial)
+fi
+
+for dispatch_case in "${dispatch_cases[@]}"; do
+  subcommand="${dispatch_case%%:*}"
+  marker="${dispatch_case#*:}"
+  if ! output="$("$payload_dir/cas" "$subcommand" --help 2>&1)"; then
+    echo "packaged CAS dispatcher failed to launch $marker for subcommand $subcommand" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$marker" <<<"$output"; then
+    echo "packaged CAS dispatcher output for $subcommand did not identify $marker" >&2
+    exit 1
+  fi
+done
+
+if [[ "$target" == "linux-x86_64" ]] && "$payload_dir/cas" trial --help >/dev/null 2>&1; then
+  echo "non-Darwin packaged CAS dispatcher exposes the trial product" >&2
+  exit 1
+fi
+
+printf 'CAS archive verified: target=%s members=%s packaged_dispatch=pass\n' \
+  "$target" "${#expected_members[@]}"

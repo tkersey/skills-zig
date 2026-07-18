@@ -1553,6 +1553,120 @@ fn writeSplitResults(writer: *std.Io.Writer, metrics: []const SplitMetric) !void
     try writer.writeByte('}');
 }
 
+const FrozenPairOrder = struct {
+    first_arm_id: []const u8,
+    second_arm_id: []const u8,
+};
+
+fn frozenPairOrder(trial_root: std.json.ObjectMap, pair_id: []const u8) !?FrozenPairOrder {
+    for ((try requiredArray(trial_root, "units")).items) |unit_value| {
+        for ((try requiredArray(try object(unit_value), "pairs")).items) |pair_value| {
+            const pair = try object(pair_value);
+            if (!std.mem.eql(u8, try requiredString(pair, "pair_id"), pair_id)) continue;
+            const order = try requiredArray(pair, "order");
+            if (order.items.len != 2) return error.PairOrderInvalid;
+            return @as(?FrozenPairOrder, .{
+                .first_arm_id = try string(order.items[0]),
+                .second_arm_id = try string(order.items[1]),
+            });
+        }
+    }
+    return null;
+}
+
+fn pairHasTerminalLanes(
+    trial: *const hctp.TrialState,
+    pair_id: []const u8,
+    order: FrozenPairOrder,
+) bool {
+    const first = laneForArm(trial, pair_id, order.first_arm_id) orelse return false;
+    const second = laneForArm(trial, pair_id, order.second_arm_id) orelse return false;
+    return first.status.isTerminal() and second.status.isTerminal();
+}
+
+fn laneHasAbsoluteGrade(lane: *const hctp.LaneState) bool {
+    return lane.status == .completed and lane.absolute_graded and lane.grade_receipt_json != null;
+}
+
+fn writeOrderEffects(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    trial: *const hctp.TrialState,
+    trial_root: std.json.ObjectMap,
+    dimensions: std.json.Array,
+) !void {
+    if (!trial.revealed) return error.TrialNotRevealed;
+    const baseline_arm = trial.baseline_arm orelse return error.PairShapeInvalid;
+    const candidate_arm = trial.candidate_arm orelse return error.PairShapeInvalid;
+
+    var terminal_pairs: usize = 0;
+    var baseline_first_pairs: usize = 0;
+    var candidate_first_pairs: usize = 0;
+    for (trial.pairs.items) |pair| {
+        const order = try frozenPairOrder(trial_root, pair.id) orelse continue;
+        if (!pairHasTerminalLanes(trial, pair.id, order)) continue;
+        terminal_pairs += 1;
+        if (std.mem.eql(u8, order.first_arm_id, baseline_arm)) {
+            baseline_first_pairs += 1;
+        } else if (std.mem.eql(u8, order.first_arm_id, candidate_arm)) {
+            candidate_first_pairs += 1;
+        } else return error.PairOrderInvalid;
+    }
+
+    try writer.writeAll(
+        "{\"diagnostic_only\":true,\"causal_interpretation\":false," ++
+            "\"claim_bearing\":false,\"position_balance\":{\"terminal_pairs\":",
+    );
+    try writer.print(
+        "{d},\"baseline_first_pairs\":{d},\"candidate_first_pairs\":{d}}}," ++
+            "\"dimensions\":{{",
+        .{ terminal_pairs, baseline_first_pairs, candidate_first_pairs },
+    );
+    for (dimensions.items, 0..) |dimension_value, dimension_index| {
+        if (dimension_index != 0) try writer.writeByte(',');
+        const dimension_id = try string(dimension_value);
+        try writeString(writer, dimension_id);
+        try writer.writeAll(":{\"contributing_pairs\":");
+
+        var sum: f64 = 0;
+        var contributing_pairs: usize = 0;
+        var baseline_first_contributors: usize = 0;
+        var candidate_first_contributors: usize = 0;
+        for (trial.pairs.items) |pair| {
+            const order = try frozenPairOrder(trial_root, pair.id) orelse continue;
+            const first = laneForArm(trial, pair.id, order.first_arm_id) orelse continue;
+            const second = laneForArm(trial, pair.id, order.second_arm_id) orelse continue;
+            if (!laneHasAbsoluteGrade(first) or !laneHasAbsoluteGrade(second)) continue;
+            const first_score = try dimensionScore(allocator, first, dimension_id) orelse continue;
+            const second_score =
+                try dimensionScore(allocator, second, dimension_id) orelse continue;
+            sum += second_score - first_score;
+            contributing_pairs += 1;
+            if (std.mem.eql(u8, order.first_arm_id, baseline_arm)) {
+                baseline_first_contributors += 1;
+            } else if (std.mem.eql(u8, order.first_arm_id, candidate_arm)) {
+                candidate_first_contributors += 1;
+            } else return error.PairOrderInvalid;
+        }
+        try writer.print("{d},\"mean_second_minus_first\":", .{contributing_pairs});
+        // A single orientation confounds position with the semantic arm.
+        if (baseline_first_contributors == 0 or candidate_first_contributors == 0) {
+            try writer.writeAll("null");
+        } else {
+            try retrace_core.canonical_json.writeCanonicalFloat(
+                writer,
+                sum / @as(f64, @floatFromInt(contributing_pairs)),
+            );
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("}}");
+}
+
+fn trialResultIncludesOrderEffects(trial_schema: []const u8) bool {
+    return std.mem.eql(u8, trial_schema, hctp.PrivateTrialSchema);
+}
+
 pub fn resultAlloc(
     allocator: std.mem.Allocator,
     campaign_id: []const u8,
@@ -1565,6 +1679,25 @@ pub fn resultAlloc(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const trial_root = try object(try parseLeaky(arena, trial.trial_json));
+    const trial_schema = try requiredString(trial_root, "schema");
+    const private_trial = trialResultIncludesOrderEffects(trial_schema);
+    var private_evidence: ?retrace_core.hctp_trial_custody.RevealedEvidence = null;
+    if (private_trial and trial.revealed) {
+        const reveal_value = try parseLeaky(
+            arena,
+            trial.reveal_json orelse return error.RevealInvalid,
+        );
+        private_evidence = try retrace_core.hctp_trial_custody.revealedEvidence(
+            arena,
+            .{ .object = trial_root },
+            reveal_value,
+        );
+        if (!std.mem.eql(u8, private_evidence.?.baseline_arm_id, trial.baseline_arm orelse "") or
+            !std.mem.eql(u8, private_evidence.?.candidate_arm_id, trial.candidate_arm orelse ""))
+        {
+            return error.RevealCommitmentMismatch;
+        }
+    }
     const estimand = try requiredObject(trial_root, "estimand");
     const dimensions = try requiredArray(estimand, "primary_dimensions");
     const uncertainty = try requiredObject(estimand, "uncertainty");
@@ -1698,8 +1831,22 @@ pub fn resultAlloc(
     const factor = try requiredObject(trial_root, "factor");
     try out.writer.writeAll(",\"intervention\":{\"factor_kind\":");
     try writeString(&out.writer, try requiredString(factor, "kind"));
-    try out.writer.writeAll(",\"one_factor_closed\":true,\"witness_fingerprint\":");
-    try writeString(&out.writer, try requiredString(factor, "intervention_witness_fingerprint"));
+    try out.writer.writeAll(",\"one_factor_closed\":true");
+    if (private_trial and private_evidence == null) {
+        try out.writer.writeAll(",\"witness_commitment\":");
+        try writeString(&out.writer, try requiredString(factor, "intervention_witness_commitment"));
+        try out.writer.writeAll(",\"witness_fingerprint\":null");
+    } else {
+        const witness_fingerprint = if (private_evidence) |evidence|
+            try retrace_core.hctp_trial_custody.digestValueAlloc(
+                arena,
+                evidence.intervention_witness,
+            )
+        else
+            try requiredString(factor, "intervention_witness_fingerprint");
+        try out.writer.writeAll(",\"witness_fingerprint\":");
+        try writeString(&out.writer, witness_fingerprint);
+    }
     try out.writer.writeAll("},\"calibration\":{\"status\":");
     try writeString(&out.writer, @tagName(calibration));
     try out.writer.writeAll(",\"referenced_trials\":[");
@@ -1721,9 +1868,21 @@ pub fn resultAlloc(
         try out.writer.writeAll(",\"candidate_arm\":");
         try writeString(&out.writer, candidate_arm);
         try out.writer.writeAll(",\"baseline_target_fingerprint\":");
-        try writeString(&out.writer, try armValueFingerprint(trial_root, baseline_arm));
+        try writeString(
+            &out.writer,
+            if (private_evidence) |evidence|
+                try requiredString(evidence.baseline_treatment, "value_fingerprint")
+            else
+                try armValueFingerprint(trial_root, baseline_arm),
+        );
         try out.writer.writeAll(",\"candidate_target_fingerprint\":");
-        try writeString(&out.writer, try armValueFingerprint(trial_root, candidate_arm));
+        try writeString(
+            &out.writer,
+            if (private_evidence) |evidence|
+                try requiredString(evidence.candidate_treatment, "value_fingerprint")
+            else
+                try armValueFingerprint(trial_root, candidate_arm),
+        );
         try out.writer.writeByte('}');
         try out.writer.writeAll(",\"unit_results\":");
         try writeUnitResults(&out.writer, effects.units.items);
@@ -1731,6 +1890,10 @@ pub fn resultAlloc(
         try writeClusterResults(&out.writer, effects.clusters.items);
         try out.writer.writeAll(",\"split_results\":");
         try writeSplitResults(&out.writer, effects.splits.items);
+        if (private_trial) {
+            try out.writer.writeAll(",\"order_effects\":");
+            try writeOrderEffects(arena, &out.writer, trial, trial_root, dimensions);
+        }
         try out.writer.writeAll(",\"claims\":{\"absolute_qualification\":");
         try writeString(&out.writer, if (!comparable) "invalid" else if (qualified) "supported" else "unsupported");
         try out.writer.writeAll(",\"noninferiority\":");
@@ -2008,7 +2171,7 @@ test "oracle regressions and false passes preserve frozen criticality" {
     try std.testing.expect(try criticalFalsePass(arena, &trial, &critical));
 }
 
-test "paired effects collapse through units and independence clusters" {
+test "frozen closed v1 result remains byte identical across replay" {
     const grade_a1_lane = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -2080,6 +2243,8 @@ test "paired effects collapse through units and independence clusters" {
         .revealed = true,
         .baseline_arm = @constCast("arm-0"),
         .candidate_arm = @constCast("arm-1"),
+        .closed = true,
+        .close_status = @constCast("completed"),
     };
     var trial_items = [_]hctp.TrialState{trial};
     const trials = hctp.CampaignTrials{ .trials = .{ .items = &trial_items, .capacity = 1 } };
@@ -2115,6 +2280,184 @@ test "paired effects collapse through units and independence clusters" {
     try std.testing.expectEqualStrings("supported", try requiredString(claims, "absolute_qualification"));
     try std.testing.expectEqualStrings("supported", try requiredString(claims, "noninferiority"));
     try std.testing.expectEqualStrings("inconclusive", try requiredString(claims, "practice_gain"));
+    try std.testing.expect(root.get("order_effects") == null);
+    try std.testing.expectEqualStrings(
+        "sha256:1535da617b35dfcc6177474601b7b79fe9e15ac023ad6fb3b80a002c2b511e76",
+        try requiredString(root, "result_fingerprint"),
+    );
+    const result_bytes_fingerprint = try retrace_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        result,
+    );
+    defer std.testing.allocator.free(result_bytes_fingerprint);
+    try std.testing.expectEqualStrings(
+        "sha256:bb1c709aca56c9b64904551a24c1ff458c04f3cef6a12aab3a58cacb1affc855",
+        result_bytes_fingerprint,
+    );
+
+    var blind_trial = trial;
+    blind_trial.revealed = false;
+    blind_trial.baseline_arm = null;
+    blind_trial.candidate_arm = null;
+    var blind_items = [_]hctp.TrialState{blind_trial};
+    const blind_trials = hctp.CampaignTrials{ .trials = .{ .items = &blind_items, .capacity = 1 } };
+    const blind_result = try resultAlloc(
+        std.testing.allocator,
+        "cmp-test",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        &blind_trials,
+        &blind_items[0],
+        .{},
+    );
+    defer std.testing.allocator.free(blind_result);
+    try std.testing.expect(std.mem.indexOf(u8, blind_result, "\"order_effects\"") == null);
+}
+
+fn orderEffectsTestLane(
+    id: []const u8,
+    pair_id: []const u8,
+    arm_id: []const u8,
+    score: f64,
+    grade_receipt: []const u8,
+) hctp.LaneState {
+    return .{
+        .id = @constCast(id),
+        .unit_id = @constCast("unit-001"),
+        .scenario_id = @constCast("scenario-001"),
+        .pair_id = @constCast(pair_id),
+        .arm_id = @constCast(arm_id),
+        .status = .completed,
+        .absolute_graded = true,
+        .grade_status = @constCast("pass"),
+        .aggregate = score,
+        .critical_failure_count = 0,
+        .grade_receipt_json = @constCast(grade_receipt),
+    };
+}
+
+fn orderEffectsTestPair(id: []const u8, repeat_index: u64) hctp.PairState {
+    return .{
+        .id = @constCast(id),
+        .unit_id = @constCast("unit-001"),
+        .split = @constCast("practice"),
+        .independence_cluster_id = @constCast("cluster-001"),
+        .repeat_index = repeat_index,
+    };
+}
+
+test "v2 order effects accept balanced B A allocation and use frozen positions" {
+    const score_prefix =
+        "{\"dimensions\":[{\"id\":\"correctness\",\"score\":";
+    const score_suffix =
+        ",\"grader_kind\":\"deterministic\"}]," ++
+        "\"derived_critical_violations\":[],\"oracle_results\":[]}";
+    const score_02 = score_prefix ++ "0.2" ++ score_suffix;
+    const score_08 = score_prefix ++ "0.8" ++ score_suffix;
+    const score_04 = score_prefix ++ "0.4" ++ score_suffix;
+    const score_06 = score_prefix ++ "0.6" ++ score_suffix;
+    var lanes = [_]hctp.LaneState{
+        orderEffectsTestLane("lane-001-r1-a0", "pair-001-r1", "arm-0", 0.2, score_02),
+        orderEffectsTestLane("lane-001-r1-a1", "pair-001-r1", "arm-1", 0.8, score_08),
+        // Lane storage order is A/B even though the frozen second pair order is B/A.
+        orderEffectsTestLane("lane-001-r2-a0", "pair-001-r2", "arm-0", 0.6, score_06),
+        orderEffectsTestLane("lane-001-r2-a1", "pair-001-r2", "arm-1", 0.4, score_04),
+    };
+    var pairs = [_]hctp.PairState{
+        orderEffectsTestPair("pair-001-r1", 1),
+        orderEffectsTestPair("pair-001-r2", 2),
+    };
+    const trial = hctp.TrialState{
+        .id = @constCast("trial-valid-001"),
+        .fingerprint = @constCast(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        .purpose = @constCast("practice_repair"),
+        .arm0_id = @constCast("arm-0"),
+        .arm1_id = @constCast("arm-1"),
+        .arm_map_commitment = @constCast(
+            "sha256:da53dc0c43de582545d4c0472985a7c9647141ea457178cdd3bb956946bb7a71",
+        ),
+        .trial_json = @constCast(fixtures.valid_trial),
+        .lanes = .{ .items = &lanes, .capacity = lanes.len },
+        .pairs = .{ .items = &pairs, .capacity = pairs.len },
+        .requires_pair_grade = false,
+        .registration_sequence = 1,
+        .registration_event_digest = @constCast(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        .revealed = true,
+        .baseline_arm = @constCast("arm-0"),
+        .candidate_arm = @constCast("arm-1"),
+    };
+    try std.testing.expect(!trialResultIncludesOrderEffects(hctp.TrialSchema));
+    try std.testing.expect(trialResultIncludesOrderEffects(hctp.PrivateTrialSchema));
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const trial_root = try object(try parseLeaky(arena, fixtures.valid_trial));
+    const dimensions = try requiredArray(
+        try requiredObject(trial_root, "estimand"),
+        "primary_dimensions",
+    );
+    var order_effects_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer order_effects_json.deinit();
+    try writeOrderEffects(
+        arena,
+        &order_effects_json.writer,
+        &trial,
+        trial_root,
+        dimensions,
+    );
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        order_effects_json.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    const order_effects = try object(parsed.value);
+    const balance = try requiredObject(order_effects, "position_balance");
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try integer(try required(balance, "terminal_pairs")),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try integer(try required(balance, "baseline_first_pairs")),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try integer(try required(balance, "candidate_first_pairs")),
+    );
+    const correctness = try requiredObject(
+        try requiredObject(order_effects, "dimensions"),
+        "correctness",
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try integer(try required(correctness, "contributing_pairs")),
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0.4),
+        try numeric(try required(correctness, "mean_second_minus_first")),
+        1e-12,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        order_effects_json.written(),
+        "\"diagnostic_only\":true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        order_effects_json.written(),
+        "\"causal_interpretation\":false",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        order_effects_json.written(),
+        "\"claim_bearing\":false",
+    ) != null);
 }
 
 test "promotion sentinel registration rejects absent and late calibration trials" {

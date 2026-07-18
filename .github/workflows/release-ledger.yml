@@ -58,6 +58,88 @@ jobs:
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build ledger binary
         run: zig build build-ledger -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+      - name: Verify portable and platform-gated Hylo surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./zig-out/bin/ledger validate hylo-trial \
+            --input testdata/hctp-v1/valid-trial.json > hylo-trial-validation.json
+          jq -e '
+            .schema == "ledger-validate-decision/v1" and
+            .contract == "hylo-trial" and
+            .verdict == "pass" and
+            .authority_granted == false and
+            .storage_mutated == false
+          ' hylo-trial-validation.json >/dev/null
+
+          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
+            help="$(./zig-out/bin/ledger --source hylo --help)"
+            for surface in \
+              compile-trial \
+              validate-trial \
+              register-trial \
+              start-lane \
+              commit-lane-start \
+              lane-materialization \
+              reveal-trial
+            do
+              if ! rg -q -- "$surface" <<<"$help"; then
+                echo "macOS Hylo help missing ${surface}" >&2
+                exit 1
+              fi
+            done
+            for protected_fd in \
+              '--custody-output-fd N' \
+              '--custody-input-fd N' \
+              '--materialization-output-fd N'
+            do
+              if ! rg -q -- "$protected_fd" <<<"$help"; then
+                echo "macOS Hylo help missing canonical protected FD: ${protected_fd}" >&2
+                exit 1
+              fi
+            done
+            for compatibility_fd in '--reveal-output-fd N' '--reveal-material-fd N'; do
+              if ! rg -q -- "$compatibility_fd" <<<"$help"; then
+                echo "macOS Hylo help missing compatibility FD: ${compatibility_fd}" >&2
+                exit 1
+              fi
+            done
+            capabilities="$(./zig-out/bin/ledger --source hylo capabilities)"
+            for feature in \
+              hylo_trial_v1 \
+              hylo_trial_v2 \
+              hylo_trial_compiler_v1 \
+              hylo_reveal_material_fd_v1 \
+              hylo_private_trial_custody_v1 \
+              hylo_trial_custody_fd_v1 \
+              hylo_private_lane_start_custody_fd_v1 \
+              hylo_trial_build_receipt_v2 \
+              hylo_lane_materialization_v1 \
+              hylo_lane_materialization_receipt_v2 \
+              hylo_trial_reveal_v1 \
+              hylo_trial_reveal_v2 \
+              hylo_run_receipt_v2
+            do
+              if ! jq -e --arg feature "$feature" \
+                '.schema == "hylo-capabilities/v1" and (.features | index($feature) != null)' \
+                <<<"$capabilities" >/dev/null
+              then
+                echo "macOS Hylo capabilities missing ${feature}" >&2
+                exit 1
+              fi
+            done
+          elif ./zig-out/bin/ledger --source hylo --help >/tmp/hylo-help 2>&1 || \
+            ./zig-out/bin/ledger --source hylo capabilities >/tmp/hylo-capabilities 2>&1
+          then
+            echo "non-macOS Ledger exposes the Hylo product source" >&2
+            exit 1
+          fi
+      - name: Exercise packaged Ledger trial compile and registration
+        if: matrix.target == 'darwin-arm64'
+        run: >-
+          zig build test-hylo-operator-recipe-ledger-release-runtime
+          -Dhylo-operator-ledger-path="${PWD}/zig-out/bin/ledger"
+          --summary all
       - name: Package ledger artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"

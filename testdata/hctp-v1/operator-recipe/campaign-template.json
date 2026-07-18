@@ -1,0 +1,111 @@
+{
+  "schema": "hylo-campaign/v1",
+  "campaign_id": "campaign-operator-recipe",
+  "target": {
+    "kind": "skill",
+    "id": "hylo",
+    "baseline_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "identity_contract": "bundle_snapshot/v1",
+    "baseline_bundle_fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "source": {
+    "corpus_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "session_refs": [
+      {
+        "kind": "seq_source_selection",
+        "ref": "selection.json",
+        "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    ],
+    "exclusions": [
+      "current_session"
+    ]
+  },
+  "privacy": {
+    "mode": "sanitized",
+    "redactions": [
+      "secrets",
+      "private_reasoning"
+    ],
+    "redaction_receipt": {
+      "schema": "hylo-redaction-receipt/v1",
+      "tool": "seq",
+      "version": "test",
+      "source_fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "output_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "evidence_refs": [
+        "seq:redaction-test"
+      ]
+    }
+  },
+  "rubric": {
+    "id": "rubric-test",
+    "fingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "dimensions": [
+      {
+        "id": "correctness",
+        "kind": "deterministic",
+        "weight": 1.0,
+        "critical": true,
+        "grader_ref": "test:dimension",
+        "grader_fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    ],
+    "judge": {
+      "kind": "composite",
+      "id": "test-judge",
+      "version": "1",
+      "config_fingerprint": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    "pass_policy": {
+      "minimum_aggregate": 1.0,
+      "zero_critical_violations": true
+    }
+  },
+  "replay_policy": {
+    "fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "blind_hidden_reference": true,
+    "holdout_blind": true,
+    "default_fidelity": "controlled_replay",
+    "repeat_count": 1
+  },
+  "stop_policy": {
+    "max_attempts": 10,
+    "require_holdout_pass": false,
+    "zero_critical_violations": true
+  },
+  "change_policy": {
+    "target_change_authority": "apply_via_owner",
+    "publication_authority": "none",
+    "allowed_paths": [
+      "target.txt"
+    ],
+    "require_clean_scope": true
+  },
+  "scenarios_file": "scenarios.jsonl",
+  "scenario_manifest": [
+    {
+      "scenario_id": "scenario-direct",
+      "scenario_fingerprint": "sha256:4dc86919192d586496b55d9bb423c9ddf7dff8ce911c0680966ba16c5d921940",
+      "split": "practice"
+    },
+    {
+      "scenario_id": "scenario-historical",
+      "scenario_fingerprint": "sha256:2d7e02f2316e34f382d6bf87f4296f22626eab72e8fbed046c34040b520abf92",
+      "split": "practice"
+    }
+  ],
+  "protocol_profiles": [
+    "hylo-trial/v1",
+    "hylo-trial/v2"
+  ],
+  "canonical_json_profile": "hylo-canonical-json/v1",
+  "trial_policy": {
+    "publication_claims": [
+      "absolute_qualification",
+      "noninferiority",
+      "practice_gain"
+    ],
+    "source_route_admission": "required"
+  }
+}

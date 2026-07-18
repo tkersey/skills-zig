@@ -1,7 +1,13 @@
 const std = @import("std");
+const cas_session_inquiry = @import("cas_session_inquiry");
 const durable_store = @import("durable_store");
 
 const MaxBytes = 96 * 1024 * 1024;
+const SourceTurnDigest =
+    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const AnchorDigest =
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -16,6 +22,11 @@ pub fn main(init: std.process.Init) !void {
     });
     defer parsed.deinit();
     const request = try object(parsed.value);
+    const request_schema = try requiredString(request, "schema");
+    const historical_request = std.mem.eql(u8, request_schema, "cas-trial-executor-request/v2");
+    if (!historical_request and !std.mem.eql(u8, request_schema, "cas-trial-executor-request/v1")) {
+        return error.ExecutorRequestSchemaInvalid;
+    }
     const workspace = try requiredString(request, "workspace");
     const executable_fingerprint = try fileFingerprintAlloc(allocator, argv[0]);
     defer allocator.free(executable_fingerprint);
@@ -45,6 +56,22 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return error.FactorMaterializationReferenceInvalid,
     };
+    if (request.get("source_episode_id") != null and request.get("source_episode_id").? != .null) {
+        if (!historical_request) return error.HistoricalExecutorRequestV2Required;
+        inline for (.{
+            .{ "historical_dcp_ref", "historical_dcp_fingerprint" },
+            .{ "historical_rip_ref", "historical_rip_fingerprint" },
+        }) |binding| {
+            const observed = try fileFingerprintAlloc(
+                allocator,
+                try requiredString(request, binding[0]),
+            );
+            defer allocator.free(observed);
+            if (!std.mem.eql(u8, observed, try requiredString(request, binding[1]))) {
+                return error.HistoricalReplayFingerprintMismatch;
+            }
+        }
+    }
     const target_snapshot = try requiredString(request, "target_snapshot_fingerprint");
     const target_package_ref = optionalString(request, "target_materialization_package_ref");
     var target_bytes: ?[]u8 = null;
@@ -88,6 +115,17 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(execution_audit_json);
     const audit_path = try writeEvidence(allocator, workspace, "execution-audit.json", execution_audit_json);
     defer audit_path.deinit(allocator);
+    const fir_receipt = if (historical_request)
+        try historicalFirReceiptAlloc(
+            allocator,
+            request,
+            workspace,
+            output_path.path,
+            trace_path.path,
+        )
+    else
+        null;
+    defer if (fir_receipt) |receipt| allocator.free(receipt);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -143,10 +181,107 @@ pub fn main(init: std.process.Init) !void {
     try writeString(&out.writer, world_path.path);
     try out.writer.writeAll(",\"metrics_path\":");
     try writeString(&out.writer, metrics_path.path);
-    try out.writer.writeAll("}}\n");
+    try out.writer.writeByte('}');
+    if (fir_receipt) |receipt| {
+        try out.writer.writeAll(
+            ",\"target_instruction_count\":1," ++
+                "\"source_target_text_presented\":false,\"fir_receipt\":",
+        );
+        try out.writer.writeAll(receipt);
+    }
+    try out.writer.writeAll("}\n");
     const result = try out.toOwnedSlice();
     defer allocator.free(result);
     try durable_store.writeTextAtomic(allocator, argv[4], result);
+}
+
+fn historicalFirReceiptAlloc(
+    allocator: std.mem.Allocator,
+    request: std.json.ObjectMap,
+    workspace: []const u8,
+    output_path: []const u8,
+    trace_path: []const u8,
+) ![]u8 {
+    const trial_id = try requiredString(request, "trial_id");
+    const lane_id = try requiredString(request, "lane_id");
+    const source_episode_id = try requiredString(request, "source_episode_id");
+    const fir_json = try cas_session_inquiry.packagedFirReceiptJsonAlloc(allocator, .{
+        .receipt_id = "FIR-sealed-historical-fixture",
+        .inquiry_id = trial_id,
+        .lane_id = lane_id,
+        .capsule_id = "DCP-sealed-fixture",
+        .source_episode_id = source_episode_id,
+        .source_thread_id = "",
+        .source_thread_id_present = false,
+        .source_rollout_path = "fixture:sealed-rollout",
+        .source_artifact_reconstructability = "transcript_only",
+        .source_turn_digest = SourceTurnDigest,
+        .lineage_mode = "rollout_transcript",
+        .fork_thread_id = "sealed-fixture-fork",
+        .forked_from_id = "",
+        .temporal_horizon = "pre_decision",
+        .turns_before = 3,
+        .turns_dropped = 2,
+        .turns_after = 1,
+        .anchor_digest_expected = AnchorDigest,
+        .anchor_digest_observed = AnchorDigest,
+        .anchor_exact = true,
+        .model = "fixture-model",
+        .model_provider = "fixture-provider",
+        .service_tier = "fixture",
+        .codex_version = "fixture",
+        .ephemeral = true,
+        .permissions = "read-only",
+        .sandbox = "read-only",
+        .hooks = "inherit",
+        .workspace_mode = "transcript_only",
+        .workspace_path = workspace,
+        .inquiry_mode = "replay",
+        .question = "Which bounded route should be selected?",
+        .client_user_message_id = "sealed-fixture-user-message",
+        .turn_id = "sealed-fixture-turn",
+        .started_at = 1,
+        .ended_at = 2,
+        .status = "completed",
+        .reconstructed_decision = "bounded decision",
+        .selected_route = "route-executed",
+        .rejected_routes = &[_][]const u8{},
+        .evidence_refs = &[_][]const u8{},
+        .assumptions = &[_][]const u8{},
+        .alternatives = &[_][]const u8{},
+        .route_flip_conditions = &[_][]const u8{},
+        .uncertainty = "low",
+        .hindsight_available = false,
+        .unsupported_claims = &[_][]const u8{},
+        .final_text_ref = output_path,
+        .event_log_ref = trace_path,
+        .archived = false,
+        .deleted = false,
+        .cleanup_status = "ephemeral_runtime_closed",
+        .permissions_valid = true,
+        .approval_or_tool_request_observed = false,
+        .hindsight_label_valid = true,
+        .answer_complete = true,
+        .receipt_valid = true,
+    });
+    defer allocator.free(fir_json);
+    const trimmed = std.mem.trimEnd(u8, fir_json, " \t\r\n");
+    return std.fmt.allocPrint(
+        allocator,
+        "{s},\"replay_binding\":{{\"trial_id\":{f},\"lane_id\":{f}," ++
+            "\"source_profile_fingerprint\":{f}," ++
+            "\"historical_dcp_fingerprint\":{f}," ++
+            "\"historical_rip_fingerprint\":{f},\"required_lineage\":{f}}}}}",
+        .{
+            trimmed[0 .. trimmed.len - 1],
+            std.json.fmt(trial_id, .{}),
+            std.json.fmt(lane_id, .{}),
+            std.json.fmt(try requiredString(request, "source_profile_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "historical_dcp_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "historical_rip_fingerprint"), .{}),
+            std.json.fmt(try requiredString(request, "required_lineage"), .{}),
+        },
+    );
 }
 
 const Evidence = struct {
