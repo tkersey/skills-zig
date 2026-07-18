@@ -392,6 +392,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("apps/ledger/scripts/hylo.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
