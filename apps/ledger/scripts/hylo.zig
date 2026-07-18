@@ -3744,9 +3744,19 @@ const LeaseDelivery = struct {
     fd: std.posix.fd_t,
     writer: LeaseRecordWriter,
 };
+const DescriptorStat = struct {
+    device: i128,
+    inode: u128,
+    nlink: u64,
+    mode: u32,
+    size: i128,
+};
 const MinimumPipeBuf: usize = 512;
 extern "c" fn fpathconf(fd: c_int, name: c_int) c_long;
+extern "c" fn fstatfs(fd: c_int, buffer: *anyopaque) c_int;
 const DarwinPipeBufPathconfName: c_int = 6;
+const LinuxPipeFsMagic: c_long = 0x50495045;
+const LinuxStatFsBufferBytes: usize = 256;
 
 fn validateCanonicalLaneLease(lease: []const u8) !void {
     if (lease.len != "HYL1-".len + 64 or !std.mem.startsWith(u8, lease, "HYL1-")) {
@@ -3773,17 +3783,69 @@ fn writeLaneLeaseRecord(fd: std.posix.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn sameFdEndpoint(expected: std.c.Stat, fd: std.posix.fd_t) bool {
-    var actual: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &actual) != 0) return false;
-    return expected.dev == actual.dev and expected.ino == actual.ino;
+fn descriptorStat(fd: std.posix.fd_t) ?DescriptorStat {
+    if (comptime builtin.os.tag == .linux) {
+        var stat: std.os.linux.Statx = undefined;
+        const result = std.os.linux.statx(
+            fd,
+            "",
+            std.os.linux.AT.EMPTY_PATH,
+            std.os.linux.STATX.BASIC_STATS,
+            &stat,
+        );
+        if (std.os.linux.errno(result) != .SUCCESS or
+            !stat.mask.TYPE or
+            !stat.mask.NLINK or
+            !stat.mask.INO or
+            !stat.mask.SIZE)
+        {
+            return null;
+        }
+        const device = (@as(u64, stat.dev_major) << 32) | @as(u64, stat.dev_minor);
+        return .{
+            .device = @intCast(device),
+            .inode = stat.ino,
+            .nlink = stat.nlink,
+            .mode = stat.mode,
+            .size = stat.size,
+        };
+    } else {
+        var stat: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat) != 0) return null;
+        return .{
+            .device = @intCast(stat.dev),
+            .inode = @intCast(stat.ino),
+            .nlink = @intCast(stat.nlink),
+            .mode = @intCast(stat.mode),
+            .size = @intCast(stat.size),
+        };
+    }
+}
+
+fn sameDescriptorEndpoint(left: DescriptorStat, right: DescriptorStat) bool {
+    return left.device == right.device and left.inode == right.inode;
+}
+
+fn sameFdEndpoint(expected: DescriptorStat, fd: std.posix.fd_t) bool {
+    const actual = descriptorStat(fd) orelse return false;
+    return sameDescriptorEndpoint(expected, actual);
+}
+
+fn isAnonymousPipe(fd: std.posix.fd_t, endpoint: DescriptorStat) bool {
+    if (!std.c.S.ISFIFO(endpoint.mode)) return false;
+    if (comptime builtin.os.tag == .linux) {
+        var buffer: [LinuxStatFsBufferBytes]u8 align(@alignOf(c_long)) = undefined;
+        if (fstatfs(fd, &buffer) != 0) return false;
+        const filesystem_type: *const c_long = @ptrCast(&buffer);
+        return filesystem_type.* == LinuxPipeFsMagic;
+    }
+    return endpoint.nlink == 0;
 }
 
 fn validateLeaseOutputEndpoint(fd: std.posix.fd_t) !void {
     if (fd < 3) return error.InvalidFd;
 
-    var endpoint: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &endpoint) != 0) return error.InvalidFd;
+    const endpoint = descriptorStat(fd) orelse return error.InvalidFd;
     if (sameFdEndpoint(endpoint, std.posix.STDIN_FILENO) or
         sameFdEndpoint(endpoint, std.posix.STDOUT_FILENO) or
         sameFdEndpoint(endpoint, std.posix.STDERR_FILENO))
@@ -3794,7 +3856,7 @@ fn validateLeaseOutputEndpoint(fd: std.posix.fd_t) !void {
     const raw_flags = std.c.fcntl(fd, std.c.F.GETFL);
     if (raw_flags < 0) return error.InvalidFd;
     const flags: std.c.O = @bitCast(@as(u32, @intCast(raw_flags)));
-    if (!std.c.S.ISFIFO(endpoint.mode) or endpoint.nlink != 0 or flags.ACCMODE != .WRONLY) {
+    if (!isAnonymousPipe(fd, endpoint) or flags.ACCMODE != .WRONLY) {
         return error.LeaseOutputEndpointUnbound;
     }
 }
@@ -3802,8 +3864,7 @@ fn validateLeaseOutputEndpoint(fd: std.posix.fd_t) !void {
 fn validateLeaseInputEndpoint(fd: std.posix.fd_t) !void {
     if (fd < 3) return error.InvalidFd;
 
-    var endpoint: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &endpoint) != 0) return error.InvalidFd;
+    const endpoint = descriptorStat(fd) orelse return error.InvalidFd;
     if (sameFdEndpoint(endpoint, std.posix.STDIN_FILENO) or
         sameFdEndpoint(endpoint, std.posix.STDOUT_FILENO) or
         sameFdEndpoint(endpoint, std.posix.STDERR_FILENO))
@@ -3814,7 +3875,7 @@ fn validateLeaseInputEndpoint(fd: std.posix.fd_t) !void {
     const raw_flags = std.c.fcntl(fd, std.c.F.GETFL);
     if (raw_flags < 0) return error.InvalidFd;
     const flags: std.c.O = @bitCast(@as(u32, @intCast(raw_flags)));
-    if (!std.c.S.ISFIFO(endpoint.mode) or endpoint.nlink != 0 or flags.ACCMODE != .RDONLY) {
+    if (!isAnonymousPipe(fd, endpoint) or flags.ACCMODE != .RDONLY) {
         return error.LeaseInputEndpointUnbound;
     }
 }
@@ -3858,12 +3919,9 @@ fn validateRevealInputEndpoint(fd: std.posix.fd_t) !void {
 }
 
 fn requireDistinctSensitiveFds(left: std.posix.fd_t, right: std.posix.fd_t) !void {
-    var left_stat: std.c.Stat = undefined;
-    var right_stat: std.c.Stat = undefined;
-    if (std.c.fstat(left, &left_stat) != 0 or
-        std.c.fstat(right, &right_stat) != 0 or
-        (left_stat.dev == right_stat.dev and left_stat.ino == right_stat.ino))
-    {
+    const left_stat = descriptorStat(left) orelse return error.SensitiveFdAliased;
+    const right_stat = descriptorStat(right) orelse return error.SensitiveFdAliased;
+    if (sameDescriptorEndpoint(left_stat, right_stat)) {
         return error.SensitiveFdAliased;
     }
 }
@@ -4849,15 +4907,12 @@ fn cmdLaneMaterialization(
         try validateRevealInputEndpoint(custody_fd);
         try validateLeaseInputEndpoint(lease_fd);
         try validateRevealOutputEndpoint(output_fd);
-        var custody_stat: std.c.Stat = undefined;
-        var lease_stat: std.c.Stat = undefined;
-        var output_stat: std.c.Stat = undefined;
-        if (std.c.fstat(custody_fd, &custody_stat) != 0 or
-            std.c.fstat(lease_fd, &lease_stat) != 0 or
-            std.c.fstat(output_fd, &output_stat) != 0 or
-            (custody_stat.dev == lease_stat.dev and custody_stat.ino == lease_stat.ino) or
-            (custody_stat.dev == output_stat.dev and custody_stat.ino == output_stat.ino) or
-            (lease_stat.dev == output_stat.dev and lease_stat.ino == output_stat.ino))
+        const custody_stat = descriptorStat(custody_fd) orelse return error.SensitiveFdAliased;
+        const lease_stat = descriptorStat(lease_fd) orelse return error.SensitiveFdAliased;
+        const output_stat = descriptorStat(output_fd) orelse return error.SensitiveFdAliased;
+        if (sameDescriptorEndpoint(custody_stat, lease_stat) or
+            sameDescriptorEndpoint(custody_stat, output_stat) or
+            sameDescriptorEndpoint(lease_stat, output_stat))
         {
             return error.SensitiveFdAliased;
         }
@@ -27154,6 +27209,28 @@ test "hylo rejects a second promotion cohort for the same applied target epoch a
     try std.testing.expectEqual(@as(usize, 1), promotion_count);
 }
 
+test "hylo anonymous pipe boundary rejects a linked fifo" {
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    const read_stat = descriptorStat(pipe_fds[0]) orelse return error.TestFdSetupFailed;
+    const write_stat = descriptorStat(pipe_fds[1]) orelse return error.TestFdSetupFailed;
+    try std.testing.expect(isAnonymousPipe(pipe_fds[0], read_stat));
+    try std.testing.expect(isAnonymousPipe(pipe_fds[1], write_stat));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const fifo_path = try std.fs.path.join(std.testing.allocator, &.{ root, "linked.fifo" });
+    defer std.testing.allocator.free(fifo_path);
+    var linked_fifo = try testOpenFifo(std.testing.allocator, fifo_path, "600");
+    defer linked_fifo.close(std.testing.io);
+    const fifo_stat = descriptorStat(linked_fifo.handle) orelse return error.TestFdSetupFailed;
+    try std.testing.expect(!isAnonymousPipe(linked_fifo.handle, fifo_stat));
+}
+
 test "hylo lease input requires one exact canonical record on an anonymous read pipe" {
     const canonical = "HYL1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     var tmp = std.testing.tmpDir(.{});
@@ -27315,9 +27392,8 @@ test "hylo lane start rejects regular character and socket lease sinks without a
             lease_file.handle,
         ),
     );
-    var lease_stat: std.c.Stat = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fstat(lease_file.handle, &lease_stat));
-    try std.testing.expectEqual(@as(i64, 0), lease_stat.size);
+    const lease_stat = descriptorStat(lease_file.handle) orelse return error.TestFdSetupFailed;
+    try std.testing.expectEqual(@as(i128, 0), lease_stat.size);
 
     var null_file = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{});
     defer null_file.close(std.testing.io);
