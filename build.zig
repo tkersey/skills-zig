@@ -974,11 +974,9 @@ pub fn build(b: *std.Build) void {
         .{ .link_libc = true },
     );
     const run_cas_dispatch_runtime_linux: ?*std.Build.Step = if (b.graph.host.result.os.tag == .linux and target.result.os.tag == .linux) cas_dispatch_runtime_linux: {
-        const cas_dispatch_run = b.addSystemCommand(&.{
-            b.getInstallPath(.bin, "cas"),
-            "review",
-            "--help",
-        });
+        const cas_dispatch_run = b.addSystemCommand(
+            &.{ b.getInstallPath(.bin, "cas"), "review", "--help" },
+        );
         cas_dispatch_run.step.dependOn(&cas_install.step);
         cas_dispatch_run.step.dependOn(&cas_review_session_install.step);
         cas_dispatch_run.expectStdOutMatch("cas review");

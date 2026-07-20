@@ -109,7 +109,7 @@ dispatch_cases=(
   conformance:cas_conformance_suite
   goal:cas_goal
   instance_runner:cas_instance_runner
-  review_session:cas_review_session
+  review:cas_review_session
   session_inquiry:cas_session_inquiry
   smoke_check:cas_smoke_check
 )
@@ -120,12 +120,16 @@ fi
 for dispatch_case in "${dispatch_cases[@]}"; do
   subcommand="${dispatch_case%%:*}"
   marker="${dispatch_case#*:}"
+  expected_marker="$marker"
+  if [[ "$subcommand" == "review" ]]; then
+    expected_marker="cas review"
+  fi
   if ! output="$("$payload_dir/cas" "$subcommand" --help 2>&1)"; then
     echo "packaged CAS dispatcher failed to launch $marker for subcommand $subcommand" >&2
     printf '%s\n' "$output" >&2
     exit 1
   fi
-  if ! grep -Fq -- "$marker" <<<"$output"; then
+  if ! grep -Fq -- "$expected_marker" <<<"$output"; then
     echo "packaged CAS dispatcher output for $subcommand did not identify $marker" >&2
     exit 1
   fi
