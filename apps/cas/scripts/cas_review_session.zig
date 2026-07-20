@@ -5800,7 +5800,10 @@ fn printStatusJson(
     else
         false;
     const attempt_fields = identityReviewAttemptFields(
-        if (wait_tuple_verdict_exists) "normalized_verdict" else statusReviewAttemptPhase(status, timed_out),
+        if (wait_tuple_verdict_exists)
+            "normalized_verdict"
+        else
+            statusReviewAttemptPhase(status, timed_out),
         wait_tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
@@ -8729,7 +8732,10 @@ fn buildReviewVerdictJsonAlloc(
     event_log_path: ?[]const u8,
     review_result_json: ?[]const u8,
 ) ![]u8 {
-    const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
+    const findings_json = compactFindingsJsonAlloc(
+        allocator,
+        review_result_json,
+    ) catch try allocator.dupe(u8, "[]");
     defer allocator.free(findings_json);
     const status = reviewVerdictStatus(clean, finding_count, failure, review_thread_id);
     const normalized_clean = std.mem.eql(u8, status, "clean") and (clean orelse false);
@@ -9936,7 +9942,11 @@ test "dirty subject capture binds untracked symlinks without following them" {
     try runTestGitCommand(allocator, root, &.{ "config", "user.email", "cas-test@example.com" });
     try runTestGitCommand(allocator, root, &.{ "config", "user.name", "CAS Test" });
     try runTestGitCommand(allocator, root, &.{ "config", "commit.gpgsign", "false" });
-    try runTestGitCommand(allocator, root, &.{ "commit", "--quiet", "--allow-empty", "-m", "initial" });
+    try runTestGitCommand(
+        allocator,
+        root,
+        &.{ "commit", "--quiet", "--allow-empty", "-m", "initial" },
+    );
     try tmp.dir.createDirPath(io, "target-dir");
     try tmp.dir.symLink(io, "target-dir", "dir-link", .{ .is_directory = true });
     try tmp.dir.symLink(io, "missing-a", "dangling", .{});
