@@ -3284,15 +3284,51 @@ fn dirtyStateDigestAlloc(
         hasher.update("\x00");
         const absolute_path = try std.fs.path.join(allocator, &.{ cwd, path });
         defer allocator.free(absolute_path);
-        const bytes = try readFileAlloc(allocator, absolute_path, 16 * 1024 * 1024);
-        defer allocator.free(bytes);
-        hasher.update(bytes);
+        try hashUntrackedEntry(allocator, io, &hasher, absolute_path);
     }
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
+fn hashUntrackedEntry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    absolute_path: []const u8,
+) !void {
+    const stat = try std.Io.Dir.cwd().statFile(
+        io,
+        absolute_path,
+        .{ .follow_symlinks = false },
+    );
+    hasher.update("kind\x00");
+    hasher.update(@tagName(stat.kind));
+    hasher.update("\x00");
+    switch (stat.kind) {
+        .file => {
+            const bytes = try readFileAlloc(
+                allocator,
+                absolute_path,
+                16 * 1024 * 1024,
+            );
+            defer allocator.free(bytes);
+            hasher.update(bytes);
+        },
+        .sym_link => {
+            var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const target_len = try std.Io.Dir.readLinkAbsolute(
+                io,
+                absolute_path,
+                &target_buffer,
+            );
+            hasher.update("target\x00");
+            hasher.update(target_buffer[0..target_len]);
+        },
+        else => {},
+    }
 }
 
 fn canonicalTargetAlloc(
@@ -5734,9 +5770,38 @@ fn printStatusJson(
     const allocator = scratch_arena.allocator();
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
+    const effective_failure = failure;
+    const review_verdict_json_opt = if (identity) |target_identity|
+        try startWaitReviewVerdictJsonAlloc(
+            allocator,
+            target_identity,
+            review_thread_id,
+            review_turn_id,
+            record_path orelse "",
+            event_log_path,
+            receipt,
+            status,
+            timed_out orelse false,
+            true,
+            effective_failure,
+        )
+    else
+        null;
+    defer if (review_verdict_json_opt) |value| allocator.free(value);
+    const wait_tuple_verdict_exists = if (identity) |target_identity|
+        startReceiptTupleVerdictExists(
+            allocator,
+            review_verdict_json_opt,
+            review_thread_id,
+            target_identity,
+            status,
+            timed_out orelse false,
+        )
+    else
+        false;
     const attempt_fields = identityReviewAttemptFields(
-        statusReviewAttemptPhase(status, timed_out),
-        false,
+        if (wait_tuple_verdict_exists) "normalized_verdict" else statusReviewAttemptPhase(status, timed_out),
+        wait_tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
         identity,
@@ -5776,7 +5841,6 @@ fn printStatusJson(
     const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.requested_multi_agent_mode);
     const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.effective_multi_agent_mode);
     const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, receipt.multi_agent_mode_support);
-    const effective_failure = failure;
     const failure_code_json = if (effective_failure) |value|
         try quoteJsonStringAlloc(allocator, value.code)
     else
@@ -5821,19 +5885,6 @@ fn printStatusJson(
     if (action == .wait) {
         if (identity) |target_identity| {
             const target_record = target orelse return error.MissingSessionTarget;
-            const review_verdict_json_opt = try startWaitReviewVerdictJsonAlloc(
-                allocator,
-                target_identity,
-                review_thread_id,
-                review_turn_id,
-                record_path orelse "",
-                event_log_path,
-                status,
-                timed_out orelse false,
-                true,
-                effective_failure,
-            );
-            defer if (review_verdict_json_opt) |value| allocator.free(value);
             if (review_verdict_json_opt) |review_verdict_json| {
                 const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
                     allocator,
@@ -5873,6 +5924,11 @@ fn printStatusJson(
             }
         }
     }
+    const review_verdict_suffix = if (review_verdict_json_opt) |value|
+        try std.fmt.allocPrint(allocator, ",\"reviewVerdict\":{s}", .{value})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(review_verdict_suffix);
 
     try stdout.print(
         "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\"",
@@ -5936,7 +5992,7 @@ fn printStatusJson(
             "\"failureHint\":{s}{s},\"hookSummary\":{s}," ++
             "\"reviewResultAvailable\":{s},\"reviewResultSource\":{s}," ++
             "\"reviewResult\":{s},\"rawReviewText\":{s}," ++
-            "\"structuredFindingCount\":{s},\"clean\":{s}}}\n",
+            "\"structuredFindingCount\":{s},\"clean\":{s}{s}}}\n",
         .{
             timeout_json,
             timed_out_json,
@@ -5950,6 +6006,7 @@ fn printStatusJson(
             review_text_json,
             structured_finding_count_json,
             clean_json,
+            review_verdict_suffix,
         },
     );
 }
@@ -5961,6 +6018,7 @@ fn startWaitReviewVerdictJsonAlloc(
     review_turn_id: ?[]const u8,
     record_path: []const u8,
     event_log_path: []const u8,
+    receipt: OutputReceipt,
     status: ?ReviewStatus,
     timed_out: bool,
     waited: bool,
@@ -6011,6 +6069,7 @@ fn startWaitReviewVerdictJsonAlloc(
         finding_count,
         effective_failure,
         identity,
+        receipt,
         review_thread_id,
         review_turn_id,
         if (record_path.len == 0) null else record_path,
@@ -6247,6 +6306,7 @@ fn printStartJson(
         review_turn_id,
         record_path,
         event_log_path,
+        receipt,
         status,
         timed_out,
         waited,
@@ -6640,9 +6700,19 @@ fn readReviewResultJsonFromRolloutAlloc(
             continue;
         }
         if (!std.mem.eql(u8, line_type, "event_msg")) continue;
-        if (!active_turn_matches) continue;
-
         const payload_obj = core_json.objectField(root_obj, "payload") orelse continue;
+        const event_turn_matches = if (payload_obj.get("turn_id")) |turn_value| blk: {
+            const observed_turn_id = switch (turn_value) {
+                .string => |value| value,
+                else => return error.InvalidReviewTurnBoundary,
+            };
+            if (observed_turn_id.len == 0) return error.InvalidReviewTurnBoundary;
+            const matches = std.mem.eql(u8, observed_turn_id, review_turn_id);
+            saw_review_turn = saw_review_turn or matches;
+            break :blk matches;
+        } else active_turn_matches;
+        if (!event_turn_matches) continue;
+
         const payload_type = core_json.stringField(payload_obj, "type") orelse continue;
         if (!std.mem.eql(u8, payload_type, "exited_review_mode")) continue;
 
@@ -8652,6 +8722,7 @@ fn buildReviewVerdictJsonAlloc(
     finding_count: ?usize,
     failure: ?FailureInfo,
     identity: TargetIdentity,
+    receipt: OutputReceipt,
     review_thread_id: ?[]const u8,
     review_turn_id: ?[]const u8,
     record_path: ?[]const u8,
@@ -8691,6 +8762,28 @@ fn buildReviewVerdictJsonAlloc(
     try writeJsonString(writer, "backendClass");
     try writer.writeByte(':');
     try writeJsonString(writer, backend_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "principalStrength");
+    try writer.writeByte(':');
+    try writeJsonString(
+        writer,
+        if (receipt.account_fingerprint_reduced_protection)
+            principal_strength_reduced
+        else
+            principal_strength_strong,
+    );
+    try writer.writeByte(',');
+    try writeJsonString(writer, "accountFingerprintReducedProtection");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "workflowBinding");
+    try writer.writeByte(':');
+    if (receipt.workflow_binding) |binding| {
+        try std.json.Stringify.value(binding, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeByte(',');
     try writeJsonString(writer, "clean");
     try writer.writeByte(':');
@@ -9829,6 +9922,44 @@ test "repo realpath canonicalizes subdirectories and dirty capture covers reposi
     );
     defer changed.deinit(allocator);
     try std.testing.expect(!targetIdentitiesEqual(initial, changed));
+}
+
+test "dirty subject capture binds untracked symlinks without following them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+
+    try runTestGitCommand(allocator, root, &.{ "init", "--quiet" });
+    try runTestGitCommand(allocator, root, &.{ "config", "user.email", "cas-test@example.com" });
+    try runTestGitCommand(allocator, root, &.{ "config", "user.name", "CAS Test" });
+    try runTestGitCommand(allocator, root, &.{ "config", "commit.gpgsign", "false" });
+    try runTestGitCommand(allocator, root, &.{ "commit", "--quiet", "--allow-empty", "-m", "initial" });
+    try tmp.dir.createDirPath(io, "target-dir");
+    try tmp.dir.symLink(io, "target-dir", "dir-link", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "missing-a", "dangling", .{});
+    var first = try computeTargetIdentityAlloc(
+        allocator,
+        io,
+        root,
+        .{ .kind = .uncommitted },
+        null,
+    );
+    defer first.deinit(allocator);
+
+    try tmp.dir.deleteFile(io, "dangling");
+    try tmp.dir.symLink(io, "missing-b", "dangling", .{});
+    var second = try computeTargetIdentityAlloc(
+        allocator,
+        io,
+        root,
+        .{ .kind = .uncommitted },
+        null,
+    );
+    defer second.deinit(allocator);
+    try std.testing.expect(!targetIdentitiesEqual(first, second));
 }
 
 test "dirty subject capture propagates Git failure" {
@@ -11389,6 +11520,10 @@ test "structured result alone determines clean despite diagnostic prose" {
         "turn",
         "/tmp/record.json",
         "/tmp/events.jsonl",
+        .{
+            .account_fingerprint_reduced_protection = false,
+            .workflow_binding = testWorkflowBinding(),
+        },
         status,
         false,
         true,
@@ -11401,6 +11536,15 @@ test "structured result alone determines clean despite diagnostic prose" {
     const verdict = parsed.value.object;
     try std.testing.expectEqualStrings("clean", verdict.get("status").?.string);
     try std.testing.expectEqualStrings("cas-start-wait", verdict.get("backendClass").?.string);
+    try std.testing.expectEqualStrings(
+        principal_strength_strong,
+        verdict.get("principalStrength").?.string,
+    );
+    try std.testing.expect(!verdict.get("accountFingerprintReducedProtection").?.bool);
+    try std.testing.expectEqualStrings(
+        "request-test",
+        verdict.get("workflowBinding").?.object.get("requestId").?.string,
+    );
     try std.testing.expect(verdict.get("clean").?.bool);
     try std.testing.expectEqual(@as(i64, 0), verdict.get("findingCount").?.integer);
     try std.testing.expectEqualStrings("thr", verdict.get("reviewThreadId").?.string);
@@ -11439,6 +11583,7 @@ test "start wait verdict builder rejects notification-only proof" {
         "turn",
         "/tmp/record.json",
         "/tmp/events.jsonl",
+        .{},
         status,
         false,
         true,
@@ -11767,6 +11912,7 @@ test "review verdict compacts findings for consumers" {
         1,
         null,
         identity,
+        .{},
         "review-thread",
         "review-turn",
         "/tmp/record.json",
@@ -11805,6 +11951,7 @@ test "review verdict requires tuple proof before proof flag" {
         0,
         null,
         identity,
+        .{},
         "review-thread",
         "review-turn",
         "/tmp/record.json",
@@ -11835,6 +11982,7 @@ test "review verdict timeout is not proof-bearing" {
         0,
         .{ .code = "wait_timed_out", .hint = "retry wait" },
         identity,
+        .{},
         "review-thread",
         "review-turn",
         "/tmp/record.json",
@@ -12030,6 +12178,70 @@ test "readReviewResultJsonFromRolloutAlloc extracts exited review output" {
         "/tmp/file.zig",
         core_json.stringField(code_location, "absoluteFilePath").?,
     );
+}
+
+test "readReviewResultJsonFromRolloutAlloc accepts event-local turn identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rollout =
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"turn_id\":\"turn_1\",\"type\":\"exited_review_mode\"," ++
+        "\"review_output\":{\"findings\":[]," ++
+        "\"overall_correctness\":\"patch is correct\"," ++
+        "\"overall_explanation\":\"Clean.\"," ++
+        "\"overall_confidence_score\":1}}}";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = rollout,
+    });
+    const rollout_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(rollout_path);
+
+    const json = (try readReviewResultJsonFromRolloutAlloc(
+        std.testing.allocator,
+        rollout_path,
+        "turn_1",
+    )).?;
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqual(@as(usize, 0), try reviewFindingCount(
+        std.testing.allocator,
+        json,
+    ));
+}
+
+test "readReviewResultJsonFromRolloutAlloc event-local turn overrides legacy context" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rollout =
+        "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn_1\"}}\n" ++
+        "{\"type\":\"event_msg\",\"payload\":{" ++
+        "\"turn_id\":\"turn_other\",\"type\":\"exited_review_mode\"," ++
+        "\"review_output\":{\"findings\":[]," ++
+        "\"overall_correctness\":\"patch is correct\"," ++
+        "\"overall_explanation\":\"Wrong turn.\"," ++
+        "\"overall_confidence_score\":1}}}";
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = rollout,
+    });
+    const rollout_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(rollout_path);
+
+    try std.testing.expect((try readReviewResultJsonFromRolloutAlloc(
+        std.testing.allocator,
+        rollout_path,
+        "turn_1",
+    )) == null);
 }
 
 test "readReviewResultJsonFromRolloutAlloc rejects duplicate verdicts for one turn" {

@@ -212,6 +212,7 @@ const ClassRecord = struct {
     boundary_key: []const u8,
     law_ref: []const u8,
     owner_boundary: []const u8,
+    severity: ClassSeverity,
     status: ClassStatus,
     set_ref: []const u8,
     construction_ref: []const u8,
@@ -449,8 +450,9 @@ fn validateGoalId(goal_id: []const u8) !void {
         return error.InvalidGoalId;
     }
     for (goal_id, 0..) |byte, index| {
-        const allowed = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.';
-        if (!allowed or (index == 0 and !std.ascii.isAlphanumeric(byte))) {
+        const alphanumeric = std.ascii.isLower(byte) or std.ascii.isDigit(byte);
+        const allowed = alphanumeric or byte == '-' or byte == '_' or byte == '.';
+        if (!allowed or (index == 0 and !alphanumeric)) {
             return error.InvalidGoalId;
         }
     }
@@ -662,6 +664,7 @@ fn inspectArtifact(
     const family = familyFromSchema(schema) orelse return error.InvalidArtifactSchema;
     const artifact_id = try inspectArtifactId(artifact, allow_draft);
     const goal_id = try stringField(artifact, "goal_id");
+    try validateGoalId(goal_id);
     if (!std.mem.eql(u8, goal_id, expected_goal)) return error.GoalIdMismatch;
     try validateSemanticAuthor(family, try stringField(artifact, "semantic_author"));
     try requireNonBlank(try stringField(artifact, "created_at"));
@@ -846,6 +849,19 @@ fn validateRepoPath(path: []const u8) !void {
     }
 }
 
+fn validateExecutablePathArray(paths: std.json.Array) !void {
+    for (paths.items) |item| try validateExecutablePath(item.string);
+}
+
+fn validateExecutablePath(path: []const u8) !void {
+    try validateRepoPath(path);
+    if (std.mem.eql(u8, path, ".") or
+        pathWithin(StoreRoot, path) or pathWithin(".git", path))
+    {
+        return error.ReservedRepoPath;
+    }
+}
+
 fn pathWithin(path: []const u8, root: []const u8) bool {
     return std.ascii.eqlIgnoreCase(path, root) or
         (path.len > root.len and path[root.len] == '/' and
@@ -885,7 +901,7 @@ fn validateCounterexampleClass(
     try requireNonBlank(try stringField(class, "law_ref"));
     try validateDiscrepancy(try stringField(class, "discrepancy"));
     try requireNonBlank(try stringField(class, "owner_boundary"));
-    try validateSeverity(try stringField(class, "severity"));
+    _ = try parseClassSeverity(try stringField(class, "severity"));
     _ = try parseClassStatus(try stringField(class, "status"));
     _ = try validateStringArray(try field(class, "observed_facts"), true);
     _ = try validateStringArray(try field(class, "evidence_refs"), true);
@@ -911,12 +927,15 @@ fn validateDiscrepancy(raw: []const u8) !void {
     if (!valid) return error.InvalidDiscrepancy;
 }
 
-fn validateSeverity(raw: []const u8) !void {
-    const valid = std.mem.eql(u8, raw, "critical") or
-        std.mem.eql(u8, raw, "high") or
-        std.mem.eql(u8, raw, "medium") or
-        std.mem.eql(u8, raw, "low");
-    if (!valid) return error.InvalidSeverity;
+const ClassSeverity = enum { critical, high, medium, low };
+
+fn parseClassSeverity(raw: []const u8) !ClassSeverity {
+    inline for (@typeInfo(ClassSeverity).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, raw, enum_field.name)) {
+            return @enumFromInt(enum_field.value);
+        }
+    }
+    return error.InvalidSeverity;
 }
 
 fn validateConstructionPayload(value: std.json.Value) !void {
@@ -951,9 +970,14 @@ fn validateConstructionPayload(value: std.json.Value) !void {
     );
     _ = try validateStringArray(try field(payload, "invalid_states_eliminated"), false);
     _ = try validateStringArray(try field(payload, "counterexample_class_refs"), false);
-    _ = try validateStringArray(try field(payload, "preserved_observations"), false);
+    const preserved_observations = try validateStringArray(
+        try field(payload, "preserved_observations"),
+        false,
+    );
     try validateProofObligations(try field(payload, "proof_obligations"));
     try validateRetirements(try field(payload, "retirements"));
+    try validateProofRoleNamespace(payload);
+    try validatePreservedObservations(payload, preserved_observations);
     try validateExecution(try field(payload, "execution"));
 }
 
@@ -1011,6 +1035,7 @@ fn validateProofObligations(value: std.json.Value) !void {
         });
         const id = try stringField(obligation, "obligation_id");
         try requireNonBlank(id);
+        try rejectReservedProofRoleId(id);
         try requireNonBlank(try stringField(obligation, "law_ref"));
         try requireNonBlank(try stringField(obligation, "statement"));
         try validateProofMode(try stringField(obligation, "proof_mode"));
@@ -1036,7 +1061,15 @@ fn validateProofMode(raw: []const u8) !void {
 fn validateArgv(value: std.json.Value) !void {
     const object = try asObject(value);
     try requireExactKeys(object, &.{"argv"});
-    _ = try validateStringArray(try field(object, "argv"), true);
+    const argv = try asArray(try field(object, "argv"));
+    if (argv.items.len == 0) return error.EmptyArray;
+    for (argv.items) |item| {
+        const token = switch (item) {
+            .string => |string| string,
+            else => return error.ExpectedString,
+        };
+        try requireNonBlank(token);
+    }
 }
 
 fn validateRetirements(value: std.json.Value) !void {
@@ -1049,6 +1082,7 @@ fn validateRetirements(value: std.json.Value) !void {
         });
         const id = try stringField(retirement, "retirement_id");
         try requireNonBlank(id);
+        try rejectReservedProofRoleId(id);
         try requireNonBlank(try stringField(retirement, "dominated_construct"));
         try validateDisposition(try stringField(retirement, "disposition"));
         try requireNonBlank(try stringField(retirement, "replacement_ref"));
@@ -1077,6 +1111,52 @@ fn rejectDuplicateId(
     }
 }
 
+fn rejectReservedProofRoleId(id: []const u8) !void {
+    if (std.mem.endsWith(u8, id, "#falsifier")) return error.ReservedProofRoleId;
+}
+
+fn validateProofRoleNamespace(payload: std.json.ObjectMap) !void {
+    const obligations = try asArray(try field(payload, "proof_obligations"));
+    const retirements = try asArray(try field(payload, "retirements"));
+    for (obligations.items) |obligation_value| {
+        const obligation = try asObject(obligation_value);
+        const obligation_id = try stringField(obligation, "obligation_id");
+        for (retirements.items) |retirement_value| {
+            const retirement = try asObject(retirement_value);
+            if (std.mem.eql(
+                u8,
+                obligation_id,
+                try stringField(retirement, "retirement_id"),
+            )) return error.AmbiguousProofRoleId;
+        }
+    }
+}
+
+fn validatePreservedObservations(
+    payload: std.json.ObjectMap,
+    preserved: std.json.Array,
+) !void {
+    const obligations = try asArray(try field(payload, "proof_obligations"));
+    for (preserved.items) |item| {
+        if (!hasObjectId(obligations, "obligation_id", item.string)) {
+            return error.UnknownPreservedObservation;
+        }
+    }
+}
+
+fn hasObjectId(
+    objects: std.json.Array,
+    field_name: []const u8,
+    expected: []const u8,
+) bool {
+    for (objects.items) |item| {
+        const object = asObject(item) catch return false;
+        const actual = stringField(object, field_name) catch return false;
+        if (std.mem.eql(u8, actual, expected)) return true;
+    }
+    return false;
+}
+
 fn validateExecution(value: std.json.Value) !void {
     const object = try asObject(value);
     try requireExactKeys(object, &.{
@@ -1084,6 +1164,7 @@ fn validateExecution(value: std.json.Value) !void {
     });
     const paths = try validateStringArray(try field(object, "allowed_paths"), true);
     try validatePathArray(paths);
+    try validateExecutablePathArray(paths);
     try requireNonBlank(try stringField(object, "owner_boundary"));
     const effects = try validateStringArray(try field(object, "operation_effects"), true);
     for (effects.items) |item| _ = try parseEffect(item.string);
@@ -1357,6 +1438,11 @@ fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
         if (std.mem.eql(u8, current_payload, successor_payload)) {
             return error.GoalSuccessorUnchanged;
         }
+        for (state.classes.items) |class| {
+            if (class.status == .accepted or class.status == .blocked) {
+                return error.GoalSuccessorHasCounterexampleDebt;
+            }
+        }
         state.construction = null;
         state.subject_digest = null;
         state.classes = .empty;
@@ -1438,6 +1524,32 @@ fn validateConstructionModeAndLineage(
     if ((try asArray(try field(payload, "falsified_predecessor_claims"))).items.len == 0) {
         return error.MissingFalsifiedClaim;
     }
+    if (std.mem.eql(u8, mode, "realization-repair") or
+        std.mem.eql(u8, mode, "ablation-repair"))
+    {
+        const predecessor = try asObject(state.construction.?.payload);
+        if (!try canonicalValuesEqual(
+            state.allocator,
+            try field(predecessor, "boundary"),
+            try field(payload, "boundary"),
+        ) or !try canonicalValuesEqual(
+            state.allocator,
+            try field(predecessor, "architecture"),
+            try field(payload, "architecture"),
+        )) return error.RepairArchitectureChanged;
+    }
+}
+
+fn canonicalValuesEqual(
+    allocator: std.mem.Allocator,
+    left: std.json.Value,
+    right: std.json.Value,
+) !bool {
+    const left_bytes = try canonicalValueAlloc(allocator, left);
+    defer allocator.free(left_bytes);
+    const right_bytes = try canonicalValueAlloc(allocator, right);
+    defer allocator.free(right_bytes);
+    return std.mem.eql(u8, left_bytes, right_bytes);
 }
 
 fn validateConstructionOwners(payload: std.json.ObjectMap) !void {
@@ -1499,15 +1611,21 @@ fn validateConstructionLaws(
     const architecture = try asObject(try field(construction, "architecture"));
     const governing = try asArray(try field(architecture, "governing_law_refs"));
     const obligations = try asArray(try field(construction, "proof_obligations"));
+    for (governing.items) |item| if (!goalHasLaw(laws, item.string)) {
+        return error.UnknownGoverningLaw;
+    };
+    for (obligations.items) |item| {
+        const obligation = try asObject(item);
+        if (!goalHasLaw(laws, try stringField(obligation, "law_ref"))) {
+            return error.UnknownProofLaw;
+        }
+    }
     for (laws.items) |item| {
         const law_id = try stringField(try asObject(item), "law_id");
         if (!hasString(governing, law_id) or !obligationCoversLaw(obligations, law_id)) {
             return error.UncoveredGoalLaw;
         }
     }
-    for (governing.items) |item| if (!goalHasLaw(laws, item.string)) {
-        return error.UnknownGoverningLaw;
-    };
 }
 
 fn validateConstructionAcceptance(
@@ -1518,6 +1636,12 @@ fn validateConstructionAcceptance(
     const acceptance = try asObject(try field(goal, "acceptance"));
     const required = try asArray(try field(acceptance, "required_proof_kinds"));
     const obligations = try asArray(try field(construction, "proof_obligations"));
+    const execution = try asObject(try field(construction, "execution"));
+    if (!std.mem.eql(
+        u8,
+        try stringField(acceptance, "terminal_route"),
+        try stringField(execution, "completion"),
+    )) return error.TerminalRouteMismatch;
     for (required.items) |item| {
         if (!obligationHasKind(obligations, item.string)) {
             return error.RequiredProofKindOmitted;
@@ -1560,7 +1684,6 @@ fn validateConstructionCounterexamples(
     const architecture = try asObject(try field(construction, "architecture"));
     const governing = try asArray(try field(architecture, "governing_law_refs"));
     const obligations = try asArray(try field(construction, "proof_obligations"));
-    const owner = try stringField(architecture, "canonical_owner");
     for (refs.items) |item| if (findClass(state, item.string) == null) {
         return error.UnknownCounterexampleClass;
     };
@@ -1572,10 +1695,29 @@ fn validateConstructionCounterexamples(
         {
             return error.AcceptedCounterexampleLawUncovered;
         }
-        if (!std.mem.eql(u8, owner, class.owner_boundary)) {
-            return error.AcceptedCounterexampleOwnerMismatch;
+        if ((class.severity == .critical or class.severity == .high) and
+            !obligationProvidesStrongLocalProof(obligations, class.law_ref))
+        {
+            return error.HighSeverityCounterexampleRequiresStrongProof;
         }
     }
+}
+
+fn obligationProvidesStrongLocalProof(
+    obligations: std.json.Array,
+    law_ref: []const u8,
+) bool {
+    for (obligations.items) |item| {
+        const obligation = asObject(item) catch return false;
+        const obligation_law = stringField(obligation, "law_ref") catch return false;
+        if (!std.mem.eql(u8, obligation_law, law_ref)) continue;
+        const mode = stringField(obligation, "proof_mode") catch return false;
+        if (std.mem.eql(u8, mode, "example-regression")) continue;
+        const kind = stringField(obligation, "proof_kind") catch return false;
+        if (std.mem.eql(u8, kind, "implementation") or
+            std.mem.eql(u8, kind, "acceptance")) return true;
+    }
+    return false;
 }
 
 fn findClass(state: *State, class_id: []const u8) ?*ClassRecord {
@@ -1639,6 +1781,7 @@ fn admitClass(
     const boundary = try stringField(class, "boundary_key");
     const law = try stringField(class, "law_ref");
     const owner = try stringField(class, "owner_boundary");
+    const severity = try parseClassSeverity(try stringField(class, "severity"));
     const status = try parseClassStatus(try stringField(class, "status"));
     if (status == .accepted) {
         const goal = try asObject(state.goal.?.payload);
@@ -1658,6 +1801,7 @@ fn admitClass(
         if (!hasString(set.predecessors, existing.set_ref)) {
             return error.MissingCounterexampleSetPredecessor;
         }
+        existing.severity = severity;
         existing.status = status;
         existing.set_ref = set.artifact_id;
         existing.construction_ref = state.construction.?.artifact_id;
@@ -1669,6 +1813,7 @@ fn admitClass(
         .boundary_key = boundary,
         .law_ref = law,
         .owner_boundary = owner,
+        .severity = severity,
         .status = status,
         .set_ref = set.artifact_id,
         .construction_ref = state.construction.?.artifact_id,
@@ -1710,6 +1855,7 @@ fn applyOperationPrepared(state: *State, event: ParsedEvent) !void {
     if (stringListContains(state.used_keys.items, key)) return error.DuplicateIdempotencyKey;
     const paths = try validateStringArray(try field(body, "paths"), effect == .edit);
     try validatePathArray(paths);
+    try validateExecutablePathArray(paths);
     const proof_refs = try validateStringArray(
         try field(body, "proof_obligation_refs"),
         true,
@@ -1767,33 +1913,49 @@ fn validateOperationAgainstConstruction(
     for (paths.items) |item| if (pathOverlapsAny(item.string, prohibited)) {
         return error.OperationScopeEscape;
     };
-    for (proof_refs.items) |item| if (!constructionRequiresRef(construction, item.string)) {
-        return error.UnknownProofObligation;
-    };
+    try validateOperationProofRefs(construction, proof_refs);
     if (effect == .edit) try validateEditAuthorityAndDebt(state);
 }
 
-fn constructionRequiresRef(
+fn validateOperationProofRefs(
+    construction: std.json.ObjectMap,
+    proof_refs: std.json.Array,
+) !void {
+    if (proof_refs.items.len != 1) return error.InvalidProofRoleCount;
+    try validateExecutableProofRef(construction, proof_refs.items[0].string);
+}
+
+fn validateExecutableProofRef(
     construction: std.json.ObjectMap,
     proof_ref: []const u8,
-) bool {
-    const obligations = asArray(field(construction, "proof_obligations") catch return false) catch
-        return false;
+) !void {
+    const obligations = try asArray(try field(construction, "proof_obligations"));
+    const falsifier_suffix = "#falsifier";
+    const is_falsifier = std.mem.endsWith(u8, proof_ref, falsifier_suffix);
+    const obligation_ref = if (is_falsifier)
+        proof_ref[0 .. proof_ref.len - falsifier_suffix.len]
+    else
+        proof_ref;
     for (obligations.items) |item| {
-        const obligation = asObject(item) catch return false;
-        const id = stringField(obligation, "obligation_id") catch return false;
-        if (std.mem.eql(u8, proof_ref, id)) return true;
-        if (std.mem.endsWith(u8, proof_ref, "#falsifier") and
-            std.mem.eql(u8, proof_ref[0 .. proof_ref.len - "#falsifier".len], id)) return true;
+        const obligation = try asObject(item);
+        const id = try stringField(obligation, "obligation_id");
+        if (!std.mem.eql(u8, obligation_ref, id)) continue;
+        const proof_kind = try stringField(obligation, "proof_kind");
+        if (!std.mem.eql(u8, proof_kind, "implementation") and
+            !std.mem.eql(u8, proof_kind, "acceptance"))
+        {
+            return error.NonLocalProofObligation;
+        }
+        return;
     }
-    const retirements = asArray(field(construction, "retirements") catch return false) catch
-        return false;
+    if (is_falsifier) return error.UnknownProofObligation;
+    const retirements = try asArray(try field(construction, "retirements"));
     for (retirements.items) |item| {
-        const retirement = asObject(item) catch return false;
-        const id = stringField(retirement, "retirement_id") catch return false;
-        if (std.mem.eql(u8, proof_ref, id)) return true;
+        const retirement = try asObject(item);
+        const id = try stringField(retirement, "retirement_id");
+        if (std.mem.eql(u8, proof_ref, id)) return;
     }
-    return false;
+    return error.UnknownProofObligation;
 }
 
 fn validateEditAuthorityAndDebt(state: *State) !void {
@@ -1830,6 +1992,7 @@ fn applyEffectRecorded(state: *State, event: ParsedEvent) !void {
     }
     const changed = try validateStringArray(try field(body, "changed_paths"), true);
     try validatePathArray(changed);
+    try validateExecutablePathArray(changed);
     if (!sameStringSet(changed, pending.paths)) return error.ChangedPathsMismatch;
     state.pending.?.consumed = true;
     state.subject_digest = next_subject;
@@ -2609,7 +2772,7 @@ fn testConstructionAlloc(
         \\"interpreter_or_handler":"owner","residual_assumptions":[]}},
         \\"falsified_predecessor_claims":{s},"preserved_predecessor_claims":{s},
         \\"invalid_states_eliminated":["invalid"],"counterexample_class_refs":{s},
-        \\"preserved_observations":["proof"],"proof_obligations":[{{
+        \\"preserved_observations":["proof-1"],"proof_obligations":[{{
         \\"obligation_id":"proof-1","law_ref":"law-1","statement":"prove law",
         \\"proof_mode":"property-law","adequacy_reason":"complete input space",
         \\"verifier":{{"argv":["verify"]}},"falsifier":{{"argv":["falsify"]}},
@@ -2989,6 +3152,39 @@ test "actuation: accepted Counterexample requires an authored successor Construc
     defer std.testing.allocator.free(refs.goal);
     defer std.testing.allocator.free(refs.construction);
     try testRegisterClass(&harness, "class-1", "law-1", "owner", "accepted");
+    const goal_draft = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_draft);
+    const goal_predecessor = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"predecessor_refs\":[\"{s}\"]",
+        .{refs.goal},
+    );
+    defer std.testing.allocator.free(goal_predecessor);
+    const goal_successor_basis = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal_draft,
+        "\"predecessor_refs\":[]",
+        goal_predecessor,
+    );
+    defer std.testing.allocator.free(goal_successor_basis);
+    const goal_successor = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal_successor_basis,
+        "\"non_goals\":[]",
+        "\"non_goals\":[\"changed\"]",
+    );
+    defer std.testing.allocator.free(goal_successor);
+    try std.testing.expectError(
+        error.GoalSuccessorHasCounterexampleDebt,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_successor),
+    );
     try std.testing.expectError(
         error.AcceptedCounterexampleDebt,
         testPrepare(&harness, "blocked", "edit", "[\"proof-1\"]"),
@@ -3002,13 +3198,25 @@ test "actuation: accepted Counterexample requires an authored successor Construc
         "[\"class-1\"]",
     );
     defer std.testing.allocator.free(k1);
+    const example_only = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        k1,
+        "\"proof_mode\":\"property-law\"",
+        "\"proof_mode\":\"example-regression\"",
+    );
+    defer std.testing.allocator.free(example_only);
+    try std.testing.expectError(
+        error.HighSeverityCounterexampleRequiresStrongProof,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", example_only),
+    );
     var k1_result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", k1);
     defer k1_result.deinit(std.testing.allocator);
     var admitted = try testPrepare(&harness, "admitted", "edit", "[\"proof-1\"]");
     admitted.deinit(std.testing.allocator);
 }
 
-test "actuation: successor Construction rejects forward stale and wrong-owner joins" {
+test "actuation: successor Construction preserves repair architecture and permits owner moves" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
     const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
@@ -3050,6 +3258,18 @@ test "actuation: successor Construction rejects forward stale and wrong-owner jo
         "[\"class-1\"]",
     );
     defer std.testing.allocator.free(current);
+    const changed_boundary = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        current,
+        "\"boundary_key\":\"boundary\"",
+        "\"boundary_key\":\"other-boundary\"",
+    );
+    defer std.testing.allocator.free(changed_boundary);
+    try std.testing.expectError(
+        error.RepairArchitectureChanged,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", changed_boundary),
+    );
     const wrong_owner = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -3059,9 +3279,24 @@ test "actuation: successor Construction rejects forward stale and wrong-owner jo
     );
     defer std.testing.allocator.free(wrong_owner);
     try std.testing.expectError(
-        error.AcceptedCounterexampleOwnerMismatch,
+        error.RepairArchitectureChanged,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_owner),
     );
+    const architecture_repair = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        wrong_owner,
+        "\"mode\":\"realization-repair\"",
+        "\"mode\":\"architecture-repair\"",
+    );
+    defer std.testing.allocator.free(architecture_repair);
+    var result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        architecture_repair,
+    );
+    result.deinit(std.testing.allocator);
 }
 
 test "actuation: pending operation excludes Counterexamples and follow-up permits edits" {
@@ -3398,6 +3633,245 @@ test "actuation: Goal semantic author is exact" {
     );
 }
 
+test "actuation: goal identity and executable path boundaries fail closed" {
+    try validateGoalId("goal-1");
+    try std.testing.expectError(error.InvalidGoalId, validateGoalId("Goal-1"));
+    try validateRepoPath(".");
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath("."));
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath(".git"));
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath(".ledger"));
+
+    const goal = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal);
+    const upper_goal = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"goal_id\":\"goal-1\"",
+        "\"goal_id\":\"Goal-1\"",
+    );
+    defer std.testing.allocator.free(upper_goal);
+    try std.testing.expectError(
+        error.InvalidGoalId,
+        materializeArtifact(std.testing.allocator, "Goal-1", upper_goal),
+    );
+    const root_scoped_goal = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"allowed_paths\":[\"src\"]",
+        "\"allowed_paths\":[\".\"]",
+    );
+    defer std.testing.allocator.free(root_scoped_goal);
+    var root_materialized = try materializeArtifact(
+        std.testing.allocator,
+        "goal-1",
+        root_scoped_goal,
+    );
+    root_materialized.deinit(std.testing.allocator);
+
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const root_execution = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"allowed_paths\":[\"src/file.zig\"]",
+        "\"allowed_paths\":[\".\"]",
+    );
+    defer std.testing.allocator.free(root_execution);
+    try std.testing.expectError(
+        error.ReservedRepoPath,
+        materializeArtifact(std.testing.allocator, "goal-1", root_execution),
+    );
+}
+
+test "actuation: Construction proof namespace is exact and argv remains ordered" {
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const repeated_argv = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"argv\":[\"verify\"]",
+        "\"argv\":[\"verify\",\"verify\"]",
+    );
+    defer std.testing.allocator.free(repeated_argv);
+    var repeated_materialized = try materializeArtifact(
+        std.testing.allocator,
+        "goal-1",
+        repeated_argv,
+    );
+    repeated_materialized.deinit(std.testing.allocator);
+
+    const unknown_observation = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"preserved_observations\":[\"proof-1\"]",
+        "\"preserved_observations\":[\"unknown\"]",
+    );
+    defer std.testing.allocator.free(unknown_observation);
+    try std.testing.expectError(
+        error.UnknownPreservedObservation,
+        materializeArtifact(std.testing.allocator, "goal-1", unknown_observation),
+    );
+    const reserved_id = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"obligation_id\":\"proof-1\"",
+        "\"obligation_id\":\"proof-1#falsifier\"",
+    );
+    defer std.testing.allocator.free(reserved_id);
+    try std.testing.expectError(
+        error.ReservedProofRoleId,
+        materializeArtifact(std.testing.allocator, "goal-1", reserved_id),
+    );
+    const ambiguous_id = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"retirements\":[]",
+        "\"retirements\":[{\"retirement_id\":\"proof-1\"," ++
+            "\"dominated_construct\":\"old\",\"disposition\":\"retire\"," ++
+            "\"replacement_ref\":\"new\",\"verifier\":{\"argv\":[\"verify\"]}}]",
+    );
+    defer std.testing.allocator.free(ambiguous_id);
+    try std.testing.expectError(
+        error.AmbiguousProofRoleId,
+        materializeArtifact(std.testing.allocator, "goal-1", ambiguous_id),
+    );
+}
+
+test "actuation: operations select one locally executable proof role" {
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        construction,
+        .{},
+    );
+    defer parsed.deinit();
+    const document = try asObject(parsed.value);
+    const artifact = try asObject(try field(document, "artifact"));
+    const payload = try asObject(try field(artifact, "payload"));
+    var verifier = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1\"]",
+        .{},
+    );
+    defer verifier.deinit();
+    try validateOperationProofRefs(payload, try asArray(verifier.value));
+    var falsifier = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1#falsifier\"]",
+        .{},
+    );
+    defer falsifier.deinit();
+    try validateOperationProofRefs(payload, try asArray(falsifier.value));
+    var multiple = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1\",\"proof-1#falsifier\"]",
+        .{},
+    );
+    defer multiple.deinit();
+    try std.testing.expectError(
+        error.InvalidProofRoleCount,
+        validateOperationProofRefs(payload, try asArray(multiple.value)),
+    );
+
+    for ([_][]const u8{ "review", "ship" }) |kind| {
+        const replacement = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "\"proof_kind\":\"{s}\"",
+            .{kind},
+        );
+        defer std.testing.allocator.free(replacement);
+        const external = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            construction,
+            "\"proof_kind\":\"implementation\"",
+            replacement,
+        );
+        defer std.testing.allocator.free(external);
+        var external_parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            external,
+            .{},
+        );
+        defer external_parsed.deinit();
+        const external_document = try asObject(external_parsed.value);
+        const external_artifact = try asObject(try field(external_document, "artifact"));
+        const external_payload = try asObject(try field(external_artifact, "payload"));
+        try std.testing.expectError(
+            error.NonLocalProofObligation,
+            validateOperationProofRefs(external_payload, try asArray(verifier.value)),
+        );
+    }
+
+    const retired = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"retirements\":[]",
+        "\"retirements\":[{\"retirement_id\":\"retire-1\"," ++
+            "\"dominated_construct\":\"old\",\"disposition\":\"retire\"," ++
+            "\"replacement_ref\":\"new\",\"verifier\":{\"argv\":[\"verify\"]}}]",
+    );
+    defer std.testing.allocator.free(retired);
+    var retired_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        retired,
+        .{},
+    );
+    defer retired_parsed.deinit();
+    const retired_document = try asObject(retired_parsed.value);
+    const retired_artifact = try asObject(try field(retired_document, "artifact"));
+    const retired_payload = try asObject(try field(retired_artifact, "payload"));
+    var retirement = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"retire-1\"]",
+        .{},
+    );
+    defer retirement.deinit();
+    try validateOperationProofRefs(retired_payload, try asArray(retirement.value));
+}
+
 test "actuation: Goal required proof kind must be represented" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
@@ -3427,6 +3901,53 @@ test "actuation: Goal required proof kind must be represented" {
     try std.testing.expectError(
         error.RequiredProofKindOmitted,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", construction),
+    );
+}
+
+test "actuation: Construction laws and terminal route join the Goal exactly" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const wrong_route = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"completion\":\"complete\"",
+        "\"completion\":\"ready-to-ship\"",
+    );
+    defer std.testing.allocator.free(wrong_route);
+    try std.testing.expectError(
+        error.TerminalRouteMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_route),
+    );
+    const unknown_law = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"law_ref\":\"law-1\"",
+        "\"law_ref\":\"law-2\"",
+    );
+    defer std.testing.allocator.free(unknown_law);
+    try std.testing.expectError(
+        error.UnknownProofLaw,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", unknown_law),
     );
 }
 
