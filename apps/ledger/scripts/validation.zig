@@ -1,6 +1,4 @@
 const app_meta = @import("app_meta");
-const actuating_review_policy_cli = @import("actuating_review_policy.zig");
-const actuating_review_resolution_cli = @import("actuating_review_resolution.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const hctp = @import("hctp.zig");
@@ -21,16 +19,13 @@ threadlocal var runtime_io: ?std.Io = null;
 const UsageText =
     \\ledger validate
     \\
-    \\usage: ledger validate CONTRACT [--phase {preflight|closeout}] --input FILE|-
+    \\usage: ledger validate CONTRACT --input FILE|-
     \\
     \\Purely validate one governance or review artifact. This command never reads or writes .ledger and never grants authority.
     \\
     \\contracts:
-    \\  actuation-review-policy  Check an actuation-review-policy/v1 or v2 snapshot
     \\  plan-source-contract       Validate a PSC-v1 plan source contract
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
-    \\  review-fold               Validate an RF-v2 review-fold receipt
-    \\  review-resolution         Check refinement and owner synthesis in review-resolution/v1
     \\  hylo-replay-episode       Validate a content-addressed CRF Slice 1 custody episode
     \\  hylo-runner-input         Validate the pure blinded runner projection
     \\  hylo-stimulus             Validate the ordered runner-visible causal stimulus
@@ -45,7 +40,6 @@ const UsageText =
     \\  source-memory-checkpoint  Validate a source-memory-checkpoint/v1 receipt
     \\
     \\options:
-    \\  --phase PHASE  preflight|closeout for Actuating contracts
     \\  --input FILE|-  Canonical JSON input path, or - for stdin
     \\  -h, --help      Show help
     \\  -V, --version   Show version
@@ -59,7 +53,6 @@ const HelpSurface = core_cli.HelpSurface{
 const Contract = enum {
     plan_source_contract,
     policy_synthesis_receipt,
-    review_fold,
     hylo_replay_episode,
     hylo_runner_input,
     hylo_stimulus,
@@ -76,7 +69,6 @@ const Contract = enum {
     fn parse(raw: []const u8) ?Contract {
         if (std.mem.eql(u8, raw, "plan-source-contract")) return .plan_source_contract;
         if (std.mem.eql(u8, raw, "policy-synthesis-receipt")) return .policy_synthesis_receipt;
-        if (std.mem.eql(u8, raw, "review-fold")) return .review_fold;
         if (std.mem.eql(u8, raw, "hylo-replay-episode")) return .hylo_replay_episode;
         if (std.mem.eql(u8, raw, "hylo-runner-input")) return .hylo_runner_input;
         if (std.mem.eql(u8, raw, "hylo-stimulus")) return .hylo_stimulus;
@@ -96,7 +88,6 @@ const Contract = enum {
         return switch (self) {
             .plan_source_contract => "plan-source-contract",
             .policy_synthesis_receipt => "policy-synthesis-receipt",
-            .review_fold => "review-fold",
             .hylo_replay_episode => "hylo-replay-episode",
             .hylo_runner_input => "hylo-runner-input",
             .hylo_stimulus => "hylo-stimulus",
@@ -140,15 +131,6 @@ const Issues = struct {
 pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
     runtime_io = io;
     defer runtime_io = null;
-
-    if (argv.len >= 3 and std.mem.eql(u8, argv[1], "validate")) {
-        if (std.mem.eql(u8, argv[2], "actuation-review-policy")) {
-            return actuating_review_policy_cli.runWithArgv(allocator, io, argv[2..]);
-        }
-        if (std.mem.eql(u8, argv[2], "review-resolution")) {
-            return actuating_review_resolution_cli.runWithArgv(allocator, io, argv[2..]);
-        }
-    }
 
     for (argv[1..]) |token| {
         if (core_cli.isHelpArg(token)) {
@@ -198,7 +180,6 @@ fn validateContract(allocator: std.mem.Allocator, contract: Contract, value: std
     switch (contract) {
         .plan_source_contract => try validatePlanSourceContract(allocator, value, issues),
         .policy_synthesis_receipt => try validatePolicySynthesisReceipt(allocator, value, issues),
-        .review_fold => try validateReviewFold(allocator, value, issues),
         .hylo_replay_episode => try validateHyloReplayEpisode(allocator, value, issues),
         .hylo_runner_input => try validateHyloRunnerInput(allocator, value, issues),
         .hylo_stimulus => try validateHyloStimulus(allocator, value, issues),
@@ -509,160 +490,6 @@ fn validatePsrTail(allocator: std.mem.Allocator, psr: std.json.ObjectMap, issues
     }
 }
 
-fn validateReviewFold(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
-    const root_object = asObject(root) orelse {
-        try issues.add(allocator, "input-object-required");
-        return;
-    };
-    const receipt_value = root_object.get("review_fold") orelse root;
-    const receipt = asObject(receipt_value) orelse {
-        try issues.add(allocator, "review-fold-object-required");
-        return;
-    };
-
-    if (!fieldEqualsString(receipt, "version", "RF-v2")) try issues.add(allocator, "receipt-version");
-    if (!isNonblankString(receipt.get("fold_id"))) try issues.add(allocator, "fold-id-missing");
-    if (!isNonblankString(receipt.get("goal_id"))) try issues.add(allocator, "goal-id-missing");
-
-    const source = asObjectValue(receipt.get("source"));
-    if (source == null) try issues.add(allocator, "source-missing");
-    const source_state = if (source) |value| stringField(value, "source_state") orelse "" else "";
-    if (source == null or !fieldInStrings(source.?, "backend", &.{ "cas", "github-comments", "human-review", "prior-artifact", "local-audit", "other" })) try issues.add(allocator, "source-backend");
-    if (source == null or !isNonblankString(source.?.get("source_batch_id")) or !isNonblankString(source.?.get("source_ref"))) try issues.add(allocator, "source-identity");
-    if (!stringIn(source_state, &.{ "clean", "findings", "invalid-proof", "incomplete" })) try issues.add(allocator, "source-state");
-    if (source) |value| {
-        const artifact = asObjectValue(value.get("artifact"));
-        if (artifact == null or !allNonblankFields(artifact.?, &.{ "repo", "base_sha", "branch", "head_sha", "state_fingerprint" })) try issues.add(allocator, "source-artifact");
-    } else try issues.add(allocator, "source-artifact");
-
-    const intent = asObjectValue(receipt.get("intent_anchor"));
-    if (intent == null or !isNonblankString(intent.?.get("original_goal"))) {
-        try issues.add(allocator, "intent-anchor");
-    } else if (asArrayValue(intent.?.get("accepted_scope")) == null or asArrayValue(intent.?.get("non_goals")) == null) {
-        try issues.add(allocator, "intent-scope");
-    }
-    for ([_][]const u8{ "strategy", "selected_work_node", "clean_run", "clean_count", "clean_run_accounting", "closure_verdict", "mutation_authority" }) |forbidden| {
-        if (receipt.get(forbidden) != null) try issues.add(allocator, "receipt-owned-field");
-    }
-
-    const findings = asArrayValue(receipt.get("findings")) orelse {
-        try issues.add(allocator, "findings-shape");
-        return validateReviewCompressionAndRoutes(allocator, receipt, &.{}, issues);
-    };
-    for (findings.items) |finding_value| {
-        if (asObject(finding_value) == null) try issues.add(allocator, "findings-shape");
-    }
-    if (std.mem.eql(u8, source_state, "clean") and findings.items.len != 0) try issues.add(allocator, "clean-source-has-findings");
-    if (std.mem.eql(u8, source_state, "findings") and findings.items.len == 0) try issues.add(allocator, "findings-source-empty");
-
-    for (findings.items, 0..) |finding_value, index| {
-        const finding = asObject(finding_value) orelse continue;
-        const finding_id = nonblankString(finding.get("finding_id")) orelse "";
-        if (finding_id.len == 0 or duplicateFindingId(findings.items, index, finding_id)) try issues.add(allocator, "finding-id");
-        if (!isNonblankString(finding.get("source_ref"))) try issues.add(allocator, "finding-source");
-        const claim = nonblankString(finding.get("claim")) orelse "";
-        if (claim.len == 0) try issues.add(allocator, "finding-claim");
-        const validity = stringField(finding, "validity") orelse "";
-        const liability = stringField(finding, "liability") orelse "";
-        const intent_relation = stringField(finding, "intent_relation") orelse "";
-        const novelty = stringField(finding, "novelty") orelse "";
-        const disposition = stringField(finding, "disposition") orelse "";
-        if (!stringIn(validity, &.{ "valid", "invalid", "unproven", "needs-owner" })) try issues.add(allocator, "finding-validity");
-        if (!stringIn(liability, &.{ "blocks-goal", "regression-risk", "proof-gap", "misuse-hazard", "invariant-gap", "complexity-stall", "style", "new-requirement", "out-of-scope" })) try issues.add(allocator, "finding-liability");
-        if (!stringIn(intent_relation, &.{ "core", "adjacent", "unrelated", "expands-scope" })) try issues.add(allocator, "finding-intent");
-        if (!stringIn(novelty, &.{ "duplicate", "same-class", "new-class" })) try issues.add(allocator, "finding-novelty");
-        if (!stringIn(disposition, &.{ "reject", "proof-only", "ask-human", "follow-up", "resolution-input", "blocked" })) try issues.add(allocator, "finding-disposition");
-        if (std.mem.eql(u8, disposition, "follow-up") and std.mem.eql(u8, intent_relation, "core")) try issues.add(allocator, "follow-up-intent");
-
-        const material = isMaterialLiability(liability);
-        const quotient = nonblankString(finding.get("quotient_key")) orelse "";
-        const duplicate_covered = std.mem.eql(u8, novelty, "duplicate") and std.mem.eql(u8, disposition, "reject") and quotientHasRoutedFinding(findings.items, quotient);
-        if (std.mem.eql(u8, intent_relation, "core") and material and !validDisposition(validity, disposition) and !duplicate_covered) try issues.add(allocator, "core-material-disposition");
-
-        const authority = asObjectValue(finding.get("mutation_authority"));
-        if (authority == null or !fieldEqualsBool(authority.?, "allowed", false)) try issues.add(allocator, "finding-mutation-authority");
-        if (authority == null or !isNonblankString(authority.?.get("reason"))) try issues.add(allocator, "finding-mutation-reason");
-        if (quotient.len == 0) try issues.add(allocator, "finding-quotient");
-
-        if (material) {
-            const observed = nonblankString(finding.get("observed_fact")) orelse "";
-            if (observed.len == 0 or std.mem.eql(u8, observed, claim)) try issues.add(allocator, "material-observed-fact");
-            if (!isNonblankString(finding.get("owner_boundary"))) try issues.add(allocator, "material-owner_boundary");
-            if (!isNonblankString(finding.get("law_family"))) try issues.add(allocator, "material-law_family");
-            if (!isNonblankString(finding.get("falsifier"))) try issues.add(allocator, "material-falsifier");
-            if (!nonblankStringArray(finding.get("evidence_refs"))) try issues.add(allocator, "material-evidence");
-        }
-        if (std.mem.eql(u8, disposition, "resolution-input")) {
-            if (!std.mem.eql(u8, source_state, "findings")) try issues.add(allocator, "resolution-input-source-state");
-            if (!std.mem.eql(u8, validity, "valid")) try issues.add(allocator, "resolution-input-validity");
-            if (!stringIn(intent_relation, &.{ "core", "adjacent" })) try issues.add(allocator, "resolution-input-intent");
-            if (!material) try issues.add(allocator, "resolution-input-liability");
-        }
-        for ([_][]const u8{ "strategy", "selected_work_node", "clean_run", "clean_count", "closure_verdict" }) |forbidden| {
-            if (finding.get(forbidden) != null) try issues.add(allocator, "finding-owned-field");
-        }
-    }
-    try validateReviewCompressionAndRoutes(allocator, receipt, findings.items, issues);
-}
-
-fn validateReviewCompressionAndRoutes(allocator: std.mem.Allocator, receipt: std.json.ObjectMap, findings: []const std.json.Value, issues: *Issues) !void {
-    const compression = asObjectValue(receipt.get("compression"));
-    const classes = if (compression) |value| asArrayValue(value.get("equivalence_classes")) else null;
-    if (classes == null) try issues.add(allocator, "compression-coverage");
-    if (classes) |rows| {
-        for (rows.items, 0..) |row_value, row_index| {
-            const row = asObject(row_value) orelse {
-                try issues.add(allocator, "compression-key");
-                continue;
-            };
-            const key = nonblankString(row.get("quotient_key")) orelse "";
-            if (key.len == 0 or duplicateStringField(rows.items, row_index, "quotient_key", key)) try issues.add(allocator, "compression-key");
-            const owner = nonblankString(row.get("owner_boundary")) orelse "";
-            const law = nonblankString(row.get("law_family")) orelse "";
-            if (owner.len == 0 or law.len == 0) try issues.add(allocator, "compression-owner-law");
-            const member_ids = asArrayValue(row.get("finding_ids"));
-            if (member_ids == null or !classCoverageMatches(findings, key, member_ids.?.items)) try issues.add(allocator, "compression-coverage");
-            for (findings) |finding_value| {
-                const finding = asObject(finding_value) orelse continue;
-                const quotient = nonblankString(finding.get("quotient_key")) orelse continue;
-                if (!std.mem.eql(u8, quotient, key) or !isMaterialLiability(stringField(finding, "liability") orelse "")) continue;
-                if (!fieldEqualsString(finding, "owner_boundary", owner) or !fieldEqualsString(finding, "law_family", law)) {
-                    try issues.add(allocator, "compression-owner-law-mismatch");
-                }
-            }
-        }
-        for (findings) |finding_value| {
-            const finding = asObject(finding_value) orelse continue;
-            const quotient = nonblankString(finding.get("quotient_key")) orelse continue;
-            if (countRowsWithField(rows.items, "quotient_key", quotient) != 1) try issues.add(allocator, "compression-coverage");
-        }
-    }
-
-    const routes = asArrayValue(receipt.get("routing_obligations"));
-    if (routes == null) {
-        try issues.add(allocator, "routing-obligations-array-required");
-        if (hasRoutedLiability(findings)) try issues.add(allocator, "routing-coverage");
-        return;
-    }
-    for (routes.?.items, 0..) |row_value, row_index| {
-        const row = asObject(row_value) orelse {
-            try issues.add(allocator, "routing-owner");
-            continue;
-        };
-        const trigger = stringField(row, "trigger") orelse "";
-        const expected_owner = routeOwner(trigger) orelse "";
-        if (expected_owner.len == 0 or !fieldEqualsString(row, "owner_lens", expected_owner)) try issues.add(allocator, "routing-owner");
-        if (duplicateStringField(routes.?.items, row_index, "trigger", trigger)) try issues.add(allocator, "routing-coverage");
-        const ids = asArrayValue(row.get("finding_ids"));
-        if (ids == null or !routeCoverageMatches(findings, trigger, ids.?.items)) try issues.add(allocator, "routing-coverage");
-    }
-    for ([_][]const u8{ "misuse-hazard", "invariant-gap", "complexity-stall" }) |trigger| {
-        const expected = countFindingsByLiability(findings, trigger);
-        const declared = countRowsWithField(routes.?.items, "trigger", trigger);
-        if ((expected == 0 and declared != 0) or (expected != 0 and declared != 1)) try issues.add(allocator, "routing-coverage");
-    }
-}
-
 const CheckpointParticipant = enum {
     learnings,
     synesthesia,
@@ -906,20 +733,11 @@ fn isEmptyListLike(value: ?std.json.Value) bool {
     };
 }
 
-fn allNonblankFields(object: std.json.ObjectMap, fields: []const []const u8) bool {
-    for (fields) |field| if (!isNonblankString(object.get(field))) return false;
-    return true;
-}
-
 fn nonblankStringArray(value: ?std.json.Value) bool {
     const array = asArrayValue(value) orelse return false;
     if (array.items.len == 0) return false;
     for (array.items) |item| if (!isNonblankString(item)) return false;
     return true;
-}
-
-fn isMaterialLiability(liability: []const u8) bool {
-    return stringIn(liability, &.{ "blocks-goal", "regression-risk", "proof-gap", "misuse-hazard", "invariant-gap", "complexity-stall" });
 }
 
 fn hasFinalCleanSweep(passes: []const std.json.Value) bool {
@@ -945,123 +763,8 @@ fn hasFinalCleanSweep(passes: []const std.json.Value) bool {
     return true;
 }
 
-fn validDisposition(validity: []const u8, disposition: []const u8) bool {
-    if (std.mem.eql(u8, validity, "valid")) return stringIn(disposition, &.{ "resolution-input", "ask-human", "blocked" });
-    if (std.mem.eql(u8, validity, "unproven")) return stringIn(disposition, &.{ "proof-only", "blocked" });
-    if (std.mem.eql(u8, validity, "needs-owner")) return stringIn(disposition, &.{ "ask-human", "blocked" });
-    if (std.mem.eql(u8, validity, "invalid")) return std.mem.eql(u8, disposition, "reject");
-    return false;
-}
-
-fn duplicateFindingId(findings: []const std.json.Value, current: usize, finding_id: []const u8) bool {
-    for (findings, 0..) |value, index| {
-        if (index == current) continue;
-        const finding = asObject(value) orelse continue;
-        const other = nonblankString(finding.get("finding_id")) orelse continue;
-        if (std.mem.eql(u8, other, finding_id)) return true;
-    }
-    return false;
-}
-
-fn quotientHasRoutedFinding(findings: []const std.json.Value, quotient: []const u8) bool {
-    if (quotient.len == 0) return false;
-    for (findings) |value| {
-        const finding = asObject(value) orelse continue;
-        const other = nonblankString(finding.get("quotient_key")) orelse continue;
-        const disposition = stringField(finding, "disposition") orelse continue;
-        if (std.mem.eql(u8, other, quotient) and stringIn(disposition, &.{ "resolution-input", "ask-human", "blocked" })) return true;
-    }
-    return false;
-}
-
-fn duplicateStringField(rows: []const std.json.Value, current: usize, field: []const u8, expected: []const u8) bool {
-    for (rows, 0..) |value, index| {
-        if (index == current) continue;
-        const row = asObject(value) orelse continue;
-        const actual = nonblankString(row.get(field)) orelse continue;
-        if (std.mem.eql(u8, actual, expected)) return true;
-    }
-    return false;
-}
-
-fn countRowsWithField(rows: []const std.json.Value, field: []const u8, expected: []const u8) usize {
-    var count: usize = 0;
-    for (rows) |value| {
-        const row = asObject(value) orelse continue;
-        const actual = nonblankString(row.get(field)) orelse continue;
-        if (std.mem.eql(u8, actual, expected)) count += 1;
-    }
-    return count;
-}
-
-fn classCoverageMatches(findings: []const std.json.Value, quotient: []const u8, ids: []const std.json.Value) bool {
-    var expected_count: usize = 0;
-    for (findings) |value| {
-        const finding = asObject(value) orelse continue;
-        const key = nonblankString(finding.get("quotient_key")) orelse continue;
-        if (!std.mem.eql(u8, key, quotient)) continue;
-        expected_count += 1;
-        const id = nonblankString(finding.get("finding_id")) orelse return false;
-        if (countStringValues(ids, id) != 1) return false;
-    }
-    if (expected_count != ids.len) return false;
-    for (ids) |id_value| if (!isNonblankString(id_value)) return false;
-    return true;
-}
-
-fn countStringValues(values: []const std.json.Value, expected: []const u8) usize {
-    var count: usize = 0;
-    for (values) |value| {
-        const actual = nonblankString(value) orelse continue;
-        if (std.mem.eql(u8, actual, expected)) count += 1;
-    }
-    return count;
-}
-
-fn routeOwner(trigger: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, trigger, "misuse-hazard")) return "footgun-finder";
-    if (std.mem.eql(u8, trigger, "invariant-gap")) return "invariant-ace";
-    if (std.mem.eql(u8, trigger, "complexity-stall")) return "complexity-mitigator";
-    return null;
-}
-
-fn countFindingsByLiability(findings: []const std.json.Value, liability: []const u8) usize {
-    var count: usize = 0;
-    for (findings) |value| {
-        const finding = asObject(value) orelse continue;
-        if (fieldEqualsString(finding, "liability", liability)) count += 1;
-    }
-    return count;
-}
-
-fn hasRoutedLiability(findings: []const std.json.Value) bool {
-    for (findings) |value| {
-        const finding = asObject(value) orelse continue;
-        if (routeOwner(stringField(finding, "liability") orelse "") != null) return true;
-    }
-    return false;
-}
-
-fn routeCoverageMatches(findings: []const std.json.Value, trigger: []const u8, ids: []const std.json.Value) bool {
-    const expected_count = countFindingsByLiability(findings, trigger);
-    if (expected_count != ids.len) return false;
-    for (findings) |value| {
-        const finding = asObject(value) orelse continue;
-        if (!fieldEqualsString(finding, "liability", trigger)) continue;
-        const id = nonblankString(finding.get("finding_id")) orelse return false;
-        if (countStringValues(ids, id) != 1) return false;
-    }
-    for (ids) |id| if (!isNonblankString(id)) return false;
-    return true;
-}
-
 fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.order(u8, lhs, rhs) == .lt;
-}
-
-test "Actuating validation modules are part of the Ledger test graph" {
-    std.testing.refAllDecls(actuating_review_policy_cli);
-    std.testing.refAllDecls(actuating_review_resolution_cli);
 }
 
 test "Hylo Slice 1 validation routes are complete and delegated" {
@@ -1211,7 +914,7 @@ test "Hylo portable artifact validators share the producer ceiling" {
 
     try std.testing.expectError(
         error.StreamTooLong,
-        readInputAlloc(std.testing.allocator, .review_fold, stimulus_path),
+        readInputAlloc(std.testing.allocator, .policy_synthesis_receipt, stimulus_path),
     );
 
     const long_component = [_]u8{'a'} ** 240;
@@ -1278,7 +981,7 @@ test "Hylo portable artifact validators share the producer ceiling" {
 
     try std.testing.expectError(
         error.StreamTooLong,
-        readInputAlloc(std.testing.allocator, .review_fold, target_bundle_path),
+        readInputAlloc(std.testing.allocator, .policy_synthesis_receipt, target_bundle_path),
     );
 }
 
@@ -1321,35 +1024,6 @@ test "policy synthesis validation rejects an incomplete fixed point" {
     try std.testing.expect(containsIssue(issues.values.items, "unresolved-errors"));
     try std.testing.expect(containsIssue(issues.values.items, "untreated-material-risks"));
     try std.testing.expect(containsIssue(issues.values.items, "missing-lens:policy_closure"));
-}
-
-test "review fold validation accepts material classified evidence" {
-    const input =
-        \\{"review_fold":{"version":"RF-v2","fold_id":"rf-1","goal_id":"goal-1","source":{"backend":"cas","source_batch_id":"batch-1","source_state":"findings","artifact":{"repo":"/repo","base_sha":"base","branch":"main","head_sha":"head","state_fingerprint":"sha256:state"},"source_ref":"cas:batch-1"},"intent_anchor":{"original_goal":"fix invariant","accepted_scope":["src"],"non_goals":[]},"findings":[{"finding_id":"finding-1","source_ref":"cas:finding-1","claim":"validation missing","observed_fact":"transition bypasses owner","suggested_repair":"validate","validity":"valid","liability":"invariant-gap","intent_relation":"core","novelty":"new-class","disposition":"resolution-input","quotient_key":"owner-validation","owner_boundary":"state-owner","law_family":"transition-preservation","falsifier":"invalid transition accepted","evidence_refs":["test:transition"],"mutation_authority":{"allowed":false,"reason":"resolution selects work"}}],"compression":{"equivalence_classes":[{"quotient_key":"owner-validation","finding_ids":["finding-1"],"owner_boundary":"state-owner","law_family":"transition-preservation"}]},"routing_obligations":[{"trigger":"invariant-gap","finding_ids":["finding-1"],"owner_lens":"invariant-ace"}]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
-    defer parsed.deinit();
-    var issues = Issues{};
-    defer issues.deinit(std.testing.allocator);
-    try validateReviewFold(std.testing.allocator, parsed.value, &issues);
-    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
-}
-
-test "review fold validation rejects authority and uncovered material evidence" {
-    const input =
-        \\{"review_fold":{"version":"RF-v2","fold_id":"rf-1","goal_id":"goal-1","source":{"backend":"cas","source_batch_id":"batch-1","source_state":"findings","artifact":{"repo":"/repo","base_sha":"base","branch":"main","head_sha":"head","state_fingerprint":"sha256:state"},"source_ref":"cas:batch-1"},"intent_anchor":{"original_goal":"fix invariant","accepted_scope":["src"],"non_goals":[]},"findings":[{"finding_id":"finding-1","source_ref":"cas:finding-1","claim":"validation missing","observed_fact":"validation missing","validity":"valid","liability":"invariant-gap","intent_relation":"core","novelty":"new-class","disposition":"resolution-input","quotient_key":"owner-validation","owner_boundary":"state-owner","law_family":"transition-preservation","falsifier":"invalid transition accepted","evidence_refs":[],"mutation_authority":{"allowed":true,"reason":"bad"},"selected_work_node":{"id":"bad"}}],"compression":{"equivalence_classes":[]},"routing_obligations":[]}}
-    ;
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
-    defer parsed.deinit();
-    var issues = Issues{};
-    defer issues.deinit(std.testing.allocator);
-    try validateReviewFold(std.testing.allocator, parsed.value, &issues);
-    try std.testing.expect(containsIssue(issues.values.items, "finding-mutation-authority"));
-    try std.testing.expect(containsIssue(issues.values.items, "finding-owned-field"));
-    try std.testing.expect(containsIssue(issues.values.items, "material-observed-fact"));
-    try std.testing.expect(containsIssue(issues.values.items, "material-evidence"));
-    try std.testing.expect(containsIssue(issues.values.items, "compression-coverage"));
-    try std.testing.expect(containsIssue(issues.values.items, "routing-coverage"));
 }
 
 test "source memory checkpoint validation accepts a complete all no-op receipt" {

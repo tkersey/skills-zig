@@ -84,6 +84,17 @@ fn text(
             current_new_file = false;
             in_hunk = false;
             try audit_module.countFile(audit);
+        } else if (in_hunk and std.mem.startsWith(u8, source_line, "@@ ")) {
+            line_number_new = try hunkLineNumber(source_line);
+        } else if (in_hunk) {
+            try hunkLine(
+                writer,
+                current_path,
+                current_new_file,
+                source_line,
+                &line_number_new,
+                audit,
+            );
         } else if (std.mem.startsWith(u8, source_line, "new file mode ")) {
             current_new_file = true;
         } else if (std.mem.startsWith(u8, source_line, "+++ b/")) {
@@ -95,15 +106,6 @@ fn text(
             if (current_path.len == 0) return error.InvalidDiff;
             line_number_new = try hunkLineNumber(source_line);
             in_hunk = true;
-        } else if (in_hunk) {
-            try hunkLine(
-                writer,
-                current_path,
-                current_new_file,
-                source_line,
-                &line_number_new,
-                audit,
-            );
         }
     }
 }
@@ -129,9 +131,7 @@ fn hunkLine(
     line_number_new: *u32,
     audit: *audit_module.Audit,
 ) !void {
-    if (std.mem.startsWith(u8, source_line, "+") and
-        !std.mem.startsWith(u8, source_line, "+++"))
-    {
+    if (std.mem.startsWith(u8, source_line, "+")) {
         if (!new_file) {
             try audit_module.addedLine(
                 writer,
@@ -205,4 +205,27 @@ test "modified diff lines are audited at their new line number" {
     try std.testing.expectEqual(@as(u32, 1), audit.files);
     try std.testing.expectEqual(@as(u32, 1), audit.diagnostics);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "example.zig:7") != null);
+}
+
+test "added concatenation operator remains hunk content" {
+    const input =
+        \\diff --git a/example.zig b/example.zig
+        \\index 111..222 100644
+        \\--- a/example.zig
+        \\+++ b/example.zig
+        \\@@ -1 +7,2 @@
+        \\+++ "first" ++
+        \\+    "second";
+        \\
+    ;
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var audit = audit_module.Audit{};
+    var new_files: std.ArrayList([]const u8) = .empty;
+    defer new_files.deinit(std.testing.allocator);
+
+    try text(std.testing.allocator, &output.writer, input, &audit, &new_files);
+    try std.testing.expectEqual(@as(u32, 1), audit.files);
+    try std.testing.expectEqual(@as(u64, 2), audit.lines);
+    try std.testing.expectEqual(@as(u32, 0), audit.diagnostics);
 }

@@ -382,6 +382,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "synesthesia_cli", .module = synesthesia_root },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
             .{ .name = "hctp_source", .module = hctp_source_for_hylo_tests },
@@ -973,10 +974,14 @@ pub fn build(b: *std.Build) void {
         .{ .link_libc = true },
     );
     const run_cas_dispatch_runtime_linux: ?*std.Build.Step = if (b.graph.host.result.os.tag == .linux and target.result.os.tag == .linux) cas_dispatch_runtime_linux: {
-        const cas_dispatch_run = b.addSystemCommand(&.{ b.getInstallPath(.bin, "cas"), "review_session", "--help" });
+        const cas_dispatch_run = b.addSystemCommand(&.{
+            b.getInstallPath(.bin, "cas"),
+            "review",
+            "--help",
+        });
         cas_dispatch_run.step.dependOn(&cas_install.step);
         cas_dispatch_run.step.dependOn(&cas_review_session_install.step);
-        cas_dispatch_run.expectStdOutMatch("cas_review_session");
+        cas_dispatch_run.expectStdOutMatch("cas review");
 
         const cas_dispatch_step = b.step("test-cas-dispatch-runtime-linux", "Verify the Linux cas dispatcher launches its sibling executable");
         cas_dispatch_step.dependOn(&cas_dispatch_run.step);

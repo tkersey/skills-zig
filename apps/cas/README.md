@@ -19,7 +19,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 ## Behavior
 
-- `cas` dispatches `account`, `capabilities`, `conformance`, `goal`, `smoke_check`, `instance_runner`, `review_session`, and `session_inquiry`; on macOS it also dispatches `trial`.
+- `cas` dispatches `account`, `capabilities`, `conformance`, `goal`, `smoke_check`, `instance_runner`, `review`, and `session_inquiry`; on macOS it also dispatches `trial`.
 - `cas trial` is the macOS-only HCTP-v1 single-execution runner. It atomically claims a
   registered lane-and-lease identity before launching one registered executor, accepts
   lane leases and visible case input only through protected file descriptors,
@@ -78,7 +78,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now prefers a CAS-managed loopback websocket app-server per instance, falling back to stdio when websocket bootstrap or handshake fails. Result rows and summaries now report the selected transport.
 - `cas_instance_runner` accepts `--multi-agent-mode explicit-request-only|proactive` for `thread/start` and `turn/start` request probes. It rejects unsupported methods and duplicate `multiAgentMode` params.
-- `cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and `cas_conformance_suite` accept `--hooks inherit|off|require-observed`. `inherit` is the default, `off` starts CAS-owned app-servers with `--disable codex_hooks`, and `require-observed` fails with `hook_not_observed` when no `hook/started` or `hook/completed` notifications were captured.
+- `cas_smoke_check`, `cas_instance_runner`, `cas review`, and `cas_conformance_suite` accept `--hooks inherit|off|require-observed`. `inherit` is the default, `off` starts CAS-owned app-servers with `--disable codex_hooks`, and `require-observed` fails with `hook_not_observed` when no `hook/started` or `hook/completed` notifications were captured.
 - JSON outputs include `hookSummary` on hook-aware lanes. Bad observed hook statuses fail closed with precedence `hook_blocked`, then `hook_failed`, then `hook_stopped`; unsupported hook-capable runtime surfaces fail with `hooks_unsupported`.
 - `cas_instance_runner` supports native responses for:
   - `item/commandExecution/requestApproval`
@@ -88,31 +88,15 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   - `mcpServer/elicitation/request`
   - `item/tool/call`
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
-- `cas_review_session` now starts detached `review/start` turns over a CAS-managed loopback websocket app-server, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and stores websocket session metadata beside the review-session record so fresh-process `status`, `wait`, and `interrupt` can reconnect to the same detached review transport.
-- `cas review_session run` is the brokered one-review path. It waits by default, returns `reviewVerdict`, reports `reviewBrokerDecision`, normalizes terminal same-tuple evidence, and auto-replaces an active same-tuple attempt only when prior transport loss plus dead owner/server liveness is proven.
-- Review wait defaults are action-aware: `run`, `start --wait`, `wait`, and `lane review` use `2700000` ms; lane smoke/suites and control paths use `300000` ms. An explicit positive `--timeout-ms` value always wins.
-- `cas review_session run`, `start`, and `lane review` accept an optional atomic `--workflow-binding-json JSON|@FILE`. For new runs the binding contains only caller-owned `requestId` and `requestFingerprint` strings. CAS validates both as non-empty, binds the object to review-lock and CAS-RER identity, and returns it unchanged.
-- `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied prompt as the native custom review target while retaining the selector for base/head/fingerprint identity and recovery.
-- `cas review_session current` and `list` return the complete valid history for the exact native repo/base/head/target-fingerprint and Codex-thread scope when no workflow binding is supplied. Passing `--workflow-binding-json` selects one exact binding. Account identity and resolved Codex path/version do not hide historical records.
-- `CAS-CURRENT-v2` and `CAS-LIST-v2` report `contextIdentityMatches` separately from immutable `CAS-RER-v1 principal.proofUsable`. The current flag compares runtime, principal, thread, tuple, and optional opaque binding without hiding historical records when those facts drift.
-- `CAS-RER-v1 workflowBinding` remains optional. Import preserves pre-0.2.75 non-empty binding objects as historical compatibility evidence; new review runs require the two-field opaque shape. CAS never attaches, relabels, or interprets an imported binding.
-- `cas review_session start` supports `--parent-mode auto|fresh|reuse`. `reuse` rejects unsafe parent threads. On Codex `0.118.x`, `auto` pre-materializes a fresh parent thread before detached `review/start`; `fresh` still forces the literal fresh-parent attempt and only retries after bootstrap materialization if the runtime rejects it.
-- `cas review_session status --latest --json` and `cas review_session wait --latest --json` select the newest persisted review-session record, so callers can inspect tuple binding and current status without manually listing `~/.codex/cas/review_sessions/*.json`.
-- `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
-- `cas review_session start` and `cas review_session lane review` accept `--multi-agent-mode explicit-request-only|proactive` for the fresh parent `thread/start` and bootstrap `turn/start` request flow. Reused parent threads are reported as unproven because CAS cannot prove it changed inherited parent execution context.
-- JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `requestedMultiAgentMode`, `effectiveMultiAgentMode`, `multiAgentModeSupport`, `multiAgentModeMetricEligible`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
-- `cas review_session lane smoke` starts a current persistent lane and verifies that the target tuple can create a first detached review attempt.
-- `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
-- `cas review_session run`, `cas review_session start`, and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses live active review locks or account/resource exhaustion locks.
-- `cas review_session receipt classify`, `cas review_session receipt gate`, and `cas review_session lock gate` provide the native Zig validator/classifier helpers for `$cas` skill fixtures and review receipts. These replace the old skill-local Python helper scripts.
-- Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
-- If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review output.
-- Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
+- `cas review` exposes exactly three actions: `run`, `start`, and `wait`. `run` brokers one tuple-bound attempt to a terminal verdict; `start` creates one detached attempt; `wait` observes that detached attempt to a terminal result.
+- `cas review run` and `start` accept an optional `--workflow-binding-json JSON|@FILE` containing caller-owned `requestId` and `requestFingerprint` strings. CAS validates the opaque binding, binds it to the attempt identity, and returns it unchanged.
+- `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied text as fresh-parent `developerInstructions` and sends the Git selector separately as `review/start.target`; the selector remains the source of base/head/fingerprint identity.
+- Review waits default to `2700000` ms. Detached `start` defaults to `300000` ms unless `--wait` is supplied. An explicit positive `--timeout-ms` value always wins.
 - `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It validates DCP-v2/RIP-v1 inputs, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports both `thread_fork_replay` and `rollout_transcript_replay` support.
-- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, `cas_review_history_v2`, and `cas_review_scoped_instructions_v1`.
+- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, and `cas_review_scoped_instructions_v1`.
 
 ## API Examples
 
@@ -164,117 +148,25 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --json
 
 # Broker one tuple-bound review verdict for the working tree.
-./zig-out/bin/cas review_session run \
+./zig-out/bin/cas review run \
   --cwd /path/to/workspace \
   --uncommitted \
   --timeout-ms 2700000 \
   --json
 
-# Bind a review atomically to an opaque caller-owned request identity.
-./zig-out/bin/cas review_session run \
+# Start one detached review with an opaque caller-owned request identity.
+./zig-out/bin/cas review start \
   --cwd /path/to/workspace \
   --base main \
   --custom-instructions @review-prompt.txt \
   --workflow-binding-json @workflow-binding.json \
-  --timeout-ms 2700000 \
   --json
 
-# Read all same-tuple/thread history, or filter to the exact binding.
-./zig-out/bin/cas review_session list \
+# Wait for the detached review to reach a terminal result.
+./zig-out/bin/cas review wait \
   --cwd /path/to/workspace \
-  --base main \
-  --custom-instructions @review-prompt.txt \
-  --codex-thread-id thr_workflow \
-  --json
-./zig-out/bin/cas review_session list \
-  --cwd /path/to/workspace \
-  --base main \
-  --custom-instructions @review-prompt.txt \
-  --codex-thread-id thr_workflow \
-  --workflow-binding-json @workflow-binding.json \
-  --json
-
-# Start a detached review session for lower-level lifecycle control.
-./zig-out/bin/cas review_session start \
-  --cwd /path/to/workspace \
-  --uncommitted \
-  --json
-
-# Reuse only a clean materialized parent thread.
-./zig-out/bin/cas review_session start \
-  --cwd /path/to/workspace \
-  --parent-thread-id thr_parent \
-  --parent-mode reuse \
-  --base main \
-  --json
-
-# Split detached review with a persisted websocket-backed session handle.
-./zig-out/bin/cas review_session start \
-  --cwd /path/to/workspace \
-  --base main \
-  --json
-
-# Fresh process reattaches to the same managed websocket transport.
-./zig-out/bin/cas review_session wait \
   --review-thread-id thr_123 \
   --timeout-ms 2700000 \
-  --json
-
-# Inspect the newest persisted review session and tuple binding.
-./zig-out/bin/cas review_session status \
-  --latest \
-  --json
-
-# Classify and validate saved CAS review artifacts with native helpers.
-./zig-out/bin/cas review_session receipt classify \
-  --path receipts.jsonl \
-  --format jsonl
-./zig-out/bin/cas review_session receipt gate \
-  --path review.json \
-  --format json
-./zig-out/bin/cas review_session lock gate \
-  --path tuple-lock.json \
-  --format json
-
-# Detached review with explicit degraded native-review fallback if websocket reconnect is lost.
-./zig-out/bin/cas review_session start \
-  --cwd /path/to/workspace \
-  --base main \
-  --fallback native-review \
-  --json
-
-# Reuse a persistent review lane and consume only the compact verdict.
-./zig-out/bin/cas review_session lane start \
-  --cwd /path/to/workspace \
-  --hooks off \
-  --json
-./zig-out/bin/cas review_session lane smoke \
-  --cwd /path/to/workspace \
-  --base main \
-  --json \
-  --timeout-ms 300000
-./zig-out/bin/cas review_session lane review \
-  --lane-id lane_123 \
-  --base main \
-  --timeout-ms 2700000 \
-  --fallback none \
-  --verdict-only
-
-# Force a second independent same-tuple review after terminal evidence exists.
-./zig-out/bin/cas review_session lane review \
-  --lane-id lane_123 \
-  --base main \
-  --fresh-attempt "clean-run 2" \
-  --timeout-ms 2700000 \
-  --fallback none \
-  --json
-# Exploratory proactive review discovery on a fresh parent.
-./zig-out/bin/cas review_session lane review \
-  --lane-id lane_123 \
-  --base main \
-  --multi-agent-mode proactive \
-  --timeout-ms 2700000 \
-  --fallback none \
   --json
 
 # Check runtime compatibility before historical replay.
