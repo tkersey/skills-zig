@@ -500,17 +500,23 @@ ledger --source actuation --goal GOAL_ID path
 
 Add `--repo PATH` before `--goal` to locate `.ledger`; the default is `.`. The
 adapter neither invokes Git nor derives subject identity from the repository.
-`prepare` accepts `actuating-operation/v1`. `append` accepts
+Actuating supplies `actuating-operation/v1.expected_subject_digest`; `prepare`
+exact-matches that opaque digest to the current structural subject and records
+it in the durable event envelope. `append` accepts
 `goal-contract/v3`, `construction-contract/v1`, `counterexample-set/v1`, or an
 `actuating-evidence-input/v1` observation. Durable evidence uses
 `actuating-evidence-event/v1`.
 
-`prepare` validates the operation against the current Goal Contract and
-Construction Contract, appends `operation_prepared`, returns the raw single-use
-capability once, and persists only its digest. The capability binds later
-effect evidence; it is not mutation authority. `append` materializes and
-validates a document draft before registering it, or validates and records an
-owner observation. It never performs the reported effect. `--capability` is
+`prepare` validates the operation against the current Goal Contract,
+Construction Contract, and expected subject, appends `operation_prepared`,
+returns the raw single-use capability once, and persists only its digest. The
+capability binds later effect evidence; it is not mutation authority. An edit
+must echo the executor-observed `pre_effect_subject_digest`; inspect and verify
+use the event envelope's current subject. Ledger exact-matches those
+caller-owned digests to the current tuple but never computes them. `append`
+materializes and validates a document draft before registering it, or validates
+and records an owner observation. It never performs the reported effect.
+`--capability` is
 required for `effect_recorded` and for a pre-effect `operation_observed`;
 `operation_aborted` is capabilityless exact tuple-and-step recovery that
 invalidates the pending capability digest. Artifact append returns

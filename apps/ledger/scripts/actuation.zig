@@ -1819,10 +1819,15 @@ fn applyEffectRecorded(state: *State, event: ParsedEvent) !void {
     if (std.mem.eql(u8, next_subject, state.subject_digest.?)) return error.SubjectDidNotChange;
     const body = try asObject(event.body);
     try requireExactKeys(body, &.{
-        "capability_digest", "changed_paths", "schema", "step_id",
+        "capability_digest", "changed_paths", "pre_effect_subject_digest", "schema", "step_id",
     });
     try requireBodySchema(body, .effect_recorded);
     try matchPendingIdentity(pending, body);
+    const pre_effect_subject = try stringField(body, "pre_effect_subject_digest");
+    try requireDigest(pre_effect_subject);
+    if (!std.mem.eql(u8, pre_effect_subject, state.subject_digest.?)) {
+        return error.SubjectDigestMismatch;
+    }
     const changed = try validateStringArray(try field(body, "changed_paths"), true);
     try validatePathArray(changed);
     if (!sameStringSet(changed, pending.paths)) return error.ChangedPathsMismatch;
@@ -1858,8 +1863,7 @@ fn applyOperationObserved(state: *State, event: ParsedEvent) !void {
     const pending = state.pending orelse return error.NoPendingOperation;
     const body = try asObject(event.body);
     try requireExactKeys(body, &.{
-        "capability_digest", "discharged_refs", "evidence_refs", "schema", "status",
-        "step_id",
+        "capability_digest", "discharged_refs", "evidence_refs", "schema", "status", "step_id",
     });
     try requireBodySchema(body, .operation_observed);
     try matchPendingIdentity(pending, body);
@@ -2163,7 +2167,9 @@ fn capabilityBodyAlloc(
 
 fn validateTransientCapabilityBody(kind: EventKind, body: std.json.ObjectMap) !void {
     const keys: []const []const u8 = switch (kind) {
-        .effect_recorded => &.{ "changed_paths", "schema", "step_id" },
+        .effect_recorded => &.{
+            "changed_paths", "pre_effect_subject_digest", "schema", "step_id",
+        },
         .operation_observed => &.{
             "discharged_refs", "evidence_refs", "schema", "status", "step_id",
         },
@@ -2220,6 +2226,8 @@ fn writeCapabilityBody(
 fn writeEffectBodyTail(writer: *std.Io.Writer, body: std.json.ObjectMap) !void {
     try writer.writeAll(",\"changed_paths\":");
     try std.json.Stringify.value(try field(body, "changed_paths"), .{}, writer);
+    try writer.writeAll(",\"pre_effect_subject_digest\":");
+    try writeJsonString(writer, try stringField(body, "pre_effect_subject_digest"));
     try writer.writeAll(",\"schema\":\"effect-recorded/v1\",\"step_id\":");
     try writeJsonString(writer, try stringField(body, "step_id"));
     try writer.writeByte('}');
@@ -2266,6 +2274,11 @@ fn prepareOperation(
         try stringField(operation, "construction_ref"),
         current.artifact_id,
     )) return error.ConstructionRefMismatch;
+    if (!std.mem.eql(
+        u8,
+        try stringField(operation, "expected_subject_digest"),
+        replay.state.subject_digest.?,
+    )) return error.SubjectDigestMismatch;
     const raw_capability = try randomCapabilityAlloc(allocator);
     errdefer allocator.free(raw_capability);
     const capability_digest = try digestTextAlloc(allocator, raw_capability);
@@ -2286,8 +2299,8 @@ fn prepareOperation(
 
 fn validateOperationInput(operation: std.json.ObjectMap, goal_id: []const u8) !void {
     try requireExactKeys(operation, &.{
-        "construction_ref", "effect",                "goal_id", "idempotency_key", "owner_boundary",
-        "paths",            "proof_obligation_refs", "schema",  "step_id",
+        "construction_ref", "effect", "expected_subject_digest", "goal_id", "idempotency_key",
+        "owner_boundary",   "paths",  "proof_obligation_refs",   "schema",  "step_id",
     });
     if (!std.mem.eql(u8, try stringField(operation, "schema"), OperationSchema)) {
         return error.InvalidInputSchema;
@@ -2296,6 +2309,7 @@ fn validateOperationInput(operation: std.json.ObjectMap, goal_id: []const u8) !v
         return error.GoalIdMismatch;
     }
     try requireDigest(try stringField(operation, "construction_ref"));
+    try requireDigest(try stringField(operation, "expected_subject_digest"));
 }
 
 fn preparedBodyAlloc(
@@ -2725,10 +2739,18 @@ fn testPrepare(
     defer replay.deinit();
     const input = try std.fmt.allocPrint(std.testing.allocator,
         \\{{"schema":"actuating-operation/v1","goal_id":"goal-1",
-        \\"construction_ref":"{s}","step_id":"{s}","effect":"{s}",
+        \\"construction_ref":"{s}","expected_subject_digest":"{s}",
+        \\"step_id":"{s}","effect":"{s}",
         \\"idempotency_key":"key-{s}","owner_boundary":"owner",
         \\"paths":["src/file.zig"],"proof_obligation_refs":{s}}}
-    , .{ replay.state.construction.?.artifact_id, step, effect, step, refs });
+    , .{
+        replay.state.construction.?.artifact_id,
+        replay.state.subject_digest.?,
+        step,
+        effect,
+        step,
+        refs,
+    });
     defer std.testing.allocator.free(input);
     return prepareOperation(std.testing.allocator, harness.store(), "goal-1", input);
 }
@@ -2851,6 +2873,7 @@ test "actuation: capability is consumed once without executing the effect" {
         "effect_recorded",
         TestDigest1,
         "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"edit-1\"," ++
+            "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
             "\"changed_paths\":[\"src/file.zig\"]}",
         prepared.capability,
     );
@@ -2877,6 +2900,66 @@ test "actuation: capability is consumed once without executing the effect" {
     );
 }
 
+test "actuation: prepared capability remains bound to its selected subject" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+
+    const stale_operation = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
+            "\"construction_ref\":\"{s}\",\"expected_subject_digest\":\"{s}\"," ++
+            "\"step_id\":\"stale-subject\",\"effect\":\"edit\"," ++
+            "\"idempotency_key\":\"stale-subject\",\"owner_boundary\":\"owner\"," ++
+            "\"paths\":[\"src/file.zig\"],\"proof_obligation_refs\":[\"proof-1\"]}}",
+        .{ refs.construction, TestDigest1 },
+    );
+    defer std.testing.allocator.free(stale_operation);
+    try std.testing.expectError(
+        error.SubjectDigestMismatch,
+        prepareOperation(std.testing.allocator, harness.store(), "goal-1", stale_operation),
+    );
+    try std.testing.expectEqual(@as(usize, 2), harness.memory.records.items.len);
+
+    var prepared = try testPrepare(&harness, "subject-bound-edit", "edit", "[\"proof-1\"]");
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.SubjectDigestMismatch,
+        testAppendOwner(
+            &harness,
+            "effect_recorded",
+            TestDigest1,
+            "{\"schema\":\"effect-recorded/v1\"," ++
+                "\"step_id\":\"subject-bound-edit\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest2 ++ "\"," ++
+                "\"changed_paths\":[\"src/file.zig\"]}",
+            prepared.capability,
+        ),
+    );
+    try testAppendOwner(
+        &harness,
+        "effect_recorded",
+        TestDigest1,
+        "{\"schema\":\"effect-recorded/v1\"," ++
+            "\"step_id\":\"subject-bound-edit\"," ++
+            "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+            "\"changed_paths\":[\"src/file.zig\"]}",
+        prepared.capability,
+    );
+    try testAppendOwner(
+        &harness,
+        "operation_observed",
+        null,
+        "{\"schema\":\"operation-observed/v1\"," ++
+            "\"step_id\":\"subject-bound-edit\"," ++
+            "\"status\":\"passed\",\"discharged_refs\":[\"proof-1\"]," ++
+            "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+        null,
+    );
+}
+
 test "actuation: event tuple references require sha256 digests" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
@@ -2892,6 +2975,7 @@ test "actuation: event tuple references require sha256 digests" {
             "effect_recorded",
             "not-a-digest",
             "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"bad-subject\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
                 "\"changed_paths\":[\"src/file.zig\"]}",
             prepared.capability,
         ),
@@ -3492,6 +3576,7 @@ test "actuation: abort recovers lost capability and discharge refs stay bound" {
             "effect_recorded",
             TestDigest1,
             "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"recover\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
                 "\"changed_paths\":[\"src/file.zig\"]}",
             prepared.capability,
         ),
@@ -3530,6 +3615,7 @@ test "actuation: Goal successor must change payload and stale operation fails cl
     const stale_operation =
         "{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
         "\"construction_ref\":\"" ++ TestDigest2 ++ "\",\"step_id\":\"stale\"," ++
+        "\"expected_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
         "\"effect\":\"edit\",\"idempotency_key\":\"stale\"," ++
         "\"owner_boundary\":\"owner\",\"paths\":[\"src/file.zig\"]," ++
         "\"proof_obligation_refs\":[\"proof-1\"]}";
