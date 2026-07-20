@@ -70,10 +70,7 @@ const HelpText = std.fmt.comptimePrint(
     \\  -h, --help        Show help
     \\  -V, --version     Show version
 , .{
-    if (HctpProductAvailable)
-        "Durable source-memory, actuation, replay, and plan ledger."
-    else
-        "Durable source-memory, actuation, and plan ledger.",
+    "Materialize, validate, record, and project workflow artifacts, including Actuating evidence.",
     if (HctpProductAvailable)
         "Source namespace; use negative-ledger, actuation, hylo, learnings, synesthesia, or universalist"
     else
@@ -3441,15 +3438,15 @@ test "repository identity distinguishes equal NEG ids in memory projections" {
     try std.testing.expect(std.mem.indexOf(u8, b, "owner/repo-b:.ledger/negative-ledger/events.jsonl#NEG-000001") != null);
 }
 
-test "actuation source routing preserves the one-transition command" {
+test "actuation source routing preserves the goal-bound artifact command" {
     const argv = [_][]const u8{
         "ledger",
         "prepare",
         "--source",
         "actuation",
-        "--run",
-        "run-1",
-        "--json",
+        "--goal",
+        "goal-1",
+        "--input",
         "operation.json",
     };
     const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "actuation");
@@ -3457,10 +3454,14 @@ test "actuation source routing preserves the one-transition command" {
     try std.testing.expectEqual(@as(usize, 6), routed.len);
     try std.testing.expectEqualStrings("ledger", routed[0]);
     try std.testing.expectEqualStrings("prepare", routed[1]);
-    try std.testing.expectEqualStrings("--run", routed[2]);
-    try std.testing.expectEqualStrings("run-1", routed[3]);
-    try std.testing.expectEqualStrings("--json", routed[4]);
+    try std.testing.expectEqualStrings("--goal", routed[2]);
+    try std.testing.expectEqualStrings("goal-1", routed[3]);
+    try std.testing.expectEqualStrings("--input", routed[4]);
     try std.testing.expectEqualStrings("operation.json", routed[5]);
+}
+
+test "actuation: adapter conformance declarations" {
+    std.testing.refAllDecls(actuation_cli);
 }
 
 test "universalist source routing preserves plan creation arguments" {
@@ -3582,8 +3583,5 @@ test "root help follows Hylo source admission" {
         HctpProductAvailable,
         std.mem.indexOf(u8, HelpText, "actuation, hylo, learnings") != null,
     );
-    try std.testing.expectEqual(
-        HctpProductAvailable,
-        std.mem.indexOf(u8, HelpText, "actuation, replay, and plan") != null,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, HelpText, "including Actuating evidence") != null);
 }

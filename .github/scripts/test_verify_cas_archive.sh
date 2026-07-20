@@ -43,7 +43,7 @@ write_stub_set() {
     '  conformance) sibling=cas_conformance_suite ;;' \
     '  goal) sibling=cas_goal ;;' \
     '  instance_runner) sibling=cas_instance_runner ;;' \
-    '  review_session) sibling=cas_review_session ;;' \
+    '  review) sibling=cas_review_session ;;' \
     '  session_inquiry) sibling=cas_session_inquiry ;;' \
     '  smoke_check) sibling=cas_smoke_check ;;' \
     '  trial) sibling=cas_trial ;;' \
@@ -67,7 +67,11 @@ write_stub_set() {
     cas-conformance-suite \
     cas-goal \
     cas-perf-budget-governor; do
-    write_stub "$dir/$name" "$name"
+    stub_marker="$name"
+    if [[ "$name" == "cas_review_session" ]]; then
+      stub_marker="cas review"
+    fi
+    write_stub "$dir/$name" "$stub_marker"
   done
   if [[ "$target" == "darwin-arm64" ]]; then
     write_stub "$dir/cas_trial" cas_trial

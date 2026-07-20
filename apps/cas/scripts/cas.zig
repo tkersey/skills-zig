@@ -28,9 +28,7 @@ const CapabilitiesTextMacos =
     \\hylo_internal_historical_replay_v1=true
     \\dcp_v1=true
     \\dcp_v2=true
-    \\cas_rer_workflow_binding_v1=false
     \\cas_rer_opaque_request_binding_v1=true
-    \\cas_review_history_v2=true
     \\cas_review_scoped_instructions_v1=true
 ;
 
@@ -38,9 +36,7 @@ const CapabilitiesTextWithoutHctp =
     \\session_inquiry_v1=true
     \\dcp_v1=true
     \\dcp_v2=true
-    \\cas_rer_workflow_binding_v1=false
     \\cas_rer_opaque_request_binding_v1=true
-    \\cas_review_history_v2=true
     \\cas_review_scoped_instructions_v1=true
 ;
 
@@ -67,9 +63,7 @@ const CapabilitiesJsonMacos =
     \\      "ephemeral_fork": true,
     \\      "read_only_inquiry": true,
     \\      "detached_inquiry": true,
-    \\      "cas_rer_workflow_binding_v1": false,
     \\      "cas_rer_opaque_request_binding_v1": true,
-    \\      "cas_review_history_v2": true,
     \\      "cas_review_scoped_instructions_v1": true
     \\    }
     \\  }
@@ -89,9 +83,7 @@ const CapabilitiesJsonWithoutHctp =
     \\      "ephemeral_fork": true,
     \\      "read_only_inquiry": true,
     \\      "detached_inquiry": true,
-    \\      "cas_rer_workflow_binding_v1": false,
     \\      "cas_rer_opaque_request_binding_v1": true,
-    \\      "cas_review_history_v2": true,
     \\      "cas_review_scoped_instructions_v1": true
     \\    }
     \\  }
@@ -114,8 +106,7 @@ const UsageTextMacos =
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
-    \\  review          | review_session    Run CAS review evidence commands.
-    \\  review-session                     Run cas_review_session.
+    \\  review                              Run tuple-bound review attempts.
     \\  session_inquiry | session-inquiry   Run cas_session_inquiry.
     \\  trial                                Run cas_trial.
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
@@ -127,12 +118,8 @@ const UsageTextMacos =
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
     \\  cas review run --cwd /path/to/repo --base main --json
-    \\  cas review current --cwd /path/to/repo --base main --json
-    \\  cas review list --cwd /path/to/repo --base main --json
-    \\  cas review import --path review-1.json --cwd /path/to/repo --base main --json
-    \\  cas review inspect --record rer_123.json --json
-    \\  cas review validate-record --record rer_123.json --json
-    \\  cas review_session start --cwd /path/to/repo --uncommitted --json
+    \\  cas review start --cwd /path/to/repo --uncommitted --json
+    \\  cas review wait --cwd /path/to/repo --latest --json
     \\  cas session_inquiry preflight --json
     \\  cas trial preflight --trial trial.json --lane-id LANE --json
     \\  cas trial run --trial trial.json --lane-id LANE ... --materialization-fd 5
@@ -157,8 +144,7 @@ const UsageTextWithoutHctp =
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
-    \\  review          | review_session    Run CAS review evidence commands.
-    \\  review-session                     Run cas_review_session.
+    \\  review                              Run tuple-bound review attempts.
     \\  session_inquiry | session-inquiry   Run cas_session_inquiry.
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
@@ -169,12 +155,8 @@ const UsageTextWithoutHctp =
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
     \\  cas review run --cwd /path/to/repo --base main --json
-    \\  cas review current --cwd /path/to/repo --base main --json
-    \\  cas review list --cwd /path/to/repo --base main --json
-    \\  cas review import --path review-1.json --cwd /path/to/repo --base main --json
-    \\  cas review inspect --record rer_123.json --json
-    \\  cas review validate-record --record rer_123.json --json
-    \\  cas review_session start --cwd /path/to/repo --uncommitted --json
+    \\  cas review start --cwd /path/to/repo --uncommitted --json
+    \\  cas review wait --cwd /path/to/repo --latest --json
     \\  cas session_inquiry preflight --json
     \\  cas smoke_check --cwd /path/to/repo --json
     \\
@@ -325,7 +307,7 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "instance_runner") or std.mem.eql(u8, subcommand, "instance-runner")) {
         return "cas_instance_runner";
     }
-    if (std.mem.eql(u8, subcommand, "review") or std.mem.eql(u8, subcommand, "review_session") or std.mem.eql(u8, subcommand, "review-session")) {
+    if (std.mem.eql(u8, subcommand, "review")) {
         return "cas_review_session";
     }
     if (std.mem.eql(u8, subcommand, "session_inquiry") or std.mem.eql(u8, subcommand, "session-inquiry")) {
@@ -378,8 +360,8 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance_runner").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
     try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review").?);
-    try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review_session").?);
-    try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review-session").?);
+    try std.testing.expect(resolveTarget("review_session") == null);
+    try std.testing.expect(resolveTarget("review-session") == null);
     try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session_inquiry").?);
     try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session-inquiry").?);
     if (HctpProductAvailable) {
@@ -392,31 +374,73 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expect(resolveTarget("unknown") == null);
 }
 
-test "capabilities advertise opaque request binding and retire semantic workflow binding" {
+test "review dispatcher advertises only the current public route" {
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas review run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas review start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas review wait") != null);
+    const retired_routes = [_][]const u8{
+        "review_session",
+        "review-session",
+        "cas review current",
+        "cas review list",
+        "cas review import",
+        "cas review inspect",
+        "cas review validate-record",
+    };
+    for (retired_routes) |retired| {
+        try std.testing.expect(std.mem.indexOf(u8, UsageText, retired) == null);
+    }
+}
+
+test "capabilities advertise only current review boundary features" {
     var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer text_output.deinit();
     try writeCapabilities(&text_output.writer, false);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_workflow_binding_v1=false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_opaque_request_binding_v1=true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_review_history_v2=true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_review_scoped_instructions_v1=true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_rer_opaque_request_binding_v1=true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_review_scoped_instructions_v1=true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_rer_workflow_binding_v1",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
+        "cas_review_history_v2",
+    ) == null);
     try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "dcp_v2=true") != null);
 
     var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer json_output.deinit();
     try writeCapabilities(&json_output.writer, true);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_workflow_binding_v1\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_opaque_request_binding_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_history_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "cas_rer_workflow_binding_v1",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "cas_review_history_v2",
+    ) == null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"dcp_v2\": true") != null);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_output.written(), .{});
     defer parsed.deinit();
     const features = parsed.value.object.get("cas_capabilities").?.object.get("features").?.object;
-    try std.testing.expect(!features.get("cas_rer_workflow_binding_v1").?.bool);
     try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);
-    try std.testing.expect(features.get("cas_review_history_v2").?.bool);
     try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
+    try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);
+    try std.testing.expect(features.get("cas_review_history_v2") == null);
     try std.testing.expect(features.get("dcp_v2").?.bool);
     const hctp_capabilities = [_][]const u8{
         "hylo_trial_runner_v1",

@@ -1,5 +1,5 @@
 const app_meta = @import("app_meta");
-const builtin = @import("builtin");
+const canonical_json = @import("execution_policy_core").canonical_json;
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
 const std = @import("std");
@@ -7,43 +7,41 @@ const std = @import("std");
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "ledger --source actuation";
-const DefaultStorePath = ".ledger/actuation/events.jsonl";
-const MaxStoreBytes = 64 * 1024 * 1024;
+const StoreRoot = ".ledger/actuation";
+const StoreName = "evidence.jsonl";
+const EventSchema = "actuating-evidence-event/v1";
+const InputSchema = "actuating-evidence-input/v1";
+const OperationSchema = "actuating-operation/v1";
+const GenesisDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const MaxStoreBytes = 16 * 1024 * 1024;
 const MaxInputBytes = 4 * 1024 * 1024;
-const MaxProcessOutputBytes = 4 * 1024 * 1024;
-const GenesisDigest = "actuation-genesis/v1";
+const MaxEvents = 10_000;
 threadlocal var runtime_io: ?std.Io = null;
 
 fn defaultIo() std.Io {
-    return if (builtin.is_test) std.testing.io else runtime_io orelse Io.io();
+    return runtime_io orelse if (@import("builtin").is_test) std.testing.io else Io.io();
 }
 
 const UsageText =
     \\ledger --source actuation
     \\
-    \\usage: ledger --source actuation [-h] [--repo PATH] [--path PATH] {open,prepare,record,execute,observe,state,close,decide,doctor,path} ...
+    \\usage: ledger --source actuation [--repo PATH] --goal GOAL_ID COMMAND [OPTIONS]
     \\
-    \\Advance one causal actuation-kernel transition per invocation. /goal owns iteration.
+    \\Materialize Actuating artifacts, append goal-local Evidence, and project Actuating state.
     \\
     \\commands:
-    \\  open       Bind authority, allowed paths, and verifier-backed obligations
-    \\  prepare    Admit one operation and issue a random single-use capability
-    \\  record     Consume an edit capability after independently reconciling the file delta
-    \\  execute    Consume an inspect/verify capability by running its admitted verifier
-    \\  observe    Run the admitted verifier after a recorded edit
-    \\  state      Fold the event chain and project the next legal transition
-    \\  close      Close only after every obligation has a passing observation
-    \\  decide     Project a Zig-native closure decision from the live kernel state
-    \\  doctor     Validate sequence, hash chain, schemas, and state transitions
-    \\  path       Print the resolved actuation event path
+    \\  append     Materialize an artifact or append an owner observation
+    \\  prepare    Admit one Construction-projected operation and issue one capability
+    \\  state      Project disposable current state from Evidence
+    \\  project    Project disposable non-authoritative Evidence facts
+    \\  doctor     Validate the complete goal-local Evidence chain
+    \\  path       Print the fixed goal-local Evidence path
     \\
     \\options:
-    \\  --repo PATH       Git repository to observe (default: current repository)
-    \\  --path PATH       Event store path (default: .ledger/actuation/events.jsonl)
-    \\  --json FILE|-     JSON input for open or prepare
-    \\  --run RUN-ID      Run identity for all post-open transitions
-    \\  --step STEP-ID    Step identity for observe
-    \\  --capability CAP  Raw capability returned once by prepare
+    \\  --repo PATH       Repository root used only to locate .ledger (default: .)
+    \\  --goal GOAL_ID    Safe goal identity; required for every command
+    \\  --input FILE|-    Artifact draft, operation, or owner observation
+    \\  --capability CAP  Single-use capability required by consuming observations
     \\  -h, --help        Show help
     \\  -V, --version     Show version
 ;
@@ -53,366 +51,274 @@ const HelpSurface = core_cli.HelpSurface{
     .help_text = UsageText,
 };
 
-const Command = enum {
-    open,
-    prepare,
-    record,
-    execute,
-    observe,
-    state,
-    close,
-    decide,
-    doctor,
-    path,
-};
+const Command = enum { append, prepare, state, project, doctor, path };
 
 const Args = struct {
     command: ?Command = null,
     repo: []const u8 = ".",
-    path: []const u8 = DefaultStorePath,
-    json_path: ?[]const u8 = null,
-    run_id: ?[]const u8 = null,
-    step_id: ?[]const u8 = null,
+    goal_id: ?[]const u8 = null,
+    input_path: ?[]const u8 = null,
     capability: ?[]const u8 = null,
 };
 
-const Effect = enum {
-    inspect,
-    edit,
-    verify,
+const ArtifactFamily = enum { goal, counterexample, construction, evidence };
+const Effect = enum { inspect, edit, verify };
+const ClassStatus = enum { accepted, rejected, blocked, follow_up };
 
-    fn parse(raw: []const u8) ?Effect {
-        inline for (@typeInfo(Effect).@"enum".fields) |field| {
-            if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
-        }
-        return null;
-    }
-
-    fn name(self: Effect) []const u8 {
-        return @tagName(self);
-    }
-};
-
-const Phase = enum {
-    ready,
-    prepared,
+const EventKind = enum {
+    goal_contract_registered,
+    counterexample_set_registered,
+    construction_contract_registered,
+    operation_prepared,
     effect_recorded,
-    closed,
-
-    fn name(self: Phase) []const u8 {
-        return @tagName(self);
-    }
+    operation_observed,
+    operation_aborted,
+    publication_observed,
+    review_campaign_started,
+    review_request_bound,
+    review_attempt_started,
+    review_attempt_completed,
+    review_transport_failed,
 };
 
-const Completion = enum {
-    complete,
-    ready_to_ship,
+const EventOrigin = enum { artifact, adapter, owner };
 
-    fn parse(raw: []const u8) ?Completion {
-        if (std.mem.eql(u8, raw, "complete")) return .complete;
-        if (std.mem.eql(u8, raw, "ready-to-ship")) return .ready_to_ship;
-        return null;
-    }
-
-    fn name(self: Completion) []const u8 {
-        return switch (self) {
-            .complete => "complete",
-            .ready_to_ship => "ready-to-ship",
-        };
-    }
+const ProtocolSpec = struct {
+    kind: EventKind,
+    wire: []const u8,
+    body_schema: ?[]const u8,
+    origin: EventOrigin,
+    artifact: ?ArtifactFamily = null,
 };
 
-const ObligationKind = enum {
-    implementation,
-    review,
-    ship,
-    acceptance,
+const protocol = [_]ProtocolSpec{
+    .{
+        .kind = .goal_contract_registered,
+        .wire = "goal_contract_registered",
+        .body_schema = "goal-contract/v3",
+        .origin = .artifact,
+        .artifact = .goal,
+    },
+    .{
+        .kind = .counterexample_set_registered,
+        .wire = "counterexample_set_registered",
+        .body_schema = "counterexample-set/v1",
+        .origin = .artifact,
+        .artifact = .counterexample,
+    },
+    .{
+        .kind = .construction_contract_registered,
+        .wire = "construction_contract_registered",
+        .body_schema = "construction-contract/v1",
+        .origin = .artifact,
+        .artifact = .construction,
+    },
+    .{
+        .kind = .operation_prepared,
+        .wire = "operation_prepared",
+        .body_schema = "operation-prepared/v1",
+        .origin = .adapter,
+    },
+    .{
+        .kind = .effect_recorded,
+        .wire = "effect_recorded",
+        .body_schema = "effect-recorded/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .operation_observed,
+        .wire = "operation_observed",
+        .body_schema = "operation-observed/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .operation_aborted,
+        .wire = "operation_aborted",
+        .body_schema = "operation-aborted/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .publication_observed,
+        .wire = "publication_observed",
+        .body_schema = "publication-observed/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .review_campaign_started,
+        .wire = "review_campaign_started",
+        .body_schema = "review-campaign-started/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .review_request_bound,
+        .wire = "review_request_bound",
+        .body_schema = "review-request-bound/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .review_attempt_started,
+        .wire = "review_attempt_started",
+        .body_schema = "review-attempt-started/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .review_attempt_completed,
+        .wire = "review_attempt_completed",
+        .body_schema = "review-attempt-completed/v1",
+        .origin = .owner,
+    },
+    .{
+        .kind = .review_transport_failed,
+        .wire = "review_transport_failed",
+        .body_schema = "review-transport-failed/v1",
+        .origin = .owner,
+    },
+};
 
-    fn parse(raw: []const u8) ?ObligationKind {
-        inline for (@typeInfo(ObligationKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+fn specForKind(kind: EventKind) *const ProtocolSpec {
+    for (&protocol) |*spec| if (spec.kind == kind) return spec;
+    unreachable;
+}
+
+fn kindFromWire(raw: []const u8) ?EventKind {
+    for (protocol) |spec| if (std.mem.eql(u8, raw, spec.wire)) return spec.kind;
+    return null;
+}
+
+fn familyFromSchema(raw: []const u8) ?ArtifactFamily {
+    for (protocol) |spec| {
+        if (spec.artifact != null and std.mem.eql(u8, raw, spec.body_schema.?)) {
+            return spec.artifact;
         }
-        return null;
     }
+    return null;
+}
 
-    fn name(self: ObligationKind) []const u8 {
-        return @tagName(self);
+fn registrationKind(family: ArtifactFamily) !EventKind {
+    for (protocol) |spec| if (spec.artifact == family) return spec.kind;
+    return error.InvalidArtifactFamily;
+}
+
+const ArtifactView = struct {
+    family: ArtifactFamily,
+    artifact_id: []const u8,
+    goal_id: []const u8,
+    predecessors: std.json.Array,
+    payload: std.json.Value,
+};
+
+const ClassRecord = struct {
+    class_id: []const u8,
+    boundary_key: []const u8,
+    law_ref: []const u8,
+    owner_boundary: []const u8,
+    severity: ClassSeverity,
+    status: ClassStatus,
+    set_ref: []const u8,
+    construction_ref: []const u8,
+    subject_digest: []const u8,
+};
+
+const Pending = struct {
+    step_id: []const u8,
+    idempotency_key: []const u8,
+    effect: Effect,
+    capability_digest: []const u8,
+    consumed: bool,
+    paths: std.json.Array,
+    proof_refs: std.json.Array,
+};
+
+const State = struct {
+    allocator: std.mem.Allocator,
+    goal_id: []const u8,
+    goal: ?ArtifactView = null,
+    construction: ?ArtifactView = null,
+    subject_digest: ?[]const u8 = null,
+    classes: std.ArrayList(ClassRecord) = .empty,
+    counterexample_sets: std.ArrayList([]const u8) = .empty,
+    pending: ?Pending = null,
+    used_steps: std.ArrayList([]const u8) = .empty,
+    used_keys: std.ArrayList([]const u8) = .empty,
+    kind_counts: [protocol.len]usize = [_]usize{0} ** protocol.len,
+    event_count: usize = 0,
+    head_digest: []const u8 = GenesisDigest,
+
+    fn init(allocator: std.mem.Allocator, goal_id: []const u8) State {
+        return .{ .allocator = allocator, .goal_id = goal_id };
     }
 };
 
-const ObligationInput = struct {
-    id: []const u8,
-    kind: []const u8,
-    statement: []const u8,
-    verifier: []const []const u8,
+const Replay = struct {
+    parent: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    snapshot: durable_store.EventSnapshot,
+    state: State,
+
+    fn deinit(self: *Replay) void {
+        self.arena.deinit();
+        self.parent.destroy(self.arena);
+    }
 };
 
-const OpenInput = struct {
-    schema: []const u8,
-    run_id: []const u8,
-    goal_id: []const u8,
-    goal_contract_digest: []const u8,
-    resolution_digest: ?[]const u8 = null,
-    source_ref: []const u8,
-    execution_authority_ref: []const u8,
-    mutation_allowed: bool,
-    completion: []const u8,
-    allowed_paths: []const []const u8,
-    obligations: []const ObligationInput,
-};
-
-const OperationInput = struct {
-    schema: []const u8,
-    step_id: []const u8,
-    effect: []const u8,
-    idempotency_key: []const u8,
-    owner_boundary: []const u8,
-    paths: []const []const u8,
-    obligation_refs: []const []const u8,
-};
-
-const PathStateWire = struct {
-    path: []const u8,
-    digest: []const u8,
-};
-
-const RunOpenedBody = struct {
-    schema: []const u8 = "actuation-run-opened/v1",
-    goal_id: []const u8,
-    goal_contract_digest: []const u8,
-    resolution_digest: ?[]const u8,
-    source_ref: []const u8,
-    execution_authority_ref: []const u8,
-    mutation_allowed: bool,
-    completion: []const u8,
-    repo: []const u8,
-    store_path: []const u8,
-    allowed_paths: []const []const u8,
-    obligations: []const ObligationInput,
-    artifact_digest: []const u8,
-};
-
-const OperationPreparedBody = struct {
-    schema: []const u8 = "actuation-operation-prepared/v1",
-    step_id: []const u8,
-    effect: []const u8,
-    idempotency_key: []const u8,
-    owner_boundary: []const u8,
-    paths: []const []const u8,
-    obligation_refs: []const []const u8,
-    verifier: []const []const u8,
-    capability_digest: []const u8,
-    artifact_before: []const u8,
-    unscoped_before: []const u8,
-    path_states_before: []const PathStateWire,
-};
-
-const EffectRecordedBody = struct {
-    schema: []const u8 = "actuation-effect-recorded/v1",
-    step_id: []const u8,
-    effect: []const u8,
-    idempotency_key: []const u8,
-    capability_digest: []const u8,
-    artifact_before: []const u8,
-    artifact_after: []const u8,
-    unscoped_before: []const u8,
-    unscoped_after: []const u8,
-    changed_paths: []const []const u8,
-    path_states_after: []const PathStateWire,
-};
-
-const OperationObservedBody = struct {
-    schema: []const u8 = "actuation-operation-observed/v1",
-    step_id: []const u8,
-    effect: []const u8,
-    idempotency_key: []const u8,
-    capability_digest: []const u8,
-    verifier: []const []const u8,
-    obligation_refs: []const []const u8,
-    outcome: []const u8,
-    exit_code: u8,
-    stdout_digest: []const u8,
-    stderr_digest: []const u8,
-    artifact_before: []const u8,
-    artifact_after: []const u8,
-};
-
-const RunClosedBody = struct {
-    schema: []const u8 = "actuation-run-closed/v1",
-    goal_contract_digest: []const u8,
-    artifact_digest: []const u8,
-    discharged_obligations: []const []const u8,
-};
-
-const EventWire = struct {
-    schema: []const u8,
-    sequence: u64,
+const ParsedEvent = struct {
+    sequence: usize,
     previous_digest: []const u8,
-    run_id: []const u8,
-    kind: []const u8,
-    recorded_at_unix: i64,
+    event_id: []const u8,
+    goal_id: []const u8,
+    construction_ref: ?[]const u8,
+    subject_digest: ?[]const u8,
+    kind: EventKind,
+    recorded_at: i64,
     body: std.json.Value,
     body_digest: []const u8,
     event_digest: []const u8,
 };
 
-const ObligationState = struct {
-    id: []u8,
-    kind: ObligationKind,
-    statement: []u8,
-    verifier: [][]u8,
-    discharged_by: ?[]u8 = null,
+const Materialized = struct {
+    family: ArtifactFamily,
+    bytes: []u8,
+    artifact_id: []u8,
 
-    fn deinit(self: *ObligationState, allocator: std.mem.Allocator) void {
-        allocator.free(self.id);
-        allocator.free(self.statement);
-        freeStringList(allocator, self.verifier);
-        if (self.discharged_by) |step_id| allocator.free(step_id);
+    fn deinit(self: *Materialized, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.artifact_id);
     }
 };
 
-const PathState = struct {
-    path: []u8,
-    digest: []u8,
-
-    fn deinit(self: *PathState, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.digest);
-    }
-};
-
-const Pending = struct {
-    step_id: []u8,
-    effect: Effect,
-    idempotency_key: []u8,
-    owner_boundary: []u8,
-    paths: [][]u8,
-    obligation_refs: [][]u8,
-    verifier: [][]u8,
-    capability_digest: []u8,
-    artifact_before: []u8,
-    artifact_after: ?[]u8 = null,
-    unscoped_before: []u8,
-    path_states_before: []PathState,
-
-    fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
-        allocator.free(self.step_id);
-        allocator.free(self.idempotency_key);
-        allocator.free(self.owner_boundary);
-        freeStringList(allocator, self.paths);
-        freeStringList(allocator, self.obligation_refs);
-        freeStringList(allocator, self.verifier);
-        allocator.free(self.capability_digest);
-        allocator.free(self.artifact_before);
-        if (self.artifact_after) |digest| allocator.free(digest);
-        allocator.free(self.unscoped_before);
-        for (self.path_states_before) |*state| state.deinit(allocator);
-        allocator.free(self.path_states_before);
-    }
-};
-
-const RunState = struct {
-    run_id: []u8,
-    goal_id: []u8,
-    goal_contract_digest: []u8,
-    resolution_digest: ?[]u8,
-    source_ref: []u8,
-    execution_authority_ref: []u8,
-    mutation_allowed: bool,
-    completion: Completion,
-    repo: []u8,
-    store_path: []u8,
-    allowed_paths: [][]u8,
-    obligations: []ObligationState,
-    step_ids: std.ArrayList([]u8) = .empty,
-    idempotency_keys: std.ArrayList([]u8) = .empty,
-    artifact_digest: []u8,
-    phase: Phase = .ready,
-    pending: ?Pending = null,
-
-    fn deinit(self: *RunState, allocator: std.mem.Allocator) void {
-        allocator.free(self.run_id);
-        allocator.free(self.goal_id);
-        allocator.free(self.goal_contract_digest);
-        if (self.resolution_digest) |digest| allocator.free(digest);
-        allocator.free(self.source_ref);
-        allocator.free(self.execution_authority_ref);
-        allocator.free(self.repo);
-        allocator.free(self.store_path);
-        freeStringList(allocator, self.allowed_paths);
-        for (self.obligations) |*obligation| obligation.deinit(allocator);
-        allocator.free(self.obligations);
-        freeOwnedArrayList(allocator, &self.step_ids);
-        freeOwnedArrayList(allocator, &self.idempotency_keys);
-        allocator.free(self.artifact_digest);
-        if (self.pending) |*pending| pending.deinit(allocator);
-    }
-};
-
-const LedgerLoad = struct {
-    event_count: u64 = 0,
-    last_digest: []u8,
-    store_revision: []u8,
-    store_exists: bool,
-    state: ?RunState = null,
-
-    fn deinit(self: *LedgerLoad, allocator: std.mem.Allocator) void {
-        allocator.free(self.last_digest);
-        allocator.free(self.store_revision);
-        if (self.state) |*state| state.deinit(allocator);
-    }
-};
-
-const TransitionResult = struct {
-    run_id: []u8,
+const AppendResult = struct {
     event_digest: []u8,
-    artifact_digest: []u8,
-    capability: ?[]u8 = null,
-    passed: ?bool = null,
-    exit_code: ?u8 = null,
+    artifact_id: ?[]u8 = null,
+    artifact_bytes: ?[]u8 = null,
 
-    fn deinit(self: *TransitionResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.run_id);
+    fn deinit(self: *AppendResult, allocator: std.mem.Allocator) void {
         allocator.free(self.event_digest);
-        allocator.free(self.artifact_digest);
-        if (self.capability) |value| allocator.free(value);
+        if (self.artifact_id) |value| allocator.free(value);
+        if (self.artifact_bytes) |value| allocator.free(value);
     }
 };
 
-const ProcessResult = struct {
-    exit_code: u8,
-    stdout: []u8,
-    stderr: []u8,
+const PrepareResult = struct {
+    event_digest: []u8,
+    capability: []u8,
 
-    fn deinit(self: *ProcessResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.stdout);
-        allocator.free(self.stderr);
+    fn deinit(self: *PrepareResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_digest);
+        allocator.free(self.capability);
     }
-};
-
-const DecisionProjection = struct {
-    terminal: bool,
-    verdict: []const u8,
-    goal_outcome: []const u8,
-    implementation_outcome: []const u8,
-    next_owner: []const u8,
-    next_transition: []const u8,
-};
-
-const DecisionBasis = enum {
-    evidence,
-    review,
-    ship,
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const code = try runWithArgv(allocator, init.io, argv);
+    const code = try runWithArgv(init.gpa, init.io, argv);
     if (code != 0) std.process.exit(code);
 }
 
-pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
+pub fn runWithArgv(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !u8 {
     const previous_io = runtime_io;
     runtime_io = io;
     defer runtime_io = previous_io;
@@ -423,1471 +329,142 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
 }
 
 fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
-    if (argv.len <= 1 or core_cli.isHelpArg(argv[1])) {
-        try printHelp();
-        return 0;
-    }
+    if (argv.len <= 1 or core_cli.isHelpArg(argv[1])) return printHelpAndSuccess();
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
         var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
         try core_cli.printVersion(&stdout_writer.interface, Version);
         return 0;
     }
-
     const args = parseArgs(argv) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
-    if (core_cli.containsHelpArg(argv[1..])) {
-        try printHelp();
-        return 0;
-    }
-
-    const repo = try discoverRepoRootAlloc(allocator, args.repo);
-    defer allocator.free(repo);
-    const store_path = try resolveStorePathAlloc(allocator, repo, args.path);
+    if (core_cli.containsHelpArg(argv[1..])) return printHelpAndSuccess();
+    const goal_id = args.goal_id.?;
+    const store_path = try storePathAlloc(allocator, args.repo, goal_id);
     defer allocator.free(store_path);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    const store = persistence.eventStore();
+    return runCommand(allocator, store, store_path, goal_id, args);
+}
 
-    switch (args.command orelse return error.MissingCommand) {
-        .open => {
-            const input = try readInputAlloc(allocator, args.json_path.?);
-            defer allocator.free(input);
-            var result = try cmdOpen(allocator, repo, store_path, input);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return 0;
-        },
-        .prepare => {
-            const input = try readInputAlloc(allocator, args.json_path.?);
-            defer allocator.free(input);
-            var result = try cmdPrepare(allocator, repo, store_path, args.run_id.?, input);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return 0;
-        },
-        .record => {
-            var result = try cmdRecord(allocator, repo, store_path, args.run_id.?, args.capability.?);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return 0;
-        },
-        .execute => {
-            var result = try cmdExecute(allocator, repo, store_path, args.run_id.?, args.capability.?);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return if (result.passed == true) 0 else 2;
-        },
-        .observe => {
-            var result = try cmdObserve(allocator, repo, store_path, args.run_id.?, args.step_id.?);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return if (result.passed == true) 0 else 2;
-        },
-        .state => {
-            try cmdState(allocator, repo, store_path, args.run_id.?);
-            return 0;
-        },
-        .close => {
-            var result = try cmdClose(allocator, repo, store_path, args.run_id.?);
-            defer result.deinit(allocator);
-            try printTransitionResult(allocator, args.command.?, args.run_id, result);
-            return 0;
-        },
-        .decide => {
-            try cmdDecide(allocator, repo, store_path, args.run_id.?);
-            return 0;
-        },
-        .doctor => {
-            try cmdDoctor(allocator, store_path);
-            return 0;
-        },
+fn runCommand(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    store_path: []const u8,
+    goal_id: []const u8,
+    args: Args,
+) !u8 {
+    switch (args.command.?) {
+        .append => try runAppendCommand(allocator, store, goal_id, args),
+        .prepare => try runPrepareCommand(allocator, store, goal_id, args),
+        .state => try printState(allocator, store, goal_id),
+        .project => try printProjection(allocator, store, goal_id),
+        .doctor => try printDoctor(allocator, store, goal_id),
         .path => {
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
             try stdout_writer.interface.print("{s}\n", .{store_path});
-            return 0;
         },
     }
+    return 0;
 }
 
-fn printHelp() !void {
+fn runAppendCommand(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    args: Args,
+) !void {
+    const input = try readInputAlloc(allocator, args.input_path.?);
+    defer allocator.free(input);
+    var result = try appendInput(allocator, store, goal_id, input, args.capability);
+    defer result.deinit(allocator);
+    try printAppendResult(allocator, result);
+}
+
+fn runPrepareCommand(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    args: Args,
+) !void {
+    const input = try readInputAlloc(allocator, args.input_path.?);
+    defer allocator.free(input);
+    var result = try prepareOperation(allocator, store, goal_id, input);
+    defer result.deinit(allocator);
+    try printPrepareResult(allocator, result);
+}
+
+fn printHelpAndSuccess() !u8 {
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     try core_cli.printHelpSurface(&stdout_writer.interface, HelpSurface, Version);
-}
-
-fn printFailure(allocator: std.mem.Allocator, err: anyerror) !void {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"actuation-error/v1\",\"verdict\":\"blocked\",\"error\":");
-    try std.json.Stringify.value(@errorName(err), .{}, &out.writer);
-    try out.writer.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    return 0;
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
     var args = Args{};
-    var i: usize = 1;
-    while (i < argv.len) : (i += 1) {
-        const token = argv[i];
+    var index: usize = 1;
+    while (index < argv.len) : (index += 1) {
+        const token = argv[index];
         if (core_cli.isHelpArg(token)) continue;
         if (std.mem.eql(u8, token, "--repo")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.repo = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--path")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.path = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--json")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.json_path = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--run")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.run_id = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--step")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.step_id = argv[i];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--capability")) {
-            i += 1;
-            if (i >= argv.len) return error.MissingValue;
-            args.capability = argv[i];
-            continue;
-        }
-        if (!std.mem.startsWith(u8, token, "-") and args.command == null) {
+            args.repo = try nextArg(argv, &index);
+        } else if (std.mem.eql(u8, token, "--goal")) {
+            args.goal_id = try nextArg(argv, &index);
+        } else if (std.mem.eql(u8, token, "--input")) {
+            args.input_path = try nextArg(argv, &index);
+        } else if (std.mem.eql(u8, token, "--capability")) {
+            args.capability = try nextArg(argv, &index);
+        } else if (!std.mem.startsWith(u8, token, "-") and args.command == null) {
             args.command = parseCommand(token) orelse return error.UnknownCommand;
-            continue;
-        }
-        return error.UnknownOption;
+        } else return error.UnknownOption;
     }
-
-    const command = args.command orelse return error.MissingCommand;
-    if ((command == .open or command == .prepare) and args.json_path == null) return error.MissingJsonInput;
-    if (command != .open and command != .doctor and command != .path and args.run_id == null) return error.MissingRunId;
-    if ((command == .record or command == .execute) and args.capability == null) return error.MissingCapability;
-    if (command == .observe and args.step_id == null) return error.MissingStepId;
+    try validateArgs(args);
     return args;
 }
 
+fn nextArg(argv: []const []const u8, index: *usize) ![]const u8 {
+    index.* += 1;
+    if (index.* >= argv.len) return error.MissingValue;
+    return argv[index.*];
+}
+
 fn parseCommand(raw: []const u8) ?Command {
-    inline for (@typeInfo(Command).@"enum".fields) |field| {
-        if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Command).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, raw, enum_field.name)) return @enumFromInt(enum_field.value);
     }
     return null;
 }
 
-fn cmdOpen(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    input_json: []const u8,
-) !TransitionResult {
-    var parsed = try std.json.parseFromSlice(OpenInput, allocator, input_json, .{});
-    defer parsed.deinit();
-    const input = parsed.value;
-    const completion = try validateOpenInput(input);
-    if (!builtin.is_test) try ensureStoreLockIgnored(allocator, repo, store_path);
-
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
-    defer exclusive.release();
-    var loaded = try loadLedgerExclusive(allocator, &exclusive, input.run_id);
-    defer loaded.deinit(allocator);
-    if (loaded.state != null) return error.DuplicateRunId;
-
-    const artifact = try repositoryArtifactDigestAlloc(allocator, repo, store_path, input.allowed_paths);
-    defer allocator.free(artifact);
-    const body = RunOpenedBody{
-        .goal_id = input.goal_id,
-        .goal_contract_digest = input.goal_contract_digest,
-        .resolution_digest = input.resolution_digest,
-        .source_ref = input.source_ref,
-        .execution_authority_ref = input.execution_authority_ref,
-        .mutation_allowed = input.mutation_allowed,
-        .completion = completion.name(),
-        .repo = repo,
-        .store_path = store_path,
-        .allowed_paths = input.allowed_paths,
-        .obligations = input.obligations,
-        .artifact_digest = artifact,
-    };
-    const body_json = try encodeBodyAlloc(allocator, body);
-    defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, input.run_id, "run_opened", body_json);
-    errdefer allocator.free(event_digest);
-    return .{
-        .run_id = try allocator.dupe(u8, input.run_id),
-        .event_digest = event_digest,
-        .artifact_digest = try allocator.dupe(u8, artifact),
-    };
+fn validateArgs(args: Args) !void {
+    const command = args.command orelse return error.MissingCommand;
+    const goal_id = args.goal_id orelse return error.MissingGoalId;
+    try validateGoalId(goal_id);
+    const needs_input = command == .append or command == .prepare;
+    if (needs_input != (args.input_path != null)) return error.InvalidInputOption;
+    if (args.capability != null and command != .append) return error.InvalidCapabilityOption;
 }
 
-fn ensureStoreLockIgnored(allocator: std.mem.Allocator, repo: []const u8, store_path: []const u8) !void {
-    const store_relative = try storeRelativeAlloc(allocator, repo, store_path);
-    defer if (store_relative) |value| allocator.free(value);
-    const relative = store_relative orelse return;
-    const lock_relative = try std.fmt.allocPrint(allocator, "{s}.lock", .{relative});
-    defer allocator.free(lock_relative);
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = &.{ "git", "check-ignore", "-q", "--", lock_relative },
-        .cwd = .{ .path = repo },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (exitCode(result.term)) {
-        0 => return,
-        1 => return error.LockSidecarNotGitignored,
-        else => return error.GitCommandFailed,
+fn validateGoalId(goal_id: []const u8) !void {
+    if (goal_id.len == 0 or goal_id.len > 128) return error.InvalidGoalId;
+    if (std.mem.eql(u8, goal_id, ".") or std.mem.eql(u8, goal_id, "..")) {
+        return error.InvalidGoalId;
+    }
+    for (goal_id, 0..) |byte, index| {
+        const alphanumeric = std.ascii.isLower(byte) or std.ascii.isDigit(byte);
+        const allowed = alphanumeric or byte == '-' or byte == '_' or byte == '.';
+        if (!allowed or (index == 0 and !alphanumeric)) {
+            return error.InvalidGoalId;
+        }
     }
 }
 
-fn cmdPrepare(
+fn storePathAlloc(
     allocator: std.mem.Allocator,
     repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-    input_json: []const u8,
-) !TransitionResult {
-    var parsed = try std.json.parseFromSlice(OperationInput, allocator, input_json, .{});
-    defer parsed.deinit();
-    const operation = parsed.value;
-    const effect = try validateOperationInput(operation);
-
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
-    defer exclusive.release();
-    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-    if (state.phase != .ready) return error.InvalidPhase;
-    if (containsString(state.step_ids.items, operation.step_id)) return error.DuplicateStepId;
-    if (containsString(state.idempotency_keys.items, operation.idempotency_key)) return error.DuplicateIdempotencyKey;
-    if (effect == .edit and !state.mutation_allowed) return error.MutationForbidden;
-    try validateOperationPaths(state.allowed_paths, operation.paths);
-
-    const verifier = try commonVerifierForRefs(state, operation.obligation_refs);
-    const current_artifact = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(current_artifact);
-    if (!std.mem.eql(u8, current_artifact, state.artifact_digest)) return error.ArtifactStale;
-
-    const raw_capability = try randomCapabilityAlloc(allocator);
-    errdefer allocator.free(raw_capability);
-    const capability_digest = try digestTextAlloc(allocator, raw_capability);
-    defer allocator.free(capability_digest);
-    const unscoped_before = try unscopedDigestAlloc(allocator, repo, store_path, operation.paths, stringSlice(state.allowed_paths));
-    defer allocator.free(unscoped_before);
-    const path_states = try snapshotPathStatesAlloc(allocator, repo, operation.paths);
-    defer freePathStates(allocator, path_states);
-    const path_wires = try pathStateWiresAlloc(allocator, path_states);
-    defer allocator.free(path_wires);
-
-    const body = OperationPreparedBody{
-        .step_id = operation.step_id,
-        .effect = effect.name(),
-        .idempotency_key = operation.idempotency_key,
-        .owner_boundary = operation.owner_boundary,
-        .paths = operation.paths,
-        .obligation_refs = operation.obligation_refs,
-        .verifier = stringSlice(verifier),
-        .capability_digest = capability_digest,
-        .artifact_before = current_artifact,
-        .unscoped_before = unscoped_before,
-        .path_states_before = path_wires,
-    };
-    const body_json = try encodeBodyAlloc(allocator, body);
-    defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "operation_prepared", body_json);
-    errdefer allocator.free(event_digest);
-
-    return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .event_digest = event_digest,
-        .artifact_digest = try allocator.dupe(u8, current_artifact),
-        .capability = raw_capability,
-    };
-}
-
-fn cmdRecord(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-    raw_capability: []const u8,
-) !TransitionResult {
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
-    defer exclusive.release();
-    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-    if (state.phase != .prepared) return error.InvalidPhase;
-    const pending = if (state.pending) |*value| value else return error.PendingOperationMissing;
-    if (pending.effect != .edit) return error.RecordRequiresEdit;
-    try validateCapability(allocator, pending.capability_digest, raw_capability);
-
-    const artifact_after = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(artifact_after);
-    if (std.mem.eql(u8, artifact_after, pending.artifact_before)) return error.EditDidNotChangeArtifact;
-
-    const unscoped_after = try unscopedDigestAlloc(allocator, repo, store_path, stringSlice(pending.paths), stringSlice(state.allowed_paths));
-    defer allocator.free(unscoped_after);
-    if (!std.mem.eql(u8, unscoped_after, pending.unscoped_before)) return error.OutOfScopeMutation;
-
-    const path_states_after = try snapshotPathStatesAlloc(allocator, repo, stringSlice(pending.paths));
-    defer freePathStates(allocator, path_states_after);
-    if (!allPathStatesChanged(pending.path_states_before, path_states_after)) return error.DeclaredPathUnchanged;
-    const path_wires = try pathStateWiresAlloc(allocator, path_states_after);
-    defer allocator.free(path_wires);
-
-    const body = EffectRecordedBody{
-        .step_id = pending.step_id,
-        .effect = pending.effect.name(),
-        .idempotency_key = pending.idempotency_key,
-        .capability_digest = pending.capability_digest,
-        .artifact_before = pending.artifact_before,
-        .artifact_after = artifact_after,
-        .unscoped_before = pending.unscoped_before,
-        .unscoped_after = unscoped_after,
-        .changed_paths = stringSlice(pending.paths),
-        .path_states_after = path_wires,
-    };
-    const body_json = try encodeBodyAlloc(allocator, body);
-    defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "effect_recorded", body_json);
-    errdefer allocator.free(event_digest);
-
-    return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .event_digest = event_digest,
-        .artifact_digest = try allocator.dupe(u8, artifact_after),
-    };
-}
-
-fn cmdExecute(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-    raw_capability: []const u8,
-) !TransitionResult {
-    return observeOperation(allocator, repo, store_path, run_id, null, raw_capability, true);
-}
-
-fn cmdObserve(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-    step_id: []const u8,
-) !TransitionResult {
-    return observeOperation(allocator, repo, store_path, run_id, step_id, null, false);
-}
-
-fn observeOperation(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-    expected_step_id: ?[]const u8,
-    raw_capability: ?[]const u8,
-    direct_execute: bool,
-) !TransitionResult {
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
-    defer exclusive.release();
-    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-    const expected_phase: Phase = if (direct_execute) .prepared else .effect_recorded;
-    if (state.phase != expected_phase) return error.InvalidPhase;
-    const pending = if (state.pending) |*value| value else return error.PendingOperationMissing;
-    if (direct_execute) {
-        if (pending.effect == .edit) return error.ExecuteRejectsEdit;
-        try validateCapability(allocator, pending.capability_digest, raw_capability.?);
-    } else {
-        if (pending.effect != .edit) return error.ObserveRequiresRecordedEdit;
-        if (!std.mem.eql(u8, pending.step_id, expected_step_id.?)) return error.StepMismatch;
-    }
-
-    const artifact_before = pending.artifact_after orelse pending.artifact_before;
-    const current_artifact = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(current_artifact);
-    if (!std.mem.eql(u8, artifact_before, current_artifact)) return error.ArtifactStale;
-
-    var process = try runProcessAlloc(allocator, repo, stringSlice(pending.verifier));
-    defer process.deinit(allocator);
-    const artifact_after = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(artifact_after);
-    const artifact_unchanged = std.mem.eql(u8, artifact_before, artifact_after);
-    if (!artifact_unchanged) return error.VerifierMutatedArtifact;
-    const passed = process.exit_code == 0;
-    const stdout_digest = try digestTextAlloc(allocator, process.stdout);
-    defer allocator.free(stdout_digest);
-    const stderr_digest = try digestTextAlloc(allocator, process.stderr);
-    defer allocator.free(stderr_digest);
-
-    const body = OperationObservedBody{
-        .step_id = pending.step_id,
-        .effect = pending.effect.name(),
-        .idempotency_key = pending.idempotency_key,
-        .capability_digest = pending.capability_digest,
-        .verifier = stringSlice(pending.verifier),
-        .obligation_refs = stringSlice(pending.obligation_refs),
-        .outcome = if (passed) "passed" else "failed",
-        .exit_code = process.exit_code,
-        .stdout_digest = stdout_digest,
-        .stderr_digest = stderr_digest,
-        .artifact_before = artifact_before,
-        .artifact_after = artifact_after,
-    };
-    const body_json = try encodeBodyAlloc(allocator, body);
-    defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "operation_observed", body_json);
-    errdefer allocator.free(event_digest);
-
-    return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .event_digest = event_digest,
-        .artifact_digest = try allocator.dupe(u8, artifact_after),
-        .passed = passed,
-        .exit_code = process.exit_code,
-    };
-}
-
-fn cmdClose(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    run_id: []const u8,
-) !TransitionResult {
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
-    defer exclusive.release();
-    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-    if (state.phase != .ready or state.pending != null) return error.InvalidPhase;
-    if (outstandingObligationCount(state) != 0) return error.ObligationsOutstanding;
-    const current_artifact = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(current_artifact);
-    if (!std.mem.eql(u8, current_artifact, state.artifact_digest)) return error.ArtifactStale;
-
-    var discharged: std.ArrayList([]const u8) = .empty;
-    defer discharged.deinit(allocator);
-    for (state.obligations) |obligation| try discharged.append(allocator, obligation.id);
-    const body = RunClosedBody{
-        .goal_contract_digest = state.goal_contract_digest,
-        .artifact_digest = current_artifact,
-        .discharged_obligations = discharged.items,
-    };
-    const body_json = try encodeBodyAlloc(allocator, body);
-    defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "run_closed", body_json);
-    errdefer allocator.free(event_digest);
-
-    return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .event_digest = event_digest,
-        .artifact_digest = try allocator.dupe(u8, current_artifact),
-    };
-}
-
-fn cmdState(allocator: std.mem.Allocator, repo: []const u8, store_path: []const u8, run_id: []const u8) !void {
-    var loaded = try loadLedger(allocator, store_path, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-    try printState(allocator, state, loaded.event_count);
-}
-
-fn cmdDecide(allocator: std.mem.Allocator, repo: []const u8, store_path: []const u8, run_id: []const u8) !void {
-    var loaded = try loadLedger(allocator, store_path, run_id);
-    defer loaded.deinit(allocator);
-    const state = if (loaded.state) |*value| value else return error.RunNotFound;
-    try validateContext(state, repo, store_path);
-
-    const current_artifact = try repositoryArtifactDigestAlloc(allocator, repo, store_path, stringSlice(state.allowed_paths));
-    defer allocator.free(current_artifact);
-    if (!std.mem.eql(u8, current_artifact, state.artifact_digest)) return error.ArtifactStale;
-
-    const state_digest = try stateDigestAlloc(allocator, state);
-    defer allocator.free(state_digest);
-    const decision = projectDecision(state);
-    const decision_id = try decisionDigestAlloc(
-        allocator,
-        state_digest,
-        decision.verdict,
-        decision.goal_outcome,
-        decision.implementation_outcome,
-        decision.next_owner,
-        decision.next_transition,
-    );
-    defer allocator.free(decision_id);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"closure_decision\":{\"version\":\"closure-decision/v1\",\"decision_id\":");
-    try std.json.Stringify.value(decision_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"run_id\":");
-    try std.json.Stringify.value(state.run_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"evaluated_artifact\":{\"repo\":");
-    try std.json.Stringify.value(state.repo, .{}, &out.writer);
-    try out.writer.writeAll(",\"state_fingerprint\":");
-    try std.json.Stringify.value(state.artifact_digest, .{}, &out.writer);
-    try out.writer.writeAll("},\"run_digest\":");
-    try std.json.Stringify.value(state_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"resolution_digest\":");
-    if (state.resolution_digest) |digest| {
-        try std.json.Stringify.value(digest, .{}, &out.writer);
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"verdict\":");
-    try std.json.Stringify.value(decision.verdict, .{}, &out.writer);
-    try out.writer.writeAll(",\"outcomes\":{\"goal_outcome\":");
-    try std.json.Stringify.value(decision.goal_outcome, .{}, &out.writer);
-    try out.writer.writeAll(",\"implementation_outcome\":");
-    try std.json.Stringify.value(decision.implementation_outcome, .{}, &out.writer);
-    try out.writer.writeAll(",\"next_owner\":");
-    try std.json.Stringify.value(decision.next_owner, .{}, &out.writer);
-    try out.writer.writeAll("},\"evidence_basis\":");
-    try writeDecisionBasis(&out.writer, state, .evidence);
-    try out.writer.writeAll(",\"review_basis\":");
-    try writeDecisionBasis(&out.writer, state, .review);
-    try out.writer.writeAll(",\"ship_basis\":");
-    try writeDecisionBasis(&out.writer, state, .ship);
-    try out.writer.writeAll(",\"implementation_checkpoint\":null,\"reasons\":[");
-    if (!decision.terminal) {
-        const reason = try std.fmt.allocPrint(allocator, "next-transition:{s}", .{decision.next_transition});
-        defer allocator.free(reason);
-        try std.json.Stringify.value(reason, .{}, &out.writer);
-    }
-    try out.writer.writeAll("]}}\n");
-    try writeStdoutAlloc(allocator, &out);
-}
-
-fn writeDecisionBasis(writer: *std.Io.Writer, state: *const RunState, basis: DecisionBasis) !void {
-    try writer.writeByte('[');
-    var index: usize = 0;
-    for (state.obligations) |obligation| {
-        const step_id = obligation.discharged_by orelse continue;
-        const included = switch (basis) {
-            .evidence => obligation.kind == .implementation or obligation.kind == .acceptance,
-            .review => obligation.kind == .review,
-            .ship => obligation.kind == .ship,
-        };
-        if (!included) continue;
-        if (index > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"obligation_id\":");
-        try std.json.Stringify.value(obligation.id, .{}, writer);
-        try writer.writeAll(",\"step_id\":");
-        try std.json.Stringify.value(step_id, .{}, writer);
-        try writer.writeByte('}');
-        index += 1;
-    }
-    try writer.writeByte(']');
-}
-
-fn projectDecision(state: *const RunState) DecisionProjection {
-    const terminal = state.phase == .closed;
-    return .{
-        .terminal = terminal,
-        .verdict = if (terminal) state.completion.name() else "continue",
-        .goal_outcome = if (!terminal or state.completion == .ready_to_ship) "continue" else "complete",
-        .implementation_outcome = if (terminal) "complete" else "incomplete",
-        .next_owner = if (!terminal)
-            "goal-actuating"
-        else if (state.completion == .ready_to_ship)
-            "ship"
-        else
-            "none",
-        .next_transition = nextTransition(state),
-    };
-}
-
-fn cmdDoctor(allocator: std.mem.Allocator, store_path: []const u8) !void {
-    var loaded = try loadLedger(allocator, store_path, null);
-    defer loaded.deinit(allocator);
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"actuation-doctor/v1\",\"ok\":true,\"events\":");
-    try out.writer.print("{d}", .{loaded.event_count});
-    try out.writer.writeAll(",\"last_event_digest\":");
-    try std.json.Stringify.value(loaded.last_digest, .{}, &out.writer);
-    try out.writer.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
-}
-
-fn stateDigestAlloc(allocator: std.mem.Allocator, state: *const RunState) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "schema", "actuation-kernel-state/v1");
-    hashTagged(&hasher, "run", state.run_id);
-    hashTagged(&hasher, "goal", state.goal_id);
-    hashTagged(&hasher, "goal-contract", state.goal_contract_digest);
-    hashTagged(&hasher, "resolution", state.resolution_digest orelse "");
-    hashTagged(&hasher, "source", state.source_ref);
-    hashTagged(&hasher, "authority", state.execution_authority_ref);
-    hashTagged(&hasher, "mutation", if (state.mutation_allowed) "true" else "false");
-    hashTagged(&hasher, "completion", state.completion.name());
-    hashTagged(&hasher, "repo", state.repo);
-    hashTagged(&hasher, "store", state.store_path);
-    hashTagged(&hasher, "artifact", state.artifact_digest);
-    hashTagged(&hasher, "phase", state.phase.name());
-    for (state.allowed_paths) |path| hashTagged(&hasher, "allowed-path", path);
-    for (state.obligations) |obligation| {
-        hashTagged(&hasher, "obligation", obligation.id);
-        hashTagged(&hasher, "obligation-kind", obligation.kind.name());
-        hashTagged(&hasher, "statement", obligation.statement);
-        for (obligation.verifier) |arg| hashTagged(&hasher, "verifier", arg);
-        hashTagged(&hasher, "discharged-by", obligation.discharged_by orelse "");
-    }
-    for (state.step_ids.items) |step_id| hashTagged(&hasher, "step", step_id);
-    for (state.idempotency_keys.items) |key| hashTagged(&hasher, "idempotency", key);
-    if (state.pending) |pending| {
-        hashTagged(&hasher, "pending-step", pending.step_id);
-        hashTagged(&hasher, "pending-effect", pending.effect.name());
-        hashTagged(&hasher, "pending-idempotency", pending.idempotency_key);
-        hashTagged(&hasher, "pending-owner", pending.owner_boundary);
-        for (pending.paths) |path| hashTagged(&hasher, "pending-path", path);
-        for (pending.obligation_refs) |ref| hashTagged(&hasher, "pending-obligation", ref);
-        for (pending.verifier) |arg| hashTagged(&hasher, "pending-verifier", arg);
-        hashTagged(&hasher, "pending-capability", pending.capability_digest);
-        hashTagged(&hasher, "pending-before", pending.artifact_before);
-        hashTagged(&hasher, "pending-after", pending.artifact_after orelse "");
-    }
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn decisionDigestAlloc(
-    allocator: std.mem.Allocator,
-    state_digest: []const u8,
-    verdict: []const u8,
-    goal_outcome: []const u8,
-    implementation_outcome: []const u8,
-    next_owner: []const u8,
-    transition: []const u8,
+    goal_id: []const u8,
 ) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "schema", "closure-decision/v1");
-    hashTagged(&hasher, "state", state_digest);
-    hashTagged(&hasher, "verdict", verdict);
-    hashTagged(&hasher, "goal", goal_outcome);
-    hashTagged(&hasher, "implementation", implementation_outcome);
-    hashTagged(&hasher, "owner", next_owner);
-    hashTagged(&hasher, "transition", transition);
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn appendEventAlloc(
-    allocator: std.mem.Allocator,
-    exclusive: *const durable_store.EventStoreExclusive,
-    loaded: LedgerLoad,
-    run_id: []const u8,
-    kind: []const u8,
-    body_json: []const u8,
-) ![]u8 {
-    const body_digest = try digestTextAlloc(allocator, body_json);
-    defer allocator.free(body_digest);
-    const sequence = loaded.event_count + 1;
-    const recorded_at_unix: i64 = @intCast(@divFloor(std.Io.Clock.real.now(defaultIo()).nanoseconds, std.time.ns_per_s));
-    const event_digest = try eventDigestAlloc(
-        allocator,
-        sequence,
-        loaded.last_digest,
-        run_id,
-        kind,
-        recorded_at_unix,
-        body_digest,
-    );
-    errdefer allocator.free(event_digest);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"actuation-event/v1\",\"sequence\":");
-    try out.writer.print("{d}", .{sequence});
-    try out.writer.writeAll(",\"previous_digest\":");
-    try std.json.Stringify.value(loaded.last_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"run_id\":");
-    try std.json.Stringify.value(run_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"kind\":");
-    try std.json.Stringify.value(kind, .{}, &out.writer);
-    try out.writer.writeAll(",\"recorded_at_unix\":");
-    try out.writer.print("{d}", .{recorded_at_unix});
-    try out.writer.writeAll(",\"body\":");
-    try out.writer.writeAll(body_json);
-    try out.writer.writeAll(",\"body_digest\":");
-    try std.json.Stringify.value(body_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"event_digest\":");
-    try std.json.Stringify.value(event_digest, .{}, &out.writer);
-    try out.writer.writeByte('}');
-    const line = try out.toOwnedSlice();
-    defer allocator.free(line);
-    var receipt = try exclusive.append(
-        allocator,
-        line,
-        .{ .revision = loaded.store_revision, .exists = loaded.store_exists },
-        MaxStoreBytes,
-    );
-    defer receipt.deinit(allocator);
-    return event_digest;
-}
-
-fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8, target_run_id: ?[]const u8) !LedgerLoad {
-    var persistence = durable_store.PersistentEventStore.init(store_path);
-    var snapshot = try persistence.eventStore().snapshot(allocator, MaxStoreBytes);
-    defer snapshot.deinit(allocator);
-    return loadLedgerFromSnapshot(allocator, snapshot, target_run_id);
-}
-
-fn acquireActuationExclusive(
-    allocator: std.mem.Allocator,
-    store: durable_store.EventStore,
-) !durable_store.EventStoreExclusive {
-    return store.acquireExclusive(allocator) catch |err| switch (err) {
-        error.EventStoreBusy => error.PathAlreadyExists,
-        else => err,
-    };
-}
-
-fn loadLedgerExclusive(
-    allocator: std.mem.Allocator,
-    exclusive: *const durable_store.EventStoreExclusive,
-    target_run_id: ?[]const u8,
-) !LedgerLoad {
-    var snapshot = try exclusive.snapshot(allocator, MaxStoreBytes);
-    defer snapshot.deinit(allocator);
-    return loadLedgerFromSnapshot(allocator, snapshot, target_run_id);
-}
-
-fn loadLedgerFromSnapshot(
-    allocator: std.mem.Allocator,
-    snapshot: durable_store.EventSnapshot,
-    target_run_id: ?[]const u8,
-) !LedgerLoad {
-    var states: std.ArrayList(RunState) = .empty;
-    defer {
-        for (states.items) |*state| state.deinit(allocator);
-        states.deinit(allocator);
-    }
-    var last_digest = try allocator.dupe(u8, GenesisDigest);
-    errdefer allocator.free(last_digest);
-    var expected_sequence: u64 = 1;
-    for (snapshot.records) |record| {
-        var parsed = try std.json.parseFromSlice(EventWire, allocator, record.payload, .{});
-        defer parsed.deinit();
-        const event = parsed.value;
-        if (!std.mem.eql(u8, event.schema, "actuation-event/v1")) return error.InvalidEventSchema;
-        if (event.sequence != expected_sequence) return error.EventSequenceMismatch;
-        if (!std.mem.eql(u8, event.previous_digest, last_digest)) return error.PreviousDigestMismatch;
-        try validateToken("run_id", event.run_id);
-
-        const encoded_body = try encodeDynamicBodyAlloc(allocator, event.body);
-        defer allocator.free(encoded_body);
-        const computed_body_digest = try digestTextAlloc(allocator, encoded_body);
-        defer allocator.free(computed_body_digest);
-        if (!std.mem.eql(u8, event.body_digest, computed_body_digest)) return error.BodyDigestMismatch;
-        const computed_event_digest = try eventDigestAlloc(
-            allocator,
-            event.sequence,
-            event.previous_digest,
-            event.run_id,
-            event.kind,
-            event.recorded_at_unix,
-            event.body_digest,
-        );
-        defer allocator.free(computed_event_digest);
-        if (!std.mem.eql(u8, event.event_digest, computed_event_digest)) return error.EventDigestMismatch;
-
-        try applyEvent(allocator, &states, event.run_id, event.kind, encoded_body);
-        allocator.free(last_digest);
-        last_digest = try allocator.dupe(u8, event.event_digest);
-        expected_sequence += 1;
-    }
-
-    var result = LedgerLoad{
-        .event_count = expected_sequence - 1,
-        .last_digest = last_digest,
-        .store_revision = try allocator.dupe(u8, snapshot.revision),
-        .store_exists = snapshot.exists,
-    };
-    errdefer allocator.free(result.store_revision);
-    if (target_run_id) |wanted| {
-        for (states.items, 0..) |state, index| {
-            if (!std.mem.eql(u8, state.run_id, wanted)) continue;
-            result.state = states.orderedRemove(index);
-            break;
-        }
-    }
-    return result;
-}
-
-fn applyEvent(
-    allocator: std.mem.Allocator,
-    states: *std.ArrayList(RunState),
-    run_id: []const u8,
-    kind: []const u8,
-    body_json: []const u8,
-) !void {
-    const state_index = findRunState(states.items, run_id);
-    if (std.mem.eql(u8, kind, "run_opened")) {
-        if (state_index != null) return error.DuplicateRunId;
-        try states.append(allocator, try stateFromOpenEvent(allocator, run_id, body_json));
-        return;
-    }
-    const index = state_index orelse return error.EventRunMissing;
-    const state = &states.items[index];
-    if (std.mem.eql(u8, kind, "operation_prepared")) {
-        try applyPreparedEvent(allocator, state, body_json);
-        return;
-    }
-    if (std.mem.eql(u8, kind, "effect_recorded")) {
-        try applyEffectRecordedEvent(allocator, state, body_json);
-        return;
-    }
-    if (std.mem.eql(u8, kind, "operation_observed")) {
-        try applyObservedEvent(allocator, state, body_json);
-        return;
-    }
-    if (std.mem.eql(u8, kind, "run_closed")) {
-        try applyClosedEvent(allocator, state, body_json);
-        return;
-    }
-    return error.UnknownEventKind;
-}
-
-fn stateFromOpenEvent(allocator: std.mem.Allocator, run_id: []const u8, body_json: []const u8) !RunState {
-    var parsed = try std.json.parseFromSlice(RunOpenedBody, allocator, body_json, .{});
-    defer parsed.deinit();
-    const body = parsed.value;
-    if (!std.mem.eql(u8, body.schema, "actuation-run-opened/v1")) return error.InvalidBodySchema;
-    try validateToken("run_id", run_id);
-    try validateToken("goal_id", body.goal_id);
-    try validateDigest(body.goal_contract_digest);
-    if (body.resolution_digest) |digest| try validateDigest(digest);
-    try validateNonEmpty("source_ref", body.source_ref);
-    try validateNonEmpty("execution_authority_ref", body.execution_authority_ref);
-    const completion = Completion.parse(body.completion) orelse return error.InvalidCompletion;
-    try validateNonEmpty("repo", body.repo);
-    try validateNonEmpty("store_path", body.store_path);
-    try validateDigest(body.artifact_digest);
-    try validateAllowedPaths(body.allowed_paths);
-    try validateObligations(body.obligations);
-
-    const obligations = try allocator.alloc(ObligationState, body.obligations.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (obligations[0..initialized]) |*obligation| obligation.deinit(allocator);
-        allocator.free(obligations);
-    }
-    for (body.obligations, 0..) |source, index| {
-        obligations[index] = .{
-            .id = try allocator.dupe(u8, source.id),
-            .kind = ObligationKind.parse(source.kind) orelse return error.InvalidObligationKind,
-            .statement = try allocator.dupe(u8, source.statement),
-            .verifier = try dupeStringList(allocator, source.verifier),
-        };
-        initialized += 1;
-    }
-
-    return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .goal_id = try allocator.dupe(u8, body.goal_id),
-        .goal_contract_digest = try allocator.dupe(u8, body.goal_contract_digest),
-        .resolution_digest = if (body.resolution_digest) |digest| try allocator.dupe(u8, digest) else null,
-        .source_ref = try allocator.dupe(u8, body.source_ref),
-        .execution_authority_ref = try allocator.dupe(u8, body.execution_authority_ref),
-        .mutation_allowed = body.mutation_allowed,
-        .completion = completion,
-        .repo = try allocator.dupe(u8, body.repo),
-        .store_path = try allocator.dupe(u8, body.store_path),
-        .allowed_paths = try dupeStringList(allocator, body.allowed_paths),
-        .obligations = obligations,
-        .artifact_digest = try allocator.dupe(u8, body.artifact_digest),
-    };
-}
-
-fn applyPreparedEvent(allocator: std.mem.Allocator, state: *RunState, body_json: []const u8) !void {
-    if (state.phase != .ready or state.pending != null) return error.InvalidEventTransition;
-    var parsed = try std.json.parseFromSlice(OperationPreparedBody, allocator, body_json, .{});
-    defer parsed.deinit();
-    const body = parsed.value;
-    if (!std.mem.eql(u8, body.schema, "actuation-operation-prepared/v1")) return error.InvalidBodySchema;
-    try validateToken("step_id", body.step_id);
-    if (containsString(state.step_ids.items, body.step_id)) return error.DuplicateStepId;
-    try validateToken("idempotency_key", body.idempotency_key);
-    if (containsString(state.idempotency_keys.items, body.idempotency_key)) return error.DuplicateIdempotencyKey;
-    const effect = Effect.parse(body.effect) orelse return error.InvalidEffect;
-    if (effect == .edit and !state.mutation_allowed) return error.MutationForbidden;
-    try validateNonEmpty("owner_boundary", body.owner_boundary);
-    try validateOperationPaths(state.allowed_paths, body.paths);
-    const expected_verifier = try commonVerifierForRefs(state, body.obligation_refs);
-    if (!equalStringLists(stringSlice(expected_verifier), body.verifier)) return error.VerifierSubstitution;
-    try validateDigest(body.capability_digest);
-    if (!std.mem.eql(u8, state.artifact_digest, body.artifact_before)) return error.EventArtifactMismatch;
-    try validateDigest(body.unscoped_before);
-    if (body.path_states_before.len != body.paths.len) return error.PathStateMismatch;
-    for (body.path_states_before, 0..) |path_state, index| {
-        if (!std.mem.eql(u8, path_state.path, body.paths[index])) return error.PathStateMismatch;
-        try validateDigest(path_state.digest);
-    }
-
-    const owned_path_states = try allocator.alloc(PathState, body.path_states_before.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (owned_path_states[0..initialized]) |*path_state| path_state.deinit(allocator);
-        allocator.free(owned_path_states);
-    }
-    for (body.path_states_before, 0..) |path_state, index| {
-        owned_path_states[index] = .{
-            .path = try allocator.dupe(u8, path_state.path),
-            .digest = try allocator.dupe(u8, path_state.digest),
-        };
-        initialized += 1;
-    }
-
-    state.pending = .{
-        .step_id = try allocator.dupe(u8, body.step_id),
-        .effect = effect,
-        .idempotency_key = try allocator.dupe(u8, body.idempotency_key),
-        .owner_boundary = try allocator.dupe(u8, body.owner_boundary),
-        .paths = try dupeStringList(allocator, body.paths),
-        .obligation_refs = try dupeStringList(allocator, body.obligation_refs),
-        .verifier = try dupeStringList(allocator, body.verifier),
-        .capability_digest = try allocator.dupe(u8, body.capability_digest),
-        .artifact_before = try allocator.dupe(u8, body.artifact_before),
-        .unscoped_before = try allocator.dupe(u8, body.unscoped_before),
-        .path_states_before = owned_path_states,
-    };
-    try state.step_ids.append(allocator, try allocator.dupe(u8, body.step_id));
-    try state.idempotency_keys.append(allocator, try allocator.dupe(u8, body.idempotency_key));
-    state.phase = .prepared;
-}
-
-fn applyEffectRecordedEvent(allocator: std.mem.Allocator, state: *RunState, body_json: []const u8) !void {
-    if (state.phase != .prepared) return error.InvalidEventTransition;
-    const pending = if (state.pending) |*value| value else return error.PendingOperationMissing;
-    if (pending.effect != .edit) return error.InvalidEventTransition;
-    var parsed = try std.json.parseFromSlice(EffectRecordedBody, allocator, body_json, .{});
-    defer parsed.deinit();
-    const body = parsed.value;
-    if (!std.mem.eql(u8, body.schema, "actuation-effect-recorded/v1")) return error.InvalidBodySchema;
-    if (!std.mem.eql(u8, pending.step_id, body.step_id) or
-        !std.mem.eql(u8, body.effect, "edit") or
-        !std.mem.eql(u8, pending.idempotency_key, body.idempotency_key) or
-        !std.mem.eql(u8, pending.capability_digest, body.capability_digest) or
-        !std.mem.eql(u8, pending.artifact_before, body.artifact_before) or
-        !std.mem.eql(u8, pending.unscoped_before, body.unscoped_before) or
-        !std.mem.eql(u8, body.unscoped_before, body.unscoped_after) or
-        !equalStringLists(stringSlice(pending.paths), body.changed_paths))
-    {
-        return error.EffectRecordMismatch;
-    }
-    if (std.mem.eql(u8, body.artifact_before, body.artifact_after)) return error.EditDidNotChangeArtifact;
-    try validateDigest(body.artifact_after);
-    if (body.path_states_after.len != pending.paths.len) return error.PathStateMismatch;
-    for (body.path_states_after, 0..) |path_state, index| {
-        if (!std.mem.eql(u8, path_state.path, pending.paths[index])) return error.PathStateMismatch;
-        if (std.mem.eql(u8, path_state.digest, pending.path_states_before[index].digest)) return error.DeclaredPathUnchanged;
-        try validateDigest(path_state.digest);
-    }
-    pending.artifact_after = try allocator.dupe(u8, body.artifact_after);
-    allocator.free(state.artifact_digest);
-    state.artifact_digest = try allocator.dupe(u8, body.artifact_after);
-    state.phase = .effect_recorded;
-}
-
-fn applyObservedEvent(allocator: std.mem.Allocator, state: *RunState, body_json: []const u8) !void {
-    if (state.phase != .prepared and state.phase != .effect_recorded) return error.InvalidEventTransition;
-    const pending = if (state.pending) |*value| value else return error.PendingOperationMissing;
-    var parsed = try std.json.parseFromSlice(OperationObservedBody, allocator, body_json, .{});
-    defer parsed.deinit();
-    const body = parsed.value;
-    if (!std.mem.eql(u8, body.schema, "actuation-operation-observed/v1")) return error.InvalidBodySchema;
-    const expected_before = pending.artifact_after orelse pending.artifact_before;
-    if (!std.mem.eql(u8, pending.step_id, body.step_id) or
-        !std.mem.eql(u8, pending.effect.name(), body.effect) or
-        !std.mem.eql(u8, pending.idempotency_key, body.idempotency_key) or
-        !std.mem.eql(u8, pending.capability_digest, body.capability_digest) or
-        !equalStringLists(stringSlice(pending.verifier), body.verifier) or
-        !equalStringLists(stringSlice(pending.obligation_refs), body.obligation_refs) or
-        !std.mem.eql(u8, expected_before, body.artifact_before))
-    {
-        return error.ObservationMismatch;
-    }
-    const passed = std.mem.eql(u8, body.outcome, "passed");
-    const failed = std.mem.eql(u8, body.outcome, "failed");
-    if (!passed and !failed) return error.InvalidObservationOutcome;
-    if (passed and (body.exit_code != 0 or !std.mem.eql(u8, body.artifact_before, body.artifact_after))) {
-        return error.InvalidPassingObservation;
-    }
-    try validateDigest(body.stdout_digest);
-    try validateDigest(body.stderr_digest);
-    try validateDigest(body.artifact_after);
-    if (passed) {
-        for (pending.obligation_refs) |ref| {
-            const obligation = findObligation(state, ref) orelse return error.UnknownObligation;
-            if (obligation.discharged_by != null) return error.ObligationAlreadyDischarged;
-            obligation.discharged_by = try allocator.dupe(u8, pending.step_id);
-        }
-    }
-    allocator.free(state.artifact_digest);
-    state.artifact_digest = try allocator.dupe(u8, body.artifact_after);
-    pending.deinit(allocator);
-    state.pending = null;
-    state.phase = .ready;
-}
-
-fn applyClosedEvent(allocator: std.mem.Allocator, state: *RunState, body_json: []const u8) !void {
-    if (state.phase != .ready or state.pending != null) return error.InvalidEventTransition;
-    if (outstandingObligationCount(state) != 0) return error.ObligationsOutstanding;
-    var parsed = try std.json.parseFromSlice(RunClosedBody, allocator, body_json, .{});
-    defer parsed.deinit();
-    const body = parsed.value;
-    if (!std.mem.eql(u8, body.schema, "actuation-run-closed/v1")) return error.InvalidBodySchema;
-    if (!std.mem.eql(u8, body.goal_contract_digest, state.goal_contract_digest) or
-        !std.mem.eql(u8, body.artifact_digest, state.artifact_digest) or
-        body.discharged_obligations.len != state.obligations.len)
-    {
-        return error.ClosureMismatch;
-    }
-    for (state.obligations, 0..) |obligation, index| {
-        if (!std.mem.eql(u8, obligation.id, body.discharged_obligations[index])) return error.ClosureMismatch;
-    }
-    state.phase = .closed;
-}
-
-fn findRunState(states: []const RunState, run_id: []const u8) ?usize {
-    for (states, 0..) |state, index| {
-        if (std.mem.eql(u8, state.run_id, run_id)) return index;
-    }
-    return null;
-}
-
-fn validateOpenInput(input: OpenInput) !Completion {
-    if (!std.mem.eql(u8, input.schema, "actuation-open/v1")) return error.InvalidInputSchema;
-    try validateToken("run_id", input.run_id);
-    try validateToken("goal_id", input.goal_id);
-    try validateDigest(input.goal_contract_digest);
-    if (input.resolution_digest) |digest| try validateDigest(digest);
-    try validateNonEmpty("source_ref", input.source_ref);
-    try validateNonEmpty("execution_authority_ref", input.execution_authority_ref);
-    const completion = Completion.parse(input.completion) orelse return error.InvalidCompletion;
-    try validateAllowedPaths(input.allowed_paths);
-    try validateObligations(input.obligations);
-    return completion;
-}
-
-fn validateOperationInput(input: OperationInput) !Effect {
-    if (!std.mem.eql(u8, input.schema, "actuation-operation/v1")) return error.InvalidInputSchema;
-    try validateToken("step_id", input.step_id);
-    try validateToken("idempotency_key", input.idempotency_key);
-    try validateNonEmpty("owner_boundary", input.owner_boundary);
-    if (input.paths.len == 0) return error.PathsMissing;
-    if (input.obligation_refs.len == 0) return error.ObligationRefsMissing;
-    return Effect.parse(input.effect) orelse error.InvalidEffect;
-}
-
-fn validateAllowedPaths(paths: []const []const u8) !void {
-    if (paths.len == 0) return error.AllowedPathsMissing;
-    for (paths, 0..) |path, index| {
-        try validateRepoPath(path);
-        for (paths[0..index]) |prior| {
-            if (std.mem.eql(u8, path, prior)) return error.DuplicatePath;
-            if (pathWithin(path, prior) or pathWithin(prior, path)) return error.OverlappingPath;
-        }
-    }
-}
-
-fn validateOperationPaths(allowed_paths: []const []const u8, paths: []const []const u8) !void {
-    if (paths.len == 0) return error.PathsMissing;
-    for (paths, 0..) |path, index| {
-        try validateRepoPath(path);
-        var allowed = false;
-        for (allowed_paths) |root| {
-            if (pathWithin(path, root)) {
-                allowed = true;
-                break;
-            }
-        }
-        if (!allowed) return error.PathOutsideScope;
-        for (paths[0..index]) |prior| {
-            if (std.mem.eql(u8, path, prior)) return error.DuplicatePath;
-            if (pathWithin(path, prior) or pathWithin(prior, path)) return error.OverlappingPath;
-        }
-    }
-}
-
-fn validateObligations(obligations: []const ObligationInput) !void {
-    if (obligations.len == 0) return error.ObligationsMissing;
-    for (obligations, 0..) |obligation, index| {
-        try validateToken("obligation_id", obligation.id);
-        if (ObligationKind.parse(obligation.kind) == null) return error.InvalidObligationKind;
-        try validateNonEmpty("obligation_statement", obligation.statement);
-        if (obligation.verifier.len == 0) return error.VerifierMissing;
-        for (obligation.verifier) |arg| try validateNonEmpty("verifier_arg", arg);
-        for (obligations[0..index]) |prior| {
-            if (std.mem.eql(u8, obligation.id, prior.id)) return error.DuplicateObligation;
-        }
-    }
-}
-
-fn validateRepoPath(path: []const u8) !void {
-    if (path.len == 0 or std.fs.path.isAbsolute(path)) return error.InvalidRepoPath;
-    if (path[0] == ':' or std.mem.indexOfScalar(u8, path, '\\') != null) return error.InvalidRepoPath;
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |component| {
-        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
-            return error.InvalidRepoPath;
-        }
-    }
-    if (pathWithin(path, ".git") or pathWithin(path, ".ledger/actuation")) return error.ReservedRepoPath;
-}
-
-fn validateToken(_: []const u8, value: []const u8) !void {
-    if (value.len == 0 or value.len > 160) return error.InvalidToken;
-    for (value) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.' and byte != ':' and byte != '/') {
-            return error.InvalidToken;
-        }
-    }
-}
-
-fn validateNonEmpty(_: []const u8, value: []const u8) !void {
-    if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.EmptyField;
-}
-
-fn validateDigest(value: []const u8) !void {
-    if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) return error.InvalidDigest;
-    for (value[7..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidDigest;
-}
-
-fn validateContext(state: *const RunState, repo: []const u8, store_path: []const u8) !void {
-    if (!std.mem.eql(u8, state.repo, repo) or !std.mem.eql(u8, state.store_path, store_path)) {
-        return error.RunContextMismatch;
-    }
-}
-
-fn commonVerifierForRefs(state: *RunState, refs: []const []const u8) ![][]u8 {
-    if (refs.len == 0) return error.ObligationRefsMissing;
-    var verifier: ?[][]u8 = null;
-    for (refs, 0..) |ref, index| {
-        try validateToken("obligation_ref", ref);
-        for (refs[0..index]) |prior| if (std.mem.eql(u8, prior, ref)) return error.DuplicateObligationRef;
-        const obligation = findObligation(state, ref) orelse return error.UnknownObligation;
-        if (obligation.discharged_by != null) return error.ObligationAlreadyDischarged;
-        if (verifier) |expected| {
-            if (!equalStringLists(stringSlice(expected), stringSlice(obligation.verifier))) return error.MixedVerifiers;
-        } else {
-            verifier = obligation.verifier;
-        }
-    }
-    return verifier.?;
-}
-
-fn findObligation(state: *RunState, id: []const u8) ?*ObligationState {
-    for (state.obligations) |*obligation| {
-        if (std.mem.eql(u8, obligation.id, id)) return obligation;
-    }
-    return null;
-}
-
-fn outstandingObligationCount(state: *const RunState) usize {
-    var count: usize = 0;
-    for (state.obligations) |obligation| if (obligation.discharged_by == null) {
-        count += 1;
-    };
-    return count;
-}
-
-fn validateCapability(allocator: std.mem.Allocator, expected_digest: []const u8, raw_capability: []const u8) !void {
-    const actual = try digestTextAlloc(allocator, raw_capability);
-    defer allocator.free(actual);
-    if (!std.crypto.timing_safe.eql([71]u8, actual[0..71].*, expected_digest[0..71].*)) return error.CapabilityMismatch;
-}
-
-fn randomCapabilityAlloc(allocator: std.mem.Allocator) ![]u8 {
-    var random: [32]u8 = undefined;
-    try std.Io.randomSecure(defaultIo(), &random);
-    const hex = std.fmt.bytesToHex(random, .lower);
-    return std.fmt.allocPrint(allocator, "AKC1-{s}", .{hex});
-}
-
-fn repositoryArtifactDigestAlloc(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    allowed_paths: []const []const u8,
-) ![]u8 {
-    const store_relative = try storeRelativeAlloc(allocator, repo, store_path);
-    defer if (store_relative) |value| allocator.free(value);
-    const excludes = if (store_relative) |value| &[_][]const u8{value} else &[_][]const u8{};
-    const workspace = try workspaceDigestAlloc(allocator, repo, excludes);
-    defer allocator.free(workspace);
-    const head_raw = try runGitRawAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
-    defer allocator.free(head_raw);
-    const branch_raw = try runGitRawAlloc(allocator, repo, &.{ "branch", "--show-current" });
-    defer allocator.free(branch_raw);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "head", head_raw);
-    hashTagged(&hasher, "branch", branch_raw);
-    hashTagged(&hasher, "workspace", workspace);
-    for (allowed_paths) |path| {
-        const path_digest = try pathStateDigestAlloc(allocator, repo, path);
-        defer allocator.free(path_digest);
-        hashTagged(&hasher, path, path_digest);
-    }
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn unscopedDigestAlloc(
-    allocator: std.mem.Allocator,
-    repo: []const u8,
-    store_path: []const u8,
-    operation_paths: []const []const u8,
-    allowed_paths: []const []const u8,
-) ![]u8 {
-    var excludes: std.ArrayList([]const u8) = .empty;
-    defer excludes.deinit(allocator);
-    try excludes.appendSlice(allocator, operation_paths);
-    const store_relative = try storeRelativeAlloc(allocator, repo, store_path);
-    defer if (store_relative) |value| allocator.free(value);
-    if (store_relative) |value| try excludes.append(allocator, value);
-    const workspace = try workspaceDigestAlloc(allocator, repo, excludes.items);
-    defer allocator.free(workspace);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "workspace", workspace);
-    for (allowed_paths) |path| {
-        if (pathOverlapsAny(path, operation_paths)) continue;
-        const path_digest = try pathStateDigestAlloc(allocator, repo, path);
-        defer allocator.free(path_digest);
-        hashTagged(&hasher, path, path_digest);
-    }
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn workspaceDigestAlloc(allocator: std.mem.Allocator, repo: []const u8, excludes: []const []const u8) ![]u8 {
-    var diff_args: std.ArrayList([]const u8) = .empty;
-    defer diff_args.deinit(allocator);
-    var owned_pathspecs: std.ArrayList([]u8) = .empty;
-    defer freeOwnedArrayList(allocator, &owned_pathspecs);
-    try diff_args.appendSlice(allocator, &.{ "diff", "--binary", "--full-index", "HEAD", "--", "." });
-    for (excludes) |path| {
-        const pathspec = try std.fmt.allocPrint(allocator, ":(exclude,literal){s}", .{path});
-        try owned_pathspecs.append(allocator, pathspec);
-        try diff_args.append(allocator, pathspec);
-    }
-    const diff = try runGitRawAlloc(allocator, repo, diff_args.items);
-    defer allocator.free(diff);
-    const tree = try runGitRawAlloc(allocator, repo, &.{ "ls-tree", "-r", "-z", "HEAD" });
-    defer allocator.free(tree);
-    const index = try runGitRawAlloc(allocator, repo, &.{ "ls-files", "--stage", "-z" });
-    defer allocator.free(index);
-    const untracked = try runGitRawAlloc(allocator, repo, &.{ "ls-files", "--others", "--exclude-standard", "-z" });
-    defer allocator.free(untracked);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "diff", diff);
-    hashFilteredNulRecords(&hasher, "tree", tree, excludes, true);
-    hashFilteredNulRecords(&hasher, "index", index, excludes, true);
-    var records = std.mem.splitScalar(u8, untracked, 0);
-    while (records.next()) |path| {
-        if (path.len == 0 or pathCoveredByAny(path, excludes)) continue;
-        const digest = try exactPathDigestAlloc(allocator, repo, path);
-        defer allocator.free(digest);
-        hashTagged(&hasher, path, digest);
-    }
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn pathStateDigestAlloc(allocator: std.mem.Allocator, repo: []const u8, path: []const u8) ![]u8 {
-    const tree = try runGitRawAlloc(allocator, repo, &.{ "ls-tree", "-r", "-z", "HEAD", "--", path });
-    defer allocator.free(tree);
-    const index = try runGitRawAlloc(allocator, repo, &.{ "ls-files", "--stage", "-z", "--", path });
-    defer allocator.free(index);
-    const diff = try runGitRawAlloc(allocator, repo, &.{ "diff", "--binary", "--full-index", "HEAD", "--", path });
-    defer allocator.free(diff);
-    const untracked = try runGitRawAlloc(allocator, repo, &.{ "ls-files", "--others", "--exclude-standard", "-z", "--", path });
-    defer allocator.free(untracked);
-    const exact = exactPathDigestAlloc(allocator, repo, path) catch try allocator.dupe(u8, "not-a-regular-file");
-    defer allocator.free(exact);
-
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "tree", tree);
-    hashTagged(&hasher, "index", index);
-    hashTagged(&hasher, "diff", diff);
-    hashTagged(&hasher, "exact", exact);
-    var records = std.mem.splitScalar(u8, untracked, 0);
-    while (records.next()) |child| {
-        if (child.len == 0) continue;
-        const digest = try exactPathDigestAlloc(allocator, repo, child);
-        defer allocator.free(digest);
-        hashTagged(&hasher, child, digest);
-    }
-    return finishDigestAlloc(allocator, &hasher);
-}
-
-fn exactPathDigestAlloc(allocator: std.mem.Allocator, repo: []const u8, path: []const u8) ![]u8 {
-    const raw = try runGitRawAlloc(allocator, repo, &.{ "hash-object", "--no-filters", "--", path });
-    defer allocator.free(raw);
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return error.PathUnreadable;
-    return digestTextAlloc(allocator, trimmed);
-}
-
-fn snapshotPathStatesAlloc(allocator: std.mem.Allocator, repo: []const u8, paths: []const []const u8) ![]PathState {
-    const states = try allocator.alloc(PathState, paths.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (states[0..initialized]) |*state| state.deinit(allocator);
-        allocator.free(states);
-    }
-    for (paths, 0..) |path, index| {
-        states[index] = .{
-            .path = try allocator.dupe(u8, path),
-            .digest = try pathStateDigestAlloc(allocator, repo, path),
-        };
-        initialized += 1;
-    }
-    return states;
-}
-
-fn pathStateWiresAlloc(allocator: std.mem.Allocator, states: []const PathState) ![]PathStateWire {
-    const wires = try allocator.alloc(PathStateWire, states.len);
-    for (states, 0..) |state, index| wires[index] = .{ .path = state.path, .digest = state.digest };
-    return wires;
-}
-
-fn allPathStatesChanged(before: []const PathState, after: []const PathState) bool {
-    if (before.len != after.len) return false;
-    for (before, after) |left, right| {
-        if (!std.mem.eql(u8, left.path, right.path) or std.mem.eql(u8, left.digest, right.digest)) return false;
-    }
-    return true;
-}
-
-fn hashFilteredNulRecords(
-    hasher: *std.crypto.hash.sha2.Sha256,
-    tag: []const u8,
-    raw: []const u8,
-    excludes: []const []const u8,
-    path_after_tab: bool,
-) void {
-    var records = std.mem.splitScalar(u8, raw, 0);
-    while (records.next()) |record| {
-        if (record.len == 0) continue;
-        const path = if (path_after_tab)
-            record[(std.mem.indexOfScalar(u8, record, '\t') orelse continue) + 1 ..]
-        else
-            record;
-        if (pathCoveredByAny(path, excludes)) continue;
-        hashTagged(hasher, tag, record);
-    }
-}
-
-fn pathCoveredByAny(path: []const u8, roots: []const []const u8) bool {
-    for (roots) |root| if (pathWithin(path, root)) return true;
-    return false;
-}
-
-fn pathOverlapsAny(path: []const u8, candidates: []const []const u8) bool {
-    for (candidates) |candidate| {
-        if (pathWithin(path, candidate) or pathWithin(candidate, path)) return true;
-    }
-    return false;
-}
-
-fn pathWithin(path: []const u8, root: []const u8) bool {
-    if (std.mem.eql(u8, path, root)) return true;
-    return path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/';
-}
-
-fn storeRelativeAlloc(allocator: std.mem.Allocator, repo: []const u8, store_path: []const u8) !?[]u8 {
-    if (!std.mem.startsWith(u8, store_path, repo)) return null;
-    if (store_path.len == repo.len) return null;
-    if (store_path[repo.len] != '/') return null;
-    return try allocator.dupe(u8, store_path[repo.len + 1 ..]);
-}
-
-fn discoverRepoRootAlloc(allocator: std.mem.Allocator, raw_repo: []const u8) ![]u8 {
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = &.{ "git", "-C", raw_repo, "rev-parse", "--show-toplevel" },
-        .stderr_limit = .limited(MaxProcessOutputBytes),
-        .stdout_limit = .limited(MaxProcessOutputBytes),
-    });
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-    if (exitCode(result.term) != 0) return error.NotGitRepository;
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.NotGitRepository;
-    return allocator.dupe(u8, trimmed);
-}
-
-fn runGitRawAlloc(allocator: std.mem.Allocator, repo: []const u8, args: []const []const u8) ![]u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, "git");
-    try argv.appendSlice(allocator, args);
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = argv.items,
-        .cwd = .{ .path = repo },
-        .stderr_limit = .limited(MaxProcessOutputBytes),
-        .stdout_limit = .limited(MaxProcessOutputBytes),
-    });
-    defer allocator.free(result.stderr);
-    if (exitCode(result.term) != 0) {
-        allocator.free(result.stdout);
-        return error.GitCommandFailed;
-    }
-    defer allocator.free(result.stdout);
-    return allocator.dupe(u8, result.stdout);
-}
-
-fn runProcessAlloc(allocator: std.mem.Allocator, repo: []const u8, argv: []const []const u8) !ProcessResult {
-    if (argv.len == 0) return error.VerifierMissing;
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = argv,
-        .cwd = .{ .path = repo },
-        .stderr_limit = .limited(MaxProcessOutputBytes),
-        .stdout_limit = .limited(MaxProcessOutputBytes),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    const stdout = try allocator.dupe(u8, result.stdout);
-    errdefer allocator.free(stdout);
-    return .{
-        .exit_code = exitCode(result.term),
-        .stdout = stdout,
-        .stderr = try allocator.dupe(u8, result.stderr),
-    };
-}
-
-fn exitCode(term: std.process.Child.Term) u8 {
-    return switch (term) {
-        .exited => |code| @intCast(@min(code, 255)),
-        else => 255,
-    };
-}
-
-fn resolveStorePathAlloc(allocator: std.mem.Allocator, repo: []const u8, raw_path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(raw_path)) return allocator.dupe(u8, raw_path);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo, raw_path });
+    try validateGoalId(goal_id);
+    return std.fs.path.join(allocator, &.{ repo, StoreRoot, goal_id, StoreName });
 }
 
 fn readInputAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -1895,538 +472,3737 @@ fn readInputAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         var reader = std.Io.File.stdin().reader(defaultIo(), &.{});
         return reader.interface.allocRemaining(allocator, .limited(MaxInputBytes));
     }
-    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(MaxInputBytes));
+    return std.Io.Dir.cwd().readFileAlloc(
+        defaultIo(),
+        path,
+        allocator,
+        .limited(MaxInputBytes),
+    );
 }
 
-fn eventDigestAlloc(
+fn asObject(value: std.json.Value) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |object| object,
+        else => error.ExpectedObject,
+    };
+}
+
+fn asArray(value: std.json.Value) !std.json.Array {
+    return switch (value) {
+        .array => |array| array,
+        else => error.ExpectedArray,
+    };
+}
+
+fn field(object: std.json.ObjectMap, name: []const u8) !std.json.Value {
+    return object.get(name) orelse error.MissingField;
+}
+
+fn stringField(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    return switch (try field(object, name)) {
+        .string => |value| value,
+        else => error.ExpectedString,
+    };
+}
+
+fn optionalStringField(
+    object: std.json.ObjectMap,
+    name: []const u8,
+) !?[]const u8 {
+    return switch (try field(object, name)) {
+        .null => null,
+        .string => |value| value,
+        else => error.ExpectedOptionalString,
+    };
+}
+
+fn boolField(object: std.json.ObjectMap, name: []const u8) !bool {
+    return switch (try field(object, name)) {
+        .bool => |value| value,
+        else => error.ExpectedBool,
+    };
+}
+
+fn integerField(object: std.json.ObjectMap, name: []const u8) !i64 {
+    return switch (try field(object, name)) {
+        .integer => |value| value,
+        else => error.ExpectedInteger,
+    };
+}
+
+fn requireExactKeys(object: std.json.ObjectMap, keys: []const []const u8) !void {
+    if (object.count() != keys.len) return error.UnexpectedField;
+    for (keys) |key| if (!object.contains(key)) return error.MissingField;
+}
+
+fn requireNonBlank(value: []const u8) !void {
+    if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.BlankValue;
+}
+
+fn requireDigest(value: []const u8) !void {
+    if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) {
+        return error.InvalidDigest;
+    }
+    for (value[7..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidDigest;
+}
+
+fn canonicalValueAlloc(
     allocator: std.mem.Allocator,
-    sequence: u64,
-    previous_digest: []const u8,
-    run_id: []const u8,
-    kind: []const u8,
-    recorded_at_unix: i64,
-    body_digest: []const u8,
+    value: std.json.Value,
 ) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashTagged(&hasher, "schema", "actuation-event/v1");
-    var number_buffer: [64]u8 = undefined;
-    const sequence_text = try std.fmt.bufPrint(&number_buffer, "{d}", .{sequence});
-    hashTagged(&hasher, "sequence", sequence_text);
-    hashTagged(&hasher, "previous", previous_digest);
-    hashTagged(&hasher, "run", run_id);
-    hashTagged(&hasher, "kind", kind);
-    const time_text = try std.fmt.bufPrint(&number_buffer, "{d}", .{recorded_at_unix});
-    hashTagged(&hasher, "time", time_text);
-    hashTagged(&hasher, "body", body_digest);
-    return finishDigestAlloc(allocator, &hasher);
+    var raw: std.Io.Writer.Allocating = .init(allocator);
+    defer raw.deinit();
+    try std.json.Stringify.value(value, .{}, &raw.writer);
+    return canonical_json.canonicalizeAlloc(allocator, raw.written());
 }
 
-fn digestTextAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(text);
-    return finishDigestAlloc(allocator, &hasher);
+fn digestCanonicalAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    const digest = try canonical_json.digestCanonicalBytes(allocator, bytes);
+    return digest.text;
 }
 
-fn hashTagged(hasher: *std.crypto.hash.sha2.Sha256, tag: []const u8, value: []const u8) void {
-    hasher.update(tag);
-    hasher.update(&.{0});
-    hasher.update(value);
-    hasher.update(&.{0xff});
-}
-
-fn finishDigestAlloc(allocator: std.mem.Allocator, hasher: *std.crypto.hash.sha2.Sha256) ![]u8 {
+fn digestTextAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
-    hasher.final(&digest);
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
 }
 
-fn encodeBodyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    return out.toOwnedSlice();
-}
-
-fn encodeDynamicBodyAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    return out.toOwnedSlice();
-}
-
-fn printTransitionResult(
-    allocator: std.mem.Allocator,
-    command: Command,
-    _: ?[]const u8,
-    result: TransitionResult,
-) !void {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"actuation-transition-result/v1\",\"command\":");
-    try std.json.Stringify.value(@tagName(command), .{}, &out.writer);
-    try out.writer.writeAll(",\"run_id\":");
-    try std.json.Stringify.value(result.run_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"event_digest\":");
-    try std.json.Stringify.value(result.event_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"artifact_digest\":");
-    try std.json.Stringify.value(result.artifact_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"capability\":");
-    if (result.capability) |capability| {
-        try std.json.Stringify.value(capability, .{}, &out.writer);
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"passed\":");
-    if (result.passed) |passed| {
-        try out.writer.writeAll(if (passed) "true" else "false");
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"exit_code\":");
-    if (result.exit_code) |code| {
-        try out.writer.print("{d}", .{code});
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
-}
-
-fn printState(allocator: std.mem.Allocator, state: *const RunState, event_count: u64) !void {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"schema\":\"actuation-kernel-state/v1\",\"run_id\":");
-    try std.json.Stringify.value(state.run_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"goal_id\":");
-    try std.json.Stringify.value(state.goal_id, .{}, &out.writer);
-    try out.writer.writeAll(",\"goal_contract_digest\":");
-    try std.json.Stringify.value(state.goal_contract_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"resolution_digest\":");
-    if (state.resolution_digest) |digest| {
-        try std.json.Stringify.value(digest, .{}, &out.writer);
-    } else {
-        try out.writer.writeAll("null");
-    }
-    try out.writer.writeAll(",\"repo\":");
-    try std.json.Stringify.value(state.repo, .{}, &out.writer);
-    try out.writer.writeAll(",\"mutation_allowed\":");
-    try out.writer.writeAll(if (state.mutation_allowed) "true" else "false");
-    try out.writer.writeAll(",\"completion\":");
-    try std.json.Stringify.value(state.completion.name(), .{}, &out.writer);
-    try out.writer.writeAll(",\"phase\":");
-    try std.json.Stringify.value(state.phase.name(), .{}, &out.writer);
-    try out.writer.writeAll(",\"artifact_digest\":");
-    try std.json.Stringify.value(state.artifact_digest, .{}, &out.writer);
-    try out.writer.writeAll(",\"event_count\":");
-    try out.writer.print("{d}", .{event_count});
-    try out.writer.writeAll(",\"outstanding_obligations\":[");
-    var outstanding_index: usize = 0;
-    for (state.obligations) |obligation| {
-        if (obligation.discharged_by != null) continue;
-        if (outstanding_index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(obligation.id, .{}, &out.writer);
-        outstanding_index += 1;
-    }
-    try out.writer.writeAll("],\"discharged_obligations\":[");
-    var discharged_index: usize = 0;
-    for (state.obligations) |obligation| {
-        if (obligation.discharged_by == null) continue;
-        if (discharged_index > 0) try out.writer.writeByte(',');
-        try out.writer.writeAll("{\"id\":");
-        try std.json.Stringify.value(obligation.id, .{}, &out.writer);
-        try out.writer.writeAll(",\"step_id\":");
-        try std.json.Stringify.value(obligation.discharged_by.?, .{}, &out.writer);
-        try out.writer.writeByte('}');
-        discharged_index += 1;
-    }
-    try out.writer.writeAll("],\"pending_step\":");
-    if (state.pending) |pending| {
-        try out.writer.writeAll("{\"step_id\":");
-        try std.json.Stringify.value(pending.step_id, .{}, &out.writer);
-        try out.writer.writeAll(",\"effect\":");
-        try std.json.Stringify.value(pending.effect.name(), .{}, &out.writer);
-        try out.writer.writeAll(",\"idempotency_key\":");
-        try std.json.Stringify.value(pending.idempotency_key, .{}, &out.writer);
-        try out.writer.writeAll(",\"owner_boundary\":");
-        try std.json.Stringify.value(pending.owner_boundary, .{}, &out.writer);
-        try out.writer.writeAll(",\"paths\":");
-        try std.json.Stringify.value(stringSlice(pending.paths), .{}, &out.writer);
-        try out.writer.writeAll(",\"obligation_refs\":");
-        try std.json.Stringify.value(stringSlice(pending.obligation_refs), .{}, &out.writer);
-        try out.writer.writeAll(",\"verifier\":");
-        try std.json.Stringify.value(stringSlice(pending.verifier), .{}, &out.writer);
-        try out.writer.writeAll(",\"capability_digest\":");
-        try std.json.Stringify.value(pending.capability_digest, .{}, &out.writer);
-        try out.writer.writeAll(",\"artifact_before\":");
-        try std.json.Stringify.value(pending.artifact_before, .{}, &out.writer);
-        try out.writer.writeAll(",\"artifact_after\":");
-        if (pending.artifact_after) |digest| {
-            try std.json.Stringify.value(digest, .{}, &out.writer);
-        } else {
-            try out.writer.writeAll("null");
+fn validateStringArray(value: std.json.Value, require_items: bool) !std.json.Array {
+    const array = try asArray(value);
+    if (require_items and array.items.len == 0) return error.EmptyArray;
+    for (array.items, 0..) |item, index| {
+        const text = switch (item) {
+            .string => |string| string,
+            else => return error.ExpectedString,
+        };
+        try requireNonBlank(text);
+        for (array.items[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.string, text)) return error.DuplicateValue;
         }
-        try out.writer.writeByte('}');
-    } else {
-        try out.writer.writeAll("null");
     }
-    try out.writer.writeAll(",\"next_transition\":");
-    try std.json.Stringify.value(nextTransition(state), .{}, &out.writer);
-    try out.writer.writeAll("}\n");
-    try writeStdoutAlloc(allocator, &out);
+    return array;
 }
 
-fn nextTransition(state: *const RunState) []const u8 {
-    return switch (state.phase) {
-        .closed => "terminal",
-        .effect_recorded => "observe",
-        .prepared => if (state.pending.?.effect == .edit) "record" else "execute",
-        .ready => if (outstandingObligationCount(state) == 0) "close" else "prepare",
+fn validateDigestArray(value: std.json.Value) !std.json.Array {
+    const array = try validateStringArray(value, false);
+    for (array.items) |item| try requireDigest(item.string);
+    return array;
+}
+
+fn hasString(array: std.json.Array, needle: []const u8) bool {
+    for (array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, needle)) return true;
+    }
+    return false;
+}
+
+fn parseEffect(raw: []const u8) !Effect {
+    inline for (@typeInfo(Effect).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, raw, enum_field.name)) return @enumFromInt(enum_field.value);
+    }
+    return error.InvalidEffect;
+}
+
+fn parseClassStatus(raw: []const u8) !ClassStatus {
+    if (std.mem.eql(u8, raw, "accepted")) return .accepted;
+    if (std.mem.eql(u8, raw, "rejected")) return .rejected;
+    if (std.mem.eql(u8, raw, "blocked")) return .blocked;
+    if (std.mem.eql(u8, raw, "follow-up")) return .follow_up;
+    return error.InvalidClassStatus;
+}
+
+fn materializeArtifact(
+    allocator: std.mem.Allocator,
+    goal_id: []const u8,
+    bytes: []const u8,
+) !Materialized {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    var view = try inspectArtifact(parsed.value, goal_id, true);
+    const document = &parsed.value.object;
+    const artifact_value = document.getPtr("artifact") orelse return error.MissingField;
+    const artifact_object = &artifact_value.object;
+    const id_value = artifact_object.getPtr("artifact_id") orelse return error.MissingField;
+    const supplied_id = switch (id_value.*) {
+        .null => null,
+        .string => |value| value,
+        else => return error.InvalidArtifactId,
+    };
+    id_value.* = .null;
+    const basis = try canonicalValueAlloc(allocator, parsed.value);
+    defer allocator.free(basis);
+    const artifact_id = try digestCanonicalAlloc(allocator, basis);
+    errdefer allocator.free(artifact_id);
+    if (supplied_id) |value| {
+        if (!std.mem.eql(u8, value, artifact_id)) return error.ArtifactIdentityMismatch;
+    }
+    id_value.* = .{ .string = artifact_id };
+    const canonical = try canonicalValueAlloc(allocator, parsed.value);
+    errdefer allocator.free(canonical);
+    view.artifact_id = artifact_id;
+    _ = try inspectArtifact(parsed.value, goal_id, false);
+    return .{ .family = view.family, .bytes = canonical, .artifact_id = artifact_id };
+}
+
+fn inspectArtifact(
+    document_value: std.json.Value,
+    expected_goal: []const u8,
+    allow_draft: bool,
+) !ArtifactView {
+    const document = try asObject(document_value);
+    try requireExactKeys(document, &.{"artifact"});
+    const artifact = try asObject(try field(document, "artifact"));
+    try requireExactKeys(artifact, &.{
+        "schema",           "artifact_id",     "goal_id", "semantic_author", "created_at",
+        "predecessor_refs", "supporting_refs", "payload",
+    });
+    const schema = try stringField(artifact, "schema");
+    const family = familyFromSchema(schema) orelse return error.InvalidArtifactSchema;
+    const artifact_id = try inspectArtifactId(artifact, allow_draft);
+    const goal_id = try stringField(artifact, "goal_id");
+    try validateGoalId(goal_id);
+    if (!std.mem.eql(u8, goal_id, expected_goal)) return error.GoalIdMismatch;
+    try validateSemanticAuthor(family, try stringField(artifact, "semantic_author"));
+    try requireNonBlank(try stringField(artifact, "created_at"));
+    const predecessors = try validateDigestArray(try field(artifact, "predecessor_refs"));
+    _ = try validateStringArray(try field(artifact, "supporting_refs"), false);
+    const payload = try field(artifact, "payload");
+    try validateArtifactPayload(family, payload);
+    return .{
+        .family = family,
+        .artifact_id = artifact_id,
+        .goal_id = goal_id,
+        .predecessors = predecessors,
+        .payload = payload,
     };
 }
 
-fn writeStdoutAlloc(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating) !void {
-    const bytes = try out.toOwnedSlice();
-    defer allocator.free(bytes);
+fn inspectArtifactId(
+    artifact: std.json.ObjectMap,
+    allow_draft: bool,
+) ![]const u8 {
+    return switch (try field(artifact, "artifact_id")) {
+        .null => if (allow_draft) "" else error.InvalidArtifactId,
+        .string => |value| blk: {
+            try requireDigest(value);
+            break :blk value;
+        },
+        else => error.InvalidArtifactId,
+    };
+}
+
+fn validateSemanticAuthor(family: ArtifactFamily, author: []const u8) !void {
+    try requireNonBlank(author);
+    switch (family) {
+        .goal => if (!std.mem.eql(u8, author, "goal-contract")) {
+            return error.SemanticAuthorMismatch;
+        },
+        .counterexample => if (!std.mem.eql(u8, author, "review-fold")) {
+            return error.SemanticAuthorMismatch;
+        },
+        .construction => if (!std.mem.eql(u8, author, "actuating")) {
+            return error.SemanticAuthorMismatch;
+        },
+        .evidence => return error.InvalidArtifactFamily,
+    }
+}
+
+fn validateArtifactPayload(family: ArtifactFamily, payload: std.json.Value) !void {
+    switch (family) {
+        .goal => try validateGoalPayload(payload),
+        .counterexample => try validateCounterexamplePayload(payload),
+        .construction => try validateConstructionPayload(payload),
+        .evidence => return error.InvalidArtifactFamily,
+    }
+}
+
+fn validateGoalPayload(value: std.json.Value) !void {
+    const payload = try asObject(value);
+    try requireExactKeys(payload, &.{
+        "objective", "authority", "scope", "compatibility", "laws", "acceptance",
+    });
+    try validateObjective(try field(payload, "objective"));
+    try validateAuthority(try field(payload, "authority"));
+    try validateScope(try field(payload, "scope"));
+    try validateCompatibility(try field(payload, "compatibility"));
+    try validateLaws(try field(payload, "laws"));
+    try validateAcceptance(try field(payload, "acceptance"));
+}
+
+fn validateObjective(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{ "required_outcomes", "non_goals" });
+    _ = try validateStringArray(try field(object, "required_outcomes"), true);
+    _ = try validateStringArray(try field(object, "non_goals"), false);
+}
+
+fn validateAuthority(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "source_ref",                 "source_digest",    "execution_authority_ref",
+        "execution_authority_digest", "mutation_allowed",
+    });
+    try requireNonBlank(try stringField(object, "source_ref"));
+    try requireDigest(try stringField(object, "source_digest"));
+    try requireNonBlank(try stringField(object, "execution_authority_ref"));
+    try requireDigest(try stringField(object, "execution_authority_digest"));
+    _ = try boolField(object, "mutation_allowed");
+}
+
+fn validateScope(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "repository", "base_ref", "allowed_paths", "prohibited_paths",
+    });
+    try requireNonBlank(try stringField(object, "repository"));
+    try requireNonBlank(try stringField(object, "base_ref"));
+    const allowed = try validateStringArray(try field(object, "allowed_paths"), true);
+    const prohibited = try validateStringArray(try field(object, "prohibited_paths"), false);
+    try validatePathArray(allowed);
+    try validatePathArray(prohibited);
+}
+
+fn validateCompatibility(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "required_contracts", "permitted_breaks", "migration_requirements",
+    });
+    _ = try validateStringArray(try field(object, "required_contracts"), false);
+    _ = try validateStringArray(try field(object, "permitted_breaks"), false);
+    _ = try validateStringArray(try field(object, "migration_requirements"), false);
+}
+
+fn validateLaws(value: std.json.Value) !void {
+    const laws = try asArray(value);
+    if (laws.items.len == 0) return error.EmptyLaws;
+    for (laws.items, 0..) |item, index| {
+        const law = try asObject(item);
+        try requireExactKeys(law, &.{
+            "law_id", "statement", "applicability", "required_observation",
+        });
+        const id = try stringField(law, "law_id");
+        try requireNonBlank(id);
+        try requireNonBlank(try stringField(law, "statement"));
+        try requireNonBlank(try stringField(law, "applicability"));
+        try requireNonBlank(try stringField(law, "required_observation"));
+        for (laws.items[0..index]) |prior| {
+            if (std.mem.eql(u8, try stringField(try asObject(prior), "law_id"), id)) {
+                return error.DuplicateLaw;
+            }
+        }
+    }
+}
+
+fn validateAcceptance(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "terminal_route", "publication_required", "required_proof_kinds",
+    });
+    const route = try stringField(object, "terminal_route");
+    if (!std.mem.eql(u8, route, "complete") and
+        !std.mem.eql(u8, route, "ready-to-ship")) return error.InvalidTerminalRoute;
+    _ = try boolField(object, "publication_required");
+    const kinds = try validateStringArray(
+        try field(object, "required_proof_kinds"),
+        true,
+    );
+    for (kinds.items) |item| if (!proofKindValid(item.string)) {
+        return error.InvalidProofKind;
+    };
+}
+
+fn proofKindValid(raw: []const u8) bool {
+    return std.mem.eql(u8, raw, "implementation") or
+        std.mem.eql(u8, raw, "review") or
+        std.mem.eql(u8, raw, "acceptance") or
+        std.mem.eql(u8, raw, "ship");
+}
+
+fn validatePathArray(paths: std.json.Array) !void {
+    var previous: ?[]const u8 = null;
+    for (paths.items) |item| {
+        const path = item.string;
+        try validateRepoPath(path);
+        if (previous) |prior| {
+            if (!std.mem.lessThan(u8, prior, path)) return error.NonCanonicalPathSet;
+        }
+        previous = path;
+    }
+}
+
+fn validateRepoPath(path: []const u8) !void {
+    if (std.mem.eql(u8, path, ".")) return;
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or path[path.len - 1] == '/') {
+        return error.InvalidRepoPath;
+    }
+    var iterator = std.mem.splitScalar(u8, path, '/');
+    while (iterator.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or
+            std.mem.eql(u8, part, "..")) return error.InvalidRepoPath;
+    }
+    if (pathWithin(path, ".git") or pathWithin(path, StoreRoot)) {
+        return error.ReservedRepoPath;
+    }
+}
+
+fn validateExecutablePathArray(paths: std.json.Array) !void {
+    for (paths.items) |item| try validateExecutablePath(item.string);
+}
+
+fn validateExecutablePath(path: []const u8) !void {
+    try validateRepoPath(path);
+    if (std.mem.eql(u8, path, ".") or
+        pathWithin(StoreRoot, path) or pathWithin(".git", path))
+    {
+        return error.ReservedRepoPath;
+    }
+}
+
+fn pathWithin(path: []const u8, root: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(path, root) or
+        (path.len > root.len and path[root.len] == '/' and
+            std.ascii.eqlIgnoreCase(path[0..root.len], root));
+}
+
+fn validateCounterexamplePayload(value: std.json.Value) !void {
+    const payload = try asObject(value);
+    try requireExactKeys(payload, &.{ "subject", "classes" });
+    const subject = try asObject(try field(payload, "subject"));
+    try requireExactKeys(subject, &.{
+        "construction_ref", "repository", "artifact_digest", "review_contract_digest",
+    });
+    try requireDigest(try stringField(subject, "construction_ref"));
+    try requireNonBlank(try stringField(subject, "repository"));
+    try requireDigest(try stringField(subject, "artifact_digest"));
+    try requireDigest(try stringField(subject, "review_contract_digest"));
+    const classes = try asArray(try field(payload, "classes"));
+    for (classes.items, 0..) |item, index| {
+        try validateCounterexampleClass(item, classes.items[0..index]);
+    }
+}
+
+fn validateCounterexampleClass(
+    value: std.json.Value,
+    prior: []const std.json.Value,
+) !void {
+    const class = try asObject(value);
+    try requireExactKeys(class, &.{
+        "class_id", "boundary_key",  "law_ref",        "discrepancy",    "owner_boundary",
+        "severity", "status",        "observed_facts", "evidence_refs",  "finding_refs",
+        "witness",  "falsifier_ref", "applicability",  "quotient_basis",
+    });
+    const class_id = try stringField(class, "class_id");
+    try requireNonBlank(class_id);
+    try requireNonBlank(try stringField(class, "boundary_key"));
+    try requireNonBlank(try stringField(class, "law_ref"));
+    try validateDiscrepancy(try stringField(class, "discrepancy"));
+    try requireNonBlank(try stringField(class, "owner_boundary"));
+    _ = try parseClassSeverity(try stringField(class, "severity"));
+    _ = try parseClassStatus(try stringField(class, "status"));
+    _ = try validateStringArray(try field(class, "observed_facts"), true);
+    _ = try validateStringArray(try field(class, "evidence_refs"), true);
+    _ = try validateDigestArray(try field(class, "finding_refs"));
+    try requireNonBlank(try stringField(class, "witness"));
+    try requireNonBlank(try stringField(class, "falsifier_ref"));
+    try requireNonBlank(try stringField(class, "applicability"));
+    try requireNonBlank(try stringField(class, "quotient_basis"));
+    for (prior) |item| {
+        const prior_class = try asObject(item);
+        if (std.mem.eql(u8, try stringField(prior_class, "class_id"), class_id)) {
+            return error.DuplicateCounterexampleClass;
+        }
+    }
+}
+
+fn validateDiscrepancy(raw: []const u8) !void {
+    const valid = std.mem.eql(u8, raw, "excess") or
+        std.mem.eql(u8, raw, "deficit") or
+        std.mem.eql(u8, raw, "incoherence") or
+        std.mem.eql(u8, raw, "partiality") or
+        std.mem.eql(u8, raw, "misbinding");
+    if (!valid) return error.InvalidDiscrepancy;
+}
+
+const ClassSeverity = enum { critical, high, medium, low };
+
+fn parseClassSeverity(raw: []const u8) !ClassSeverity {
+    inline for (@typeInfo(ClassSeverity).@"enum".fields) |enum_field| {
+        if (std.mem.eql(u8, raw, enum_field.name)) {
+            return @enumFromInt(enum_field.value);
+        }
+    }
+    return error.InvalidSeverity;
+}
+
+fn validateConstructionPayload(value: std.json.Value) !void {
+    const payload = try asObject(value);
+    try requireExactKeys(payload, &.{
+        "goal_contract_ref",
+        "mode",
+        "subject",
+        "boundary",
+        "architecture",
+        "falsified_predecessor_claims",
+        "preserved_predecessor_claims",
+        "invalid_states_eliminated",
+        "counterexample_class_refs",
+        "preserved_observations",
+        "proof_obligations",
+        "retirements",
+        "execution",
+    });
+    try requireDigest(try stringField(payload, "goal_contract_ref"));
+    try validateConstructionMode(try stringField(payload, "mode"));
+    try validateConstructionSubject(try field(payload, "subject"));
+    try validateBoundary(try field(payload, "boundary"));
+    try validateArchitecture(try field(payload, "architecture"));
+    _ = try validateStringArray(
+        try field(payload, "falsified_predecessor_claims"),
+        false,
+    );
+    _ = try validateStringArray(
+        try field(payload, "preserved_predecessor_claims"),
+        false,
+    );
+    _ = try validateStringArray(try field(payload, "invalid_states_eliminated"), false);
+    _ = try validateStringArray(try field(payload, "counterexample_class_refs"), false);
+    const preserved_observations = try validateStringArray(
+        try field(payload, "preserved_observations"),
+        false,
+    );
+    try validateProofObligations(try field(payload, "proof_obligations"));
+    try validateRetirements(try field(payload, "retirements"));
+    try validateProofRoleNamespace(payload);
+    try validatePreservedObservations(payload, preserved_observations);
+    try validateExecution(try field(payload, "execution"));
+}
+
+fn validateConstructionMode(raw: []const u8) !void {
+    const valid = std.mem.eql(u8, raw, "initial") or
+        std.mem.eql(u8, raw, "realization-repair") or
+        std.mem.eql(u8, raw, "architecture-repair") or
+        std.mem.eql(u8, raw, "ablation-repair");
+    if (!valid) return error.InvalidConstructionMode;
+}
+
+fn validateConstructionSubject(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{ "repository", "base_artifact_digest" });
+    try requireNonBlank(try stringField(object, "repository"));
+    try requireDigest(try stringField(object, "base_artifact_digest"));
+}
+
+fn validateBoundary(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "boundary_key", "source_worlds", "target_worlds", "carriers",
+        "operations",   "observations",
+    });
+    try requireNonBlank(try stringField(object, "boundary_key"));
+    _ = try validateStringArray(try field(object, "source_worlds"), true);
+    _ = try validateStringArray(try field(object, "target_worlds"), true);
+    _ = try validateStringArray(try field(object, "carriers"), true);
+    _ = try validateStringArray(try field(object, "operations"), true);
+    _ = try validateStringArray(try field(object, "observations"), true);
+}
+
+fn validateArchitecture(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "governing_law_refs",        "canonical_owner",        "selected_construction",
+        "representation_or_machine", "interpreter_or_handler", "residual_assumptions",
+    });
+    _ = try validateStringArray(try field(object, "governing_law_refs"), true);
+    try requireNonBlank(try stringField(object, "canonical_owner"));
+    try requireNonBlank(try stringField(object, "selected_construction"));
+    try requireNonBlank(try stringField(object, "representation_or_machine"));
+    try requireNonBlank(try stringField(object, "interpreter_or_handler"));
+    _ = try validateStringArray(try field(object, "residual_assumptions"), false);
+}
+
+fn validateProofObligations(value: std.json.Value) !void {
+    const obligations = try asArray(value);
+    if (obligations.items.len == 0) return error.EmptyProofObligations;
+    for (obligations.items, 0..) |item, index| {
+        const obligation = try asObject(item);
+        try requireExactKeys(obligation, &.{
+            "obligation_id", "law_ref",   "statement",  "proof_mode", "adequacy_reason",
+            "verifier",      "falsifier", "proof_kind",
+        });
+        const id = try stringField(obligation, "obligation_id");
+        try requireNonBlank(id);
+        try rejectReservedProofRoleId(id);
+        try requireNonBlank(try stringField(obligation, "law_ref"));
+        try requireNonBlank(try stringField(obligation, "statement"));
+        try validateProofMode(try stringField(obligation, "proof_mode"));
+        try requireNonBlank(try stringField(obligation, "adequacy_reason"));
+        try validateArgv(try field(obligation, "verifier"));
+        try validateArgv(try field(obligation, "falsifier"));
+        if (!proofKindValid(try stringField(obligation, "proof_kind"))) {
+            return error.InvalidProofKind;
+        }
+        try rejectDuplicateId(obligations.items[0..index], "obligation_id", id);
+    }
+}
+
+fn validateProofMode(raw: []const u8) !void {
+    const modes = [_][]const u8{
+        "representation", "total-transition", "exhaustive-model",   "static-refinement",
+        "property-law",   "differential",     "example-regression",
+    };
+    for (modes) |mode| if (std.mem.eql(u8, raw, mode)) return;
+    return error.InvalidProofMode;
+}
+
+fn validateArgv(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{"argv"});
+    const argv = try asArray(try field(object, "argv"));
+    if (argv.items.len == 0) return error.EmptyArray;
+    for (argv.items) |item| {
+        const token = switch (item) {
+            .string => |string| string,
+            else => return error.ExpectedString,
+        };
+        try requireNonBlank(token);
+    }
+}
+
+fn validateRetirements(value: std.json.Value) !void {
+    const retirements = try asArray(value);
+    for (retirements.items, 0..) |item, index| {
+        const retirement = try asObject(item);
+        try requireExactKeys(retirement, &.{
+            "retirement_id", "dominated_construct", "disposition", "replacement_ref",
+            "verifier",
+        });
+        const id = try stringField(retirement, "retirement_id");
+        try requireNonBlank(id);
+        try rejectReservedProofRoleId(id);
+        try requireNonBlank(try stringField(retirement, "dominated_construct"));
+        try validateDisposition(try stringField(retirement, "disposition"));
+        try requireNonBlank(try stringField(retirement, "replacement_ref"));
+        try validateArgv(try field(retirement, "verifier"));
+        try rejectDuplicateId(retirements.items[0..index], "retirement_id", id);
+    }
+}
+
+fn validateDisposition(raw: []const u8) !void {
+    const valid = std.mem.eql(u8, raw, "collapse") or
+        std.mem.eql(u8, raw, "delegate") or
+        std.mem.eql(u8, raw, "retire") or
+        std.mem.eql(u8, raw, "replace");
+    if (!valid) return error.InvalidRetirementDisposition;
+}
+
+fn rejectDuplicateId(
+    prior: []const std.json.Value,
+    field_name: []const u8,
+    id: []const u8,
+) !void {
+    for (prior) |item| {
+        if (std.mem.eql(u8, try stringField(try asObject(item), field_name), id)) {
+            return error.DuplicateValue;
+        }
+    }
+}
+
+fn rejectReservedProofRoleId(id: []const u8) !void {
+    if (std.mem.endsWith(u8, id, "#falsifier")) return error.ReservedProofRoleId;
+}
+
+fn validateProofRoleNamespace(payload: std.json.ObjectMap) !void {
+    const obligations = try asArray(try field(payload, "proof_obligations"));
+    const retirements = try asArray(try field(payload, "retirements"));
+    for (obligations.items) |obligation_value| {
+        const obligation = try asObject(obligation_value);
+        const obligation_id = try stringField(obligation, "obligation_id");
+        for (retirements.items) |retirement_value| {
+            const retirement = try asObject(retirement_value);
+            if (std.mem.eql(
+                u8,
+                obligation_id,
+                try stringField(retirement, "retirement_id"),
+            )) return error.AmbiguousProofRoleId;
+        }
+    }
+}
+
+fn validatePreservedObservations(
+    payload: std.json.ObjectMap,
+    preserved: std.json.Array,
+) !void {
+    const obligations = try asArray(try field(payload, "proof_obligations"));
+    for (preserved.items) |item| {
+        if (!hasObjectId(obligations, "obligation_id", item.string)) {
+            return error.UnknownPreservedObservation;
+        }
+    }
+}
+
+fn hasObjectId(
+    objects: std.json.Array,
+    field_name: []const u8,
+    expected: []const u8,
+) bool {
+    for (objects.items) |item| {
+        const object = asObject(item) catch return false;
+        const actual = stringField(object, field_name) catch return false;
+        if (std.mem.eql(u8, actual, expected)) return true;
+    }
+    return false;
+}
+
+fn validateExecution(value: std.json.Value) !void {
+    const object = try asObject(value);
+    try requireExactKeys(object, &.{
+        "allowed_paths", "owner_boundary", "operation_effects", "completion",
+    });
+    const paths = try validateStringArray(try field(object, "allowed_paths"), true);
+    try validatePathArray(paths);
+    try validateExecutablePathArray(paths);
+    try requireNonBlank(try stringField(object, "owner_boundary"));
+    const effects = try validateStringArray(try field(object, "operation_effects"), true);
+    for (effects.items) |item| _ = try parseEffect(item.string);
+    const completion = try stringField(object, "completion");
+    if (!std.mem.eql(u8, completion, "complete") and
+        !std.mem.eql(u8, completion, "ready-to-ship")) return error.InvalidCompletion;
+}
+
+fn replayStore(
+    parent: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+) !Replay {
+    const arena = try parent.create(std.heap.ArenaAllocator);
+    arena.* = .init(parent);
+    var replay = Replay{
+        .parent = parent,
+        .arena = arena,
+        .snapshot = undefined,
+        .state = undefined,
+    };
+    errdefer replay.deinit();
+    const allocator = replay.arena.allocator();
+    replay.snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    replay.state = try foldSnapshot(allocator, replay.snapshot, goal_id);
+    return replay;
+}
+
+fn replayExclusive(
+    parent: std.mem.Allocator,
+    exclusive: *const durable_store.EventStoreExclusive,
+    goal_id: []const u8,
+) !Replay {
+    const arena = try parent.create(std.heap.ArenaAllocator);
+    arena.* = .init(parent);
+    var replay = Replay{
+        .parent = parent,
+        .arena = arena,
+        .snapshot = undefined,
+        .state = undefined,
+    };
+    errdefer replay.deinit();
+    const allocator = replay.arena.allocator();
+    replay.snapshot = try exclusive.snapshot(allocator, MaxStoreBytes);
+    replay.state = try foldSnapshot(allocator, replay.snapshot, goal_id);
+    return replay;
+}
+
+fn foldSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: durable_store.EventSnapshot,
+    goal_id: []const u8,
+) !State {
+    if (snapshot.blank_entries != 0) return error.BlankEvidenceRecord;
+    if (snapshot.records.len > MaxEvents) return error.TooManyEvents;
+    var state = State.init(allocator, goal_id);
+    for (snapshot.records) |record| {
+        const event = try parseEvent(allocator, record.payload);
+        try applyEvent(&state, event);
+    }
+    return state;
+}
+
+fn parseEvent(allocator: std.mem.Allocator, bytes: []const u8) !ParsedEvent {
+    const canonical = try canonical_json.canonicalizeAlloc(allocator, bytes);
+    if (!std.mem.eql(u8, canonical, bytes)) return error.NonCanonicalEvidence;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    const object = try asObject(parsed.value);
+    try requireExactKeys(object, &.{
+        "body",     "body_digest",    "construction_ref", "event_digest", "event_id",
+        "goal_id",  "kind",           "previous_digest",  "recorded_at",  "schema",
+        "sequence", "subject_digest",
+    });
+    if (!std.mem.eql(u8, try stringField(object, "schema"), EventSchema)) {
+        return error.InvalidEventSchema;
+    }
+    const sequence_i64 = try integerField(object, "sequence");
+    if (sequence_i64 <= 0) return error.InvalidSequence;
+    const kind = kindFromWire(try stringField(object, "kind")) orelse
+        return error.InvalidEventKind;
+    const construction_ref = try optionalStringField(object, "construction_ref");
+    const subject_digest = try optionalStringField(object, "subject_digest");
+    if (construction_ref) |value| try requireDigest(value);
+    if (subject_digest) |value| try requireDigest(value);
+    const event = ParsedEvent{
+        .sequence = @intCast(sequence_i64),
+        .previous_digest = try stringField(object, "previous_digest"),
+        .event_id = try stringField(object, "event_id"),
+        .goal_id = try stringField(object, "goal_id"),
+        .construction_ref = construction_ref,
+        .subject_digest = subject_digest,
+        .kind = kind,
+        .recorded_at = try integerField(object, "recorded_at"),
+        .body = try field(object, "body"),
+        .body_digest = try stringField(object, "body_digest"),
+        .event_digest = try stringField(object, "event_digest"),
+    };
+    try validateEventDigests(allocator, event);
+    return event;
+}
+
+fn validateEventDigests(allocator: std.mem.Allocator, event: ParsedEvent) !void {
+    try requireDigest(event.previous_digest);
+    try requireDigest(event.body_digest);
+    try requireDigest(event.event_digest);
+    var expected_id_buffer: [32]u8 = undefined;
+    const expected_id = try std.fmt.bufPrint(&expected_id_buffer, "e-{d}", .{event.sequence});
+    if (!std.mem.eql(u8, expected_id, event.event_id)) return error.EventIdMismatch;
+    const body = try canonicalValueAlloc(allocator, event.body);
+    const expected_body = try digestCanonicalAlloc(allocator, body);
+    if (!std.mem.eql(u8, expected_body, event.body_digest)) return error.BodyDigestMismatch;
+    const basis = try eventBasisAlloc(allocator, event, body);
+    const expected_event = try digestCanonicalAlloc(allocator, basis);
+    if (!std.mem.eql(u8, expected_event, event.event_digest)) {
+        return error.EventDigestMismatch;
+    }
+}
+
+fn eventBasisAlloc(
+    allocator: std.mem.Allocator,
+    event: ParsedEvent,
+    body: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"body\":");
+    try out.writer.writeAll(body);
+    try out.writer.writeAll(",\"body_digest\":");
+    try writeJsonString(&out.writer, event.body_digest);
+    try out.writer.writeAll(",\"construction_ref\":");
+    try writeOptionalJsonString(&out.writer, event.construction_ref);
+    try out.writer.writeAll(",\"event_id\":");
+    try writeJsonString(&out.writer, event.event_id);
+    try writeEventTail(&out.writer, event);
+    return out.toOwnedSlice();
+}
+
+fn writeEventTail(writer: *std.Io.Writer, event: ParsedEvent) !void {
+    try writer.writeAll(",\"goal_id\":");
+    try writeJsonString(writer, event.goal_id);
+    try writer.writeAll(",\"kind\":");
+    try writeJsonString(writer, specForKind(event.kind).wire);
+    try writer.writeAll(",\"previous_digest\":");
+    try writeJsonString(writer, event.previous_digest);
+    try writer.print(",\"recorded_at\":{d}", .{event.recorded_at});
+    try writer.writeAll(",\"schema\":\"");
+    try writer.writeAll(EventSchema);
+    try writer.print("\",\"sequence\":{d},\"subject_digest\":", .{event.sequence});
+    try writeOptionalJsonString(writer, event.subject_digest);
+    try writer.writeByte('}');
+}
+
+fn eventBytesAlloc(
+    allocator: std.mem.Allocator,
+    state: State,
+    kind: EventKind,
+    construction_ref: ?[]const u8,
+    subject_digest: ?[]const u8,
+    body: []const u8,
+) ![]u8 {
+    const sequence = state.event_count + 1;
+    const event_id = try std.fmt.allocPrint(allocator, "e-{d}", .{sequence});
+    defer allocator.free(event_id);
+    const body_digest = try digestCanonicalAlloc(allocator, body);
+    defer allocator.free(body_digest);
+    const recorded_at: i64 = @intCast(@divFloor(
+        std.Io.Clock.real.now(defaultIo()).nanoseconds,
+        std.time.ns_per_s,
+    ));
+    var event = ParsedEvent{
+        .sequence = sequence,
+        .previous_digest = state.head_digest,
+        .event_id = event_id,
+        .goal_id = state.goal_id,
+        .construction_ref = construction_ref,
+        .subject_digest = subject_digest,
+        .kind = kind,
+        .recorded_at = recorded_at,
+        .body = undefined,
+        .body_digest = body_digest,
+        .event_digest = "",
+    };
+    const basis = try eventBasisAlloc(allocator, event, body);
+    defer allocator.free(basis);
+    event.event_digest = try digestCanonicalAlloc(allocator, basis);
+    defer allocator.free(event.event_digest);
+    return finalEventAlloc(allocator, event, body);
+}
+
+fn finalEventAlloc(
+    allocator: std.mem.Allocator,
+    event: ParsedEvent,
+    body: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"body\":");
+    try out.writer.writeAll(body);
+    try out.writer.writeAll(",\"body_digest\":");
+    try writeJsonString(&out.writer, event.body_digest);
+    try out.writer.writeAll(",\"construction_ref\":");
+    try writeOptionalJsonString(&out.writer, event.construction_ref);
+    try out.writer.writeAll(",\"event_digest\":");
+    try writeJsonString(&out.writer, event.event_digest);
+    try out.writer.writeAll(",\"event_id\":");
+    try writeJsonString(&out.writer, event.event_id);
+    try writeEventTail(&out.writer, event);
+    return out.toOwnedSlice();
+}
+
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeOptionalJsonString(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    if (value) |text| try writeJsonString(writer, text) else try writer.writeAll("null");
+}
+
+fn applyEvent(state: *State, event: ParsedEvent) !void {
+    if (!std.mem.eql(u8, event.goal_id, state.goal_id)) return error.GoalIdMismatch;
+    if (event.sequence != state.event_count + 1) return error.SequenceMismatch;
+    if (!std.mem.eql(u8, event.previous_digest, state.head_digest)) {
+        return error.PreviousDigestMismatch;
+    }
+    switch (event.kind) {
+        .goal_contract_registered => try applyGoalRegistration(state, event),
+        .construction_contract_registered => try applyConstructionRegistration(state, event),
+        .counterexample_set_registered => try applyCounterexampleRegistration(state, event),
+        .operation_prepared => try applyOperationPrepared(state, event),
+        .effect_recorded => try applyEffectRecorded(state, event),
+        .operation_observed => try applyOperationObserved(state, event),
+        .operation_aborted => try applyOperationAborted(state, event),
+        .publication_observed => try applyPublicationObserved(state, event),
+        .review_campaign_started => try applyReviewCampaignStarted(state, event),
+        .review_request_bound => try applyReviewRequestBound(state, event),
+        .review_attempt_started => try applyReviewAttemptStarted(state, event),
+        .review_attempt_completed => try applyReviewAttemptCompleted(state, event),
+        .review_transport_failed => try applyReviewTransportFailed(state, event),
+    }
+    state.kind_counts[@intFromEnum(event.kind)] += 1;
+    state.event_count = event.sequence;
+    state.head_digest = event.event_digest;
+}
+
+fn verifiedArtifactView(
+    state: *State,
+    body: std.json.Value,
+    expected: ArtifactFamily,
+) !ArtifactView {
+    const bytes = try canonicalValueAlloc(state.allocator, body);
+    const materialized = try materializeArtifact(state.allocator, state.goal_id, bytes);
+    if (materialized.family != expected or !std.mem.eql(u8, materialized.bytes, bytes)) {
+        return error.ArtifactIdentityMismatch;
+    }
+    return inspectArtifact(body, state.goal_id, false);
+}
+
+fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
+    if (event.construction_ref != null or event.subject_digest != null) {
+        return error.InvalidGoalRegistration;
+    }
+    const view = try verifiedArtifactView(state, event.body, .goal);
+    if (state.goal) |current| {
+        if (state.pending != null or view.predecessors.items.len != 1 or
+            !std.mem.eql(u8, view.predecessors.items[0].string, current.artifact_id))
+        {
+            return error.InvalidGoalSuccessor;
+        }
+        const current_payload = try canonicalValueAlloc(state.allocator, current.payload);
+        const successor_payload = try canonicalValueAlloc(state.allocator, view.payload);
+        if (std.mem.eql(u8, current_payload, successor_payload)) {
+            return error.GoalSuccessorUnchanged;
+        }
+        for (state.classes.items) |class| {
+            if (class.status == .accepted or class.status == .blocked) {
+                return error.GoalSuccessorHasCounterexampleDebt;
+            }
+        }
+        state.construction = null;
+        state.subject_digest = null;
+        state.classes = .empty;
+        state.counterexample_sets = .empty;
+    } else if (view.predecessors.items.len != 0) return error.InvalidInitialGoal;
+    state.goal = view;
+}
+
+fn applyConstructionRegistration(state: *State, event: ParsedEvent) !void {
+    if (state.goal == null or state.pending != null) return error.InvalidConstructionTransition;
+    const view = try verifiedArtifactView(state, event.body, .construction);
+    if (event.construction_ref == null or
+        !std.mem.eql(u8, event.construction_ref.?, view.artifact_id))
+    {
+        return error.ConstructionRefMismatch;
+    }
+    try validateConstructionAgainstState(state, view, event.subject_digest);
+    state.construction = view;
+    state.subject_digest = event.subject_digest;
+}
+
+fn validateConstructionAgainstState(
+    state: *State,
+    view: ArtifactView,
+    event_subject: ?[]const u8,
+) !void {
+    const goal = state.goal.?;
+    const payload = try asObject(view.payload);
+    if (!std.mem.eql(u8, try stringField(payload, "goal_contract_ref"), goal.artifact_id)) {
+        return error.GoalContractRefMismatch;
+    }
+    const subject = try asObject(try field(payload, "subject"));
+    if (!std.mem.eql(
+        u8,
+        try stringField(subject, "repository"),
+        try goalRepository(goal.payload),
+    )) return error.RepositoryMismatch;
+    const base_digest = try stringField(subject, "base_artifact_digest");
+    if (event_subject == null or !std.mem.eql(u8, event_subject.?, base_digest)) {
+        return error.SubjectDigestMismatch;
+    }
+    if (state.construction != null and
+        (state.subject_digest == null or
+            !std.mem.eql(u8, base_digest, state.subject_digest.?)))
+    {
+        return error.StaleConstructionSubject;
+    }
+    try validateConstructionModeAndLineage(state, view, payload);
+    try validateConstructionOwners(payload);
+    try validateConstructionScope(goal.payload, payload);
+    try validateConstructionLaws(goal.payload, payload);
+    try validateConstructionAcceptance(goal.payload, payload);
+    try validateConstructionCounterexamples(state, payload);
+}
+
+fn validateConstructionModeAndLineage(
+    state: *State,
+    view: ArtifactView,
+    payload: std.json.ObjectMap,
+) !void {
+    const mode = try stringField(payload, "mode");
+    if (state.construction == null) {
+        if (!std.mem.eql(u8, mode, "initial") or view.predecessors.items.len != 0) {
+            return error.InvalidInitialConstruction;
+        }
+        if ((try asArray(try field(payload, "falsified_predecessor_claims"))).items.len != 0 or
+            (try asArray(try field(payload, "preserved_predecessor_claims"))).items.len != 0)
+        {
+            return error.InitialConstructionClaimsPredecessor;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, mode, "initial") or view.predecessors.items.len != 1 or
+        !std.mem.eql(
+            u8,
+            view.predecessors.items[0].string,
+            state.construction.?.artifact_id,
+        )) return error.InvalidConstructionLineage;
+    if ((try asArray(try field(payload, "falsified_predecessor_claims"))).items.len == 0) {
+        return error.MissingFalsifiedClaim;
+    }
+    if (std.mem.eql(u8, mode, "realization-repair") or
+        std.mem.eql(u8, mode, "ablation-repair"))
+    {
+        const predecessor = try asObject(state.construction.?.payload);
+        if (!try canonicalValuesEqual(
+            state.allocator,
+            try field(predecessor, "boundary"),
+            try field(payload, "boundary"),
+        ) or !try canonicalValuesEqual(
+            state.allocator,
+            try field(predecessor, "architecture"),
+            try field(payload, "architecture"),
+        )) return error.RepairArchitectureChanged;
+    }
+}
+
+fn canonicalValuesEqual(
+    allocator: std.mem.Allocator,
+    left: std.json.Value,
+    right: std.json.Value,
+) !bool {
+    const left_bytes = try canonicalValueAlloc(allocator, left);
+    defer allocator.free(left_bytes);
+    const right_bytes = try canonicalValueAlloc(allocator, right);
+    defer allocator.free(right_bytes);
+    return std.mem.eql(u8, left_bytes, right_bytes);
+}
+
+fn validateConstructionOwners(payload: std.json.ObjectMap) !void {
+    const architecture = try asObject(try field(payload, "architecture"));
+    const execution = try asObject(try field(payload, "execution"));
+    if (!std.mem.eql(
+        u8,
+        try stringField(architecture, "canonical_owner"),
+        try stringField(execution, "owner_boundary"),
+    )) return error.OwnerBoundaryMismatch;
+}
+
+fn validateConstructionScope(
+    goal_value: std.json.Value,
+    construction: std.json.ObjectMap,
+) !void {
+    const goal = try asObject(goal_value);
+    const goal_scope = try asObject(try field(goal, "scope"));
+    const execution = try asObject(try field(construction, "execution"));
+    const goal_allowed = try asArray(try field(goal_scope, "allowed_paths"));
+    const prohibited = try asArray(try field(goal_scope, "prohibited_paths"));
+    const construction_paths = try asArray(try field(execution, "allowed_paths"));
+    for (construction_paths.items) |item| {
+        if (!pathCovered(item.string, goal_allowed) or
+            pathOverlapsAny(item.string, prohibited))
+        {
+            return error.ConstructionScopeEscape;
+        }
+    }
+}
+
+fn pathCovered(path: []const u8, scopes: std.json.Array) bool {
+    for (scopes.items) |item| {
+        if (pathWithinScope(path, item.string)) return true;
+    }
+    return false;
+}
+
+fn pathOverlapsAny(path: []const u8, scopes: std.json.Array) bool {
+    for (scopes.items) |item| {
+        if (pathWithinScope(path, item.string) or
+            pathWithinScope(item.string, path)) return true;
+    }
+    return false;
+}
+
+fn pathWithinScope(path: []const u8, scope: []const u8) bool {
+    return std.mem.eql(u8, scope, ".") or std.mem.eql(u8, scope, path) or
+        (path.len > scope.len and path[scope.len] == '/' and
+            std.mem.eql(u8, path[0..scope.len], scope));
+}
+
+fn validateConstructionLaws(
+    goal_value: std.json.Value,
+    construction: std.json.ObjectMap,
+) !void {
+    const goal = try asObject(goal_value);
+    const laws = try asArray(try field(goal, "laws"));
+    const architecture = try asObject(try field(construction, "architecture"));
+    const governing = try asArray(try field(architecture, "governing_law_refs"));
+    const obligations = try asArray(try field(construction, "proof_obligations"));
+    for (governing.items) |item| if (!goalHasLaw(laws, item.string)) {
+        return error.UnknownGoverningLaw;
+    };
+    for (obligations.items) |item| {
+        const obligation = try asObject(item);
+        if (!goalHasLaw(laws, try stringField(obligation, "law_ref"))) {
+            return error.UnknownProofLaw;
+        }
+    }
+    for (laws.items) |item| {
+        const law_id = try stringField(try asObject(item), "law_id");
+        if (!hasString(governing, law_id) or !obligationCoversLaw(obligations, law_id)) {
+            return error.UncoveredGoalLaw;
+        }
+    }
+}
+
+fn validateConstructionAcceptance(
+    goal_value: std.json.Value,
+    construction: std.json.ObjectMap,
+) !void {
+    const goal = try asObject(goal_value);
+    const acceptance = try asObject(try field(goal, "acceptance"));
+    const required = try asArray(try field(acceptance, "required_proof_kinds"));
+    const obligations = try asArray(try field(construction, "proof_obligations"));
+    const execution = try asObject(try field(construction, "execution"));
+    if (!std.mem.eql(
+        u8,
+        try stringField(acceptance, "terminal_route"),
+        try stringField(execution, "completion"),
+    )) return error.TerminalRouteMismatch;
+    for (required.items) |item| {
+        if (!obligationHasKind(obligations, item.string)) {
+            return error.RequiredProofKindOmitted;
+        }
+    }
+}
+
+fn obligationHasKind(obligations: std.json.Array, proof_kind: []const u8) bool {
+    for (obligations.items) |item| {
+        const obligation = asObject(item) catch return false;
+        const kind = stringField(obligation, "proof_kind") catch return false;
+        if (std.mem.eql(u8, kind, proof_kind)) return true;
+    }
+    return false;
+}
+
+fn obligationCoversLaw(obligations: std.json.Array, law_id: []const u8) bool {
+    for (obligations.items) |item| {
+        const obligation = asObject(item) catch return false;
+        const ref = stringField(obligation, "law_ref") catch return false;
+        if (std.mem.eql(u8, ref, law_id)) return true;
+    }
+    return false;
+}
+
+fn goalHasLaw(laws: std.json.Array, law_id: []const u8) bool {
+    for (laws.items) |item| {
+        const law = asObject(item) catch return false;
+        const id = stringField(law, "law_id") catch return false;
+        if (std.mem.eql(u8, id, law_id)) return true;
+    }
+    return false;
+}
+
+fn validateConstructionCounterexamples(
+    state: *State,
+    construction: std.json.ObjectMap,
+) !void {
+    const refs = try asArray(try field(construction, "counterexample_class_refs"));
+    const architecture = try asObject(try field(construction, "architecture"));
+    const governing = try asArray(try field(architecture, "governing_law_refs"));
+    const obligations = try asArray(try field(construction, "proof_obligations"));
+    for (refs.items) |item| if (findClass(state, item.string) == null) {
+        return error.UnknownCounterexampleClass;
+    };
+    for (state.classes.items) |class| {
+        if (class.status != .accepted) continue;
+        if (!hasString(refs, class.class_id)) return error.AcceptedCounterexampleOmitted;
+        if (!hasString(governing, class.law_ref) or
+            !obligationCoversLaw(obligations, class.law_ref))
+        {
+            return error.AcceptedCounterexampleLawUncovered;
+        }
+        if ((class.severity == .critical or class.severity == .high) and
+            !obligationProvidesStrongLocalProof(obligations, class.law_ref))
+        {
+            return error.HighSeverityCounterexampleRequiresStrongProof;
+        }
+    }
+}
+
+fn obligationProvidesStrongLocalProof(
+    obligations: std.json.Array,
+    law_ref: []const u8,
+) bool {
+    for (obligations.items) |item| {
+        const obligation = asObject(item) catch return false;
+        const obligation_law = stringField(obligation, "law_ref") catch return false;
+        if (!std.mem.eql(u8, obligation_law, law_ref)) continue;
+        const mode = stringField(obligation, "proof_mode") catch return false;
+        if (std.mem.eql(u8, mode, "example-regression")) continue;
+        const kind = stringField(obligation, "proof_kind") catch return false;
+        if (std.mem.eql(u8, kind, "implementation") or
+            std.mem.eql(u8, kind, "acceptance")) return true;
+    }
+    return false;
+}
+
+fn findClass(state: *State, class_id: []const u8) ?*ClassRecord {
+    for (state.classes.items) |*class| {
+        if (std.mem.eql(u8, class.class_id, class_id)) return class;
+    }
+    return null;
+}
+
+fn applyCounterexampleRegistration(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    if (state.pending != null) return error.OperationAlreadyPending;
+    const view = try verifiedArtifactView(state, event.body, .counterexample);
+    if (stringListContains(state.counterexample_sets.items, view.artifact_id)) {
+        return error.DuplicateCounterexampleSet;
+    }
+    const payload = try asObject(view.payload);
+    try validateCounterexampleSubject(state, payload);
+    for (view.predecessors.items) |item| {
+        if (!stringListContains(state.counterexample_sets.items, item.string)) {
+            return error.UnknownCounterexampleSetPredecessor;
+        }
+    }
+    const classes = try asArray(try field(payload, "classes"));
+    for (classes.items) |item| try admitClass(state, view, try asObject(item));
+    try state.counterexample_sets.append(state.allocator, view.artifact_id);
+}
+
+fn validateCounterexampleSubject(state: *State, payload: std.json.ObjectMap) !void {
+    const subject = try asObject(try field(payload, "subject"));
+    if (!std.mem.eql(
+        u8,
+        try stringField(subject, "repository"),
+        try goalRepository(state.goal.?.payload),
+    )) return error.RepositoryMismatch;
+    if (!std.mem.eql(
+        u8,
+        try stringField(subject, "construction_ref"),
+        state.construction.?.artifact_id,
+    )) return error.ConstructionRefMismatch;
+    if (!std.mem.eql(
+        u8,
+        try stringField(subject, "artifact_digest"),
+        state.subject_digest.?,
+    )) return error.SubjectDigestMismatch;
+    try requireDigest(try stringField(subject, "review_contract_digest"));
+}
+
+fn goalRepository(goal_value: std.json.Value) ![]const u8 {
+    const goal = try asObject(goal_value);
+    const scope = try asObject(try field(goal, "scope"));
+    return stringField(scope, "repository");
+}
+
+fn admitClass(
+    state: *State,
+    set: ArtifactView,
+    class: std.json.ObjectMap,
+) !void {
+    const id = try stringField(class, "class_id");
+    const boundary = try stringField(class, "boundary_key");
+    const law = try stringField(class, "law_ref");
+    const owner = try stringField(class, "owner_boundary");
+    const severity = try parseClassSeverity(try stringField(class, "severity"));
+    const status = try parseClassStatus(try stringField(class, "status"));
+    if (status == .accepted) {
+        const goal = try asObject(state.goal.?.payload);
+        const laws = try asArray(try field(goal, "laws"));
+        if (!goalHasLaw(laws, law)) return error.UnknownCounterexampleLaw;
+    }
+    if (findClass(state, id)) |existing| {
+        if (std.mem.eql(u8, existing.set_ref, set.artifact_id)) {
+            return error.DuplicateCounterexampleClass;
+        }
+        if (!std.mem.eql(u8, existing.boundary_key, boundary) or
+            !std.mem.eql(u8, existing.law_ref, law) or
+            !std.mem.eql(u8, existing.owner_boundary, owner))
+        {
+            return error.CounterexampleIdentityDrift;
+        }
+        if (!hasString(set.predecessors, existing.set_ref)) {
+            return error.MissingCounterexampleSetPredecessor;
+        }
+        existing.severity = severity;
+        existing.status = status;
+        existing.set_ref = set.artifact_id;
+        existing.construction_ref = state.construction.?.artifact_id;
+        existing.subject_digest = state.subject_digest.?;
+        return;
+    }
+    try state.classes.append(state.allocator, .{
+        .class_id = id,
+        .boundary_key = boundary,
+        .law_ref = law,
+        .owner_boundary = owner,
+        .severity = severity,
+        .status = status,
+        .set_ref = set.artifact_id,
+        .construction_ref = state.construction.?.artifact_id,
+        .subject_digest = state.subject_digest.?,
+    });
+}
+
+fn requireCurrentTuple(state: *State, event: ParsedEvent) !void {
+    if (state.construction == null or state.subject_digest == null) {
+        return error.MissingCurrentConstruction;
+    }
+    if (event.construction_ref == null or
+        !std.mem.eql(u8, event.construction_ref.?, state.construction.?.artifact_id))
+    {
+        return error.ConstructionRefMismatch;
+    }
+    if (event.subject_digest == null or
+        !std.mem.eql(u8, event.subject_digest.?, state.subject_digest.?))
+    {
+        return error.SubjectDigestMismatch;
+    }
+}
+
+fn applyOperationPrepared(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    if (state.pending != null) return error.OperationAlreadyPending;
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "capability_digest",     "effect", "idempotency_key", "owner_boundary", "paths",
+        "proof_obligation_refs", "schema", "step_id",
+    });
+    try requireBodySchema(body, .operation_prepared);
+    const step_id = try stringField(body, "step_id");
+    const key = try stringField(body, "idempotency_key");
+    const effect = try parseEffect(try stringField(body, "effect"));
+    try requireNonBlank(step_id);
+    try requireNonBlank(key);
+    if (stringListContains(state.used_steps.items, step_id)) return error.DuplicateStepId;
+    if (stringListContains(state.used_keys.items, key)) return error.DuplicateIdempotencyKey;
+    const paths = try validateStringArray(try field(body, "paths"), effect == .edit);
+    try validatePathArray(paths);
+    try validateExecutablePathArray(paths);
+    const proof_refs = try validateStringArray(
+        try field(body, "proof_obligation_refs"),
+        true,
+    );
+    try validateOperationAgainstConstruction(state, body, effect, paths, proof_refs);
+    const capability_digest = try stringField(body, "capability_digest");
+    try requireDigest(capability_digest);
+    try state.used_steps.append(state.allocator, step_id);
+    try state.used_keys.append(state.allocator, key);
+    state.pending = .{
+        .step_id = step_id,
+        .idempotency_key = key,
+        .effect = effect,
+        .capability_digest = capability_digest,
+        .consumed = false,
+        .paths = paths,
+        .proof_refs = proof_refs,
+    };
+}
+
+fn requireBodySchema(body: std.json.ObjectMap, kind: EventKind) !void {
+    const expected = specForKind(kind).body_schema orelse return error.MissingBodySchema;
+    if (!std.mem.eql(u8, try stringField(body, "schema"), expected)) {
+        return error.InvalidBodySchema;
+    }
+}
+
+fn stringListContains(items: []const []const u8, needle: []const u8) bool {
+    for (items) |item| if (std.mem.eql(u8, item, needle)) return true;
+    return false;
+}
+
+fn validateOperationAgainstConstruction(
+    state: *State,
+    body: std.json.ObjectMap,
+    effect: Effect,
+    paths: std.json.Array,
+    proof_refs: std.json.Array,
+) !void {
+    const construction = try asObject(state.construction.?.payload);
+    const execution = try asObject(try field(construction, "execution"));
+    const owner = try stringField(execution, "owner_boundary");
+    if (!std.mem.eql(u8, owner, try stringField(body, "owner_boundary"))) {
+        return error.OwnerBoundaryMismatch;
+    }
+    const allowed_effects = try asArray(try field(execution, "operation_effects"));
+    if (!hasString(allowed_effects, @tagName(effect))) return error.EffectNotAllowed;
+    const allowed_paths = try asArray(try field(execution, "allowed_paths"));
+    for (paths.items) |item| if (!pathCovered(item.string, allowed_paths)) {
+        return error.OperationScopeEscape;
+    };
+    const goal = try asObject(state.goal.?.payload);
+    const goal_scope = try asObject(try field(goal, "scope"));
+    const prohibited = try asArray(try field(goal_scope, "prohibited_paths"));
+    for (paths.items) |item| if (pathOverlapsAny(item.string, prohibited)) {
+        return error.OperationScopeEscape;
+    };
+    try validateOperationProofRefs(construction, proof_refs);
+    if (effect == .edit) try validateEditAuthorityAndDebt(state);
+}
+
+fn validateOperationProofRefs(
+    construction: std.json.ObjectMap,
+    proof_refs: std.json.Array,
+) !void {
+    if (proof_refs.items.len != 1) return error.InvalidProofRoleCount;
+    try validateExecutableProofRef(construction, proof_refs.items[0].string);
+}
+
+fn validateExecutableProofRef(
+    construction: std.json.ObjectMap,
+    proof_ref: []const u8,
+) !void {
+    const obligations = try asArray(try field(construction, "proof_obligations"));
+    const falsifier_suffix = "#falsifier";
+    const is_falsifier = std.mem.endsWith(u8, proof_ref, falsifier_suffix);
+    const obligation_ref = if (is_falsifier)
+        proof_ref[0 .. proof_ref.len - falsifier_suffix.len]
+    else
+        proof_ref;
+    for (obligations.items) |item| {
+        const obligation = try asObject(item);
+        const id = try stringField(obligation, "obligation_id");
+        if (!std.mem.eql(u8, obligation_ref, id)) continue;
+        const proof_kind = try stringField(obligation, "proof_kind");
+        if (!std.mem.eql(u8, proof_kind, "implementation") and
+            !std.mem.eql(u8, proof_kind, "acceptance"))
+        {
+            return error.NonLocalProofObligation;
+        }
+        return;
+    }
+    if (is_falsifier) return error.UnknownProofObligation;
+    const retirements = try asArray(try field(construction, "retirements"));
+    for (retirements.items) |item| {
+        const retirement = try asObject(item);
+        const id = try stringField(retirement, "retirement_id");
+        if (std.mem.eql(u8, proof_ref, id)) return;
+    }
+    return error.UnknownProofObligation;
+}
+
+fn validateEditAuthorityAndDebt(state: *State) !void {
+    const goal = try asObject(state.goal.?.payload);
+    const authority = try asObject(try field(goal, "authority"));
+    if (!try boolField(authority, "mutation_allowed")) return error.MutationNotAuthorized;
+    const construction = try asObject(state.construction.?.payload);
+    const refs = try asArray(try field(construction, "counterexample_class_refs"));
+    for (state.classes.items) |class| {
+        if (class.status == .blocked) return error.UnresolvedCounterexample;
+        if (class.status == .accepted and !hasString(refs, class.class_id)) {
+            return error.AcceptedCounterexampleDebt;
+        }
+    }
+}
+
+fn applyEffectRecorded(state: *State, event: ParsedEvent) !void {
+    try requireCurrentConstruction(state, event);
+    const pending = state.pending orelse return error.NoPendingOperation;
+    if (pending.effect != .edit or pending.consumed) return error.InvalidEffectTransition;
+    const next_subject = event.subject_digest orelse return error.MissingSubjectDigest;
+    try requireDigest(next_subject);
+    if (std.mem.eql(u8, next_subject, state.subject_digest.?)) return error.SubjectDidNotChange;
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "capability_digest", "changed_paths", "pre_effect_subject_digest", "schema", "step_id",
+    });
+    try requireBodySchema(body, .effect_recorded);
+    try matchPendingIdentity(pending, body);
+    const pre_effect_subject = try stringField(body, "pre_effect_subject_digest");
+    try requireDigest(pre_effect_subject);
+    if (!std.mem.eql(u8, pre_effect_subject, state.subject_digest.?)) {
+        return error.SubjectDigestMismatch;
+    }
+    const changed = try validateStringArray(try field(body, "changed_paths"), true);
+    try validatePathArray(changed);
+    try validateExecutablePathArray(changed);
+    if (!sameStringSet(changed, pending.paths)) return error.ChangedPathsMismatch;
+    state.pending.?.consumed = true;
+    state.subject_digest = next_subject;
+}
+
+fn requireCurrentConstruction(state: *State, event: ParsedEvent) !void {
+    if (state.construction == null or event.construction_ref == null or
+        !std.mem.eql(u8, event.construction_ref.?, state.construction.?.artifact_id))
+    {
+        return error.ConstructionRefMismatch;
+    }
+}
+
+fn matchPendingIdentity(pending: Pending, body: std.json.ObjectMap) !void {
+    if (!std.mem.eql(u8, try stringField(body, "step_id"), pending.step_id) or
+        !std.mem.eql(
+            u8,
+            try stringField(body, "capability_digest"),
+            pending.capability_digest,
+        )) return error.PendingOperationMismatch;
+}
+
+fn sameStringSet(left: std.json.Array, right: std.json.Array) bool {
+    if (left.items.len != right.items.len) return false;
+    for (left.items) |item| if (!hasString(right, item.string)) return false;
+    return true;
+}
+
+fn applyOperationObserved(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const pending = state.pending orelse return error.NoPendingOperation;
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "capability_digest", "discharged_refs", "evidence_refs", "schema", "status", "step_id",
+    });
+    try requireBodySchema(body, .operation_observed);
+    try matchPendingIdentity(pending, body);
+    if (pending.effect == .edit and !pending.consumed) return error.EffectNotRecorded;
+    if (pending.effect != .edit and pending.consumed) return error.CapabilityAlreadyConsumed;
+    try requireNonBlank(try stringField(body, "status"));
+    const discharged = try validateStringArray(try field(body, "discharged_refs"), false);
+    for (discharged.items) |item| if (!hasString(pending.proof_refs, item.string)) {
+        return error.UnknownProofDischarge;
+    };
+    const evidence_refs = try validateDigestArray(try field(body, "evidence_refs"));
+    if (evidence_refs.items.len == 0) return error.EmptyEvidenceRefs;
+    state.pending = null;
+}
+
+fn applyOperationAborted(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const pending = state.pending orelse return error.NoPendingOperation;
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{ "capability_digest", "reason", "schema", "step_id" });
+    try requireBodySchema(body, .operation_aborted);
+    try matchPendingIdentity(pending, body);
+    try requireNonBlank(try stringField(body, "reason"));
+    state.pending = null;
+}
+
+fn applyPublicationObserved(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{ "receipt_ref", "schema", "status" });
+    try requireBodySchema(body, .publication_observed);
+    try requireDigest(try stringField(body, "receipt_ref"));
+    try requireNonBlank(try stringField(body, "status"));
+}
+
+fn applyReviewCampaignStarted(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{ "campaign_id", "review_contract_digest", "schema" });
+    try requireBodySchema(body, .review_campaign_started);
+    const contract_digest = try stringField(body, "review_contract_digest");
+    try requireDigest(contract_digest);
+    const campaign_id = try stringField(body, "campaign_id");
+    const expected_campaign = try campaignDigestAlloc(
+        state.allocator,
+        state,
+        contract_digest,
+    );
+    if (!std.mem.eql(u8, campaign_id, expected_campaign)) {
+        return error.ReviewCampaignMismatch;
+    }
+}
+
+fn campaignDigestAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+    review_digest: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("actuating-review-campaign/v1\x00");
+    try out.writer.writeAll(state.goal_id);
+    try out.writer.writeByte(0);
+    try out.writer.writeAll(state.construction.?.artifact_id);
+    try out.writer.writeByte(0);
+    try out.writer.writeAll(state.subject_digest.?);
+    try out.writer.writeByte(0);
+    try out.writer.writeAll(review_digest);
+    return digestTextAlloc(allocator, out.written());
+}
+
+fn applyReviewRequestBound(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "campaign_id",          "initial_wave", "instruction_digest", "lens",
+        "lens_contract_digest", "request_id",   "schema",
+    });
+    try requireBodySchema(body, .review_request_bound);
+    try requireDigest(try stringField(body, "campaign_id"));
+    try requireNonBlank(try stringField(body, "request_id"));
+    try requireDigest(try stringField(body, "instruction_digest"));
+    try requireDigest(try stringField(body, "lens_contract_digest"));
+    try requireNonBlank(try stringField(body, "lens"));
+    _ = try boolField(body, "initial_wave");
+}
+
+fn applyReviewAttemptStarted(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "attempt_id", "fresh_attempt", "receipt_ref", "request_id", "schema",
+    });
+    try requireBodySchema(body, .review_attempt_started);
+    try requireNonBlank(try stringField(body, "request_id"));
+    try requireNonBlank(try stringField(body, "attempt_id"));
+    _ = try boolField(body, "fresh_attempt");
+    try requireDigest(try stringField(body, "receipt_ref"));
+}
+
+fn applyReviewAttemptCompleted(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "attempt_id",  "context_match", "fallback", "finding_refs", "principal",
+        "receipt_ref", "request_id",    "schema",   "verdict",
+    });
+    try requireBodySchema(body, .review_attempt_completed);
+    try requireNonBlank(try stringField(body, "request_id"));
+    try requireNonBlank(try stringField(body, "attempt_id"));
+    try requireNonBlank(try stringField(body, "principal"));
+    try requireNonBlank(try stringField(body, "verdict"));
+    _ = try boolField(body, "context_match");
+    _ = try boolField(body, "fallback");
+    _ = try validateDigestArray(try field(body, "finding_refs"));
+    try requireDigest(try stringField(body, "receipt_ref"));
+}
+
+fn applyReviewTransportFailed(state: *State, event: ParsedEvent) !void {
+    try requireCurrentTuple(state, event);
+    const body = try asObject(event.body);
+    try requireExactKeys(body, &.{
+        "attempt_id", "failure_ref", "receipt_ref", "request_id", "schema",
+    });
+    try requireBodySchema(body, .review_transport_failed);
+    try requireNonBlank(try stringField(body, "request_id"));
+    try requireNonBlank(try stringField(body, "attempt_id"));
+    try requireDigest(try stringField(body, "failure_ref"));
+    try requireDigest(try stringField(body, "receipt_ref"));
+}
+
+fn appendInput(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    input: []const u8,
+    raw_capability: ?[]const u8,
+) !AppendResult {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+    defer parsed.deinit();
+    const object = try asObject(parsed.value);
+    if (object.contains("artifact")) {
+        if (raw_capability != null) return error.UnexpectedCapability;
+        return appendArtifact(allocator, store, goal_id, input);
+    }
+    return appendObservation(allocator, store, goal_id, parsed.value, raw_capability);
+}
+
+fn appendArtifact(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    input: []const u8,
+) !AppendResult {
+    var materialized = try materializeArtifact(allocator, goal_id, input);
+    defer materialized.deinit(allocator);
+    var exclusive = try store.acquireExclusive(allocator);
+    defer exclusive.release();
+    var replay = try replayExclusive(allocator, &exclusive, goal_id);
+    defer replay.deinit();
+    const tuple = try artifactEventTuple(&replay.state, materialized);
+    const event_digest = try appendCanonicalEvent(
+        allocator,
+        &exclusive,
+        &replay,
+        try registrationKind(materialized.family),
+        tuple.construction_ref,
+        tuple.subject_digest,
+        materialized.bytes,
+    );
+    return .{
+        .event_digest = event_digest,
+        .artifact_id = try allocator.dupe(u8, materialized.artifact_id),
+        .artifact_bytes = try allocator.dupe(u8, materialized.bytes),
+    };
+}
+
+const EventTuple = struct {
+    construction_ref: ?[]const u8,
+    subject_digest: ?[]const u8,
+};
+
+fn artifactEventTuple(state: *State, materialized: Materialized) !EventTuple {
+    if (materialized.family == .goal) return .{
+        .construction_ref = null,
+        .subject_digest = null,
+    };
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        state.allocator,
+        materialized.bytes,
+        .{},
+    );
+    const view = try inspectArtifact(parsed.value, state.goal_id, false);
+    if (materialized.family == .construction) {
+        const payload = try asObject(view.payload);
+        const subject = try asObject(try field(payload, "subject"));
+        return .{
+            .construction_ref = view.artifact_id,
+            .subject_digest = try stringField(subject, "base_artifact_digest"),
+        };
+    }
+    if (state.construction == null or state.subject_digest == null) {
+        return error.MissingCurrentConstruction;
+    }
+    return .{
+        .construction_ref = state.construction.?.artifact_id,
+        .subject_digest = state.subject_digest,
+    };
+}
+
+fn appendObservation(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    input: std.json.Value,
+    raw_capability: ?[]const u8,
+) !AppendResult {
+    const object = try asObject(input);
+    try requireExactKeys(object, &.{
+        "body", "construction_ref", "goal_id", "kind", "schema", "subject_digest",
+    });
+    if (!std.mem.eql(u8, try stringField(object, "schema"), InputSchema)) {
+        return error.InvalidInputSchema;
+    }
+    if (!std.mem.eql(u8, try stringField(object, "goal_id"), goal_id)) {
+        return error.GoalIdMismatch;
+    }
+    const kind = kindFromWire(try stringField(object, "kind")) orelse
+        return error.InvalidEventKind;
+    if (specForKind(kind).origin != .owner) return error.EventKindNotOwnerAppendable;
+    var exclusive = try store.acquireExclusive(allocator);
+    defer exclusive.release();
+    var replay = try replayExclusive(allocator, &exclusive, goal_id);
+    defer replay.deinit();
+    const body = try ownerBodyAlloc(
+        allocator,
+        &replay.state,
+        kind,
+        try field(object, "body"),
+        raw_capability,
+    );
+    defer allocator.free(body);
+    const event_digest = try appendCanonicalEvent(
+        allocator,
+        &exclusive,
+        &replay,
+        kind,
+        try optionalStringField(object, "construction_ref"),
+        try optionalStringField(object, "subject_digest"),
+        body,
+    );
+    return .{ .event_digest = event_digest };
+}
+
+fn ownerBodyAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+    kind: EventKind,
+    body_value: std.json.Value,
+    raw_capability: ?[]const u8,
+) ![]u8 {
+    return switch (kind) {
+        .effect_recorded => capabilityBodyAlloc(
+            allocator,
+            state,
+            kind,
+            body_value,
+            raw_capability,
+        ),
+        .operation_observed, .operation_aborted => capabilityBodyAlloc(
+            allocator,
+            state,
+            kind,
+            body_value,
+            raw_capability,
+        ),
+        else => blk: {
+            if (raw_capability != null) return error.UnexpectedCapability;
+            break :blk canonicalValueAlloc(allocator, body_value);
+        },
+    };
+}
+
+fn capabilityBodyAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+    kind: EventKind,
+    body_value: std.json.Value,
+    raw_capability: ?[]const u8,
+) ![]u8 {
+    const pending = state.pending orelse return error.NoPendingOperation;
+    const body = try asObject(body_value);
+    try validateTransientCapabilityBody(kind, body);
+    try validateCapabilityUse(allocator, pending, kind, raw_capability);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeCapabilityBody(&out.writer, pending.capability_digest, kind, body);
+    return canonical_json.canonicalizeAlloc(allocator, out.written());
+}
+
+fn validateTransientCapabilityBody(kind: EventKind, body: std.json.ObjectMap) !void {
+    const keys: []const []const u8 = switch (kind) {
+        .effect_recorded => &.{
+            "changed_paths", "pre_effect_subject_digest", "schema", "step_id",
+        },
+        .operation_observed => &.{
+            "discharged_refs", "evidence_refs", "schema", "status", "step_id",
+        },
+        .operation_aborted => &.{ "reason", "schema", "step_id" },
+        else => return error.InvalidCapabilityEvent,
+    };
+    try requireExactKeys(body, keys);
+    try requireBodySchema(body, kind);
+}
+
+fn validateCapabilityUse(
+    allocator: std.mem.Allocator,
+    pending: Pending,
+    kind: EventKind,
+    raw_capability: ?[]const u8,
+) !void {
+    const consumes = kind == .effect_recorded or
+        (kind == .operation_observed and !pending.consumed);
+    if (consumes and raw_capability == null) return error.MissingCapability;
+    if (!consumes and raw_capability != null) return error.UnexpectedCapability;
+    if (raw_capability) |raw| {
+        const actual = try digestTextAlloc(allocator, raw);
+        defer allocator.free(actual);
+        const actual_bytes = try digestBytes(actual);
+        const expected_bytes = try digestBytes(pending.capability_digest);
+        if (!std.crypto.timing_safe.eql([32]u8, actual_bytes, expected_bytes)) {
+            return error.CapabilityMismatch;
+        }
+    }
+}
+
+fn digestBytes(digest: []const u8) ![32]u8 {
+    var bytes: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&bytes, digest[7..]);
+    return bytes;
+}
+
+fn writeCapabilityBody(
+    writer: *std.Io.Writer,
+    capability_digest: []const u8,
+    kind: EventKind,
+    body: std.json.ObjectMap,
+) !void {
+    try writer.writeAll("{\"capability_digest\":");
+    try writeJsonString(writer, capability_digest);
+    switch (kind) {
+        .effect_recorded => try writeEffectBodyTail(writer, body),
+        .operation_observed => try writeObservationBodyTail(writer, body),
+        .operation_aborted => try writeAbortBodyTail(writer, body),
+        else => unreachable,
+    }
+}
+
+fn writeEffectBodyTail(writer: *std.Io.Writer, body: std.json.ObjectMap) !void {
+    try writer.writeAll(",\"changed_paths\":");
+    try std.json.Stringify.value(try field(body, "changed_paths"), .{}, writer);
+    try writer.writeAll(",\"pre_effect_subject_digest\":");
+    try writeJsonString(writer, try stringField(body, "pre_effect_subject_digest"));
+    try writer.writeAll(",\"schema\":\"effect-recorded/v1\",\"step_id\":");
+    try writeJsonString(writer, try stringField(body, "step_id"));
+    try writer.writeByte('}');
+}
+
+fn writeObservationBodyTail(writer: *std.Io.Writer, body: std.json.ObjectMap) !void {
+    try writer.writeAll(",\"discharged_refs\":");
+    try std.json.Stringify.value(try field(body, "discharged_refs"), .{}, writer);
+    try writer.writeAll(",\"evidence_refs\":");
+    try std.json.Stringify.value(try field(body, "evidence_refs"), .{}, writer);
+    try writer.writeAll(",\"schema\":\"operation-observed/v1\",\"status\":");
+    try writeJsonString(writer, try stringField(body, "status"));
+    try writer.writeAll(",\"step_id\":");
+    try writeJsonString(writer, try stringField(body, "step_id"));
+    try writer.writeByte('}');
+}
+
+fn writeAbortBodyTail(writer: *std.Io.Writer, body: std.json.ObjectMap) !void {
+    try writer.writeAll(",\"reason\":");
+    try writeJsonString(writer, try stringField(body, "reason"));
+    try writer.writeAll(",\"schema\":\"operation-aborted/v1\",\"step_id\":");
+    try writeJsonString(writer, try stringField(body, "step_id"));
+    try writer.writeByte('}');
+}
+
+fn prepareOperation(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+    input: []const u8,
+) !PrepareResult {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+    defer parsed.deinit();
+    const operation = try asObject(parsed.value);
+    try validateOperationInput(operation, goal_id);
+    var exclusive = try store.acquireExclusive(allocator);
+    defer exclusive.release();
+    var replay = try replayExclusive(allocator, &exclusive, goal_id);
+    defer replay.deinit();
+    const current = replay.state.construction orelse return error.MissingCurrentConstruction;
+    if (replay.state.subject_digest == null) return error.MissingSubjectDigest;
+    if (!std.mem.eql(
+        u8,
+        try stringField(operation, "construction_ref"),
+        current.artifact_id,
+    )) return error.ConstructionRefMismatch;
+    if (!std.mem.eql(
+        u8,
+        try stringField(operation, "expected_subject_digest"),
+        replay.state.subject_digest.?,
+    )) return error.SubjectDigestMismatch;
+    const raw_capability = try randomCapabilityAlloc(allocator);
+    errdefer allocator.free(raw_capability);
+    const capability_digest = try digestTextAlloc(allocator, raw_capability);
+    defer allocator.free(capability_digest);
+    const body = try preparedBodyAlloc(allocator, operation, capability_digest);
+    defer allocator.free(body);
+    const event_digest = try appendCanonicalEvent(
+        allocator,
+        &exclusive,
+        &replay,
+        .operation_prepared,
+        replay.state.construction.?.artifact_id,
+        replay.state.subject_digest,
+        body,
+    );
+    return .{ .event_digest = event_digest, .capability = raw_capability };
+}
+
+fn validateOperationInput(operation: std.json.ObjectMap, goal_id: []const u8) !void {
+    try requireExactKeys(operation, &.{
+        "construction_ref", "effect", "expected_subject_digest", "goal_id", "idempotency_key",
+        "owner_boundary",   "paths",  "proof_obligation_refs",   "schema",  "step_id",
+    });
+    if (!std.mem.eql(u8, try stringField(operation, "schema"), OperationSchema)) {
+        return error.InvalidInputSchema;
+    }
+    if (!std.mem.eql(u8, try stringField(operation, "goal_id"), goal_id)) {
+        return error.GoalIdMismatch;
+    }
+    try requireDigest(try stringField(operation, "construction_ref"));
+    try requireDigest(try stringField(operation, "expected_subject_digest"));
+}
+
+fn preparedBodyAlloc(
+    allocator: std.mem.Allocator,
+    operation: std.json.ObjectMap,
+    capability_digest: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"capability_digest\":");
+    try writeJsonString(&out.writer, capability_digest);
+    for ([_][]const u8{
+        "effect", "idempotency_key", "owner_boundary", "paths", "proof_obligation_refs",
+    }) |name| {
+        try out.writer.writeAll(",");
+        try writeJsonString(&out.writer, name);
+        try out.writer.writeByte(':');
+        try std.json.Stringify.value(try field(operation, name), .{}, &out.writer);
+    }
+    try out.writer.writeAll(",\"schema\":\"operation-prepared/v1\",\"step_id\":");
+    try writeJsonString(&out.writer, try stringField(operation, "step_id"));
+    try out.writer.writeByte('}');
+    return canonical_json.canonicalizeAlloc(allocator, out.written());
+}
+
+fn randomCapabilityAlloc(allocator: std.mem.Allocator) ![]u8 {
+    var random: [32]u8 = undefined;
+    try std.Io.randomSecure(defaultIo(), &random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    return std.fmt.allocPrint(allocator, "AKC2-{s}", .{hex});
+}
+
+fn appendCanonicalEvent(
+    allocator: std.mem.Allocator,
+    exclusive: *const durable_store.EventStoreExclusive,
+    replay: *Replay,
+    kind: EventKind,
+    construction_ref: ?[]const u8,
+    subject_digest: ?[]const u8,
+    body: []const u8,
+) ![]u8 {
+    if (replay.state.event_count >= MaxEvents) return error.TooManyEvents;
+    const event_bytes = try eventBytesAlloc(
+        allocator,
+        replay.state,
+        kind,
+        construction_ref,
+        subject_digest,
+        body,
+    );
+    defer allocator.free(event_bytes);
+    const event = try parseEvent(replay.arena.allocator(), event_bytes);
+    try applyEvent(&replay.state, event);
+    var receipt = try exclusive.append(
+        allocator,
+        event_bytes,
+        .{ .revision = replay.snapshot.revision, .exists = replay.snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
+    return allocator.dupe(u8, event.event_digest);
+}
+
+fn printState(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+) !void {
+    var replay = try replayStore(allocator, store, goal_id);
+    defer replay.deinit();
+    const output = try structuralJsonAlloc(
+        replay.arena.allocator(),
+        &replay.state,
+        "actuating-structural-state/v1",
+    );
+    try writeStdout(output);
+}
+
+fn structuralJsonAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+    schema: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"authority_granted\":false,\"construction_ref\":");
+    try writeOptionalJsonString(
+        &out.writer,
+        if (state.construction) |value| value.artifact_id else null,
+    );
+    try out.writer.print(",\"counterexample_class_count\":{d},\"event_count\":{d}", .{
+        state.classes.items.len, state.event_count,
+    });
+    try out.writer.writeAll(",\"event_kinds\":");
+    try writeEventCounts(&out.writer, state);
+    try out.writer.writeAll(",\"goal_contract_ref\":");
+    try writeOptionalJsonString(
+        &out.writer,
+        if (state.goal) |value| value.artifact_id else null,
+    );
+    try out.writer.writeAll(",\"goal_id\":");
+    try writeJsonString(&out.writer, state.goal_id);
+    try out.writer.writeAll(",\"head_digest\":");
+    try writeJsonString(&out.writer, state.head_digest);
+    try out.writer.writeAll(",\"pending_operation\":");
+    try writePending(&out.writer, state.pending);
+    try out.writer.writeAll(",\"schema\":");
+    try writeJsonString(&out.writer, schema);
+    try out.writer.writeAll(",\"semantic_decision_established\":false,\"subject_digest\":");
+    try writeOptionalJsonString(&out.writer, state.subject_digest);
+    try out.writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn writeEventCounts(writer: *std.Io.Writer, state: *State) !void {
+    try writer.writeByte('{');
+    for (protocol, 0..) |spec, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeJsonString(writer, spec.wire);
+        try writer.print(":{d}", .{state.kind_counts[@intFromEnum(spec.kind)]});
+    }
+    try writer.writeByte('}');
+}
+
+fn writePending(writer: *std.Io.Writer, pending: ?Pending) !void {
+    if (pending == null) return writer.writeAll("null");
+    try writer.writeAll("{\"capability_consumed\":");
+    try writer.writeAll(if (pending.?.consumed) "true" else "false");
+    try writer.writeAll(",\"capability_digest\":");
+    try writeJsonString(writer, pending.?.capability_digest);
+    try writer.writeAll(",\"effect\":");
+    try writeJsonString(writer, @tagName(pending.?.effect));
+    try writer.writeAll(",\"idempotency_key\":");
+    try writeJsonString(writer, pending.?.idempotency_key);
+    try writer.writeAll(",\"paths\":");
+    try std.json.Stringify.value(std.json.Value{ .array = pending.?.paths }, .{}, writer);
+    try writer.writeAll(",\"proof_obligation_refs\":");
+    try std.json.Stringify.value(std.json.Value{ .array = pending.?.proof_refs }, .{}, writer);
+    try writer.writeAll(",\"step_id\":");
+    try writeJsonString(writer, pending.?.step_id);
+    try writer.writeByte('}');
+}
+
+fn printProjection(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+) !void {
+    var replay = try replayStore(allocator, store, goal_id);
+    defer replay.deinit();
+    const output = try projectionJsonAlloc(replay.arena.allocator(), &replay.state);
+    try writeStdout(output);
+}
+
+fn projectionJsonAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+) ![]u8 {
+    const basis = try structuralJsonAlloc(
+        allocator,
+        state,
+        "actuating-structural-evidence-projection/v1",
+    );
+    defer allocator.free(basis);
+    const canonical = try canonical_json.canonicalizeAlloc(allocator, basis);
+    defer allocator.free(canonical);
+    const projection_id = try digestCanonicalAlloc(allocator, canonical);
+    defer allocator.free(projection_id);
+    const marker = ",\"schema\":";
+    const marker_index = std.mem.indexOf(u8, canonical, marker) orelse unreachable;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(canonical[0..marker_index]);
+    try out.writer.writeAll(",\"projection_id\":");
+    try writeJsonString(&out.writer, projection_id);
+    try out.writer.writeAll(canonical[marker_index..]);
+    try out.writer.writeByte('\n');
+    return out.toOwnedSlice();
+}
+
+fn printDoctor(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    goal_id: []const u8,
+) !void {
+    var replay = try replayStore(allocator, store, goal_id);
+    defer replay.deinit();
+    var out: std.Io.Writer.Allocating = .init(replay.arena.allocator());
+    try out.writer.print(
+        "{{\"events\":{d},\"head_digest\":",
+        .{replay.state.event_count},
+    );
+    try writeJsonString(&out.writer, replay.state.head_digest);
+    try out.writer.writeAll(",\"ok\":true,\"schema\":\"actuating-doctor/v1\"}\n");
+    try writeStdout(out.written());
+}
+
+fn printAppendResult(allocator: std.mem.Allocator, result: AppendResult) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"artifact\":");
+    if (result.artifact_bytes) |bytes| {
+        try out.writer.writeAll(bytes);
+    } else try out.writer.writeAll("null");
+    try out.writer.writeAll(",\"artifact_id\":");
+    try writeOptionalJsonString(&out.writer, result.artifact_id);
+    try out.writer.writeAll(",\"event_digest\":");
+    try writeJsonString(&out.writer, result.event_digest);
+    try out.writer.writeAll(",\"schema\":\"actuating-append-result/v1\"}\n");
+    try writeStdout(out.written());
+}
+
+fn printPrepareResult(allocator: std.mem.Allocator, result: PrepareResult) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"capability\":");
+    try writeJsonString(&out.writer, result.capability);
+    try out.writer.writeAll(",\"event_digest\":");
+    try writeJsonString(&out.writer, result.event_digest);
+    try out.writer.writeAll(",\"schema\":\"actuating-prepare-result/v1\"}\n");
+    try writeStdout(out.written());
+}
+
+fn printFailure(allocator: std.mem.Allocator, err: anyerror) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"error\":");
+    try writeJsonString(&out.writer, @errorName(err));
+    try out.writer.writeAll(",\"schema\":\"actuating-error/v1\",\"status\":\"error\"}\n");
+    try writeStdout(out.written());
+}
+
+fn writeStdout(bytes: []const u8) !void {
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     try stdout_writer.interface.writeAll(bytes);
 }
 
-fn dupeStringList(allocator: std.mem.Allocator, values: []const []const u8) ![][]u8 {
-    const out = try allocator.alloc([]u8, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |value| allocator.free(value);
-        allocator.free(out);
+const TestDigest0 =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const TestDigest1 =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const TestDigest2 =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+fn testGoalAlloc(
+    allocator: std.mem.Allocator,
+    artifact_id: []const u8,
+    proof_kinds: []const u8,
+    publication_required: bool,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"artifact":{{"schema":"goal-contract/v3","artifact_id":{s},
+        \\"goal_id":"goal-1","semantic_author":"goal-contract","created_at":"now",
+        \\"predecessor_refs":[],"supporting_refs":["user:turn"],"payload":{{
+        \\"objective":{{"required_outcomes":["law holds"],"non_goals":[]}},
+        \\"authority":{{"source_ref":"user:turn","source_digest":"{s}",
+        \\"execution_authority_ref":"user:turn","execution_authority_digest":"{s}",
+        \\"mutation_allowed":true}},"scope":{{"repository":"repo","base_ref":"main",
+        \\"allowed_paths":["src"],"prohibited_paths":[]}},"compatibility":{{
+        \\"required_contracts":[],"permitted_breaks":[],"migration_requirements":[]}},
+        \\"laws":[{{"law_id":"law-1","statement":"law holds","applicability":"all",
+        \\"required_observation":"property"}}],"acceptance":{{"terminal_route":"complete",
+        \\"publication_required":{s},"required_proof_kinds":{s}}}}}}}}}
+    , .{
+        artifact_id,
+        TestDigest0,
+        TestDigest1,
+        if (publication_required) "true" else "false",
+        proof_kinds,
+    });
+}
+
+fn testConstructionAlloc(
+    allocator: std.mem.Allocator,
+    goal_ref: []const u8,
+    predecessor: ?[]const u8,
+    mode: []const u8,
+    subject: []const u8,
+    counter_refs: []const u8,
+) ![]u8 {
+    const predecessors = if (predecessor) |value|
+        try std.fmt.allocPrint(allocator, "[\"{s}\"]", .{value})
+    else
+        try allocator.dupe(u8, "[]");
+    defer allocator.free(predecessors);
+    const repair_claims = !std.mem.eql(u8, mode, "initial");
+    return std.fmt.allocPrint(allocator,
+        \\{{"artifact":{{"schema":"construction-contract/v1","artifact_id":null,
+        \\"goal_id":"goal-1","semantic_author":"actuating","created_at":"now",
+        \\"predecessor_refs":{s},"supporting_refs":[],"payload":{{
+        \\"goal_contract_ref":"{s}","mode":"{s}","subject":{{"repository":"repo",
+        \\"base_artifact_digest":"{s}"}},"boundary":{{"boundary_key":"boundary",
+        \\"source_worlds":["source"],"target_worlds":["target"],"carriers":["value"],
+        \\"operations":["edit"],"observations":["proof"]}},"architecture":{{
+        \\"governing_law_refs":["law-1"],"canonical_owner":"owner",
+        \\"selected_construction":"typed owner","representation_or_machine":"tagged union",
+        \\"interpreter_or_handler":"owner","residual_assumptions":[]}},
+        \\"falsified_predecessor_claims":{s},"preserved_predecessor_claims":{s},
+        \\"invalid_states_eliminated":["invalid"],"counterexample_class_refs":{s},
+        \\"preserved_observations":["proof-1"],"proof_obligations":[{{
+        \\"obligation_id":"proof-1","law_ref":"law-1","statement":"prove law",
+        \\"proof_mode":"property-law","adequacy_reason":"complete input space",
+        \\"verifier":{{"argv":["verify"]}},"falsifier":{{"argv":["falsify"]}},
+        \\"proof_kind":"implementation"}}],"retirements":[],"execution":{{
+        \\"allowed_paths":["src/file.zig"],"owner_boundary":"owner",
+        \\"operation_effects":["edit","inspect","verify"],"completion":"complete"}}}}}}}}
+    , .{
+        predecessors,
+        goal_ref,
+        mode,
+        subject,
+        if (repair_claims) "[\"claim failed\"]" else "[]",
+        if (repair_claims) "[\"law stays\"]" else "[]",
+        counter_refs,
+    });
+}
+
+fn testCounterexamplesAlloc(
+    allocator: std.mem.Allocator,
+    construction_ref: []const u8,
+    subject: []const u8,
+    review_digest: []const u8,
+    classes: []const u8,
+) ![]u8 {
+    return testCounterexamplesLineageAlloc(
+        allocator,
+        construction_ref,
+        subject,
+        review_digest,
+        classes,
+        "[]",
+    );
+}
+
+fn testCounterexamplesLineageAlloc(
+    allocator: std.mem.Allocator,
+    construction_ref: []const u8,
+    subject: []const u8,
+    review_digest: []const u8,
+    classes: []const u8,
+    predecessors: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"artifact":{{"schema":"counterexample-set/v1","artifact_id":null,
+        \\"goal_id":"goal-1","semantic_author":"review-fold","created_at":"now",
+        \\"predecessor_refs":{s},"supporting_refs":[],"payload":{{"subject":{{
+        \\"construction_ref":"{s}","repository":"repo","artifact_digest":"{s}",
+        \\"review_contract_digest":"{s}"}},"classes":{s}}}}}}}
+    , .{ predecessors, construction_ref, subject, review_digest, classes });
+}
+
+fn testClassListAlloc(
+    allocator: std.mem.Allocator,
+    class_id: []const u8,
+    law_ref: []const u8,
+    owner: []const u8,
+    status: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "[{{\"class_id\":\"{s}\",\"boundary_key\":\"boundary\"," ++
+            "\"law_ref\":\"{s}\",\"discrepancy\":\"misbinding\"," ++
+            "\"owner_boundary\":\"{s}\",\"severity\":\"high\"," ++
+            "\"status\":\"{s}\",\"observed_facts\":[\"fact\"]," ++
+            "\"evidence_refs\":[\"test:evidence\"],\"finding_refs\":[]," ++
+            "\"witness\":\"witness\",\"falsifier_ref\":\"test:falsifier\"," ++
+            "\"applicability\":\"current\",\"quotient_basis\":\"law+boundary\"}}]",
+        .{ class_id, law_ref, owner, status },
+    );
+}
+
+const TestHarness = struct {
+    memory: durable_store.MemoryEventStore,
+
+    fn init(allocator: std.mem.Allocator) TestHarness {
+        return .{ .memory = .init(allocator, "memory:actuation") };
     }
-    for (values, 0..) |value, index| {
-        out[index] = try allocator.dupe(u8, value);
-        initialized += 1;
+
+    fn deinit(self: *TestHarness) void {
+        self.memory.deinit();
     }
-    return out;
-}
 
-fn freeStringList(allocator: std.mem.Allocator, values: [][]u8) void {
-    for (values) |value| allocator.free(value);
-    allocator.free(values);
-}
-
-fn freeOwnedArrayList(allocator: std.mem.Allocator, values: *std.ArrayList([]u8)) void {
-    for (values.items) |value| allocator.free(value);
-    values.deinit(allocator);
-}
-
-fn freePathStates(allocator: std.mem.Allocator, states: []PathState) void {
-    for (states) |*state| state.deinit(allocator);
-    allocator.free(states);
-}
-
-fn containsString(values: []const []u8, needle: []const u8) bool {
-    for (values) |value| if (std.mem.eql(u8, value, needle)) return true;
-    return false;
-}
-
-fn equalStringLists(left: []const []const u8, right: []const []const u8) bool {
-    if (left.len != right.len) return false;
-    for (left, right) |a, b| if (!std.mem.eql(u8, a, b)) return false;
-    return true;
-}
-
-fn stringSlice(values: []const []u8) []const []const u8 {
-    return @as([*]const []const u8, @ptrCast(values.ptr))[0..values.len];
-}
-
-const TestRepo = struct {
-    tmp: std.testing.TmpDir,
-    root: []u8,
-    store: []u8,
-    target: []u8,
-    other: []u8,
+    fn store(self: *TestHarness) durable_store.EventStore {
+        return self.memory.eventStore();
+    }
 };
 
-fn setupTestRepo(allocator: std.mem.Allocator) !TestRepo {
-    var tmp = std.testing.tmpDir(.{});
-    errdefer tmp.cleanup();
-    const root_z = try tmp.dir.realPathFileAlloc(defaultIo(), ".", allocator);
-    defer allocator.free(root_z);
-    const root = try allocator.dupe(u8, root_z);
-    errdefer allocator.free(root);
-    const store = try std.fs.path.join(allocator, &.{ root, DefaultStorePath });
-    errdefer allocator.free(store);
-    const target = try std.fs.path.join(allocator, &.{ root, "target.txt" });
-    errdefer allocator.free(target);
-    const other = try std.fs.path.join(allocator, &.{ root, "other.txt" });
-    errdefer allocator.free(other);
-    const gitignore = try std.fs.path.join(allocator, &.{ root, ".gitignore" });
-    defer allocator.free(gitignore);
-    try durable_store.writeTextAtomic(allocator, gitignore, ".ledger/\n");
-    try durable_store.writeTextAtomic(allocator, target, "before\n");
-    try durable_store.writeTextAtomic(allocator, other, "stable\n");
-    try runTestCommand(allocator, root, &.{ "git", "init", "--quiet" });
-    try runTestCommand(allocator, root, &.{ "git", "config", "user.email", "actuation@example.invalid" });
-    try runTestCommand(allocator, root, &.{ "git", "config", "user.name", "Actuation Test" });
-    try runTestCommand(allocator, root, &.{ "git", "add", ".gitignore", "target.txt", "other.txt" });
-    try runTestCommand(allocator, root, &.{ "git", "commit", "--quiet", "-m", "fixture" });
-    return .{ .tmp = tmp, .root = root, .store = store, .target = target, .other = other };
+fn testAppendGoalAndConstruction(
+    harness: *TestHarness,
+    proof_kinds: []const u8,
+    publication: bool,
+) !struct { goal: []u8, construction: []u8 } {
+    const allocator = std.testing.allocator;
+    const goal_text = try testGoalAlloc(allocator, "null", proof_kinds, publication);
+    defer allocator.free(goal_text);
+    var goal = try appendArtifact(allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(allocator);
+    const construction_text = try testConstructionAlloc(
+        allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer allocator.free(construction_text);
+    var construction = try appendArtifact(
+        allocator,
+        harness.store(),
+        "goal-1",
+        construction_text,
+    );
+    defer construction.deinit(allocator);
+    return .{
+        .goal = try allocator.dupe(u8, goal.artifact_id.?),
+        .construction = try allocator.dupe(u8, construction.artifact_id.?),
+    };
 }
 
-fn cleanupTestRepo(
-    allocator: std.mem.Allocator,
-    fixture: *TestRepo,
-) void {
-    allocator.free(fixture.other);
-    allocator.free(fixture.target);
-    allocator.free(fixture.store);
-    allocator.free(fixture.root);
-    fixture.tmp.cleanup();
+fn testPrepare(
+    harness: *TestHarness,
+    step: []const u8,
+    effect: []const u8,
+    refs: []const u8,
+) !PrepareResult {
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const input = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"actuating-operation/v1","goal_id":"goal-1",
+        \\"construction_ref":"{s}","expected_subject_digest":"{s}",
+        \\"step_id":"{s}","effect":"{s}",
+        \\"idempotency_key":"key-{s}","owner_boundary":"owner",
+        \\"paths":["src/file.zig"],"proof_obligation_refs":{s}}}
+    , .{
+        replay.state.construction.?.artifact_id,
+        replay.state.subject_digest.?,
+        step,
+        effect,
+        step,
+        refs,
+    });
+    defer std.testing.allocator.free(input);
+    return prepareOperation(std.testing.allocator, harness.store(), "goal-1", input);
 }
 
-fn runTestCommand(allocator: std.mem.Allocator, repo: []const u8, argv: []const []const u8) !void {
-    var result = try runProcessAlloc(allocator, repo, argv);
-    defer result.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+fn testAppendOwner(
+    harness: *TestHarness,
+    kind: []const u8,
+    subject: ?[]const u8,
+    body: []const u8,
+    capability: ?[]const u8,
+) !void {
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const input = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"actuating-evidence-input/v1","goal_id":"goal-1",
+        \\"construction_ref":"{s}","subject_digest":"{s}","kind":"{s}","body":{s}}}
+    , .{
+        replay.state.construction.?.artifact_id,
+        subject orelse replay.state.subject_digest.?,
+        kind,
+        body,
+    });
+    defer std.testing.allocator.free(input);
+    var result = try appendInput(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        input,
+        capability,
+    );
+    result.deinit(std.testing.allocator);
 }
 
-const TestOpenSingle =
-    \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"complete","allowed_paths":["target.txt"],"obligations":[{"id":"obl-1","kind":"implementation","statement":"The diff remains whitespace-clean.","verifier":["git","diff","--check"]}]}
-;
+fn testRegisterClass(
+    harness: *TestHarness,
+    class_id: []const u8,
+    law_ref: []const u8,
+    owner: []const u8,
+    status: []const u8,
+) !void {
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        class_id,
+        law_ref,
+        owner,
+        status,
+    );
+    defer std.testing.allocator.free(classes);
+    const q = try testCounterexamplesAlloc(
+        std.testing.allocator,
+        replay.state.construction.?.artifact_id,
+        replay.state.subject_digest.?,
+        TestDigest2,
+        classes,
+    );
+    defer std.testing.allocator.free(q);
+    var result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", q);
+    result.deinit(std.testing.allocator);
+}
 
-const TestOpenTwoPaths =
-    \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"complete","allowed_paths":["target.txt","other.txt"],"obligations":[{"id":"obl-1","kind":"implementation","statement":"The diff remains whitespace-clean.","verifier":["git","diff","--check"]}]}
-;
+fn testCurrentCounterexamplesAlloc(
+    harness: *TestHarness,
+    classes: []const u8,
+    predecessors: []const u8,
+) ![]u8 {
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    return testCounterexamplesLineageAlloc(
+        std.testing.allocator,
+        replay.state.construction.?.artifact_id,
+        replay.state.subject_digest.?,
+        TestDigest2,
+        classes,
+        predecessors,
+    );
+}
 
-const TestOpenTwoObligations =
-    \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","resolution_digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"ready-to-ship","allowed_paths":["target.txt"],"obligations":[{"id":"obl-1","kind":"implementation","statement":"The first verifier passes.","verifier":["git","diff","--check"]},{"id":"obl-2","kind":"ship","statement":"The second verifier passes.","verifier":["git","diff","--check"]}]}
-;
+test "actuation: four-family materialization is canonical and exact" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const empty = try testCounterexamplesAlloc(
+        std.testing.allocator,
+        refs.construction,
+        TestDigest0,
+        TestDigest2,
+        "[]",
+    );
+    defer std.testing.allocator.free(empty);
+    var result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", empty);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), harness.memory.records.items.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.artifact_bytes.?,
+        result.artifact_id.?,
+    ) != null);
+    try std.testing.expectError(
+        error.DuplicateCounterexampleSet,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", empty),
+    );
+}
 
-const TestOpenDirectory =
-    \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"complete","allowed_paths":["scope"],"obligations":[{"id":"obl-1","kind":"implementation","statement":"The diff remains whitespace-clean.","verifier":["git","diff","--check"]}]}
-;
-
-const TestOpenMutatingVerifier =
-    \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"complete","allowed_paths":["target.txt"],"obligations":[{"id":"obl-1","kind":"implementation","statement":"The verifier is observational.","verifier":["sh","-c","printf 'mutated\\n' > other.txt; exit 1"]}]}
-;
-
-const TestEditOperation =
-    \\{"schema":"actuation-operation/v1","step_id":"step-1","effect":"edit","idempotency_key":"run-1:step-1","owner_boundary":"fixture","paths":["target.txt"],"obligation_refs":["obl-1"]}
-;
-
-test "edit capability is issued before effect, consumed once, observed, and closed" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenSingle);
-    defer opened.deinit(std.testing.allocator);
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", TestEditOperation);
+test "actuation: capability is consumed once without executing the effect" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var prepared = try testPrepare(&harness, "edit-1", "edit", "[\"proof-1\"]");
     defer prepared.deinit(std.testing.allocator);
-    try std.testing.expect(prepared.capability != null);
-
-    try durable_store.writeTextAtomic(std.testing.allocator, fixture.target, "after\n");
-    var recorded = try cmdRecord(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?);
-    defer recorded.deinit(std.testing.allocator);
+    try testAppendOwner(
+        &harness,
+        "effect_recorded",
+        TestDigest1,
+        "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"edit-1\"," ++
+            "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+            "\"changed_paths\":[\"src/file.zig\"]}",
+        prepared.capability,
+    );
     try std.testing.expectError(
-        error.InvalidPhase,
-        cmdRecord(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?),
+        error.UnexpectedCapability,
+        testAppendOwner(
+            &harness,
+            "operation_observed",
+            null,
+            "{\"schema\":\"operation-observed/v1\",\"step_id\":\"edit-1\"," ++
+                "\"status\":\"passed\",\"discharged_refs\":[\"proof-1\"]," ++
+                "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+            prepared.capability,
+        ),
     );
-
-    var observed = try cmdObserve(std.testing.allocator, fixture.root, fixture.store, "run-1", "step-1");
-    defer observed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?bool, true), observed.passed);
-    var closed = try cmdClose(std.testing.allocator, fixture.root, fixture.store, "run-1");
-    defer closed.deinit(std.testing.allocator);
-
-    var loaded = try loadLedger(std.testing.allocator, fixture.store, "run-1");
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Phase.closed, loaded.state.?.phase);
-    try std.testing.expectEqual(@as(u64, 5), loaded.event_count);
-    const decision = projectDecision(&loaded.state.?);
-    try std.testing.expectEqualStrings("complete", decision.verdict);
-    try std.testing.expectEqualStrings("complete", decision.goal_outcome);
-    try std.testing.expectEqualStrings("none", decision.next_owner);
-    try std.testing.expectEqualStrings("terminal", decision.next_transition);
+    try testAppendOwner(
+        &harness,
+        "operation_observed",
+        null,
+        "{\"schema\":\"operation-observed/v1\",\"step_id\":\"edit-1\"," ++
+            "\"status\":\"passed\",\"discharged_refs\":[\"proof-1\"]," ++
+            "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+        null,
+    );
 }
 
-test "idempotency keys cannot authorize a second operation" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenTwoObligations);
-    defer opened.deinit(std.testing.allocator);
-    const first =
-        \\{"schema":"actuation-operation/v1","step_id":"step-1","effect":"verify","idempotency_key":"same-key","owner_boundary":"fixture","paths":["target.txt"],"obligation_refs":["obl-1"]}
-    ;
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", first);
-    defer prepared.deinit(std.testing.allocator);
-    var executed = try cmdExecute(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?);
-    defer executed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?bool, true), executed.passed);
+test "actuation: prepared capability remains bound to its selected subject" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
 
-    const second =
-        \\{"schema":"actuation-operation/v1","step_id":"step-2","effect":"verify","idempotency_key":"same-key","owner_boundary":"fixture","paths":["target.txt"],"obligation_refs":["obl-2"]}
-    ;
+    const stale_operation = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
+            "\"construction_ref\":\"{s}\",\"expected_subject_digest\":\"{s}\"," ++
+            "\"step_id\":\"stale-subject\",\"effect\":\"edit\"," ++
+            "\"idempotency_key\":\"stale-subject\",\"owner_boundary\":\"owner\"," ++
+            "\"paths\":[\"src/file.zig\"],\"proof_obligation_refs\":[\"proof-1\"]}}",
+        .{ refs.construction, TestDigest1 },
+    );
+    defer std.testing.allocator.free(stale_operation);
     try std.testing.expectError(
-        error.DuplicateIdempotencyKey,
-        cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", second),
+        error.SubjectDigestMismatch,
+        prepareOperation(std.testing.allocator, harness.store(), "goal-1", stale_operation),
     );
-}
+    try std.testing.expectEqual(@as(usize, 2), harness.memory.records.items.len);
 
-test "ready-to-ship is a terminal projection chosen at open" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenTwoObligations);
-    defer opened.deinit(std.testing.allocator);
-    const operation =
-        \\{"schema":"actuation-operation/v1","step_id":"step-1","effect":"verify","idempotency_key":"verify-all","owner_boundary":"fixture","paths":["target.txt"],"obligation_refs":["obl-1","obl-2"]}
-    ;
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", operation);
-    defer prepared.deinit(std.testing.allocator);
-    var executed = try cmdExecute(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?);
-    defer executed.deinit(std.testing.allocator);
-    var closed = try cmdClose(std.testing.allocator, fixture.root, fixture.store, "run-1");
-    defer closed.deinit(std.testing.allocator);
-
-    var loaded = try loadLedger(std.testing.allocator, fixture.store, "run-1");
-    defer loaded.deinit(std.testing.allocator);
-    const decision = projectDecision(&loaded.state.?);
-    try std.testing.expectEqualStrings(
-        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        loaded.state.?.resolution_digest.?,
-    );
-    try std.testing.expectEqualStrings("ready-to-ship", decision.verdict);
-    try std.testing.expectEqualStrings("continue", decision.goal_outcome);
-    try std.testing.expectEqualStrings("complete", decision.implementation_outcome);
-    try std.testing.expectEqualStrings("ship", decision.next_owner);
-
-    var ship_basis: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer ship_basis.deinit();
-    try writeDecisionBasis(&ship_basis.writer, &loaded.state.?, .ship);
-    const ship_json = try ship_basis.toOwnedSlice();
-    defer std.testing.allocator.free(ship_json);
-    try std.testing.expect(std.mem.indexOf(u8, ship_json, "obl-2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, ship_json, "obl-1") == null);
-}
-
-test "post-hoc prepare is rejected when the live artifact already moved" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenSingle);
-    defer opened.deinit(std.testing.allocator);
-    try durable_store.writeTextAtomic(std.testing.allocator, fixture.target, "post-hoc\n");
-    try std.testing.expectError(
-        error.ArtifactStale,
-        cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", TestEditOperation),
-    );
-}
-
-test "record rejects a simultaneous mutation outside the prepared path set" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenTwoPaths);
-    defer opened.deinit(std.testing.allocator);
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", TestEditOperation);
-    defer prepared.deinit(std.testing.allocator);
-    try durable_store.writeTextAtomic(std.testing.allocator, fixture.target, "after\n");
-    try durable_store.writeTextAtomic(std.testing.allocator, fixture.other, "escaped\n");
-    try std.testing.expectError(
-        error.OutOfScopeMutation,
-        cmdRecord(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?),
-    );
-}
-
-test "an allowed directory does not make its prepared child look out of scope" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    try runTestCommand(std.testing.allocator, fixture.root, &.{ "mkdir", "-p", "scope" });
-    const child = try std.fs.path.join(std.testing.allocator, &.{ fixture.root, "scope/child.txt" });
-    defer std.testing.allocator.free(child);
-    try durable_store.writeTextAtomic(std.testing.allocator, child, "before\n");
-    try runTestCommand(std.testing.allocator, fixture.root, &.{ "git", "add", "scope/child.txt" });
-    try runTestCommand(std.testing.allocator, fixture.root, &.{ "git", "commit", "--quiet", "-m", "add scope" });
-
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenDirectory);
-    defer opened.deinit(std.testing.allocator);
-    const operation =
-        \\{"schema":"actuation-operation/v1","step_id":"step-1","effect":"edit","idempotency_key":"nested-edit","owner_boundary":"fixture","paths":["scope/child.txt"],"obligation_refs":["obl-1"]}
-    ;
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", operation);
-    defer prepared.deinit(std.testing.allocator);
-    try durable_store.writeTextAtomic(std.testing.allocator, child, "after\n");
-    var recorded = try cmdRecord(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?);
-    defer recorded.deinit(std.testing.allocator);
-}
-
-test "a verifier that mutates the repository cannot record an observation" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenMutatingVerifier);
-    defer opened.deinit(std.testing.allocator);
-    const operation =
-        \\{"schema":"actuation-operation/v1","step_id":"step-1","effect":"verify","idempotency_key":"mutating-verifier","owner_boundary":"fixture","paths":["target.txt"],"obligation_refs":["obl-1"]}
-    ;
-    var prepared = try cmdPrepare(std.testing.allocator, fixture.root, fixture.store, "run-1", operation);
+    var prepared = try testPrepare(&harness, "subject-bound-edit", "edit", "[\"proof-1\"]");
     defer prepared.deinit(std.testing.allocator);
     try std.testing.expectError(
-        error.VerifierMutatedArtifact,
-        cmdExecute(std.testing.allocator, fixture.root, fixture.store, "run-1", prepared.capability.?),
+        error.SubjectDigestMismatch,
+        testAppendOwner(
+            &harness,
+            "effect_recorded",
+            TestDigest1,
+            "{\"schema\":\"effect-recorded/v1\"," ++
+                "\"step_id\":\"subject-bound-edit\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest2 ++ "\"," ++
+                "\"changed_paths\":[\"src/file.zig\"]}",
+            prepared.capability,
+        ),
     );
-    var loaded = try loadLedger(std.testing.allocator, fixture.store, "run-1");
-    defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Phase.prepared, loaded.state.?.phase);
-    try std.testing.expectEqual(@as(u64, 2), loaded.event_count);
-}
-
-test "close rejects uncovered obligations" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenSingle);
-    defer opened.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        error.ObligationsOutstanding,
-        cmdClose(std.testing.allocator, fixture.root, fixture.store, "run-1"),
+    try testAppendOwner(
+        &harness,
+        "effect_recorded",
+        TestDigest1,
+        "{\"schema\":\"effect-recorded/v1\"," ++
+            "\"step_id\":\"subject-bound-edit\"," ++
+            "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+            "\"changed_paths\":[\"src/file.zig\"]}",
+        prepared.capability,
     );
-}
-
-test "decision projection remains a continuation before close" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenSingle);
-    defer opened.deinit(std.testing.allocator);
-    var loaded = try loadLedger(std.testing.allocator, fixture.store, "run-1");
-    defer loaded.deinit(std.testing.allocator);
-    const decision = projectDecision(&loaded.state.?);
-    try std.testing.expectEqualStrings("continue", decision.verdict);
-    try std.testing.expectEqualStrings("continue", decision.goal_outcome);
-    try std.testing.expectEqualStrings("incomplete", decision.implementation_outcome);
-    try std.testing.expectEqualStrings("goal-actuating", decision.next_owner);
-    try std.testing.expectEqualStrings("prepare", decision.next_transition);
-}
-
-test "open rejects an unknown proof-basis kind" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    const invalid =
-        \\{"schema":"actuation-open/v1","run_id":"run-1","goal_id":"goal-1","goal_contract_digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","source_ref":"user:turn","execution_authority_ref":"user:turn","mutation_allowed":true,"completion":"complete","allowed_paths":["target.txt"],"obligations":[{"id":"obl-1","kind":"summary","statement":"Invalid proof kind.","verifier":["git","diff","--check"]}]}
-    ;
-    try std.testing.expectError(
-        error.InvalidObligationKind,
-        cmdOpen(std.testing.allocator, fixture.root, fixture.store, invalid),
+    try testAppendOwner(
+        &harness,
+        "operation_observed",
+        null,
+        "{\"schema\":\"operation-observed/v1\"," ++
+            "\"step_id\":\"subject-bound-edit\"," ++
+            "\"status\":\"passed\",\"discharged_refs\":[\"proof-1\"]," ++
+            "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+        null,
     );
 }
 
-test "tampered event body fails the hash-chain load" {
-    var fixture = try setupTestRepo(std.testing.allocator);
-    defer cleanupTestRepo(std.testing.allocator, &fixture);
-    var opened = try cmdOpen(std.testing.allocator, fixture.root, fixture.store, TestOpenSingle);
-    defer opened.deinit(std.testing.allocator);
-    const bytes = try durable_store.readRegularFileNoSymlink(std.testing.allocator, fixture.store, MaxStoreBytes);
-    defer std.testing.allocator.free(bytes);
-    const marker = "goal-1";
-    const index = std.mem.indexOf(u8, bytes, marker) orelse return error.TestMarkerMissing;
-    const tampered = try std.testing.allocator.dupe(u8, bytes);
-    defer std.testing.allocator.free(tampered);
-    tampered[index + marker.len - 1] = '2';
-    try durable_store.writeTextAtomic(std.testing.allocator, fixture.store, tampered);
+test "actuation: event tuple references require sha256 digests" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var prepared = try testPrepare(&harness, "bad-subject", "edit", "[\"proof-1\"]");
+    defer prepared.deinit(std.testing.allocator);
     try std.testing.expectError(
-        error.BodyDigestMismatch,
-        loadLedger(std.testing.allocator, fixture.store, "run-1"),
+        error.InvalidDigest,
+        testAppendOwner(
+            &harness,
+            "effect_recorded",
+            "not-a-digest",
+            "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"bad-subject\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+                "\"changed_paths\":[\"src/file.zig\"]}",
+            prepared.capability,
+        ),
+    );
+}
+
+test "actuation: accepted Counterexample requires an authored successor Construction" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-1", "law-1", "owner", "accepted");
+    const goal_draft = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_draft);
+    const goal_predecessor = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"predecessor_refs\":[\"{s}\"]",
+        .{refs.goal},
+    );
+    defer std.testing.allocator.free(goal_predecessor);
+    const goal_successor_basis = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal_draft,
+        "\"predecessor_refs\":[]",
+        goal_predecessor,
+    );
+    defer std.testing.allocator.free(goal_successor_basis);
+    const goal_successor = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal_successor_basis,
+        "\"non_goals\":[]",
+        "\"non_goals\":[\"changed\"]",
+    );
+    defer std.testing.allocator.free(goal_successor);
+    try std.testing.expectError(
+        error.GoalSuccessorHasCounterexampleDebt,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_successor),
+    );
+    try std.testing.expectError(
+        error.AcceptedCounterexampleDebt,
+        testPrepare(&harness, "blocked", "edit", "[\"proof-1\"]"),
+    );
+    const k1 = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-1\"]",
+    );
+    defer std.testing.allocator.free(k1);
+    const example_only = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        k1,
+        "\"proof_mode\":\"property-law\"",
+        "\"proof_mode\":\"example-regression\"",
+    );
+    defer std.testing.allocator.free(example_only);
+    try std.testing.expectError(
+        error.HighSeverityCounterexampleRequiresStrongProof,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", example_only),
+    );
+    var k1_result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", k1);
+    defer k1_result.deinit(std.testing.allocator);
+    var admitted = try testPrepare(&harness, "admitted", "edit", "[\"proof-1\"]");
+    admitted.deinit(std.testing.allocator);
+}
+
+test "actuation: successor Construction preserves repair architecture and permits owner moves" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const forward = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"future-class\"]",
+    );
+    defer std.testing.allocator.free(forward);
+    try std.testing.expectError(
+        error.UnknownCounterexampleClass,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", forward),
+    );
+    try testRegisterClass(&harness, "class-1", "law-1", "owner", "accepted");
+    const stale = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest1,
+        "[\"class-1\"]",
+    );
+    defer std.testing.allocator.free(stale);
+    try std.testing.expectError(
+        error.StaleConstructionSubject,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", stale),
+    );
+    const current = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-1\"]",
+    );
+    defer std.testing.allocator.free(current);
+    const changed_boundary = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        current,
+        "\"boundary_key\":\"boundary\"",
+        "\"boundary_key\":\"other-boundary\"",
+    );
+    defer std.testing.allocator.free(changed_boundary);
+    try std.testing.expectError(
+        error.RepairArchitectureChanged,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", changed_boundary),
+    );
+    const wrong_owner = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        current,
+        "\"owner\"",
+        "\"other-owner\"",
+    );
+    defer std.testing.allocator.free(wrong_owner);
+    try std.testing.expectError(
+        error.RepairArchitectureChanged,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_owner),
+    );
+    const architecture_repair = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        wrong_owner,
+        "\"mode\":\"realization-repair\"",
+        "\"mode\":\"architecture-repair\"",
+    );
+    defer std.testing.allocator.free(architecture_repair);
+    var result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        architecture_repair,
+    );
+    result.deinit(std.testing.allocator);
+}
+
+test "actuation: pending operation excludes Counterexamples and follow-up permits edits" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-follow-up",
+        "law-1",
+        "owner",
+        "follow-up",
+    );
+    defer std.testing.allocator.free(classes);
+    const q = try testCounterexamplesAlloc(
+        std.testing.allocator,
+        refs.construction,
+        TestDigest0,
+        TestDigest2,
+        classes,
+    );
+    defer std.testing.allocator.free(q);
+    var prepared = try testPrepare(&harness, "pending", "verify", "[\"proof-1\"]");
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.OperationAlreadyPending,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", q),
+    );
+    try testAppendOwner(
+        &harness,
+        "operation_aborted",
+        null,
+        "{\"schema\":\"operation-aborted/v1\",\"step_id\":\"pending\"," ++
+            "\"reason\":\"owner stopped\"}",
+        null,
+    );
+    var q_result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", q);
+    defer q_result.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.DuplicateCounterexampleSet,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", q),
+    );
+    var edit = try testPrepare(&harness, "follow-up-edit", "edit", "[\"proof-1\"]");
+    defer edit.deinit(std.testing.allocator);
+    try testAppendOwner(
+        &harness,
+        "operation_aborted",
+        null,
+        "{\"schema\":\"operation-aborted/v1\",\"step_id\":\"follow-up-edit\"," ++
+            "\"reason\":\"test complete\"}",
+        null,
+    );
+}
+
+test "actuation: Counterexample status revises on same tuple through set lineage" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const initial_classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-recur",
+        "law-1",
+        "owner",
+        "follow-up",
+    );
+    defer std.testing.allocator.free(initial_classes);
+    const initial = try testCurrentCounterexamplesAlloc(&harness, initial_classes, "[]");
+    defer std.testing.allocator.free(initial);
+    var initial_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        initial,
+    );
+    defer initial_result.deinit(std.testing.allocator);
+    const predecessors = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[\"{s}\"]",
+        .{initial_result.artifact_id.?},
+    );
+    defer std.testing.allocator.free(predecessors);
+    const revised_classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-recur",
+        "law-1",
+        "owner",
+        "rejected",
+    );
+    defer std.testing.allocator.free(revised_classes);
+    const revised = try testCurrentCounterexamplesAlloc(
+        &harness,
+        revised_classes,
+        predecessors,
+    );
+    defer std.testing.allocator.free(revised);
+    var revised_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        revised,
+    );
+    defer revised_result.deinit(std.testing.allocator);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    try std.testing.expectEqual(ClassStatus.rejected, replay.state.classes.items[0].status);
+}
+
+test "actuation: Counterexample recurrence requires lineage and stable identity" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-recur", "law-1", "owner", "rejected");
+    var before = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    const prior_set = try std.testing.allocator.dupe(u8, before.state.classes.items[0].set_ref);
+    before.deinit();
+    defer std.testing.allocator.free(prior_set);
+    const k1 = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(k1);
+    var k1_result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", k1);
+    defer k1_result.deinit(std.testing.allocator);
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-recur",
+        "law-1",
+        "owner",
+        "rejected",
+    );
+    defer std.testing.allocator.free(classes);
+    const missing = try testCurrentCounterexamplesAlloc(&harness, classes, "[]");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectError(
+        error.MissingCounterexampleSetPredecessor,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", missing),
+    );
+    const predecessors = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[\"{s}\"]",
+        .{prior_set},
+    );
+    defer std.testing.allocator.free(predecessors);
+    const drift_classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-recur",
+        "law-1",
+        "other-owner",
+        "rejected",
+    );
+    defer std.testing.allocator.free(drift_classes);
+    const drift = try testCurrentCounterexamplesAlloc(&harness, drift_classes, predecessors);
+    defer std.testing.allocator.free(drift);
+    try std.testing.expectError(
+        error.CounterexampleIdentityDrift,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", drift),
+    );
+    const valid = try testCurrentCounterexamplesAlloc(&harness, classes, predecessors);
+    defer std.testing.allocator.free(valid);
+    var valid_result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", valid);
+    defer valid_result.deinit(std.testing.allocator);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    try std.testing.expect(std.mem.eql(
+        u8,
+        replay.state.classes.items[0].construction_ref,
+        k1_result.artifact_id.?,
+    ));
+}
+
+test "actuation: accepted Counterexample must name a Goal law" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-law-2",
+        "law-2",
+        "owner",
+        "accepted",
+    );
+    defer std.testing.allocator.free(classes);
+    const q = try testCounterexamplesAlloc(
+        std.testing.allocator,
+        refs.construction,
+        TestDigest0,
+        TestDigest2,
+        classes,
+    );
+    defer std.testing.allocator.free(q);
+    try std.testing.expectError(
+        error.UnknownCounterexampleLaw,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", q),
+    );
+    try std.testing.expectEqual(@as(usize, 2), harness.memory.records.items.len);
+}
+
+test "actuation: review evidence shape is structural and campaign identity is bound" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    const campaign_id = try campaignDigestAlloc(
+        std.testing.allocator,
+        &replay.state,
+        TestDigest2,
+    );
+    replay.deinit();
+    defer std.testing.allocator.free(campaign_id);
+    try std.testing.expectError(
+        error.ReviewCampaignMismatch,
+        testAppendOwner(
+            &harness,
+            "review_campaign_started",
+            null,
+            "{\"schema\":\"review-campaign-started/v1\",\"campaign_id\":\"" ++
+                TestDigest0 ++ "\",\"review_contract_digest\":\"" ++
+                TestDigest2 ++ "\"}",
+            null,
+        ),
+    );
+    const campaign = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"review-campaign-started/v1\",\"campaign_id\":\"{s}\"," ++
+            "\"review_contract_digest\":\"{s}\"}}",
+        .{ campaign_id, TestDigest2 },
+    );
+    defer std.testing.allocator.free(campaign);
+    try testAppendOwner(&harness, "review_campaign_started", null, campaign, null);
+    try testAppendOwner(
+        &harness,
+        "review_attempt_started",
+        null,
+        "{\"schema\":\"review-attempt-started/v1\",\"request_id\":\"request\"," ++
+            "\"attempt_id\":\"attempt\",\"fresh_attempt\":false," ++
+            "\"receipt_ref\":\"" ++ TestDigest0 ++ "\"}",
+        null,
+    );
+    try testAppendOwner(
+        &harness,
+        "review_attempt_completed",
+        null,
+        "{\"schema\":\"review-attempt-completed/v1\",\"request_id\":\"request\"," ++
+            "\"attempt_id\":\"attempt\",\"verdict\":\"owner-defined\"," ++
+            "\"principal\":\"reduced\",\"context_match\":false,\"fallback\":true," ++
+            "\"finding_refs\":[],\"receipt_ref\":\"" ++ TestDigest1 ++ "\"}",
+        null,
+    );
+    try testAppendOwner(
+        &harness,
+        "review_transport_failed",
+        null,
+        "{\"schema\":\"review-transport-failed/v1\",\"request_id\":\"other\"," ++
+            "\"attempt_id\":\"other-attempt\",\"failure_ref\":\"" ++
+            TestDigest1 ++ "\",\"receipt_ref\":\"" ++ TestDigest2 ++ "\"}",
+        null,
+    );
+    var final = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer final.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        final.state.kind_counts[@intFromEnum(EventKind.review_attempt_completed)],
+    );
+}
+
+test "actuation: state and projection deny authority and semantic decision" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const state_json = try structuralJsonAlloc(
+        std.testing.allocator,
+        &replay.state,
+        "actuating-structural-state/v1",
+    );
+    defer std.testing.allocator.free(state_json);
+    const projection = try projectionJsonAlloc(std.testing.allocator, &replay.state);
+    defer std.testing.allocator.free(projection);
+    for ([_][]const u8{ state_json, projection }) |document| {
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"authority_granted\":false",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            document,
+            "\"semantic_decision_established\":false",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(u8, document, "\"closure\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, document, "\"verdict\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, document, "discharged") == null);
+    }
+}
+
+test "actuation: Goal semantic author is exact" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal);
+    const wrong_author = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"semantic_author\":\"goal-contract\"",
+        "\"semantic_author\":\"actuating\"",
+    );
+    defer std.testing.allocator.free(wrong_author);
+    try std.testing.expectError(
+        error.SemanticAuthorMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_author),
+    );
+}
+
+test "actuation: goal identity and executable path boundaries fail closed" {
+    try validateGoalId("goal-1");
+    try std.testing.expectError(error.InvalidGoalId, validateGoalId("Goal-1"));
+    try validateRepoPath(".");
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath("."));
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath(".git"));
+    try std.testing.expectError(error.ReservedRepoPath, validateExecutablePath(".ledger"));
+
+    const goal = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal);
+    const upper_goal = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"goal_id\":\"goal-1\"",
+        "\"goal_id\":\"Goal-1\"",
+    );
+    defer std.testing.allocator.free(upper_goal);
+    try std.testing.expectError(
+        error.InvalidGoalId,
+        materializeArtifact(std.testing.allocator, "Goal-1", upper_goal),
+    );
+    const root_scoped_goal = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"allowed_paths\":[\"src\"]",
+        "\"allowed_paths\":[\".\"]",
+    );
+    defer std.testing.allocator.free(root_scoped_goal);
+    var root_materialized = try materializeArtifact(
+        std.testing.allocator,
+        "goal-1",
+        root_scoped_goal,
+    );
+    root_materialized.deinit(std.testing.allocator);
+
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const root_execution = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"allowed_paths\":[\"src/file.zig\"]",
+        "\"allowed_paths\":[\".\"]",
+    );
+    defer std.testing.allocator.free(root_execution);
+    try std.testing.expectError(
+        error.ReservedRepoPath,
+        materializeArtifact(std.testing.allocator, "goal-1", root_execution),
+    );
+}
+
+test "actuation: Construction proof namespace is exact and argv remains ordered" {
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const repeated_argv = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"argv\":[\"verify\"]",
+        "\"argv\":[\"verify\",\"verify\"]",
+    );
+    defer std.testing.allocator.free(repeated_argv);
+    var repeated_materialized = try materializeArtifact(
+        std.testing.allocator,
+        "goal-1",
+        repeated_argv,
+    );
+    repeated_materialized.deinit(std.testing.allocator);
+
+    const unknown_observation = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"preserved_observations\":[\"proof-1\"]",
+        "\"preserved_observations\":[\"unknown\"]",
+    );
+    defer std.testing.allocator.free(unknown_observation);
+    try std.testing.expectError(
+        error.UnknownPreservedObservation,
+        materializeArtifact(std.testing.allocator, "goal-1", unknown_observation),
+    );
+    const reserved_id = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"obligation_id\":\"proof-1\"",
+        "\"obligation_id\":\"proof-1#falsifier\"",
+    );
+    defer std.testing.allocator.free(reserved_id);
+    try std.testing.expectError(
+        error.ReservedProofRoleId,
+        materializeArtifact(std.testing.allocator, "goal-1", reserved_id),
+    );
+    const ambiguous_id = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"retirements\":[]",
+        "\"retirements\":[{\"retirement_id\":\"proof-1\"," ++
+            "\"dominated_construct\":\"old\",\"disposition\":\"retire\"," ++
+            "\"replacement_ref\":\"new\",\"verifier\":{\"argv\":[\"verify\"]}}]",
+    );
+    defer std.testing.allocator.free(ambiguous_id);
+    try std.testing.expectError(
+        error.AmbiguousProofRoleId,
+        materializeArtifact(std.testing.allocator, "goal-1", ambiguous_id),
+    );
+}
+
+test "actuation: operations select one locally executable proof role" {
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        construction,
+        .{},
+    );
+    defer parsed.deinit();
+    const document = try asObject(parsed.value);
+    const artifact = try asObject(try field(document, "artifact"));
+    const payload = try asObject(try field(artifact, "payload"));
+    var verifier = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1\"]",
+        .{},
+    );
+    defer verifier.deinit();
+    try validateOperationProofRefs(payload, try asArray(verifier.value));
+    var falsifier = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1#falsifier\"]",
+        .{},
+    );
+    defer falsifier.deinit();
+    try validateOperationProofRefs(payload, try asArray(falsifier.value));
+    var multiple = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"proof-1\",\"proof-1#falsifier\"]",
+        .{},
+    );
+    defer multiple.deinit();
+    try std.testing.expectError(
+        error.InvalidProofRoleCount,
+        validateOperationProofRefs(payload, try asArray(multiple.value)),
+    );
+
+    for ([_][]const u8{ "review", "ship" }) |kind| {
+        const replacement = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "\"proof_kind\":\"{s}\"",
+            .{kind},
+        );
+        defer std.testing.allocator.free(replacement);
+        const external = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            construction,
+            "\"proof_kind\":\"implementation\"",
+            replacement,
+        );
+        defer std.testing.allocator.free(external);
+        var external_parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            external,
+            .{},
+        );
+        defer external_parsed.deinit();
+        const external_document = try asObject(external_parsed.value);
+        const external_artifact = try asObject(try field(external_document, "artifact"));
+        const external_payload = try asObject(try field(external_artifact, "payload"));
+        try std.testing.expectError(
+            error.NonLocalProofObligation,
+            validateOperationProofRefs(external_payload, try asArray(verifier.value)),
+        );
+    }
+
+    const retired = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"retirements\":[]",
+        "\"retirements\":[{\"retirement_id\":\"retire-1\"," ++
+            "\"dominated_construct\":\"old\",\"disposition\":\"retire\"," ++
+            "\"replacement_ref\":\"new\",\"verifier\":{\"argv\":[\"verify\"]}}]",
+    );
+    defer std.testing.allocator.free(retired);
+    var retired_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        retired,
+        .{},
+    );
+    defer retired_parsed.deinit();
+    const retired_document = try asObject(retired_parsed.value);
+    const retired_artifact = try asObject(try field(retired_document, "artifact"));
+    const retired_payload = try asObject(try field(retired_artifact, "payload"));
+    var retirement = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[\"retire-1\"]",
+        .{},
+    );
+    defer retirement.deinit();
+    try validateOperationProofRefs(retired_payload, try asArray(retirement.value));
+}
+
+test "actuation: Goal required proof kind must be represented" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"review\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        goal_text,
+    );
+    defer goal.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    try std.testing.expectError(
+        error.RequiredProofKindOmitted,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", construction),
+    );
+}
+
+test "actuation: Construction laws and terminal route join the Goal exactly" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const wrong_route = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"completion\":\"complete\"",
+        "\"completion\":\"ready-to-ship\"",
+    );
+    defer std.testing.allocator.free(wrong_route);
+    try std.testing.expectError(
+        error.TerminalRouteMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_route),
+    );
+    const unknown_law = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"law_ref\":\"law-1\"",
+        "\"law_ref\":\"law-2\"",
+    );
+    defer std.testing.allocator.free(unknown_law);
+    try std.testing.expectError(
+        error.UnknownProofLaw,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", unknown_law),
+    );
+}
+
+test "actuation: Construction repository matches Goal repository" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const wrong = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"repository\":\"repo\"",
+        "\"repository\":\"other\"",
+    );
+    defer std.testing.allocator.free(wrong);
+    try std.testing.expectError(
+        error.RepositoryMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong),
+    );
+}
+
+test "actuation: Counterexample repository matches Goal repository" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const q = try testCounterexamplesAlloc(
+        std.testing.allocator,
+        refs.construction,
+        TestDigest0,
+        TestDigest2,
+        "[]",
+    );
+    defer std.testing.allocator.free(q);
+    const wrong = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        q,
+        "\"repository\":\"repo\"",
+        "\"repository\":\"other\"",
+    );
+    defer std.testing.allocator.free(wrong);
+    try std.testing.expectError(
+        error.RepositoryMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong),
+    );
+}
+
+test "actuation: Construction scope cannot overlap a prohibited descendant" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal);
+    const scoped_goal = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        goal,
+        "\"prohibited_paths\":[]",
+        "\"prohibited_paths\":[\"src/secret\"]",
+    );
+    defer std.testing.allocator.free(scoped_goal);
+    var goal_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        scoped_goal,
+    );
+    defer goal_result.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal_result.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(construction);
+    const wide = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"allowed_paths\":[\"src/file.zig\"]",
+        "\"allowed_paths\":[\"src\"]",
+    );
+    defer std.testing.allocator.free(wide);
+    try std.testing.expectError(
+        error.ConstructionScopeEscape,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wide),
+    );
+}
+
+test "actuation: abort recovers lost capability and discharge refs stay bound" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var prepared = try testPrepare(&harness, "recover", "verify", "[\"proof-1\"]");
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.UnknownProofDischarge,
+        testAppendOwner(
+            &harness,
+            "operation_observed",
+            null,
+            "{\"schema\":\"operation-observed/v1\",\"step_id\":\"recover\"," ++
+                "\"status\":\"owner-result\",\"discharged_refs\":[\"unknown\"]," ++
+                "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+            prepared.capability,
+        ),
+    );
+    try testAppendOwner(
+        &harness,
+        "operation_aborted",
+        null,
+        "{\"schema\":\"operation-aborted/v1\",\"step_id\":\"recover\"," ++
+            "\"reason\":\"capability output lost\"}",
+        null,
+    );
+    try std.testing.expectError(
+        error.NoPendingOperation,
+        testAppendOwner(
+            &harness,
+            "effect_recorded",
+            TestDigest1,
+            "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"recover\"," ++
+                "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+                "\"changed_paths\":[\"src/file.zig\"]}",
+            prepared.capability,
+        ),
+    );
+}
+
+test "actuation: event limit rejects before durable append" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    var exclusive = try harness.store().acquireExclusive(std.testing.allocator);
+    defer exclusive.release();
+    var replay = try replayExclusive(std.testing.allocator, &exclusive, "goal-1");
+    defer replay.deinit();
+    replay.state.event_count = MaxEvents;
+    try std.testing.expectError(
+        error.TooManyEvents,
+        appendCanonicalEvent(
+            std.testing.allocator,
+            &exclusive,
+            &replay,
+            .goal_contract_registered,
+            null,
+            null,
+            "{}",
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), harness.memory.records.items.len);
+}
+
+test "actuation: Goal successor must change payload and stale operation fails closed" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const stale_operation =
+        "{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
+        "\"construction_ref\":\"" ++ TestDigest2 ++ "\",\"step_id\":\"stale\"," ++
+        "\"expected_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+        "\"effect\":\"edit\",\"idempotency_key\":\"stale\"," ++
+        "\"owner_boundary\":\"owner\",\"paths\":[\"src/file.zig\"]," ++
+        "\"proof_obligation_refs\":[\"proof-1\"]}";
+    try std.testing.expectError(
+        error.ConstructionRefMismatch,
+        prepareOperation(std.testing.allocator, harness.store(), "goal-1", stale_operation),
+    );
+    const initial_goal = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(initial_goal);
+    const replacement = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "\"predecessor_refs\":[\"{s}\"]",
+        .{refs.goal},
+    );
+    defer std.testing.allocator.free(replacement);
+    const successor = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        initial_goal,
+        "\"predecessor_refs\":[]",
+        replacement,
+    );
+    defer std.testing.allocator.free(successor);
+    try std.testing.expectError(
+        error.GoalSuccessorUnchanged,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor),
+    );
+    const changed = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor,
+        "\"non_goals\":[]",
+        "\"non_goals\":[\"changed\"]",
+    );
+    defer std.testing.allocator.free(changed);
+    var result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", changed);
+    result.deinit(std.testing.allocator);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    try std.testing.expect(replay.state.construction == null);
+    try std.testing.expect(replay.state.subject_digest == null);
+}
+
+test "actuation: hash chain rejects reorder and tamper" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    std.mem.swap([]u8, &harness.memory.records.items[0], &harness.memory.records.items[1]);
+    try std.testing.expectError(
+        error.SequenceMismatch,
+        replayStore(std.testing.allocator, harness.store(), "goal-1"),
+    );
+    std.mem.swap([]u8, &harness.memory.records.items[0], &harness.memory.records.items[1]);
+    const record = harness.memory.records.items[1];
+    const marker = "\"event_digest\":\"sha256:";
+    const offset = (std.mem.indexOf(u8, record, marker) orelse unreachable) + marker.len;
+    record[offset] = if (record[offset] == '0') '1' else '0';
+    try std.testing.expectError(
+        error.EventDigestMismatch,
+        replayStore(std.testing.allocator, harness.store(), "goal-1"),
     );
 }

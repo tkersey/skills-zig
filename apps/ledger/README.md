@@ -1,20 +1,29 @@
 # ledger
 
-Repo-local durable source, actuation, and plan ledger with pure validation of governance and review artifacts. Its replay product surface is available on macOS.
+Repo-local artifact and durable-source toolchain. Its replay product surface is
+available on macOS.
 
-`ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only event store that future runs can query through the Ledger API.
-It also owns causal actuation under `--source actuation`, learning capture under `--source learnings`, and, on macOS, replay-campaign evidence under `--source hylo`.
-`ledger validate` checks immutable governance and review artifacts without reading or writing
-any ledger store and without granting execution authority.
+`ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and
+route-exclusion evidence in an append-only event store that future runs can
+query through the Ledger API. It also supports artifact materialization,
+validation, evidence append, and deterministic projection for `$actuating`;
+learning capture under `--source learnings`; and, on macOS, replay-campaign
+evidence under `--source hylo`.
 
-The negative ledger, actuation, learning, and Synesthesia sources, plus the
-macOS-only Hylo source, share one
-storage contract: ordered snapshots, opaque revisions, compare-and-append,
-atomic replacement, exclusive effectful-transition sessions, and logical store
-identity. The current persistent adapter is JSONL, so existing commands, paths,
-stores, and migration workflows remain compatible. A backend change is
-confined to the persistent adapter; migrated source callers do not split lines
-or coordinate storage locks.
+Ledger CLI is not the Evidence Ledger artifact. For an `$actuating` goal,
+`$actuating` owns the Goal Contract interpretation, Construction selection,
+review-finding evaluation, next action, and closure meaning. Ledger performs
+only the requested artifact operation. It does not implement repository
+changes, run or interpret review, select a repair, publish, or grant execution
+authority. CAS owns review attempts, transport, principal proof, and verdicts.
+`$ship` owns public effects and their readback.
+
+The negative ledger, Actuating evidence, learning, and Synesthesia sources,
+plus the macOS-only Hylo source, share one storage contract: ordered snapshots,
+opaque revisions, compare-and-append, atomic replacement, and logical store
+identity. The current persistent adapter is JSONL. A backend change is confined
+to the persistent adapter; source callers do not split lines or coordinate
+storage locks.
 
 Current negative-ledger adapter path:
 
@@ -26,12 +35,6 @@ Current learning-source adapter path:
 
 ```bash
 .ledger/learnings/events.jsonl
-```
-
-Current actuation-source adapter path:
-
-```bash
-.ledger/actuation/events.jsonl
 ```
 
 Current macOS Hylo adapter path:
@@ -107,9 +110,6 @@ make creation collision-safe without rewriting an earlier plan. The
 Universalist source resolves `latest` by the greatest valid plan id; it does
 not maintain a mutable latest pointer.
 
-The actuation store lock sidecar must be Git-ignored before `open`; ignoring
-`.ledger/` covers the default store and lock.
-
 ## Commands
 
 ```bash
@@ -133,10 +133,12 @@ ledger show --source learnings --id lrn-...
 ledger export --source learnings --id lrn-... --format memory-note
 ledger migrate --source learnings --mode copy
 ledger doctor --source learnings
-ledger open --source actuation --json actuation-open.json
-ledger prepare --source actuation --run RUN-ID --json operation.json
-ledger state --source actuation --run RUN-ID
-ledger decide --source actuation --run RUN-ID
+ledger --source actuation --goal GOAL_ID prepare --input operation.json
+ledger --source actuation --goal GOAL_ID append --input artifact-or-evidence.json
+ledger --source actuation --goal GOAL_ID state
+ledger --source actuation --goal GOAL_ID project
+ledger --source actuation --goal GOAL_ID doctor
+ledger --source actuation --goal GOAL_ID path
 ledger --source hylo validate-campaign --campaign campaign.json
 ledger --source hylo fingerprint --input artifact.json
 ledger --source hylo snapshot-target --repo . --revision INDEX --input target-roots.json
@@ -153,9 +155,6 @@ ledger path --source universalist --id 20260711T164436123456789Z-0000
 ledger emit --source universalist --plan PLAN --contract CONTRACT [receipt fields] [--write-plan]
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
-ledger validate review-fold --input review-fold.json
-ledger validate actuation-review-policy --phase preflight --input review-policy.json
-ledger validate review-resolution --phase preflight --input review-resolution.json
 ledger validate hylo-replay-episode --input episode.json
 ledger validate hylo-runner-input --input runner-input.json
 ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
@@ -430,15 +429,12 @@ discriminate among them.
 
 ## Stateless validation
 
-`ledger validate` is the pure validation surface for artifacts that participate
-in planning and review evidence:
+`ledger validate` is the pure validation surface for supported immutable
+artifacts:
 
 ```bash
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
-ledger validate review-fold --input review-fold.json
-ledger validate actuation-review-policy --phase preflight --input review-policy.json
-ledger validate review-resolution --phase preflight --input review-resolution.json
 ledger validate hylo-replay-episode --input episode.json
 ledger validate hylo-runner-input --input runner-input.json
 ledger validate hylo-stimulus --input stimulus.json
@@ -452,13 +448,12 @@ ledger validate hylo-custody-manifest --input custody-manifest.json
 ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
-Input is canonical JSON from a file or `-` for stdin. The general governance
-contracts emit `ledger-validate-decision/v1`; the Actuating contracts emit their
-domain decision schemas and require `--phase preflight|closeout`. Every
-invocation exits `0` for `pass` and `2` for a blocked or malformed artifact.
-Every decision records `authority_granted:false` and `storage_mutated:false`.
-The Hylo validators are schema decisions only; their availability does not
-admit the macOS-only replay or HCTP product routes.
+Input is canonical JSON from a file or `-` for stdin. General governance
+contracts emit `ledger-validate-decision/v1`. Every invocation exits `0` for
+`pass` and `2` for a blocked or malformed artifact. Every decision records
+`authority_granted:false` and `storage_mutated:false`. The Hylo validators are
+schema decisions only; their availability does not admit the macOS-only replay
+or HCTP product routes.
 
 `source-memory-checkpoint/v1` validation requires exactly one Learnings,
 Synesthesia, and Negative Ledger disposition, checks source-specific IDs and
@@ -467,134 +462,82 @@ those results. It validates coordination evidence only: source skills retain
 semantic and mutation authority, and an admission failure after canonical
 success must be represented as `degraded`, never as canonical rollback.
 
-The Actuating review-policy checker preserves `actuation-review-policy/v1`
-same-tuple suffix semantics and also accepts `actuation-review-policy/v2`.
-Version 2 derives the standard clean suffix from an ordered attempt history and
-permits tuple movement only through an `auxiliary-remediation` carry that binds
-the resolution, correctness observations, actuation events, and SHIP receipt.
-Carry transitions preserve credit but never add it, and closeout still requires
-a clean standard attempt plus current auxiliary evidence on the current tuple.
+This is intentionally a command rather than a `--source` namespace. Validation
+is a deterministic observation over one immutable input; it neither authors
+the artifact's meaning nor grants authority.
 
-The review-resolution checker continues to parse historical
-`review-resolution/v1` snapshots while requiring
-`owner-boundary-synthesis/v1` whenever a snapshot contains decisions. A
-decision-free historical snapshot retains its prior result. A decision-bearing
-historical snapshot parses but blocks until it carries resolution history,
-owner syntheses, and synthesis-bound decisions.
-The history goal must match every retained review fold, and every retained
-prior synthesis must join exactly one current component.
+## `$actuating` artifact support
 
-Each synthesis identifies one stable structural component with
-`stable_component_key`. The key is `sha256:` plus the lowercase SHA-256 digest
-of this byte sequence:
+The authoritative per-goal artifacts are the Goal Contract, Counterexample Set,
+Construction Contract, and Evidence Ledger. `$actuating` governs their
+lifecycle: it preserves accepted goal authority, selects the Construction,
+directs its correct-by-construction implementation, evaluates review findings,
+chooses the next action, and interprets closure. `ledger --source actuation` is
+the thin storage and projection adapter `$actuating` invokes; it does not author
+that meaning and is not an implementation or review controller.
+
+Owner observations retain their semantic owner. Recording a CAS verdict or
+`$ship` receipt does not convert it into a Ledger judgment.
+
+Every command is bound to one goal. Its fixed Evidence Ledger path is:
 
 ```text
-owner-boundary-synthesis/boundary-identity/v1\n
-<compact JSON boundary identity>
+<repo>/.ledger/actuation/<safe-goal-id>/evidence.jsonl
 ```
 
-The compact JSON object has the keys `source_worlds`, `target_worlds`,
-`carriers`, `operations`, `observations`, and `laws` in that order. Each array
-is sorted lexicographically before encoding. Generation, review tuple, commit,
-publication, batch, and attempt provenance therefore cannot affect component
-identity.
-
-`reuse-owner` admits only pressure-free local repair and adds no structural
-obligations. `converge-kernel` requires at least one abstraction-pressure
-signal, a canonical owner, and structural obligations; its decisions must use
-`replacement-kernel`. `separate-laws` carries a falsifiable obstruction and
-cannot materialize repair. `blocked` carries a falsifier and cannot materialize
-repair. Every repair decision cites its synthesis, uses the synthesis-owned
-construction, and the resolution materializes exactly one selected work node
-at the canonical owner named by the selected synthesis.
-
-At closeout, every structural obligation needs an `observation_ref`.
-`collapse`, `retire`, and `delegate` targets must be declared and completed as
-semantic-balance retirements; `dominated_remaining` must be empty. The checker
-validates those declarations but does not dereference observation artifacts or
-execute verifier argv.
-
-This is intentionally a command rather than a `--source` namespace. Sources own
-state and event folds; validation is a deterministic observation over one
-immutable input.
-
-## Actuation kernel
-
-`ledger --source actuation` advances one causal kernel transition per invocation. It does not run a recursive controller: `/goal` observes the projected `next_transition` and decides whether to invoke the kernel again.
-
-The workflow is an executable recursion-scheme split:
-
-```text
-coalgebra: current state -> next legal transition
-handler:   prepared capability -> process effect or external-edit reconciliation
-algebra:   prior state + immutable event -> next state
-```
-
-Open a run with authority, exact path scope, and verifier-backed obligations:
-
-```json
-{
-  "schema": "actuation-open/v1",
-  "run_id": "run-1",
-  "goal_id": "goal-1",
-  "goal_contract_digest": "sha256:...",
-  "resolution_digest": null,
-  "source_ref": "user:turn-1",
-  "execution_authority_ref": "user:turn-1",
-  "mutation_allowed": true,
-  "completion": "complete",
-  "allowed_paths": ["src/kernel.zig"],
-  "obligations": [
-    {
-      "id": "obl-test",
-      "kind": "implementation",
-      "statement": "The kernel law tests pass.",
-      "verifier": ["zig", "build", "test-ledger"]
-    }
-  ]
-}
-```
-
-Prepare exactly one operation:
-
-```json
-{
-  "schema": "actuation-operation/v1",
-  "step_id": "step-1",
-  "effect": "edit",
-  "idempotency_key": "run-1:step-1",
-  "owner_boundary": "actuation-kernel",
-  "paths": ["src/kernel.zig"],
-  "obligation_refs": ["obl-test"]
-}
-```
-
-The transition sequence is:
+The current command surface is:
 
 ```bash
-ledger open --source actuation --json actuation-open.json
-ledger prepare --source actuation --run run-1 --json operation.json
-# Perform the admitted edit with the returned capability outstanding.
-ledger record --source actuation --run run-1 --capability AKC1-...
-ledger observe --source actuation --run run-1 --step step-1
-ledger close --source actuation --run run-1
-ledger decide --source actuation --run run-1
+ledger --source actuation --goal GOAL_ID prepare --input operation.json
+ledger --source actuation --goal GOAL_ID append --input artifact-or-evidence.json
+ledger --source actuation --goal GOAL_ID append \
+  --input effect-evidence.json --capability AKC2-...
+ledger --source actuation --goal GOAL_ID state
+ledger --source actuation --goal GOAL_ID project
+ledger --source actuation --goal GOAL_ID doctor
+ledger --source actuation --goal GOAL_ID path
 ```
 
-For `inspect` and `verify`, use `execute` instead of `record` plus `observe`; the kernel runs the admitted verifier directly. Set `completion` to `ready-to-ship` for a generation that hands off to `$ship`, or `complete` for a terminal local/review generation. Supply `resolution_digest` for a review-bound generation. Obligation `kind` is `implementation`, `review`, `ship`, or `acceptance`; `decide` preserves those proof bases separately. It returns `continue` until the run is closed, then projects the selected terminal verdict as `closure-decision/v1`.
+Add `--repo PATH` before `--goal` to locate `.ledger`; the default is `.`. The
+adapter neither invokes Git nor derives subject identity from the repository.
+Actuating supplies `actuating-operation/v1.expected_subject_digest`; `prepare`
+exact-matches that opaque digest to the current structural subject and records
+it in the durable event envelope. `append` accepts
+`goal-contract/v3`, `construction-contract/v1`, `counterexample-set/v1`, or an
+`actuating-evidence-input/v1` observation. Durable evidence uses
+`actuating-evidence-event/v1`.
 
-The kernel:
+`prepare` validates the operation against the current Goal Contract,
+Construction Contract, and expected subject, appends `operation_prepared`,
+returns the raw single-use capability once, and persists only its digest. The
+capability binds later effect evidence; it is not mutation authority. An edit
+must echo the executor-observed `pre_effect_subject_digest`; inspect and verify
+use the event envelope's current subject. Ledger exact-matches those
+caller-owned digests to the current tuple but never computes them. `append`
+materializes and validates a document draft before registering it, or validates
+and records an owner observation. It never performs the reported effect.
+`--capability` is
+required for `effect_recorded` and for a pre-effect `operation_observed`;
+`operation_aborted` is capabilityless exact tuple-and-step recovery that
+invalidates the pending capability digest. Artifact append returns
+`actuating-append-result/v1` with the exact
+canonical artifact, its `artifact_id`, and the registration `event_digest`;
+observation append returns the same schema with `artifact` and `artifact_id` set
+to `null`.
+`state` projects current structural evidence. `project` emits a discardable
+`actuating-structural-evidence-projection/v1` with a digest-derived
+`projection_id`. Both surfaces report `authority_granted:false` and
+`semantic_decision_established:false`; neither computes review credit, a next
+action, or closure.
+`doctor` validates the store and its hash chain. `path` prints the fixed
+goal-local evidence path.
 
-- returns 256-bit capability material once and persists only its SHA-256 digest;
-- rejects duplicate idempotency keys, replay, stale pre-state, path escape, undeclared path movement, verifier substitution, verifier-side repository mutation, and uncovered closure obligations;
-- executes the verifier declared by the obligation rather than accepting a caller-supplied success flag;
-- folds a globally sequenced, predecessor-hashed `actuation-event/v1` chain into one run state;
-- derives both continuation and terminal closure decisions in Zig from that folded state;
-- exits `2` when an executed observation fails and `0` when it passes.
-
-A repo-local process cannot physically intercept in-app mutation tools. Edit effects are therefore admitted before mutation and independently reconciled afterward. The kernel establishes causal admission and observed path conservation; it does not claim to be an OS sandbox.
-
-The returned capability is a causal single-use token, not a secret-transport claim. Automation should capture the `prepare` result without echoing the raw value and consume it promptly; command-line and transcript confidentiality remain caller/runtime responsibilities.
+Repository tools perform implementation and verification. CAS returns review
+attempt and verdict evidence. `$review-fold` classifies findings into a
+Counterexample Set; `$actuating` evaluates that set, selects any successor
+Construction, and chooses the next action.
+`$ship` performs and reads back public effects. Ledger may record their
+evidence only when `$actuating` requests it.
 
 Path migration:
 
