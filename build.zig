@@ -1350,13 +1350,54 @@ pub fn build(b: *std.Build) void {
     test_hctp_conformance.dependOn(test_hctp_conformance_backends);
     test_hctp_conformance.dependOn(&run_hylo_operator_recipe.step);
     if (run_hylo_operator_recipe_macos_runtime) |run| test_hctp_conformance.dependOn(&run.step);
+    const test_hylo_qualification_contracts = b.step(
+        "test-hylo-qualification-contracts",
+        "Run the contract, fold, proof, and legacy-compatibility Hylo qualification shard",
+    );
+    test_hylo_qualification_contracts.dependOn(&run_hctp_contract_tests.step);
+    test_hylo_qualification_contracts.dependOn(&run_hctp_fold_tests.step);
+    test_hylo_qualification_contracts.dependOn(&run_hylo_proof_tests.step);
+    test_hylo_qualification_contracts.dependOn(&run_hctp_legacy_compat.step);
+    const test_hylo_qualification_section36 = b.step(
+        "test-hylo-qualification-section36",
+        "Run the store-independent and Hylo-owned Section 36 qualification shard",
+    );
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_registration.step);
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_execution.step);
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_grading.step);
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_retrace_holdout.step);
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_manifest.step);
+    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_hylo.step);
+    test_hylo_qualification_section36.dependOn(&run_hylo_operator_recipe.step);
+    const test_hylo_qualification_memory = b.step(
+        "test-hylo-qualification-memory",
+        "Run the memory EventStore qualification shard",
+    );
+    test_hylo_qualification_memory.dependOn(test_hctp_conformance_memory);
+    const test_hylo_qualification_persistent = b.step(
+        "test-hylo-qualification-persistent",
+        "Run the persistent EventStore qualification shard",
+    );
+    test_hylo_qualification_persistent.dependOn(test_hctp_conformance_persistent);
+    const test_hylo_qualification_runtime = b.step(
+        "test-hylo-qualification-runtime",
+        "Run the subprocess-backed integration and operator qualification shard",
+    );
+    test_hylo_qualification_runtime.dependOn(test_hctp_integration);
+    if (run_hylo_operator_recipe_macos_runtime) |run| {
+        test_hylo_qualification_runtime.dependOn(&run.step);
+    }
+    const test_hylo_qualification_core = b.step(
+        "test-hylo-qualification-core",
+        "Run the non-backend Hylo qualification shard",
+    );
+    test_hylo_qualification_core.dependOn(test_hylo_qualification_contracts);
+    test_hylo_qualification_core.dependOn(test_hylo_qualification_section36);
+    test_hylo_qualification_core.dependOn(test_hylo_qualification_runtime);
     const test_hylo = b.step("test-hylo", "Run HCTP-v1 contract and fold tests");
-    test_hylo.dependOn(&run_hctp_contract_tests.step);
-    test_hylo.dependOn(&run_hctp_fold_tests.step);
-    test_hylo.dependOn(&run_hylo_proof_tests.step);
-    test_hylo.dependOn(&run_hctp_legacy_compat.step);
-    test_hylo.dependOn(test_hctp_conformance);
-    test_hylo.dependOn(test_hctp_integration);
+    test_hylo.dependOn(test_hylo_qualification_core);
+    test_hylo.dependOn(test_hylo_qualification_memory);
+    test_hylo.dependOn(test_hylo_qualification_persistent);
     const run_memory_note_tests = addTestStep(
         b,
         memory_note_root,

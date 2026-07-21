@@ -42,10 +42,12 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  qualify:
+  bind:
     if: inputs.qualification_run_id == null || inputs.qualification_run_id == ''
-    runs-on: macos-latest
-    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.bind.outputs.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -72,24 +74,60 @@ jobs:
             exit 1
           fi
 
+  qualify:
+    needs: bind
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - core
+          - memory
+          - persistent
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.bind.outputs.sha }}
+          persist-credentials: false
+
+      - name: Rebind shard to the qualified commit
+        shell: bash
+        env:
+          QUALIFIED_SHA: ${{ needs.bind.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "${actual_sha}" != "${QUALIFIED_SHA}" ]; then
+            echo "Qualification shard SHA mismatch: got ${actual_sha}, expected ${QUALIFIED_SHA}" >&2
+            exit 1
+          fi
+
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
           use-cache: false
 
-      - id: full
-        name: Run full Hylo qualification
+      - name: Run Hylo qualification shard
         env:
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-local-cache
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
-        run: zig build test-hylo -j2 --summary all
+        run: zig build test-hylo-qualification-${{ matrix.shard }} -j2 --summary all
 
+  receipt:
+    if: >-
+      always() &&
+      (inputs.qualification_run_id == null || inputs.qualification_run_id == '') &&
+      needs.bind.result == 'success'
+    needs: [bind, qualify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Record exact-SHA qualification receipt
-        if: always() && steps.bind.outputs.sha != ''
         shell: bash
         env:
-          QUALIFIED_SHA: ${{ steps.bind.outputs.sha }}
-          RESULT: ${{ steps.full.outcome }}
+          QUALIFIED_SHA: ${{ needs.bind.outputs.sha }}
+          RESULT: ${{ needs.qualify.result }}
         run: |
           set -euo pipefail
           # shellcheck disable=SC2016
@@ -104,7 +142,7 @@ jobs:
               qualified_sha: $qualified_sha,
               result: $result,
               run_id: $run_id,
-              command: "zig build test-hylo -j2 --summary all"
+              command: "zig build test-hylo-qualification-{core,memory,persistent} -j2 --summary all; isolated matrix"
             }' > hylo-qualification-receipt.json
 
           printf -- '- SHA: %s\n- Result: %s\n- Run: %s/%s/actions/runs/%s\n' \
@@ -112,10 +150,10 @@ jobs:
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload exact-SHA qualification receipt
-        if: always() && steps.bind.outputs.sha != ''
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: hylo-qualification-${{ steps.bind.outputs.sha }}
+          name: hylo-qualification-${{ needs.bind.outputs.sha }}
           path: hylo-qualification-receipt.json
           if-no-files-found: error
           overwrite: true
@@ -200,7 +238,7 @@ jobs:
              .qualified_sha == $expected_sha and
              .result == "success" and
              .run_id == $run_id and
-             .command == "zig build test-hylo -j2 --summary all"' \
+             .command == "zig build test-hylo-qualification-{core,memory,persistent} -j2 --summary all; isolated matrix"' \
             "${receipts[0]}" >/dev/null
 
           printf -- '- Reused qualification: %s/%s/actions/runs/%s\n- SHA: %s\n' \

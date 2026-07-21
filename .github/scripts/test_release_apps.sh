@@ -25,12 +25,38 @@ done
 
 for required_qualification_edge in \
   'test_hctp_conformance.dependOn(&run_hylo_operator_recipe.step);' \
-  'test_hylo.dependOn(test_hctp_conformance);'; do
+  'test_hylo_qualification_contracts.dependOn(&run_hctp_contract_tests.step);' \
+  'test_hylo_qualification_contracts.dependOn(&run_hctp_fold_tests.step);' \
+  'test_hylo_qualification_contracts.dependOn(&run_hylo_proof_tests.step);' \
+  'test_hylo_qualification_contracts.dependOn(&run_hctp_legacy_compat.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_registration.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_execution.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_grading.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_retrace_holdout.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_manifest.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_hylo.step);' \
+  'test_hylo_qualification_section36.dependOn(&run_hylo_operator_recipe.step);' \
+  'test_hylo_qualification_memory.dependOn(test_hctp_conformance_memory);' \
+  'test_hylo_qualification_persistent.dependOn(test_hctp_conformance_persistent);' \
+  'test_hylo_qualification_runtime.dependOn(test_hctp_integration);' \
+  'test_hylo_qualification_runtime.dependOn(&run.step);' \
+  'test_hylo_qualification_core.dependOn(test_hylo_qualification_contracts);' \
+  'test_hylo_qualification_core.dependOn(test_hylo_qualification_section36);' \
+  'test_hylo_qualification_core.dependOn(test_hylo_qualification_runtime);' \
+  'test_hylo.dependOn(test_hylo_qualification_core);' \
+  'test_hylo.dependOn(test_hylo_qualification_memory);' \
+  'test_hylo.dependOn(test_hylo_qualification_persistent);'; do
   if ! grep -Fq "$required_qualification_edge" "$build_graph"; then
-    echo "Hylo qualification graph missing operator-recipe edge: $required_qualification_edge" >&2
+    echo "Hylo qualification graph missing build edge: $required_qualification_edge" >&2
     exit 1
   fi
 done
+
+qualification_edge_count="$(grep -Ec '^    test_hylo\.dependOn\(' "$build_graph")"
+if [[ "$qualification_edge_count" != "3" ]]; then
+  echo "test-hylo must compose exactly the three build-owned qualification shards" >&2
+  exit 1
+fi
 
 for app in seq cas ledger; do
   workflow="$repo_root/.github/workflows/release-${app}.yml"
@@ -85,7 +111,16 @@ for required_qualification_token in \
   'workflow_call:' \
   'schedule:' \
   'workflow_dispatch:' \
-  'run: zig build test-hylo -j2 --summary all' \
+  'fail-fast: false' \
+  '          - core' \
+  '          - memory' \
+  '          - persistent' \
+  'run: zig build test-hylo-qualification-${{ matrix.shard }} -j2 --summary all' \
+  'ref: ${{ needs.bind.outputs.sha }}' \
+  'needs: [bind, qualify]' \
+  "needs.bind.result == 'success'" \
+  'RESULT: ${{ needs.qualify.result }}' \
+  'command: "zig build test-hylo-qualification-{core,memory,persistent} -j2 --summary all; isolated matrix"' \
   'schema: "hylo-qualification-receipt/v1"' \
   '.path == ".github/workflows/auto-release.yml"' \
   '.qualified_sha == $expected_sha' \
@@ -95,6 +130,15 @@ for required_qualification_token in \
     exit 1
   fi
 done
+
+qualification_shard_count="$(
+  sed -n '/^        shard:$/,/^    steps:$/p' "$qualification_workflow" |
+    grep -Ec '^          - [a-z0-9-]+$'
+)"
+if [[ "$qualification_shard_count" != "3" ]]; then
+  echo "shared Hylo qualification workflow must enumerate exactly three shards" >&2
+  exit 1
+fi
 
 for required_auto_release_token in \
   'uses: ./.github/workflows/release-hylo-qualification.yml' \

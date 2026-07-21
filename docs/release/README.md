@@ -80,6 +80,13 @@ pure and does not grant runtime authority.
 Full Hylo qualification is also available on a weekly schedule and through
 manual dispatch of `.github/workflows/release-hylo-qualification.yml`. Those
 advisory runs produce exact-SHA receipts but grant no publication authority.
+Publication qualification runs three build-owned shards on isolated macOS
+runners: core, memory, and persistent. The core retains the original contract,
+Section 36, integration, and operator graph. Each runner keeps Zig at `-j2`;
+the workflow emits a successful receipt only after every shard passes on the
+same exact commit. The canonical local fallback remains
+`zig build test-hylo -j2 --summary all`, whose dependency graph is the union of
+those three shards.
 
 ## Homebrew Tap Handoff
 
