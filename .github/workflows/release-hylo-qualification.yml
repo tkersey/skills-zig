@@ -77,17 +77,13 @@ jobs:
   qualify:
     needs: bind
     runs-on: macos-latest
-    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shard: core
-            timeout_minutes: 7
-          - shard: memory
-            timeout_minutes: 5
-          - shard: persistent
-            timeout_minutes: 5
+        shard:
+          - core
+          - memory
+          - persistent
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

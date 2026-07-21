@@ -131,10 +131,9 @@ for required_qualification_token in \
   'schedule:' \
   'workflow_dispatch:' \
   'fail-fast: false' \
-  'timeout-minutes: ${{ matrix.timeout_minutes }}' \
-  '          - shard: core' \
-  '          - shard: memory' \
-  '          - shard: persistent' \
+  '          - core' \
+  '          - memory' \
+  '          - persistent' \
   'run: zig build test-hylo-qualification-${{ matrix.shard }} -Doptimize=ReleaseSafe -j2 --summary all' \
   'ref: ${{ needs.bind.outputs.sha }}' \
   'needs: [bind, qualify]' \
@@ -168,34 +167,19 @@ if grep -R -E 'builtin\.(mode|optimize_mode)' \
 fi
 
 qualification_shard_count="$(
-  sed -n '/^        include:$/,/^    steps:$/p' "$qualification_workflow" |
-    grep -Ec '^          - shard: [a-z0-9-]+$'
+  sed -n '/^        shard:$/,/^    steps:$/p' "$qualification_workflow" |
+    grep -Ec '^          - [a-z0-9-]+$'
 )"
 if [[ "$qualification_shard_count" != "3" ]]; then
   echo "shared Hylo qualification workflow must enumerate exactly three shards" >&2
   exit 1
 fi
 
-for shard_budget in 'core 7' 'memory 5' 'persistent 5'; do
-  read -r shard timeout <<<"$shard_budget"
-  if ! awk -v shard="$shard" -v timeout="$timeout" '
-    $0 == "          - shard: " shard {
-      getline
-      if ($0 == "            timeout_minutes: " timeout) found = 1
-    }
-    END { exit found ? 0 : 1 }
-  ' "$qualification_workflow"; then
-    echo "qualification shard $shard must retain its measured ${timeout}-minute budget" >&2
-    exit 1
-  fi
-done
-
-qualification_timeout_budget="$(
-  sed -n '/^        include:$/,/^    steps:$/p' "$qualification_workflow" |
-    awk '/^            timeout_minutes: [0-9]+$/ { total += $2; count += 1 } END { print count ":" total }'
+qualification_job_header="$(
+  sed -n '/^  qualify:$/,/^    steps:$/p' "$qualification_workflow"
 )"
-if [[ "$qualification_timeout_budget" != "3:17" ]]; then
-  echo "qualification must retain three measured shard budgets and a 17 runner-minute timeout ceiling" >&2
+if grep -Eq 'timeout-minutes|timeout_minutes' <<<"$qualification_job_header"; then
+  echo "qualification proof shards must run to natural completion without wall-clock deadlines" >&2
   exit 1
 fi
 
