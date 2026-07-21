@@ -10,12 +10,18 @@ on:
         description: Release tag to publish
         required: true
         type: string
+      qualification_run_id:
+        description: Optional trusted Auto Release run containing the exact-SHA Hylo receipt
+        required: false
+        default: ""
+        type: string
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -23,6 +29,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  hylo-qualification:
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-hylo-qualification.yml
+    with:
+      source_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
+      expected_sha: ${{ github.sha }}
+      expected_caller_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
+      qualification_run_id: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.qualification_run_id || '' }}
+
   release:
     strategy:
       fail-fast: false
@@ -40,7 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ github.sha }}
       - name: Validate ledger tag matches VERSION
         run: |
           expected_tag="ledger-v$(tr -d '[:space:]' < apps/ledger/VERSION)"
@@ -156,7 +173,7 @@ jobs:
           overwrite: false
 
   publish:
-    needs: release
+    needs: [release, hylo-qualification]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -180,6 +197,26 @@ jobs:
       - name: Publish ledger release assets
         run: |
           set -euo pipefail
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          object_type="$(jq -r '.object.type' <<<"${ref_json}")"
+          tag_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
+          for _ in 1 2 3 4; do
+            if [ "${object_type}" = "commit" ]; then
+              break
+            fi
+            if [ "${object_type}" != "tag" ]; then
+              echo "Release tag resolves to unsupported Git object type: ${object_type}" >&2
+              exit 1
+            fi
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}")"
+            object_type="$(jq -r '.object.type' <<<"${tag_json}")"
+            tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
+          done
+          if [ "${object_type}" != "commit" ] || [ "${tag_sha}" != "${GITHUB_SHA}" ]; then
+            echo "Release tag does not resolve to qualified commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
+            exit 1
+          fi
+
           mapfile -d '' assets < <(find release-assets -type f -name '*.tar.gz' -print0 | sort -z)
           if gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber

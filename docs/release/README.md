@@ -32,8 +32,9 @@ Release contract:
    - `libs/execution_policy_core/**` counts for its shipped consumer: `seq`.
    - `libs/retrace_core/**` and `testdata/hctp-v1/**` count for the HCTP consumers: `seq`, `cas`, and `ledger`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
+   - `.github/workflows/release-hylo-qualification.yml` counts for `seq`, `cas`, and `ledger` because it gates their publication authority.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
-3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
+3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` runs one full Hylo qualification for the exact commit if a Seq, CAS, or Ledger version changed. It then creates any missing tags and dispatches the matching release workflows with the exact-SHA qualification receipt. Direct tag and manual release runs perform the same qualification when no trusted Auto Release receipt is supplied. A manual release dispatch must select the release tag as its workflow ref and pass the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`; a dispatch from `main` fails closed.
 4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Seq's release workflow must also initialize Zig 0.16's ZIP package-cache directory before a clean-runner fetch.
 
@@ -76,6 +77,10 @@ archives, but their non-Darwin binaries do not advertise or route HCTP/CRF
 product commands. Stateless `ledger validate hylo-*` schema validation remains
 pure and does not grant runtime authority.
 
+Full Hylo qualification is also available on a weekly schedule and through
+manual dispatch of `.github/workflows/release-hylo-qualification.yml`. Those
+advisory runs produce exact-SHA receipts but grant no publication authority.
+
 ## Homebrew Tap Handoff
 
 Homebrew formula updates are intentionally handled in a separate tap repository.
@@ -116,11 +121,12 @@ curl -fsSL https://www.githubstatus.com/api/v2/components.json \
 If GitHub Actions is degraded/outage and tag runs remain queued, publish manually so tap
 propagation is not blocked:
 
-1. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`), preserving the Darwin-only `cas_trial` payload rule.
-2. Create the release directly on the existing tag:
+1. On a clean macOS checkout of the exact release tag, run `zig build test-hylo -j2 --summary all` and retain the successful command output with the tag commit SHA.
+2. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`), preserving the Darwin-only `cas_trial` payload rule.
+3. Create the release directly on the existing tag:
    - `gh release create <tag> <asset1> <asset2> --verify-tag`
-3. Update `homebrew-tap` formula version + SHA256 from the published assets.
-4. Prove end-to-end with:
+4. Update `homebrew-tap` formula version + SHA256 from the published assets.
+5. Prove end-to-end with:
    - `brew audit --strict tkersey/tap/<cli>`
    - `brew upgrade --formula tkersey/tap/<cli>`
    - `brew test tkersey/tap/<cli>`

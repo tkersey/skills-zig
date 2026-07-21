@@ -276,29 +276,6 @@ jobs:
       - name: Test CAS archive verifier with macOS tar
         run: .github/scripts/test_verify_cas_archive.sh
 
-  hctp-product-macos:
-    needs: changes
-    if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.cas == 'true' || needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - name: Test macOS HCTP product and operator-recipe conformance
-        run: zig build test-hylo test-hctp-conformance -j1 --summary all
-      - name: Test sealed commitments after the operator-recipe aggregate
-        run: zig build test-hctp-sealed-commitments --summary all
-      - name: Verify macOS seq command and capability admission
-        run: |
-          (cd apps/seq && zig build -Doptimize=ReleaseFast --summary all)
-          apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
-          zig build test-hylo-operator-recipe-seq-release-runtime \
-            -Dhylo-operator-seq-path="${PWD}/apps/seq/zig-out/bin/seq" \
-            --summary all
-
   cas-fuzz-linux:
     needs: changes
     if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
@@ -336,9 +313,9 @@ jobs:
         with:
           version: 0.16.0
       - name: Build ledger
-        run: zig build build-ledger -Doptimize=ReleaseFast
+        run: zig build build-ledger
       - name: Test generic ledger and portable validators
-        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia test-hylo-operator-recipe --summary all
+        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia --summary all
 
   memory-note:
     needs: changes

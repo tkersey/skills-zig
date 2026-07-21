@@ -327,6 +327,11 @@ case "$mode" in
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
+        .github/workflows/release-hylo-qualification.yml)
+          mark_app seq
+          mark_app cas
+          mark_app ledger
+          ;;
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;

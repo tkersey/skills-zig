@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       affected_json: ${{ steps.detect.outputs.affected_json }}
+      hylo_release_required: ${{ steps.detect.outputs.hylo_release_required }}
       version_changed_json: ${{ steps.detect.outputs.version_changed_json }}
     steps:
       - uses: actions/checkout@v5
@@ -43,9 +44,14 @@ jobs:
           version_changed="$("./.github/scripts/release_apps.sh" version-changed "$base" "$head")"
           affected_json="$(printf '%s\n' "$affected" | jq -Rsc 'split("\n") | map(select(length > 0))')"
           version_changed_json="$(printf '%s\n' "$version_changed" | jq -Rsc 'split("\n") | map(select(length > 0))')"
-          echo "affected_json=$affected_json" >> "$GITHUB_OUTPUT"
-          echo "version_changed_json=$version_changed_json" >> "$GITHUB_OUTPUT"
+          hylo_release_required="$(jq -r 'any(.[]; . == "seq" or . == "cas" or . == "ledger")' <<< "$version_changed_json")"
+          {
+            echo "affected_json=$affected_json"
+            echo "hylo_release_required=$hylo_release_required"
+            echo "version_changed_json=$version_changed_json"
+          } >> "$GITHUB_OUTPUT"
           echo "affected=$affected_json"
+          echo "hylo_release_required=$hylo_release_required"
           echo "version_changed=$version_changed_json"
 
   contract:
@@ -74,11 +80,30 @@ jobs:
             exit 1
           fi
 
+  hylo-qualification:
+    needs:
+      - detect
+      - contract
+    if: needs.detect.outputs.hylo_release_required == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-hylo-qualification.yml
+    with:
+      source_ref: ${{ github.sha }}
+      expected_sha: ${{ github.sha }}
+      expected_caller_ref: ${{ github.ref }}
+
   dispatch:
     needs:
       - detect
       - contract
-    if: needs.detect.outputs.version_changed_json != '[]'
+      - hylo-qualification
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      (needs.contract.result == 'success' || needs.contract.result == 'skipped') &&
+      needs.detect.outputs.version_changed_json != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,6 +112,15 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Require Hylo qualification for publication-bound CLIs
+        if: matrix.app == 'seq' || matrix.app == 'cas' || matrix.app == 'ledger'
+        env:
+          QUALIFICATION_RESULT: ${{ needs.hylo-qualification.result }}
+        run: |
+          if [ "${QUALIFICATION_RESULT}" != "success" ]; then
+            echo "Hylo qualification did not succeed for ${{ matrix.app }}: ${QUALIFICATION_RESULT}" >&2
+            exit 1
+          fi
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -125,7 +159,14 @@ jobs:
         if: steps.tag.outputs.dispatch == 'true'
         run: |
           set -euo pipefail
-          gh workflow run "release-${{ matrix.app }}.yml" \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref main \
-            -f tag_name="${{ steps.tag.outputs.tag }}"
+          workflow_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --ref "${{ steps.tag.outputs.tag }}"
+            -f "tag_name=${{ steps.tag.outputs.tag }}"
+          )
+          case "${{ matrix.app }}" in
+            seq|cas|ledger)
+              workflow_args+=(-f "qualification_run_id=${GITHUB_RUN_ID}")
+              ;;
+          esac
+          gh workflow run "release-${{ matrix.app }}.yml" "${workflow_args[@]}"

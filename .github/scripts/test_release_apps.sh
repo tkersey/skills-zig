@@ -23,12 +23,22 @@ for required_edge in \
   fi
 done
 
+for required_qualification_edge in \
+  'test_hctp_conformance.dependOn(&run_hylo_operator_recipe.step);' \
+  'test_hylo.dependOn(test_hctp_conformance);'; do
+  if ! grep -Fq "$required_qualification_edge" "$build_graph"; then
+    echo "Hylo qualification graph missing operator-recipe edge: $required_qualification_edge" >&2
+    exit 1
+  fi
+done
+
 for app in seq cas ledger; do
   workflow="$repo_root/.github/workflows/release-${app}.yml"
   if ! grep -Fq 'zig_target:' "$workflow" ||
     ! grep -Fq -- '-Dtarget=${{ matrix.zig_target }}' "$workflow" ||
-    ! grep -Fq -- '-Dcpu=baseline' "$workflow"; then
-    echo "release workflow must bind ${app} artifacts to an explicit target and baseline CPU" >&2
+    ! grep -Fq -- '-Dcpu=baseline' "$workflow" ||
+    ! grep -Fq -- '-Doptimize=ReleaseFast' "$workflow"; then
+    echo "release workflow must bind ${app} artifacts to an explicit target, baseline CPU, and ReleaseFast optimization" >&2
     exit 1
   fi
 done
@@ -45,6 +55,75 @@ if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]
   echo "Seq release metadata mismatch: VERSION=$seq_version build.zig.zon=$seq_manifest_version" >&2
   exit 1
 fi
+
+pr_workflow="$repo_root/.github/workflows/pr-ci.yml"
+qualification_workflow="$repo_root/.github/workflows/release-hylo-qualification.yml"
+auto_release_workflow="$repo_root/.github/workflows/auto-release.yml"
+
+if grep -Fq '  hctp-product-macos:' "$pr_workflow" ||
+  grep -Eq '(^|[^[:alnum:]_-])test-hylo([^[:alnum:]_-]|$)' "$pr_workflow"; then
+  echo "PR CI must not run exhaustive Hylo qualification" >&2
+  exit 1
+fi
+
+if grep -Fq 'zig build build-ledger -Doptimize=ReleaseFast' "$pr_workflow" ||
+  grep -Fq 'test-hylo-operator-recipe' "$pr_workflow"; then
+  echo "Ledger PR admission must not run release optimization or Hylo qualification" >&2
+  exit 1
+fi
+
+for required_ledger_pr_command in \
+  'run: zig build build-ledger' \
+  'run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia --summary all'; do
+  if ! grep -Fq "$required_ledger_pr_command" "$pr_workflow"; then
+    echo "Ledger PR admission command missing: $required_ledger_pr_command" >&2
+    exit 1
+  fi
+done
+
+for required_qualification_token in \
+  'workflow_call:' \
+  'schedule:' \
+  'workflow_dispatch:' \
+  'run: zig build test-hylo -j2 --summary all' \
+  'schema: "hylo-qualification-receipt/v1"' \
+  '.path == ".github/workflows/auto-release.yml"' \
+  '.qualified_sha == $expected_sha' \
+  '.result == "success"'; do
+  if ! grep -Fq "$required_qualification_token" "$qualification_workflow"; then
+    echo "shared Hylo qualification workflow missing: $required_qualification_token" >&2
+    exit 1
+  fi
+done
+
+for required_auto_release_token in \
+  'uses: ./.github/workflows/release-hylo-qualification.yml' \
+  'source_ref: ${{ github.sha }}' \
+  'expected_sha: ${{ github.sha }}' \
+  'Require Hylo qualification for publication-bound CLIs' \
+  '--ref "${{ steps.tag.outputs.tag }}"' \
+  'workflow_args+=(-f "qualification_run_id=${GITHUB_RUN_ID}")'; do
+  if ! grep -Fq -- "$required_auto_release_token" "$auto_release_workflow"; then
+    echo "Auto Release qualification wiring missing: $required_auto_release_token" >&2
+    exit 1
+  fi
+done
+
+for app in seq cas ledger; do
+  workflow="$repo_root/.github/workflows/release-${app}.yml"
+  for required_release_token in \
+    'uses: ./.github/workflows/release-hylo-qualification.yml' \
+    'ref: ${{ github.sha }}' \
+    'expected_sha: ${{ github.sha }}' \
+    'qualification_run_id: ${{ github.event_name == '\''workflow_dispatch'\'' && github.event.inputs.qualification_run_id || '\'''\'' }}' \
+    'needs: [release, hylo-qualification]' \
+    'Release tag does not resolve to qualified commit ${GITHUB_SHA}'; do
+    if ! grep -Fq "$required_release_token" "$workflow"; then
+      echo "${app} publication qualification wiring missing: $required_release_token" >&2
+      exit 1
+    fi
+  done
+done
 
 git -C "$tmp" init --quiet
 git -C "$tmp" config user.name "Release Classifier Test"
@@ -247,6 +326,7 @@ assert_case "apps/cas/scripts/cas_trial.zig" "cas"
 assert_case "apps/lift/src/main.zig" "lift"
 assert_case "apps/img/src/main.zig" "img"
 assert_case ".github/workflows/release-img.yml" "img"
+assert_case ".github/workflows/release-hylo-qualification.yml" "seq,cas,ledger"
 assert_case ".github/scripts/verify_cas_archive.sh" "cas"
 assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
 assert_version_case "apps/img/VERSION" "img"
@@ -256,4 +336,4 @@ assert_cas_trial_macos_runtime_build_hunk
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 17/17 cases passed"
+echo "release app classifier: 18/18 cases passed"
