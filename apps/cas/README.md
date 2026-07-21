@@ -77,7 +77,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now prefers a CAS-managed loopback websocket app-server per instance, falling back to stdio when websocket bootstrap or handshake fails. Result rows and summaries now report the selected transport.
-- `cas_instance_runner` accepts `--multi-agent-mode explicit-request-only|proactive` for `thread/start` and `turn/start` request probes. It rejects unsupported methods and duplicate `multiAgentMode` params.
+- `cas_instance_runner` and `cas review` reject the retired `--multi-agent-mode` option. Codex 0.145 ignores the corresponding request field, so CAS no longer transmits it or grants effectiveness or metric credit. Configure canonical `[agents]` settings and current Codex reasoning effort instead. Generic `--params-json` remains caller-owned and receives no CAS mode certification.
 - `cas_smoke_check`, `cas_instance_runner`, `cas review`, and `cas_conformance_suite` accept `--hooks inherit|off|require-observed`. `inherit` is the default, `off` starts CAS-owned app-servers with `--disable codex_hooks`, and `require-observed` fails with `hook_not_observed` when no `hook/started` or `hook/completed` notifications were captured.
 - JSON outputs include `hookSummary` on hook-aware lanes. Bad observed hook statuses fail closed with precedence `hook_blocked`, then `hook_failed`, then `hook_stopped`; unsupported hook-capable runtime surfaces fail with `hooks_unsupported`.
 - `cas_instance_runner` supports native responses for:
@@ -93,8 +93,10 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review run` and `start` accept an optional `--workflow-binding-json JSON|@FILE` containing caller-owned `requestId` and `requestFingerprint` strings. CAS validates the opaque binding, binds it to the attempt identity, and returns it unchanged.
 - `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied text as fresh-parent `developerInstructions` and sends the Git selector separately as `review/start.target`; the selector remains the source of base/head/fingerprint identity.
 - Review waits default to `2700000` ms. Detached `start` defaults to `300000` ms unless `--wait` is supplied. An explicit positive `--timeout-ms` value always wins.
+- On Codex 0.145 and newer, CAS sets `excludeTurns:true` on metadata-only `thread/resume` requests. Older runtimes retain the prior parameter shape.
 - `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It validates DCP-v2/RIP-v1 inputs, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
+- Thread-backed inquiry rejects paginated source history before `thread/fork`, which Codex 0.145 does not support. Use a legacy-history thread or the verified `rollout_transcript` lineage.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports both `thread_fork_replay` and `rollout_transcript_replay` support.
 - `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, and `cas_review_scoped_instructions_v1`.
@@ -210,7 +212,6 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --cwd /path/to/workspace \
   --method turn/start \
   --params-json '{"threadId":"thr_123","input":[{"type":"text","text":"summarize the repo"}]}' \
-  --multi-agent-mode proactive \
   --json
 
 # Grant requested permissions for the current request and accept an elicitation payload.

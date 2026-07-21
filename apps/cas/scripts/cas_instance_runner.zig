@@ -26,7 +26,7 @@ const UsageText =
     \\  --method NAME                       App-server method (default: thread/list).
     \\  --params-json JSON                  Params as inline JSON.
     \\  --params-file PATH                  Params from JSON file.
-    \\  --multi-agent-mode MODE             explicit-request-only|proactive for thread/start or turn/start.
+    \\  --multi-agent-mode MODE             Removed: use Codex reasoning effort and canonical agent config.
     \\  --state-file-dir DIR                Per-instance state files (optional).
     \\  --request-timeout-ms N              Accepted for parity.
     \\  --server-request-timeout-ms N       Forwarded server-request timeout.
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const opts = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), usageDetailForParseError(err));
     };
 
     if (opts.show_version) {
@@ -137,8 +137,7 @@ pub fn main(init: std.process.Init) !void {
         try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel instances may share it. Use --state-file-dir for per-instance state isolation.\n");
     }
 
-    const mode_support = multiAgentModeSupport(opts.method, opts.multi_agent_mode);
-    const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file, opts.multi_agent_mode);
+    const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
     defer allocator.free(params);
     _ = opts.request_timeout_ms;
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch "codex";
@@ -351,10 +350,10 @@ pub fn main(init: std.process.Init) !void {
         .state_file_dir = opts.state_file_dir,
         .method = opts.method,
         .params = params,
-        .requestedMultiAgentMode = if (opts.multi_agent_mode) |mode| mode.configValue() else null,
-        .effectiveMultiAgentMode = if (mode_support == .proven) opts.multi_agent_mode.?.configValue() else null,
-        .multiAgentModeSupport = mode_support.asString(),
-        .multiAgentModeMetricEligible = opts.multi_agent_mode == .proactive and mode_support == .proven,
+        .requestedMultiAgentMode = @as(?[]const u8, null),
+        .effectiveMultiAgentMode = @as(?[]const u8, null),
+        .multiAgentModeSupport = cas.MultiAgentModeSupport.not_requested.asString(),
+        .multiAgentModeMetricEligible = false,
         .instances_requested = opts.instances,
         .instances_started = instances_started,
         .start_failures = start_failures.items,
@@ -557,9 +556,17 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     }
 
     if (out.params_json != null and out.params_file != null) return error.DuplicateParamsSource;
-    if (multiAgentModeSupport(out.method, out.multi_agent_mode) == .unsupported) return error.MultiAgentModeUnsupportedMethod;
+    if (out.multi_agent_mode != null) return error.MultiAgentModeRemoved;
     out.opt_out_methods = try methods.toOwnedSlice(allocator);
     return out;
+}
+
+fn usageDetailForParseError(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.MultiAgentModeRemoved => "Codex 0.145 ignores request-scoped multiAgentMode; configure [agents] " ++
+            "in config.toml and use the current Codex reasoning-effort controls instead.",
+        else => null,
+    };
 }
 
 fn buildParamsJson(
@@ -567,63 +574,22 @@ fn buildParamsJson(
     method: []const u8,
     params_json: ?[]const u8,
     params_file: ?[]const u8,
-    multi_agent_mode: ?cas.MultiAgentMode,
 ) ![]u8 {
     if (params_json) |raw| {
         var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed_json.deinit();
-        if (multi_agent_mode) |mode| return addMultiAgentModeToParamsJson(allocator, raw, parsed_json.value, mode);
         return allocator.dupe(u8, raw);
     }
     if (params_file) |path| {
         const raw = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(4 * 1024 * 1024));
         var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed_json.deinit();
-        if (multi_agent_mode) |mode| {
-            defer allocator.free(raw);
-            return addMultiAgentModeToParamsJson(allocator, raw, parsed_json.value, mode);
-        }
         return raw;
     }
     if (std.mem.eql(u8, method, "thread/list")) {
         return allocator.dupe(u8, "{\"cursor\":null,\"limit\":1}");
     }
-    if (multi_agent_mode) |mode| {
-        return std.fmt.allocPrint(allocator, "{{\"multiAgentMode\":\"{s}\"}}", .{mode.wireValue()});
-    }
     return allocator.dupe(u8, "{}");
-}
-
-fn multiAgentModeSupport(method: []const u8, mode: ?cas.MultiAgentMode) cas.MultiAgentModeSupport {
-    if (mode == null) return .not_requested;
-    if (std.mem.eql(u8, method, "thread/start") or std.mem.eql(u8, method, "turn/start")) return .proven;
-    return .unsupported;
-}
-
-fn addMultiAgentModeToParamsJson(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    value: std.json.Value,
-    mode: cas.MultiAgentMode,
-) ![]u8 {
-    const obj = switch (value) {
-        .object => |object| object,
-        else => return error.MultiAgentModeRequiresObjectParams,
-    };
-    if (obj.get("multiAgentMode") != null) return error.DuplicateMultiAgentMode;
-
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
-        return error.MultiAgentModeRequiresObjectParams;
-    }
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
-    var iter = obj.iterator();
-    if (iter.next() != null) try out.writer.writeAll(",");
-    try out.writer.print("\"multiAgentMode\":\"{s}\"}}", .{mode.wireValue()});
-    return out.toOwnedSlice();
 }
 
 fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json: []const u8) ![]u8 {
@@ -841,7 +807,7 @@ test "parseArgs rejects duplicate parameter sources" {
     try std.testing.expectError(error.DuplicateParamsSource, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs accepts multi-agent mode for request methods that support it" {
+test "parseArgs rejects removed multi-agent mode for turn start" {
     const argv = [_][]const u8{
         "cas_instance_runner",
         "--cwd",
@@ -852,13 +818,10 @@ test "parseArgs accepts multi-agent mode for request methods that support it" {
         "proactive",
     };
 
-    const parsed = try parseArgs(std.testing.allocator, &argv);
-    defer std.testing.allocator.free(parsed.opt_out_methods);
-
-    try std.testing.expectEqual(cas.MultiAgentMode.proactive, parsed.multi_agent_mode.?);
+    try std.testing.expectError(error.MultiAgentModeRemoved, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs rejects multi-agent mode for unsupported request methods" {
+test "parseArgs rejects removed multi-agent mode for thread list" {
     const argv = [_][]const u8{
         "cas_instance_runner",
         "--cwd",
@@ -869,16 +832,15 @@ test "parseArgs rejects multi-agent mode for unsupported request methods" {
         "proactive",
     };
 
-    try std.testing.expectError(error.MultiAgentModeUnsupportedMethod, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MultiAgentModeRemoved, parseArgs(std.testing.allocator, &argv));
 }
 
-test "buildParamsJson injects multi-agent mode into object params" {
+test "buildParamsJson preserves caller-owned raw parameters" {
     const params = try buildParamsJson(
         std.testing.allocator,
         "turn/start",
         "{\"threadId\":\"thr_1\",\"input\":[]}",
         null,
-        .proactive,
     );
     defer std.testing.allocator.free(params);
 
@@ -886,19 +848,20 @@ test "buildParamsJson injects multi-agent mode into object params" {
     defer parsed.deinit();
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("thr_1", obj.get("threadId").?.string);
-    try std.testing.expectEqualStrings("proactive", obj.get("multiAgentMode").?.string);
+    try std.testing.expect(obj.get("multiAgentMode") == null);
 }
 
-test "buildParamsJson rejects duplicate multi-agent mode" {
-    try std.testing.expectError(
-        error.DuplicateMultiAgentMode,
-        buildParamsJson(
-            std.testing.allocator,
-            "thread/start",
-            "{\"multiAgentMode\":\"explicitRequestOnly\"}",
-            null,
-            .proactive,
-        ),
+test "buildParamsJson leaves generic raw multiAgentMode caller-owned" {
+    const params = try buildParamsJson(
+        std.testing.allocator,
+        "thread/start",
+        "{\"multiAgentMode\":\"explicitRequestOnly\"}",
+        null,
+    );
+    defer std.testing.allocator.free(params);
+    try std.testing.expectEqualStrings(
+        "{\"multiAgentMode\":\"explicitRequestOnly\"}",
+        params,
     );
 }
 

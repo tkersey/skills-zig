@@ -79,6 +79,7 @@ const FailureCode = enum {
     source_not_found,
     source_stale,
     source_turn_digest_mismatch,
+    thread_history_mode_unsupported,
     decision_anchor_unavailable,
     fork_unsupported,
     fork_failed,
@@ -1362,6 +1363,7 @@ fn failureCodeForError(err: anyerror) FailureCode {
         error.SourceNotFound => .source_not_found,
         error.SourceStale => .source_stale,
         error.SourceDigestMismatch => .source_turn_digest_mismatch,
+        error.ThreadHistoryModeUnsupported => .thread_history_mode_unsupported,
         error.ForkUnsupported => .fork_unsupported,
         error.ForkFailed => .fork_failed,
         error.LineageMismatch => .lineage_mismatch,
@@ -1908,11 +1910,28 @@ fn verifySourceThread(
     dcp: Dcp,
     events_path: []const u8,
 ) !void {
+    const source_metadata_params = try stringifyAnyAlloc(allocator, .{ .threadId = source_thread_id, .includeTurns = false });
+    defer allocator.free(source_metadata_params);
+    const source_metadata_json = client.requestJson("thread/read", source_metadata_params) catch return error.SourceNotFound;
+    defer allocator.free(source_metadata_json);
+    try verifyForkableThreadHistory(allocator, source_metadata_json);
+    const metadata_event = try stringifyAnyAlloc(allocator, .{
+        .event = "thread/read",
+        .thread_id = source_thread_id,
+        .include_turns = false,
+    });
+    defer allocator.free(metadata_event);
+    try appendLine(events_path, metadata_event);
+
     const source_read_params = try stringifyAnyAlloc(allocator, .{ .threadId = source_thread_id, .includeTurns = true });
     defer allocator.free(source_read_params);
     const source_json = client.requestJson("thread/read", source_read_params) catch return error.SourceNotFound;
     defer allocator.free(source_json);
-    const read_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/read", .thread_id = source_thread_id });
+    const read_event = try stringifyAnyAlloc(allocator, .{
+        .event = "thread/read",
+        .thread_id = source_thread_id,
+        .include_turns = true,
+    });
     defer allocator.free(read_event);
     try appendLine(events_path, read_event);
     const source_digest = try turnDigestFromThreadRead(allocator, source_json);
@@ -1923,6 +1942,20 @@ fn verifySourceThread(
     if (!std.mem.eql(u8, source_digest.digest, dcp.source_turn_digest)) {
         try appendSourceDigestMismatchEvent(allocator, events_path, source_digest, dcp.total_turns, dcp.source_turn_digest, "source_turn_digest_mismatch");
         return error.SourceDigestMismatch;
+    }
+}
+
+fn verifyForkableThreadHistory(allocator: std.mem.Allocator, raw: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.SourceStale,
+    };
+    const thread = core_json.objectField(root, "thread") orelse return error.SourceStale;
+    const history_mode = core_json.stringField(thread, "historyMode") orelse return;
+    if (!std.mem.eql(u8, history_mode, "legacy")) {
+        return error.ThreadHistoryModeUnsupported;
     }
 }
 
@@ -4998,6 +5031,29 @@ test "turnDigestFromThreadRead includes live function call records" {
     defer allocator.free(expected);
     try std.testing.expectEqual(@as(usize, 1), observed.count);
     try std.testing.expectEqualStrings(expected, observed.digest);
+}
+
+test "thread-backed inquiry rejects paginated history before fork" {
+    const allocator = std.testing.allocator;
+    try verifyForkableThreadHistory(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-legacy\",\"historyMode\":\"legacy\",\"turns\":[]}}",
+    );
+    try verifyForkableThreadHistory(
+        allocator,
+        "{\"thread\":{\"id\":\"thread-compatible\",\"turns\":[]}}",
+    );
+    try std.testing.expectError(
+        error.ThreadHistoryModeUnsupported,
+        verifyForkableThreadHistory(
+            allocator,
+            "{\"thread\":{\"id\":\"thread-paginated\",\"historyMode\":\"paginated\",\"turns\":[]}}",
+        ),
+    );
+    try std.testing.expectEqual(
+        FailureCode.thread_history_mode_unsupported,
+        failureCodeForError(error.ThreadHistoryModeUnsupported),
+    );
 }
 
 fn freeStringList(allocator: std.mem.Allocator, list: []const []const u8) void {

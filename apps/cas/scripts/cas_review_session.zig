@@ -41,7 +41,7 @@ const UsageText =
     \\  --title TITLE                    Optional commit title for --commit.
     \\  --custom-instructions VALUE      Exact review prompt, raw text, @file, or -; may accompany a target selector.
     \\  --workflow-binding-json VALUE    Optional opaque request binding as JSON or @file.
-    \\  --multi-agent-mode MODE          explicit-request-only|proactive for fresh parent request flow.
+    \\  --multi-agent-mode MODE          Removed: use Codex reasoning effort and canonical agent config.
     \\
     \\Approval/runtime options:
     \\  --exec-approval VALUE            auto|accept|acceptForSession|decline|cancel.
@@ -377,17 +377,6 @@ const FailureInfo = struct {
 };
 
 const account_resource_exhausted_hint = "detached review stopped because the account or runtime resource budget was exhausted before emitting a structured reviewResult";
-
-fn applyMultiAgentModeReceipt(
-    receipt: *OutputReceipt,
-    mode: ?cas.MultiAgentMode,
-    support: cas.MultiAgentModeSupport,
-) void {
-    receipt.requested_multi_agent_mode = mode;
-    receipt.multi_agent_mode_support = if (mode == null) .not_requested else support;
-    receipt.effective_multi_agent_mode = if (receipt.multi_agent_mode_support == .proven) mode else null;
-    receipt.multi_agent_mode_metric_eligible = mode == .proactive and receipt.multi_agent_mode_support == .proven;
-}
 
 fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) OutputReceipt {
     var out = receipt;
@@ -815,9 +804,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     // They must remain reachable without satisfying operation operands.
     if (out.show_help or out.show_version) return out;
 
-    if (out.action == .wait and out.multi_agent_mode != null) {
-        return error.MultiAgentModeUnsupportedAction;
-    }
+    if (out.multi_agent_mode != null) return error.MultiAgentModeRemoved;
     if (out.action == .wait and out.review_lock_override_reason != null) {
         return error.ReviewLockOverrideUnsupportedAction;
     }
@@ -874,10 +861,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 const ReviewThreadIdSelectorHint =
     "pass the bare reviewThreadId; use --path for a session record or " ++
     "--latest for the newest persisted session.";
+const MultiAgentModeRemovedHint =
+    "Codex 0.145 ignores request-scoped multiAgentMode; configure [agents] in " ++
+    "config.toml and use the current Codex reasoning-effort controls instead.";
 
 fn usageDetailForParseError(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.InvalidReviewThreadId => ReviewThreadIdSelectorHint,
+        error.MultiAgentModeRemoved => MultiAgentModeRemovedHint,
         else => null,
     };
 }
@@ -1097,7 +1088,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
         defer allocator.free(existing_parent_event_log_path);
-        try resumeParentThread(allocator, &client, existing, existing_parent_event_log_path);
+        try resumeParentThread(allocator, &client, existing, existing_parent_event_log_path, codex_version);
         var parent_status = try fetchReviewStatus(
             allocator,
             &client,
@@ -1105,6 +1096,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             null,
             existing_parent_event_log_path,
             null,
+            codex_version,
         );
         defer parent_status.deinit(allocator);
         if (failureInfoForParentReuse(&parent_status)) |failure| {
@@ -1125,14 +1117,12 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         &client,
         cwd,
         session_dir,
-        parsed.multi_agent_mode,
         parsed.custom_instructions,
     ) catch |err| {
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "review_failed", null, null, null, null);
         return err;
     };
     defer allocator.free(parent_thread_id);
-    applyMultiAgentModeReceipt(&output_receipt, parsed.multi_agent_mode, if (created_parent_thread) .proven else .unproven);
     const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
     defer allocator.free(parent_event_log_path);
     const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
@@ -1151,7 +1141,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parent_event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
-            parsed.multi_agent_mode,
+            codex_version,
         ) catch {
             updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "parent_materialization_failed", null, null, null, parent_event_log_path);
             try renderErrorAndExit(
@@ -1182,7 +1172,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 parent_event_log_path,
                 parsed.timeout_ms,
                 parsed.poll_interval_ms,
-                parsed.multi_agent_mode,
+                codex_version,
             ) catch {
                 updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "parent_materialization_failed", null, null, null, parent_event_log_path);
                 try renderErrorAndExit(
@@ -1333,6 +1323,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             record.event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
+            codex_version,
         ) catch |err| switch (err) {
             error.WaitTimedOut => {
                 const timeout_status = try fetchReviewStatus(
@@ -1342,6 +1333,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     record.review_turn_id,
                     record.event_log_path,
                     null,
+                    codex_version,
                 );
                 record.last_observed_status = timeoutStatusString(&timeout_status);
                 try writeSessionRecord(allocator, record_path, record);
@@ -1676,6 +1668,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.event_log_path,
         parsed.timeout_ms,
         parsed.poll_interval_ms,
+        current_codex_version,
     ) catch |err| switch (err) {
         error.WaitTimedOut => {
             var timeout_status = try fetchReviewStatus(
@@ -1685,6 +1678,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 record.review_turn_id,
                 record.event_log_path,
                 null,
+                current_codex_version,
             );
             try applyRecordedStatusOverlay(allocator, record, &timeout_status);
             record.last_observed_status = timeoutStatusString(&timeout_status);
@@ -2664,6 +2658,7 @@ fn fetchReviewStatus(
     review_turn_id: ?[]const u8,
     event_log_path: []const u8,
     live_notifications: ?*LiveReviewNotificationState,
+    codex_version: []const u8,
 ) !ReviewStatus {
     const params_json = try stringifyAnyAlloc(allocator, .{
         .threadId = review_thread_id,
@@ -2718,7 +2713,7 @@ fn fetchReviewStatus(
             );
             try populateReviewResult(allocator, &status, review_turn_id);
             try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
-            if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status)) {
+            if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
                 status.deinit(allocator);
                 for (captured_notifications.items) |line| allocator.free(line);
                 captured_notifications.clearRetainingCapacity();
@@ -2768,7 +2763,7 @@ fn fetchReviewStatus(
     );
     try populateReviewResult(allocator, &status, review_turn_id);
     try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
-    if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status)) {
+    if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
         status.deinit(allocator);
         const params_after_resume = try stringifyAnyAlloc(allocator, .{
             .threadId = review_thread_id,
@@ -3031,15 +3026,18 @@ fn maybeResumeMaterializedThread(
     review_thread_id: []const u8,
     event_log_path: []const u8,
     status: *const ReviewStatus,
+    codex_version: []const u8,
 ) !bool {
     if (!status.materialized) return false;
     if (!std.mem.eql(u8, status.thread_status, "notLoaded")) return false;
     const rollout_path = status.rollout_path orelse return false;
 
-    const params_json = try stringifyAnyAlloc(allocator, .{
-        .threadId = review_thread_id,
-        .path = rollout_path,
-    });
+    const params_json = try buildThreadResumeParamsJson(
+        allocator,
+        review_thread_id,
+        rollout_path,
+        codex_version,
+    );
     defer allocator.free(params_json);
 
     const resume_result_json = client.requestJson("thread/resume", params_json) catch return false;
@@ -3084,19 +3082,11 @@ fn buildTurnStartParamsJson(
     allocator: std.mem.Allocator,
     thread_id: []const u8,
     text: []const u8,
-    multi_agent_mode: ?cas.MultiAgentMode,
 ) ![]u8 {
     const thread_id_json = try quoteJsonStringAlloc(allocator, thread_id);
     defer allocator.free(thread_id_json);
     const text_json = try quoteJsonStringAlloc(allocator, text);
     defer allocator.free(text_json);
-    if (multi_agent_mode) |mode| {
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"threadId\":{s},\"input\":[{{\"type\":\"text\",\"text\":{s}}}],\"multiAgentMode\":\"{s}\"}}",
-            .{ thread_id_json, text_json, mode.wireValue() },
-        );
-    }
     return std.fmt.allocPrint(
         allocator,
         "{{\"threadId\":{s},\"input\":[{{\"type\":\"text\",\"text\":{s}}}]}}",
@@ -3111,6 +3101,7 @@ fn waitForThreadTerminalState(
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
+    codex_version: []const u8,
 ) !ReviewStatus {
     const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     while (true) {
@@ -3121,6 +3112,7 @@ fn waitForThreadTerminalState(
             null,
             event_log_path,
             null,
+            codex_version,
         );
         if (isTerminalTurnStatus(latest.turn_status)) return latest;
         latest.deinit(allocator);
@@ -3136,13 +3128,12 @@ fn materializeParentThreadTurn(
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
-    multi_agent_mode: ?cas.MultiAgentMode,
+    codex_version: []const u8,
 ) !void {
     const params_json = try buildTurnStartParamsJson(
         allocator,
         parent_thread_id,
         parent_materialization_prompt,
-        multi_agent_mode,
     );
     defer allocator.free(params_json);
     const result_json = try client.requestJson("turn/start", params_json);
@@ -3157,6 +3148,7 @@ fn materializeParentThreadTurn(
         event_log_path,
         timeout_ms,
         poll_interval_ms,
+        codex_version,
     );
     defer terminal_status.deinit(allocator);
     if (std.mem.eql(u8, terminal_status.turn_status, "failed") or
@@ -3582,6 +3574,7 @@ fn waitForReviewCompletion(
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
+    codex_version: []const u8,
 ) !ReviewStatus {
     const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     var live_notifications = LiveReviewNotificationState{
@@ -3612,6 +3605,7 @@ fn waitForReviewCompletion(
                 review_turn_id,
                 event_log_path,
                 &live_notifications,
+                codex_version,
             );
         }
         if (@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - started_ms >= timeout_ms) return error.WaitTimedOut;
@@ -3624,13 +3618,11 @@ fn startParentThreadAlloc(
     client: *cas.Client,
     cwd: []const u8,
     session_dir: []const u8,
-    multi_agent_mode: ?cas.MultiAgentMode,
     developer_instructions: ?[]const u8,
 ) ![]const u8 {
     const params_json = try buildThreadStartParamsJson(
         allocator,
         cwd,
-        multi_agent_mode,
         developer_instructions,
     );
     defer allocator.free(params_json);
@@ -3647,13 +3639,11 @@ fn startParentThreadAlloc(
 fn buildThreadStartParamsJson(
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    multi_agent_mode: ?cas.MultiAgentMode,
     developer_instructions: ?[]const u8,
 ) ![]u8 {
     return stringifyAnyAlloc(allocator, .{
         .cwd = cwd,
         .experimentalRawEvents = false,
-        .multiAgentMode = if (multi_agent_mode) |mode| mode.wireValue() else null,
         .developerInstructions = developer_instructions,
     });
 }
@@ -3663,15 +3653,52 @@ fn codexDetachedReviewNeedsLiveConnection(codex_version: []const u8) bool {
     return semver.major == 0 and semver.minor == 118;
 }
 
+fn codexResumeSupportsExcludeTurns(codex_version: []const u8) bool {
+    const semver = parseSemverTriplet(codex_version) orelse return false;
+    return semver.major > 0 or (semver.major == 0 and semver.minor >= 145);
+}
+
+fn buildThreadResumeParamsJson(
+    allocator: std.mem.Allocator,
+    thread_id: []const u8,
+    path: ?[]const u8,
+    codex_version: []const u8,
+) ![]u8 {
+    if (codexResumeSupportsExcludeTurns(codex_version)) {
+        if (path) |rollout_path| {
+            return stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id,
+                .path = rollout_path,
+                .excludeTurns = true,
+            });
+        }
+        return stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .excludeTurns = true,
+        });
+    }
+    if (path) |rollout_path| {
+        return stringifyAnyAlloc(allocator, .{
+            .threadId = thread_id,
+            .path = rollout_path,
+        });
+    }
+    return stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
+}
+
 fn resumeParentThread(
     allocator: std.mem.Allocator,
     client: *cas.Client,
     parent_thread_id: []const u8,
     parent_event_log_path: []const u8,
+    codex_version: []const u8,
 ) !void {
-    const params_json = try stringifyAnyAlloc(allocator, .{
-        .threadId = parent_thread_id,
-    });
+    const params_json = try buildThreadResumeParamsJson(
+        allocator,
+        parent_thread_id,
+        null,
+        codex_version,
+    );
     defer allocator.free(params_json);
     const result_json = try client.requestJson("thread/resume", params_json);
     defer allocator.free(result_json);
@@ -9467,7 +9494,7 @@ test "latestSessionRecordPathInDirAlloc selects newest top-level session record"
     try std.testing.expectEqualStrings(expected, latest);
 }
 
-test "parseArgs accepts multi-agent mode for start" {
+test "parseArgs rejects removed multi-agent mode for start" {
     const start_argv = [_][]const u8{
         "cas_review_session",
         "start",
@@ -9478,11 +9505,13 @@ test "parseArgs accepts multi-agent mode for start" {
         "--multi-agent-mode",
         "proactive",
     };
-    const start = try parseArgs(std.testing.allocator, &start_argv);
-    try std.testing.expectEqual(cas.MultiAgentMode.proactive, start.multi_agent_mode.?);
+    try std.testing.expectError(
+        error.MultiAgentModeRemoved,
+        parseArgs(std.testing.allocator, &start_argv),
+    );
 }
 
-test "parseArgs rejects multi-agent mode on unsupported review-session actions" {
+test "parseArgs rejects removed multi-agent mode for wait" {
     const argv = [_][]const u8{
         "cas_review_session",
         "wait",
@@ -9493,16 +9522,15 @@ test "parseArgs rejects multi-agent mode on unsupported review-session actions" 
     };
 
     try std.testing.expectError(
-        error.MultiAgentModeUnsupportedAction,
+        error.MultiAgentModeRemoved,
         parseArgs(std.testing.allocator, &argv),
     );
 }
 
-test "request builders include multi-agent mode on fresh parent flow" {
+test "request builders omit removed multi-agent mode" {
     const thread_params = try buildThreadStartParamsJson(
         std.testing.allocator,
         "/tmp/repo",
-        .proactive,
         "review only this contract",
     );
     defer std.testing.allocator.free(thread_params);
@@ -9513,10 +9541,7 @@ test "request builders include multi-agent mode on fresh parent flow" {
         .{},
     );
     defer parsed_thread.deinit();
-    try std.testing.expectEqualStrings(
-        "proactive",
-        parsed_thread.value.object.get("multiAgentMode").?.string,
-    );
+    try std.testing.expect(parsed_thread.value.object.get("multiAgentMode") == null);
     try std.testing.expectEqualStrings(
         "review only this contract",
         parsed_thread.value.object.get("developerInstructions").?.string,
@@ -9526,7 +9551,6 @@ test "request builders include multi-agent mode on fresh parent flow" {
         std.testing.allocator,
         "thr_1",
         "hello",
-        .explicit_request_only,
     );
     defer std.testing.allocator.free(turn_params);
     var parsed_turn = try std.json.parseFromSlice(
@@ -9536,10 +9560,36 @@ test "request builders include multi-agent mode on fresh parent flow" {
         .{},
     );
     defer parsed_turn.deinit();
-    try std.testing.expectEqualStrings(
-        "explicitRequestOnly",
-        parsed_turn.value.object.get("multiAgentMode").?.string,
+    try std.testing.expect(parsed_turn.value.object.get("multiAgentMode") == null);
+}
+
+test "thread resume excludes turns only for Codex 0.145 and newer" {
+    const current = try buildThreadResumeParamsJson(
+        std.testing.allocator,
+        "thr_1",
+        "/tmp/rollout.jsonl",
+        "codex-cli 0.145.0",
     );
+    defer std.testing.allocator.free(current);
+    var current_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, current, .{});
+    defer current_json.deinit();
+    try std.testing.expect(current_json.value.object.get("excludeTurns").?.bool);
+    try std.testing.expectEqualStrings(
+        "/tmp/rollout.jsonl",
+        current_json.value.object.get("path").?.string,
+    );
+
+    const legacy = try buildThreadResumeParamsJson(
+        std.testing.allocator,
+        "thr_1",
+        null,
+        "codex-cli 0.144.2",
+    );
+    defer std.testing.allocator.free(legacy);
+    var legacy_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, legacy, .{});
+    defer legacy_json.deinit();
+    try std.testing.expect(legacy_json.value.object.get("excludeTurns") == null);
+    try std.testing.expect(legacy_json.value.object.get("path") == null);
 }
 
 test "parseArgs captures parent mode and approvals" {
