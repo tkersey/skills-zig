@@ -88,7 +88,7 @@ case "$mode" in
           *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".build_deps = &.{"*|*".test_deps = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
             return 0
             ;;
-          *\"Build\ *|*\"Run\ *|*\"Test\ *|*"execution_policy_core/src/root.zig"*|*"test-execution-policy-core"*)
+          *\"Build\ *|*\"Run\ *|*\"Test\ *|*"execution_policy_core/src/root.zig"*|*"test-execution-policy-core"*|*"test_full.dependOn(test_all);"*)
             return 0
             ;;
         esac
@@ -123,6 +123,14 @@ case "$mode" in
             ;;
           *"run_retrace_core_tests"*|*"test-retrace-core"*)
             current_app="__retrace_core"
+            return
+            ;;
+          *"jsonl_stream_release_fast"*|*"canonical_json_release_fast"*|*"retrace_large_tests_root"*|*"retrace_corpus_tests_root"*|*"run_retrace_large_tests"*|*"run_retrace_corpus_tests"*)
+            current_app="__retrace_core"
+            return
+            ;;
+          *"ledger_routine_test_filters"*|*"run_ledger_portable_ceiling"*|*"ledger_validation_qualification_root"*)
+            current_app="__ledger_test"
             return
             ;;
           *"const st_"*"= b.createModule"*|*"const st_root = b.createModule"*|*"apps/st"*)

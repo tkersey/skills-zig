@@ -291,6 +291,48 @@ assert_cas_trial_macos_runtime_build_hunk() {
   assert_observed "representative CAS trial macOS runtime build hunk" "cas"
 }
 
+assert_retrace_qualification_build_diff() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const jsonl_stream_release_fast = b.createModule(.{' \
+    '    .root_source_file = b.path("libs/retrace_core/src/jsonl_stream.zig"),' \
+    '    .target = target,' \
+    '    .optimize = .ReleaseFast,' \
+    '});' \
+    'const retrace_large_tests_root = b.createModule(.{' \
+    '    .root_source_file = b.path("libs/retrace_core/tests/jsonl_stream_large.zig"),' \
+    '    .target = target,' \
+    '    .optimize = .ReleaseFast,' \
+    '    .imports = &.{' \
+    '        .{ .name = "jsonl_stream", .module = jsonl_stream_release_fast },' \
+    '    },' \
+    '});' \
+    'const ledger_routine_test_filters = &.{' \
+    '    "ledger.test.",' \
+    '    "validation.test.",' \
+    '};' \
+    'const run_ledger_portable_ceiling = addTestStepWithOptions(' \
+    '    b,' \
+    '    ledger_validation_qualification_root,' \
+    '    "test-ledger-portable-ceiling",' \
+    '    "Run the large portable-artifact validator ceiling proof",' \
+    ');' \
+    'const run_retrace_large_tests = addTestStep(' \
+    '    b,' \
+    '    retrace_large_tests_root,' \
+    '    "test-retrace-core-large",' \
+    '    "Run the greater-than-256-MiB streaming regression in ReleaseFast",' \
+    ');' \
+    'const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");' \
+    'test_full.dependOn(test_all);' \
+    'test_full.dependOn(&run_ledger_portable_ceiling.step);' \
+    'test_full.dependOn(&run_retrace_large_tests.step);' >> "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "representative Retrace qualification build graph"
+  assert_observed "representative Retrace qualification build graph" "seq,cas,ledger"
+}
+
 assert_ambiguous_build_diff() {
   git -C "$tmp" reset --hard --quiet "$base"
   git -C "$tmp" clean -fdq
@@ -333,7 +375,8 @@ assert_version_case "apps/img/VERSION" "img"
 assert_hctp_build_diff
 assert_hylo_operator_terminal_build_diff
 assert_cas_trial_macos_runtime_build_hunk
+assert_retrace_qualification_build_diff
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 18/18 cases passed"
+echo "release app classifier: 19/19 cases passed"

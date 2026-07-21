@@ -10,6 +10,7 @@ const session_scan = @import("../session_scan.zig");
 const time_utils = @import("../time_utils.zig");
 const retrace_core = @import("retrace_core");
 const canonical_trace = retrace_core.canonical_trace;
+const jsonl_stream = retrace_core.jsonl_stream;
 const decision_capsule = @import("../decision_capsule.zig");
 const hctp_source = @import("../hctp_source.zig");
 const hylo_extract = @import("../hylo_extract/mod.zig");
@@ -2322,6 +2323,18 @@ fn traceParseOptions(opts: Options) canonical_trace.TraceParseOptions {
     return .{ .include_raw = opts.include_raw };
 }
 
+fn traceDatasetParseOptions(opts: Options, dataset_name: []const u8) canonical_trace.TraceParseOptions {
+    var options = canonical_trace.TraceParseOptions{
+        .include_raw = opts.include_raw,
+        .include_occurrences = false,
+    };
+    if (std.mem.eql(u8, dataset_name, "tool_lifecycle")) {
+        options.include_message_bodies = false;
+        if (opts.limit > 0) options.max_tools = opts.limit;
+    }
+    return options;
+}
+
 fn collectTraceRolloutPaths(allocator: std.mem.Allocator, sessions_root: []const u8) !std.ArrayList([]u8) {
     var paths = try collectJsonlPaths(allocator, sessions_root, null);
     errdefer freePathList(allocator, &paths);
@@ -2362,7 +2375,7 @@ fn resolveTraceTargetPaths(
         defer if (best_ts) |ts| allocator.free(ts);
         var best_ongoing = false;
         for (paths.items, 0..) |path, idx| {
-            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+            var parsed = canonical_trace.parseSessionSummaryTrace(allocator, path, traceParseOptions(opts)) catch continue;
             defer parsed.deinit(allocator);
             const ts = parsed.session.start_time orelse parsed.session.end_time orelse "";
             const better = best_index == null or
@@ -2388,22 +2401,38 @@ fn resolveTraceTargetPaths(
     }
 
     if (opts.session_id) |wanted| {
-        var write_idx: usize = 0;
+        var filename_matches: usize = 0;
         for (paths.items) |path| {
-            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch {
-                allocator.free(path);
-                continue;
-            };
-            defer parsed.deinit(allocator);
-            const matches = if (parsed.session.session_id) |id|
-                std.mem.eql(u8, id, wanted)
-            else
-                std.mem.eql(u8, inferSessionIdFromPath(path), wanted);
-            if (matches) {
-                paths.items[write_idx] = path;
-                write_idx += 1;
-            } else {
-                allocator.free(path);
+            if (std.mem.eql(u8, inferSessionIdFromPath(path), wanted)) filename_matches += 1;
+        }
+
+        var write_idx: usize = 0;
+        if (filename_matches > 0) {
+            for (paths.items) |path| {
+                if (std.mem.eql(u8, inferSessionIdFromPath(path), wanted)) {
+                    paths.items[write_idx] = path;
+                    write_idx += 1;
+                } else {
+                    allocator.free(path);
+                }
+            }
+        } else {
+            for (paths.items) |path| {
+                var parsed = canonical_trace.parseSessionSummaryTrace(allocator, path, traceParseOptions(opts)) catch {
+                    allocator.free(path);
+                    continue;
+                };
+                defer parsed.deinit(allocator);
+                if (parsed.session.session_id) |id| {
+                    if (std.mem.eql(u8, id, wanted)) {
+                        paths.items[write_idx] = path;
+                        write_idx += 1;
+                    } else {
+                        allocator.free(path);
+                    }
+                } else {
+                    allocator.free(path);
+                }
             }
         }
         paths.items.len = write_idx;
@@ -2675,7 +2704,13 @@ fn collectTraceDatasetRowsWithOptions(
     }
 
     for (paths.items) |path| {
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        var parsed = (if (std.mem.eql(u8, dataset_name, "sessions"))
+            canonical_trace.parseSessionSummaryTrace(allocator, path, traceParseOptions(opts))
+        else
+            canonical_trace.parseSessionTrace(allocator, path, traceDatasetParseOptions(opts, dataset_name))) catch |err| {
+            if (opts.path != null or opts.session_id != null or opts.current) return err;
+            continue;
+        };
         defer parsed.deinit(allocator);
 
         if (std.mem.eql(u8, dataset_name, "sessions")) {
@@ -17278,16 +17313,24 @@ fn collectInvocationRecordsFromSession(
     session_path: []const u8,
     out: *std.ArrayList(InvocationRecord),
 ) !void {
-    const content_opt = try readFileAllocOrSkip(allocator, session_path);
-    if (content_opt == null) return;
-    defer allocator.free(content_opt.?);
+    const file = (if (std.fs.path.isAbsolute(session_path))
+        std.Io.Dir.openFileAbsolute(defaultIo(), session_path, .{})
+    else
+        std.Io.Dir.cwd().openFile(defaultIo(), session_path, .{})) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer file.close(defaultIo());
+
+    var reader = file.reader(defaultIo(), &.{});
+    var stream = try jsonl_stream.Stream.init(allocator, &reader.interface, .{});
+    defer stream.deinit();
 
     var call_indices = std.StringHashMap(usize).init(allocator);
     defer call_indices.deinit();
 
-    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    while (try stream.next()) |record_line| {
+        const trimmed = std.mem.trim(u8, record_line.bytes, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] != '{') continue;
         if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"response_item\"")) continue;
 
@@ -25065,7 +25108,10 @@ fn readFileAllocOrSkipTracked(
     path: []const u8,
     stats: ?*stats_mod.SeqStats,
 ) !?[]u8 {
-    const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch return null;
+    const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
     if (stats) |s| {
         s.files_opened += 1;
         s.bytes_read += @intCast(content.len);

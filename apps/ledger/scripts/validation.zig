@@ -865,7 +865,9 @@ test "portable hylo-trial validation accepts fixture and blocks malformed input"
     try std.testing.expect(std.mem.indexOf(u8, UsageText, "hylo-trial") != null);
 }
 
-test "Hylo portable artifact validators share the producer ceiling" {
+pub fn runPortableArtifactProducerCeilingQualification() !void {
+    if (!builtin.is_test) return error.TestOnlyQualification;
+
     try std.testing.expect(replay_episode.max_portable_artifact_bytes > MaxInputBytes);
     try std.testing.expect(hctp.MaxTrialArtifactBytes > MaxInputBytes);
     for (std.enums.values(Contract)) |contract| {

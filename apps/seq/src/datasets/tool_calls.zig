@@ -1,4 +1,6 @@
 const std = @import("std");
+const retrace_core = @import("retrace_core");
+const jsonl_stream = retrace_core.jsonl_stream;
 
 pub const Row = struct {
     path: []u8,
@@ -68,16 +70,19 @@ pub fn collect(allocator: std.mem.Allocator, sessions_root: []const u8) !RowList
     }
 
     for (jsonl_paths.items) |path| {
-        const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch continue;
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => continue,
+            else => return err,
+        };
+        defer file.close(io);
 
-        var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const content = reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024)) catch continue;
-        defer allocator.free(content);
+        var reader = file.reader(io, &.{});
+        var stream = try jsonl_stream.Stream.init(allocator, &reader.interface, .{});
+        defer stream.deinit();
 
-        var line_it = std.mem.splitScalar(u8, content, '\n');
-        while (line_it.next()) |line| {
-            const maybe_row = try parseLine(allocator, path, line);
+        while (try stream.next()) |record| {
+            const maybe_row = try parseLine(allocator, path, record.bytes);
             if (maybe_row) |row| {
                 try rows.append(allocator, row);
             }

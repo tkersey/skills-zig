@@ -1,4 +1,0 @@
-{"type":"session_meta","timestamp":"2026-04-01T12:00:00Z","payload":{"id":"parent","cwd":"/repo","model":"gpt-5","thread_name":"Parent"}}
-{"type":"event_msg","timestamp":"2026-04-01T12:00:01Z","payload":{"type":"task_started","turn_id":"parent-turn"}}
-{"type":"event_msg","timestamp":"2026-04-01T12:00:02Z","payload":{"type":"collab_agent_spawn_end","turn_id":"parent-turn","call_id":"spawn-parent","new_thread_id":"worker","agent_nickname":"w","agent_role":"explorer","prompt":"inspect"}}
-{"type":"event_msg","timestamp":"2026-04-01T12:00:03Z","payload":{"type":"task_complete","turn_id":"parent-turn","duration_ms":2000}}

@@ -1480,7 +1480,21 @@ fn randomOpaqueIdAlloc(
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "opaque-{s}", .{hex});
+    return std.fmt.allocPrint(allocator, "opaque-h{s}", .{hex});
+}
+
+test "random opaque identifiers namespace digest tokens away from semantic dates" {
+    const salt = [_]u8{0x42} ** 32;
+    const id = try randomOpaqueIdAlloc(
+        std.testing.allocator,
+        &salt,
+        "lane-0",
+        &.{ "trial-001", "unit-001", "1" },
+    );
+    defer std.testing.allocator.free(id);
+
+    try std.testing.expectEqual(@as(usize, "opaque-h".len + 64), id.len);
+    try std.testing.expect(std.mem.startsWith(u8, id, "opaque-h"));
 }
 
 fn trialBuildSourceCase(

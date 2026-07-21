@@ -1,3 +1,0 @@
-{"type":"session_meta","timestamp":"2026-04-01T12:00:02Z","payload":{"id":"worker","cwd":"/repo","model":"gpt-5","thread_name":"Worker","source":{"subagent":{"parent_thread_id":"parent","agent_nickname":"w","agent_role":"explorer"}}}}
-{"type":"event_msg","timestamp":"2026-04-01T12:00:03Z","payload":{"type":"task_started","turn_id":"worker-turn"}}
-{"type":"event_msg","timestamp":"2026-04-01T12:00:04Z","payload":{"type":"task_complete","turn_id":"worker-turn","duration_ms":1000}}

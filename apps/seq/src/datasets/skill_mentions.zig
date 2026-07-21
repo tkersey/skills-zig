@@ -220,6 +220,35 @@ pub fn parseJsonl(
     const parsed_messages = try messages.parseJsonl(allocator, path, jsonl, msg_options);
     defer messages.freeRows(allocator, parsed_messages);
 
+    return parseMessages(allocator, parsed_messages, options);
+}
+
+pub fn parseJsonlReader(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    options: ParseOptions,
+    metrics: ?*messages.ParseMetrics,
+) ![]SkillMentionRow {
+    const msg_options = messages.ParseOptions{
+        .include_user = options.include_user,
+        .include_assistant = options.include_assistant,
+        .strip_echo_assistant = true,
+        .skip_meta_user_messages = true,
+        .dedupe_by_role_and_text = true,
+    };
+
+    const parsed_messages = try messages.parseJsonlReader(allocator, path, reader, msg_options, metrics);
+    defer messages.freeRows(allocator, parsed_messages);
+
+    return parseMessages(allocator, parsed_messages, options);
+}
+
+pub fn parseMessages(
+    allocator: std.mem.Allocator,
+    parsed_messages: []const messages.MessageRow,
+    options: ParseOptions,
+) ![]SkillMentionRow {
     var rows: std.ArrayList(SkillMentionRow) = .empty;
     errdefer {
         for (rows.items) |row| row.deinit(allocator);

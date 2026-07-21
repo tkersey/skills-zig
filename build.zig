@@ -54,6 +54,32 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const jsonl_stream_release_fast = b.createModule(.{
+        .root_source_file = b.path("libs/retrace_core/src/jsonl_stream.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const canonical_json_release_fast = b.createModule(.{
+        .root_source_file = b.path("libs/retrace_core/src/canonical_json.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const retrace_large_tests_root = b.createModule(.{
+        .root_source_file = b.path("libs/retrace_core/tests/jsonl_stream_large.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "jsonl_stream", .module = jsonl_stream_release_fast },
+        },
+    });
+    const retrace_corpus_tests_root = b.createModule(.{
+        .root_source_file = b.path("libs/retrace_core/tests/canonical_json_corpus.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "canonical_json", .module = canonical_json_release_fast },
+        },
+    });
     const hctp_fixtures = b.createModule(.{
         .root_source_file = b.path("testdata/hctp-v1/fixtures.zig"),
         .target = target,
@@ -387,6 +413,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
             .{ .name = "hctp_source", .module = hctp_source_for_hylo_tests },
             .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const ledger_validation_qualification_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/validation_qualification.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "app_meta", .module = ledger_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
         },
     });
     const hylo_cli_tests_root = b.createModule(.{
@@ -1035,9 +1072,15 @@ pub fn build(b: *std.Build) void {
         "ledger-test-filter",
         "Override the Ledger test filter",
     );
+    const ledger_routine_test_filters = &.{
+        "ledger.test.",
+        "actuation.test.",
+        "universalist.test.",
+        "validation.test.",
+    };
     const ledger_tests = b.addTest(.{
         .root_module = ledger_root,
-        .filters = if (ledger_test_filter) |filter| &.{filter} else &.{},
+        .filters = if (ledger_test_filter) |filter| &.{filter} else ledger_routine_test_filters,
     });
     const run_ledger_tests = std.Build.Step.Run.create(b, "run ledger tests (terminal)");
     run_ledger_tests.addArtifactArg(ledger_tests);
@@ -1046,6 +1089,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_ledger_tests.addArgs(args);
     const test_ledger = b.step("test-ledger", "Run ledger tests");
     test_ledger.dependOn(&run_ledger_tests.step);
+    const run_ledger_portable_ceiling = addTestStepWithOptions(
+        b,
+        ledger_validation_qualification_root,
+        "test-ledger-portable-ceiling",
+        "Run the large portable-artifact validator ceiling proof",
+        .{ .filters = &.{"Hylo portable artifact validators share the producer ceiling"} },
+    );
     const hylo_test_filter = b.option(
         []const u8,
         "hylo-test-filter",
@@ -1344,14 +1394,25 @@ pub fn build(b: *std.Build) void {
         "Run Retrace core contract tests",
         .{ .cwd = b.path("apps/seq") },
     );
+    const run_retrace_large_tests = addTestStep(
+        b,
+        retrace_large_tests_root,
+        "test-retrace-core-large",
+        "Run the greater-than-256-MiB streaming regression in ReleaseFast",
+    );
+    run_retrace_core_tests.step.dependOn(&run_retrace_large_tests.step);
+    const run_retrace_corpus_tests = addTestStep(
+        b,
+        retrace_corpus_tests_root,
+        "test-retrace-core-corpus",
+        "Run the broad deterministic float corpus in ReleaseFast",
+    );
 
     const cas_build_deps: []const *std.Build.Step = if (hctp_product_available)
         &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_trial_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step }
     else
         &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step };
-    const ledger_test_deps: []const *std.Build.Step = if (hctp_product_available)
-        &.{ &run_ledger_tests.step, test_hylo, &run_synesthesia_tests.step }
-    else
+    const ledger_test_deps: []const *std.Build.Step =
         &.{ &run_ledger_tests.step, &run_synesthesia_tests.step };
 
     const app_surfaces = [_]AppSurface{
@@ -1424,7 +1485,7 @@ pub fn build(b: *std.Build) void {
         _ = addGroupedStep(b, surface.build_step_name, surface.build_description, surface.build_deps);
     }
 
-    const test_all = b.step("test", "Run all tests");
+    const test_all = b.step("test", "Run all routine application and core tests");
     for (app_surfaces) |surface| {
         for (surface.test_deps) |dep| test_all.dependOn(dep);
     }
@@ -1432,6 +1493,12 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_durable_store_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
+
+    const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
+    test_full.dependOn(test_all);
+    test_full.dependOn(&run_ledger_portable_ceiling.step);
+    test_full.dependOn(&run_retrace_corpus_tests.step);
+    test_full.dependOn(test_hylo);
 
     const enable_zlinter = b.option(
         bool,

@@ -1,4 +1,6 @@
 const std = @import("std");
+const retrace_core = @import("retrace_core");
+const jsonl_stream = retrace_core.jsonl_stream;
 
 pub const MessageRow = struct {
     path: []const u8,
@@ -28,6 +30,11 @@ pub const ParseOptions = struct {
     skip_meta_user_messages: bool = true,
     dedupe_by_role_and_text: bool = true,
     strip_skill_blocks: bool = false,
+};
+
+pub const ParseMetrics = struct {
+    bytes_read: usize = 0,
+    lines_seen: usize = 0,
 };
 
 const DateParts = struct {
@@ -371,6 +378,17 @@ pub fn parseJsonl(
     jsonl: []const u8,
     options: ParseOptions,
 ) ![]MessageRow {
+    var reader = std.Io.Reader.fixed(jsonl);
+    return parseJsonlReader(allocator, path, &reader, options, null);
+}
+
+pub fn parseJsonlReader(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    options: ParseOptions,
+    metrics: ?*ParseMetrics,
+) ![]MessageRow {
     var rows: std.ArrayList(MessageRow) = .empty;
     errdefer {
         for (rows.items) |row| row.deinit(allocator);
@@ -383,9 +401,11 @@ pub fn parseJsonl(
         seen.deinit();
     }
 
-    var lines = std.mem.splitScalar(u8, jsonl, '\n');
-    while (lines.next()) |line| {
-        const maybe_row = try parseJsonlLine(allocator, path, line, options);
+    var stream = try jsonl_stream.Stream.init(allocator, reader, .{});
+    defer stream.deinit();
+
+    while (try stream.next()) |record| {
+        const maybe_row = try parseJsonlLine(allocator, path, record.bytes, options);
         if (maybe_row) |row| {
             if (options.dedupe_by_role_and_text) {
                 const key = try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ row.role, row.text });
@@ -398,6 +418,13 @@ pub fn parseJsonl(
             }
             try rows.append(allocator, row);
         }
+    }
+
+    if (metrics) |out| {
+        out.* = .{
+            .bytes_read = stream.bytes_read,
+            .lines_seen = stream.line_number,
+        };
     }
 
     return rows.toOwnedSlice(allocator);
@@ -453,4 +480,29 @@ test "parse messages drops rows emptied by skill-block stripping" {
     defer freeRows(allocator, rows);
 
     try std.testing.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "reader parsing preserves byte-slice results and reports source metrics" {
+    const allocator = std.testing.allocator;
+    const jsonl =
+        \\{"type":"event_msg","timestamp":"2026-02-19T10:11:12Z","payload":{"type":"user_message","message":"First"}}
+        \\{"type":"event_msg","timestamp":"2026-02-19T10:12:12Z","payload":{"type":"agent_message","message":"Second"}}
+    ;
+
+    const expected = try parseJsonl(allocator, "/tmp/parity.jsonl", jsonl, .{});
+    defer freeRows(allocator, expected);
+
+    var reader = std.Io.Reader.fixed(jsonl);
+    var metrics = ParseMetrics{};
+    const actual = try parseJsonlReader(allocator, "/tmp/parity.jsonl", &reader, .{}, &metrics);
+    defer freeRows(allocator, actual);
+
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try std.testing.expectEqualStrings(want.role, got.role);
+        try std.testing.expectEqualStrings(want.text, got.text);
+        try std.testing.expectEqualStrings(want.timestamp.?, got.timestamp.?);
+    }
+    try std.testing.expectEqual(jsonl.len, metrics.bytes_read);
+    try std.testing.expectEqual(@as(usize, 2), metrics.lines_seen);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const jsonl_stream = @import("jsonl_stream.zig");
 
 pub const TraceFormat = enum {
     new_044_plus,
@@ -39,6 +40,12 @@ pub const ToolLifecycleStatus = enum {
 pub const TraceParseOptions = struct {
     ongoing_threshold_secs: i64 = 60,
     include_raw: bool = false,
+    include_occurrences: bool = true,
+    include_message_bodies: bool = true,
+    /// Retain the stable top N tools ordered by turn_index descending. This
+    /// matches the tool_lifecycle dataset's limit semantics without retaining
+    /// large payloads for rows that cannot reach that result.
+    max_tools: ?usize = null,
 };
 
 pub const RawTraceEvent = struct {
@@ -353,6 +360,7 @@ pub const CanonicalSessionTrace = struct {
     session: SessionRecord,
     turns: std.ArrayList(TurnRecord) = .empty,
     tools: std.ArrayList(ToolLifecycleRecord) = .empty,
+    omitted_tool_call_ids: std.StringHashMapUnmanaged(void) = .empty,
     graph_edges: std.ArrayList(SessionGraphEdge) = .empty,
     occurrences: std.ArrayList(TraceOccurrence) = .empty,
     warnings: std.ArrayList([]u8) = .empty,
@@ -363,6 +371,9 @@ pub const CanonicalSessionTrace = struct {
         self.turns.deinit(allocator);
         for (self.tools.items) |*tool| tool.deinit(allocator);
         self.tools.deinit(allocator);
+        var omitted_it = self.omitted_tool_call_ids.keyIterator();
+        while (omitted_it.next()) |call_id| allocator.free(call_id.*);
+        self.omitted_tool_call_ids.deinit(allocator);
         for (self.graph_edges.items) |*edge| edge.deinit(allocator);
         self.graph_edges.deinit(allocator);
         for (self.occurrences.items) |*occurrence| occurrence.deinit(allocator);
@@ -455,13 +466,10 @@ pub fn parseSessionTrace(
 
     const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
     var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const content = try reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
-    defer allocator.free(content);
-
-    return parseSessionTraceBytes(
+    return parseSessionTraceReader(
         allocator,
         path,
-        content,
+        &reader.interface,
         stat.mtime.nanoseconds,
         options,
     );
@@ -477,6 +485,17 @@ pub fn parseSessionTraceBytes(
     source_mtime_ns: i128,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
+    var reader = std.Io.Reader.fixed(content);
+    return parseSessionTraceReader(allocator, path, &reader, source_mtime_ns, options);
+}
+
+pub fn parseSessionTraceReader(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+) !CanonicalSessionTrace {
     var trace = CanonicalSessionTrace{
         .session = try SessionRecord.init(allocator, path),
     };
@@ -487,10 +506,11 @@ pub fn parseSessionTraceBytes(
     var synthetic_turns: i64 = 0;
     var saw_task_started = false;
     var saw_primary_session_meta = false;
-    var line_it = std.mem.splitScalar(u8, content, '\n');
-    var line_number: usize = 0;
-    while (line_it.next()) |raw_line| {
-        line_number += 1;
+    var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
+    defer lines.deinit();
+    while (try lines.next()) |record| {
+        const line_number = record.number;
+        const raw_line = record.bytes;
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (line.len == 0) continue;
 
@@ -507,7 +527,10 @@ pub fn parseSessionTraceBytes(
         const root_type = stringField(root, "type");
         const payload = objectField(root, "payload");
         const timestamp = bestTimestamp(root);
-        const occurrence_index = try appendOccurrence(allocator, &trace, root, root_type, payload, timestamp, current_turn_index, line_number);
+        const occurrence_index = if (options.include_occurrences)
+            try appendOccurrence(allocator, &trace, root, root_type, payload, timestamp, current_turn_index, line_number)
+        else
+            null;
         if (stringField(root, "record_type")) |record_type| {
             // Preserve state carriers in the canonical occurrence stream so
             // exact-context consumers can explicitly retain or reject them.
@@ -525,13 +548,13 @@ pub fn parseSessionTraceBytes(
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 try applyTurnContext(allocator, &trace.turns.items[idx], payload orelse root);
                 try applySessionContextFromTurn(allocator, &trace.session, trace.turns.items[idx]);
-                trace.occurrences.items[occurrence_index].turn_index = @intCast(idx);
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "compacted")) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 trace.turns.items[idx].has_compaction = true;
-                trace.occurrences.items[occurrence_index].turn_index = @intCast(idx);
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "event_msg")) {
@@ -543,12 +566,16 @@ pub fn parseSessionTraceBytes(
                         trace.turns.items[idx].status_reason = try dupReplace(allocator, trace.turns.items[idx].status_reason, "task_started");
                     } else if (std.mem.eql(u8, event_type, "user_message")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
-                        try replaceUserMessage(allocator, &trace.turns.items[idx], msg);
+                        if (options.include_message_bodies) {
+                            const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
+                            try replaceUserMessage(allocator, &trace.turns.items[idx], msg);
+                        }
                     } else if (std.mem.eql(u8, event_type, "agent_message")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
-                        try attachAssistantMessage(allocator, &trace.turns.items[idx], msg, line_number);
+                        if (options.include_message_bodies) {
+                            const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
+                            try attachAssistantMessage(allocator, &trace.turns.items[idx], msg, line_number);
+                        }
                     } else if (std.mem.eql(u8, event_type, "task_complete")) {
                         if (current_turn_index) |idx| try completeTurn(allocator, &trace.turns.items[idx], .complete, "task_complete", timestamp, p);
                     } else if (std.mem.eql(u8, event_type, "turn_aborted")) {
@@ -571,15 +598,19 @@ pub fn parseSessionTraceBytes(
                         }
                     } else if (std.mem.endsWith(u8, event_type, "_end")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
-                        try finalizeToolEvent(allocator, &trace, idx, p, event_type, timestamp, line_number);
+                        try finalizeToolEvent(allocator, &trace, idx, p, event_type, timestamp, line_number, options.max_tools);
                     }
                 }
-                if (current_turn_index) |idx| trace.occurrences.items[occurrence_index].turn_index = @intCast(idx);
+                if (current_turn_index) |idx| {
+                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                }
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "response_item")) {
-                if (payload) |p| try applyResponseItem(allocator, &trace, path, &current_turn_index, &synthetic_turns, saw_task_started, p, timestamp, line_number);
-                if (current_turn_index) |idx| trace.occurrences.items[occurrence_index].turn_index = @intCast(idx);
+                if (payload) |p| try applyResponseItem(allocator, &trace, path, &current_turn_index, &synthetic_turns, saw_task_started, p, timestamp, line_number, options);
+                if (current_turn_index) |idx| {
+                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                }
                 continue;
             }
         }
@@ -599,24 +630,30 @@ pub fn parseSessionTraceBytes(
                 const role = stringField(root, "role") orelse "";
                 if (std.mem.eql(u8, role, "user")) {
                     const idx = try startSyntheticTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp);
-                    const text = try messageTextAlloc(allocator, root);
-                    defer allocator.free(text);
-                    try attachUserMessage(allocator, &trace.turns.items[idx], text);
+                    if (options.include_message_bodies) {
+                        const text = try messageTextAlloc(allocator, root);
+                        defer allocator.free(text);
+                        try attachUserMessage(allocator, &trace.turns.items[idx], text);
+                    }
                 } else if (std.mem.eql(u8, role, "assistant")) {
                     const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                    const text = try messageTextAlloc(allocator, root);
-                    defer allocator.free(text);
-                    try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
+                    if (options.include_message_bodies) {
+                        const text = try messageTextAlloc(allocator, root);
+                        defer allocator.free(text);
+                        try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
+                    }
                     try completeTurn(allocator, &trace.turns.items[idx], .complete, "synthetic_message_boundary", timestamp, root);
                 }
             } else if (root.get("call_id") != null and root.get("arguments") != null and root.get("name") != null) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try declareTool(allocator, &trace, idx, root, timestamp, line_number);
+                try declareTool(allocator, &trace, idx, root, timestamp, line_number, options.max_tools);
             } else if (root.get("call_id") != null and root.get("output") != null) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number);
+                try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number, options.max_tools);
             }
-            if (current_turn_index) |idx| trace.occurrences.items[occurrence_index].turn_index = @intCast(idx);
+            if (current_turn_index) |idx| {
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+            }
         }
     }
 
@@ -661,9 +698,22 @@ pub fn parseSessionSummaryTrace(
 
     const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
     var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const content = try reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
-    defer allocator.free(content);
+    return parseSessionSummaryTraceReader(
+        allocator,
+        path,
+        &reader.interface,
+        stat.mtime.nanoseconds,
+        options,
+    );
+}
 
+pub fn parseSessionSummaryTraceReader(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+) !CanonicalSessionTrace {
     var trace = CanonicalSessionTrace{
         .session = try SessionRecord.init(allocator, path),
     };
@@ -679,10 +729,11 @@ pub fn parseSessionSummaryTrace(
 
     var last_turn_open = false;
     var saw_primary_session_meta = false;
-    var line_it = std.mem.splitScalar(u8, content, '\n');
-    var line_number: usize = 0;
-    while (line_it.next()) |raw_line| {
-        line_number += 1;
+    var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
+    defer lines.deinit();
+    while (try lines.next()) |record| {
+        const line_number = record.number;
+        const raw_line = record.bytes;
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (line.len == 0) continue;
 
@@ -765,7 +816,7 @@ pub fn parseSessionSummaryTrace(
     }
 
     const now_ns = nowRealtimeNs();
-    const age_secs = @divTrunc(now_ns - stat.mtime.nanoseconds, std.time.ns_per_s);
+    const age_secs = @divTrunc(now_ns - source_mtime_ns, std.time.ns_per_s);
     if (last_turn_open) {
         if (age_secs <= options.ongoing_threshold_secs) {
             trace.session.is_ongoing = true;
@@ -1230,6 +1281,7 @@ fn applyResponseItem(
     payload: std.json.ObjectMap,
     timestamp: ?[]const u8,
     line_number: usize,
+    options: TraceParseOptions,
 ) !void {
     const payload_type = stringField(payload, "type") orelse return;
     if (std.mem.eql(u8, payload_type, "message")) {
@@ -1238,20 +1290,22 @@ fn applyResponseItem(
             try startSyntheticTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp)
         else
             try ensureTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp, stringField(payload, "turn_id"));
-        const text = try messageTextAlloc(allocator, payload);
-        defer allocator.free(text);
-        if (std.mem.eql(u8, role, "user")) {
-            try attachUserMessage(allocator, &trace.turns.items[idx], text);
-        } else if (std.mem.eql(u8, role, "assistant")) {
-            try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
+        if (options.include_message_bodies) {
+            const text = try messageTextAlloc(allocator, payload);
+            defer allocator.free(text);
+            if (std.mem.eql(u8, role, "user")) {
+                try attachUserMessage(allocator, &trace.turns.items[idx], text);
+            } else if (std.mem.eql(u8, role, "assistant")) {
+                try attachAssistantMessage(allocator, &trace.turns.items[idx], text, line_number);
+            }
         }
         return;
     }
     const idx = try ensureTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp, stringField(payload, "turn_id"));
     if (std.mem.eql(u8, payload_type, "function_call") or std.mem.eql(u8, payload_type, "custom_tool_call")) {
-        try declareTool(allocator, trace, idx, payload, timestamp, line_number);
+        try declareTool(allocator, trace, idx, payload, timestamp, line_number, options.max_tools);
     } else if (std.mem.eql(u8, payload_type, "function_call_output") or std.mem.eql(u8, payload_type, "custom_tool_call_output")) {
-        try finalizeToolOutput(allocator, trace, idx, payload, payload_type, timestamp, line_number);
+        try finalizeToolOutput(allocator, trace, idx, payload, payload_type, timestamp, line_number, options.max_tools);
     }
 }
 
@@ -1323,9 +1377,55 @@ fn findToolByCallId(trace: *CanonicalSessionTrace, call_id: []const u8) ?usize {
     return null;
 }
 
-fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, timestamp: ?[]const u8, line_number: usize) !void {
+fn toolCandidateIsNoBetter(
+    candidate: ToolLifecycleRecord,
+    current_worst: ToolLifecycleRecord,
+) bool {
+    const candidate_turn = candidate.turn_index orelse return true;
+    const worst_turn = current_worst.turn_index orelse return false;
+    return candidate_turn <= worst_turn;
+}
+
+fn retainNewestTools(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    max_tools: ?usize,
+) !void {
+    const limit = max_tools orelse return;
+    if (trace.tools.items.len <= limit) return;
+
+    // Rows enter in source order. For equal turn indexes the query engine is
+    // stable, so the later equal-key row is the one that cannot reach top N.
+    var discard_index: usize = 0;
+    for (trace.tools.items[1..], 1..) |candidate, index| {
+        if (toolCandidateIsNoBetter(candidate, trace.tools.items[discard_index])) {
+            discard_index = index;
+        }
+    }
+
+    var discarded = trace.tools.orderedRemove(discard_index);
+    defer discarded.deinit(allocator);
+    if (discarded.call_id) |call_id| {
+        if (!trace.omitted_tool_call_ids.contains(call_id)) {
+            const owned_call_id = try allocator.dupe(u8, call_id);
+            errdefer allocator.free(owned_call_id);
+            try trace.omitted_tool_call_ids.put(allocator, owned_call_id, {});
+        }
+    }
+}
+
+fn declareTool(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    turn_idx: usize,
+    payload: std.json.ObjectMap,
+    timestamp: ?[]const u8,
+    line_number: usize,
+    max_tools: ?usize,
+) !void {
     const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse return;
     if (findToolByCallId(trace, call_id)) |_| return;
+    if (trace.omitted_tool_call_ids.contains(call_id)) return;
     const name = stringField(payload, "name") orelse stringField(payload, "tool_name") orelse "unknown";
     var record = ToolLifecycleRecord{
         .session_id = try dupOpt(allocator, trace.session.session_id),
@@ -1342,14 +1442,26 @@ fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn
         .lifecycle_status = .declared,
         .declared_line = @intCast(line_number),
     };
-    errdefer record.deinit(allocator);
+    var record_owned = true;
+    errdefer if (record_owned) record.deinit(allocator);
     if (record.arguments_json) |args| try parseExecArgsIntoRecord(allocator, &record, args);
     trace.turns.items[turn_idx].tool_count += 1;
     try trace.tools.append(allocator, record);
+    record_owned = false;
+    try retainNewestTools(allocator, trace, max_tools);
 }
 
-fn finalizeToolEvent(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, event_type: []const u8, timestamp: ?[]const u8, line_number: usize) !void {
-    try finalizeToolOutput(allocator, trace, turn_idx, payload, event_type, timestamp, line_number);
+fn finalizeToolEvent(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    turn_idx: usize,
+    payload: std.json.ObjectMap,
+    event_type: []const u8,
+    timestamp: ?[]const u8,
+    line_number: usize,
+    max_tools: ?usize,
+) !void {
+    try finalizeToolOutput(allocator, trace, turn_idx, payload, event_type, timestamp, line_number, max_tools);
     if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
         try appendGraphEdge(allocator, trace, payload, timestamp);
         trace.turns.items[turn_idx].spawned_worker_count += 1;
@@ -1357,9 +1469,19 @@ fn finalizeToolEvent(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace
     }
 }
 
-fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, event_type: []const u8, timestamp: ?[]const u8, line_number: usize) !void {
+fn finalizeToolOutput(
+    allocator: std.mem.Allocator,
+    trace: *CanonicalSessionTrace,
+    turn_idx: usize,
+    payload: std.json.ObjectMap,
+    event_type: []const u8,
+    timestamp: ?[]const u8,
+    line_number: usize,
+    max_tools: ?usize,
+) !void {
     const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse event_type;
     const idx = findToolByCallId(trace, call_id) orelse blk: {
+        if (trace.omitted_tool_call_ids.contains(call_id)) return;
         var record = ToolLifecycleRecord{
             .session_id = try dupOpt(allocator, trace.session.session_id),
             .path = try allocator.dupe(u8, trace.session.path),
@@ -1369,10 +1491,15 @@ fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrac
             .call_id = try allocator.dupe(u8, call_id),
             .lifecycle_status = .inferred,
         };
-        errdefer record.deinit(allocator);
+        var record_owned = true;
+        errdefer if (record_owned) record.deinit(allocator);
         try trace.tools.append(allocator, record);
+        record_owned = false;
         trace.turns.items[turn_idx].tool_count += 1;
-        break :blk trace.tools.items.len - 1;
+        try retainNewestTools(allocator, trace, max_tools);
+        if (trace.omitted_tool_call_ids.contains(call_id)) return;
+        const retained_index = findToolByCallId(trace, call_id) orelse return;
+        break :blk retained_index;
     };
     var rec = &trace.tools.items[idx];
     rec.kind = kindFromEndEvent(event_type, rec.tool_name);
@@ -1547,6 +1674,67 @@ test "bytes-backed trace parsing preserves the exact assistant occurrence line" 
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), trace.turns.items[0].final_answer_line.?);
     try std.testing.expectEqualStrings("selected", trace.turns.items[0].final_answer.?);
+}
+
+test "bounded tool retention still observes the retained call completion" {
+    const source =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"bounded-tools\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"omitted\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-one\",\"arguments\":\"{}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:04Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-two\",\"arguments\":\"{}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:05Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-one\",\"output\":\"done\"}}\n";
+    var trace = try parseSessionTraceBytes(
+        std.testing.allocator,
+        "/provenance/bounded.jsonl",
+        source,
+        nowRealtimeNs(),
+        .{
+            .include_occurrences = false,
+            .include_message_bodies = false,
+            .max_tools = 1,
+        },
+    );
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), trace.occurrences.items.len);
+    try std.testing.expect(trace.turns.items[0].user_message == null);
+    try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
+    try std.testing.expectEqualStrings("call-one", trace.tools.items[0].call_id.?);
+    try std.testing.expectEqualStrings("done", trace.tools.items[0].output_text.?);
+    try std.testing.expectEqual(ToolLifecycleStatus.completed, trace.tools.items[0].lifecycle_status);
+}
+
+test "bounded tool retention preserves newest-turn query semantics" {
+    const source =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"bounded-newest-tools\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-one\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-one\",\"arguments\":\"{}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-one\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:04Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-two\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:05Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-two\",\"arguments\":\"{}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:06Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-two\",\"output\":\"newest\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:07Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-one\",\"output\":\"late-old-output\"}}\n";
+    var trace = try parseSessionTraceBytes(
+        std.testing.allocator,
+        "/provenance/bounded-newest.jsonl",
+        source,
+        nowRealtimeNs(),
+        .{
+            .include_occurrences = false,
+            .include_message_bodies = false,
+            .max_tools = 1,
+        },
+    );
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
+    try std.testing.expectEqualStrings("call-two", trace.tools.items[0].call_id.?);
+    try std.testing.expectEqualStrings("newest", trace.tools.items[0].output_text.?);
+    try std.testing.expectEqualStrings("turn-two", trace.tools.items[0].turn_id.?);
+    var tool_count: i64 = 0;
+    for (trace.turns.items) |turn| tool_count += turn.tool_count;
+    try std.testing.expectEqual(@as(i64, 2), tool_count);
 }
 
 test "canonical trace retains state and unknown carriers for exact consumers" {

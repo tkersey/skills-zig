@@ -3,7 +3,11 @@ const actuation_cli = @import("actuation.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
-const hylo_cli = @import("hylo.zig");
+const hylo_cli = if (builtin.is_test) struct {
+    pub fn runWithArgv(_: std.mem.Allocator, _: std.Io, _: []const []const u8) !u8 {
+        return error.HyloDelegateUnavailableInLedgerTests;
+    }
+} else @import("hylo.zig");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 const synesthesia_cli = @import("synesthesia_cli");
@@ -3571,11 +3575,17 @@ test "learnings show source alias preserves both command orderings" {
     );
 }
 
-test "ledger test graph includes source and validation modules" {
+test "ledger routine test graph includes owned source and validation modules" {
     std.testing.refAllDecls(actuation_cli);
-    if (HctpProductAvailable) std.testing.refAllDecls(hylo_cli);
     std.testing.refAllDecls(universalist_cli);
     std.testing.refAllDecls(validation_cli);
+}
+
+test "ledger routine tests fail closed at the Hylo delegate" {
+    try std.testing.expectError(
+        error.HyloDelegateUnavailableInLedgerTests,
+        hylo_cli.runWithArgv(std.testing.allocator, std.testing.io, &.{ "ledger", "hylo" }),
+    );
 }
 
 test "root help follows Hylo source admission" {
