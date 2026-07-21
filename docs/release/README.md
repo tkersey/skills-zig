@@ -81,12 +81,18 @@ Full Hylo qualification is also available on a weekly schedule and through
 manual dispatch of `.github/workflows/release-hylo-qualification.yml`. Those
 advisory runs produce exact-SHA receipts but grant no publication authority.
 Publication qualification runs three build-owned shards on isolated macOS
-runners: core, memory, and persistent. The core retains the original contract,
-Section 36, integration, and operator graph. Each runner keeps Zig at `-j2`;
-the workflow emits a successful receipt only after every shard passes on the
-same exact commit. The canonical local fallback remains
-`zig build test-hylo -j2 --summary all`, whose dependency graph is the union of
-those three shards.
+runners: core, memory, and persistent. The core retains contract,
+portable Section 36, integration, and operator proof. The manifest-backed
+memory and persistent runners uniquely own all 17 EventStore cases, so core
+does not repeat their expensive owner tests. Each runner keeps Zig at
+`-j2` and compiles the identical proof graph in `ReleaseSafe`, whose optimized
+code retains Zig runtime-safety traps and assertions. Measured timeout budgets
+are 7 minutes for core and 5 minutes for each backend, capping the three-shard
+qualification at 17 macOS runner-minutes. The workflow emits a successful
+receipt only after every shard passes on the same exact commit. The canonical
+local fallback remains
+`zig build test-hylo -Doptimize=ReleaseSafe -j2 --summary all`, whose dependency
+graph is the union of those three shards.
 
 ## Homebrew Tap Handoff
 

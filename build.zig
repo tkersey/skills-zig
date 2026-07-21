@@ -1367,7 +1367,6 @@ pub fn build(b: *std.Build) void {
     test_hylo_qualification_section36.dependOn(&run_hctp_conformance_grading.step);
     test_hylo_qualification_section36.dependOn(&run_hctp_conformance_retrace_holdout.step);
     test_hylo_qualification_section36.dependOn(&run_hctp_conformance_manifest.step);
-    test_hylo_qualification_section36.dependOn(&run_hctp_conformance_hylo.step);
     test_hylo_qualification_section36.dependOn(&run_hylo_operator_recipe.step);
     const test_hylo_qualification_memory = b.step(
         "test-hylo-qualification-memory",

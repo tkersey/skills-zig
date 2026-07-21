@@ -34,7 +34,6 @@ for required_qualification_edge in \
   'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_grading.step);' \
   'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_retrace_holdout.step);' \
   'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_manifest.step);' \
-  'test_hylo_qualification_section36.dependOn(&run_hctp_conformance_hylo.step);' \
   'test_hylo_qualification_section36.dependOn(&run_hylo_operator_recipe.step);' \
   'test_hylo_qualification_memory.dependOn(test_hctp_conformance_memory);' \
   'test_hylo_qualification_persistent.dependOn(test_hctp_conformance_persistent);' \
@@ -51,6 +50,26 @@ for required_qualification_edge in \
     exit 1
   fi
 done
+
+duplicate_section36_edge='test_hylo_qualification_section36.dependOn(&run_hctp_conformance_hylo.step);'
+if grep -Fq "$duplicate_section36_edge" "$build_graph"; then
+  echo "core must not repeat the 17 Hylo-owned cases already proved by both backend lanes" >&2
+  exit 1
+fi
+
+coverage_manifest="$repo_root/testdata/hctp-v1/conformance-store-coverage-v1.json"
+coverage_shape="$(
+  jq -r '[
+    .expected_case_count,
+    (.cases | length),
+    ([.cases[] | select(.owner_source == "apps/ledger/scripts/hylo.zig")] | length),
+    ([.cases[] | select(.persistent_reload_required == true)] | length)
+  ] | @tsv' "$coverage_manifest"
+)"
+if [[ "$coverage_shape" != $'71\t71\t17\t17' ]]; then
+  echo "Hylo qualification proof quotient requires 71 mapped cases and 17 persistent owner cases" >&2
+  exit 1
+fi
 
 qualification_edge_count="$(grep -Ec '^    test_hylo\.dependOn\(' "$build_graph")"
 if [[ "$qualification_edge_count" != "3" ]]; then
@@ -112,15 +131,16 @@ for required_qualification_token in \
   'schedule:' \
   'workflow_dispatch:' \
   'fail-fast: false' \
-  '          - core' \
-  '          - memory' \
-  '          - persistent' \
-  'run: zig build test-hylo-qualification-${{ matrix.shard }} -j2 --summary all' \
+  'timeout-minutes: ${{ matrix.timeout_minutes }}' \
+  '          - shard: core' \
+  '          - shard: memory' \
+  '          - shard: persistent' \
+  'run: zig build test-hylo-qualification-${{ matrix.shard }} -Doptimize=ReleaseSafe -j2 --summary all' \
   'ref: ${{ needs.bind.outputs.sha }}' \
   'needs: [bind, qualify]' \
   "needs.bind.result == 'success'" \
   'RESULT: ${{ needs.qualify.result }}' \
-  'command: "zig build test-hylo-qualification-{core,memory,persistent} -j2 --summary all; isolated matrix"' \
+  'command: "zig build test-hylo-qualification-{core,memory,persistent} -Doptimize=ReleaseSafe -j2 --summary all; isolated matrix"' \
   'schema: "hylo-qualification-receipt/v1"' \
   '.path == ".github/workflows/auto-release.yml"' \
   '.qualified_sha == $expected_sha' \
@@ -131,12 +151,51 @@ for required_qualification_token in \
   fi
 done
 
+if grep -Eq 'test-hylo-qualification.*-Doptimize=(Debug|ReleaseFast|ReleaseSmall)' "$qualification_workflow"; then
+  echo "Hylo qualification must retain ReleaseSafe runtime safety" >&2
+  exit 1
+fi
+if grep -R -E 'builtin\.(mode|optimize_mode)' \
+  --include='*.zig' \
+  "$repo_root/apps/seq" \
+  "$repo_root/apps/cas" \
+  "$repo_root/apps/ledger" \
+  "$repo_root/libs" \
+  "$repo_root/testdata" \
+  "$build_graph" >/dev/null; then
+  echo "Hylo qualification sources must not select different behavior by optimization mode" >&2
+  exit 1
+fi
+
 qualification_shard_count="$(
-  sed -n '/^        shard:$/,/^    steps:$/p' "$qualification_workflow" |
-    grep -Ec '^          - [a-z0-9-]+$'
+  sed -n '/^        include:$/,/^    steps:$/p' "$qualification_workflow" |
+    grep -Ec '^          - shard: [a-z0-9-]+$'
 )"
 if [[ "$qualification_shard_count" != "3" ]]; then
   echo "shared Hylo qualification workflow must enumerate exactly three shards" >&2
+  exit 1
+fi
+
+for shard_budget in 'core 7' 'memory 5' 'persistent 5'; do
+  read -r shard timeout <<<"$shard_budget"
+  if ! awk -v shard="$shard" -v timeout="$timeout" '
+    $0 == "          - shard: " shard {
+      getline
+      if ($0 == "            timeout_minutes: " timeout) found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$qualification_workflow"; then
+    echo "qualification shard $shard must retain its measured ${timeout}-minute budget" >&2
+    exit 1
+  fi
+done
+
+qualification_timeout_budget="$(
+  sed -n '/^        include:$/,/^    steps:$/p' "$qualification_workflow" |
+    awk '/^            timeout_minutes: [0-9]+$/ { total += $2; count += 1 } END { print count ":" total }'
+)"
+if [[ "$qualification_timeout_budget" != "3:17" ]]; then
+  echo "qualification must retain three measured shard budgets and a 17 runner-minute timeout ceiling" >&2
   exit 1
 fi
 
