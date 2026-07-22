@@ -767,6 +767,8 @@ const Options = struct {
     bundle_dir_text: ?[]const u8 = null,
     artifact_root_text: ?[]const u8 = null,
     policy_root_text: ?[]const u8 = null,
+    evidence_store_text: ?[]const u8 = null,
+    actuation_goal_id_text: ?[]const u8 = null,
     receipt_path_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
     receipt_path_count: usize = 0,
     receipt_glob_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
@@ -1117,8 +1119,12 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --format markdown           Only valid with --mode report
         ,
         .actuation_audit =>
-        \\usage: seq actuation-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|(--repo <path>|--workdir <path>) (--since <iso>|--until <iso>|--last <duration>)] [--include-workers] [--mode summary|runs|slices|proof|compactions|decisions|hylo|report] [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
+        \\usage: seq actuation-audit --root <path> [selector]
+        \\  [--evidence-store <evidence.jsonl> --goal-id <id>]
+        \\  [--mode summary|runs|slices|proof|compactions|decisions|hylo|kernel|report]
+        \\  [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
         \\extra options:
+        \\  selector                   --session-id, --path, or bounded --repo/--workdir
         \\  --exclude-current          Exclude the current CODEX_THREAD_ID session from corpus selectors
         \\  --strict                   Exit 2 when a true run has a defined actuation control failure
         \\  --include-excerpts         Include bounded sanitized excerpts; full prompts and private reasoning stay excluded
@@ -1284,6 +1290,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt == .dot) return error.InvalidFormatForCommand;
             const mode = opts.mode orelse "summary";
             if (!isValidActuationAuditMode(mode)) return error.InvalidModeArg;
+            if (std.mem.eql(u8, mode, "kernel") and fmt != .json) {
+                return error.InvalidFormatForCommand;
+            }
             if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
         },
         .cas_review_audit => {
@@ -1626,6 +1635,18 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.bundle_dir_text != null, supports_bundle_dir, "--bundle-dir", cmd);
     try ensureOptionAllowed(opts.artifact_root_text != null, supports_artifact_root, "--artifact-root", cmd);
     try ensureOptionAllowed(opts.policy_root_text != null, supports_policy_root, "--policy-root", cmd);
+    try ensureOptionAllowed(
+        opts.evidence_store_text != null,
+        cmd == .actuation_audit,
+        "--evidence-store",
+        cmd,
+    );
+    try ensureOptionAllowed(
+        opts.actuation_goal_id_text != null,
+        cmd == .actuation_audit,
+        "--goal-id",
+        cmd,
+    );
     try ensureOptionAllowed(opts.receipt_path_count > 0, cmd == .cas_review_audit, "--receipt-path", cmd);
     try ensureOptionAllowed(opts.receipt_glob_count > 0, cmd == .cas_review_audit, "--receipt-glob", cmd);
     try ensureOptionAllowed(opts.base_sha_text != null, cmd == .cas_review_audit, "--base-sha", cmd);
@@ -1868,12 +1889,44 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         }
     }
     if (cmd == .actuation_audit) {
+        const mode = opts.mode orelse "summary";
         if (opts.mode) |text| {
             if (!isValidActuationAuditMode(text)) return error.InvalidModeArg;
         }
         if (!hasActuationAuditScope(opts)) {
             printCliError("error: actuation-audit requires --session-id, --path, or (--repo/--workdir with --since/--until/--last)\n", .{});
             return error.MissingArgValue;
+        }
+        if (std.mem.eql(u8, mode, "kernel")) {
+            if (opts.evidence_store_text == null or opts.actuation_goal_id_text == null) {
+                printCliError(
+                    "error: kernel mode requires --evidence-store and --goal-id\n",
+                    .{},
+                );
+                return error.MissingArgValue;
+            }
+            const has_session_id = opts.session_id != null;
+            const has_path = opts.path != null;
+            if (opts.exclude_current or opts.include_workers or opts.include_excerpts) {
+                printCliError(
+                    "error: kernel mode does not support --exclude-current, " ++
+                        "--include-workers, or --include-excerpts\n",
+                    .{},
+                );
+                return error.InvalidModeArg;
+            }
+            if (has_session_id == has_path or opts.repo_text != null or
+                opts.workdir_text != null or opts.since != null or opts.until != null or
+                opts.last_text != null)
+            {
+                printCliError(
+                    "error: kernel mode requires exactly one --session-id or --path selector\n",
+                    .{},
+                );
+                return error.InvalidModeArg;
+            }
+        } else if (opts.evidence_store_text != null or opts.actuation_goal_id_text != null) {
+            return error.InvalidModeArg;
         }
     }
     if (cmd == .cas_review_audit) {
@@ -2133,6 +2186,7 @@ fn isValidActuationAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "compactions") or
         std.mem.eql(u8, text, "decisions") or
         std.mem.eql(u8, text, "hylo") or
+        std.mem.eql(u8, text, "kernel") or
         std.mem.eql(u8, text, "report");
 }
 
@@ -3392,6 +3446,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "source_governance_projection_v1": true,
             \\      "c3_structured_closure_v1": true,
             \\      "actuation_audit_v1": true,
+            \\      "actuation_artifact_kernel_audit_v1": true,
             \\      "actuation_hylo_audit_v1": true,
             \\      "execution_policy_audit_v1": true,
             \\      "ledger_artifact_root_v1": true,
@@ -3457,6 +3512,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "source_governance_projection_v1", .enabled = true },
         .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "actuation_audit_v1", .enabled = true },
+        .{ .name = "actuation_artifact_kernel_audit_v1", .enabled = true },
         .{ .name = "actuation_hylo_audit_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
         .{ .name = "ledger_artifact_root_v1", .enabled = true },
@@ -3512,6 +3568,10 @@ fn writeEnabledCapability(writer: anytype, name: []const u8) !void {
 
 fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const mode = opts.mode orelse "summary";
+    if (std.mem.eql(u8, mode, "kernel")) {
+        try cmdActuationAuditKernel(allocator, sessions_root, opts);
+        return;
+    }
     if (opts.format == .markdown and std.mem.eql(u8, mode, "report")) {
         try cmdActuationAuditReport(allocator, sessions_root, opts);
         return;
@@ -3549,6 +3609,968 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
 
     const cols = actuationColumnsForMode(mode);
     try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
+}
+
+const ActuationReceiptDigests = struct {
+    set: StringSet,
+    producer_call_ids: StringSet,
+    producer_execution_handles: StringSet,
+
+    fn init(allocator: std.mem.Allocator) ActuationReceiptDigests {
+        return .{
+            .set = StringSet.init(allocator),
+            .producer_call_ids = StringSet.init(allocator),
+            .producer_execution_handles = StringSet.init(allocator),
+        };
+    }
+
+    fn deinit(self: *ActuationReceiptDigests) void {
+        self.set.deinit();
+        self.producer_call_ids.deinit();
+        self.producer_execution_handles.deinit();
+    }
+
+    fn visit(self: *ActuationReceiptDigests, raw_line: []const u8, _: usize) !void {
+        var arena = std.heap.ArenaAllocator.init(self.set.allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            arena.allocator(),
+            std.mem.trim(u8, raw_line, " \t\r\n"),
+            .{},
+        ) catch return;
+        const root = switch (parsed.value) {
+            .object => |object| object,
+            else => return,
+        };
+        const root_type = stdJsonStringField(root, "type") orelse return;
+        if (!std.mem.eql(u8, root_type, "response_item")) return;
+        const payload = stdJsonObjectField(root, "payload") orelse return;
+        const payload_type = stdJsonStringField(payload, "type") orelse return;
+        if (std.mem.eql(u8, payload_type, "function_call") or
+            std.mem.eql(u8, payload_type, "custom_tool_call"))
+        {
+            const name = stdJsonStringField(payload, "name") orelse return;
+            const call_id = stdJsonStringField(payload, "call_id") orelse return;
+            const input = stdJsonStringField(payload, "arguments") orelse
+                stdJsonStringField(payload, "input") orelse return;
+            if ((isExecToolName(name) and isActuationProducingToolInput(name, input) and
+                execOutputForwardingIsBound(name, input)) or
+                self.isProducerContinuationInput(name, input))
+            {
+                try self.producer_call_ids.put(call_id);
+            }
+            return;
+        }
+        if (!std.mem.eql(u8, payload_type, "function_call_output") and
+            !std.mem.eql(u8, payload_type, "custom_tool_call_output")) return;
+        const call_id = stdJsonStringField(payload, "call_id") orelse return;
+        if (!self.producer_call_ids.contains(call_id)) return;
+        try self.collectProducerOutput(payload.get("output") orelse return, arena.allocator());
+    }
+
+    fn isProducerContinuationInput(
+        self: *const ActuationReceiptDigests,
+        name: []const u8,
+        input: []const u8,
+    ) bool {
+        const binding = continuationHandleInput(name, input) orelse return false;
+        if (binding.invocation) |invocation| {
+            if (!nestedToolOutputForwardingIsBound(input, invocation)) return false;
+        }
+        var handles = self.producer_execution_handles.map.keyIterator();
+        while (handles.next()) |handle| {
+            if (inputReferencesExecutionHandle(
+                binding.arguments,
+                binding.field_name,
+                handle.*,
+            )) return true;
+        }
+        return false;
+    }
+
+    fn collectProducerOutput(
+        self: *ActuationReceiptDigests,
+        value: std.json.Value,
+        scratch: std.mem.Allocator,
+    ) !void {
+        switch (value) {
+            .string => |text| try self.collectForwardedText(text, scratch),
+            .array => |array| {
+                for (array.items) |item| {
+                    if (item == .object) {
+                        if (stdJsonStringField(item.object, "text")) |text| {
+                            try self.collectForwardedText(text, scratch);
+                        }
+                    }
+                }
+            },
+            .object => |object| try self.collectStructuredResult(object, scratch),
+            else => {},
+        }
+    }
+
+    fn collectForwardedText(
+        self: *ActuationReceiptDigests,
+        text: []const u8,
+        scratch: std.mem.Allocator,
+    ) !void {
+        try self.collectExecutionHandleText(text);
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (std.json.parseFromSlice(std.json.Value, scratch, trimmed, .{})) |parsed| {
+            switch (parsed.value) {
+                .object => |object| {
+                    if (object.contains("output") or object.contains("exit_code") or
+                        object.contains("session_id") or object.contains("cell_id"))
+                    {
+                        try self.collectStructuredResult(object, scratch);
+                        return;
+                    }
+                    try self.collectReceiptObject(object);
+                    return;
+                },
+                else => {},
+            }
+        } else |_| {}
+        try self.collectReceiptLines(trimmed, scratch);
+    }
+
+    fn collectStructuredResult(
+        self: *ActuationReceiptDigests,
+        object: std.json.ObjectMap,
+        scratch: std.mem.Allocator,
+    ) !void {
+        try self.collectExecutionHandles(object);
+        const exit_code = object.get("exit_code") orelse return;
+        if (exit_code != .integer or exit_code.integer != 0) return;
+        const stdout = stdJsonStringField(object, "output") orelse return;
+        try self.collectReceiptLines(stdout, scratch);
+    }
+
+    fn collectReceiptLines(
+        self: *ActuationReceiptDigests,
+        text: []const u8,
+        scratch: std.mem.Allocator,
+    ) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            const parsed = std.json.parseFromSlice(
+                std.json.Value,
+                scratch,
+                line,
+                .{},
+            ) catch continue;
+            if (parsed.value == .object) try self.collectReceiptObject(parsed.value.object);
+        }
+    }
+
+    fn collectReceiptObject(
+        self: *ActuationReceiptDigests,
+        object: std.json.ObjectMap,
+    ) !void {
+        const schema = stdJsonStringField(object, "schema") orelse return;
+        if (!isActuationReceiptSchema(schema)) return;
+        const digest = stdJsonStringField(object, "event_digest") orelse return;
+        if (!isSha256Digest(digest)) return;
+        try self.set.put(digest);
+    }
+
+    fn collectExecutionHandles(
+        self: *ActuationReceiptDigests,
+        object: std.json.ObjectMap,
+    ) !void {
+        for ([_][]const u8{ "session_id", "cell_id" }) |field_name| {
+            const value = object.get(field_name) orelse continue;
+            switch (value) {
+                .string => |handle| if (handle.len != 0) {
+                    try self.producer_execution_handles.put(handle);
+                },
+                .integer => |handle| {
+                    const text = try std.fmt.allocPrint(self.set.allocator, "{d}", .{handle});
+                    defer self.set.allocator.free(text);
+                    try self.producer_execution_handles.put(text);
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn collectExecutionHandleText(self: *ActuationReceiptDigests, text: []const u8) !void {
+        const handle = executionHandleFromYieldStatus(text) orelse return;
+        try self.producer_execution_handles.put(handle);
+    }
+
+    fn slicesAlloc(
+        self: *ActuationReceiptDigests,
+        allocator: std.mem.Allocator,
+    ) ![][]const u8 {
+        const slices = try allocator.alloc([]const u8, self.set.count());
+        var index: usize = 0;
+        var it = self.set.map.keyIterator();
+        while (it.next()) |key| : (index += 1) slices[index] = key.*;
+        return slices;
+    }
+};
+
+fn executionHandleFromYieldStatus(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, text, " \t\r\n");
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    const first = trimCarriageReturn(lines.next() orelse return null);
+    const script_marker = "Script running with cell ID ";
+    if (std.mem.startsWith(u8, first, script_marker)) {
+        const handle = runtimeHandleSuffix(first, script_marker) orelse return null;
+        if (!runtimeDurationLine(
+            trimCarriageReturn(lines.next() orelse return null),
+            "Wall time ",
+        )) return null;
+        if (!std.mem.eql(
+            u8,
+            trimCarriageReturn(lines.next() orelse return null),
+            "Output:",
+        )) return null;
+        return handle;
+    }
+    const chunk_marker = "Chunk ID: ";
+    if (runtimeHandleSuffix(first, chunk_marker) == null) return null;
+    if (!runtimeDurationLine(
+        trimCarriageReturn(lines.next() orelse return null),
+        "Wall time: ",
+    )) return null;
+    const process_marker = "Process running with session ID ";
+    const handle = runtimeHandleSuffix(
+        trimCarriageReturn(lines.next() orelse return null),
+        process_marker,
+    ) orelse return null;
+    const token_count = trimCarriageReturn(lines.next() orelse return null);
+    const token_marker = "Original token count: ";
+    if (!std.mem.startsWith(u8, token_count, token_marker) or
+        !asciiDigits(token_count[token_marker.len..])) return null;
+    if (!std.mem.eql(
+        u8,
+        trimCarriageReturn(lines.next() orelse return null),
+        "Output:",
+    )) return null;
+    return handle;
+}
+
+fn trimCarriageReturn(line: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, line, "\r");
+}
+
+fn runtimeHandleSuffix(line: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    const handle = line[prefix.len..];
+    if (handle.len == 0) return null;
+    for (handle) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return null;
+    }
+    return handle;
+}
+
+fn runtimeDurationLine(line: []const u8, prefix: []const u8) bool {
+    const suffix = " seconds";
+    if (!std.mem.startsWith(u8, line, prefix) or
+        !std.mem.endsWith(u8, line, suffix) or
+        line.len <= prefix.len + suffix.len) return false;
+    var decimal_points: usize = 0;
+    for (line[prefix.len .. line.len - suffix.len]) |byte| {
+        if (byte == '.') {
+            decimal_points += 1;
+            if (decimal_points > 1) return false;
+        } else if (!std.ascii.isDigit(byte)) return false;
+    }
+    return true;
+}
+
+fn asciiDigits(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn isExecToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "exec") or std.mem.eql(u8, name, "exec_command");
+}
+
+const ContinuationHandleInput = struct {
+    arguments: []const u8,
+    field_name: []const u8,
+    invocation: ?[]const u8,
+};
+
+fn continuationHandleInput(name: []const u8, input: []const u8) ?ContinuationHandleInput {
+    if (std.mem.eql(u8, name, "write_stdin")) return .{
+        .arguments = input,
+        .field_name = "session_id",
+        .invocation = null,
+    };
+    if (std.mem.eql(u8, name, "wait")) return .{
+        .arguments = input,
+        .field_name = "cell_id",
+        .invocation = null,
+    };
+    if (!std.mem.eql(u8, name, "exec")) return null;
+    const write_arguments = nestedToolInvocationArguments(input, "tools.write_stdin");
+    const wait_arguments = nestedToolInvocationArguments(input, "tools.wait");
+    if ((write_arguments == null) == (wait_arguments == null)) return null;
+    if (write_arguments) |arguments| return .{
+        .arguments = arguments,
+        .field_name = "session_id",
+        .invocation = "tools.write_stdin",
+    };
+    return .{
+        .arguments = wait_arguments.?,
+        .field_name = "cell_id",
+        .invocation = "tools.wait",
+    };
+}
+
+fn inputReferencesExecutionHandle(
+    input: []const u8,
+    field_name: []const u8,
+    expected: []const u8,
+) bool {
+    const raw = objectFieldRawValue(input, field_name) orelse return false;
+    const value = staticStringValue(raw) orelse std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return std.mem.eql(u8, value, expected);
+}
+
+fn execOutputForwardingIsBound(name: []const u8, input: []const u8) bool {
+    if (std.mem.eql(u8, name, "exec_command")) return true;
+    if (std.mem.indexOf(u8, input, "tools.exec_command") == null) return true;
+    return nestedToolOutputForwardingIsBound(input, "tools.exec_command");
+}
+
+fn nestedToolInvocationArguments(input: []const u8, invocation: []const u8) ?[]const u8 {
+    const invocation_start = std.mem.indexOf(u8, input, invocation) orelse return null;
+    if (std.mem.indexOfPos(u8, input, invocation_start + invocation.len, invocation) != null) {
+        return null;
+    }
+    var cursor = invocation_start + invocation.len;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != '(') return null;
+    const close = matchingDelimiter(input, cursor, '(', ')') orelse return null;
+    return input[cursor + 1 .. close];
+}
+
+fn matchingDelimiter(
+    input: []const u8,
+    open_index: usize,
+    open: u8,
+    close: u8,
+) ?usize {
+    var depth: usize = 0;
+    var cursor = open_index;
+    while (cursor < input.len) : (cursor += 1) {
+        if (input[cursor] == '"' or input[cursor] == '\'' or input[cursor] == '`') {
+            cursor = quotedEnd(input, cursor, input.len) orelse return null;
+            continue;
+        }
+        if (input[cursor] == open) {
+            depth += 1;
+        } else if (input[cursor] == close) {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return cursor;
+        }
+    }
+    return null;
+}
+
+fn quotedEnd(input: []const u8, start: usize, limit: usize) ?usize {
+    const delimiter = input[start];
+    var cursor = start + 1;
+    while (cursor < limit) : (cursor += 1) {
+        if (input[cursor] == delimiter and !isEscapedByte(input, cursor)) return cursor;
+    }
+    return null;
+}
+
+fn objectFieldRawValue(input: []const u8, field_name: []const u8) ?[]const u8 {
+    const object = std.mem.trim(u8, input, " \t\r\n");
+    if (object.len < 2 or object[0] != '{') return null;
+    const object_end = matchingDelimiter(object, 0, '{', '}') orelse return null;
+    if (std.mem.trim(u8, object[object_end + 1 ..], " \t\r\n").len != 0) return null;
+    var found: ?[]const u8 = null;
+    var cursor: usize = 1;
+    while (cursor < object_end) {
+        while (cursor < object_end and
+            (std.ascii.isWhitespace(object[cursor]) or object[cursor] == ',')) cursor += 1;
+        if (cursor == object_end) break;
+        const key = objectKey(object, &cursor, object_end) orelse return null;
+        while (cursor < object_end and std.ascii.isWhitespace(object[cursor])) cursor += 1;
+        if (cursor == object_end or object[cursor] != ':') return null;
+        cursor += 1;
+        while (cursor < object_end and std.ascii.isWhitespace(object[cursor])) cursor += 1;
+        const value_start = cursor;
+        const value_end = objectFieldEnd(object, cursor, object_end) orelse return null;
+        if (std.mem.eql(u8, key, field_name)) {
+            if (found != null) return null;
+            found = std.mem.trim(u8, object[value_start..value_end], " \t\r\n");
+        }
+        cursor = value_end;
+        if (cursor < object_end) cursor += 1;
+    }
+    return found;
+}
+
+fn objectKey(input: []const u8, cursor: *usize, limit: usize) ?[]const u8 {
+    if (input[cursor.*] == '"' or input[cursor.*] == '\'') {
+        const start = cursor.*;
+        const end = quotedEnd(input, start, limit) orelse return null;
+        cursor.* = end + 1;
+        return input[start + 1 .. end];
+    }
+    const start = cursor.*;
+    while (cursor.* < limit and
+        (std.ascii.isAlphanumeric(input[cursor.*]) or input[cursor.*] == '_')) cursor.* += 1;
+    return if (cursor.* == start) null else input[start..cursor.*];
+}
+
+fn objectFieldEnd(input: []const u8, start: usize, limit: usize) ?usize {
+    var nesting: usize = 0;
+    var cursor = start;
+    while (cursor < limit) : (cursor += 1) {
+        switch (input[cursor]) {
+            '"', '\'', '`' => cursor = quotedEnd(input, cursor, limit) orelse return null,
+            '{', '[', '(' => nesting += 1,
+            '}', ']', ')' => {
+                if (nesting == 0) return null;
+                nesting -= 1;
+            },
+            ',' => if (nesting == 0) return cursor,
+            else => {},
+        }
+    }
+    return limit;
+}
+
+fn staticStringValue(input: []const u8) ?[]const u8 {
+    const raw = std.mem.trim(u8, input, " \t\r\n");
+    if (raw.len < 2 or (raw[0] != '"' and raw[0] != '\'' and raw[0] != '`')) return null;
+    const end = quotedEnd(raw, 0, raw.len) orelse return null;
+    if (end != raw.len - 1) return null;
+    const value = raw[1..end];
+    if (raw[0] == '`' and std.mem.indexOf(u8, value, "${") != null) return null;
+    return value;
+}
+
+fn nestedToolOutputForwardingIsBound(input: []const u8, invocation: []const u8) bool {
+    _ = nestedToolInvocationArguments(input, invocation) orelse return false;
+    const exec_index = std.mem.indexOf(u8, input, invocation) orelse
+        return false;
+    if (std.mem.indexOfPos(u8, input, exec_index + invocation.len, invocation) != null) {
+        return false;
+    }
+    var invocation_open = exec_index + invocation.len;
+    skipAsciiWhitespace(input, &invocation_open);
+    if (invocation_open >= input.len or input[invocation_open] != '(') return false;
+    const invocation_close = matchingDelimiter(
+        input,
+        invocation_open,
+        '(',
+        ')',
+    ) orelse return false;
+    var equals = exec_index;
+    while (equals > 0 and input[equals - 1] != '=') equals -= 1;
+    if (equals == 0) return false;
+    var name_end = equals - 1;
+    while (name_end > 0 and std.ascii.isWhitespace(input[name_end - 1])) name_end -= 1;
+    var name_start = name_end;
+    while (name_start > 0 and
+        (std.ascii.isAlphanumeric(input[name_start - 1]) or input[name_start - 1] == '_'))
+    {
+        name_start -= 1;
+    }
+    if (name_start == name_end) return false;
+    const variable = input[name_start..name_end];
+    const text_index = std.mem.indexOfPos(u8, input, invocation_close + 1, "text(") orelse
+        return false;
+    if (std.mem.indexOfPos(u8, input, text_index + "text(".len, "text(") != null) return false;
+    if (!onlyStatementSeparators(input[invocation_close + 1 .. text_index])) return false;
+    var cursor = text_index + "text(".len;
+    skipAsciiWhitespace(input, &cursor);
+    if (consumeIdentifierPath(input, &cursor, variable, "output")) {
+        skipAsciiWhitespace(input, &cursor);
+        if (cursor >= input.len or input[cursor] != ')') return false;
+        return onlyStatementSeparators(input[cursor + 1 ..]);
+    }
+    cursor = text_index + "text(".len;
+    skipAsciiWhitespace(input, &cursor);
+    if (!consumeLiteral(input, &cursor, "JSON.stringify")) return false;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != '(') return false;
+    cursor += 1;
+    skipAsciiWhitespace(input, &cursor);
+    if (consumeLiteral(input, &cursor, variable)) {
+        skipAsciiWhitespace(input, &cursor);
+        if (cursor >= input.len or input[cursor] != ')') return false;
+        cursor += 1;
+        skipAsciiWhitespace(input, &cursor);
+        if (cursor >= input.len or input[cursor] != ')') return false;
+        return onlyStatementSeparators(input[cursor + 1 ..]);
+    }
+    if (cursor >= input.len or input[cursor] != '{') return false;
+    cursor += 1;
+    if (!consumeProjectedExecField(input, &cursor, variable, "exit_code")) return false;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != ',') return false;
+    cursor += 1;
+    if (!consumeProjectedExecField(input, &cursor, variable, "output")) return false;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != '}') return false;
+    cursor += 1;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != ')') return false;
+    cursor += 1;
+    skipAsciiWhitespace(input, &cursor);
+    if (cursor >= input.len or input[cursor] != ')') return false;
+    return onlyStatementSeparators(input[cursor + 1 ..]);
+}
+
+fn onlyStatementSeparators(input: []const u8) bool {
+    for (input) |byte| {
+        if (!std.ascii.isWhitespace(byte) and byte != ';') return false;
+    }
+    return true;
+}
+
+fn consumeProjectedExecField(
+    input: []const u8,
+    cursor: *usize,
+    variable: []const u8,
+    field_name: []const u8,
+) bool {
+    skipAsciiWhitespace(input, cursor);
+    if (!consumeLiteral(input, cursor, field_name)) return false;
+    skipAsciiWhitespace(input, cursor);
+    if (cursor.* >= input.len or input[cursor.*] != ':') return false;
+    cursor.* += 1;
+    skipAsciiWhitespace(input, cursor);
+    return consumeIdentifierPath(input, cursor, variable, field_name);
+}
+
+fn consumeIdentifierPath(
+    input: []const u8,
+    cursor: *usize,
+    variable: []const u8,
+    field_name: []const u8,
+) bool {
+    if (!consumeLiteral(input, cursor, variable)) return false;
+    skipAsciiWhitespace(input, cursor);
+    if (cursor.* >= input.len or input[cursor.*] != '.') return false;
+    cursor.* += 1;
+    skipAsciiWhitespace(input, cursor);
+    return consumeLiteral(input, cursor, field_name);
+}
+
+fn consumeLiteral(input: []const u8, cursor: *usize, literal: []const u8) bool {
+    if (!std.mem.startsWith(u8, input[cursor.*..], literal)) return false;
+    cursor.* += literal.len;
+    return true;
+}
+
+fn skipAsciiWhitespace(input: []const u8, cursor: *usize) void {
+    while (cursor.* < input.len and std.ascii.isWhitespace(input[cursor.*])) cursor.* += 1;
+}
+
+fn isActuationReceiptSchema(schema: []const u8) bool {
+    return std.mem.eql(u8, schema, "actuating-append-result/v1") or
+        std.mem.eql(u8, schema, "actuating-prepare-result/v1") or
+        std.mem.eql(u8, schema, "actuation-transition-result/v1");
+}
+
+fn isActuationProducingToolInput(name: []const u8, input: []const u8) bool {
+    if (std.mem.eql(u8, name, "exec_command")) return isActuationProducingInput(input);
+    if (!std.mem.eql(u8, name, "exec")) return false;
+    return isActuationProducingInput(input);
+}
+
+fn isActuationProducingInput(input: []const u8) bool {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    const command = if (std.mem.indexOf(u8, input, "tools.exec_command") != null) blk: {
+        const arguments = nestedToolInvocationArguments(input, "tools.exec_command") orelse
+            return false;
+        break :blk commandValueSlice(arguments) orelse return false;
+    } else if (trimmed.len != 0 and trimmed[0] == '{')
+        commandValueSlice(trimmed) orelse return false
+    else
+        input;
+    if (std.mem.indexOf(u8, command, "ledger") == null) return false;
+    if (std.mem.indexOf(u8, command, ">(") != null) return false;
+    var cursor: usize = 0;
+    var producer = false;
+    while (nextShellWord(command, &cursor)) |word| {
+        if (!std.mem.eql(u8, std.fs.path.basename(word.text), "ledger")) continue;
+        if (!isShellCommandPosition(command, word.start)) continue;
+        if (isInsideCapturedCommand(command, word.start)) continue;
+        const segment = shellCommandSegment(command, word.end);
+        if (segmentIsActuationProducer(segment)) producer = true;
+    }
+    return producer and !hasUnboundShellOutputCommand(command);
+}
+
+fn commandValueSlice(input: []const u8) ?[]const u8 {
+    const raw = objectFieldRawValue(input, "cmd") orelse return null;
+    return staticStringValue(raw);
+}
+
+fn isEscapedByte(input: []const u8, index: usize) bool {
+    var backslashes: usize = 0;
+    var cursor = index;
+    while (cursor > 0 and input[cursor - 1] == '\\') : (cursor -= 1) backslashes += 1;
+    return backslashes % 2 == 1;
+}
+
+fn hasUnboundShellOutputCommand(input: []const u8) bool {
+    var cursor: usize = 0;
+    while (nextShellWord(input, &cursor)) |word| {
+        if (!isShellCommandPosition(input, word.start)) continue;
+        const command = std.fs.path.basename(word.text);
+        if (isShellControlOrWrapper(command) or std.mem.indexOfScalar(u8, command, '=') != null) {
+            continue;
+        }
+        if (isInsideCapturedCommand(input, word.start)) continue;
+        if (isSilentShellSetupCommand(input, word)) continue;
+        if (feedsActuationProducer(input, word.end)) continue;
+        if (std.mem.eql(u8, command, "ledger") and
+            segmentIsActuationProducer(shellCommandSegment(input, word.end))) continue;
+        return true;
+    }
+    return false;
+}
+
+fn isShellControlOrWrapper(command: []const u8) bool {
+    for ([_][]const u8{
+        "set",  "for",   "do",    "done", "if",   "then", "elif",    "else",
+        "fi",   "while", "until", "case", "esac", "time", "command", "env",
+        "exec",
+    }) |candidate| if (std.mem.eql(u8, command, candidate)) return true;
+    return false;
+}
+
+fn isSilentShellSetupCommand(input: []const u8, command: ShellWord) bool {
+    if (!std.mem.eql(u8, std.fs.path.basename(command.text), "cd")) return false;
+    const segment = shellCommandSegment(input, command.end);
+    var cursor: usize = 0;
+    var path = nextShellWord(segment, &cursor) orelse return false;
+    if (std.mem.eql(u8, path.text, "--")) {
+        path = nextShellWord(segment, &cursor) orelse return false;
+    }
+    return path.text[0] == '/' and nextShellWord(segment, &cursor) == null;
+}
+
+fn isInsideCapturedCommand(input: []const u8, before: usize) bool {
+    var depth: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < before) : (cursor += 1) {
+        if (cursor + 1 < before and input[cursor + 1] == '(' and
+            (input[cursor] == '$' or input[cursor] == '<' or input[cursor] == '>'))
+        {
+            depth += 1;
+            cursor += 1;
+        } else if (input[cursor] == ')' and depth > 0) {
+            depth -= 1;
+        }
+    }
+    return depth > 0;
+}
+
+fn feedsActuationProducer(input: []const u8, after: usize) bool {
+    var cursor = after;
+    var previous_end = after;
+    var saw_pipe = false;
+    while (nextShellWord(input, &cursor)) |word| {
+        const between = input[previous_end..word.start];
+        if (shellSequenceEnds(between)) return false;
+        if (std.mem.indexOfScalar(u8, between, '|') != null) saw_pipe = true;
+        if (std.mem.eql(u8, std.fs.path.basename(word.text), "ledger") and
+            isShellCommandPosition(input, word.start) and saw_pipe and
+            segmentIsActuationProducer(shellCommandSegment(input, word.end))) return true;
+        previous_end = word.end;
+    }
+    return false;
+}
+
+fn shellSequenceEnds(text: []const u8) bool {
+    var cursor: usize = 0;
+    while (cursor < text.len) : (cursor += 1) {
+        if (text[cursor] == '\n' or text[cursor] == ';' or
+            encodedNewlineIsSequenceBoundary(text, cursor) or
+            ((text[cursor] == '&' or text[cursor] == '|') and
+                cursor + 1 < text.len and text[cursor + 1] == text[cursor])) return true;
+    }
+    return false;
+}
+
+const ShellWord = struct {
+    text: []const u8,
+    start: usize,
+    end: usize,
+};
+
+fn nextShellWord(input: []const u8, cursor: *usize) ?ShellWord {
+    while (cursor.* < input.len and !isShellWordByte(input[cursor.*])) {
+        if (input[cursor.*] == '\\') {
+            var escaped_end = cursor.*;
+            while (escaped_end < input.len and input[escaped_end] == '\\') escaped_end += 1;
+            if (escaped_end < input.len and input[escaped_end] == 'n') {
+                cursor.* = escaped_end + 1;
+                continue;
+            }
+        }
+        cursor.* += 1;
+    }
+    if (cursor.* == input.len) return null;
+    const start = cursor.*;
+    while (cursor.* < input.len and isShellWordByte(input[cursor.*])) cursor.* += 1;
+    return .{ .text = input[start..cursor.*], .start = start, .end = cursor.* };
+}
+
+fn isShellWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or
+        byte == '_' or byte == '-' or byte == '.' or byte == '/' or byte == '=';
+}
+
+fn isShellCommandPosition(input: []const u8, word_start: usize) bool {
+    var cursor = word_start;
+    while (cursor > 0 and std.ascii.isWhitespace(input[cursor - 1])) cursor -= 1;
+    if (cursor == 0) return true;
+    if (encodedNewlineBeforeIsSequenceBoundary(input, cursor)) return true;
+    if (previousShellWord(input, cursor)) |word| {
+        for ([_][]const u8{ "do", "then", "else", "time", "command", "env", "exec" }) |prefix| {
+            if (std.mem.eql(u8, word, prefix)) return true;
+        }
+    }
+    return switch (input[cursor - 1]) {
+        '(', '{', '|', ';', '&', '!' => true,
+        '\'', '"', '`' => isCommandValueQuote(input, cursor - 1),
+        else => false,
+    };
+}
+
+fn encodedNewlineBeforeIsSequenceBoundary(input: []const u8, end: usize) bool {
+    if (end == 0 or input[end - 1] != 'n') return false;
+    var start = end - 1;
+    while (start > 0 and input[start - 1] == '\\') start -= 1;
+    return start < end - 1 and (end - 1 - start) % 2 == 0;
+}
+
+fn encodedNewlineIsSequenceBoundary(input: []const u8, start: usize) bool {
+    if (input[start] != '\\' or (start > 0 and input[start - 1] == '\\')) return false;
+    var end = start;
+    while (end < input.len and input[end] == '\\') end += 1;
+    return end < input.len and input[end] == 'n' and (end - start) % 2 == 0;
+}
+
+fn previousShellWord(input: []const u8, before: usize) ?[]const u8 {
+    var end = before;
+    while (end > 0 and std.ascii.isWhitespace(input[end - 1])) end -= 1;
+    var start = end;
+    while (start > 0 and isShellWordByte(input[start - 1])) start -= 1;
+    return if (start == end) null else input[start..end];
+}
+
+fn isCommandValueQuote(input: []const u8, quote_index: usize) bool {
+    var cursor = quote_index;
+    while (cursor > 0 and std.ascii.isWhitespace(input[cursor - 1])) cursor -= 1;
+    if (cursor == 0 or input[cursor - 1] != ':') return false;
+    cursor -= 1;
+    while (cursor > 0 and
+        (std.ascii.isWhitespace(input[cursor - 1]) or input[cursor - 1] == '"' or
+            input[cursor - 1] == '\'')) cursor -= 1;
+    const end = cursor;
+    while (cursor > 0 and std.ascii.isAlphabetic(input[cursor - 1])) cursor -= 1;
+    return std.mem.eql(u8, input[cursor..end], "cmd");
+}
+
+fn shellCommandSegment(input: []const u8, start: usize) []const u8 {
+    const delimiter = commandStringDelimiter(input, start);
+    var cursor = start;
+    while (cursor < input.len) : (cursor += 1) {
+        if (input[cursor] == '\n' or input[cursor] == ';' or
+            encodedNewlineIsSequenceBoundary(input, cursor) or
+            ((input[cursor] == '&' or input[cursor] == '|') and
+                cursor + 1 < input.len and input[cursor + 1] == input[cursor]) or
+            (delimiter != null and input[cursor] == delimiter.? and
+                commandStringEndsAt(input, cursor)))
+        {
+            return input[start..cursor];
+        }
+    }
+    return input[start..];
+}
+
+fn commandStringEndsAt(input: []const u8, quote_index: usize) bool {
+    if (input[quote_index - 1] == '\\') return false;
+    var before = quote_index;
+    while (before > 0 and std.ascii.isWhitespace(input[before - 1])) before -= 1;
+    if (before > 0 and input[before - 1] == '+') return false;
+    var after = quote_index + 1;
+    while (after < input.len and std.ascii.isWhitespace(input[after])) after += 1;
+    return after == input.len or input[after] != '+';
+}
+
+fn commandStringDelimiter(input: []const u8, before: usize) ?u8 {
+    var search_end = before;
+    while (search_end > 0) {
+        const key_index = std.mem.lastIndexOf(u8, input[0..search_end], "cmd") orelse return null;
+        var cursor = key_index + "cmd".len;
+        while (cursor < before and
+            (std.ascii.isWhitespace(input[cursor]) or input[cursor] == '"' or
+                input[cursor] == '\'')) cursor += 1;
+        if (cursor < before and input[cursor] == ':') {
+            cursor += 1;
+            while (cursor < before and std.ascii.isWhitespace(input[cursor])) cursor += 1;
+            if (cursor < before and
+                (input[cursor] == '"' or input[cursor] == '\'' or input[cursor] == '`'))
+            {
+                return input[cursor];
+            }
+        }
+        search_end = key_index;
+    }
+    return null;
+}
+
+fn segmentIsActuationProducer(segment: []const u8) bool {
+    var cursor: usize = 0;
+    var source = false;
+    var producer = false;
+    var previous: ?[]const u8 = null;
+    while (nextShellWord(segment, &cursor)) |word| {
+        if (std.mem.eql(u8, word.text, "--source=actuation") or
+            (previous != null and std.mem.eql(u8, previous.?, "--source") and
+                std.mem.eql(u8, word.text, "actuation"))) source = true;
+        if (isActuationProducerCommand(word.text)) producer = true;
+        previous = word.text;
+    }
+    return source and producer;
+}
+
+fn isActuationProducerCommand(word: []const u8) bool {
+    for ([_][]const u8{
+        "append", "prepare", "open", "record", "observe", "execute", "close",
+    }) |command| if (std.mem.eql(u8, word, command)) return true;
+    return false;
+}
+
+fn isSha256Digest(value: []const u8) bool {
+    if (value.len != 71 or !std.mem.startsWith(u8, value, "sha256:")) return false;
+    for (value[7..]) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
+const KernelSessionObservation = struct {
+    trace: canonical_trace.CanonicalSessionTrace,
+    receipts: ActuationReceiptDigests,
+    event_digests: [][]const u8,
+
+    fn deinit(self: *KernelSessionObservation, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_digests);
+        self.trace.deinit(allocator);
+        self.receipts.deinit();
+    }
+};
+
+fn observeKernelSession(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    opts: Options,
+) !KernelSessionObservation {
+    const file = try std.Io.Dir.openFileAbsolute(defaultIo(), path, .{});
+    defer file.close(defaultIo());
+    const stat = try file.stat(defaultIo());
+    var reader = file.reader(defaultIo(), &.{});
+    var receipts = ActuationReceiptDigests.init(allocator);
+    errdefer receipts.deinit();
+    var trace = try canonical_trace.parseSessionSummaryTraceReaderWithVisitor(
+        allocator,
+        path,
+        &reader.interface,
+        stat.mtime.nanoseconds,
+        traceParseOptions(opts),
+        &receipts,
+        ActuationReceiptDigests.visit,
+    );
+    errdefer trace.deinit(allocator);
+    return .{
+        .trace = trace,
+        .receipts = receipts,
+        .event_digests = try receipts.slicesAlloc(allocator),
+    };
+}
+
+fn cmdActuationAuditKernel(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !void {
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, true);
+    defer freePathList(allocator, &paths);
+    const path = paths.items[0];
+    var observation = try observeKernelSession(allocator, path, opts);
+    defer observation.deinit(allocator);
+    const trace = &observation.trace;
+    const session_id = trace.session.session_id orelse inferSessionIdFromPath(path);
+    const start_text = trace.session.start_time orelse if (trace.turns.items.len > 0)
+        trace.turns.items[0].started_at
+    else
+        null;
+    var end_text = trace.session.end_time;
+    if (end_text == null) {
+        var index = trace.turns.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (trace.turns.items[index].completed_at) |value| {
+                end_text = value;
+                break;
+            }
+        }
+    }
+    const start_epoch_s = if (start_text) |text|
+        @divFloor(
+            time_utils.parseIsoTimestampMillis(text) orelse return error.InvalidTimestampArg,
+            1000,
+        )
+    else
+        null;
+    const end_epoch_s = if (end_text) |text|
+        @divFloor(
+            time_utils.parseIsoTimestampMillis(text) orelse return error.InvalidTimestampArg,
+            1000,
+        )
+    else
+        null;
+    try validateKernelWindow(start_epoch_s, end_epoch_s);
+    const rendered = try actuation_audit.kernel.auditEvidenceStoreAlloc(
+        allocator,
+        opts.evidence_store_text.?,
+        opts.actuation_goal_id_text.?,
+        .{
+            .session_id = session_id,
+            .session_path = path,
+            .start_epoch_s = start_epoch_s,
+            .end_epoch_s = end_epoch_s,
+        },
+        observation.event_digests,
+    );
+    defer allocator.free(rendered);
+    if (opts.actuation_strict and
+        try actuation_audit.kernel.hasStrictFailure(allocator, rendered)) std.process.exit(2);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn validateKernelWindow(start_epoch_s: ?i64, end_epoch_s: ?i64) !void {
+    if (start_epoch_s == null or end_epoch_s == null or
+        start_epoch_s.? > end_epoch_s.?) return error.InvalidSessionWindow;
 }
 
 fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -24659,6 +25681,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.policy_root_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--evidence-store")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.evidence_store_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--goal-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.actuation_goal_id_text = args[i];
         } else if (std.mem.eql(u8, arg, "--receipt-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -24884,6 +25914,51 @@ test "actuation-audit validates bounded selector modes and formats" {
     const session_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--session-id", "abc", "--mode", "runs" });
     try validateCommandOptions(.actuation_audit, session_opts);
 
+    const kernel_opts = try parseOptionsForCommand(.actuation_audit, &.{
+        "--session-id", "abc",    "--mode",   "kernel", "--evidence-store", "/tmp/evidence.jsonl",
+        "--goal-id",    "goal-1", "--format", "json",
+    });
+    try validateFormatForCommand(.actuation_audit, kernel_opts);
+    try validateCommandOptions(.actuation_audit, kernel_opts);
+    try validateKernelWindow(1, 2);
+    try std.testing.expectError(error.InvalidSessionWindow, validateKernelWindow(null, 2));
+    try std.testing.expectError(error.InvalidSessionWindow, validateKernelWindow(2, null));
+    try std.testing.expectError(error.InvalidSessionWindow, validateKernelWindow(2, 1));
+    const kernel_dual_selector = try parseOptionsForCommand(.actuation_audit, &.{
+        "--session-id", "abc",    "--path",           "/tmp/session.jsonl",
+        "--mode",       "kernel", "--evidence-store", "/tmp/evidence.jsonl",
+        "--goal-id",    "goal-1",
+    });
+    try std.testing.expectError(
+        error.InvalidModeArg,
+        validateCommandOptions(.actuation_audit, kernel_dual_selector),
+    );
+    var kernel_modifier = kernel_opts;
+    kernel_modifier.exclude_current = true;
+    try std.testing.expectError(
+        error.InvalidModeArg,
+        validateCommandOptions(.actuation_audit, kernel_modifier),
+    );
+    kernel_modifier = kernel_opts;
+    kernel_modifier.include_workers = true;
+    try std.testing.expectError(
+        error.InvalidModeArg,
+        validateCommandOptions(.actuation_audit, kernel_modifier),
+    );
+    kernel_modifier = kernel_opts;
+    kernel_modifier.include_excerpts = true;
+    try std.testing.expectError(
+        error.InvalidModeArg,
+        validateCommandOptions(.actuation_audit, kernel_modifier),
+    );
+    const kernel_missing_store = try parseOptionsForCommand(.actuation_audit, &.{
+        "--session-id", "abc", "--mode", "kernel", "--format", "json",
+    });
+    try std.testing.expectError(
+        error.MissingArgValue,
+        validateCommandOptions(.actuation_audit, kernel_missing_store),
+    );
+
     const repo_window_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--repo", "/tmp/repo", "--last", "2h" });
     try validateCommandOptions(.actuation_audit, repo_window_opts);
 
@@ -24905,6 +25980,257 @@ test "actuation-audit validates bounded selector modes and formats" {
 
     const dot_opts = Options{ .format = .dot, .format_set = true, .path = "/tmp/session.jsonl" };
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.actuation_audit, dot_opts));
+}
+
+test "actuation kernel provenance accepts only emitted Actuating receipts" {
+    const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ignored = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-actuation\"," ++
+        "\"input\":\"ledger --source actuation append\"}}";
+    const output_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-actuation\"," ++
+        "\"output\":[{\"type\":\"input_text\",\"text\":\"{\\\"schema\\\":\\\"" ++
+        "actuating-append-result/v1\\\",\\\"event_digest\\\":\\\"" ++ digest ++
+        "\\\"}\"}]}}";
+    const search_call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-search\"," ++
+        "\"input\":\"rg -- '--source actuation' saved-receipts.json\"}}";
+    const search_output_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\"," ++
+        "\"call_id\":\"call-search\",\"output\":\"{\\\"schema\\\":\\\"" ++
+        "actuating-append-result/v1\\\",\\\"event_digest\\\":\\\"" ++ ignored ++
+        "\\\"}\"}}";
+    const serialized = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const batched = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const serialized_call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-serialized\"," ++
+        "\"input\":\"ledger --source actuation append\"}}";
+    const serialized_output_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-serialized\",\"output\":\"{\\\"exit_code\\\":0," ++
+        "\\\"output\\\":\\\"{\\\\\\\"schema\\\\\\\":" ++
+        "\\\\\\\"actuating-append-result/v1\\\\\\\"," ++
+        "\\\\\\\"event_digest\\\\\\\":\\\\\\\"" ++ serialized ++
+        "\\\\\\\"}\\\"}\"}}";
+    const batched_call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-batched\"," ++
+        "\"input\":\"for f in inputs/*; do ledger --source actuation append; done\"}}";
+    const batched_output_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-batched\",\"output\":[{\"type\":\"input_text\",\"text\":" ++
+        "\"{\\\"schema\\\":\\\"actuating-append-result/v1\\\"," ++
+        "\\\"event_digest\\\":\\\"" ++ digest ++ "\\\"}\\n" ++
+        "{\\\"schema\\\":\\\"actuating-append-result/v1\\\"," ++
+        "\\\"event_digest\\\":\\\"" ++ batched ++ "\\\"}\\n\"}]}}";
+    const ambiguous_call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-ambiguous\"," ++
+        "\"input\":\"ledger --source actuation append; cat saved-receipt.json\"}}";
+    const ambiguous_output_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-ambiguous\",\"output\":\"{\\\"schema\\\":\\\"" ++
+        "actuating-append-result/v1\\\",\\\"event_digest\\\":\\\"" ++ ignored ++
+        "\\\"}\"}}";
+    var receipts = ActuationReceiptDigests.init(std.testing.allocator);
+    defer receipts.deinit();
+    try receipts.visit(call_line, 1);
+    try receipts.visit(output_line, 2);
+    try receipts.visit(search_call_line, 3);
+    try receipts.visit(search_output_line, 4);
+    try receipts.visit(serialized_call_line, 5);
+    try receipts.visit(serialized_output_line, 6);
+    try receipts.visit(batched_call_line, 7);
+    try receipts.visit(batched_output_line, 8);
+    try receipts.visit(ambiguous_call_line, 9);
+    try receipts.visit(ambiguous_output_line, 10);
+    try std.testing.expect(receipts.set.contains(digest));
+    try std.testing.expect(receipts.set.contains(serialized));
+    try std.testing.expect(receipts.set.contains(batched));
+    try std.testing.expect(!receipts.set.contains(ignored));
+    try std.testing.expectEqual(@as(usize, 3), receipts.set.count());
+}
+
+test "actuation kernel provenance follows a yielded producer execution" {
+    const digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-start\",\"input\":" ++
+        "\"const r=await tools.exec_command({cmd:\\\"ledger --source actuation append\\\"}); " ++
+        "text(JSON.stringify(r));\"}}";
+    const running_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-start\",\"output\":\"{\\\"exit_code\\\":null," ++
+        "\\\"session_id\\\":42,\\\"output\\\":\\\"\\\"}\"}}";
+    const continuation_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-finish\",\"input\":" ++
+        "\"const r=await tools.write_stdin({session_id:42,chars:\\\"\\\"}); " ++
+        "text(JSON.stringify(r));\"}}";
+    const decoy_continuation_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\"," ++
+        "\"name\":\"exec\",\"call_id\":\"call-finish\",\"input\":" ++
+        "\"const fake={session_id:42};const r=await tools.write_stdin(" ++
+        "{session_id:99,chars:\\\"\\\"});text(JSON.stringify(r));\"}}";
+    const finished_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\"," ++
+        "\"call_id\":\"call-finish\",\"output\":\"{\\\"exit_code\\\":0," ++
+        "\\\"output\\\":\\\"{\\\\\\\"schema\\\\\\\":" ++
+        "\\\\\\\"actuating-append-result/v1\\\\\\\"," ++
+        "\\\\\\\"event_digest\\\\\\\":\\\\\\\"" ++ digest ++
+        "\\\\\\\"}\\\"}\"}}";
+    var receipts = ActuationReceiptDigests.init(std.testing.allocator);
+    defer receipts.deinit();
+    try receipts.visit(call_line, 1);
+    try receipts.visit(running_line, 2);
+    try receipts.visit(decoy_continuation_line, 3);
+    try receipts.visit(finished_line, 4);
+    try std.testing.expectEqual(@as(usize, 0), receipts.set.count());
+    try receipts.visit(continuation_line, 5);
+    try receipts.visit(finished_line, 6);
+    try std.testing.expect(receipts.set.contains(digest));
+    try std.testing.expectEqual(@as(usize, 1), receipts.set.count());
+}
+
+test "actuation kernel provenance recognizes only runtime yielded-status envelopes" {
+    const script_status =
+        "Script running with cell ID cell-42\n" ++
+        "Wall time 11.0 seconds\nOutput:\n";
+    try std.testing.expectEqualStrings(
+        "cell-42",
+        executionHandleFromYieldStatus(script_status).?,
+    );
+    const process_status =
+        "Chunk ID: a1b2c3\nWall time: 30.0018 seconds\n" ++
+        "Process running with session ID 77\nOriginal token count: 0\nOutput:\n";
+    try std.testing.expectEqualStrings(
+        "77",
+        executionHandleFromYieldStatus(process_status).?,
+    );
+    try std.testing.expect(executionHandleFromYieldStatus(
+        "receipt text: Script running with cell ID forged",
+    ) == null);
+    try std.testing.expect(executionHandleFromYieldStatus(
+        "Script running with cell ID forged\nnot a runtime envelope",
+    ) == null);
+    try std.testing.expect(executionHandleFromYieldStatus(
+        "Chunk ID: a1b2c3\nProcess running with session ID 77\nOutput:\n",
+    ) == null);
+}
+
+test "actuation kernel provenance follows a native exec command session" {
+    const digest = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const call_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\"," ++
+        "\"name\":\"exec_command\",\"call_id\":\"call-start\"," ++
+        "\"arguments\":\"{\\\"cmd\\\":\\\"ledger --source actuation append\\\"}\"}}";
+    const running_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\"," ++
+        "\"call_id\":\"call-start\",\"output\":\"Chunk ID: a1b2c3\\n" ++
+        "Wall time: 30.0018 seconds\\nProcess running with session ID 77\\n" ++
+        "Original token count: 0\\nOutput:\\n\"}}";
+    const continuation_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\"," ++
+        "\"name\":\"write_stdin\",\"call_id\":\"call-finish\"," ++
+        "\"arguments\":\"{\\\"session_id\\\":77,\\\"chars\\\":\\\"\\\"}\"}}";
+    const finished_line =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\"," ++
+        "\"call_id\":\"call-finish\",\"output\":\"{\\\"schema\\\":\\\"" ++
+        "actuating-append-result/v1\\\",\\\"event_digest\\\":\\\"" ++ digest ++
+        "\\\"}\"}}";
+    var receipts = ActuationReceiptDigests.init(std.testing.allocator);
+    defer receipts.deinit();
+    try receipts.visit(call_line, 1);
+    try receipts.visit(running_line, 2);
+    try receipts.visit(continuation_line, 3);
+    try receipts.visit(finished_line, 4);
+    try std.testing.expect(receipts.set.contains(digest));
+    try std.testing.expectEqual(@as(usize, 1), receipts.set.count());
+}
+
+test "actuation receipt producer parser admits only Ledger producer commands" {
+    for ([_][]const u8{
+        "ledger --source actuation --goal goal-1 append --input input.json",
+        "ledger --source   actuation append --input input.json",
+        "ledger --source\\n  actuation append --input input.json",
+        "ledger prepare --source actuation --run legacy-run --json operation.json",
+        "const r = await tools.exec_command({\"cmd\":\"jq . input | ledger " ++
+            "--source=actuation --goal goal-1 append\"});",
+        "const r = await tools.exec_command({cmd:\"for f in inputs/*; do ledger " ++
+            "--source actuation append --input $f; done\"});",
+        "const r = await tools.exec_command({cmd: `ledger --source actuation " ++
+            "--goal \"$goal\" append`});",
+        "const r = await tools.exec_command({cmd:\"goal=goal-1\\\\nledger " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"cd /repo && ledger " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"cat input.json | ledger " ++
+            "--source actuation append --input -\"});",
+    }) |input| try std.testing.expect(isActuationProducingInput(input));
+    for ([_][]const u8{
+        "rg -- '--source actuation' saved-receipts.json",
+        "echo ledger --source actuation append",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation doctor; " ++
+            "echo append\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation state\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation doctor\"," ++
+            "label:\"append\"});",
+        "const r = await tools.exec_command({cmd:\"rg ledger file && echo " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"git status && ledger close " ++
+            "--source actuation --run legacy\"});",
+        "const r = await tools.exec_command({cmd:\"cd - && ledger " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"cd relative && ledger " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"prepared=$(ledger prepare " ++
+            "--source actuation --run legacy)\"});",
+        "const safe=JSON.stringify(input);const r=await tools.exec_command({cmd:" ++
+            "\"printf '%s' '\"+safe+\"' | ledger --source actuation --goal \"+" ++
+            "goal+\" append --input -\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation append; " ++
+            "cat saved-receipt.json\"});",
+        "const r = await tools.exec_command({cmd:\"cat saved-receipt.json; ledger " ++
+            "--source actuation append\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation append; " ++
+            "printf '%s\\n' saved-receipt\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation append; " ++
+            "jq . saved-receipt.json\"});",
+        "const r = await tools.exec_command({cmd:\"ledger --source actuation append; " ++
+            "git show HEAD:saved-receipt.json\"});",
+        "ledger --source actuation append > >(cat >/dev/null; cat saved-receipt.json)",
+    }) |input| try std.testing.expect(!isActuationProducingInput(input));
+    try std.testing.expect(!execOutputForwardingIsBound(
+        "exec",
+        "const a=await tools.exec_command({cmd:\"ledger --source actuation append\"});" ++
+            "const b=await tools.exec_command({cmd:\"cat saved-receipt.json\"});text(b.output);",
+    ));
+    try std.testing.expect(!execOutputForwardingIsBound(
+        "exec",
+        "const r=await tools.exec_command({cmd:\"ledger --source actuation append\"});" ++
+            "r.output=saved_receipt;text(r.output);",
+    ));
+    try std.testing.expect(!execOutputForwardingIsBound(
+        "exec",
+        "const r=await tools.exec_command({cmd:\"ledger --source actuation append\"});" ++
+            "text(r.output);text(saved_receipt);",
+    ));
+    try std.testing.expect(execOutputForwardingIsBound(
+        "exec",
+        "const r=await tools.exec_command({cmd:\"ledger --source actuation append " ++
+            "--input 'text('\"});text(JSON.stringify(r));",
+    ));
+    try std.testing.expect(!isActuationProducingToolInput(
+        "exec",
+        "const fake={cmd:\"ledger --source actuation append\"};" ++
+            "const r=await tools.exec_command({cmd:\"cat saved-receipt.json\"});" ++
+            "text(r.output);",
+    ));
 }
 
 test "execution-policy-audit validates bounded selector modes and formats" {
@@ -26751,6 +28077,11 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_capsule_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"streaming_session_scanner_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        "\"actuation_artifact_kernel_audit_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(

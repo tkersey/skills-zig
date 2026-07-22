@@ -37,6 +37,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const seq_meta = addVersionModule(b, @embedFile("VERSION"));
+    const ledger_actuation_core = b.createModule(.{
+        .root_source_file = b.path("../ledger/scripts/actuation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "app_meta", .module = seq_meta },
+        },
+    });
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -48,6 +59,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -77,6 +89,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });

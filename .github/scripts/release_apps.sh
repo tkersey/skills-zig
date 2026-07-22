@@ -366,6 +366,10 @@ case "$mode" in
         apps/synesthesia/*)
           mark_app ledger
           ;;
+        apps/ledger/scripts/actuation.zig)
+          mark_app seq
+          mark_app ledger
+          ;;
         apps/ledger/*)
           mark_app ledger
           ;;

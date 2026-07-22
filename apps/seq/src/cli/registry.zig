@@ -147,7 +147,13 @@ const actuation_audit_flags = [_]FlagSpec{
     .{ .name = "--last", .value_kind = .duration, .help = "Relative time window" },
     .{ .name = "--exclude-current", .value_kind = .bool, .help = "Exclude the current CODEX_THREAD_ID session" },
     .{ .name = "--include-workers", .value_kind = .bool, .help = "Include linked worker sessions" },
-    .{ .name = "--mode", .value_kind = .string, .help = "summary, runs, slices, proof, compactions, decisions, or report" },
+    .{ .name = "--evidence-store", .value_kind = .path, .help = "Actuating Evidence JSONL store" },
+    .{ .name = "--goal-id", .value_kind = .string, .help = "Actuating Goal identity" },
+    .{
+        .name = "--mode",
+        .value_kind = .string,
+        .help = "summary, runs, slices, proof, compactions, decisions, hylo, kernel, or report",
+    },
     .{ .name = "--strict", .value_kind = .bool, .help = "Exit 2 on actuation control violations" },
     .{ .name = "--include-excerpts", .value_kind = .bool, .help = "Allow bounded sanitized excerpts" },
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
@@ -378,12 +384,18 @@ test "registry exposes actuation-audit command surface" {
 
     var has_include_workers = false;
     var has_strict = false;
+    var has_evidence_store = false;
+    var has_goal_id = false;
     for (spec.flags) |flag| {
         if (std.mem.eql(u8, flag.name, "--include-workers")) has_include_workers = true;
         if (std.mem.eql(u8, flag.name, "--strict")) has_strict = true;
+        if (std.mem.eql(u8, flag.name, "--evidence-store")) has_evidence_store = true;
+        if (std.mem.eql(u8, flag.name, "--goal-id")) has_goal_id = true;
     }
     try std.testing.expect(has_include_workers);
     try std.testing.expect(has_strict);
+    try std.testing.expect(has_evidence_store);
+    try std.testing.expect(has_goal_id);
 }
 
 test "registry exposes execution-policy-audit command surface" {

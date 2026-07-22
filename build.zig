@@ -115,6 +115,18 @@ pub fn build(b: *std.Build) void {
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
     const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
+    const ledger_actuation_core = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/actuation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "app_meta", .module = ledger_meta },
+        },
+    });
+    seq_perf_cli.addImport("ledger_actuation_core", ledger_actuation_core);
     const img_atlas = b.createModule(.{
         .root_source_file = b.path("apps/img/assets/atlas.zig"),
         .target = target,
@@ -148,6 +160,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
@@ -170,6 +183,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
