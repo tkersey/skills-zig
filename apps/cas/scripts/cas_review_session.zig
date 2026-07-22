@@ -3636,6 +3636,17 @@ fn isTerminalTurnStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "errored");
 }
 
+fn reviewStatusAwaitsStructuredCompletion(
+    codex_version: []const u8,
+    status: *const ReviewStatus,
+) bool {
+    return std.mem.eql(u8, codexReviewDelivery(codex_version), "inline") and
+        std.mem.eql(u8, status.turn_status, "completed") and
+        status.last_turn_has_entered_review_mode and
+        !status.last_turn_has_exited_review_mode and
+        !status.review_result_available;
+}
+
 fn isTransportLossError(err: anyerror) bool {
     return err == error.AppServerClosed or
         err == error.ConnectionRefused or
@@ -3677,7 +3688,7 @@ fn waitForReviewCompletion(
         try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, &live_notifications);
 
         if (live_notifications.observed_terminal_status != null) {
-            return try fetchReviewStatus(
+            const latest = try fetchReviewStatus(
                 allocator,
                 client,
                 review_thread_id,
@@ -3686,6 +3697,10 @@ fn waitForReviewCompletion(
                 &live_notifications,
                 codex_version,
             );
+            if (!reviewStatusAwaitsStructuredCompletion(codex_version, &latest)) {
+                return latest;
+            }
+            latest.deinit(allocator);
         }
         if (@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - started_ms >= timeout_ms) return error.WaitTimedOut;
         std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(poll_interval_ms), .awake) catch {};
@@ -12325,6 +12340,39 @@ test "unmaterialized review status remains non-terminal and non-proof-bearing" {
     try std.testing.expect(!status.materialized);
     try std.testing.expect(!status.review_result_available);
     try std.testing.expect(!isTerminalTurnStatus(status.turn_status));
+}
+
+test "inline partial review completion remains pending until structured exit" {
+    var status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "loaded"),
+        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
+        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/rollout.jsonl"),
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .review_text = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+
+    try std.testing.expect(reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.144.0", &status));
+
+    status.last_turn_has_exited_review_mode = true;
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    status.last_turn_has_exited_review_mode = false;
+    status.review_result_available = true;
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
+    status.review_result_available = false;
+    std.testing.allocator.free(status.turn_status);
+    status.turn_status = try std.testing.allocator.dupe(u8, "failed");
+    try std.testing.expect(!reviewStatusAwaitsStructuredCompletion("codex-cli 0.145.0", &status));
 }
 
 test "parseReviewStatusAlloc selects the persisted turn and rejects thread mismatch" {
