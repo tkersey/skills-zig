@@ -78,16 +78,84 @@ fn roleAllowed(role: []const u8, options: ParseOptions) bool {
     return false;
 }
 
-fn isMessageCandidate(line: []const u8) bool {
-    if (std.mem.indexOf(u8, line, "event_msg") != null) {
-        return std.mem.indexOf(u8, line, "user_message") != null or
-            std.mem.indexOf(u8, line, "agent_message") != null;
+pub fn isJsonlMessageCandidate(line: []const u8) bool {
+    var root_type: ?[]const u8 = null;
+    var payload_type: ?[]const u8 = null;
+    var payload_depth: ?usize = null;
+    var depth: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < line.len) {
+        switch (line[pos]) {
+            '{' => {
+                depth += 1;
+                pos += 1;
+            },
+            '}' => {
+                if (payload_depth == depth) payload_depth = null;
+                if (depth == 0) return false;
+                depth -= 1;
+                pos += 1;
+            },
+            '"' => {
+                const key = jsonStringToken(line, &pos) orelse return false;
+                var value_pos = skipJsonWhitespace(line, pos);
+                if (value_pos >= line.len or line[value_pos] != ':') continue;
+                value_pos = skipJsonWhitespace(line, value_pos + 1);
+
+                if (depth == 1 and std.mem.eql(u8, key, "payload") and value_pos < line.len and line[value_pos] == '{') {
+                    payload_depth = 2;
+                } else if (std.mem.eql(u8, key, "type") and
+                    (depth == 1 or (payload_depth != null and depth == payload_depth.?)))
+                {
+                    if (value_pos >= line.len or line[value_pos] != '"') continue;
+                    var value_end = value_pos;
+                    const value = jsonStringToken(line, &value_end) orelse return false;
+                    if (depth == 1) root_type = value else payload_type = value;
+                    pos = value_end;
+                }
+            },
+            else => pos += 1,
+        }
+        if (root_type != null and payload_type != null) break;
     }
-    if (std.mem.indexOf(u8, line, "response_item") != null) {
-        return std.mem.indexOf(u8, line, "\"type\":\"message\"") != null or
-            std.mem.indexOf(u8, line, "\"type\": \"message\"") != null;
+
+    if (root_type == null or payload_type == null) return false;
+    if (std.mem.eql(u8, root_type.?, "response_item")) return std.mem.eql(u8, payload_type.?, "message");
+    if (std.mem.eql(u8, root_type.?, "event_msg")) {
+        return std.mem.eql(u8, payload_type.?, "user_message") or std.mem.eql(u8, payload_type.?, "agent_message");
     }
     return false;
+}
+
+fn jsonStringToken(line: []const u8, pos: *usize) ?[]const u8 {
+    if (pos.* >= line.len or line[pos.*] != '"') return null;
+    pos.* += 1;
+    const start = pos.*;
+    var escaped = false;
+    while (pos.* < line.len) : (pos.* += 1) {
+        const byte = line[pos.*];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') {
+            const token = line[start..pos.*];
+            pos.* += 1;
+            return token;
+        }
+    }
+    return null;
+}
+
+fn skipJsonWhitespace(line: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '\t' or line[pos] == '\r' or line[pos] == '\n')) : (pos += 1) {}
+    return pos;
 }
 
 fn stripEchoView(text: []const u8) []const u8 {
@@ -283,7 +351,7 @@ pub fn parseJsonlLine(
 ) !?MessageRow {
     const trimmed_line = std.mem.trim(u8, line, " \t\r\n");
     if (trimmed_line.len == 0) return null;
-    if (!isMessageCandidate(trimmed_line)) return null;
+    if (!isJsonlMessageCandidate(trimmed_line)) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed_line, .{}) catch return null;
     defer parsed.deinit();
@@ -505,4 +573,19 @@ test "reader parsing preserves byte-slice results and reports source metrics" {
     }
     try std.testing.expectEqual(jsonl.len, metrics.bytes_read);
     try std.testing.expectEqual(@as(usize, 2), metrics.lines_seen);
+}
+
+test "message candidate rejects markers nested in tool output" {
+    const line =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T00:00:00Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"x\",\"output\":\"copied {\\\"type\\\":\\\"message\\\"} event_msg user_message\"}}";
+    try std.testing.expect(!isJsonlMessageCandidate(line));
+}
+
+test "message candidate is independent of root member order" {
+    const line =
+        "{\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]},\"type\":\"response_item\",\"timestamp\":\"2026-07-21T00:00:00Z\"}";
+    try std.testing.expect(isJsonlMessageCandidate(line));
+    const row = (try parseJsonlLine(std.testing.allocator, "/tmp/order.jsonl", line, .{})).?;
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello", row.text);
 }

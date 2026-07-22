@@ -14,7 +14,6 @@ const world_availability = retrace_core.world_availability;
 const world_snapshot = retrace_core.world_snapshot;
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const Io = std.Io.Threaded.global_single_threaded;
-const MaxSessionBytes = 256 * 1024 * 1024;
 const MaxTargetFileBytes = 64 * 1024 * 1024;
 const MaxTargetBytes = 256 * 1024 * 1024;
 const MaxTargetFiles = 4096;
@@ -85,15 +84,6 @@ const TargetSnapshot = struct {
     }
 };
 
-const SessionSnapshot = struct {
-    bytes: []u8,
-    mtime_ns: i128,
-
-    fn deinit(self: *SessionSnapshot, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
-    }
-};
-
 const ParsedSessionSnapshot = struct {
     trace: canonical_trace.CanonicalSessionTrace,
     rollout_fingerprint: []u8,
@@ -107,20 +97,55 @@ const ParsedSessionSnapshot = struct {
 fn parseSessionSnapshotAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
-    snapshot: SessionSnapshot,
 ) !ParsedSessionSnapshot {
-    var trace = try canonical_trace.parseSessionTraceBytes(
+    var file = try std.Io.Dir.openFileAbsolute(Io.io(), path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(Io.io());
+    return parseSessionSnapshotFileAlloc(allocator, path, &file);
+}
+
+fn parseSessionSnapshotFileAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    file: *std.Io.File,
+) !ParsedSessionSnapshot {
+    const before = try file.stat(Io.io());
+    if (before.kind != .file) return error.SessionSourceChangedDuringRead;
+
+    var reader = file.reader(Io.io(), &.{});
+    var trace = try canonical_trace.parseSessionTraceReader(
         allocator,
         path,
-        snapshot.bytes,
-        snapshot.mtime_ns,
+        &reader.interface,
+        before.mtime.nanoseconds,
         .{},
     );
     errdefer trace.deinit(allocator);
+    try reader.seekTo(0);
+    const rollout_fingerprint = try digestReaderAlloc(allocator, &reader.interface);
+    errdefer allocator.free(rollout_fingerprint);
+    const after = try file.stat(Io.io());
+    if (!sameFileObservation(before, after)) return error.SessionSourceChangedDuringRead;
     return .{
         .trace = trace,
-        .rollout_fingerprint = try canonical_json.digestBytesAlloc(allocator, snapshot.bytes),
+        .rollout_fingerprint = rollout_fingerprint,
     };
+}
+
+fn digestReaderAlloc(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        const read_len = try reader.readSliceShort(buffer[0..]);
+        if (read_len == 0) break;
+        hasher.update(buffer[0..read_len]);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
 }
 
 pub fn usage() []const u8 {
@@ -153,9 +178,7 @@ pub fn compile(allocator: std.mem.Allocator, options: Options) !void {
 
     const session_path = try findSessionPathAlloc(allocator, options.root, options.session_id);
     defer allocator.free(session_path);
-    var session_snapshot = try readSessionSnapshotAlloc(allocator, session_path);
-    defer session_snapshot.deinit(allocator);
-    var parsed_session = try parseSessionSnapshotAlloc(allocator, session_path, session_snapshot);
+    var parsed_session = try parseSessionSnapshotAlloc(allocator, session_path);
     defer parsed_session.deinit(allocator);
     const trace = parsed_session.trace;
     if (hasMalformedJsonlWarning(trace)) return error.MalformedSessionJsonl;
@@ -1975,24 +1998,7 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = try std.Io.Dir.openFileAbsolute(Io.io(), path, .{});
     defer file.close(Io.io());
     var reader = file.reader(Io.io(), &.{});
-    return reader.interface.allocRemaining(allocator, .limited(MaxSessionBytes));
-}
-
-fn readSessionSnapshotAlloc(allocator: std.mem.Allocator, path: []const u8) !SessionSnapshot {
-    var file = try std.Io.Dir.openFileAbsolute(Io.io(), path, .{
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
-    defer file.close(Io.io());
-    const before = try file.stat(Io.io());
-    if (before.kind != .file or before.size > MaxSessionBytes) return error.SessionSourceTooLarge;
-    var reader = file.reader(Io.io(), &.{});
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(MaxSessionBytes + 1));
-    errdefer allocator.free(bytes);
-    if (bytes.len > MaxSessionBytes) return error.SessionSourceTooLarge;
-    const after = try file.stat(Io.io());
-    if (!sameFileObservation(before, after) or after.size != bytes.len) return error.SessionSourceChangedDuringRead;
-    return .{ .bytes = bytes, .mtime_ns = after.mtime.nanoseconds };
+    return reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
 }
 
 fn sameFileObservation(left: std.Io.File.Stat, right: std.Io.File.Stat) bool {
@@ -2049,8 +2055,8 @@ test "session parse and digest remain bound to one snapshot after path replaceme
     const source_b =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"session-b\"}}\n";
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = source_path, .data = source_a });
-    var snapshot = try readSessionSnapshotAlloc(std.testing.allocator, source_path);
-    defer snapshot.deinit(std.testing.allocator);
+    var source_file = try std.Io.Dir.openFileAbsolute(std.testing.io, source_path, .{});
+    defer source_file.close(std.testing.io);
 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = replacement_path, .data = source_b });
     try std.Io.Dir.renameAbsolute(replacement_path, source_path, std.testing.io);
@@ -2058,7 +2064,7 @@ test "session parse and digest remain bound to one snapshot after path replaceme
     defer std.testing.allocator.free(current_path_bytes);
     try std.testing.expectEqualStrings(source_b, current_path_bytes);
 
-    var parsed = try parseSessionSnapshotAlloc(std.testing.allocator, source_path, snapshot);
+    var parsed = try parseSessionSnapshotFileAlloc(std.testing.allocator, source_path, &source_file);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("session-a", parsed.trace.session.session_id.?);
     const expected_fingerprint = try canonical_json.digestBytesAlloc(std.testing.allocator, source_a);

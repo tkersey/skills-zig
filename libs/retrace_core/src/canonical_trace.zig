@@ -48,6 +48,11 @@ pub const TraceParseOptions = struct {
     max_tools: ?usize = null,
 };
 
+pub const StreamMetrics = struct {
+    bytes_read: usize = 0,
+    lines_seen: usize = 0,
+};
+
 pub const RawTraceEvent = struct {
     path: []u8,
     line_number: usize,
@@ -496,6 +501,35 @@ pub fn parseSessionTraceReader(
     source_mtime_ns: i128,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
+    const Ignore = struct {
+        fn visit(_: void, _: []const u8, _: usize) !void {}
+    };
+    return parseSessionTraceReaderWithVisitor(allocator, path, reader, source_mtime_ns, options, {}, Ignore.visit);
+}
+
+pub fn parseSessionTraceReaderWithVisitor(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+    context: anytype,
+    comptime visit: anytype,
+) !CanonicalSessionTrace {
+    var metrics = StreamMetrics{};
+    return parseSessionTraceReaderWithVisitorMetrics(allocator, path, reader, source_mtime_ns, options, context, visit, &metrics);
+}
+
+pub fn parseSessionTraceReaderWithVisitorMetrics(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+    context: anytype,
+    comptime visit: anytype,
+    metrics: *StreamMetrics,
+) !CanonicalSessionTrace {
     var trace = CanonicalSessionTrace{
         .session = try SessionRecord.init(allocator, path),
     };
@@ -511,6 +545,7 @@ pub fn parseSessionTraceReader(
     while (try lines.next()) |record| {
         const line_number = record.number;
         const raw_line = record.bytes;
+        try visit(context, raw_line, line_number);
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (line.len == 0) continue;
 
@@ -685,6 +720,7 @@ pub fn parseSessionTraceReader(
         if (tool.lifecycle_status == .declared) tool.lifecycle_status = .unresolved;
     }
     trace.session.turn_count = @intCast(trace.turns.items.len);
+    metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
 
@@ -714,6 +750,35 @@ pub fn parseSessionSummaryTraceReader(
     source_mtime_ns: i128,
     options: TraceParseOptions,
 ) !CanonicalSessionTrace {
+    const Ignore = struct {
+        fn visit(_: void, _: []const u8, _: usize) !void {}
+    };
+    return parseSessionSummaryTraceReaderWithVisitor(allocator, path, reader, source_mtime_ns, options, {}, Ignore.visit);
+}
+
+pub fn parseSessionSummaryTraceReaderWithVisitor(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+    context: anytype,
+    comptime visit: anytype,
+) !CanonicalSessionTrace {
+    var metrics = StreamMetrics{};
+    return parseSessionSummaryTraceReaderWithVisitorMetrics(allocator, path, reader, source_mtime_ns, options, context, visit, &metrics);
+}
+
+pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    reader: *std.Io.Reader,
+    source_mtime_ns: i128,
+    options: TraceParseOptions,
+    context: anytype,
+    comptime visit: anytype,
+    metrics: *StreamMetrics,
+) !CanonicalSessionTrace {
     var trace = CanonicalSessionTrace{
         .session = try SessionRecord.init(allocator, path),
     };
@@ -734,6 +799,7 @@ pub fn parseSessionSummaryTraceReader(
     while (try lines.next()) |record| {
         const line_number = record.number;
         const raw_line = record.bytes;
+        try visit(context, raw_line, line_number);
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (line.len == 0) continue;
 
@@ -832,6 +898,7 @@ pub fn parseSessionSummaryTraceReader(
             try replaceOpt(allocator, &trace.session.status_reason, "task_complete");
         }
     }
+    metrics.* = .{ .bytes_read = lines.bytes_read, .lines_seen = lines.line_number };
     return trace;
 }
 

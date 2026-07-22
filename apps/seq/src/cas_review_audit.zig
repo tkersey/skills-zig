@@ -1,5 +1,6 @@
 const std = @import("std");
 const query = @import("query/engine.zig");
+const session_scan = @import("session_scan.zig");
 const spec = @import("types/spec.zig");
 const time_utils = @import("time_utils.zig");
 
@@ -252,77 +253,102 @@ fn scanSessionPath(
     audit: *Audit,
     dedupe: *std.StringHashMap(void),
 ) !void {
-    const text = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(64 * 1024 * 1024)) catch return;
-    defer allocator.free(text);
+    var pending_arena = std.heap.ArenaAllocator.init(allocator);
+    defer pending_arena.deinit();
+    const pending_allocator = pending_arena.allocator();
 
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
+    var pending = std.StringHashMap(PendingCall).init(pending_allocator);
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        pending_allocator: std.mem.Allocator,
+        path: []const u8,
+        params: Params,
+        audit: *Audit,
+        dedupe: *std.StringHashMap(void),
+        pending: *std.StringHashMap(PendingCall),
+        session_id: []const u8 = "",
 
-    var pending = std.StringHashMap(PendingCall).init(aa);
-    var session_id: []const u8 = "";
+        fn visit(self: *@This(), line_raw: []const u8, _: usize) !void {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) return;
 
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line_raw| {
-        const line = std.mem.trim(u8, line_raw, " \t\r");
-        if (line.len == 0) continue;
-        const parsed = std.json.parseFromSlice(std.json.Value, aa, line, .{}) catch continue;
-        const root = object(parsed.value) orelse continue;
-        if (stringField(root, "timestamp")) |timestamp| {
-            if (!withinWindow(timestamp, params)) continue;
-        }
-
-        if (optEql(stringField(root, "type"), "session_meta")) {
-            if (objectField(root, "payload")) |meta| {
-                if (stringField(meta, "id")) |id| session_id = id;
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            const scratch_allocator = scratch.allocator();
+            const parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, line, .{}) catch return;
+            const root = object(parsed.value) orelse return;
+            if (stringField(root, "timestamp")) |timestamp| {
+                if (!withinWindow(timestamp, self.params)) return;
             }
-            continue;
-        }
 
-        const payload = objectField(root, "payload") orelse continue;
-        const payload_type = stringField(payload, "type") orelse continue;
-
-        if (std.mem.eql(u8, payload_type, "session_meta")) {
-            if (objectField(payload, "payload")) |meta| {
-                if (stringField(meta, "id")) |id| session_id = id;
+            if (optEql(stringField(root, "type"), "session_meta")) {
+                if (objectField(root, "payload")) |meta| {
+                    if (stringField(meta, "id")) |id| self.session_id = try self.pending_allocator.dupe(u8, id);
+                }
+                return;
             }
-            continue;
-        }
 
-        if (std.mem.eql(u8, payload_type, "function_call")) {
-            const tool_name = stringField(payload, "name") orelse continue;
-            if (!std.mem.eql(u8, tool_name, "exec_command")) continue;
-            const call_id = stringField(payload, "call_id") orelse continue;
-            const arguments = stringField(payload, "arguments") orelse continue;
-            const args_parsed = std.json.parseFromSlice(std.json.Value, aa, arguments, .{}) catch continue;
-            const args_obj = object(args_parsed.value) orelse continue;
-            const cmd = stringField(args_obj, "cmd") orelse continue;
-            if (!looksLikeCasReviewCommand(cmd)) continue;
-            const ts = stringField(root, "timestamp") orelse "";
-            const call = PendingCall{
-                .call_id = call_id,
-                .session_id = session_id,
-                .timestamp = ts,
-                .command = cmd,
-                .cwd = nullableString(args_obj, "workdir") orelse nullableString(args_obj, "cwd"),
-            };
-            try pending.put(call_id, call);
-            continue;
-        }
+            const payload = objectField(root, "payload") orelse return;
+            const payload_type = stringField(payload, "type") orelse return;
 
-        if (std.mem.eql(u8, payload_type, "exec_command_end") or std.mem.eql(u8, payload_type, "function_call_output")) {
-            const call_id = stringField(payload, "call_id") orelse continue;
-            var call = pending.get(call_id) orelse continue;
-            if (call.cwd == null) call.cwd = nullableString(payload, "cwd");
-            try pending.put(call_id, call);
-            if (manualRecoveryCommand(call.command)) {
-                try appendManualRecoveryCommandRow(allocator, call, path, params, audit, dedupe);
+            if (std.mem.eql(u8, payload_type, "session_meta")) {
+                if (objectField(payload, "payload")) |meta| {
+                    if (stringField(meta, "id")) |id| self.session_id = try self.pending_allocator.dupe(u8, id);
+                }
+                return;
             }
-            const stdout = nullableStringAny(payload, &.{ "stdout", "output", "aggregated_output" }) orelse "";
-            const stderr = stringField(payload, "stderr") orelse "";
-            try appendRowsFromCommandText(allocator, stdout, stderr, call, path, params, audit, dedupe);
+
+            if (std.mem.eql(u8, payload_type, "function_call")) {
+                const tool_name = stringField(payload, "name") orelse return;
+                if (!std.mem.eql(u8, tool_name, "exec_command")) return;
+                const call_id = stringField(payload, "call_id") orelse return;
+                const arguments = stringField(payload, "arguments") orelse return;
+                const args_parsed = std.json.parseFromSlice(std.json.Value, scratch_allocator, arguments, .{}) catch return;
+                const args_obj = object(args_parsed.value) orelse return;
+                const cmd = stringField(args_obj, "cmd") orelse return;
+                if (!looksLikeCasReviewCommand(cmd)) return;
+                const ts = stringField(root, "timestamp") orelse "";
+                const owned_call_id = try self.pending_allocator.dupe(u8, call_id);
+                const call = PendingCall{
+                    .call_id = owned_call_id,
+                    .session_id = self.session_id,
+                    .timestamp = try self.pending_allocator.dupe(u8, ts),
+                    .command = try self.pending_allocator.dupe(u8, cmd),
+                    .cwd = if (nullableString(args_obj, "workdir") orelse nullableString(args_obj, "cwd")) |cwd|
+                        try self.pending_allocator.dupe(u8, cwd)
+                    else
+                        null,
+                };
+                try self.pending.put(owned_call_id, call);
+                return;
+            }
+
+            if (std.mem.eql(u8, payload_type, "exec_command_end") or std.mem.eql(u8, payload_type, "function_call_output")) {
+                const call_id = stringField(payload, "call_id") orelse return;
+                var call = self.pending.get(call_id) orelse return;
+                if (call.cwd == null) {
+                    if (nullableString(payload, "cwd")) |cwd| call.cwd = try self.pending_allocator.dupe(u8, cwd);
+                }
+                try self.pending.put(call_id, call);
+                if (manualRecoveryCommand(call.command)) {
+                    try appendManualRecoveryCommandRow(self.allocator, call, self.path, self.params, self.audit, self.dedupe);
+                }
+                const stdout = nullableStringAny(payload, &.{ "stdout", "output", "aggregated_output" }) orelse "";
+                const stderr = stringField(payload, "stderr") orelse "";
+                try appendRowsFromCommandText(self.allocator, stdout, stderr, call, self.path, self.params, self.audit, self.dedupe);
+            }
         }
-    }
+    };
+    var context = Context{
+        .allocator = allocator,
+        .pending_allocator = pending_allocator,
+        .path = path,
+        .params = params,
+        .audit = audit,
+        .dedupe = dedupe,
+        .pending = &pending,
+    };
+    _ = (try session_scan.forEachLine(allocator, path, &context, Context.visit)) orelse return;
 
     var leftovers = pending.valueIterator();
     while (leftovers.next()) |call| {
@@ -1789,6 +1815,40 @@ test "standard response item output is audited with top-level session meta" {
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.start_wait_normalized_count);
     try std.testing.expectEqualStrings("sess-standard", scalarString(audit.rows.items[0], "session_id").?);
+}
+
+test "session audit streams aggregate input larger than legacy file limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "large-session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    const prefix =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-06-27T01:00:00Z\",\"payload\":{\"id\":\"sess-large\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-06-27T01:00:01Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-large\",\"arguments\":\"{\\\"cmd\\\":\\\"cas review_session start --wait --json\\\",\\\"cwd\\\":\\\"/repo\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-06-27T01:00:02Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-large\",\"output\":\"{\\\"reviewThreadId\\\":\\\"thr_large\\\",\\\"baseSha\\\":\\\"b\\\",\\\"headSha\\\":\\\"h\\\",\\\"targetFingerprint\\\":\\\"t\\\",\\\"reviewVerdict\\\":{\\\"status\\\":\\\"clean\\\",\\\"clean\\\":true,\\\"findingCount\\\":0,\\\"failureCode\\\":null,\\\"baseSha\\\":\\\"b\\\",\\\"headSha\\\":\\\"h\\\",\\\"targetFingerprint\\\":\\\"t\\\",\\\"reviewThreadId\\\":\\\"thr_large\\\",\\\"backendClass\\\":\\\"cas-start-wait\\\"}}\\n\"}}\n";
+    {
+        var file = try std.Io.Dir.createFileAbsolute(defaultIo(), path, .{});
+        defer file.close(defaultIo());
+        var writer = file.writer(defaultIo(), &.{});
+        try writer.interface.writeAll(prefix);
+        try writer.seekTo(65 * 1024 * 1024);
+        try writer.interface.writeAll("\n");
+    }
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-large",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
 }
 
 test "brokered run output contributes broker summary counters" {

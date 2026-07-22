@@ -28,7 +28,7 @@ Binary output:
 The HCTP/CRF product commands `hylo-extract` and `hctp-source` are supported on
 macOS only. Other Seq analytics remain independent of that runtime admission.
 
-`hylo-extract` compiles one selected historical response into CRF Slice 1 artifacts, using the earliest structured target activation in that response's causal prefix. One bounded, held session-byte snapshot supplies both canonical parsing and the rollout digest. The selected historical response is bound to its exact downstream source line; an answer that predates same-turn target activation is rejected. Extraction preserves ordered message occurrences, replaces the historical target body with a target slot, seals the selected historical response under an owner-only FD key, and emits a pure runner manifest containing only causal artifact references. Malformed JSONL makes exact extraction fail; a conflicting later `session_meta` remains a non-authoritative parser warning and does not override the primary metadata. Unknown or state-bearing pre-cut carriers are rejected rather than silently omitted.
+`hylo-extract` compiles one selected historical response into CRF Slice 1 artifacts, using the earliest structured target activation in that response's causal prefix. One held session file supplies a streaming canonical parse and rollout digest; a before/after identity check rejects source drift without imposing an aggregate session-size ceiling. The selected historical response is bound to its exact downstream source line; an answer that predates same-turn target activation is rejected. Extraction preserves ordered message occurrences, replaces the historical target body with a target slot, seals the selected historical response under an owner-only FD key, and emits a pure runner manifest containing only causal artifact references. Malformed JSONL makes exact extraction fail; a conflicting later `session_meta` remains a non-authoritative parser warning and does not override the primary metadata. Unknown or state-bearing pre-cut carriers are rejected rather than silently omitted.
 
 ```bash
 umask 077
@@ -296,13 +296,14 @@ seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill se
 - keeps raw transcript text out of output by default; `--include-excerpts` is explicit and prints a privacy warning
 - associates downstream outcomes without claiming the skill caused the outcome
 - leaves matched-cohort analysis disabled in capabilities as P2/deferred
+- streams session JSONL through one shared scanner with command-owned folds; aggregate corpus size is not a scanner limit, while the 256 MiB per-record guard remains fail-closed
 
 Companion commands:
 - `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint plus the parsed skill kind, trigger IDs, route IDs, clause IDs, and clause-route bindings from that same snapshot
 - `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
 - `skill-decision-receipt validate --file <receipt.json>` performs contract-free structural SDR-v1 validation; contract binding is enforced by `skill-decision-audit` when it loads an SKDC-v1 contract
 - `decision-capsule` freezes one visible historical decision as DCP-v2 for controlled replay
-- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, `skill_decision_receipt_contract_binding_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
+- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `streaming_session_scanner_v1`, `skill_contract_v1`, `skill_decision_receipt_v1`, `skill_decision_receipt_contract_binding_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
 
 Examples:
 ```bash

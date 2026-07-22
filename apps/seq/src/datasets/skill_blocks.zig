@@ -138,6 +138,13 @@ pub fn parseJsonl(
     const parsed_messages = try messages.parseJsonl(allocator, path, jsonl, msg_options);
     defer messages.freeRows(allocator, parsed_messages);
 
+    return parseMessages(allocator, parsed_messages);
+}
+
+pub fn parseMessages(
+    allocator: std.mem.Allocator,
+    parsed_messages: []const messages.MessageRow,
+) ![]SkillBlockRow {
     var rows: std.ArrayList(SkillBlockRow) = .empty;
     errdefer {
         for (rows.items) |row| row.deinit(allocator);

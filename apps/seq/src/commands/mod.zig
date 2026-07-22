@@ -2017,6 +2017,7 @@ const TailState = struct {
     turn_count: usize = 0,
     tool_count: usize = 0,
     last_file_size: u64 = 0,
+    raw_inode: ?u64 = null,
 };
 
 fn isValidTraceWorkerKind(text: []const u8) bool {
@@ -3127,47 +3128,82 @@ fn appendTailRawRows(
     state: *TailState,
 ) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const file = try std.Io.Dir.openFileAbsolute(io, state.path, .{});
+    var file = try std.Io.Dir.openFileAbsolute(io, state.path, .{});
     defer file.close(io);
 
-    const stat = try file.stat(io);
-    if (stat.size < state.raw_byte_offset or stat.size < state.last_file_size) {
+    const before = try file.stat(io);
+    const file_replaced = state.raw_inode != null and state.raw_inode.? != before.inode;
+    if (file_replaced or before.size < state.raw_byte_offset or before.size < state.last_file_size) {
         state.raw_byte_offset = 0;
         state.raw_line_number = 0;
-        var warning = query.Row.init(allocator);
-        errdefer warning.deinit();
-        try warning.putStaticKey("event", .{ .string = "warning" });
-        try warning.putStaticKey("path", .{ .string = state.path });
-        try warning.putStaticKey("line_number", .null);
-        try warning.putStaticKey("entry_type", .{ .string = "file_truncated" });
-        try warning.putStaticKey("event_type", .null);
-        try warning.putStaticKey("timestamp", .null);
-        try out_rows.append(allocator, warning);
+        try appendTailWarningRow(allocator, out_rows, state.path, if (file_replaced) "file_replaced" else "file_truncated");
     }
-    state.last_file_size = stat.size;
-    if (stat.size <= state.raw_byte_offset) return;
+    state.raw_inode = before.inode;
+    state.last_file_size = before.size;
+    if (before.size <= state.raw_byte_offset) return;
 
-    var reader = file.reader(io, &.{});
-    try reader.seekTo(state.raw_byte_offset);
-    const content = try reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
-    defer allocator.free(content);
-    var line_it = std.mem.splitScalar(u8, content, '\n');
-    while (line_it.next()) |line| {
-        if (line.len == 0) continue;
-        state.raw_line_number += 1;
-        var event = try canonical_trace.parseRawTraceEvent(allocator, state.path, state.raw_line_number, line) orelse continue;
-        defer event.deinit(allocator);
-        var row = query.Row.init(allocator);
-        errdefer row.deinit();
-        try row.putStaticKey("event", .{ .string = "raw" });
-        try row.putStaticKey("path", .{ .string = event.path });
-        try row.putStaticKey("line_number", .{ .int = @intCast(event.line_number) });
-        try row.putStaticKey("entry_type", .{ .string = event.entry_type });
-        try putOptionalString(&row, "event_type", event.event_type);
-        try putOptionalString(&row, "timestamp", event.timestamp);
-        try out_rows.append(allocator, row);
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        out_rows: *std.ArrayList(query.Row),
+        state: *TailState,
+
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            if (line.len == 0) return;
+            self.state.raw_line_number += 1;
+            var event = try canonical_trace.parseRawTraceEvent(self.allocator, self.state.path, self.state.raw_line_number, line) orelse return;
+            defer event.deinit(self.allocator);
+            var row = query.Row.init(self.allocator);
+            errdefer row.deinit();
+            try row.putStaticKey("event", .{ .string = "raw" });
+            try row.putStaticKey("path", .{ .string = event.path });
+            try row.putStaticKey("line_number", .{ .int = @intCast(event.line_number) });
+            try row.putStaticKey("entry_type", .{ .string = event.entry_type });
+            try putOptionalString(&row, "event_type", event.event_type);
+            try putOptionalString(&row, "timestamp", event.timestamp);
+            try self.out_rows.append(self.allocator, row);
+        }
+    };
+    var context = Context{ .allocator = allocator, .out_rows = out_rows, .state = state };
+    const start_offset = state.raw_byte_offset;
+    const metrics = try session_scan.forEachLineFromFileOffset(allocator, &file, start_offset, &context, Context.visit);
+    const after = try file.stat(io);
+    try applyTailPostScanObservation(allocator, out_rows, state, before.size, after.size, start_offset, metrics.bytes_read);
+}
+
+fn appendTailWarningRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    kind: []const u8,
+) !void {
+    var warning = query.Row.init(allocator);
+    errdefer warning.deinit();
+    try warning.putStaticKey("event", .{ .string = "warning" });
+    try warning.putStaticKey("path", .{ .string = path });
+    try warning.putStaticKey("line_number", .null);
+    try warning.putStaticKey("entry_type", .{ .string = kind });
+    try warning.putStaticKey("event_type", .null);
+    try warning.putStaticKey("timestamp", .null);
+    try out_rows.append(allocator, warning);
+}
+
+fn applyTailPostScanObservation(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    state: *TailState,
+    before_size: u64,
+    after_size: u64,
+    start_offset: u64,
+    bytes_read: usize,
+) !void {
+    state.last_file_size = after_size;
+    if (after_size < before_size) {
+        state.raw_byte_offset = 0;
+        state.raw_line_number = 0;
+        try appendTailWarningRow(allocator, out_rows, state.path, "file_truncated");
+        return;
     }
-    state.raw_byte_offset = stat.size;
+    state.raw_byte_offset = start_offset + bytes_read;
 }
 
 fn cmdTraceTail(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -3313,6 +3349,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\    "features": {
             \\      "skill_decision_audit": true,
             \\      "skill_decision_delta": true,
+            \\      "streaming_session_scanner_v1": true,
             \\      "skill_contract_v1": true,
             \\      "skill_contract_receipt_binding_projection_v1": true,
             \\      "skill_decision_receipt_v1": true,
@@ -3392,6 +3429,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
     const features = [_]CapabilityFeature{
         .{ .name = "skill_decision_audit", .enabled = true },
         .{ .name = "skill_decision_delta", .enabled = true },
+        .{ .name = "streaming_session_scanner_v1", .enabled = true },
         .{ .name = "skill_contract_v1", .enabled = true },
         .{ .name = "skill_contract_receipt_binding_projection_v1", .enabled = true },
         .{ .name = "skill_decision_receipt_v1", .enabled = true },
@@ -4615,6 +4653,7 @@ const SkillDecisionAudit = struct {
     sessions_scanned: i64 = 0,
     candidate_sessions: i64 = 0,
     activation_sessions: i64 = 0,
+    cursor_file_size: ?usize = null,
 
     fn deinit(self: *SkillDecisionAudit, allocator: std.mem.Allocator) void {
         self.contract.deinit(allocator);
@@ -4653,35 +4692,33 @@ fn compileSkillDecisionAudit(
 
     for (paths.items) |path| {
         if (exclude_path) |excluded| if (std.mem.eql(u8, path, excluded)) continue;
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        if (!try sessionContentMatchesSkillDecisionScope(allocator, path, repo_scope, workdir_scope)) continue;
+        var scanned = (try scanSkillDecisionSession(allocator, path, &audit, opts)) orelse continue;
+        defer scanned.deinit(allocator);
+        if (opts.path != null) audit.cursor_file_size = scanned.source_bytes;
+        if (!try sessionTraceMatchesSkillDecisionScope(allocator, scanned.scope_trace.?, repo_scope, workdir_scope)) continue;
         audit.candidate_sessions += 1;
         audit.sessions_scanned += 1;
-        audit.rows_scanned += countNonEmptyLines(content.?);
+        audit.rows_scanned += @intCast(scanned.rows_scanned);
 
         const session_id = inferSessionIdFromPath(path);
-        if (try sessionHasSkillActivation(allocator, path, content.?, audit.target_skill, opts)) {
+        if (scanned.has_activation) {
             try activation_sessions.put(session_id, {});
         }
-        try collectReceiptEpisodesForSession(allocator, &audit, path, content.?, opts);
-        try collectExplicitRouteEpisodesForSession(allocator, &audit, path, content.?, opts);
+        try collectReceiptEpisodesForSession(allocator, &audit, path, scanned, opts);
+        try collectExplicitRouteEpisodesForSession(allocator, &audit, path, scanned, opts);
     }
     audit.activation_sessions = @intCast(activation_sessions.count());
     try finalizeContractClauseCompliance(&audit);
     return audit;
 }
 
-fn sessionContentMatchesSkillDecisionScope(
+fn sessionTraceMatchesSkillDecisionScope(
     allocator: std.mem.Allocator,
-    path: []const u8,
+    parsed: canonical_trace.CanonicalSessionTrace,
     repo_scope: ?[]const u8,
     workdir_scope: ?[]const u8,
 ) !bool {
     if (repo_scope == null and workdir_scope == null) return true;
-    var parsed = canonical_trace.parseSessionSummaryTrace(allocator, path, .{}) catch return false;
-    defer parsed.deinit(allocator);
     if (workdir_scope) |scope| {
         if (sessionTraceMatchesWorkdirScope(allocator, parsed, scope)) return true;
     }
@@ -4763,56 +4800,177 @@ fn resolveCurrentSessionPathForExclusionLocal(allocator: std.mem.Allocator, sess
     return allocator.dupe(u8, "");
 }
 
-fn countNonEmptyLines(text: []const u8) i64 {
-    var count: i64 = 0;
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |line| {
-        if (std.mem.trim(u8, line, " \t\r\n").len > 0) count += 1;
-    }
-    return count;
-}
+const IndexedDecisionMessage = struct {
+    ordinal: usize,
+    timestamp: ?[]u8,
+    role: []u8,
+    text: []u8,
 
-fn sessionHasSkillActivation(
+    fn init(allocator: std.mem.Allocator, ordinal: usize, row: datasets.messages.MessageRow) !IndexedDecisionMessage {
+        return .{
+            .ordinal = ordinal,
+            .timestamp = if (row.timestamp) |value| try allocator.dupe(u8, value) else null,
+            .role = try allocator.dupe(u8, row.role),
+            .text = try allocator.dupe(u8, row.text),
+        };
+    }
+
+    fn deinit(self: IndexedDecisionMessage, allocator: std.mem.Allocator) void {
+        if (self.timestamp) |value| allocator.free(value);
+        allocator.free(self.role);
+        allocator.free(self.text);
+    }
+};
+
+const SkillDecisionSessionScan = struct {
+    has_activation: bool = false,
+    rows_scanned: usize = 0,
+    source_bytes: usize = 0,
+    scope_trace: ?canonical_trace.CanonicalSessionTrace = null,
+    receipt_messages: std.ArrayList(IndexedDecisionMessage) = .empty,
+    explicit_messages: std.ArrayList(IndexedDecisionMessage) = .empty,
+    outcomes: std.ArrayList(OutcomeSignal) = .empty,
+
+    fn deinit(self: *SkillDecisionSessionScan, allocator: std.mem.Allocator) void {
+        if (self.scope_trace) |*trace| trace.deinit(allocator);
+        for (self.receipt_messages.items) |message| message.deinit(allocator);
+        self.receipt_messages.deinit(allocator);
+        for (self.explicit_messages.items) |message| message.deinit(allocator);
+        self.explicit_messages.deinit(allocator);
+        for (self.outcomes.items) |outcome| if (outcome.timestamp) |value| allocator.free(value);
+        self.outcomes.deinit(allocator);
+    }
+};
+
+fn scanSkillDecisionSession(
     allocator: std.mem.Allocator,
     path: []const u8,
-    content: []const u8,
-    skill: []const u8,
+    audit: *const SkillDecisionAudit,
     opts: Options,
-) !bool {
-    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
-    defer datasets.skill_mentions.freeRows(allocator, mentions);
-    for (mentions) |row| {
-        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
-        if (!eqlIgnoreCaseAscii(row.skill, skill)) continue;
-        const kind = skill_decision_signals.classifySkillMention(row.role, row.types);
-        if (kind == .explicit_user_activation or kind == .assistant_declared_activation) return true;
-    }
-    return false;
+) !?SkillDecisionSessionScan {
+    var scan = SkillDecisionSessionScan{};
+    errdefer scan.deinit(allocator);
+    var seen_messages = std.AutoHashMap([std.crypto.hash.sha2.Sha256.digest_length]u8, void).init(allocator);
+    defer seen_messages.deinit();
+    var seen_activation_messages = std.AutoHashMap([std.crypto.hash.sha2.Sha256.digest_length]u8, void).init(allocator);
+    defer seen_activation_messages.deinit();
+
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        scan: *SkillDecisionSessionScan,
+        path: []const u8,
+        audit: *const SkillDecisionAudit,
+        opts: Options,
+        seen_messages: *@TypeOf(seen_messages),
+        seen_activation_messages: *@TypeOf(seen_activation_messages),
+        ordinal: usize = 0,
+
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            if (std.mem.trim(u8, line, " \t\r\n").len == 0) return;
+            self.scan.rows_scanned += 1;
+            const maybe_message = try datasets.messages.parseJsonlLine(self.allocator, self.path, line, .{
+                .strip_skill_blocks = true,
+                .dedupe_by_role_and_text = false,
+            });
+            var normalized: ?datasets.messages.MessageRow = maybe_message;
+            defer if (normalized) |message| message.deinit(self.allocator);
+            if (normalized) |message| {
+                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                hasher.update(message.role);
+                hasher.update("\x1f");
+                hasher.update(message.text);
+                var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                hasher.final(&digest);
+                const entry = try self.seen_messages.getOrPut(digest);
+                if (entry.found_existing) {
+                    message.deinit(self.allocator);
+                    normalized = null;
+                }
+            }
+            if (!self.scan.has_activation) {
+                const raw_message = try datasets.messages.parseJsonlLine(self.allocator, self.path, line, .{
+                    .dedupe_by_role_and_text = false,
+                    .strip_skill_blocks = false,
+                });
+                if (raw_message) |message| {
+                    defer message.deinit(self.allocator);
+                    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                    hasher.update(message.role);
+                    hasher.update("\x1f");
+                    hasher.update(message.text);
+                    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                    hasher.final(&digest);
+                    const entry = try self.seen_activation_messages.getOrPut(digest);
+                    if (entry.found_existing) return;
+                    if (timestampSatisfiesBounds(message.timestamp, self.opts)) {
+                        const one = [_]datasets.messages.MessageRow{message};
+                        const mentions = try datasets.skill_mentions.parseMessages(self.allocator, one[0..], .{ .dedupe_adjacent = false });
+                        defer datasets.skill_mentions.freeRows(self.allocator, mentions);
+                        for (mentions) |mention| {
+                            if (!eqlIgnoreCaseAscii(mention.skill, self.audit.target_skill)) continue;
+                            const kind = skill_decision_signals.classifySkillMention(mention.role, mention.types);
+                            if (kind == .explicit_user_activation or kind == .assistant_declared_activation) {
+                                self.scan.has_activation = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            const row = normalized orelse return;
+            self.ordinal += 1;
+            if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") != null) {
+                try self.scan.receipt_messages.append(self.allocator, try IndexedDecisionMessage.init(self.allocator, self.ordinal, row));
+            } else if (std.mem.eql(u8, row.role, "assistant") and
+                (containsDollarSkillLocal(row.text, self.audit.target_skill) or containsBareSkillReferenceLocal(row.text, self.audit.target_skill)) and
+                (extractStructuredRouteValue(row.text, "selected_route") != null or uniqueContractRouteMatch(self.audit.contract.contract(), row.text) != null))
+            {
+                try self.scan.explicit_messages.append(self.allocator, try IndexedDecisionMessage.init(self.allocator, self.ordinal, row));
+            }
+
+            const outcome = outcomeForMessage(row);
+            if (!std.mem.eql(u8, outcome.kind, "unknown")) {
+                try self.scan.outcomes.append(self.allocator, .{
+                    .kind = outcome.kind,
+                    .timestamp = if (outcome.timestamp) |value| try self.allocator.dupe(u8, value) else null,
+                    .value = outcome.value,
+                });
+            }
+        }
+    };
+    var context = Context{
+        .allocator = allocator,
+        .scan = &scan,
+        .path = path,
+        .audit = audit,
+        .opts = opts,
+        .seen_messages = &seen_messages,
+        .seen_activation_messages = &seen_activation_messages,
+    };
+    const trace_scan = (try session_scan.scanTraceWithVisitor(allocator, path, .{}, .summary, &context, Context.visit)) orelse return null;
+    scan.scope_trace = trace_scan.trace;
+    scan.source_bytes = trace_scan.metrics.bytes_read;
+    return scan;
 }
 
 fn collectReceiptEpisodesForSession(
     allocator: std.mem.Allocator,
     audit: *SkillDecisionAudit,
     path: []const u8,
-    content: []const u8,
+    scanned: SkillDecisionSessionScan,
     opts: Options,
 ) !void {
-    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-        .strip_skill_blocks = true,
-        .dedupe_by_role_and_text = true,
-    });
-    defer datasets.messages.freeRows(allocator, messages);
-    for (messages) |row| {
-        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
-        if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
-        var parsed = skill_decision_receipt.parseText(allocator, row.text) catch continue;
+    for (scanned.receipt_messages.items) |message| {
+        if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+        var parsed = skill_decision_receipt.parseText(allocator, message.text) catch continue;
         defer parsed.deinit();
         if (!eqlIgnoreCaseAscii(parsed.receipt.skill, audit.target_skill)) continue;
         const validation = try skill_decision_receipt.validateParsed(allocator, parsed.receipt, audit.target_skill, audit.contract.contract());
         defer validation.deinit(allocator);
         if (!validation.valid) {
             if (hasReceiptContractBindingFailure(validation.codes)) {
-                try appendSkillDecisionReceiptBindingMiss(allocator, &audit.misses, audit, path, row.timestamp, parsed.receipt, validation.codes);
+                try appendSkillDecisionReceiptBindingMiss(allocator, &audit.misses, audit, path, message.timestamp, parsed.receipt, validation.codes);
             }
             continue;
         }
@@ -4820,7 +4978,7 @@ fn collectReceiptEpisodesForSession(
         const decision_id = if (parsed.receipt.decision_id.len > 0) parsed.receipt.decision_id else "unknown";
         const episode_id = try std.fmt.allocPrint(allocator, "{s}:receipt:{s}", .{ inferSessionIdFromPath(path), decision_id });
         defer allocator.free(episode_id);
-        const outcome = firstOutcomeAfter(messages, row.timestamp);
+        const outcome = firstOutcomeAfterSignals(scanned.outcomes.items, message.timestamp);
         const alternatives = try joinStringListSep(allocator, parsed.receipt.alternatives_considered, ",");
         defer allocator.free(alternatives);
         const rejected_routes = try joinStringListSep(allocator, parsed.receipt.rejected_routes, ",");
@@ -4832,8 +4990,8 @@ fn collectReceiptEpisodesForSession(
             .episode_id = episode_id,
             .path = path,
             .session_id = inferSessionIdFromPath(path),
-            .start_timestamp = row.timestamp,
-            .end_timestamp = row.timestamp,
+            .start_timestamp = message.timestamp,
+            .end_timestamp = message.timestamp,
             .skill_version = parsed.receipt.skill_version,
             .receipt_contract_fingerprint = parsed.receipt.skill_contract_fingerprint,
             .contract_binding_status = if (audit.contract.contract() != null) "matched" else "unbound",
@@ -4847,7 +5005,7 @@ fn collectReceiptEpisodesForSession(
             .outcome_class = outcome.kind,
             .artifact_state = if (parsed.receipt.artifact_state_present) "present" else "unknown",
             .evidence_refs = "sdr",
-            .contamination_flags = skill_decision_signals.contaminationFlags(row.text),
+            .contamination_flags = skill_decision_signals.contaminationFlags(message.text),
         });
         if (outcome.kind.len > 0 and !std.mem.eql(u8, outcome.kind, "unknown")) {
             try appendSkillDecisionOutcomeRow(allocator, &audit.outcomes, episode_id, outcome, "same_session_after_episode", "not_proven");
@@ -4888,26 +5046,18 @@ fn collectExplicitRouteEpisodesForSession(
     allocator: std.mem.Allocator,
     audit: *SkillDecisionAudit,
     path: []const u8,
-    content: []const u8,
+    scanned: SkillDecisionSessionScan,
     opts: Options,
 ) !void {
-    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-        .strip_skill_blocks = true,
-        .dedupe_by_role_and_text = true,
-    });
-    defer datasets.messages.freeRows(allocator, messages);
-    for (messages, 0..) |row, idx| {
-        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
-        if (!std.mem.eql(u8, row.role, "assistant")) continue;
-        if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") != null) continue;
-        if (!containsDollarSkillLocal(row.text, audit.target_skill) and !containsBareSkillReferenceLocal(row.text, audit.target_skill)) continue;
-        const selected = extractStructuredRouteValue(row.text, "selected_route") orelse uniqueContractRouteMatch(audit.contract.contract(), row.text) orelse continue;
-        const rejected = extractStructuredRouteValue(row.text, "rejected_route") orelse "";
-        const decision_id = try std.fmt.allocPrint(allocator, "explicit-{d}", .{idx + 1});
+    for (scanned.explicit_messages.items) |message| {
+        if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+        const selected = extractStructuredRouteValue(message.text, "selected_route") orelse uniqueContractRouteMatch(audit.contract.contract(), message.text) orelse continue;
+        const rejected = extractStructuredRouteValue(message.text, "rejected_route") orelse "";
+        const decision_id = try std.fmt.allocPrint(allocator, "explicit-{d}", .{message.ordinal});
         defer allocator.free(decision_id);
-        const episode_id = try std.fmt.allocPrint(allocator, "{s}:explicit:{d}", .{ inferSessionIdFromPath(path), idx + 1 });
+        const episode_id = try std.fmt.allocPrint(allocator, "{s}:explicit:{d}", .{ inferSessionIdFromPath(path), message.ordinal });
         defer allocator.free(episode_id);
-        const outcome = firstOutcomeAfter(messages, row.timestamp);
+        const outcome = firstOutcomeAfterSignals(scanned.outcomes.items, message.timestamp);
         const clause_refs = try inferredClauseRefsForRoute(allocator, audit.contract.contract(), selected);
         defer allocator.free(clause_refs);
         try appendSkillDecisionEpisodeRow(allocator, &audit.episodes, audit, .{
@@ -4915,8 +5065,8 @@ fn collectExplicitRouteEpisodesForSession(
             .episode_id = episode_id,
             .path = path,
             .session_id = inferSessionIdFromPath(path),
-            .start_timestamp = row.timestamp,
-            .end_timestamp = row.timestamp,
+            .start_timestamp = message.timestamp,
+            .end_timestamp = message.timestamp,
             .activation_class = "assistant_declared_activation",
             .question_preview = "unknown",
             .selected_route = selected,
@@ -4927,7 +5077,7 @@ fn collectExplicitRouteEpisodesForSession(
             .outcome_class = outcome.kind,
             .artifact_state = "unknown",
             .evidence_refs = "assistant_route_attribution",
-            .contamination_flags = skill_decision_signals.contaminationFlags(row.text),
+            .contamination_flags = skill_decision_signals.contaminationFlags(message.text),
         });
         if (outcome.kind.len > 0 and !std.mem.eql(u8, outcome.kind, "unknown")) {
             try appendSkillDecisionOutcomeRow(allocator, &audit.outcomes, episode_id, outcome, "same_session_after_episode", "not_proven");
@@ -5006,19 +5156,35 @@ const OutcomeSignal = struct {
     value: []const u8 = "",
 };
 
+fn outcomeForMessage(row: datasets.messages.MessageRow) OutcomeSignal {
+    if (containsIgnoreCaseAscii(row.text, "review reopen")) return .{ .kind = "review_reopen", .timestamp = row.timestamp, .value = "review_reopen" };
+    if (containsIgnoreCaseAscii(row.text, "reversal")) return .{ .kind = "reversal", .timestamp = row.timestamp, .value = "reversal" };
+    if (containsIgnoreCaseAscii(row.text, "proof pass") or containsIgnoreCaseAscii(row.text, "validation pass")) return .{ .kind = "proof_pass", .timestamp = row.timestamp, .value = "pass" };
+    if (containsIgnoreCaseAscii(row.text, "proof fail") or containsIgnoreCaseAscii(row.text, "validation fail")) return .{ .kind = "proof_fail", .timestamp = row.timestamp, .value = "fail" };
+    if (containsIgnoreCaseAscii(row.text, "commit")) return .{ .kind = "commit", .timestamp = row.timestamp, .value = "commit" };
+    if (containsIgnoreCaseAscii(row.text, "push")) return .{ .kind = "push", .timestamp = row.timestamp, .value = "push" };
+    if (containsIgnoreCaseAscii(row.text, "pull request") or containsIgnoreCaseAscii(row.text, "PR #")) return .{ .kind = "pr", .timestamp = row.timestamp, .value = "pr" };
+    if (containsIgnoreCaseAscii(row.text, "closure")) return .{ .kind = "closure", .timestamp = row.timestamp, .value = "closure" };
+    return .{};
+}
+
+fn firstOutcomeAfterSignals(outcomes: []const OutcomeSignal, timestamp: ?[]const u8) OutcomeSignal {
+    const start = timestamp orelse "";
+    for (outcomes) |outcome| {
+        const ts = outcome.timestamp orelse "";
+        if (start.len > 0 and std.mem.order(u8, ts, start) != .gt) continue;
+        return outcome;
+    }
+    return .{};
+}
+
 fn firstOutcomeAfter(messages: []const datasets.messages.MessageRow, timestamp: ?[]const u8) OutcomeSignal {
     const start = timestamp orelse "";
     for (messages) |row| {
         const ts = row.timestamp orelse "";
         if (start.len > 0 and std.mem.order(u8, ts, start) != .gt) continue;
-        if (containsIgnoreCaseAscii(row.text, "review reopen")) return .{ .kind = "review_reopen", .timestamp = row.timestamp, .value = "review_reopen" };
-        if (containsIgnoreCaseAscii(row.text, "reversal")) return .{ .kind = "reversal", .timestamp = row.timestamp, .value = "reversal" };
-        if (containsIgnoreCaseAscii(row.text, "proof pass") or containsIgnoreCaseAscii(row.text, "validation pass")) return .{ .kind = "proof_pass", .timestamp = row.timestamp, .value = "pass" };
-        if (containsIgnoreCaseAscii(row.text, "proof fail") or containsIgnoreCaseAscii(row.text, "validation fail")) return .{ .kind = "proof_fail", .timestamp = row.timestamp, .value = "fail" };
-        if (containsIgnoreCaseAscii(row.text, "commit")) return .{ .kind = "commit", .timestamp = row.timestamp, .value = "commit" };
-        if (containsIgnoreCaseAscii(row.text, "push")) return .{ .kind = "push", .timestamp = row.timestamp, .value = "push" };
-        if (containsIgnoreCaseAscii(row.text, "pull request") or containsIgnoreCaseAscii(row.text, "PR #")) return .{ .kind = "pr", .timestamp = row.timestamp, .value = "pr" };
-        if (containsIgnoreCaseAscii(row.text, "closure")) return .{ .kind = "closure", .timestamp = row.timestamp, .value = "closure" };
+        const outcome = outcomeForMessage(row);
+        if (!std.mem.eql(u8, outcome.kind, "unknown")) return outcome;
     }
     return .{};
 }
@@ -5440,7 +5606,7 @@ fn skillDecisionCursorJsonAlloc(allocator: std.mem.Allocator, opts: Options, aud
     var writer_alloc = std.Io.Writer.Allocating.init(allocator);
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
-    const file_size = if (opts.path) |path| skillDecisionCursorFileSize(path) else null;
+    const file_size = if (opts.path != null) audit.cursor_file_size else null;
     try writer.writeAll("{\"cursor_version\":\"SDD-C1\",\"session_path\":");
     try writeOptionalJsonString(writer, opts.path);
     try writer.writeAll(",\"session_id\":");
@@ -5472,13 +5638,6 @@ fn skillDecisionCursorJsonAlloc(allocator: std.mem.Allocator, opts: Options, aud
     try output.writeJsonString(writer, app_meta.version);
     try writer.writeAll("}");
     return writer_alloc.toOwnedSlice();
-}
-
-fn skillDecisionCursorFileSize(path: []const u8) ?i64 {
-    var file = std.Io.Dir.cwd().openFile(defaultIo(), path, .{}) catch return null;
-    defer file.close(defaultIo());
-    const stat = file.stat(defaultIo()) catch return null;
-    return @intCast(stat.size);
 }
 
 fn lastSkillDecisionEpisodeTimestamp(rows: []const query.Row) ?[]const u8 {
@@ -6352,23 +6511,19 @@ fn collectWorkflowProvenanceRows(
         }
         if (has_workdir_filter and !workdir_paths.contains(path)) continue;
 
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-        defer parsed.deinit(allocator);
-        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
-
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
-        defer allocator.free(content);
-        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
+        var scanned = (session_scan.scanTraceAndMessages(allocator, path, traceParseOptions(opts), .{
             .include_user = true,
             .include_assistant = true,
             .strip_echo_assistant = true,
             .skip_meta_user_messages = true,
             .dedupe_by_role_and_text = true,
             .strip_skill_blocks = true,
-        }) catch continue;
-        defer datasets.messages.freeRows(allocator, messages);
+        }, .full) catch continue) orelse continue;
+        defer scanned.deinit(allocator);
+        const parsed = scanned.trace;
+        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
 
-        for (messages) |message| {
+        for (scanned.messages) |message| {
             if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
             try appendMessageWorkflowProvenanceRows(allocator, &out, workflow, parsed.session.session_id, path, message);
         }
@@ -6489,32 +6644,39 @@ fn recordWorkflowTermSummaryFromRawSignals(
     unique_by: []const u8,
     example_limit: usize,
 ) !void {
-    const content = try readFileAllocOrSkip(allocator, path);
-    if (content == null) return;
-    defer allocator.free(content.?);
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        states: *std.ArrayList(WorkflowTermState),
+        path: []const u8,
+        workflow: []const u8,
+        opts: Options,
+        unique_by: []const u8,
+        example_limit: usize,
 
-    var lines = std.mem.splitScalar(u8, content.?, '\n');
-    while (lines.next()) |line| {
-        if (!containsDollarWorkflowMention(line, workflow)) continue;
-        if (!lineLooksLikeAssistantMessage(line)) continue;
-        const timestamp = extractFlatJsonStringField(line, "timestamp");
-        if (timestamp != null and !timestampSatisfiesBounds(timestamp, opts)) continue;
-        const snippet = line[0..@min(line.len, 240)];
-        for (states.items) |*state| {
-            if (!termGroupMatches(snippet, state.group.terms)) continue;
-            state.matched_rows += 1;
-            try state.sessions.put(path);
-            const unique_key = if (std.mem.eql(u8, unique_by, "snippet"))
-                try allocator.dupe(u8, snippet)
-            else
-                try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ path, snippet });
-            defer allocator.free(unique_key);
-            const was_new = try state.uniques.putNew(unique_key);
-            if (was_new and state.examples.items.len < example_limit) {
-                try state.examples.append(allocator, try allocator.dupe(u8, snippet));
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            if (!containsDollarWorkflowMention(line, self.workflow)) return;
+            if (!lineLooksLikeAssistantMessage(line)) return;
+            const timestamp = extractFlatJsonStringField(line, "timestamp");
+            if (timestamp != null and !timestampSatisfiesBounds(timestamp, self.opts)) return;
+            const snippet = line[0..@min(line.len, 240)];
+            for (self.states.items) |*state| {
+                if (!termGroupMatches(snippet, state.group.terms)) continue;
+                state.matched_rows += 1;
+                try state.sessions.put(self.path);
+                const unique_key = if (std.mem.eql(u8, self.unique_by, "snippet"))
+                    try self.allocator.dupe(u8, snippet)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}\x1f{s}", .{ self.path, snippet });
+                defer self.allocator.free(unique_key);
+                const was_new = try state.uniques.putNew(unique_key);
+                if (was_new and state.examples.items.len < self.example_limit) {
+                    try state.examples.append(self.allocator, try self.allocator.dupe(u8, snippet));
+                }
             }
         }
-    }
+    };
+    var context = Context{ .allocator = allocator, .states = states, .path = path, .workflow = workflow, .opts = opts, .unique_by = unique_by, .example_limit = example_limit };
+    _ = try session_scan.forEachLine(allocator, path, &context, Context.visit);
 }
 
 fn lineLooksLikeAssistantMessage(line: []const u8) bool {
@@ -6704,24 +6866,30 @@ fn appendWorkflowOverlapStateFromRawSignals(
     pair: WorkflowPair,
     opts: Options,
 ) !void {
-    const content = try readFileAllocOrSkip(allocator, path);
-    if (content == null) return;
-    defer allocator.free(content.?);
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        states: *std.ArrayList(WorkflowOverlapState),
+        index: *std.StringHashMap(usize),
+        path: []const u8,
+        pair: WorkflowPair,
+        opts: Options,
 
-    var lines = std.mem.splitScalar(u8, content.?, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOfScalar(u8, line, '$') == null) continue;
-        const timestamp = extractFlatJsonStringField(line, "timestamp");
-        if (timestamp != null and !timestampSatisfiesBounds(timestamp, opts)) continue;
-        if (containsDollarWorkflowMention(line, pair.a)) {
-            const idx = try getOrCreateWorkflowOverlapState(allocator, states, index, path);
-            try recordWorkflowOverlapSignal(allocator, &states.items[idx], true, timestamp);
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            if (std.mem.indexOfScalar(u8, line, '$') == null) return;
+            const timestamp = extractFlatJsonStringField(line, "timestamp");
+            if (timestamp != null and !timestampSatisfiesBounds(timestamp, self.opts)) return;
+            if (containsDollarWorkflowMention(line, self.pair.a)) {
+                const idx = try getOrCreateWorkflowOverlapState(self.allocator, self.states, self.index, self.path);
+                try recordWorkflowOverlapSignal(self.allocator, &self.states.items[idx], true, timestamp);
+            }
+            if (containsDollarWorkflowMention(line, self.pair.b)) {
+                const idx = try getOrCreateWorkflowOverlapState(self.allocator, self.states, self.index, self.path);
+                try recordWorkflowOverlapSignal(self.allocator, &self.states.items[idx], false, timestamp);
+            }
         }
-        if (containsDollarWorkflowMention(line, pair.b)) {
-            const idx = try getOrCreateWorkflowOverlapState(allocator, states, index, path);
-            try recordWorkflowOverlapSignal(allocator, &states.items[idx], false, timestamp);
-        }
-    }
+    };
+    var context = Context{ .allocator = allocator, .states = states, .index = index, .path = path, .pair = pair, .opts = opts };
+    _ = try session_scan.forEachLine(allocator, path, &context, Context.visit);
 }
 
 fn containsDollarWorkflowMention(text: []const u8, workflow: []const u8) bool {
@@ -7066,30 +7234,29 @@ fn appendTextWorkflowSignalRowsForPath(
     path: []const u8,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    const content = try readFileAllocOrSkip(allocator, path);
-    if (content == null) return;
-    defer allocator.free(content.?);
+    var scanned = (try session_scan.scanFileWithOptions(allocator, path, .{
+        .messages = true,
+        .skill_mentions = true,
+    }, .{
+        .messages = .{
+            .strip_skill_blocks = true,
+            .dedupe_by_role_and_text = true,
+        },
+        .skill_mentions = .{
+            .include_blocks = false,
+            .include_dollars = true,
+            .skip_dollar_in_skill_block = true,
+            .dedupe_adjacent = true,
+        },
+    }, null)) orelse return;
+    defer scanned.deinit(allocator);
 
-    const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
-        .strip_skill_blocks = true,
-        .dedupe_by_role_and_text = true,
-    });
-    defer datasets.messages.freeRows(allocator, messages);
-
-    for (messages) |row| {
+    for (scanned.messages) |row| {
         try appendDollarWorkflowSignals(allocator, out_rows, row);
         try appendOutcomeSignals(allocator, out_rows, row);
     }
 
-    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{
-        .include_blocks = false,
-        .include_dollars = true,
-        .skip_dollar_in_skill_block = true,
-        .dedupe_adjacent = true,
-    });
-    defer datasets.skill_mentions.freeRows(allocator, mentions);
-
-    for (mentions) |row| {
+    for (scanned.skill_mentions) |row| {
         try appendWorkflowSignalRow(
             allocator,
             out_rows,
@@ -7541,11 +7708,7 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        if (!contentContainsAdjudicationCandidate(content.?, skill, opts.include_root_equivalent_text)) continue;
-
+        if (!try sessionContainsAdjudicationCandidate(allocator, path, skill, opts.include_root_equivalent_text)) continue;
         const parse_options = datasets.messages.ParseOptions{
             .include_user = true,
             .include_assistant = true,
@@ -7554,7 +7717,7 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
             .dedupe_by_role_and_text = false,
             .strip_skill_blocks = true,
         };
-        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        const messages = (try session_scan.collectMessages(allocator, path, parse_options, null)) orelse continue;
         defer datasets.messages.freeRows(allocator, messages);
 
         const summary = try summarizeAdjudicationSession(allocator, messages, window, skill, opts.include_root_equivalent_text);
@@ -7644,6 +7807,26 @@ fn contentContainsAdjudicationCandidate(content: []const u8, skill: []const u8, 
         if (containsDollarWorkflowMention(content, part)) return true;
     }
     return false;
+}
+
+fn sessionContainsAdjudicationCandidate(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    skill: []const u8,
+    root_equivalents: ?[]const u8,
+) !bool {
+    const Context = struct {
+        skill: []const u8,
+        root_equivalents: ?[]const u8,
+        found: bool = false,
+
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            if (!self.found and contentContainsAdjudicationCandidate(line, self.skill, self.root_equivalents)) self.found = true;
+        }
+    };
+    var context = Context{ .skill = skill, .root_equivalents = root_equivalents };
+    _ = (try session_scan.forEachLine(allocator, path, &context, Context.visit)) orelse return false;
+    return context.found;
 }
 
 fn adjudicationSummaryRows(allocator: std.mem.Allocator, rows: []const query.Row) !std.ArrayList(query.Row) {
@@ -8815,8 +8998,16 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-        defer parsed.deinit(allocator);
+        var scanned = (session_scan.scanTraceAndMessages(allocator, path, traceParseOptions(opts), .{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = true,
+        }, .full) catch continue) orelse continue;
+        defer scanned.deinit(allocator);
+        const parsed = scanned.trace;
 
         if (current_thread_id) |thread_id| {
             if (resolveTraceMatchesThread(parsed, path, thread_id)) continue;
@@ -8824,19 +9015,7 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
         if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
 
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
-        defer allocator.free(content);
-        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
-            .include_user = true,
-            .include_assistant = true,
-            .strip_echo_assistant = true,
-            .skip_meta_user_messages = true,
-            .dedupe_by_role_and_text = false,
-            .strip_skill_blocks = true,
-        }) catch continue;
-        defer datasets.messages.freeRows(allocator, messages);
-
-        var signals = summarizeResolveSession(messages, parsed, opts);
+        var signals = summarizeResolveSession(scanned.messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
         if (!signals.true_resolve) {
@@ -8845,7 +9024,7 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         }
 
         audit.denominator.true_resolve_sessions += 1;
-        try recordResolveMessages(allocator, &audit, messages, opts, &signals);
+        try recordResolveMessages(allocator, &audit, scanned.messages, opts, &signals);
         try recordResolveTools(allocator, &audit, parsed, repo_root, opts, &signals);
 
         if (signals.mutation_session) {
@@ -8930,8 +9109,16 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-        defer parsed.deinit(allocator);
+        var scanned = (session_scan.scanTraceAndMessages(allocator, path, traceParseOptions(opts), .{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = true,
+        }, .full) catch continue) orelse continue;
+        defer scanned.deinit(allocator);
+        const parsed = scanned.trace;
 
         if (current_thread_id) |thread_id| {
             if (resolveTraceMatchesThread(parsed, path, thread_id)) continue;
@@ -8939,19 +9126,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
         if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
 
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
-        defer allocator.free(content);
-        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
-            .include_user = true,
-            .include_assistant = true,
-            .strip_echo_assistant = true,
-            .skip_meta_user_messages = true,
-            .dedupe_by_role_and_text = false,
-            .strip_skill_blocks = true,
-        }) catch continue;
-        defer datasets.messages.freeRows(allocator, messages);
-
-        var signals = summarizeReviewCompilerSession(messages, parsed, opts);
+        var signals = summarizeReviewCompilerSession(scanned.messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
         switch (signals.governance_state) {
@@ -8992,7 +9167,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         }
 
         audit.denominator.true_resolve_sessions += 1;
-        try recordReviewCompilerMessages(allocator, &audit, messages, opts, &signals, parsed.session.session_id);
+        try recordReviewCompilerMessages(allocator, &audit, scanned.messages, opts, &signals, parsed.session.session_id);
         try recordReviewCompilerTools(allocator, &audit, parsed, repo_root, opts, &signals);
         finalizeReviewCompilerCompliance(&audit, signals);
         if (signals.true_mbk) try addReviewCompilerMaterialRun(allocator, &audit, signals, parsed.session.session_id, repo_root);
@@ -12334,12 +12509,18 @@ const QueryLiftCommands = struct {
             if (exclude_path) |excluded| {
                 if (std.mem.eql(u8, path, excluded)) continue;
             }
-            const content = try readFileAllocOrSkip(allocator, path);
-            if (content == null) continue;
-            defer allocator.free(content.?);
-
-            try recordSkillActivationMentions(allocator, &states, skill, path, content.?, window, opts);
-            try recordSkillActivationReferences(allocator, &states, skill, path, content.?, window, opts);
+            var scanned = (try session_scan.scanFileWithOptions(allocator, path, .{
+                .messages = true,
+                .skill_mentions = true,
+            }, .{
+                .messages = .{
+                    .strip_skill_blocks = true,
+                    .dedupe_by_role_and_text = true,
+                },
+            }, null)) orelse continue;
+            defer scanned.deinit(allocator);
+            try recordSkillActivationMentions(allocator, &states, skill, scanned.skill_mentions, window, opts);
+            try recordSkillActivationReferences(allocator, &states, skill, scanned.messages, window, opts);
             try recordSkillActivationToolReads(allocator, &states, skill, path, window);
         }
 
@@ -12366,14 +12547,10 @@ const QueryLiftCommands = struct {
         allocator: std.mem.Allocator,
         states: *[5]SkillActivationState,
         skill: []const u8,
-        path: []const u8,
-        content: []const u8,
+        mentions: []const datasets.skill_mentions.SkillMentionRow,
         window: SkillActivationWindow,
         opts: Options,
     ) !void {
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-
         for (mentions) |row| {
             if (!eqlIgnoreCaseAscii(row.skill, skill)) continue;
             if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
@@ -12399,17 +12576,10 @@ const QueryLiftCommands = struct {
         allocator: std.mem.Allocator,
         states: *[5]SkillActivationState,
         skill: []const u8,
-        path: []const u8,
-        content: []const u8,
+        messages: []const datasets.messages.MessageRow,
         window: SkillActivationWindow,
         opts: Options,
     ) !void {
-        const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-            .strip_skill_blocks = true,
-            .dedupe_by_role_and_text = true,
-        });
-        defer datasets.messages.freeRows(allocator, messages);
-
         for (messages) |row| {
             if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
             if (opts.roles_csv) |roles| {
@@ -12499,26 +12669,18 @@ const QueryLiftCommands = struct {
         defer freePathList(allocator, &paths);
         const path = paths.items[0];
 
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch null;
-        defer if (parsed) |*trace| trace.deinit(allocator);
-        const session_id = if (parsed) |trace| trace.session.session_id orelse inferSessionIdFromPath(path) else inferSessionIdFromPath(path);
-
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse return error.SessionNotFound;
-        defer allocator.free(content);
-
         const window = try resolveSkillActivationWindow(opts);
         var evidence: std.ArrayList(SkillEvidenceRecord) = .empty;
         defer {
             for (evidence.items) |*item| item.deinit(allocator);
             evidence.deinit(allocator);
         }
+        var observed_session_id: ?[]u8 = null;
+        defer if (observed_session_id) |value| allocator.free(value);
 
-        try collectSkillEvidenceMentions(allocator, &evidence, skill, path, content, window, opts);
-        try collectSkillEvidenceMessages(allocator, &evidence, skill, path, content, window, opts);
-        try collectSkillEvidenceToolReads(allocator, &evidence, skill, path, window, opts);
-        if (hasActivationEvidence(evidence.items)) {
-            try collectSkillEvidenceOutcomes(allocator, &evidence, path, content, window, opts);
-        }
+        const scan_metrics = try collectSkillEvidenceStream(allocator, &evidence, skill, path, window, opts, &observed_session_id);
+        const file_size = scan_metrics.bytes_read;
+        const session_id = if (observed_session_id) |value| value else opts.session_id orelse inferSessionIdFromPath(path);
 
         std.mem.sort(SkillEvidenceRecord, evidence.items, {}, skillEvidenceLessThan);
         for (evidence.items, 0..) |*item, idx| item.ordinal = idx + 1;
@@ -12546,7 +12708,7 @@ const QueryLiftCommands = struct {
 
         const cursor_line = if (cursor_start != null and cursor_valid) cursor_start.?.last_line_number else 0;
         const changed = if (cursor_start) |cursor|
-            !(cursor_valid and cursor.last_file_size == content.len and std.mem.eql(u8, cursor.evidence_hash, evidence_hash))
+            !(cursor_valid and cursor.last_file_size == file_size and std.mem.eql(u8, cursor.evidence_hash, evidence_hash))
         else
             evidence.items.len > 0;
 
@@ -12559,7 +12721,7 @@ const QueryLiftCommands = struct {
             .path_fingerprint = path_fingerprint,
             .last_line_number = evidence.items.len,
             .last_timestamp = if (evidence.items.len > 0) evidence.items[evidence.items.len - 1].timestamp else null,
-            .last_file_size = content.len,
+            .last_file_size = file_size,
             .evidence_hash = evidence_hash,
         });
         defer allocator.free(cursor_end_json);
@@ -12588,24 +12750,195 @@ const QueryLiftCommands = struct {
         try writeTextOutput(rendered, opts.out_path);
     }
 
-    fn collectSkillEvidenceMentions(
+    fn collectSkillEvidenceStream(
         allocator: std.mem.Allocator,
         out: *std.ArrayList(SkillEvidenceRecord),
         skill: []const u8,
         path: []const u8,
-        content: []const u8,
         window: SkillActivationWindow,
         opts: Options,
-    ) !void {
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-        for (mentions) |row| {
-            if (!eqlIgnoreCaseAscii(row.skill, skill)) continue;
-            if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
-            if (opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) continue;
-            const kind = evidenceKindFromDecisionSignal(skill_decision_signals.classifySkillMention(row.role, row.types));
-            try appendSkillEvidenceRecord(allocator, out, kind, row.timestamp, row.role, "skill_mentions", row.snippet, opts.include_raw);
+        observed_session_id: *?[]u8,
+    ) !session_scan.StreamMetrics {
+        var seen_mentions = std.AutoHashMap([std.crypto.hash.sha2.Sha256.digest_length]u8, void).init(allocator);
+        defer seen_mentions.deinit();
+        var seen_messages = std.AutoHashMap([std.crypto.hash.sha2.Sha256.digest_length]u8, void).init(allocator);
+        defer seen_messages.deinit();
+        var pending_outcomes: std.ArrayList(SkillEvidenceRecord) = .empty;
+        defer {
+            for (pending_outcomes.items) |*item| item.deinit(allocator);
+            pending_outcomes.deinit(allocator);
         }
+
+        const Context = struct {
+            allocator: std.mem.Allocator,
+            out: *std.ArrayList(SkillEvidenceRecord),
+            pending_outcomes: *std.ArrayList(SkillEvidenceRecord),
+            seen_mentions: *@TypeOf(seen_mentions),
+            seen_messages: *@TypeOf(seen_messages),
+            skill: []const u8,
+            path: []const u8,
+            window: SkillActivationWindow,
+            opts: Options,
+            previous_target_types: u8 = 0,
+
+            fn visit(self: *@This(), line: []const u8, _: usize) !void {
+                try self.collectMentions(line);
+                try self.collectToolRead(line);
+                const maybe_message = try datasets.messages.parseJsonlLine(self.allocator, self.path, line, .{
+                    .strip_skill_blocks = true,
+                    .dedupe_by_role_and_text = false,
+                });
+                var normalized: ?datasets.messages.MessageRow = maybe_message;
+                defer if (normalized) |message| message.deinit(self.allocator);
+                if (normalized) |message| {
+                    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                    hasher.update(message.role);
+                    hasher.update("\x1f");
+                    hasher.update(message.text);
+                    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                    hasher.final(&digest);
+                    const entry = try self.seen_messages.getOrPut(digest);
+                    if (entry.found_existing) {
+                        message.deinit(self.allocator);
+                        normalized = null;
+                    }
+                }
+                if (normalized) |row| try self.collectMessage(row);
+            }
+
+            fn collectMentions(self: *@This(), line: []const u8) !void {
+                if (!datasets.messages.isJsonlMessageCandidate(line)) return;
+                const raw_message = try datasets.messages.parseJsonlLine(self.allocator, self.path, line, .{
+                    .dedupe_by_role_and_text = false,
+                    .strip_skill_blocks = false,
+                });
+                const message = raw_message orelse return;
+                defer message.deinit(self.allocator);
+
+                var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                hasher.update(message.role);
+                hasher.update("\x1f");
+                hasher.update(message.text);
+                var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+                hasher.final(&digest);
+                const entry = try self.seen_mentions.getOrPut(digest);
+                if (entry.found_existing) return;
+                if (!containsIgnoreCaseAscii(message.text, self.skill)) {
+                    self.previous_target_types = 0;
+                    return;
+                }
+
+                const one = [_]datasets.messages.MessageRow{message};
+                const mentions = try datasets.skill_mentions.parseMessages(self.allocator, one[0..], .{ .dedupe_adjacent = false });
+                defer datasets.skill_mentions.freeRows(self.allocator, mentions);
+                var current_target_types: u8 = 0;
+                for (mentions) |row| {
+                    if (!eqlIgnoreCaseAscii(row.skill, self.skill)) continue;
+                    const type_bits: u8 = if (std.mem.eql(u8, row.types, "block")) 1 else if (std.mem.eql(u8, row.types, "dollar")) 2 else 3;
+                    current_target_types |= type_bits;
+                    const adjacent_duplicate = (self.previous_target_types & 1 != 0 and type_bits == 2) or
+                        (self.previous_target_types & 2 != 0 and type_bits == 1);
+                    if (adjacent_duplicate) continue;
+                    if (!timestampSatisfiesActivationWindow(row.timestamp, self.window)) continue;
+                    if (self.opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) continue;
+                    const kind = evidenceKindFromDecisionSignal(skill_decision_signals.classifySkillMention(row.role, row.types));
+                    try appendSkillEvidenceRecord(self.allocator, self.out, kind, row.timestamp, row.role, "skill_mentions", row.snippet, self.opts.include_raw);
+                }
+                self.previous_target_types = current_target_types;
+            }
+
+            fn collectMessage(self: *@This(), row: datasets.messages.MessageRow) !void {
+                if (!timestampSatisfiesActivationWindow(row.timestamp, self.window)) return;
+                if (self.opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) return;
+                const assistant_declared = std.mem.eql(u8, row.role, "assistant") and
+                    !containsDollarSkill(row.text, self.skill) and
+                    containsAssistantDeclaredSkillUse(row.text, self.skill);
+                const target_lens = containsTargetSkillLensUse(row.text, self.skill);
+                if (assistant_declared) {
+                    try appendSkillEvidenceRecord(self.allocator, self.out, .assistant_declared_skill_use, row.timestamp, row.role, "messages", row.text, self.opts.include_raw);
+                }
+                if (target_lens) {
+                    try appendSkillEvidenceRecord(self.allocator, self.out, .target_skill_lens_use, row.timestamp, row.role, "messages", row.text, self.opts.include_raw);
+                }
+                const outcome = skillSuccessOutcomeForText(row.text);
+                if (containsBareSkillReference(row.text, self.skill) and
+                    !containsDollarSkill(row.text, self.skill) and
+                    !assistant_declared and
+                    !target_lens and
+                    outcome.positive_bits == 0)
+                {
+                    try appendSkillEvidenceRecord(self.allocator, self.out, .raw_mention, row.timestamp, row.role, "messages", row.text, self.opts.include_raw);
+                }
+                if (outcome.positive_bits != 0) {
+                    try appendSkillEvidenceRecord(self.allocator, self.pending_outcomes, .successful_activation_outcome, row.timestamp, row.role, "messages", row.text, self.opts.include_raw);
+                }
+            }
+
+            fn collectToolRead(self: *@This(), line: []const u8) !void {
+                const trimmed = std.mem.trim(u8, line, " \t\r\n");
+                if (trimmed.len == 0 or trimmed[0] != '{') return;
+                if (!std.mem.containsAtLeast(u8, trimmed, 1, "response_item")) return;
+                if (!containsIgnoreCaseAscii(trimmed, self.skill)) return;
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch return;
+                defer parsed.deinit();
+                const root = switch (parsed.value) {
+                    .object => |obj| obj,
+                    else => return,
+                };
+                if (!stdJsonFieldEq(root, "type", "response_item")) return;
+                const payload = stdJsonObjectField(root, "payload") orelse return;
+                const payload_type = stdJsonStringField(payload, "type") orelse return;
+                if (!std.mem.eql(u8, payload_type, "function_call") and !std.mem.eql(u8, payload_type, "custom_tool_call")) return;
+                const tool_name = stdJsonStringField(payload, "name") orelse return;
+                var record = InvocationRecord{
+                    .path = try self.allocator.dupe(u8, self.path),
+                    .session_id = try self.allocator.dupe(u8, inferSessionIdFromPath(self.path)),
+                    .invocation_kind = if (std.mem.eql(u8, payload_type, "function_call")) .function_call else .custom_tool_call,
+                };
+                defer record.deinit(self.allocator);
+                record.tool_name = try self.allocator.dupe(u8, tool_name);
+                if (stdJsonStringField(root, "timestamp")) |timestamp| record.start_ts = try self.allocator.dupe(u8, timestamp);
+                if (record.invocation_kind == .function_call) {
+                    if (stdJsonStringField(payload, "arguments")) |arguments| try applyFunctionCallArguments(self.allocator, &record, arguments);
+                } else if (stdJsonStringField(payload, "input")) |input| {
+                    record.input_text = try self.allocator.dupe(u8, input);
+                    if (std.mem.eql(u8, tool_name, "shell")) record.command_text = try self.allocator.dupe(u8, input);
+                }
+                if (!timestampSatisfiesActivationWindow(record.start_ts, self.window)) return;
+                if (!containsSkillFileRead(record.command_text, self.skill) and
+                    !containsSkillFileRead(record.arguments_text, self.skill) and
+                    !containsSkillFileRead(record.input_text, self.skill)) return;
+                const snippet = record.command_text orelse record.arguments_text orelse record.input_text orelse "";
+                try appendSkillEvidenceRecord(self.allocator, self.out, .manual_skill_file_read, record.start_ts, "tool", "tool_invocations", snippet, self.opts.include_raw);
+            }
+        };
+        var context = Context{
+            .allocator = allocator,
+            .out = out,
+            .pending_outcomes = &pending_outcomes,
+            .seen_mentions = &seen_mentions,
+            .seen_messages = &seen_messages,
+            .skill = skill,
+            .path = path,
+            .window = window,
+            .opts = opts,
+        };
+        var trace_scan = (try session_scan.scanTraceWithVisitor(allocator, path, .{}, .summary, &context, Context.visit)) orelse return error.SessionNotFound;
+        defer trace_scan.trace.deinit(allocator);
+        if (observed_session_id.* == null) {
+            if (trace_scan.trace.session.session_id) |session_id| observed_session_id.* = try allocator.dupe(u8, session_id);
+        }
+
+        if (hasActivationEvidence(out.items)) {
+            for (pending_outcomes.items) |item| try out.append(allocator, item);
+            pending_outcomes.items.len = 0;
+        }
+        return .{
+            .bytes_read = trace_scan.metrics.bytes_read,
+            .lines_seen = trace_scan.metrics.lines_seen,
+        };
     }
 
     fn evidenceKindFromDecisionSignal(kind: skill_decision_signals.SignalKind) SkillEvidenceKind {
@@ -12615,91 +12948,6 @@ const QueryLiftCommands = struct {
             else => .raw_mention,
         };
     }
-
-    fn collectSkillEvidenceMessages(
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(SkillEvidenceRecord),
-        skill: []const u8,
-        path: []const u8,
-        content: []const u8,
-        window: SkillActivationWindow,
-        opts: Options,
-    ) !void {
-        const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-            .strip_skill_blocks = true,
-            .dedupe_by_role_and_text = true,
-        });
-        defer datasets.messages.freeRows(allocator, messages);
-        for (messages) |row| {
-            if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
-            if (opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) continue;
-            const assistant_declared = std.mem.eql(u8, row.role, "assistant") and
-                !containsDollarSkill(row.text, skill) and
-                containsAssistantDeclaredSkillUse(row.text, skill);
-            const target_lens = containsTargetSkillLensUse(row.text, skill);
-            if (assistant_declared) {
-                try appendSkillEvidenceRecord(allocator, out, .assistant_declared_skill_use, row.timestamp, row.role, "messages", row.text, opts.include_raw);
-            }
-            if (target_lens) {
-                try appendSkillEvidenceRecord(allocator, out, .target_skill_lens_use, row.timestamp, row.role, "messages", row.text, opts.include_raw);
-            }
-            if (containsBareSkillReference(row.text, skill) and
-                !containsDollarSkill(row.text, skill) and
-                !assistant_declared and
-                !target_lens and
-                skillSuccessOutcomeForText(row.text).positive_bits == 0)
-            {
-                try appendSkillEvidenceRecord(allocator, out, .raw_mention, row.timestamp, row.role, "messages", row.text, opts.include_raw);
-            }
-        }
-    }
-
-    fn collectSkillEvidenceToolReads(
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(SkillEvidenceRecord),
-        skill: []const u8,
-        path: []const u8,
-        window: SkillActivationWindow,
-        opts: Options,
-    ) !void {
-        var records: std.ArrayList(InvocationRecord) = .empty;
-        defer deinitInvocationRecords(allocator, &records);
-        try collectInvocationRecordsFromSession(allocator, path, &records);
-        for (records.items) |record| {
-            if (!timestampSatisfiesActivationWindow(record.start_ts, window)) continue;
-            if (!containsSkillFileRead(record.command_text, skill) and
-                !containsSkillFileRead(record.arguments_text, skill) and
-                !containsSkillFileRead(record.input_text, skill))
-            {
-                continue;
-            }
-            const snippet = record.command_text orelse record.arguments_text orelse record.input_text orelse "";
-            try appendSkillEvidenceRecord(allocator, out, .manual_skill_file_read, record.start_ts, "tool", "tool_invocations", snippet, opts.include_raw);
-        }
-    }
-
-    fn collectSkillEvidenceOutcomes(
-        allocator: std.mem.Allocator,
-        out: *std.ArrayList(SkillEvidenceRecord),
-        path: []const u8,
-        content: []const u8,
-        window: SkillActivationWindow,
-        opts: Options,
-    ) !void {
-        const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-            .strip_skill_blocks = true,
-            .dedupe_by_role_and_text = true,
-        });
-        defer datasets.messages.freeRows(allocator, messages);
-        for (messages) |row| {
-            if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
-            if (opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) continue;
-            const outcome = skillSuccessOutcomeForText(row.text);
-            if (outcome.positive_bits == 0) continue;
-            try appendSkillEvidenceRecord(allocator, out, .successful_activation_outcome, row.timestamp, row.role, "messages", row.text, opts.include_raw);
-        }
-    }
-
     fn appendSkillEvidenceRecord(
         allocator: std.mem.Allocator,
         out: *std.ArrayList(SkillEvidenceRecord),
@@ -14247,13 +14495,9 @@ fn searchMessageHits(
     stats.candidate_files += @intCast(input_paths.items.len);
 
     for (input_paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        stats.files_opened += 1;
-
-        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        const parsed = (try session_scan.collectMessages(allocator, path, parse_options, null)) orelse continue;
         defer datasets.messages.freeRows(allocator, parsed);
+        stats.files_opened += 1;
         stats.rows_examined += @intCast(parsed.len);
 
         for (parsed) |row| {
@@ -15387,13 +15631,19 @@ fn cmdSkillSuccessRank(allocator: std.mem.Allocator, sessions_root: []const u8, 
         if (exclude_path) |excluded| {
             if (std.mem.eql(u8, path, excluded)) continue;
         }
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const needs_outcome = try collectSkillSuccessMentionsForPath(allocator, &aggregates, path, content.?, window, opts.skill);
+        var scanned = (try session_scan.scanFileWithOptions(allocator, path, .{
+            .messages = true,
+            .skill_mentions = true,
+        }, .{
+            .messages = .{
+                .strip_skill_blocks = true,
+                .dedupe_by_role_and_text = true,
+            },
+        }, null)) orelse continue;
+        defer scanned.deinit(allocator);
+        const needs_outcome = try collectSkillSuccessMentions(allocator, &aggregates, scanned.skill_mentions, window, opts.skill);
         if (needs_outcome) {
-            try collectSkillSuccessOutcomesForPath(allocator, &outcomes, path, content.?, window);
+            try collectSkillSuccessOutcomes(allocator, &outcomes, path, scanned.messages, window);
         }
     }
 
@@ -15449,19 +15699,13 @@ fn skillSuccessTimestampInWindow(timestamp: ?[]const u8, window: SkillSuccessWin
     return true;
 }
 
-fn collectSkillSuccessOutcomesForPath(
+fn collectSkillSuccessOutcomes(
     allocator: std.mem.Allocator,
     outcomes: *std.StringHashMap(SkillOutcome),
     path: []const u8,
-    content: []const u8,
+    messages: []const datasets.messages.MessageRow,
     window: SkillSuccessWindow,
 ) !void {
-    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
-        .strip_skill_blocks = true,
-        .dedupe_by_role_and_text = true,
-    });
-    defer datasets.messages.freeRows(allocator, messages);
-
     var outcome = outcomes.get(path) orelse SkillOutcome{};
     for (messages) |message| {
         if (!skillSuccessTimestampInWindow(message.timestamp, window)) continue;
@@ -15496,17 +15740,13 @@ fn containsAnyIgnoreCaseAscii(text: []const u8, needles: []const []const u8) boo
     return false;
 }
 
-fn collectSkillSuccessMentionsForPath(
+fn collectSkillSuccessMentions(
     allocator: std.mem.Allocator,
     aggregates: *std.StringHashMap(SkillSuccessAggregate),
-    path: []const u8,
-    content: []const u8,
+    mentions: []const datasets.skill_mentions.SkillMentionRow,
     window: SkillSuccessWindow,
     skill_filter: ?[]const u8,
 ) !bool {
-    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
-    defer datasets.skill_mentions.freeRows(allocator, mentions);
-
     var needs_outcome = false;
     for (mentions) |mention| {
         if (!skillSuccessTimestampInWindow(mention.timestamp, window)) continue;
@@ -15972,11 +16212,12 @@ fn collectSkillBlockRows(
     }
 
     for (input_paths) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const parsed = try datasets.skill_blocks.parseJsonl(allocator, path, content.?, .{});
+        const messages = (try session_scan.collectMessages(allocator, path, .{
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = false,
+        }, null)) orelse continue;
+        defer datasets.messages.freeRows(allocator, messages);
+        const parsed = try datasets.skill_blocks.parseMessages(allocator, messages);
         for (parsed) |row| {
             if (!std.mem.eql(u8, row.skill, skill_name) or !timestampSatisfiesBounds(row.timestamp, opts)) {
                 row.deinit(allocator);
@@ -16634,39 +16875,41 @@ fn summarizeSessionConcurrency(
         .session_path = session_path,
     };
 
-    const content_opt = try readFileAllocOrSkip(allocator, session_path);
-    if (content_opt == null) return summary;
-    defer allocator.free(content_opt.?);
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        summary: *ConcurrencySummary,
 
-    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) continue;
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (trimmed.len == 0) return;
 
-        if (std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"function_call\"")) {
-            if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"spawn_agent\"")) {
-                summary.spawn_agent_calls += 1;
-            } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"wait\"")) {
-                summary.wait_calls += 1;
-            } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"close_agent\"")) {
-                summary.close_agent_calls += 1;
+            if (std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"function_call\"")) {
+                if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"spawn_agent\"")) {
+                    self.summary.spawn_agent_calls += 1;
+                } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"wait\"")) {
+                    self.summary.wait_calls += 1;
+                } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"close_agent\"")) {
+                    self.summary.close_agent_calls += 1;
+                }
             }
+
+            if (!std.mem.containsAtLeast(u8, trimmed, 1, "spawn_agents_on_csv")) return;
+
+            const invocation_opt = try parseSpawnAgentsInvocation(self.allocator, trimmed);
+            if (invocation_opt == null) return;
+            const invocation = invocation_opt.?;
+            defer invocation.deinit(self.allocator);
+
+            const csv_rows = if (invocation.csv_path) |csv_path|
+                try countCsvDataRows(self.allocator, csv_path)
+            else
+                null;
+
+            self.summary.observe(invocation.max_concurrency, csv_rows);
         }
-
-        if (!std.mem.containsAtLeast(u8, trimmed, 1, "spawn_agents_on_csv")) continue;
-
-        const invocation_opt = try parseSpawnAgentsInvocation(allocator, trimmed);
-        if (invocation_opt == null) continue;
-        const invocation = invocation_opt.?;
-        defer invocation.deinit(allocator);
-
-        const csv_rows = if (invocation.csv_path) |csv_path|
-            try countCsvDataRows(allocator, csv_path)
-        else
-            null;
-
-        summary.observe(invocation.max_concurrency, csv_rows);
-    }
+    };
+    var context = Context{ .allocator = allocator, .summary = &summary };
+    _ = try session_scan.forEachLine(allocator, session_path, &context, Context.visit);
 
     summary.refreshSubstrate();
     return summary;
@@ -17806,25 +18049,20 @@ fn cmdPlanSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     defer deinitQueryRows(allocator, &rows);
 
     for (input_paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
+        var scanned = (session_scan.scanTraceAndMessages(allocator, path, traceParseOptions(opts), parse_options, .summary) catch continue) orelse continue;
+        defer scanned.deinit(allocator);
+        const trace = scanned.trace;
         stats.files_opened += 1;
 
-        const meta = try plan_blocks.parseSessionMeta(allocator, content.?);
-        defer meta.deinit(allocator);
-
         if (repo_root) |required_repo| {
-            const cwd = meta.cwd orelse continue;
+            const cwd = trace.session.cwd orelse continue;
             if (!try pathMatchesRepoScope(allocator, required_repo, cwd)) continue;
         }
 
-        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
-        defer datasets.messages.freeRows(allocator, parsed);
-        stats.messages_examined += @intCast(parsed.len);
+        stats.messages_examined += @intCast(scanned.messages.len);
 
         const session_id = inferSessionIdFromPath(path);
-        for (parsed) |message_row| {
+        for (scanned.messages) |message_row| {
             if (!timestampSatisfiesBounds(message_row.timestamp, opts)) continue;
 
             const blocks = try plan_blocks.extractPlanBlocks(allocator, message_row.text);
@@ -17838,7 +18076,7 @@ fn cmdPlanSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
                 try qrow.putOwnedKey("path", .{ .string = path });
                 try qrow.putOwnedKey("session_id", .{ .string = session_id });
                 try putOptionalString(&qrow, "timestamp", message_row.timestamp);
-                try putOptionalString(&qrow, "cwd", meta.cwd);
+                try putOptionalString(&qrow, "cwd", trace.session.cwd);
                 try putOptionalString(&qrow, "title", block.title);
                 try putOptionalString(&qrow, "iteration", block.iteration);
                 try qrow.putOwnedKey("plan_index", .{ .int = @intCast(block.plan_index) });
@@ -18231,11 +18469,7 @@ fn collectSessionPromptRows(
     errdefer deinitQueryRows(allocator, &rows);
 
     for (input_paths) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        const parsed = (try session_scan.collectMessages(allocator, path, parse_options, null)) orelse continue;
         defer datasets.messages.freeRows(allocator, parsed);
 
         for (parsed) |row| {
@@ -18295,11 +18529,7 @@ fn cmdReplyLatency(allocator: std.mem.Allocator, sessions_root: []const u8, opts
     defer deinitQueryRows(allocator, &rows);
 
     for (input_paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        const parsed = (try session_scan.collectMessages(allocator, path, parse_options, null)) orelse continue;
         defer datasets.messages.freeRows(allocator, parsed);
 
         try appendReplyLatencyRowsForSession(allocator, path, parsed, mode, opts, &rows);
@@ -20013,22 +20243,18 @@ fn collectRoutingGapSignals(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-        for (mentions) |row| {
+        var scanned = (try session_scan.scanFile(allocator, path, .{
+            .messages = true,
+            .skill_mentions = true,
+        }, null)) orelse continue;
+        defer scanned.deinit(allocator);
+        for (scanned.skill_mentions) |row| {
             if (!discovery_skills.contains(row.skill)) continue;
             try addToStringSet(allocator, invoked_sessions, row.path);
             break;
         }
 
-        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.messages.freeRows(allocator, messages);
-
-        for (messages) |row| {
+        for (scanned.messages) |row| {
             if (!std.mem.eql(u8, row.role, "user")) continue;
             for (cue_states) |*cue_state| {
                 if (!query.textMatchesPatternAtoms(row.text, cue_state.atoms, cue_state.spec.case_insensitive)) continue;
@@ -20910,22 +21136,19 @@ fn collectReviewCompilerDatasetRows(
     var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
     defer freePathList(allocator, &paths);
     for (paths.items) |path| {
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-        defer parsed.deinit(allocator);
-        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
-        if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
-        defer allocator.free(content);
-        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
+        var scanned = (session_scan.scanTraceAndMessages(allocator, path, traceParseOptions(opts), .{
             .include_user = true,
             .include_assistant = true,
             .strip_echo_assistant = true,
             .skip_meta_user_messages = true,
             .dedupe_by_role_and_text = false,
             .strip_skill_blocks = true,
-        }) catch continue;
-        defer datasets.messages.freeRows(allocator, messages);
-        const signals = summarizeReviewCompilerSession(messages, parsed, opts);
+        }, .full) catch continue) orelse continue;
+        defer scanned.deinit(allocator);
+        const parsed = scanned.trace;
+        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
+        if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
+        const signals = summarizeReviewCompilerSession(scanned.messages, parsed, opts);
         if (!signals.candidate) continue;
         const protocol_match = switch (protocol) {
             .auto => signals.true_resolve or signals.governance_state == .incidental,
@@ -20958,7 +21181,7 @@ fn collectResolveIntentClosedDatasetRows(
     var paths = try collectResolveArtifactJsonPaths(allocator, artifact_root);
     defer freePathList(allocator, &paths);
     for (paths.items) |path| {
-        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
+        const content = (try readBoundedArtifactAllocOrSkip(allocator, path)) orelse continue;
         defer allocator.free(content);
         var artifact = resolve_intent_closed.parseArtifact(allocator, content, path, .controller_artifact) catch continue;
         defer artifact.deinit(allocator);
@@ -21597,15 +21820,19 @@ fn collectSkillDecisionSignalRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
         const session_id = inferSessionIdFromPath(path);
 
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-        for (mentions) |row| {
+        var scanned = (try session_scan.scanFileWithOptions(allocator, path, .{
+            .messages = true,
+            .skill_mentions = true,
+        }, .{
+            .messages = .{
+                .strip_skill_blocks = true,
+                .dedupe_by_role_and_text = true,
+            },
+        }, null)) orelse continue;
+        defer scanned.deinit(allocator);
+        for (scanned.skill_mentions) |row| {
             const signal_kind = skill_decision_signals.classifySkillMention(row.role, row.types);
             try appendSkillDecisionSignalRow(allocator, out_rows, .{
                 .path = row.path,
@@ -21618,12 +21845,7 @@ fn collectSkillDecisionSignalRows(
             });
         }
 
-        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
-            .strip_skill_blocks = true,
-            .dedupe_by_role_and_text = true,
-        });
-        defer datasets.messages.freeRows(allocator, messages);
-        for (messages) |row| {
+        for (scanned.messages) |row| {
             try appendSkillDollarSignalsForMessage(allocator, out_rows, row, session_id);
             try appendReceiptSignalsForMessage(allocator, out_rows, row, session_id);
             try appendDecisionMarkerSignalsForMessage(allocator, out_rows, row, session_id);
@@ -21873,10 +22095,7 @@ fn collectSkillDecisionReceiptDatasetRows(
     defer freePathList(allocator, &paths);
     const target_skill = paramString(query_params, "skill");
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        try collectReceiptDatasetRowsFromSession(allocator, out_rows, path, content.?, target_skill);
+        try collectReceiptDatasetRowsFromSession(allocator, out_rows, path, target_skill);
     }
 }
 
@@ -21891,13 +22110,10 @@ fn collectSkillDecisionEpisodeDatasetRows(
     defer freePathList(allocator, &paths);
     const target_skill = paramString(query_params, "skill");
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
+        const messages = (try session_scan.collectMessages(allocator, path, .{
             .strip_skill_blocks = true,
             .dedupe_by_role_and_text = true,
-        });
+        }, null)) orelse continue;
         defer datasets.messages.freeRows(allocator, messages);
         for (messages) |row| {
             if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
@@ -22055,22 +22271,28 @@ fn collectDecisionCapsuleRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-        if (std.mem.indexOf(u8, content.?, "decision_context_packet") == null) continue;
         if (std.mem.endsWith(u8, path, ".json")) {
-            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "file", content.?);
+            const content = (try readBoundedArtifactAllocOrSkip(allocator, path)) orelse continue;
+            defer allocator.free(content);
+            if (std.mem.indexOf(u8, content, "decision_context_packet") == null) continue;
+            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "file", content);
             continue;
         }
-        var lines = std.mem.splitScalar(u8, content.?, '\n');
-        while (lines.next()) |line| {
-            if (std.mem.indexOf(u8, line, "decision_context_packet") == null) continue;
-            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "session_text", line);
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
-            defer parsed.deinit();
-            try appendDecisionCapsuleRowsFromValueStrings(allocator, out_rows, path, parsed.value);
-        }
+        const Context = struct {
+            allocator: std.mem.Allocator,
+            out_rows: *std.ArrayList(query.Row),
+            path: []const u8,
+
+            fn visit(self: *@This(), line: []const u8, _: usize) !void {
+                if (std.mem.indexOf(u8, line, "decision_context_packet") == null) return;
+                _ = try appendDecisionCapsuleRowFromText(self.allocator, self.out_rows, self.path, "session_text", line);
+                var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return;
+                defer parsed.deinit();
+                try appendDecisionCapsuleRowsFromValueStrings(self.allocator, self.out_rows, self.path, parsed.value);
+            }
+        };
+        var context = Context{ .allocator = allocator, .out_rows = out_rows, .path = path };
+        _ = try session_scan.forEachLine(allocator, path, &context, Context.visit);
     }
 }
 
@@ -22150,13 +22372,12 @@ fn collectReceiptDatasetRowsFromSession(
     allocator: std.mem.Allocator,
     out_rows: *std.ArrayList(query.Row),
     path: []const u8,
-    content: []const u8,
     target_skill: ?[]const u8,
 ) !void {
-    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
+    const messages = (try session_scan.collectMessages(allocator, path, .{
         .strip_skill_blocks = true,
         .dedupe_by_role_and_text = true,
-    });
+    }, null)) orelse return;
     defer datasets.messages.freeRows(allocator, messages);
     for (messages) |row| {
         if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
@@ -22212,45 +22433,7 @@ fn collectWorkflowSignalRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
-            .strip_skill_blocks = true,
-            .dedupe_by_role_and_text = true,
-        });
-        defer datasets.messages.freeRows(allocator, messages);
-
-        for (messages) |row| {
-            try appendDollarWorkflowSignals(allocator, out_rows, row);
-            try appendOutcomeSignals(allocator, out_rows, row);
-        }
-
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{
-            .include_blocks = false,
-            .include_dollars = true,
-            .skip_dollar_in_skill_block = true,
-            .dedupe_adjacent = true,
-        });
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-
-        for (mentions) |row| {
-            try appendWorkflowSignalRow(
-                allocator,
-                out_rows,
-                row.path,
-                null,
-                row.timestamp,
-                row.role,
-                sourceKindForRole(row.role),
-                "skill_mention",
-                row.skill,
-                null,
-                row.snippet,
-                "cleaned",
-            );
-        }
+        try appendTextWorkflowSignalRowsForPath(allocator, path, out_rows);
     }
 
     var tool_rows: std.ArrayList(query.Row) = .empty;
@@ -22698,10 +22881,6 @@ fn collectGoalRunRowsFromSession(
     session_path: []const u8,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    const content_opt = try readFileAllocOrSkip(allocator, session_path);
-    if (content_opt == null) return;
-    defer allocator.free(content_opt.?);
-
     var goal_calls = std.StringHashMap(GoalToolCall).init(allocator);
     defer {
         var it = goal_calls.iterator();
@@ -22724,67 +22903,82 @@ fn collectGoalRunRowsFromSession(
 
     var review_invocation_count: i64 = 0;
 
-    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0 or trimmed[0] != '{') continue;
-        if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"response_item\"")) continue;
+    const Context = struct {
+        allocator: std.mem.Allocator,
+        session_path: []const u8,
+        goal_calls: *std.StringHashMap(GoalToolCall),
+        aggregates: *std.StringHashMap(GoalAggregate),
+        review_invocation_count: *i64,
 
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
+        fn visit(self: *@This(), line: []const u8, _: usize) !void {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (trimmed.len == 0 or trimmed[0] != '{') return;
+            if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"response_item\"")) return;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch continue;
-        defer parsed.deinit();
-        const root = switch (parsed.value) {
-            .object => |obj| obj,
-            else => continue,
-        };
-        if (!stdJsonFieldEq(root, "type", "response_item")) continue;
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
 
-        const payload = stdJsonObjectField(root, "payload") orelse continue;
-        const payload_type = stdJsonStringField(payload, "type") orelse continue;
-        const timestamp = stdJsonStringField(root, "timestamp");
+            const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch return;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |obj| obj,
+                else => return,
+            };
+            if (!stdJsonFieldEq(root, "type", "response_item")) return;
 
-        if (std.mem.eql(u8, payload_type, "function_call")) {
-            const tool_name = stdJsonStringField(payload, "name") orelse continue;
-            if (std.mem.eql(u8, tool_name, "get_goal") or
-                std.mem.eql(u8, tool_name, "update_goal") or
-                std.mem.eql(u8, tool_name, "create_goal"))
-            {
-                const call_id = stdJsonStringField(payload, "call_id") orelse continue;
-                const key = try allocator.dupe(u8, call_id);
-                errdefer allocator.free(key);
-                var call = GoalToolCall{
-                    .name = try allocator.dupe(u8, tool_name),
-                    .timestamp = if (timestamp) |value| try allocator.dupe(u8, value) else null,
-                };
-                errdefer call.deinit(allocator);
-                const gop = try goal_calls.getOrPut(key);
-                if (gop.found_existing) {
-                    allocator.free(key);
-                    gop.value_ptr.deinit(allocator);
+            const payload = stdJsonObjectField(root, "payload") orelse return;
+            const payload_type = stdJsonStringField(payload, "type") orelse return;
+            const timestamp = stdJsonStringField(root, "timestamp");
+
+            if (std.mem.eql(u8, payload_type, "function_call")) {
+                const tool_name = stdJsonStringField(payload, "name") orelse return;
+                if (std.mem.eql(u8, tool_name, "get_goal") or
+                    std.mem.eql(u8, tool_name, "update_goal") or
+                    std.mem.eql(u8, tool_name, "create_goal"))
+                {
+                    const call_id = stdJsonStringField(payload, "call_id") orelse return;
+                    const key = try self.allocator.dupe(u8, call_id);
+                    errdefer self.allocator.free(key);
+                    var call = GoalToolCall{
+                        .name = try self.allocator.dupe(u8, tool_name),
+                        .timestamp = if (timestamp) |value| try self.allocator.dupe(u8, value) else null,
+                    };
+                    errdefer call.deinit(self.allocator);
+                    const gop = try self.goal_calls.getOrPut(key);
+                    if (gop.found_existing) {
+                        self.allocator.free(key);
+                        gop.value_ptr.deinit(self.allocator);
+                    }
+                    gop.value_ptr.* = call;
+                    return;
                 }
-                gop.value_ptr.* = call;
-                continue;
-            }
 
-            if (std.mem.eql(u8, tool_name, "exec_command")) {
-                if (stdJsonStringField(payload, "arguments")) |arguments_text| {
-                    if (try functionCallArgumentsContainCodexReview(allocator, arguments_text)) {
-                        review_invocation_count += 1;
+                if (std.mem.eql(u8, tool_name, "exec_command")) {
+                    if (stdJsonStringField(payload, "arguments")) |arguments_text| {
+                        if (try functionCallArgumentsContainCodexReview(self.allocator, arguments_text)) {
+                            self.review_invocation_count.* += 1;
+                        }
                     }
                 }
+                return;
             }
-            continue;
-        }
 
-        if (!std.mem.eql(u8, payload_type, "function_call_output")) continue;
-        const call_id = stdJsonStringField(payload, "call_id") orelse continue;
-        const call = goal_calls.get(call_id) orelse continue;
-        const output_text = stdJsonStringField(payload, "output") orelse continue;
-        const goal_timestamp: ?[]const u8 = if (call.timestamp) |value| value else timestamp;
-        try applyGoalToolOutput(allocator, &aggregates, session_path, goal_timestamp, output_text);
-    }
+            if (!std.mem.eql(u8, payload_type, "function_call_output")) return;
+            const call_id = stdJsonStringField(payload, "call_id") orelse return;
+            const call = self.goal_calls.get(call_id) orelse return;
+            const output_text = stdJsonStringField(payload, "output") orelse return;
+            const goal_timestamp: ?[]const u8 = if (call.timestamp) |value| value else timestamp;
+            try applyGoalToolOutput(self.allocator, self.aggregates, self.session_path, goal_timestamp, output_text);
+        }
+    };
+    var context = Context{
+        .allocator = allocator,
+        .session_path = session_path,
+        .goal_calls = &goal_calls,
+        .aggregates = &aggregates,
+        .review_invocation_count = &review_invocation_count,
+    };
+    _ = try session_scan.forEachLine(allocator, session_path, &context, Context.visit);
 
     const review_invocation_key = goalAggregateReviewInvocationKey(&aggregates);
 
@@ -25099,24 +25293,11 @@ fn loadSpecText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return allocator.dupe(u8, raw);
 }
 
-fn readFileAllocOrSkip(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    return readFileAllocOrSkipTracked(allocator, path, null);
-}
-
-fn readFileAllocOrSkipTracked(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    stats: ?*stats_mod.SeqStats,
-) !?[]u8 {
-    const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return null,
+fn readBoundedArtifactAllocOrSkip(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
         else => return err,
     };
-    if (stats) |s| {
-        s.files_opened += 1;
-        s.bytes_read += @intCast(content.len);
-    }
-    return content;
 }
 
 fn freePathList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
@@ -26568,6 +26749,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_intent_closed_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_capsule_v2\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"streaming_session_scanner_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
@@ -27312,6 +27494,25 @@ fn runCommandWithOutput(
     defer file.close(std.Io.Threaded.global_single_threaded.io());
     var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
     return reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
+}
+
+fn writeSparseLargeSessionForTest(path: []const u8, prefix: []const u8) !u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var writer = file.writer(io, &.{});
+    try writer.interface.writeAll(prefix);
+
+    const stride: u64 = 8 * 1024 * 1024;
+    const target_size: u64 = 257 * 1024 * 1024;
+    var offset: u64 = stride;
+    while (offset <= target_size) : (offset += stride) {
+        try writer.seekTo(offset);
+        try writer.interface.writeAll("\n");
+    }
+    try writer.seekTo(target_size);
+    try writer.interface.writeAll("\n");
+    return (try file.stat(io)).size;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -28140,6 +28341,7 @@ test "plan-search applies repo filter, stats, and chronological sort" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"used_repo_filter\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"plan_blocks_found\": 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_files\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"files_opened\": 3") != null);
 }
 
 test "session-tooling summary groups by primary executable" {
@@ -28361,6 +28563,15 @@ test "skill-evidence summarizes session evidence with privacy and cursor delta" 
     try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_mention\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_transcript_included\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_examples\"") == null);
+    var got_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, got, .{});
+    defer got_json.deinit();
+    const got_root = switch (got_json.value) {
+        .object => |obj| obj,
+        else => return error.InvalidSpec,
+    };
+    const cursor_end = stdJsonObjectField(got_root, "cursor_end") orelse return error.InvalidSpec;
+    const cursor_json = stdJsonObjectField(cursor_end, "json") orelse return error.InvalidSpec;
+    try std.testing.expectEqual(@as(i64, @intCast(session_content.len)), stdJsonIntField(cursor_json, "last_file_size").?);
 
     const cursor = try extractCursorTokenForTest(std.testing.allocator, got);
     defer std.testing.allocator.free(cursor);
@@ -28400,6 +28611,199 @@ test "skill-evidence summarizes session evidence with privacy and cursor delta" 
     defer std.testing.allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"raw_transcript_included\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"raw_examples\"") != null);
+}
+
+test "skill-evidence preserves legacy session identity and structurally parses tool calls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_content =
+        "{\"id\":\"canonical-legacy-session\",\"timestamp\":\"2026-07-21T09:59:00Z\",\"cwd\":\"/tmp/legacy-skill-evidence\"}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Validation passed and proof captured.\"}]}}\n" ++
+        "{\"type\" : \"response_item\",\"timestamp\":\"2026-07-21T10:00:01Z\",\"payload\" : {\"type\": \"function_call\",\"name\":\"exec_command\",\"call_id\":\"legacy-read\",\"arguments\":\"{\\\"cmd\\\":\\\"sed -n '1,120p' /Users/tk/.dotfiles/codex/skills/seq/SKILL.md\\\"}\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "rollout-legacy-filename.jsonl",
+        .data = session_content,
+    });
+    const session_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "rollout-legacy-filename.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(session_path);
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "legacy-skill-evidence.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_evidence, &.{
+        "--path", session_path, "--skill", "seq", "--format", "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"canonical-legacy-session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"manual_skill_file_read\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"successful_activation_outcome\": 1") != null);
+}
+
+test "skill-evidence resets adjacency across target-free messages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/07/21");
+    const session_content =
+        "{\"timestamp\":\"2026-07-21T09:59:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"skill-adjacency-session\",\"cwd\":\"/tmp/skill-adjacency\",\"model\":\"gpt-test\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $seq\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Intervening message without the target name.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Validation passed and proof captured.\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/07/21/rollout-2026-07-21T00-00-00-skill-adjacency-session.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-adjacency.json" });
+    defer std.testing.allocator.free(output_path);
+    const args = [_][]const u8{
+        "--root", root_abs, "--session-id", "skill-adjacency-session", "--skill", "seq", "--format", "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_evidence, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"injected_skill_block\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"successful_activation_outcome\": 1") != null);
+
+    const duplicate_session_content =
+        "{\"timestamp\":\"2026-07-21T10:59:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"skill-adjacency-dedupe-session\",\"cwd\":\"/tmp/skill-adjacency\",\"model\":\"gpt-test\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T11:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Neutral repeated text.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T11:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $seq\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T11:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Neutral repeated text.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T11:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/07/21/rollout-2026-07-21T01-00-00-skill-adjacency-dedupe-session.jsonl",
+        .data = duplicate_session_content,
+    });
+    const duplicate_output = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-adjacency-dedupe.json" });
+    defer std.testing.allocator.free(duplicate_output);
+    const duplicate_args = [_][]const u8{
+        "--root", root_abs, "--session-id", "skill-adjacency-dedupe-session", "--skill", "seq", "--format", "json",
+    };
+    const duplicate_got = try runCommandWithOutput(std.testing.allocator, .skill_evidence, duplicate_args[0..], duplicate_output);
+    defer std.testing.allocator.free(duplicate_got);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate_got, "\"injected_skill_block\": 0") != null);
+}
+
+test "skill scanners stream a session corpus larger than 256 MiB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/07/21");
+    const session_rel = "sessions/2026/07/21/rollout-2026-07-21T10-00-00-large-skill-session.jsonl";
+    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_root);
+    const session_abs = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, session_rel });
+    defer std.testing.allocator.free(session_abs);
+    const prefix =
+        "{\"timestamp\":\"2026-07-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"large-skill-session\",\"cwd\":\"/tmp/large-skill\",\"model\":\"gpt-test\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: large-stream-route\\n  skill: seq\\n  selected_route: streaming\\n  rejected_routes: [whole-file]\\n  artifact_state: clean\\n\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"validation pass with proof captured\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T10:00:04Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"large-read\",\"arguments\":\"{\\\"cmd\\\":\\\"sed -n '1,120p' /Users/tk/.dotfiles/codex/skills/seq/SKILL.md\\\"}\"}}\n";
+    const size = try writeSparseLargeSessionForTest(session_abs, prefix);
+    try std.testing.expect(size > 256 * 1024 * 1024);
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const evidence_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "large-skill-evidence.json" });
+    defer std.testing.allocator.free(evidence_out);
+    const evidence_args = [_][]const u8{
+        "--root", root_abs, "--session-id", "large-skill-session", "--skill", "seq", "--format", "json",
+    };
+    const evidence = try runCommandWithOutput(std.testing.allocator, .skill_evidence, evidence_args[0..], evidence_out);
+    defer std.testing.allocator.free(evidence);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"injected_skill_block\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"manual_skill_file_read\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"successful_activation_outcome\": 1") != null);
+
+    const decision_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "large-skill-decision.json" });
+    defer std.testing.allocator.free(decision_out);
+    const decision_args = [_][]const u8{
+        "--root", root_abs, "--path", session_abs, "--skill", "seq", "--mode", "episodes", "--format", "json",
+    };
+    const decisions = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, decision_args[0..], decision_out);
+    defer std.testing.allocator.free(decisions);
+    try std.testing.expect(std.mem.indexOf(u8, decisions, "\"decision_id\": \"large-stream-route\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, decisions, "\"outcome_class\": \"proof_pass\"") != null);
+}
+
+test "session scanner source guard rejects bounded whole-file regressions" {
+    const commands_source = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "src/commands/mod.zig",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(commands_source);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "readFileAlloc" ++ "OrSkip") == null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "allocRemaining(allocator, .limited(256" ++ " * 1024 * 1024))") == null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "session_scan.forEachLineFromFileOffset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "session_scan.forEachLineFrom" ++ "Offset") == null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "session_scan.collectSkill" ++ "Mentions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "session_scan.scanFileWithOptions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "session_scan.scanTraceAndMessages") != null);
+    try std.testing.expect(std.mem.indexOf(u8, commands_source, "skillDecisionCursor" ++ "FileSize") == null);
+
+    const hylo_source = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "src/hylo_extract/mod.zig",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(hylo_source);
+    try std.testing.expect(std.mem.indexOf(u8, hylo_source, "MaxSession" ++ "Bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hylo_source, "SessionSource" ++ "TooLarge") == null);
+
+    const cas_audit_source = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "src/cas_review_audit.zig",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer std.testing.allocator.free(cas_audit_source);
+    try std.testing.expect(std.mem.indexOf(u8, cas_audit_source, "session_scan.forEachLine") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cas_audit_source, "var lines = std.mem.splitScalar(u8, text, '\\n')") == null);
+}
+
+test "bounded standalone artifact reads preserve the 256 MiB contract" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "artifact.json", .{});
+    defer file.close(io);
+    const size: u64 = 65 * 1024 * 1024;
+    try file.setLength(io, size);
+    const path = try tmp.dir.realPathFileAlloc(io, "artifact.json", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const content = (try readBoundedArtifactAllocOrSkip(std.testing.allocator, path)).?;
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqual(@as(usize, @intCast(size)), content.len);
+}
+
+test "tail post-scan observation detects concurrent truncation" {
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(std.testing.allocator, &rows);
+    var state = TailState{
+        .path = "/tmp/session.jsonl",
+        .raw_byte_offset = 120,
+        .raw_line_number = 3,
+        .last_file_size = 200,
+    };
+    try applyTailPostScanObservation(std.testing.allocator, &rows, &state, 200, 80, 120, 10);
+    try std.testing.expectEqual(@as(u64, 0), state.raw_byte_offset);
+    try std.testing.expectEqual(@as(usize, 0), state.raw_line_number);
+    try std.testing.expectEqual(@as(u64, 80), state.last_file_size);
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try std.testing.expect(scalarStringEq(rows.items[0].valueOrNull("entry_type"), "file_truncated"));
 }
 
 test "query-lift commands run representative dataset wrappers" {
@@ -29099,6 +29503,47 @@ test "skill_decision_audit firewall excludes weak presence from episodes" {
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_episodes\": 0") != null);
+    const expected_file_size = try std.fmt.allocPrint(std.testing.allocator, "\"file_size\":{d}", .{raw_content.len});
+    defer std.testing.allocator.free(expected_file_size);
+    try std.testing.expect(std.mem.indexOf(u8, got, expected_file_size) != null);
+}
+
+test "skill_decision_audit deduplicates activation before windowing and ignores blank cursor rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-21T08:00:00Z\",\"payload\":{\"id\":\"decision-dedupe-window\",\"cwd\":\"/repo\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T09:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $team-patterns for this decision.\"}]}}\n" ++
+        "   \n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-21T11:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $team-patterns for this decision.\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "decision-dedupe-window.jsonl",
+        .data = session_content,
+    });
+    const session_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "decision-dedupe-window.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(session_path);
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const summary_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "decision-dedupe-summary.json" });
+    defer std.testing.allocator.free(summary_path);
+    const summary = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, &.{
+        "--path", session_path, "--skill", "team-patterns", "--since", "2026-07-21T10:00:00Z", "--mode", "summary", "--format", "json",
+    }, summary_path);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"activation_sessions\": 0") != null);
+
+    const packet_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "decision-dedupe-packet.json" });
+    defer std.testing.allocator.free(packet_path);
+    const packet = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, &.{
+        "--path", session_path, "--skill", "team-patterns", "--since", "2026-07-21T10:00:00Z", "--mode", "tune-packet", "--format", "json",
+    }, packet_path);
+    defer std.testing.allocator.free(packet);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"last_event_offset\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, packet, "\"rows_scanned\":3") != null);
 }
 
 test "skill_decision_audit binds receipt fingerprints and reports stale receipts" {
