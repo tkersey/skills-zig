@@ -2696,22 +2696,32 @@ fn fetchReviewStatus(
     else
         client.requestJson("thread/read", params_json)) catch |err| {
         const detail = client.lastError() orelse @errorName(err);
-        if (std.mem.indexOf(u8, detail, "includeTurns is unavailable") != null or
-            std.mem.indexOf(u8, detail, "not materialized yet") != null)
-        {
+        appendLogRecord(allocator, event_log_path, "thread/read", "error", detail) catch {};
+        if (reviewHistoryIsNotMaterialized(detail)) {
             const without_turns_params = try stringifyAnyAlloc(allocator, .{
                 .threadId = review_thread_id,
                 .includeTurns = false,
             });
             defer allocator.free(without_turns_params);
-            const without_turns_json = if (live_notifications != null)
-                try client.requestJsonCaptureNotifications(
+            const without_turns_json = (if (live_notifications != null)
+                client.requestJsonCaptureNotifications(
                     "thread/read",
                     without_turns_params,
                     &captured_notifications,
                 )
             else
-                try client.requestJson("thread/read", without_turns_params);
+                client.requestJson("thread/read", without_turns_params)) catch |fallback_err| {
+                const fallback_detail = client.lastError() orelse @errorName(fallback_err);
+                appendLogRecord(allocator, event_log_path, "thread/read", "error", fallback_detail) catch {};
+                if (!reviewHistoryIsNotMaterialized(fallback_detail)) return fallback_err;
+                if (live_notifications) |state| {
+                    try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
+                }
+                var pending = try unmaterializedReviewStatusAlloc(allocator, fallback_detail);
+                errdefer pending.deinit(allocator);
+                try populateReviewEvidenceFromLiveNotifications(allocator, &pending, live_notifications);
+                return pending;
+            };
             defer allocator.free(without_turns_json);
             if (live_notifications) |state| {
                 try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
@@ -2818,6 +2828,51 @@ fn fetchReviewStatus(
     return status;
 }
 
+fn reviewHistoryIsNotMaterialized(detail: []const u8) bool {
+    if (std.mem.indexOf(u8, detail, "includeTurns is unavailable") != null or
+        std.mem.indexOf(u8, detail, "not materialized yet") != null)
+    {
+        return true;
+    }
+    const thread_read_failed =
+        std.mem.indexOf(u8, detail, "failed to load thread history") != null or
+        std.mem.indexOf(u8, detail, "failed to read thread") != null;
+    return thread_read_failed and
+        std.mem.indexOf(u8, detail, "failed to read session metadata") != null and
+        std.mem.indexOf(u8, detail, "rollout at ") != null and
+        std.mem.indexOf(u8, detail, " is empty") != null;
+}
+
+fn unmaterializedReviewStatusAlloc(
+    allocator: std.mem.Allocator,
+    raw_error: []const u8,
+) !ReviewStatus {
+    const thread_status = try allocator.dupe(u8, "materializing");
+    errdefer allocator.free(thread_status);
+    const turn_status = try allocator.dupe(u8, "materializing");
+    errdefer allocator.free(turn_status);
+    const thread_preview = try allocator.dupe(u8, "");
+    errdefer allocator.free(thread_preview);
+    const raw_response_json = try allocator.dupe(u8, raw_error);
+    errdefer allocator.free(raw_response_json);
+    return .{
+        .thread_status = thread_status,
+        .turn_status = turn_status,
+        .turn_count = 0,
+        .materialized = false,
+        .thread_preview = thread_preview,
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .review_text = null,
+        .raw_response_json = raw_response_json,
+    };
+}
+
 fn parseReviewStatusAlloc(
     allocator: std.mem.Allocator,
     raw_json: []const u8,
@@ -2899,7 +2954,12 @@ fn parseReviewStatusAlloc(
         },
         else => {},
     };
-    if (expected_turn_id != null and selected_turn == null) return error.MissingReviewTurn;
+    // An inline review may own the thread before Codex materializes its rollout.
+    // Preserve turn identity once turns are observable, while allowing callers
+    // to retain the structured non-terminal state during that interval.
+    if (materialized and expected_turn_id != null and selected_turn == null) {
+        return error.MissingReviewTurn;
+    }
     return .{
         .thread_status = try allocator.dupe(u8, thread_status),
         .turn_status = try allocator.dupe(u8, turn_status),
@@ -12218,6 +12278,53 @@ test "parseReviewStatusAlloc handles materialized and pending states" {
     try std.testing.expectEqualStrings("materializing", pending.turn_status);
     try std.testing.expectEqual(@as(usize, 0), pending.turn_count);
     try std.testing.expect(!pending.materialized);
+
+    const inline_pending = try parseReviewStatusAlloc(
+        std.testing.allocator,
+        "{\"thread\":{\"id\":\"thr_inline\",\"status\":\"running\"}}",
+        false,
+        "thr_inline",
+        "turn_inline",
+    );
+    defer inline_pending.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("materializing", inline_pending.turn_status);
+    try std.testing.expectEqual(@as(usize, 0), inline_pending.turn_count);
+    try std.testing.expect(!inline_pending.materialized);
+}
+
+test "review history materialization classifier is narrow" {
+    try std.testing.expect(reviewHistoryIsNotMaterialized(
+        "includeTurns is unavailable while thread is not materialized yet",
+    ));
+    try std.testing.expect(reviewHistoryIsNotMaterialized(
+        "failed to load thread history for thread thr: thread-store internal error: " ++
+            "failed to read session metadata /tmp/rollout.jsonl: rollout at " ++
+            "/tmp/rollout.jsonl is empty",
+    ));
+    try std.testing.expect(reviewHistoryIsNotMaterialized(
+        "failed to read thread: thread-store internal error: failed to read " ++
+            "session metadata /tmp/rollout.jsonl: rollout at /tmp/rollout.jsonl is empty",
+    ));
+    try std.testing.expect(!reviewHistoryIsNotMaterialized(
+        "failed to load thread history: permission denied",
+    ));
+    try std.testing.expect(!reviewHistoryIsNotMaterialized(
+        "rollout at /tmp/rollout.jsonl is corrupt",
+    ));
+}
+
+test "unmaterialized review status remains non-terminal and non-proof-bearing" {
+    const status = try unmaterializedReviewStatusAlloc(
+        std.testing.allocator,
+        "rollout is empty",
+    );
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("materializing", status.thread_status);
+    try std.testing.expectEqualStrings("materializing", status.turn_status);
+    try std.testing.expectEqual(@as(usize, 0), status.turn_count);
+    try std.testing.expect(!status.materialized);
+    try std.testing.expect(!status.review_result_available);
+    try std.testing.expect(!isTerminalTurnStatus(status.turn_status));
 }
 
 test "parseReviewStatusAlloc selects the persisted turn and rejects thread mismatch" {
