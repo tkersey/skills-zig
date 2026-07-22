@@ -10,6 +10,8 @@ const ProgramName = "ledger --source actuation";
 const StoreRoot = ".ledger/actuation";
 const StoreName = "evidence.jsonl";
 const EventSchema = "actuating-evidence-event/v1";
+const ConstructionSchemaLegacy = "construction-contract/v1";
+const ConstructionSchemaOwnerLocalProof = "construction-contract/v2";
 const InputSchema = "actuating-evidence-input/v1";
 const OperationSchema = "actuating-operation/v1";
 const GenesisDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -42,6 +44,7 @@ const UsageText =
     \\  --goal GOAL_ID    Safe goal identity; required for every command
     \\  --input FILE|-    Artifact draft, operation, or owner observation
     \\  --capability CAP  Single-use capability required by consuming observations
+    \\  --review-contract FILE|-  Actuating Review Contract package for project only
     \\  -h, --help        Show help
     \\  -V, --version     Show version
 ;
@@ -59,6 +62,7 @@ const Args = struct {
     goal_id: ?[]const u8 = null,
     input_path: ?[]const u8 = null,
     capability: ?[]const u8 = null,
+    review_contract_path: ?[]const u8 = null,
 };
 
 const ArtifactFamily = enum { goal, counterexample, construction, evidence };
@@ -109,7 +113,7 @@ const protocol = [_]ProtocolSpec{
     .{
         .kind = .construction_contract_registered,
         .wire = "construction_contract_registered",
-        .body_schema = "construction-contract/v1",
+        .body_schema = ConstructionSchemaOwnerLocalProof,
         .origin = .artifact,
         .artifact = .construction,
     },
@@ -186,6 +190,7 @@ fn kindFromWire(raw: []const u8) ?EventKind {
 }
 
 fn familyFromSchema(raw: []const u8) ?ArtifactFamily {
+    if (std.mem.eql(u8, raw, ConstructionSchemaLegacy)) return .construction;
     for (protocol) |spec| {
         if (spec.artifact != null and std.mem.eql(u8, raw, spec.body_schema.?)) {
             return spec.artifact;
@@ -201,6 +206,7 @@ fn registrationKind(family: ArtifactFamily) !EventKind {
 
 const ArtifactView = struct {
     family: ArtifactFamily,
+    schema: []const u8,
     artifact_id: []const u8,
     goal_id: []const u8,
     predecessors: std.json.Array,
@@ -217,6 +223,7 @@ const ClassRecord = struct {
     set_ref: []const u8,
     construction_ref: []const u8,
     subject_digest: []const u8,
+    occurrences: usize,
 };
 
 const Pending = struct {
@@ -277,10 +284,12 @@ const ParsedEvent = struct {
 
 const Materialized = struct {
     family: ArtifactFamily,
+    schema: []u8,
     bytes: []u8,
     artifact_id: []u8,
 
     fn deinit(self: *Materialized, allocator: std.mem.Allocator) void {
+        allocator.free(self.schema);
         allocator.free(self.bytes);
         allocator.free(self.artifact_id);
     }
@@ -358,7 +367,12 @@ fn runCommand(
         .append => try runAppendCommand(allocator, store, goal_id, args),
         .prepare => try runPrepareCommand(allocator, store, goal_id, args),
         .state => try printState(allocator, store, goal_id),
-        .project => try printProjection(allocator, store, goal_id),
+        .project => try printProjection(
+            allocator,
+            store,
+            goal_id,
+            args.review_contract_path,
+        ),
         .doctor => try printDoctor(allocator, store, goal_id),
         .path => {
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
@@ -414,6 +428,8 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.input_path = try nextArg(argv, &index);
         } else if (std.mem.eql(u8, token, "--capability")) {
             args.capability = try nextArg(argv, &index);
+        } else if (std.mem.eql(u8, token, "--review-contract")) {
+            args.review_contract_path = try nextArg(argv, &index);
         } else if (!std.mem.startsWith(u8, token, "-") and args.command == null) {
             args.command = parseCommand(token) orelse return error.UnknownCommand;
         } else return error.UnknownOption;
@@ -442,6 +458,9 @@ fn validateArgs(args: Args) !void {
     const needs_input = command == .append or command == .prepare;
     if (needs_input != (args.input_path != null)) return error.InvalidInputOption;
     if (args.capability != null and command != .append) return error.InvalidCapabilityOption;
+    if (args.review_contract_path != null and command != .project) {
+        return error.InvalidReviewContractOption;
+    }
 }
 
 fn validateGoalId(goal_id: []const u8) !void {
@@ -645,7 +664,12 @@ fn materializeArtifact(
     errdefer allocator.free(canonical);
     view.artifact_id = artifact_id;
     _ = try inspectArtifact(parsed.value, goal_id, false);
-    return .{ .family = view.family, .bytes = canonical, .artifact_id = artifact_id };
+    return .{
+        .family = view.family,
+        .schema = try allocator.dupe(u8, view.schema),
+        .bytes = canonical,
+        .artifact_id = artifact_id,
+    };
 }
 
 fn inspectArtifact(
@@ -671,9 +695,10 @@ fn inspectArtifact(
     const predecessors = try validateDigestArray(try field(artifact, "predecessor_refs"));
     _ = try validateStringArray(try field(artifact, "supporting_refs"), false);
     const payload = try field(artifact, "payload");
-    try validateArtifactPayload(family, payload);
+    try validateArtifactPayload(family, schema, payload);
     return .{
         .family = family,
+        .schema = schema,
         .artifact_id = artifact_id,
         .goal_id = goal_id,
         .predecessors = predecessors,
@@ -711,11 +736,15 @@ fn validateSemanticAuthor(family: ArtifactFamily, author: []const u8) !void {
     }
 }
 
-fn validateArtifactPayload(family: ArtifactFamily, payload: std.json.Value) !void {
+fn validateArtifactPayload(
+    family: ArtifactFamily,
+    schema: []const u8,
+    payload: std.json.Value,
+) !void {
     switch (family) {
         .goal => try validateGoalPayload(payload),
         .counterexample => try validateCounterexamplePayload(payload),
-        .construction => try validateConstructionPayload(payload),
+        .construction => try validateConstructionPayload(schema, payload),
         .evidence => return error.InvalidArtifactFamily,
     }
 }
@@ -835,6 +864,7 @@ fn validatePathArray(paths: std.json.Array) !void {
 }
 
 fn validateRepoPath(path: []const u8) !void {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidRepoPath;
     if (std.mem.eql(u8, path, ".")) return;
     if (path.len == 0 or std.fs.path.isAbsolute(path) or path[path.len - 1] == '/') {
         return error.InvalidRepoPath;
@@ -938,7 +968,7 @@ fn parseClassSeverity(raw: []const u8) !ClassSeverity {
     return error.InvalidSeverity;
 }
 
-fn validateConstructionPayload(value: std.json.Value) !void {
+fn validateConstructionPayload(schema: []const u8, value: std.json.Value) !void {
     const payload = try asObject(value);
     try requireExactKeys(payload, &.{
         "goal_contract_ref",
@@ -974,7 +1004,7 @@ fn validateConstructionPayload(value: std.json.Value) !void {
         try field(payload, "preserved_observations"),
         false,
     );
-    try validateProofObligations(try field(payload, "proof_obligations"));
+    try validateProofObligations(schema, try field(payload, "proof_obligations"));
     try validateRetirements(try field(payload, "retirements"));
     try validateProofRoleNamespace(payload);
     try validatePreservedObservations(payload, preserved_observations);
@@ -1024,15 +1054,24 @@ fn validateArchitecture(value: std.json.Value) !void {
     _ = try validateStringArray(try field(object, "residual_assumptions"), false);
 }
 
-fn validateProofObligations(value: std.json.Value) !void {
+fn validateProofObligations(schema: []const u8, value: std.json.Value) !void {
     const obligations = try asArray(value);
     if (obligations.items.len == 0) return error.EmptyProofObligations;
     for (obligations.items, 0..) |item, index| {
         const obligation = try asObject(item);
-        try requireExactKeys(obligation, &.{
-            "obligation_id", "law_ref",   "statement",  "proof_mode", "adequacy_reason",
-            "verifier",      "falsifier", "proof_kind",
-        });
+        if (std.mem.eql(u8, schema, ConstructionSchemaOwnerLocalProof)) {
+            try requireExactKeys(obligation, &.{
+                "obligation_id", "law_ref",         "owner_boundary", "statement",
+                "proof_mode",    "adequacy_reason", "verifier",       "falsifier",
+                "proof_kind",
+            });
+            try requireNonBlank(try stringField(obligation, "owner_boundary"));
+        } else {
+            try requireExactKeys(obligation, &.{
+                "obligation_id", "law_ref",   "statement",  "proof_mode", "adequacy_reason",
+                "verifier",      "falsifier", "proof_kind",
+            });
+        }
         const id = try stringField(obligation, "obligation_id");
         try requireNonBlank(id);
         try rejectReservedProofRoleId(id);
@@ -1191,6 +1230,33 @@ fn replayStore(
     replay.snapshot = try store.snapshot(allocator, MaxStoreBytes);
     replay.state = try foldSnapshot(allocator, replay.snapshot, goal_id);
     return replay;
+}
+
+pub fn validateEvidenceStore(
+    allocator: std.mem.Allocator,
+    evidence_path: []const u8,
+    goal_id: []const u8,
+) !void {
+    const snapshot = try validatedEvidenceSnapshotAlloc(allocator, evidence_path, goal_id);
+    allocator.free(snapshot);
+}
+
+pub fn validatedEvidenceSnapshotAlloc(
+    allocator: std.mem.Allocator,
+    evidence_path: []const u8,
+    goal_id: []const u8,
+) ![]u8 {
+    try validateGoalId(goal_id);
+    var persistence = durable_store.PersistentEventStore.init(evidence_path);
+    var replay = try replayStore(allocator, persistence.eventStore(), goal_id);
+    defer replay.deinit();
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (replay.snapshot.records) |record| {
+        try out.writer.writeAll(record.payload);
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
 }
 
 fn replayExclusive(
@@ -1495,7 +1561,7 @@ fn validateConstructionAgainstState(
     try validateConstructionScope(goal.payload, payload);
     try validateConstructionLaws(goal.payload, payload);
     try validateConstructionAcceptance(goal.payload, payload);
-    try validateConstructionCounterexamples(state, payload);
+    try validateConstructionCounterexamples(state, view.schema, payload);
 }
 
 fn validateConstructionModeAndLineage(
@@ -1678,6 +1744,7 @@ fn goalHasLaw(laws: std.json.Array, law_id: []const u8) bool {
 
 fn validateConstructionCounterexamples(
     state: *State,
+    construction_schema: []const u8,
     construction: std.json.ObjectMap,
 ) !void {
     const refs = try asArray(try field(construction, "counterexample_class_refs"));
@@ -1695,15 +1762,44 @@ fn validateConstructionCounterexamples(
         {
             return error.AcceptedCounterexampleLawUncovered;
         }
-        if ((class.severity == .critical or class.severity == .high) and
-            !obligationProvidesStrongLocalProof(obligations, class.law_ref))
+        if (std.mem.eql(u8, construction_schema, ConstructionSchemaOwnerLocalProof)) {
+            if (!obligationProvidesImplementationProof(
+                obligations,
+                class.law_ref,
+                class.owner_boundary,
+                true,
+            )) {
+                return error.AcceptedCounterexampleRequiresImplementationProof;
+            }
+            if (class.occurrences > 1 and
+                !obligationProvidesImplementationProof(
+                    obligations,
+                    class.law_ref,
+                    class.owner_boundary,
+                    false,
+                ))
+            {
+                return error.RecurrentCounterexampleRequiresNonExampleImplementationProof;
+            }
+            if ((class.severity == .critical or class.severity == .high) and
+                !obligationProvidesImplementationProof(
+                    obligations,
+                    class.law_ref,
+                    class.owner_boundary,
+                    false,
+                ))
+            {
+                return error.HighSeverityCounterexampleRequiresStrongProof;
+            }
+        } else if ((class.severity == .critical or class.severity == .high) and
+            !obligationProvidesLegacyStrongLocalProof(obligations, class.law_ref))
         {
             return error.HighSeverityCounterexampleRequiresStrongProof;
         }
     }
 }
 
-fn obligationProvidesStrongLocalProof(
+fn obligationProvidesLegacyStrongLocalProof(
     obligations: std.json.Array,
     law_ref: []const u8,
 ) bool {
@@ -1716,6 +1812,26 @@ fn obligationProvidesStrongLocalProof(
         const kind = stringField(obligation, "proof_kind") catch return false;
         if (std.mem.eql(u8, kind, "implementation") or
             std.mem.eql(u8, kind, "acceptance")) return true;
+    }
+    return false;
+}
+
+fn obligationProvidesImplementationProof(
+    obligations: std.json.Array,
+    law_ref: []const u8,
+    owner_boundary: []const u8,
+    allow_example: bool,
+) bool {
+    for (obligations.items) |item| {
+        const obligation = asObject(item) catch return false;
+        const obligation_law = stringField(obligation, "law_ref") catch return false;
+        if (!std.mem.eql(u8, obligation_law, law_ref)) continue;
+        const obligation_owner = stringField(obligation, "owner_boundary") catch return false;
+        if (!std.mem.eql(u8, obligation_owner, owner_boundary)) continue;
+        const mode = stringField(obligation, "proof_mode") catch return false;
+        if (!allow_example and std.mem.eql(u8, mode, "example-regression")) continue;
+        const kind = stringField(obligation, "proof_kind") catch return false;
+        if (std.mem.eql(u8, kind, "implementation")) return true;
     }
     return false;
 }
@@ -1806,6 +1922,7 @@ fn admitClass(
         existing.set_ref = set.artifact_id;
         existing.construction_ref = state.construction.?.artifact_id;
         existing.subject_digest = state.subject_digest.?;
+        existing.occurrences += 1;
         return;
     }
     try state.classes.append(state.allocator, .{
@@ -1818,6 +1935,7 @@ fn admitClass(
         .set_ref = set.artifact_id,
         .construction_ref = state.construction.?.artifact_id,
         .subject_digest = state.subject_digest.?,
+        .occurrences = 1,
     });
 }
 
@@ -1970,6 +2088,11 @@ fn validateEditAuthorityAndDebt(state: *State) !void {
             return error.AcceptedCounterexampleDebt;
         }
     }
+    try validateConstructionCounterexamples(
+        state,
+        state.construction.?.schema,
+        construction,
+    );
 }
 
 fn applyEffectRecorded(state: *State, event: ParsedEvent) !void {
@@ -2183,6 +2306,11 @@ fn appendArtifact(
 ) !AppendResult {
     var materialized = try materializeArtifact(allocator, goal_id, input);
     defer materialized.deinit(allocator);
+    if (materialized.family == .construction and
+        !std.mem.eql(u8, materialized.schema, ConstructionSchemaOwnerLocalProof))
+    {
+        return error.LegacyConstructionAppendDenied;
+    }
     var exclusive = try store.acquireExclusive(allocator);
     defer exclusive.release();
     var replay = try replayExclusive(allocator, &exclusive, goal_id);
@@ -2620,11 +2748,215 @@ fn printProjection(
     allocator: std.mem.Allocator,
     store: durable_store.EventStore,
     goal_id: []const u8,
+    review_contract_path: ?[]const u8,
 ) !void {
     var replay = try replayStore(allocator, store, goal_id);
     defer replay.deinit();
-    const output = try projectionJsonAlloc(replay.arena.allocator(), &replay.state);
+    const output = if (review_contract_path) |path| blk: {
+        const input = try readInputAlloc(replay.arena.allocator(), path);
+        const review_digest = try reviewContractDigestAlloc(
+            replay.arena.allocator(),
+            input,
+        );
+        break :blk try reviewIdentityProjectionJsonAlloc(
+            replay.arena.allocator(),
+            &replay.state,
+            review_digest,
+        );
+    } else try projectionJsonAlloc(replay.arena.allocator(), &replay.state);
     try writeStdout(output);
+}
+
+fn reviewContractDigestAlloc(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const package = try asObject(parsed.value);
+    try requireExactKeys(package, &.{ "lens_contract_manifests", "review_contract" });
+    const manifests = try asObject(try field(package, "lens_contract_manifests"));
+    const review_value = package.getPtr("review_contract") orelse return error.MissingField;
+    const review = try asObject(review_value.*);
+    try requireExactKeys(review, &.{
+        "attempt_quality",    "contract_digest", "contract_id", "initial_wave",
+        "material_change",    "required_lenses", "schema",      "standard_convergence",
+        "transport_recovery",
+    });
+    if (!std.mem.eql(
+        u8,
+        try stringField(review, "schema"),
+        "actuating-review-contract/v1",
+    )) return error.InvalidReviewContractSchema;
+    try requireNonBlank(try stringField(review, "contract_id"));
+    const supplied_digest = try stringField(review, "contract_digest");
+    try requireDigest(supplied_digest);
+    try validateReviewTopology(allocator, manifests, review);
+    const digest_value = review.getPtr("contract_digest") orelse return error.MissingField;
+    digest_value.* = .null;
+    const canonical = try canonicalValueAlloc(allocator, review_value.*);
+    defer allocator.free(canonical);
+    const computed = try digestCanonicalAlloc(allocator, canonical);
+    errdefer allocator.free(computed);
+    if (!std.mem.eql(u8, supplied_digest, computed)) {
+        return error.ReviewContractDigestMismatch;
+    }
+    return computed;
+}
+
+fn validateReviewTopology(
+    allocator: std.mem.Allocator,
+    manifests: std.json.ObjectMap,
+    review: std.json.ObjectMap,
+) !void {
+    const lenses = try asArray(try field(review, "required_lenses"));
+    if (lenses.items.len == 0 or manifests.count() != lenses.items.len) {
+        return error.ReviewLensTopologyMismatch;
+    }
+    for (lenses.items, 0..) |item, index| {
+        const lens = try asObject(item);
+        try requireExactKeys(lens, &.{
+            "contract_digest", "contract_ref", "name", "role",
+        });
+        const name = try stringField(lens, "name");
+        try requireNonBlank(name);
+        try requireNonBlank(try stringField(lens, "role"));
+        const contract_ref = try stringField(lens, "contract_ref");
+        try validateRepoPath(contract_ref);
+        const contract_digest = try stringField(lens, "contract_digest");
+        try requireDigest(contract_digest);
+        for (lenses.items[0..index]) |prior_item| {
+            const prior = try asObject(prior_item);
+            if (std.mem.eql(u8, name, try stringField(prior, "name"))) {
+                return error.DuplicateReviewLens;
+            }
+        }
+        const manifest_value = manifests.get(name) orelse {
+            return error.MissingReviewLensManifest;
+        };
+        const manifest = try asObject(manifest_value);
+        try requireExactKeys(manifest, &.{"resources"});
+        const resources = try asArray(try field(manifest, "resources"));
+        if (resources.items.len == 0) return error.EmptyReviewLensManifest;
+        var package_bytes: std.Io.Writer.Allocating = .init(allocator);
+        defer package_bytes.deinit();
+        try package_bytes.writer.writeAll("actuating-lens-contract/v1\x00");
+        var contains_contract_ref = false;
+        for (resources.items, 0..) |resource_item, resource_index| {
+            const resource = try asObject(resource_item);
+            try requireExactKeys(resource, &.{ "digest", "path" });
+            const path = try stringField(resource, "path");
+            try validateRepoPath(path);
+            const digest = try stringField(resource, "digest");
+            try requireDigest(digest);
+            if (resource_index > 0) {
+                const prior = try asObject(resources.items[resource_index - 1]);
+                if (!std.mem.lessThan(u8, try stringField(prior, "path"), path)) {
+                    return error.NonCanonicalReviewResourceSet;
+                }
+            }
+            contains_contract_ref = contains_contract_ref or
+                std.mem.eql(u8, path, contract_ref);
+            try package_bytes.writer.writeAll(path);
+            try package_bytes.writer.writeByte(0);
+            try package_bytes.writer.writeAll(digest);
+            try package_bytes.writer.writeByte(0);
+        }
+        if (!contains_contract_ref) return error.ReviewContractRefMissing;
+        const computed = try digestTextAlloc(allocator, package_bytes.written());
+        defer allocator.free(computed);
+        if (!std.mem.eql(u8, contract_digest, computed)) {
+            return error.ReviewLensContractDigestMismatch;
+        }
+    }
+    try validateReviewPolicyShape(review);
+}
+
+fn validateReviewPolicyShape(review: std.json.ObjectMap) !void {
+    const initial = try asObject(try field(review, "initial_wave"));
+    try requireExactKeys(initial, &.{ "all_lenses_required", "concurrent", "non_cancelling" });
+    _ = try boolField(initial, "all_lenses_required");
+    _ = try boolField(initial, "concurrent");
+    _ = try boolField(initial, "non_cancelling");
+    const convergence = try asObject(try field(review, "standard_convergence"));
+    try requireExactKeys(convergence, &.{
+        "findings_reset_streak",
+        "first_wave_standard_counts",
+        "later_attempts_serial",
+        "required_consecutive_clean_attempts",
+    });
+    _ = try boolField(convergence, "findings_reset_streak");
+    _ = try boolField(convergence, "first_wave_standard_counts");
+    _ = try boolField(convergence, "later_attempts_serial");
+    if (try integerField(convergence, "required_consecutive_clean_attempts") <= 0) {
+        return error.InvalidReviewConvergence;
+    }
+    const material = try asObject(try field(review, "material_change"));
+    try requireExactKeys(material, &.{"resets_all_review_credit"});
+    _ = try boolField(material, "resets_all_review_credit");
+    const recovery = try asObject(try field(review, "transport_recovery"));
+    try requireExactKeys(recovery, &.{ "maximum_fresh_recovery_attempts", "request_local" });
+    if (try integerField(recovery, "maximum_fresh_recovery_attempts") < 0) {
+        return error.InvalidReviewRecovery;
+    }
+    _ = try boolField(recovery, "request_local");
+    const quality = try asObject(try field(review, "attempt_quality"));
+    try requireExactKeys(quality, &.{
+        "context_match_required",
+        "current_tuple_required",
+        "exact_instruction_digest_required",
+        "exact_workflow_binding_required",
+        "fallback_forbidden",
+        "reduced_principal_forbidden",
+        "required_backend_class",
+        "strong_principal_required",
+        "structured_statuses",
+        "tuple_verdict_required",
+    });
+    for ([_][]const u8{
+        "context_match_required",
+        "current_tuple_required",
+        "exact_instruction_digest_required",
+        "exact_workflow_binding_required",
+        "fallback_forbidden",
+        "reduced_principal_forbidden",
+        "strong_principal_required",
+        "tuple_verdict_required",
+    }) |name| _ = try boolField(quality, name);
+    try requireNonBlank(try stringField(quality, "required_backend_class"));
+    _ = try validateStringArray(try field(quality, "structured_statuses"), true);
+}
+
+fn reviewIdentityProjectionJsonAlloc(
+    allocator: std.mem.Allocator,
+    state: *State,
+    review_digest: []const u8,
+) ![]u8 {
+    const goal = state.goal orelse return error.MissingCurrentGoal;
+    const construction = state.construction orelse return error.MissingCurrentConstruction;
+    const subject = state.subject_digest orelse return error.MissingSubjectDigest;
+    const campaign_id = try campaignDigestAlloc(allocator, state, review_digest);
+    defer allocator.free(campaign_id);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"authority_granted\":false,\"campaign_id\":");
+    try writeJsonString(&out.writer, campaign_id);
+    try out.writer.writeAll(",\"construction_ref\":");
+    try writeJsonString(&out.writer, construction.artifact_id);
+    try out.writer.writeAll(",\"evidence_head\":");
+    try writeJsonString(&out.writer, state.head_digest);
+    try out.writer.writeAll(",\"goal_contract_ref\":");
+    try writeJsonString(&out.writer, goal.artifact_id);
+    try out.writer.writeAll(",\"goal_id\":");
+    try writeJsonString(&out.writer, state.goal_id);
+    try out.writer.writeAll(",\"review_contract_digest\":");
+    try writeJsonString(&out.writer, review_digest);
+    try out.writer.writeAll(",\"schema\":\"actuating-review-identity-projection/v1\"");
+    try out.writer.writeAll(",\"semantic_decision_established\":false,\"storage_mutated\":false");
+    try out.writer.writeAll(",\"subject_digest\":");
+    try writeJsonString(&out.writer, subject);
+    try out.writer.writeAll("}\n");
+    return allocator.dupe(u8, out.written());
 }
 
 fn projectionJsonAlloc(
@@ -2760,7 +3092,7 @@ fn testConstructionAlloc(
     defer allocator.free(predecessors);
     const repair_claims = !std.mem.eql(u8, mode, "initial");
     return std.fmt.allocPrint(allocator,
-        \\{{"artifact":{{"schema":"construction-contract/v1","artifact_id":null,
+        \\{{"artifact":{{"schema":"construction-contract/v2","artifact_id":null,
         \\"goal_id":"goal-1","semantic_author":"actuating","created_at":"now",
         \\"predecessor_refs":{s},"supporting_refs":[],"payload":{{
         \\"goal_contract_ref":"{s}","mode":"{s}","subject":{{"repository":"repo",
@@ -2773,7 +3105,8 @@ fn testConstructionAlloc(
         \\"falsified_predecessor_claims":{s},"preserved_predecessor_claims":{s},
         \\"invalid_states_eliminated":["invalid"],"counterexample_class_refs":{s},
         \\"preserved_observations":["proof-1"],"proof_obligations":[{{
-        \\"obligation_id":"proof-1","law_ref":"law-1","statement":"prove law",
+        \\"obligation_id":"proof-1","law_ref":"law-1","owner_boundary":"owner",
+        \\"statement":"prove law",
         \\"proof_mode":"property-law","adequacy_reason":"complete input space",
         \\"verifier":{{"argv":["verify"]}},"falsifier":{{"argv":["falsify"]}},
         \\"proof_kind":"implementation"}}],"retirements":[],"execution":{{
@@ -2829,19 +3162,87 @@ fn testClassListAlloc(
     class_id: []const u8,
     law_ref: []const u8,
     owner: []const u8,
+    severity: []const u8,
     status: []const u8,
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         "[{{\"class_id\":\"{s}\",\"boundary_key\":\"boundary\"," ++
             "\"law_ref\":\"{s}\",\"discrepancy\":\"misbinding\"," ++
-            "\"owner_boundary\":\"{s}\",\"severity\":\"high\"," ++
+            "\"owner_boundary\":\"{s}\",\"severity\":\"{s}\"," ++
             "\"status\":\"{s}\",\"observed_facts\":[\"fact\"]," ++
             "\"evidence_refs\":[\"test:evidence\"],\"finding_refs\":[]," ++
             "\"witness\":\"witness\",\"falsifier_ref\":\"test:falsifier\"," ++
             "\"applicability\":\"current\",\"quotient_basis\":\"law+boundary\"}}]",
-        .{ class_id, law_ref, owner, status },
+        .{ class_id, law_ref, owner, severity, status },
     );
+}
+
+const TestReviewPackage = struct {
+    bytes: []u8,
+    digest: []u8,
+
+    fn deinit(self: TestReviewPackage, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.digest);
+    }
+};
+
+fn testReviewPackageAlloc(allocator: std.mem.Allocator) !TestReviewPackage {
+    var lens_basis: std.Io.Writer.Allocating = .init(allocator);
+    defer lens_basis.deinit();
+    try lens_basis.writer.writeAll("actuating-lens-contract/v1\x00lens.md\x00");
+    try lens_basis.writer.writeAll(TestDigest0);
+    try lens_basis.writer.writeByte(0);
+    const lens_digest = try digestTextAlloc(allocator, lens_basis.written());
+    defer allocator.free(lens_digest);
+    const review_basis_input = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attempt_quality\":{{\"context_match_required\":true," ++
+            "\"current_tuple_required\":true,\"exact_instruction_digest_required\":true," ++
+            "\"exact_workflow_binding_required\":true,\"fallback_forbidden\":true," ++
+            "\"reduced_principal_forbidden\":true,\"required_backend_class\":\"cas-start-wait\"," ++
+            "\"strong_principal_required\":true," ++
+            "\"structured_statuses\":[\"clean\",\"findings\"]," ++
+            "\"tuple_verdict_required\":true}},\"contract_digest\":null," ++
+            "\"contract_id\":\"test-review-contract\",\"initial_wave\":{{" ++
+            "\"all_lenses_required\":true,\"concurrent\":true,\"non_cancelling\":true}}," ++
+            "\"material_change\":{{\"resets_all_review_credit\":true}}," ++
+            "\"required_lenses\":[{{\"contract_digest\":\"{s}\",\"contract_ref\":\"lens.md\"," ++
+            "\"name\":\"standard\",\"role\":\"standard\"}}]," ++
+            "\"schema\":\"actuating-review-contract/v1\",\"standard_convergence\":{{" ++
+            "\"findings_reset_streak\":true,\"first_wave_standard_counts\":true," ++
+            "\"later_attempts_serial\":true,\"required_consecutive_clean_attempts\":5}}," ++
+            "\"transport_recovery\":{{\"maximum_fresh_recovery_attempts\":1," ++
+            "\"request_local\":true}}}}",
+        .{lens_digest},
+    );
+    defer allocator.free(review_basis_input);
+    const review_basis = try canonical_json.canonicalizeAlloc(allocator, review_basis_input);
+    defer allocator.free(review_basis);
+    const review_digest = try digestCanonicalAlloc(allocator, review_basis);
+    errdefer allocator.free(review_digest);
+    const digest_field = try std.fmt.allocPrint(
+        allocator,
+        "\"contract_digest\":\"{s}\"",
+        .{review_digest},
+    );
+    defer allocator.free(digest_field);
+    const review = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        review_basis,
+        "\"contract_digest\":null",
+        digest_field,
+    );
+    defer allocator.free(review);
+    const bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"lens_contract_manifests\":{{\"standard\":{{\"resources\":[{{" ++
+            "\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review_contract\":{s}}}",
+        .{ TestDigest0, review },
+    );
+    return .{ .bytes = bytes, .digest = review_digest };
 }
 
 const TestHarness = struct {
@@ -2889,6 +3290,34 @@ fn testAppendGoalAndConstruction(
     return .{
         .goal = try allocator.dupe(u8, goal.artifact_id.?),
         .construction = try allocator.dupe(u8, construction.artifact_id.?),
+    };
+}
+
+fn testAppendLegacyConstruction(
+    harness: *TestHarness,
+    input: []const u8,
+) !AppendResult {
+    const allocator = std.testing.allocator;
+    var materialized = try materializeArtifact(allocator, "goal-1", input);
+    defer materialized.deinit(allocator);
+    try std.testing.expect(std.mem.eql(u8, materialized.schema, ConstructionSchemaLegacy));
+    var exclusive = try harness.store().acquireExclusive(allocator);
+    defer exclusive.release();
+    var replay = try replayExclusive(allocator, &exclusive, "goal-1");
+    defer replay.deinit();
+    const tuple = try artifactEventTuple(&replay.state, materialized);
+    return .{
+        .event_digest = try appendCanonicalEvent(
+            allocator,
+            &exclusive,
+            &replay,
+            .construction_contract_registered,
+            tuple.construction_ref,
+            tuple.subject_digest,
+            materialized.bytes,
+        ),
+        .artifact_id = try allocator.dupe(u8, materialized.artifact_id),
+        .artifact_bytes = try allocator.dupe(u8, materialized.bytes),
     };
 }
 
@@ -2952,6 +3381,7 @@ fn testRegisterClass(
     class_id: []const u8,
     law_ref: []const u8,
     owner: []const u8,
+    severity: []const u8,
     status: []const u8,
 ) !void {
     var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
@@ -2961,6 +3391,7 @@ fn testRegisterClass(
         class_id,
         law_ref,
         owner,
+        severity,
         status,
     );
     defer std.testing.allocator.free(classes);
@@ -2991,6 +3422,44 @@ fn testCurrentCounterexamplesAlloc(
         classes,
         predecessors,
     );
+}
+
+test "actuation: validated snapshot returns the owner-admitted Evidence bytes" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    var expected_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected_writer.deinit();
+    for (replay.snapshot.records) |record| {
+        try expected_writer.writer.writeAll(record.payload);
+        try expected_writer.writer.writeByte('\n');
+    }
+    const expected = try expected_writer.toOwnedSlice();
+    defer std.testing.allocator.free(expected);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "evidence.jsonl",
+        .data = expected,
+    });
+    const evidence_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "evidence.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(evidence_path);
+    const actual = try validatedEvidenceSnapshotAlloc(
+        std.testing.allocator,
+        evidence_path,
+        "goal-1",
+    );
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
 }
 
 test "actuation: four-family materialization is canonical and exact" {
@@ -3151,7 +3620,7 @@ test "actuation: accepted Counterexample requires an authored successor Construc
     const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
     defer std.testing.allocator.free(refs.goal);
     defer std.testing.allocator.free(refs.construction);
-    try testRegisterClass(&harness, "class-1", "law-1", "owner", "accepted");
+    try testRegisterClass(&harness, "class-1", "law-1", "owner", "high", "accepted");
     const goal_draft = try testGoalAlloc(
         std.testing.allocator,
         "null",
@@ -3216,6 +3685,106 @@ test "actuation: accepted Counterexample requires an authored successor Construc
     admitted.deinit(std.testing.allocator);
 }
 
+test "actuation: legacy Construction replay preserves prior proof admission" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"acceptance\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(std.testing.allocator);
+    const initial_implementation = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+    );
+    defer std.testing.allocator.free(initial_implementation);
+    const initial = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        initial_implementation,
+        "\"proof_kind\":\"implementation\"",
+        "\"proof_kind\":\"acceptance\"",
+    );
+    defer std.testing.allocator.free(initial);
+    var initial_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        initial,
+    );
+    defer initial_result.deinit(std.testing.allocator);
+    try testRegisterClass(&harness, "class-legacy", "law-1", "owner", "medium", "accepted");
+    const successor_implementation = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        initial_result.artifact_id.?,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-legacy\"]",
+    );
+    defer std.testing.allocator.free(successor_implementation);
+    const successor_v2 = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor_implementation,
+        "\"proof_kind\":\"implementation\"",
+        "\"proof_kind\":\"acceptance\"",
+    );
+    defer std.testing.allocator.free(successor_v2);
+    try std.testing.expectError(
+        error.AcceptedCounterexampleRequiresImplementationProof,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor_v2),
+    );
+    const successor_v1 = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor_v2,
+        ConstructionSchemaOwnerLocalProof,
+        ConstructionSchemaLegacy,
+    );
+    defer std.testing.allocator.free(successor_v1);
+    var successor_v1_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        successor_v1,
+        .{},
+    );
+    defer successor_v1_parsed.deinit();
+    const legacy_document = try asObject(successor_v1_parsed.value);
+    const legacy_artifact = try asObject(try field(legacy_document, "artifact"));
+    const legacy_payload = try asObject(try field(legacy_artifact, "payload"));
+    var legacy_obligations = try asArray(try field(legacy_payload, "proof_obligations"));
+    _ = legacy_obligations.items[0].object.orderedRemove("owner_boundary");
+    const successor_v1_shape = try canonicalValueAlloc(
+        std.testing.allocator,
+        successor_v1_parsed.value,
+    );
+    defer std.testing.allocator.free(successor_v1_shape);
+    try std.testing.expectError(
+        error.LegacyConstructionAppendDenied,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor_v1_shape),
+    );
+    var legacy = try testAppendLegacyConstruction(&harness, successor_v1_shape);
+    defer legacy.deinit(std.testing.allocator);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    try std.testing.expect(std.mem.eql(
+        u8,
+        replay.state.construction.?.schema,
+        ConstructionSchemaLegacy,
+    ));
+    var prepared = try testPrepare(&harness, "legacy-replay", "edit", "[\"proof-1\"]");
+    prepared.deinit(std.testing.allocator);
+}
+
 test "actuation: successor Construction preserves repair architecture and permits owner moves" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
@@ -3235,7 +3804,7 @@ test "actuation: successor Construction preserves repair architecture and permit
         error.UnknownCounterexampleClass,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", forward),
     );
-    try testRegisterClass(&harness, "class-1", "law-1", "owner", "accepted");
+    try testRegisterClass(&harness, "class-1", "law-1", "owner", "high", "accepted");
     const stale = try testConstructionAlloc(
         std.testing.allocator,
         refs.goal,
@@ -3270,22 +3839,35 @@ test "actuation: successor Construction preserves repair architecture and permit
         error.RepairArchitectureChanged,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", changed_boundary),
     );
-    const wrong_owner = try std.mem.replaceOwned(
+    const wrong_architecture_owner = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         current,
-        "\"owner\"",
-        "\"other-owner\"",
+        "\"canonical_owner\":\"owner\"",
+        "\"canonical_owner\":\"other-owner\"",
     );
-    defer std.testing.allocator.free(wrong_owner);
+    defer std.testing.allocator.free(wrong_architecture_owner);
     try std.testing.expectError(
         error.RepairArchitectureChanged,
-        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_owner),
+        appendArtifact(
+            std.testing.allocator,
+            harness.store(),
+            "goal-1",
+            wrong_architecture_owner,
+        ),
     );
+    const moved_owner = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        wrong_architecture_owner,
+        "\"allowed_paths\":[\"src/file.zig\"],\"owner_boundary\":\"owner\"",
+        "\"allowed_paths\":[\"src/file.zig\"],\"owner_boundary\":\"other-owner\"",
+    );
+    defer std.testing.allocator.free(moved_owner);
     const architecture_repair = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
-        wrong_owner,
+        moved_owner,
         "\"mode\":\"realization-repair\"",
         "\"mode\":\"architecture-repair\"",
     );
@@ -3310,6 +3892,7 @@ test "actuation: pending operation excludes Counterexamples and follow-up permit
         "class-follow-up",
         "law-1",
         "owner",
+        "high",
         "follow-up",
     );
     defer std.testing.allocator.free(classes);
@@ -3364,6 +3947,7 @@ test "actuation: Counterexample status revises on same tuple through set lineage
         "class-recur",
         "law-1",
         "owner",
+        "high",
         "follow-up",
     );
     defer std.testing.allocator.free(initial_classes);
@@ -3387,6 +3971,7 @@ test "actuation: Counterexample status revises on same tuple through set lineage
         "class-recur",
         "law-1",
         "owner",
+        "high",
         "rejected",
     );
     defer std.testing.allocator.free(revised_classes);
@@ -3406,6 +3991,162 @@ test "actuation: Counterexample status revises on same tuple through set lineage
     var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
     defer replay.deinit();
     try std.testing.expectEqual(ClassStatus.rejected, replay.state.classes.items[0].status);
+    try std.testing.expectEqual(@as(usize, 2), replay.state.classes.items[0].occurrences);
+}
+
+test "actuation: accepted classes require implementation-owned proof" {
+    var acceptance = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"law_ref\":\"law-1\",\"owner_boundary\":\"owner\"," ++
+            "\"proof_kind\":\"acceptance\",\"proof_mode\":\"property-law\"}]",
+        .{},
+    );
+    defer acceptance.deinit();
+    const acceptance_obligations = try asArray(acceptance.value);
+    try std.testing.expect(!obligationProvidesImplementationProof(
+        acceptance_obligations,
+        "law-1",
+        "owner",
+        true,
+    ));
+    var example = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"law_ref\":\"law-1\",\"owner_boundary\":\"owner\"," ++
+            "\"proof_kind\":\"implementation\"," ++
+            "\"proof_mode\":\"example-regression\"}]",
+        .{},
+    );
+    defer example.deinit();
+    const example_obligations = try asArray(example.value);
+    try std.testing.expect(obligationProvidesImplementationProof(
+        example_obligations,
+        "law-1",
+        "owner",
+        true,
+    ));
+    try std.testing.expect(!obligationProvidesImplementationProof(
+        example_obligations,
+        "law-1",
+        "owner",
+        false,
+    ));
+    try std.testing.expect(!obligationProvidesImplementationProof(
+        example_obligations,
+        "law-1",
+        "other-owner",
+        true,
+    ));
+}
+
+test "actuation: accepted class rejects implementation proof from another owner" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(
+        &harness,
+        "class-owner-proof",
+        "law-1",
+        "owner",
+        "medium",
+        "accepted",
+    );
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-owner-proof\"]",
+    );
+    defer std.testing.allocator.free(successor);
+    const wrong_owner = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor,
+        "\"law_ref\":\"law-1\",\"owner_boundary\":\"owner\"",
+        "\"law_ref\":\"law-1\",\"owner_boundary\":\"other-owner\"",
+    );
+    defer std.testing.allocator.free(wrong_owner);
+    try std.testing.expectError(
+        error.AcceptedCounterexampleRequiresImplementationProof,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_owner),
+    );
+}
+
+test "actuation: recurrent accepted class rejects example-only implementation proof" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(
+        &harness,
+        "class-recur-proof",
+        "law-1",
+        "owner",
+        "medium",
+        "accepted",
+    );
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-recur-proof\"]",
+    );
+    defer std.testing.allocator.free(successor);
+    const example_only = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor,
+        "\"proof_mode\":\"property-law\"",
+        "\"proof_mode\":\"example-regression\"",
+    );
+    defer std.testing.allocator.free(example_only);
+    var current = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        example_only,
+    );
+    defer current.deinit(std.testing.allocator);
+    var first = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    const prior_set = try std.testing.allocator.dupe(u8, first.state.classes.items[0].set_ref);
+    first.deinit();
+    defer std.testing.allocator.free(prior_set);
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-recur-proof",
+        "law-1",
+        "owner",
+        "medium",
+        "accepted",
+    );
+    defer std.testing.allocator.free(classes);
+    const predecessors = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[\"{s}\"]",
+        .{prior_set},
+    );
+    defer std.testing.allocator.free(predecessors);
+    const recurrence = try testCurrentCounterexamplesAlloc(&harness, classes, predecessors);
+    defer std.testing.allocator.free(recurrence);
+    var recurrence_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        recurrence,
+    );
+    defer recurrence_result.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.RecurrentCounterexampleRequiresNonExampleImplementationProof,
+        testPrepare(&harness, "recurrent-debt", "edit", "[\"proof-1\"]"),
+    );
 }
 
 test "actuation: Counterexample recurrence requires lineage and stable identity" {
@@ -3414,7 +4155,7 @@ test "actuation: Counterexample recurrence requires lineage and stable identity"
     const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
     defer std.testing.allocator.free(refs.goal);
     defer std.testing.allocator.free(refs.construction);
-    try testRegisterClass(&harness, "class-recur", "law-1", "owner", "rejected");
+    try testRegisterClass(&harness, "class-recur", "law-1", "owner", "high", "rejected");
     var before = try replayStore(std.testing.allocator, harness.store(), "goal-1");
     const prior_set = try std.testing.allocator.dupe(u8, before.state.classes.items[0].set_ref);
     before.deinit();
@@ -3435,6 +4176,7 @@ test "actuation: Counterexample recurrence requires lineage and stable identity"
         "class-recur",
         "law-1",
         "owner",
+        "high",
         "rejected",
     );
     defer std.testing.allocator.free(classes);
@@ -3455,6 +4197,7 @@ test "actuation: Counterexample recurrence requires lineage and stable identity"
         "class-recur",
         "law-1",
         "other-owner",
+        "high",
         "rejected",
     );
     defer std.testing.allocator.free(drift_classes);
@@ -3488,6 +4231,7 @@ test "actuation: accepted Counterexample must name a Goal law" {
         "class-law-2",
         "law-2",
         "owner",
+        "high",
         "accepted",
     );
     defer std.testing.allocator.free(classes);
@@ -3607,6 +4351,54 @@ test "actuation: state and projection deny authority and semantic decision" {
         try std.testing.expect(std.mem.indexOf(u8, document, "\"verdict\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, document, "discharged") == null);
     }
+}
+
+test "actuation: review identity projection validates exact supplied contract without mutation" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    var package = try testReviewPackageAlloc(std.testing.allocator);
+    defer package.deinit(std.testing.allocator);
+    const before = harness.memory.records.items.len;
+    const digest = try reviewContractDigestAlloc(std.testing.allocator, package.bytes);
+    defer std.testing.allocator.free(digest);
+    try std.testing.expectEqualStrings(package.digest, digest);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    const projection = try reviewIdentityProjectionJsonAlloc(
+        std.testing.allocator,
+        &replay.state,
+        digest,
+    );
+    defer std.testing.allocator.free(projection);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        projection,
+        "\"schema\":\"actuating-review-identity-projection/v1\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        projection,
+        "\"storage_mutated\":false",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, projection, package.digest) != null);
+    try std.testing.expectEqual(before, harness.memory.records.items.len);
+    const corrupt = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        package.bytes,
+        package.digest,
+        TestDigest1,
+    );
+    defer std.testing.allocator.free(corrupt);
+    try std.testing.expectError(
+        error.ReviewContractDigestMismatch,
+        reviewContractDigestAlloc(std.testing.allocator, corrupt),
+    );
+    try std.testing.expectEqual(before, harness.memory.records.items.len);
+    try std.testing.expectError(error.InvalidRepoPath, validateRepoPath("lens\x00contract.md"));
 }
 
 test "actuation: Goal semantic author is exact" {

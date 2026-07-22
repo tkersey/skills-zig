@@ -4,6 +4,7 @@ const canonical_trace = retrace_core.canonical_trace;
 const output = @import("output/mod.zig");
 
 pub const classify = @import("actuation/classify.zig");
+pub const kernel = @import("actuation/kernel.zig");
 pub const render = @import("actuation/render.zig");
 pub const refactor_kernel = @import("actuation/refactor_kernel.zig");
 

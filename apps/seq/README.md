@@ -332,6 +332,24 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","pa
 - Potential hidden refactor-kernel is an observational classifier. Use AER-v1/RKO-v1 for formal workflow evidence.
 - keeps raw prompts/excerpts out by default; `--include-excerpts` is explicit
 - `--strict` exits 2 for graph bypass or projection inversion rows
+- `--mode kernel --format json` requires one `--session-id` or `--path`,
+  `--evidence-store`, and `--goal-id`; it validates canonical
+  `actuating-evidence-event/v1` admission through Ledger's owner validator,
+  projects that exact admitted snapshot, then joins only events whose Actuating
+  receipt digest was emitted by a parsed Ledger producer command in the selected
+  session and whose timestamp falls inside that session. It admits every
+  producer-bound receipt line emitted on stdout, extracts the command and
+  continuation handle from the actual nested invocation, requires its exact
+  result forwarder, rejects sibling commands with unbound stdout, and carries
+  producer identity through yielded execution handles. Evidence sequence, not timestamp
+  order, supplies causal state through the last session-bound event; timestamps
+  control window counts only. It emits non-authoritative
+  `SEQ-ACTKERNEL-v1` counts for formal
+  Constructions, effects, Counterexample recurrence, owner-local implementation
+  proof coverage, recurrent example-only violations, aggregate-only violations,
+  and legacy v1 proof as owner-local debt because v1 has no owner binding,
+  timestamp-overlap events excluded for missing session receipts,
+  and subject transitions. It never establishes review credit or closure.
 
 Examples:
 ```bash
@@ -344,6 +362,9 @@ seq actuation-audit \
   --format json
 seq actuation-audit --root ~/.codex/sessions --workdir /path/to/repo --last 7d --exclude-current --mode hylo --format json
 seq actuation-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode report --format markdown
+seq actuation-audit --root ~/.codex/sessions --session-id <session_id> \
+  --evidence-store /path/to/evidence.jsonl --goal-id <goal_id> \
+  --mode kernel --format json
 seq query --root ~/.codex/sessions --spec '{"dataset":"actuation_runs","params":{"path":"rollout.jsonl"},"select":["session_id","verdict","graph.compile_failures","projection.update_plan_calls","surface.churn.apply_patch_calls"],"format":"table"}'
 ```
 
@@ -355,6 +376,9 @@ Actuation query datasets:
 - `actuation_compactions`
 - `actuation_workers`
 - `actuation_hylo_runs`
+
+`capabilities --format json` advertises
+`actuation_artifact_kernel_audit_v1` when the native kernel join is available.
 
 `execution-policy-audit` compiles EPRUN-v1 ledgers for closed-loop EPG/EPS/EPD/ETR policy runtime evidence:
 - requires a bounded selector: `--session-id`, `--path`, `--repo`, `--since`, `--until`, or `--last`

@@ -137,6 +137,8 @@ ledger --source actuation --goal GOAL_ID prepare --input operation.json
 ledger --source actuation --goal GOAL_ID append --input artifact-or-evidence.json
 ledger --source actuation --goal GOAL_ID state
 ledger --source actuation --goal GOAL_ID project
+ledger --source actuation --goal GOAL_ID project \
+  --review-contract /path/to/review-contract.json
 ledger --source actuation --goal GOAL_ID doctor
 ledger --source actuation --goal GOAL_ID path
 ledger --source hylo validate-campaign --campaign campaign.json
@@ -502,10 +504,14 @@ Add `--repo PATH` before `--goal` to locate `.ledger`; the default is `.`. The
 adapter neither invokes Git nor derives subject identity from the repository.
 Actuating supplies `actuating-operation/v1.expected_subject_digest`; `prepare`
 exact-matches that opaque digest to the current structural subject and records
-it in the durable event envelope. `append` accepts
-`goal-contract/v3`, `construction-contract/v1`, `counterexample-set/v1`, or an
-`actuating-evidence-input/v1` observation. Durable evidence uses
-`actuating-evidence-event/v1`.
+it in the durable event envelope. `append` accepts `goal-contract/v3`,
+`construction-contract/v2`, `counterexample-set/v1`, or an
+`actuating-evidence-input/v1` observation. Construction v2 makes owner-local
+implementation proof mandatory for accepted Counterexample classes and
+non-example implementation proof mandatory for recurrent classes. Replay keeps
+previously admitted `construction-contract/v1` events readable under their
+original proof rules, but new v1 Construction appends fail closed. Durable
+evidence uses `actuating-evidence-event/v1`.
 
 `prepare` validates the operation against the current Goal Contract,
 Construction Contract, and expected subject, appends `operation_prepared`,
@@ -524,9 +530,18 @@ invalidates the pending capability digest. Artifact append returns
 canonical artifact, its `artifact_id`, and the registration `event_digest`;
 observation append returns the same schema with `artifact` and `artifact_id` set
 to `null`.
+Construction admission derives Counterexample recurrence from immutable Set
+lineage. Every accepted class must have a law-matched `implementation` proof
+obligation; a recurrent accepted class must have a non-example implementation
+proof. Aggregate acceptance checks cannot substitute for owner-local proof.
 `state` projects current structural evidence. `project` emits a discardable
 `actuating-structural-evidence-projection/v1` with a digest-derived
-`projection_id`. Both surfaces report `authority_granted:false` and
+`projection_id`. With `--review-contract FILE|-`, `project` instead validates
+the exact supplied Actuating package, recomputes its normative and lens-package
+digests, and emits `actuating-review-identity-projection/v1` for the current
+Goal, Construction, subject, Evidence head, Review Contract digest, and
+campaign identity without appending an event. Both surfaces report
+`authority_granted:false` and
 `semantic_decision_established:false`; neither computes review credit, a next
 action, or closure.
 `doctor` validates the store and its hash chain. `path` prints the fixed

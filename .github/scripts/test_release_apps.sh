@@ -452,6 +452,7 @@ assert_case "libs/execution_policy_core/src/root.zig" "seq"
 assert_case "libs/retrace_core/src/lib.zig" "seq,cas,ledger"
 assert_case "testdata/hctp-v1/valid-trial.json" "seq,cas,ledger"
 assert_case "apps/cas/scripts/cas_trial.zig" "cas"
+assert_case "apps/ledger/scripts/actuation.zig" "seq,ledger"
 assert_case "apps/lift/src/main.zig" "lift"
 assert_case "apps/img/src/main.zig" "img"
 assert_case ".github/workflows/release-img.yml" "img"
@@ -466,4 +467,4 @@ assert_retrace_qualification_build_diff
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 19/19 cases passed"
+echo "release app classifier: 20/20 cases passed"
