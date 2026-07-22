@@ -1678,6 +1678,10 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.workflowBinding,
     );
     defer current_tuple.deinit(allocator);
+    const attempt_codex_version = reviewAttemptRuntimeVersion(
+        record.codex_version,
+        current_codex_version,
+    );
 
     const latest = waitForReviewCompletion(
         allocator,
@@ -1687,7 +1691,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.event_log_path,
         parsed.timeout_ms,
         parsed.poll_interval_ms,
-        current_codex_version,
+        attempt_codex_version,
     ) catch |err| switch (err) {
         error.WaitTimedOut => {
             var timeout_status = try fetchReviewStatus(
@@ -1697,7 +1701,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 record.review_turn_id,
                 record.event_log_path,
                 null,
-                current_codex_version,
+                attempt_codex_version,
             );
             try applyRecordedStatusOverlay(allocator, record, &timeout_status);
             record.last_observed_status = timeoutStatusString(&timeout_status);
@@ -3634,6 +3638,14 @@ fn isTerminalTurnStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "interrupted") or
         std.mem.eql(u8, status, "failed") or
         std.mem.eql(u8, status, "errored");
+}
+
+fn reviewAttemptRuntimeVersion(
+    recorded_codex_version: []const u8,
+    current_codex_version: []const u8,
+) []const u8 {
+    _ = current_codex_version;
+    return recorded_codex_version;
 }
 
 fn reviewStatusAwaitsStructuredCompletion(
@@ -12804,6 +12816,17 @@ test "parseSemverTriplet extracts version from codex banner text" {
     try std.testing.expectEqual(@as(u32, 118), parsed.minor);
     try std.testing.expectEqual(@as(u32, 0), parsed.patch);
     try std.testing.expect(parseSemverTriplet("codex-cli dev-build") == null);
+}
+
+test "review wait completion semantics stay bound to the recorded runtime" {
+    try std.testing.expectEqualStrings(
+        "codex-cli 0.145.0",
+        reviewAttemptRuntimeVersion("codex-cli 0.145.0", "codex-cli 0.144.0"),
+    );
+    try std.testing.expectEqualStrings(
+        "codex-cli 0.144.0",
+        reviewAttemptRuntimeVersion("codex-cli 0.144.0", "codex-cli 0.145.0"),
+    );
 }
 
 test "failureInfoForStatus flags missing terminal review result" {
