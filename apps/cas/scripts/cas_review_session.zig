@@ -994,6 +994,20 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .workflow_binding = workflow_binding,
         .developer_instructions = parsed.custom_instructions,
     };
+    if (codexReviewRequiresFreshParent(codex_version) and parsed.parent_thread_id != null) {
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "review/start",
+            "Codex 0.145 structured review attempts require a fresh CAS-owned thread",
+            cwd,
+            output_receipt,
+            .{
+                .code = "inline_review_parent_reuse_unsupported",
+                .hint = "omit --parent-thread-id and let CAS create one unique isolated thread for this attempt",
+            },
+        );
+    }
 
     var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io) catch |err| {
         try renderErrorAndExit(
@@ -1125,7 +1139,12 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     defer allocator.free(parent_thread_id);
     const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
     defer allocator.free(parent_event_log_path);
-    const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
+    const review_params_json = try buildReviewStartParamsJson(
+        allocator,
+        parent_thread_id,
+        target,
+        codex_version,
+    );
     defer allocator.free(review_params_json);
     appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
 
@@ -3736,16 +3755,32 @@ fn buildReviewStartParamsJson(
     allocator: std.mem.Allocator,
     parent_thread_id: []const u8,
     target: TargetConfig,
+    codex_version: []const u8,
 ) ![]u8 {
     const target_json = try buildTargetJson(allocator, target);
     defer allocator.free(target_json);
     const parent_thread_id_json = try quoteJsonStringAlloc(allocator, parent_thread_id);
     defer allocator.free(parent_thread_id_json);
+    const delivery = codexReviewDelivery(codex_version);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"threadId\":{s},\"delivery\":\"detached\",\"target\":{s}}}",
-        .{ parent_thread_id_json, target_json },
+        "{{\"threadId\":{s},\"delivery\":\"{s}\",\"target\":{s}}}",
+        .{ parent_thread_id_json, delivery, target_json },
     );
+}
+
+fn codexReviewDelivery(codex_version: []const u8) []const u8 {
+    const semver = parseSemverTriplet(codex_version) orelse return "detached";
+    // Codex 0.145 routes detached delivery through an ordinary review-agent
+    // turn, which emits prose but no exited_review_mode.review_output. CAS
+    // already owns an isolated parent thread, so native inline delivery keeps
+    // the attempt isolated while preserving Codex's structured review event.
+    if (semver.major > 0 or semver.minor >= 145) return "inline";
+    return "detached";
+}
+
+fn codexReviewRequiresFreshParent(codex_version: []const u8) bool {
+    return std.mem.eql(u8, codexReviewDelivery(codex_version), "inline");
 }
 
 fn buildTargetJson(allocator: std.mem.Allocator, target: TargetConfig) ![]u8 {
@@ -9590,6 +9625,56 @@ test "thread resume excludes turns only for Codex 0.145 and newer" {
     defer legacy_json.deinit();
     try std.testing.expect(legacy_json.value.object.get("excludeTurns") == null);
     try std.testing.expect(legacy_json.value.object.get("path") == null);
+}
+
+test "review start preserves structured output on Codex 0.145 and newer" {
+    const target = TargetConfig{
+        .kind = .base_branch,
+        .branch = "main",
+    };
+    const current = try buildReviewStartParamsJson(
+        std.testing.allocator,
+        "thr_isolated",
+        target,
+        "codex-cli 0.145.0",
+    );
+    defer std.testing.allocator.free(current);
+    var current_json = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        current,
+        .{},
+    );
+    defer current_json.deinit();
+    try std.testing.expectEqualStrings(
+        "inline",
+        current_json.value.object.get("delivery").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "thr_isolated",
+        current_json.value.object.get("threadId").?.string,
+    );
+
+    const legacy = try buildReviewStartParamsJson(
+        std.testing.allocator,
+        "thr_isolated",
+        target,
+        "codex-cli 0.144.6",
+    );
+    defer std.testing.allocator.free(legacy);
+    var legacy_json = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        legacy,
+        .{},
+    );
+    defer legacy_json.deinit();
+    try std.testing.expectEqualStrings(
+        "detached",
+        legacy_json.value.object.get("delivery").?.string,
+    );
+    try std.testing.expect(codexReviewRequiresFreshParent("codex-cli 0.145.0"));
+    try std.testing.expect(!codexReviewRequiresFreshParent("codex-cli 0.144.6"));
 }
 
 test "parseArgs captures parent mode and approvals" {
