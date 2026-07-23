@@ -10,12 +10,6 @@ on:
         description: Release tag to publish
         required: true
         type: string
-      qualification_run_id:
-        description: Optional trusted Auto Release run containing the exact-SHA Hylo receipt
-        required: false
-        default: ""
-        type: string
-
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
 
@@ -28,17 +22,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  hylo-qualification:
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/release-hylo-qualification.yml
-    with:
-      source_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
-      expected_sha: ${{ github.sha }}
-      expected_caller_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
-      qualification_run_id: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.qualification_run_id || '' }}
-
   release:
     strategy:
       fail-fast: false
@@ -67,87 +50,17 @@ jobs:
           version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
-      - name: Verify platform-gated CAS trial surface
+      - name: Verify removed CAS product stays absent
         shell: bash
         run: |
           set -euo pipefail
-          capabilities="$(./zig-out/bin/cas capabilities --json)"
-          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
-            for feature in \
-              hylo_trial_runner_v1 \
-              hylo_trial_runner_v2 \
-              hylo_fd_lane_lease_v1 \
-              hylo_signed_run_receipt_v1 \
-              hylo_signed_run_receipt_v2 \
-              hylo_private_lane_materialization_fd_v1 \
-              hylo_target_common_projection_opening_v1 \
-              hylo_private_receipt_redaction_v1 \
-              hylo_trial_route_projection_v1 \
-              hylo_internal_historical_replay_v1
-            do
-              if ! jq -e --arg feature "$feature" \
-                '.cas_capabilities.features[$feature] == true' \
-                <<<"$capabilities" >/dev/null
-              then
-                echo "macOS CAS capabilities missing ${feature}=true" >&2
-                exit 1
-              fi
-            done
-            trial_help="$(./zig-out/bin/cas_trial --help)"
-            for required_help in \
-              'compile-replay' \
-              '--source-profile-fd N' \
-              '--materialization-fd N' \
-              'hylo-trial/v2' \
-              'commitment-only hylo-run-receipt/v2' \
-              'materialization_claim_fingerprint' \
-              'compile-replay` is diagnostic-only' \
-              'hylo-target-common-projection-opening/v1 as target_common_projection_opening'
-            do
-              if ! grep -Fq -- "$required_help" <<<"$trial_help"; then
-                echo "macOS CAS trial help missing ${required_help}" >&2
-                exit 1
-              fi
-            done
-            ./zig-out/bin/cas_trial preflight \
-              --trial testdata/hctp-v1/valid-null-trial.json \
-              --lane-id lane-null-a0 --json > direct-preflight.json
-            jq -e '
-              .source_profile_kind == "direct" and
-              .compile_replay_required == false and
-              .replay_preparation_mode == "none" and
-              .source_kind == .source_profile_kind and
-              (has("historical_replay_required") | not) and
-              .source_profile_body_delivery == "none" and
-              .execution_route == "direct" and
-              .required_lineage == null
-            ' direct-preflight.json >/dev/null
-          else
-            for feature in \
-              hylo_trial_runner_v1 \
-              hylo_trial_runner_v2 \
-              hylo_fd_lane_lease_v1 \
-              hylo_signed_run_receipt_v1 \
-              hylo_signed_run_receipt_v2 \
-              hylo_private_lane_materialization_fd_v1 \
-              hylo_target_common_projection_opening_v1 \
-              hylo_private_receipt_redaction_v1 \
-              hylo_trial_route_projection_v1 \
-              hylo_internal_historical_replay_v1
-            do
-              if jq -e --arg feature "$feature" \
-                '.cas_capabilities.features | has($feature)' \
-                <<<"$capabilities" >/dev/null
-              then
-                echo "non-macOS CAS capabilities expose ${feature}" >&2
-                exit 1
-              fi
-            done
-            help="$(./zig-out/bin/cas --help)"
-            if grep -Fq -- 'trial' <<<"$help"; then
-              echo "non-macOS CAS help exposes the trial product" >&2
-              exit 1
-            fi
+          if ./zig-out/bin/cas trial --help >/dev/null 2>&1; then
+            echo "CAS dispatcher exposes removed trial route" >&2
+            exit 1
+          fi
+          if ./zig-out/bin/cas capabilities --json | grep -Eq '"hylo_|"hctp_'; then
+            echo "CAS capabilities expose removed product features" >&2
+            exit 1
           fi
       - name: Verify Linux dispatcher can launch its sibling executable
         if: matrix.target == 'linux-x86_64'
@@ -167,9 +80,6 @@ jobs:
           cp zig-out/bin/cas_review_session dist/cas/cas-review-session
           cp zig-out/bin/cas_session_inquiry dist/cas/cas_session_inquiry
           cp zig-out/bin/cas_session_inquiry dist/cas/cas-session-inquiry
-          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
-            cp zig-out/bin/cas_trial dist/cas/cas_trial
-          fi
           cp zig-out/bin/cas_conformance_suite dist/cas/cas_conformance_suite
           cp zig-out/bin/cas_conformance_suite dist/cas/cas-conformance-suite
           cp zig-out/bin/cas_goal dist/cas/cas_goal
@@ -187,7 +97,7 @@ jobs:
           overwrite: false
 
   publish:
-    needs: [release, hylo-qualification]
+    needs: release
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -206,7 +116,7 @@ jobs:
             echo "Expected 2 release archives, got ${count}" >&2
             exit 1
           fi
-      - name: Bind publication tag to qualified commit
+      - name: Bind publication tag to release commit
         shell: bash
         run: |
           set -euo pipefail
@@ -226,7 +136,7 @@ jobs:
             tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
           done
           if [ "${object_type}" != "commit" ] || [ "${tag_sha}" != "${GITHUB_SHA}" ]; then
-            echo "Release tag does not resolve to qualified commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
+            echo "Release tag does not resolve to release commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
             exit 1
           fi
       - name: Publish cas release assets

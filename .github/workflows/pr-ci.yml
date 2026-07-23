@@ -19,14 +19,16 @@ on:
       - "libs/durable_store/**"
       - "libs/execution_policy_core/**"
       - "libs/retrace_core/**"
-      - "testdata/hctp-v1/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
-      - ".github/workflows/hylo-published-operator-contract.yml"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
+
+concurrency:
+  group: pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -35,63 +37,51 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      seq: ${{ steps.filter.outputs.seq }}
-      lift: ${{ steps.filter.outputs.lift }}
-      cas: ${{ steps.filter.outputs.cas }}
-      cron: ${{ steps.filter.outputs.cron }}
-      ledger: ${{ steps.filter.outputs.ledger }}
-      memory_note: ${{ steps.filter.outputs.memory_note }}
-      img: ${{ steps.filter.outputs.img }}
-      core: ${{ steps.filter.outputs.core }}
+      seq: ${{ steps.classify.outputs.seq }}
+      lift: ${{ steps.classify.outputs.lift }}
+      cas: ${{ steps.classify.outputs.cas }}
+      cron: ${{ steps.classify.outputs.cron }}
+      ledger: ${{ steps.classify.outputs.ledger }}
+      memory_note: ${{ steps.classify.outputs.memory_note }}
+      img: ${{ steps.classify.outputs.img }}
+      perf: ${{ steps.classify.outputs.perf }}
     steps:
       - uses: actions/checkout@v4
-      - id: filter
-        uses: dorny/paths-filter@v3
         with:
-          filters: |
-            seq:
-              - "apps/seq/**"
-              - "libs/durable_store/**"
-              - "libs/execution_policy_core/**"
-              - "libs/retrace_core/**"
-              - "testdata/hctp-v1/**"
-            lift:
-              - "apps/lift/**"
-            cas:
-              - "apps/cas/**"
-              - "libs/durable_store/**"
-              - "libs/retrace_core/**"
-              - "testdata/hctp-v1/**"
-            cron:
-              - "apps/cron/**"
-            ledger:
-              - "apps/ledger/**"
-              - "apps/learnings/**"
-              - "apps/synesthesia/**"
-              - "libs/durable_store/**"
-              - "libs/retrace_core/**"
-              - "testdata/hctp-v1/**"
-            memory_note:
-              - "apps/memory-note/**"
-            img:
-              - "apps/img/**"
-            core:
-              - "build.zig"
-              - "build.zig.zon"
-              - "README.md"
-              - "libs/core/**"
-              - "libs/durable_store/**"
-              - ".github/scripts/**"
-              - ".github/workflows/pr-ci.yml"
-              - ".github/workflows/release-*.yml"
-              - ".github/workflows/auto-release.yml"
-              - ".github/workflows/hylo-published-operator-contract.yml"
-              - "scripts/perf/**"
-              - "docs/release/**"
+          fetch-depth: 0
+      - id: classify
+        name: Classify changed owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          declare -A selected=()
+          while IFS= read -r app; do
+            selected["$app"]=true
+          done < <(.github/scripts/release_apps.sh affected "$base" "$head")
+
+          changed_paths="$(git diff --name-only "$base" "$head")"
+          if grep -Fxq ".github/scripts/linux_fuzz_gate.sh" <<<"$changed_paths"; then
+            selected[seq]=true
+            selected[lift]=true
+            selected[cas]=true
+          fi
+
+          for app in seq lift cas cron ledger memory-note img; do
+            output_name="${app//-/_}"
+            echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
+          done
+
+          perf=false
+          if grep -Eq '^scripts/perf/' <<<"$changed_paths"; then
+            perf=true
+          fi
+          echo "perf=$perf" >> "$GITHUB_OUTPUT"
 
   install-prefix-guard:
     needs: changes
-    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.seq == 'true'
+    if: needs.changes.outputs.seq == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +141,7 @@ jobs:
 
   seq:
     needs: changes
-    if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.seq == 'true'
     runs-on: ubuntu-latest
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-global
@@ -184,7 +174,7 @@ jobs:
 
   seq-fuzz-linux:
     needs: changes
-    if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.seq == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -200,7 +190,7 @@ jobs:
 
   lift:
     needs: changes
-    if: needs.changes.outputs.lift == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.lift == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -214,7 +204,7 @@ jobs:
 
   lift-fuzz-linux:
     needs: changes
-    if: needs.changes.outputs.lift == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.lift == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -227,7 +217,7 @@ jobs:
 
   cas:
     needs: changes
-    if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.cas == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -262,23 +252,9 @@ jobs:
       - name: Test generic CAS surfaces
         run: zig build test-cas
 
-  cas-hctp-runtime-macos:
-    needs: changes
-    if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Test macOS CAS trial product and lifecycle laws
-        run: zig build test-cas-trial test-cas-trial-macos-runtime -j1 --summary all
-      - name: Test CAS archive verifier with macOS tar
-        run: .github/scripts/test_verify_cas_archive.sh
-
   cas-fuzz-linux:
     needs: changes
-    if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.cas == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -289,9 +265,21 @@ jobs:
       - name: Fuzz CAS budget governor (Linux)
         run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
 
+  perf-hub:
+    needs: changes
+    if: needs.changes.outputs.perf == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test performance hub
+        run: zig build test-perf-hub
+
   cron:
     needs: changes
-    if: needs.changes.outputs.cron == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.cron == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -305,7 +293,7 @@ jobs:
 
   ledger:
     needs: changes
-    if: needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.ledger == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -315,11 +303,11 @@ jobs:
       - name: Build ledger
         run: zig build build-ledger
       - name: Test generic ledger and portable validators
-        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia --summary all
+        run: zig build test-ledger test-learnings test-append-learning test-synesthesia --summary all
 
   memory-note:
     needs: changes
-    if: needs.changes.outputs.memory_note == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.memory_note == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -333,7 +321,7 @@ jobs:
 
   img:
     needs: changes
-    if: needs.changes.outputs.img == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.img == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

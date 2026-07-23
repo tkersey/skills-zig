@@ -1,7 +1,4 @@
-const builtin = @import("builtin");
 const std = @import("std");
-
-pub const HctpProductAvailable = builtin.os.tag == .macos;
 
 pub const Command = enum {
     skills_rank,
@@ -14,8 +11,6 @@ pub const Command = enum {
     skill_contract,
     skill_decision_receipt,
     decision_capsule,
-    hctp_source,
-    hylo_extract,
     skill_blocks,
     artifact_search,
     tool_audit,
@@ -86,8 +81,6 @@ pub const command_defs = [_]CommandDef{
     .{ .name = "skill-contract", .cmd = .skill_contract },
     .{ .name = "skill-decision-receipt", .cmd = .skill_decision_receipt },
     .{ .name = "decision-capsule", .cmd = .decision_capsule },
-    .{ .name = "hctp-source", .cmd = .hctp_source },
-    .{ .name = "hylo-extract", .cmd = .hylo_extract },
     .{ .name = "skill-blocks", .cmd = .skill_blocks },
     .{ .name = "artifact-search", .cmd = .artifact_search },
     .{ .name = "tool-audit", .cmd = .tool_audit },
@@ -150,11 +143,8 @@ pub fn parseCommand(arg: []const u8) Command {
     return .unknown;
 }
 
-pub fn commandAvailable(cmd: Command) bool {
-    return HctpProductAvailable or switch (cmd) {
-        .hctp_source, .hylo_extract => false,
-        else => true,
-    };
+pub fn commandAvailable(_: Command) bool {
+    return true;
 }
 
 pub fn isHelpArg(arg: []const u8) bool {
@@ -182,10 +172,4 @@ test "parseCommand recognizes full CLI surface" {
     try std.testing.expect(isHelpArg("--help"));
     try std.testing.expect(isHelpArg("-h"));
     try std.testing.expect(!isHelpArg("query"));
-}
-
-test "HCTP product commands share one macOS admission law" {
-    try std.testing.expectEqual(HctpProductAvailable, commandAvailable(.hctp_source));
-    try std.testing.expectEqual(HctpProductAvailable, commandAvailable(.hylo_extract));
-    try std.testing.expect(commandAvailable(.capabilities));
 }

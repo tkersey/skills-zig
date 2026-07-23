@@ -3,11 +3,6 @@ const actuation_cli = @import("actuation.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
-const hylo_cli = if (builtin.is_test) struct {
-    pub fn runWithArgv(_: std.mem.Allocator, _: std.Io, _: []const []const u8) !u8 {
-        return error.HyloDelegateUnavailableInLedgerTests;
-    }
-} else @import("hylo.zig");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 const synesthesia_cli = @import("synesthesia_cli");
@@ -15,7 +10,6 @@ const universalist_cli = @import("universalist.zig");
 const validation_cli = @import("validation.zig");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const HctpProductAvailable = builtin.os.tag == .macos;
 const LegacyStorePath = ".ledger/negative-ledger.jsonl";
 const DefaultStorePath = ".ledger/negative-ledger/events.jsonl";
 const MaxStoreBytes = 64 * 1024 * 1024;
@@ -75,10 +69,7 @@ const HelpText = std.fmt.comptimePrint(
     \\  -V, --version     Show version
 , .{
     "Materialize, validate, record, and project workflow artifacts, including Actuating evidence.",
-    if (HctpProductAvailable)
-        "Source namespace; use negative-ledger, actuation, hylo, learnings, synesthesia, or universalist"
-    else
-        "Source namespace; use negative-ledger, actuation, learnings, synesthesia, or universalist",
+    "Source namespace; use negative-ledger, actuation, learnings, synesthesia, or universalist",
 });
 
 const HelpSurface = core_cli.HelpSurface{
@@ -264,10 +255,6 @@ pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argvSource(argv)) |source| {
-        if (!sourceAvailable(source)) {
-            core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSource", source);
-            return;
-        }
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
         defer allocator.free(source_argv);
         if (std.mem.eql(u8, source, "negative-ledger")) {
@@ -284,11 +271,6 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, source, "actuation")) {
             const code = try actuation_cli.runWithArgv(allocator, init.io, source_argv);
-            if (code != 0) std.process.exit(code);
-            return;
-        }
-        if (HctpProductAvailable and std.mem.eql(u8, source, "hylo")) {
-            const code = try hylo_cli.runWithArgv(allocator, init.io, source_argv);
             if (code != 0) std.process.exit(code);
             return;
         }
@@ -335,10 +317,6 @@ fn argvSource(argv: []const []const u8) ?[]const u8 {
         return argv[i];
     }
     return null;
-}
-
-fn sourceAvailable(source: []const u8) bool {
-    return HctpProductAvailable or !std.mem.eql(u8, source, "hylo");
 }
 
 fn sourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8, source: []const u8) ![]const []const u8 {
@@ -3514,14 +3492,6 @@ test "universalist source routing preserves receipt emission arguments" {
     try std.testing.expectEqualStrings("--write-plan", routed[6]);
 }
 
-test "hylo source routing preserves replay commands" {
-    const argv = [_][]const u8{ "ledger", "--source", "hylo", "doctor", "--repo", "." };
-    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "hylo");
-    defer std.testing.allocator.free(routed);
-    try std.testing.expectEqualSlices([]const u8, &.{ "ledger", "doctor", "--repo", "." }, routed);
-    try std.testing.expectEqual(HctpProductAvailable, sourceAvailable("hylo"));
-}
-
 test "negative ledger source alias preserves root command arguments" {
     const argv = [_][]const u8{ "ledger", "export", "--source", "negative-ledger", "--file", ".ledger/custom.jsonl", "--id", "NEG-000001", "--format", "memory-note" };
     const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "negative-ledger");
@@ -3581,17 +3551,7 @@ test "ledger routine test graph includes owned source and validation modules" {
     std.testing.refAllDecls(validation_cli);
 }
 
-test "ledger routine tests fail closed at the Hylo delegate" {
-    try std.testing.expectError(
-        error.HyloDelegateUnavailableInLedgerTests,
-        hylo_cli.runWithArgv(std.testing.allocator, std.testing.io, &.{ "ledger", "hylo" }),
-    );
-}
-
-test "root help follows Hylo source admission" {
-    try std.testing.expectEqual(
-        HctpProductAvailable,
-        std.mem.indexOf(u8, HelpText, "actuation, hylo, learnings") != null,
-    );
+test "root help advertises owned source namespaces" {
+    try std.testing.expect(std.mem.indexOf(u8, HelpText, "actuation, learnings, synesthesia") != null);
     try std.testing.expect(std.mem.indexOf(u8, HelpText, "including Actuating evidence") != null);
 }

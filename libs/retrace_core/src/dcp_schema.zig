@@ -206,7 +206,7 @@ pub fn sourceEpisodeIdAlloc(
     return std.fmt.allocPrint(allocator, "session:{s}#turn:{s}", .{ session_id, turn_id });
 }
 
-/// Resolves the HCTP source-episode projection without mutating the DCP value.
+/// Resolves the source-episode projection without mutating the DCP value.
 /// Callers must validate the original packet (including its packet_id) before
 /// consuming this projection so released DCP-v2 bytes remain byte-faithful. A
 /// nonempty explicit identity is authoritative; display locators are used only

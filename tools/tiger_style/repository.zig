@@ -12,17 +12,12 @@ const SurfaceRule = struct {
 const surface_rules = [_]SurfaceRule{
     .{
         .token = "libs/retrace_core/**",
-        .pr_ci_occurrences = 4,
+        .pr_ci_occurrences = 1,
         .auto_release_occurrences = 1,
     },
     .{
         .token = "libs/execution_policy_core/**",
-        .pr_ci_occurrences = 2,
-        .auto_release_occurrences = 1,
-    },
-    .{
-        .token = "testdata/hctp-v1/**",
-        .pr_ci_occurrences = 4,
+        .pr_ci_occurrences = 1,
         .auto_release_occurrences = 1,
     },
 };
@@ -161,13 +156,11 @@ fn checkOccurrenceCount(
 
 test "surface rules preserve PR and release mappings" {
     const pr_ci =
-        "libs/retrace_core/**\n" ** 4 ++
-        "libs/execution_policy_core/**\n" ** 2 ++
-        "testdata/hctp-v1/**\n" ** 4;
+        "libs/retrace_core/**\n" ++
+        "libs/execution_policy_core/**\n";
     const auto_release =
         "libs/retrace_core/**\n" ++
-        "libs/execution_policy_core/**\n" ++
-        "testdata/hctp-v1/**\n";
+        "libs/execution_policy_core/**\n";
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
 
@@ -178,19 +171,16 @@ test "surface rules preserve PR and release mappings" {
         auto_release,
         &result,
     );
-    try std.testing.expectEqual(@as(u32, 6), result.checks);
+    try std.testing.expectEqual(@as(u32, 4), result.checks);
     try std.testing.expectEqual(@as(u32, 0), result.diagnostics);
 }
 
 test "surface rules reject an unpaired mapping" {
     const pr_ci =
-        "libs/retrace_core/**\n" ** 3 ++
-        "libs/execution_policy_core/**\n" ** 2 ++
-        "testdata/hctp-v1/**\n" ** 4;
+        "libs/execution_policy_core/**\n";
     const auto_release =
         "libs/retrace_core/**\n" ++
-        "libs/execution_policy_core/**\n" ++
-        "testdata/hctp-v1/**\n";
+        "libs/execution_policy_core/**\n";
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
 

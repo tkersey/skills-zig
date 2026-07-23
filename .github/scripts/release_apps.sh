@@ -57,7 +57,6 @@ case "$mode" in
     mark_retrace_core_consumers() {
       mark_app seq
       mark_app cas
-      mark_app ledger
     }
 
     mark_execution_policy_core_consumers() {
@@ -312,11 +311,6 @@ case "$mode" in
         libs/execution_policy_core/*)
           mark_execution_policy_core_consumers
           ;;
-        testdata/hctp-v1/*)
-          mark_app seq
-          mark_app cas
-          mark_app ledger
-          ;;
         .github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
@@ -333,11 +327,6 @@ case "$mode" in
           mark_app cron
           ;;
         .github/workflows/release-ledger.yml)
-          mark_app ledger
-          ;;
-        .github/workflows/release-hylo-qualification.yml)
-          mark_app seq
-          mark_app cas
           mark_app ledger
           ;;
         .github/workflows/release-memory-note.yml)

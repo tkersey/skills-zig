@@ -10,12 +10,6 @@ on:
         description: Release tag to publish
         required: true
         type: string
-      qualification_run_id:
-        description: Optional trusted Auto Release run containing the exact-SHA Hylo receipt
-        required: false
-        default: ""
-        type: string
-
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -29,17 +23,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  hylo-qualification:
-    permissions:
-      actions: read
-      contents: read
-    uses: ./.github/workflows/release-hylo-qualification.yml
-    with:
-      source_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
-      expected_sha: ${{ github.sha }}
-      expected_caller_ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag_name || github.ref_name }}
-      qualification_run_id: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.qualification_run_id || '' }}
-
   release:
     strategy:
       fail-fast: false
@@ -75,88 +58,18 @@ jobs:
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build ledger binary
         run: zig build build-ledger -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
-      - name: Verify portable and platform-gated Hylo surfaces
+      - name: Verify removed Ledger product stays absent
         shell: bash
         run: |
           set -euo pipefail
-          ./zig-out/bin/ledger validate hylo-trial \
-            --input testdata/hctp-v1/valid-trial.json > hylo-trial-validation.json
-          jq -e '
-            .schema == "ledger-validate-decision/v1" and
-            .contract == "hylo-trial" and
-            .verdict == "pass" and
-            .authority_granted == false and
-            .storage_mutated == false
-          ' hylo-trial-validation.json >/dev/null
-
-          if [ "${{ matrix.target }}" = "darwin-arm64" ]; then
-            help="$(./zig-out/bin/ledger --source hylo --help)"
-            for surface in \
-              compile-trial \
-              validate-trial \
-              register-trial \
-              start-lane \
-              commit-lane-start \
-              lane-materialization \
-              reveal-trial
-            do
-              if ! grep -Fq -- "$surface" <<<"$help"; then
-                echo "macOS Hylo help missing ${surface}" >&2
-                exit 1
-              fi
-            done
-            for protected_fd in \
-              '--custody-output-fd N' \
-              '--custody-input-fd N' \
-              '--materialization-output-fd N'
-            do
-              if ! grep -Fq -- "$protected_fd" <<<"$help"; then
-                echo "macOS Hylo help missing canonical protected FD: ${protected_fd}" >&2
-                exit 1
-              fi
-            done
-            for compatibility_fd in '--reveal-output-fd N' '--reveal-material-fd N'; do
-              if ! grep -Fq -- "$compatibility_fd" <<<"$help"; then
-                echo "macOS Hylo help missing compatibility FD: ${compatibility_fd}" >&2
-                exit 1
-              fi
-            done
-            capabilities="$(./zig-out/bin/ledger --source hylo capabilities)"
-            for feature in \
-              hylo_trial_v1 \
-              hylo_trial_v2 \
-              hylo_trial_compiler_v1 \
-              hylo_reveal_material_fd_v1 \
-              hylo_private_trial_custody_v1 \
-              hylo_trial_custody_fd_v1 \
-              hylo_private_lane_start_custody_fd_v1 \
-              hylo_trial_build_receipt_v2 \
-              hylo_lane_materialization_v1 \
-              hylo_lane_materialization_receipt_v2 \
-              hylo_trial_reveal_v1 \
-              hylo_trial_reveal_v2 \
-              hylo_run_receipt_v2
-            do
-              if ! jq -e --arg feature "$feature" \
-                '.schema == "hylo-capabilities/v1" and (.features | index($feature) != null)' \
-                <<<"$capabilities" >/dev/null
-              then
-                echo "macOS Hylo capabilities missing ${feature}" >&2
-                exit 1
-              fi
-            done
-          elif ./zig-out/bin/ledger --source hylo --help >/tmp/hylo-help 2>&1 || \
-            ./zig-out/bin/ledger --source hylo capabilities >/tmp/hylo-capabilities 2>&1
-          then
-            echo "non-macOS Ledger exposes the Hylo product source" >&2
+          if ./zig-out/bin/ledger --source hylo --help >/dev/null 2>&1; then
+            echo "Ledger exposes removed source namespace" >&2
             exit 1
           fi
-      - name: Exercise packaged Ledger trial compile and registration
-        if: matrix.target == 'darwin-arm64'
-        run: >-
-          zig build test-hylo-operator-recipe-ledger-release-runtime
-          -Dhylo-operator-ledger-path="${PWD}/zig-out/bin/ledger"
-          --summary all
+          if ./zig-out/bin/ledger validate hylo-trial --input /dev/null >/dev/null 2>&1; then
+            echo "Ledger exposes removed validation contract" >&2
+            exit 1
+          fi
       - name: Package ledger artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
@@ -173,7 +86,7 @@ jobs:
           overwrite: false
 
   publish:
-    needs: [release, hylo-qualification]
+    needs: release
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -213,7 +126,7 @@ jobs:
             tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
           done
           if [ "${object_type}" != "commit" ] || [ "${tag_sha}" != "${GITHUB_SHA}" ]; then
-            echo "Release tag does not resolve to qualified commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
+            echo "Release tag does not resolve to release commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
             exit 1
           fi
 
