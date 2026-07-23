@@ -81,7 +81,9 @@ const UsageText =
     \\  --version | version                 Show version.
 ;
 
-const InstalledBinarySet = "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, cas_session_inquiry, cas_conformance_suite, cas_goal";
+const InstalledBinarySet =
+    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
+    "cas_session_inquiry, cas_conformance_suite, cas_goal";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

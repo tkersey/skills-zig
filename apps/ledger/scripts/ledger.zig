@@ -3552,6 +3552,8 @@ test "ledger routine test graph includes owned source and validation modules" {
 }
 
 test "root help advertises owned source namespaces" {
-    try std.testing.expect(std.mem.indexOf(u8, HelpText, "actuation, learnings, synesthesia") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, HelpText, "actuation, learnings, synesthesia") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, HelpText, "including Actuating evidence") != null);
 }
