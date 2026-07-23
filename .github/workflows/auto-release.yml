@@ -97,8 +97,8 @@ jobs:
           fetch-depth: 0
       - name: Fetch tags
         run: git fetch --tags origin
-      - id: tag
-        name: Create release tag if needed
+      - id: release
+        name: Prepare release dispatch
         run: |
           set -euo pipefail
           app="${{ matrix.app }}"
@@ -112,6 +112,12 @@ jobs:
             exit 0
           fi
 
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+      - name: Create release tag for legacy workflows
+        if: steps.release.outputs.dispatch == 'true' && matrix.app != 'seq'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
             existing_sha="$(git rev-list -n 1 "$tag")"
             if [ "$existing_sha" != "${GITHUB_SHA}" ]; then
@@ -124,15 +130,23 @@ jobs:
             git tag "$tag" "${GITHUB_SHA}"
             git push origin "refs/tags/$tag"
           fi
-
-          echo "dispatch=true" >> "$GITHUB_OUTPUT"
       - name: Dispatch release workflow
-        if: steps.tag.outputs.dispatch == 'true'
+        if: steps.release.outputs.dispatch == 'true'
         run: |
           set -euo pipefail
-          workflow_args=(
-            --repo "$GITHUB_REPOSITORY"
-            --ref "${{ steps.tag.outputs.tag }}"
-            -f "tag_name=${{ steps.tag.outputs.tag }}"
-          )
+          if [ "${{ matrix.app }}" = "seq" ]; then
+            echo "Seq tag creation is deferred until qualification succeeds."
+            workflow_args=(
+              --repo "$GITHUB_REPOSITORY"
+              --ref "${GITHUB_REF_NAME}"
+              -f "tag_name=${{ steps.release.outputs.tag }}"
+              -f "commit_sha=${GITHUB_SHA}"
+            )
+          else
+            workflow_args=(
+              --repo "$GITHUB_REPOSITORY"
+              --ref "${{ steps.release.outputs.tag }}"
+              -f "tag_name=${{ steps.release.outputs.tag }}"
+            )
+          fi
           gh workflow run "release-${{ matrix.app }}.yml" "${workflow_args[@]}"

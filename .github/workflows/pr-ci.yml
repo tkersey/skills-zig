@@ -113,6 +113,10 @@ jobs:
           fetch-depth: 0
       - name: Test release app classifier
         run: .github/scripts/test_release_apps.sh
+      - name: Test Seq CI proof matrix
+        run: .github/scripts/test_seq_ci_job.sh
+      - name: Test Seq qualify-before-tag release transaction
+        run: .github/scripts/test_seq_release_transaction.sh
       - name: Test CAS archive verifier
         run: .github/scripts/test_verify_cas_archive.sh
       - name: Require VERSION bumps for release-relevant CLI changes
@@ -159,20 +163,14 @@ jobs:
           key: zig-seq-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', '.github/workflows/pr-ci.yml') }}
           restore-keys: |
             zig-seq-${{ runner.os }}-0.16.0-
-      - name: Build seq
-        run: zig build build-seq -Doptimize=ReleaseFast --summary all
-      - name: Build standalone seq release surface
-        working-directory: apps/seq
-        run: zig build -Doptimize=ReleaseFast --summary all
-      - name: Build standalone seq
-        working-directory: apps/seq
-        run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
+      - name: Build seq integration surface
+        run: zig build build-seq -Doptimize=Debug --summary all
       - name: Test seq
         run: zig build test-seq --summary all
       - name: Test Retrace core contracts
         run: zig build test-retrace-core --summary all
       - name: Verify non-macOS seq command and capability admission
-        run: apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
+        run: apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq
 
   seq-fuzz-linux:
     needs: changes

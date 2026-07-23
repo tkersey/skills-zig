@@ -10,8 +10,14 @@ on:
         description: Release tag to publish
         required: true
         type: string
+      commit_sha:
+        description: Exact commit to qualify before creating a missing tag
+        required: false
+        type: string
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  REQUESTED_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || '' }}
+  RELEASE_COMMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.commit_sha || github.sha }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
@@ -40,7 +46,25 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.RELEASE_COMMIT }}
+      - name: Validate immutable release commit
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] &&
+             [ "${GITHUB_REF_TYPE}" != "tag" ] &&
+             [ -z "${REQUESTED_COMMIT}" ]; then
+            echo "A branch-based Seq release dispatch requires commit_sha." >&2
+            exit 1
+          fi
+          if [[ ! "${RELEASE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release commit must be a full immutable SHA: ${RELEASE_COMMIT}" >&2
+            exit 1
+          fi
+          checkout_sha="$(git rev-parse HEAD)"
+          if [ "${checkout_sha}" != "${RELEASE_COMMIT}" ]; then
+            echo "Checked out ${checkout_sha}, expected ${RELEASE_COMMIT}" >&2
+            exit 1
+          fi
       - name: Validate tag matches apps/seq/VERSION
         run: |
           version="$(tr -d '[:space:]' < apps/seq/VERSION)"
@@ -101,10 +125,19 @@ jobs:
             echo "Expected 2 release archives, got ${count}" >&2
             exit 1
           fi
-      - name: Publish seq release assets
+      - name: Create or verify qualified Seq release tag
         run: |
           set -euo pipefail
-          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+
+          if ! ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" 2>/dev/null)"; then
+            gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${RELEASE_TAG}" \
+              -f "sha=${RELEASE_COMMIT}" >/dev/null
+            ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          fi
+
           object_type="$(jq -r '.object.type' <<<"${ref_json}")"
           tag_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
           for _ in 1 2 3 4; do
@@ -119,11 +152,13 @@ jobs:
             object_type="$(jq -r '.object.type' <<<"${tag_json}")"
             tag_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
           done
-          if [ "${object_type}" != "commit" ] || [ "${tag_sha}" != "${GITHUB_SHA}" ]; then
-            echo "Release tag does not resolve to release commit ${GITHUB_SHA}: ${object_type} ${tag_sha}" >&2
+          if [ "${object_type}" != "commit" ] || [ "${tag_sha}" != "${RELEASE_COMMIT}" ]; then
+            echo "Release tag does not resolve to qualified commit ${RELEASE_COMMIT}: ${object_type} ${tag_sha}" >&2
             exit 1
           fi
-
+      - name: Publish seq release assets
+        run: |
+          set -euo pipefail
           mapfile -d '' assets < <(find release-assets -type f -name '*.tar.gz' -print0 | sort -z)
           if gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
