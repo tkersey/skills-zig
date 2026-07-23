@@ -534,12 +534,21 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     };
 }
 
-fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8, args: Args, codex_home: []const u8) !void {
+fn cmdDoctor(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    args: Args,
+    codex_home: []const u8,
+) !void {
     const path = try resolveJsonlPathAlloc(allocator, repo_root, args.path);
     defer allocator.free(path);
     var persistence = durable_store.PersistentEventStore.init(path);
     var fold = SynesthesiaDoctorFold{ .allocator = allocator };
-    var summary = persistence.eventStore().scan(allocator, MaxStoreBytes, fold.visitor()) catch |err| {
+    var summary = persistence.eventStore().scan(
+        allocator,
+        MaxStoreBytes,
+        fold.visitor(),
+    ) catch |err| {
         try printDoctorJson(allocator, "invalid", path, 0, @errorName(err));
         return;
     };

@@ -1949,8 +1949,16 @@ fn scanJsonlEventStore(
     max_bytes: usize,
     visitor: EventRecordVisitor,
 ) !EventScanSummary {
-    const stat = std.Io.Dir.cwd().statFile(Io.io(), logical_ref, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return emptyEventScanSummary(allocator, logical_ref, false),
+    const stat = std.Io.Dir.cwd().statFile(
+        Io.io(),
+        logical_ref,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return emptyEventScanSummary(
+            allocator,
+            logical_ref,
+            false,
+        ),
         else => return err,
     };
     if (stat.kind == .sym_link) return error.SymlinkComponent;
@@ -1958,9 +1966,17 @@ fn scanJsonlEventStore(
     if (stat.size > max_bytes) return error.FileTooBig;
 
     var file = if (std.fs.path.isAbsolute(logical_ref))
-        try std.Io.Dir.openFileAbsolute(Io.io(), logical_ref, .{ .allow_directory = false, .follow_symlinks = false })
+        try std.Io.Dir.openFileAbsolute(
+            Io.io(),
+            logical_ref,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        )
     else
-        try std.Io.Dir.cwd().openFile(Io.io(), logical_ref, .{ .allow_directory = false, .follow_symlinks = false });
+        try std.Io.Dir.cwd().openFile(
+            Io.io(),
+            logical_ref,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(Io.io());
 
     var raw_hash = EventHash.init(.{});
@@ -1969,7 +1985,10 @@ fn scanJsonlEventStore(
     var reader = file.reader(Io.io(), &.{});
     var stream = try jsonl_core.Stream.init(allocator, &reader.interface, .{
         .max_line_bytes = @max(max_bytes, 1),
-        .chunk_observer = .{ .context = &raw_observer, .observeFn = RawHashObserver.observe },
+        .chunk_observer = .{
+            .context = &raw_observer,
+            .observeFn = RawHashObserver.observe,
+        },
     });
     defer stream.deinit();
 
@@ -2011,7 +2030,11 @@ fn scanMemoryEventStore(
 ) !EventScanSummary {
     var extent_bytes: usize = 0;
     for (store.records.items) |payload| {
-        extent_bytes = std.math.add(usize, extent_bytes, payload.len + 1) catch return error.StreamTooLong;
+        extent_bytes = std.math.add(
+            usize,
+            extent_bytes,
+            payload.len + 1,
+        ) catch return error.StreamTooLong;
         if (extent_bytes > max_bytes) return error.StreamTooLong;
     }
 
@@ -2441,7 +2464,12 @@ pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []c
     try writeTempAndRename(&dir, tmp_name, base, text);
 }
 
-fn writeTempAndRename(dir: *std.Io.Dir, tmp_name: []const u8, base: []const u8, text: []const u8) !void {
+fn writeTempAndRename(
+    dir: *std.Io.Dir,
+    tmp_name: []const u8,
+    base: []const u8,
+    text: []const u8,
+) !void {
     var file = try dir.createFile(Io.io(), tmp_name, .{ .truncate = true, .read = true });
     var close_file = true;
     errdefer if (close_file) file.close(Io.io());
@@ -2461,15 +2489,27 @@ pub fn appendLineAtomic(
 ) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
-    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+    if (parent.len == 0 or
+        base.len == 0 or
+        std.mem.eql(u8, base, ".") or
+        std.mem.eql(u8, base, ".."))
+    {
         return error.InvalidPath;
     }
     try ensureDirectoryPathNoSymlinks(parent);
 
     var dir = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{ .follow_symlinks = false })
+        try std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        )
     else
-        try std.Io.Dir.cwd().openDir(Io.io(), parent, .{ .follow_symlinks = false });
+        try std.Io.Dir.cwd().openDir(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        );
     defer dir.close(Io.io());
 
     var source: ?std.Io.File = dir.openFile(Io.io(), base, .{
@@ -2500,13 +2540,17 @@ pub fn appendLineAtomic(
     });
     var destination_open = true;
     errdefer if (destination_open) destination.close(Io.io());
-    errdefer dir.deleteFile(Io.io(), tmp_name) catch {};
+    // Preserve the primary append error; temp-file cleanup is best effort.
+    errdefer dir.deleteFile(Io.io(), tmp_name) catch |cleanup_error| switch (cleanup_error) {
+        error.FileNotFound => {},
+        else => {},
+    };
 
     var last_byte: ?u8 = null;
     if (source) |*file| {
         var reader = file.reader(Io.io(), &.{});
         var buffer: [jsonl_core.chunk_size]u8 = undefined;
-        while (true) {
+        while (true) { // tiger: event-loop -- bounded by source EOF.
             const read = try reader.interface.readSliceShort(&buffer);
             if (read == 0) break;
             try destination.writeStreamingAll(Io.io(), buffer[0..read]);

@@ -4,7 +4,9 @@ const durable_store = @import("durable_store");
 const Io = std.Io.Threaded.global_single_threaded;
 const default_fixture_bytes: usize = 60 * 1024 * 1024;
 const rounds: usize = 3;
-const fixture_line = "{\"schema\":\"event/v1\",\"sequence\":1,\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}\n";
+const fixture_line =
+    "{\"schema\":\"event/v1\",\"sequence\":1," ++
+    "\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}\n";
 
 const Cli = struct {
     fixture_bytes: usize = default_fixture_bytes,
@@ -23,6 +25,15 @@ const Round = struct {
     elapsed_ns: u64,
     peak_live_bytes: u64,
     record_count: usize,
+};
+
+const Measurements = struct {
+    actual_bytes: usize,
+    record_count: usize,
+    scan_elapsed_ns: u64,
+    scan_peak_live_bytes: u64,
+    append_elapsed_ns: u64,
+    append_peak_live_bytes: u64,
 };
 
 const PeakAllocator = struct {
@@ -55,7 +66,12 @@ const PeakAllocator = struct {
         self.live_bytes -= @intCast(bytes);
     }
 
-    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
         const self: *PeakAllocator = @ptrCast(@alignCast(context));
         const memory = self.child.rawAlloc(len, alignment, return_address) orelse return null;
         self.addLive(len);
@@ -87,7 +103,12 @@ const PeakAllocator = struct {
         return_address: usize,
     ) ?[*]u8 {
         const self: *PeakAllocator = @ptrCast(@alignCast(context));
-        const result = self.child.rawRemap(memory, alignment, new_len, return_address) orelse return null;
+        const result = self.child.rawRemap(
+            memory,
+            alignment,
+            new_len,
+            return_address,
+        ) orelse return null;
         if (new_len >= memory.len) {
             self.addLive(new_len - memory.len);
         } else {
@@ -120,17 +141,34 @@ pub fn main(init: std.process.Init) !void {
     );
     defer allocator.free(fixture_dir);
     try std.Io.Dir.cwd().createDirPath(Io.io(), fixture_dir);
-    defer std.Io.Dir.cwd().deleteTree(Io.io(), fixture_dir) catch {};
+    defer cleanupFixture(fixture_dir);
 
-    const fixture_path = try std.fs.path.join(allocator, &.{ fixture_dir, "events.jsonl" });
+    const fixture_path = try std.fs.path.join(
+        allocator,
+        &.{ fixture_dir, "events.jsonl" },
+    );
     defer allocator.free(fixture_path);
-    const actual_bytes = try writeFixture(fixture_path, cli.fixture_bytes);
+    const measurements = try measureFixture(fixture_path, cli.fixture_bytes);
+    try writeReport(allocator, cli, measurements);
+}
+
+fn cleanupFixture(path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(Io.io(), path) catch |err| {
+        std.debug.print(
+            "durable-store performance fixture cleanup failed: {s}\n",
+            .{@errorName(err)},
+        );
+    };
+}
+
+fn measureFixture(fixture_path: []const u8, fixture_bytes: usize) !Measurements {
+    const actual_bytes = try writeFixture(fixture_path, fixture_bytes);
 
     var samples: [rounds]Round = undefined;
     for (&samples) |*sample| sample.* = try measureScan(fixture_path, actual_bytes);
     var append_samples: [rounds]Round = undefined;
     for (&append_samples) |*sample| {
-        _ = try writeFixture(fixture_path, cli.fixture_bytes);
+        _ = try writeFixture(fixture_path, fixture_bytes);
         sample.* = try measureAppend(fixture_path, actual_bytes);
     }
 
@@ -149,53 +187,114 @@ pub fn main(init: std.process.Init) !void {
     std.mem.sort(u64, &append_elapsed, {}, comptime std.sort.asc(u64));
     std.mem.sort(u64, &append_peaks, {}, comptime std.sort.asc(u64));
 
+    return .{
+        .actual_bytes = actual_bytes,
+        .record_count = samples[0].record_count,
+        .scan_elapsed_ns = elapsed[rounds / 2],
+        .scan_peak_live_bytes = peaks[rounds / 2],
+        .append_elapsed_ns = append_elapsed[rounds / 2],
+        .append_peak_live_bytes = append_peaks[rounds / 2],
+    };
+}
+
+fn writeReport(
+    allocator: std.mem.Allocator,
+    cli: Cli,
+    measurements: Measurements,
+) !void {
     var stdout_writer = std.Io.File.stdout().writer(Io.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (cli.baseline_path) |baseline_path| {
-        const baseline = try loadBaseline(allocator, baseline_path);
-        const scan_alloc_reduction = reductionPct(baseline.scan_peak_live_bytes, peaks[rounds / 2]);
-        const append_alloc_reduction = reductionPct(baseline.append_peak_live_bytes, append_peaks[rounds / 2]);
-        const scan_latency_regression = regressionPct(baseline.scan_elapsed_ns, elapsed[rounds / 2]);
-        const append_latency_regression = regressionPct(baseline.append_elapsed_ns, append_elapsed[rounds / 2]);
-        const passed = scan_alloc_reduction >= 80.0 and
-            append_alloc_reduction >= 80.0 and
-            scan_latency_regression <= 5.0 and
-            append_latency_regression <= 10.0;
-        try stdout.print(
-            "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\",\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d},\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d},\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d},\"scan_alloc_reduction_pct\":{d:.2},\"append_alloc_reduction_pct\":{d:.2},\"scan_latency_regression_pct\":{d:.2},\"append_latency_regression_pct\":{d:.2},\"status\":\"{s}\",\"strict\":{s}}}\n",
-            .{
-                actual_bytes,
-                samples[0].record_count,
-                rounds,
-                elapsed[rounds / 2],
-                peaks[rounds / 2],
-                append_elapsed[rounds / 2],
-                append_peaks[rounds / 2],
-                scan_alloc_reduction,
-                append_alloc_reduction,
-                scan_latency_regression,
-                append_latency_regression,
-                if (passed) "pass" else "fail",
-                if (cli.strict) "true" else "false",
-            },
-        );
-        if (cli.strict and !passed) return error.PerformanceRegression;
+        try writeMeasuredReport(allocator, stdout, baseline_path, cli, measurements);
     } else {
-        try stdout.print(
-            "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\",\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d},\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d},\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d},\"status\":\"unmeasured\",\"strict\":{s}}}\n",
-            .{
-                actual_bytes,
-                samples[0].record_count,
-                rounds,
-                elapsed[rounds / 2],
-                peaks[rounds / 2],
-                append_elapsed[rounds / 2],
-                append_peaks[rounds / 2],
-                if (cli.strict) "true" else "false",
-            },
-        );
-        if (cli.strict) return error.MissingBaseline;
+        try writeUnmeasuredReport(stdout, cli, measurements);
     }
+}
+
+fn writeMeasuredReport(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    baseline_path: []const u8,
+    cli: Cli,
+    measurements: Measurements,
+) !void {
+    const baseline = try loadBaseline(allocator, baseline_path);
+    const scan_alloc_reduction = reductionPct(
+        baseline.scan_peak_live_bytes,
+        measurements.scan_peak_live_bytes,
+    );
+    const append_alloc_reduction = reductionPct(
+        baseline.append_peak_live_bytes,
+        measurements.append_peak_live_bytes,
+    );
+    const scan_latency_regression = regressionPct(
+        baseline.scan_elapsed_ns,
+        measurements.scan_elapsed_ns,
+    );
+    const append_latency_regression = regressionPct(
+        baseline.append_elapsed_ns,
+        measurements.append_elapsed_ns,
+    );
+    const passed = scan_alloc_reduction >= 80.0 and
+        append_alloc_reduction >= 80.0 and
+        scan_latency_regression <= 5.0 and
+        append_latency_regression <= 10.0;
+    const measured_format =
+        "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
+        "\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d}," ++
+        "\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d}," ++
+        "\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d}," ++
+        "\"scan_alloc_reduction_pct\":{d:.2}," ++
+        "\"append_alloc_reduction_pct\":{d:.2}," ++
+        "\"scan_latency_regression_pct\":{d:.2}," ++
+        "\"append_latency_regression_pct\":{d:.2}," ++
+        "\"status\":\"{s}\",\"strict\":{s}}}\n";
+    try stdout.print(
+        measured_format,
+        .{
+            measurements.actual_bytes,
+            measurements.record_count,
+            rounds,
+            measurements.scan_elapsed_ns,
+            measurements.scan_peak_live_bytes,
+            measurements.append_elapsed_ns,
+            measurements.append_peak_live_bytes,
+            scan_alloc_reduction,
+            append_alloc_reduction,
+            scan_latency_regression,
+            append_latency_regression,
+            if (passed) "pass" else "fail",
+            if (cli.strict) "true" else "false",
+        },
+    );
+    if (cli.strict and !passed) return error.PerformanceRegression;
+}
+
+fn writeUnmeasuredReport(
+    stdout: *std.Io.Writer,
+    cli: Cli,
+    measurements: Measurements,
+) !void {
+    const unmeasured_format =
+        "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
+        "\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d}," ++
+        "\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d}," ++
+        "\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d}," ++
+        "\"status\":\"unmeasured\",\"strict\":{s}}}\n";
+    try stdout.print(
+        unmeasured_format,
+        .{
+            measurements.actual_bytes,
+            measurements.record_count,
+            rounds,
+            measurements.scan_elapsed_ns,
+            measurements.scan_peak_live_bytes,
+            measurements.append_elapsed_ns,
+            measurements.append_peak_live_bytes,
+            if (cli.strict) "true" else "false",
+        },
+    );
+    if (cli.strict) return error.MissingBaseline;
 }
 
 fn parseCli(argv: []const []const u8) !Cli {
@@ -287,7 +386,12 @@ fn measureAppend(path: []const u8, fixture_bytes: usize) !Round {
 }
 
 fn loadBaseline(allocator: std.mem.Allocator, path: []const u8) !Baseline {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(Io.io(), path, allocator, .limited(1024 * 1024));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        Io.io(),
+        path,
+        allocator,
+        .limited(1024 * 1024),
+    );
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
