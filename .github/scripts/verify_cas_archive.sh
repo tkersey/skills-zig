@@ -44,9 +44,6 @@ expected_members=(
   cas-goal
   cas-perf-budget-governor
 )
-if [[ "$target" == "darwin-arm64" ]]; then
-  expected_members+=(cas_trial)
-fi
 
 expected_normalized="$scratch/expected-normalized"
 actual_normalized="$scratch/actual-normalized"
@@ -113,9 +110,6 @@ dispatch_cases=(
   session_inquiry:cas_session_inquiry
   smoke_check:cas_smoke_check
 )
-if [[ "$target" == "darwin-arm64" ]]; then
-  dispatch_cases+=(trial:cas_trial)
-fi
 
 for dispatch_case in "${dispatch_cases[@]}"; do
   subcommand="${dispatch_case%%:*}"
@@ -135,8 +129,8 @@ for dispatch_case in "${dispatch_cases[@]}"; do
   fi
 done
 
-if [[ "$target" == "linux-x86_64" ]] && "$payload_dir/cas" trial --help >/dev/null 2>&1; then
-  echo "non-Darwin packaged CAS dispatcher exposes the trial product" >&2
+if "$payload_dir/cas" trial --help >/dev/null 2>&1; then
+  echo "packaged CAS dispatcher exposes a removed subcommand" >&2
   exit 1
 fi
 

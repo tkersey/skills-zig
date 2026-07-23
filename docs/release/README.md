@@ -30,11 +30,10 @@ Release contract:
    - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
    - `libs/durable_store/**` counts for its shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
    - `libs/execution_policy_core/**` counts for its shipped consumer: `seq`.
-   - `libs/retrace_core/**` and `testdata/hctp-v1/**` count for the HCTP consumers: `seq`, `cas`, and `ledger`.
+   - `libs/retrace_core/**` counts for its shipped consumers: `seq` and `cas`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
-   - `.github/workflows/release-hylo-qualification.yml` counts for `seq`, `cas`, and `ledger` because it gates their publication authority.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
-3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` runs one full Hylo qualification for the exact commit if a Seq, CAS, or Ledger version changed. It then creates any missing tags and dispatches the matching release workflows with the exact-SHA qualification receipt. Direct tag and manual release runs perform the same qualification when no trusted Auto Release receipt is supplied. A manual release dispatch must select the release tag as its workflow ref and pass the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`; a dispatch from `main` fails closed.
+3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows. A manual release dispatch must select the release tag as its workflow ref and pass the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`; a dispatch from `main` fails closed.
 4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
 5. Generic release builds must declare their target architecture and use Zig's baseline CPU. Build-time dependencies carried by a release binary must be content-addressed rather than inherited from the build runner. Seq's release workflow must also initialize Zig 0.16's ZIP package-cache directory before a clean-runner fetch.
 
@@ -69,30 +68,6 @@ Examples:
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
 - `img-v0.1.0-linux-x86_64.tar.gz`
 - `img-v0.1.0-darwin-arm64.tar.gz`
-
-HCTP/CRF runtime commands are macOS-only. The CAS release therefore packages
-`cas_trial` only in its Darwin archive; the other CAS archive retains the
-unrelated generic CAS binaries. Seq and Ledger keep both generic release
-archives, but their non-Darwin binaries do not advertise or route HCTP/CRF
-product commands. Stateless `ledger validate hylo-*` schema validation remains
-pure and does not grant runtime authority.
-
-Full Hylo qualification is also available on a weekly schedule and through
-manual dispatch of `.github/workflows/release-hylo-qualification.yml`. Those
-advisory runs produce exact-SHA receipts but grant no publication authority.
-Publication qualification runs three build-owned shards on isolated macOS
-runners: core, memory, and persistent. The core retains contract,
-portable Section 36, integration, and operator proof. The manifest-backed
-memory and persistent runners uniquely own all 17 EventStore cases, so core
-does not repeat their expensive owner tests. Each runner keeps Zig at
-`-j2` and compiles the identical proof graph in `ReleaseSafe`, whose optimized
-code retains Zig runtime-safety traps and assertions. Qualification shards
-intentionally have no wall-clock deadline: their durations are measured as
-operational observations, while publication is gated only by the natural proof
-result. The workflow emits a successful receipt only after every shard passes
-on the same exact commit. The canonical local fallback remains
-`zig build test-hylo -Doptimize=ReleaseSafe -j2 --summary all`, whose dependency
-graph is the union of those three shards.
 
 ## Homebrew Tap Handoff
 
@@ -134,8 +109,8 @@ curl -fsSL https://www.githubstatus.com/api/v2/components.json \
 If GitHub Actions is degraded/outage and tag runs remain queued, publish manually so tap
 propagation is not blocked:
 
-1. On a clean macOS checkout of the exact release tag, run `zig build test-hylo -j2 --summary all` and retain the successful command output with the tag commit SHA.
-2. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`), preserving the Darwin-only `cas_trial` payload rule.
+1. On a clean checkout of the exact release tag, run the affected CLI's build and test lanes and retain the successful command output with the tag commit SHA.
+2. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`).
 3. Create the release directly on the existing tag:
    - `gh release create <tag> <asset1> <asset2> --verify-tag`
 4. Update `homebrew-tap` formula version + SHA256 from the published assets.

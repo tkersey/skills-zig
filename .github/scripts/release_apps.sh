@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <affected|version-changed> <base> <head>" >&2
+  echo "usage: $0 <affected|ci-affected|version-changed> <base> <head>" >&2
   exit 1
 fi
 
@@ -33,7 +33,7 @@ base="$(resolve_ref "$base_ref")"
 head="$(resolve_ref "$head_ref")"
 
 case "$mode" in
-  affected)
+  affected|ci-affected)
     declare -A affected=()
 
     mark_app() {
@@ -57,7 +57,6 @@ case "$mode" in
     mark_retrace_core_consumers() {
       mark_app seq
       mark_app cas
-      mark_app ledger
     }
 
     mark_execution_policy_core_consumers() {
@@ -312,11 +311,6 @@ case "$mode" in
         libs/execution_policy_core/*)
           mark_execution_policy_core_consumers
           ;;
-        testdata/hctp-v1/*)
-          mark_app seq
-          mark_app cas
-          mark_app ledger
-          ;;
         .github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas
           ;;
@@ -333,11 +327,6 @@ case "$mode" in
           mark_app cron
           ;;
         .github/workflows/release-ledger.yml)
-          mark_app ledger
-          ;;
-        .github/workflows/release-hylo-qualification.yml)
-          mark_app seq
-          mark_app cas
           mark_app ledger
           ;;
         .github/workflows/release-memory-note.yml)
@@ -381,6 +370,16 @@ case "$mode" in
           ;;
       esac
     done < <(git diff --name-only "$base" "$head")
+
+    if [[ "$mode" == "ci-affected" ]]; then
+      while IFS= read -r path; do
+        case "$path" in
+          .github/workflows/pr-ci.yml|.github/scripts/*)
+            mark_all
+            ;;
+        esac
+      done < <(git diff --name-only "$base" "$head")
+    fi
 
     for app in "${apps[@]}"; do
       if [[ -n "${affected[$app]:-}" ]]; then

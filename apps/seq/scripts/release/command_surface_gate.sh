@@ -21,16 +21,7 @@ if [[ ! -x "$BIN_PATH" ]]; then
   exit 1
 fi
 
-platform="$(uname -s)"
-hctp_product_available=false
-if [[ "$platform" == "Darwin" ]]; then
-  hctp_product_available=true
-fi
-
 expected="$(grep -E '\.name = "' "$SRC_LIB" | sed -E 's/.*\.name = "([^"]+)".*/\1/' | sort)"
-if [[ "$hctp_product_available" != true ]]; then
-  expected="$(printf '%s\n' "$expected" | grep -Ev '^(hctp-source|hylo-extract)$')"
-fi
 help_output="$("$BIN_PATH" --help)"
 actual="$(printf '%s\n' "$help_output" | sed -n 's/^- //p' | sort)"
 
@@ -200,88 +191,18 @@ if ! "$BIN_PATH" execution-policy-audit --help | matches_ere '--policy-root <pat
   exit 1
 fi
 capabilities_json="$("$BIN_PATH" capabilities --format json)"
-if [[ "$hctp_product_available" == true ]]; then
-  for cmd in hctp-source hylo-extract; do
-    if ! printf '%s\n' "$help_output" | matches_ere "^- ${cmd}$"; then
-      echo "required macOS HCTP command missing: ${cmd}" >&2
-      exit 1
-    fi
-  done
-  for feature in \
-    hctp_source_selection_v1 \
-    hctp_source_route_admission_v1 \
-    hctp_independence_clusters_v1 \
-    hctp_sealed_case_v1 \
-    hctp_materializer_v1 \
-    hctp_source_materialization_v1 \
-    hctp_source_selection_opening_fd_v1 \
-    hctp_historical_profile_v1 \
-    hctp_case_blind_source_profile_fd_v1 \
-    hylo_extract_v1
-  do
-    if ! printf '%s\n' "$capabilities_json" | matches_ere "\"${feature}\": true"; then
-      echo "macOS capabilities missing ${feature}=true" >&2
-      exit 1
-    fi
-  done
-  hctp_source_help="$("$BIN_PATH" hctp-source --help)"
-  for flag in \
-    '--manifest-fd N' \
-    '--source-signing-seed-fd N' \
-    '--sealed-dir DIR' \
-    '--seal-key-output-fd N' \
-    '--seal-key-fd N' \
-    '--visible-output-fd N' \
-    '--source-profile-output-fd N' \
-    '--source-selection-opening-fd N' \
-    '--signing-seed-fd N'
-  do
-    if ! printf '%s\n' "$hctp_source_help" | matches_ere "$flag"; then
-      echo "hctp-source help missing protected compile/materialize flag: ${flag}" >&2
-      exit 1
-    fi
-  done
-  if ! printf '%s\n' "$hctp_source_help" | matches_ere 'hylo-source-selection-opening/v1'; then
-    echo "hctp-source help missing the v2 protected source-selection opening contract" >&2
+for removed_command in hctp-source hylo-extract; do
+  if printf '%s\n' "$help_output" | matches_ere "^- ${removed_command}$"; then
+    echo "command surface exposes removed command: ${removed_command}" >&2
     exit 1
   fi
-  hylo_extract_help="$("$BIN_PATH" hylo-extract --help)"
-  for flag in \
-    '--target-root DIR' \
-    '--output-root DIR' \
-    '--sealed-root DIR' \
-    '--seal-key-output-fd N'
-  do
-    if ! printf '%s\n' "$hylo_extract_help" | matches_ere "$flag"; then
-      echo "hylo-extract help missing protected target/output flag: ${flag}" >&2
-      exit 1
-    fi
-  done
-else
-  for cmd in hctp-source hylo-extract; do
-    if printf '%s\n' "$help_output" | matches_ere "^- ${cmd}$"; then
-      echo "non-macOS command surface exposes ${cmd}" >&2
-      exit 1
-    fi
-  done
-  for feature in \
-    hctp_source_selection_v1 \
-    hctp_source_route_admission_v1 \
-    hctp_independence_clusters_v1 \
-    hctp_sealed_case_v1 \
-    hctp_materializer_v1 \
-    hctp_source_materialization_v1 \
-    hctp_source_selection_opening_fd_v1 \
-    hctp_historical_profile_v1 \
-    hctp_case_blind_source_profile_fd_v1 \
-    hylo_extract_v1
-  do
-    if printf '%s\n' "$capabilities_json" | matches_ere "\"${feature}\""; then
-      echo "non-macOS capabilities expose ${feature}" >&2
-      exit 1
-    fi
-  done
-fi
+done
+for removed_feature in hctp_source_selection_v1 hylo_extract_v1; do
+  if printf '%s\n' "$capabilities_json" | matches_ere "\"${removed_feature}\""; then
+    echo "capabilities expose removed feature: ${removed_feature}" >&2
+    exit 1
+  fi
+done
 if ! "$BIN_PATH" capabilities --format json | matches_ere '"skill_decision_audit": true'; then
   echo "capabilities missing skill_decision_audit=true" >&2
   exit 1

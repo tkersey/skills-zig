@@ -1,13 +1,10 @@
 const std = @import("std");
 
-/// This is the identity codec for Hylo and HCTP artifacts. It is not a claim
+/// Canonical JSON support for generic retrace artifacts. This is not a claim
 /// of full RFC 8785 compatibility: integers retain their exact i64 value,
 /// object keys are ordered by their raw UTF-8 bytes rather than by UTF-16 code
 /// units, and an integer-shaped f64 outside the parser's i64 domain uses
 /// scientific notation so canonical JSON remains parse-closed.
-pub const Profile = "hylo-canonical-json/v1";
-pub const Sha256Algorithm = "sha256-hylo-canonical-json-v1";
-
 const Omission = struct {
     key: ?[]const u8 = null,
     recursive: bool = false,
@@ -347,93 +344,17 @@ fn expectCanonicalParseClosure(canonical: []const u8) !void {
     try std.testing.expectEqualStrings(canonical, repeated);
 }
 
-test "published profile vectors pin numbers Unicode keys escapes integers and digests" {
-    const RfcVector = struct {
-        ieee754: []const u8,
-        rfc8785_canonical: ?[]const u8,
-        profile_canonical: ?[]const u8,
+test "canonical JSON remains parse closed and rejects unsupported values" {
+    const cases = [_]std.json.Value{
+        .{ .float = 1.5 },
+        .{ .float = 1.0e-7 },
+        .{ .float = 9.223372036854776e18 },
     };
-    const ProfileCase = struct {
-        id: []const u8,
-        input_json: []const u8,
-        canonical_json: []const u8,
-        sha256: []const u8,
-    };
-    const Corpus = struct {
-        schema: []const u8,
-        profile: []const u8,
-        rfc8785_appendix_b_inputs: []const RfcVector,
-        profile_cases: []const ProfileCase,
-    };
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const corpus_bytes = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        "../../testdata/hctp-v1/canonical-json-v1.json",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    ) catch try std.Io.Dir.cwd().readFileAlloc(
-        io,
-        "testdata/hctp-v1/canonical-json-v1.json",
-        std.testing.allocator,
-        .limited(1024 * 1024),
-    );
-    defer std.testing.allocator.free(corpus_bytes);
-    var corpus = try std.json.parseFromSlice(
-        Corpus,
-        std.testing.allocator,
-        corpus_bytes,
-        .{ .ignore_unknown_fields = false },
-    );
-    defer corpus.deinit();
-    try std.testing.expectEqualStrings("hylo-canonical-json-v1-vectors/v1", corpus.value.schema);
-    try std.testing.expectEqualStrings(Profile, corpus.value.profile);
-    try std.testing.expectEqualStrings("sha256-hylo-canonical-json-v1", Sha256Algorithm);
-    try std.testing.expectEqual(@as(usize, 26), corpus.value.rfc8785_appendix_b_inputs.len);
-
-    var finite_count: usize = 0;
-    var nonfinite_count: usize = 0;
-    var intentional_override_count: usize = 0;
-    for (corpus.value.rfc8785_appendix_b_inputs) |vector| {
-        const bits = try std.fmt.parseInt(u64, vector.ieee754, 16);
-        if (vector.profile_canonical) |expected| {
-            finite_count += 1;
-            const rfc8785_expected = vector.rfc8785_canonical orelse
-                return error.FiniteRfc8785VectorMissing;
-            const encoded = try canonicalJsonAlloc(std.testing.allocator, .{ .float = @bitCast(bits) });
-            defer std.testing.allocator.free(encoded);
-            try std.testing.expectEqualStrings(expected, encoded);
-            try expectCanonicalParseClosure(encoded);
-            if (!std.mem.eql(u8, rfc8785_expected, expected)) intentional_override_count += 1;
-        } else {
-            nonfinite_count += 1;
-            try std.testing.expect(vector.rfc8785_canonical == null);
-            try std.testing.expectError(
-                error.NonFiniteNumber,
-                canonicalJsonAlloc(std.testing.allocator, .{ .float = @bitCast(bits) }),
-            );
-        }
+    for (cases) |value| {
+        const encoded = try canonicalJsonAlloc(std.testing.allocator, value);
+        defer std.testing.allocator.free(encoded);
+        try expectCanonicalParseClosure(encoded);
     }
-    try std.testing.expectEqual(@as(usize, 24), finite_count);
-    try std.testing.expectEqual(@as(usize, 2), nonfinite_count);
-    try std.testing.expectEqual(@as(usize, 3), intentional_override_count);
-
-    for (corpus.value.profile_cases) |profile_case| {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            std.testing.allocator,
-            profile_case.input_json,
-            .{ .duplicate_field_behavior = .@"error" },
-        );
-        defer parsed.deinit();
-        const canonical = try canonicalJsonAlloc(std.testing.allocator, parsed.value);
-        defer std.testing.allocator.free(canonical);
-        try std.testing.expectEqualStrings(profile_case.canonical_json, canonical);
-        try expectCanonicalParseClosure(canonical);
-        const digest = try digestBytesAlloc(std.testing.allocator, canonical);
-        defer std.testing.allocator.free(digest);
-        try std.testing.expectEqualStrings(profile_case.sha256, digest["sha256:".len..]);
-    }
-
     try std.testing.expectError(
         error.NumberOutOfRange,
         canonicalJsonAlloc(std.testing.allocator, .{ .number_string = "9223372036854775808" }),

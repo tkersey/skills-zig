@@ -1,14 +1,11 @@
 # ledger
 
-Repo-local artifact and durable-source toolchain. Its replay product surface is
-available on macOS.
+Repo-local artifact and durable-source toolchain.
 
 `ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and
 route-exclusion evidence in an append-only event store that future runs can
-query through the Ledger API. It also supports artifact materialization,
-validation, evidence append, and deterministic projection for `$actuating`;
-learning capture under `--source learnings`; and, on macOS, replay-campaign
-evidence under `--source hylo`.
+query through the Ledger API. It also materializes and validates Actuating,
+Learnings, Synesthesia, Negative Ledger, and Universalist artifacts.
 
 Ledger CLI is not the Evidence Ledger artifact. For an `$actuating` goal,
 `$actuating` owns the Goal Contract interpretation, Construction selection,
@@ -18,12 +15,10 @@ changes, run or interpret review, select a repair, publish, or grant execution
 authority. CAS owns review attempts, transport, principal proof, and verdicts.
 `$ship` owns public effects and their readback.
 
-The negative ledger, Actuating evidence, learning, and Synesthesia sources,
-plus the macOS-only Hylo source, share one storage contract: ordered snapshots,
-opaque revisions, compare-and-append, atomic replacement, and logical store
-identity. The current persistent adapter is JSONL. A backend change is confined
-to the persistent adapter; source callers do not split lines or coordinate
-storage locks.
+The negative ledger, Actuating evidence, learning, and Synesthesia sources share
+one storage contract: ordered snapshots, opaque revisions, compare-and-append,
+atomic replacement, and logical store identity. The current persistent adapter
+is JSONL; source callers do not split lines or coordinate storage locks.
 
 Current negative-ledger adapter path:
 
@@ -36,67 +31,6 @@ Current learning-source adapter path:
 ```bash
 .ledger/learnings/events.jsonl
 ```
-
-Current macOS Hylo adapter path:
-
-```bash
-.ledger/hylo/events.jsonl
-```
-
-Ledger 0.10.1 adds the additive `hylo-trial/v1` profile. The native Hylo source
-owns atomic twin-trial registration, FD-delivered lane leases, signed run and
-grade receipts, blinded arm reveal, cluster-balanced effects, calibrated claim
-derivation, publication identity, and reproducible proof bundles. Legacy Hylo
-campaigns retain their original attempt semantics.
-
-The `ledger --source hylo` replay and HCTP lifecycle is supported only on
-macOS. The stateless `ledger validate hylo-*` contracts remain pure,
-platform-neutral validation: they neither expose the Hylo source runtime nor
-grant execution authority.
-
-```bash
-ledger --source hylo capabilities
-ledger --source hylo validate-trial --repo REPO --trial trial.json
-ledger --source hylo register-trial --repo REPO --trial trial.json
-ledger --source hylo start-lane --repo REPO --campaign-id CAMPAIGN --trial-id TRIAL \
-  --lane-id LANE --runner-id cas-trial --lease-output-fd 3
-ledger --source hylo recover-lane-start --repo REPO --campaign-id CAMPAIGN \
-  --trial-id TRIAL --lane-id LANE --runner-id cas-trial \
-  --lane-lease-digest DIGEST --lease-input-fd 3
-ledger --source hylo recover-lane-finish --repo REPO --receipt run-receipt.json \
-  --lease-input-fd 3
-ledger --source hylo trial-result --repo REPO --trial-id TRIAL --format markdown
-ledger --source hylo proof-artifact-set --repo REPO --trial-id TRIAL \
-  --output proof-artifacts.json
-# A trusted source_owner signs that exact set as hylo-proof-sanitization-receipt/v1.
-ledger --source hylo export-proof --repo REPO --trial-id TRIAL --output proof.tar \
-  --sanitization-receipt proof-sanitization.json
-ledger --source hylo verify-proof --repo REPO --input proof.tar
-```
-
-Trial lifecycle events can be mutated only through the high-level commands.
-The low-level `append` command rejects them, and lease secrets never enter the
-event store, normal stdout, or proof bundles. `start-lane` first transfers one
-`PIPE_BUF`-bounded lease record through a validated anonymous pipe and only then
-appends `lane_started`; the raw nonce is inert until that event commits its
-digest. If the public receipt is lost after the commit, `recover-lane-start`
-re-emits it without appending only when the caller supplies the retained lease
-and the exact campaign, trial, lane, runner, and lease digest. This recovery
-contract assumes the broker survives long enough to retain the delivered
-lease. It does not recover a capability discarded by a dead broker or receiver;
-that stronger failure model requires an explicit lease-rotation transition.
-If a terminal append commits before its public acknowledgement is retained,
-`recover-lane-finish` emits a typed acknowledgement without appending only when
-the retained lease, receipt lineage, and canonical run-receipt fingerprint equal
-Ledger's terminal lane state. Bare terminal status is not recovery authority.
-
-Default live `verify-proof` treats the manifest's declared global event range
-as an immutable prefix: it matches every declared digest against one current
-store snapshot and validates the complete live suffix chain. Later valid events,
-including events in the same campaign, therefore do not invalidate an earlier
-closed-trial proof. The explicit `--expected-campaign-head` and
-`--expected-trust-policy-fingerprint` pair remains an offline exact-value
-anchor; it does not consult or imply the current live head.
 
 Universalist plan artifacts:
 
@@ -141,15 +75,6 @@ ledger --source actuation --goal GOAL_ID project \
   --review-contract /path/to/review-contract.json
 ledger --source actuation --goal GOAL_ID doctor
 ledger --source actuation --goal GOAL_ID path
-ledger --source hylo validate-campaign --campaign campaign.json
-ledger --source hylo fingerprint --input artifact.json
-ledger --source hylo snapshot-target --repo . --revision INDEX --input target-roots.json
-ledger --source hylo append --repo . --json event-intent.json
-ledger --source hylo doctor --repo .
-ledger --source hylo progress --repo . --campaign-id cmp-example --format markdown
-ledger --source hylo frontier --repo . --campaign-id cmp-example --format markdown
-ledger --source hylo next-experiment --repo . --campaign-id cmp-example
-ledger --source hylo path --repo .
 ledger create --source universalist --template universalist-plan.md
 ledger latest --source universalist
 ledger latest --source universalist --format path
@@ -157,12 +82,9 @@ ledger path --source universalist --id 20260711T164436123456789Z-0000
 ledger emit --source universalist --plan PLAN --contract CONTRACT [receipt fields] [--write-plan]
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
-ledger validate hylo-replay-episode --input episode.json
-ledger validate hylo-runner-input --input runner-input.json
 ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
-The CRF episode validator checks the cut-bound causal fingerprint and ordered stimulus contract. The runner validator checks the allow-listed projection, rejects custody fields recursively, and never grants execution or edit authority.
 
 Use `--file PATH` to point at a non-default store.
 For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
@@ -248,187 +170,6 @@ rejects a second JSON or YAML receipt. Without `--write-plan`, the command is a
 plan-read-only receipt projection and may use a non-addressed plan when
 `--decision-id` is explicit.
 
-## Hylo replay kernel
-
-On macOS, `ledger --source hylo` owns the durable evidence boundary for replay-driven
-improvement campaigns. This hardened contract requires Ledger 0.6.1 or newer:
-
-```text
-unfold historical evidence -> content-addressed campaign and scenarios
-interpret one scenario      -> attempt trace
-grade frozen observations   -> evidence-bound grade
-fold immutable events       -> progress, deltas, and frontier
-```
-
-Campaigns and scenarios are language-neutral JSON contracts. Validate the
-content-addressed pair before running it:
-
-```bash
-ledger --source hylo validate-campaign --campaign campaign.json
-```
-
-Use `fingerprint` to obtain the canonical lowercase SHA-256 fingerprint of any
-JSON snapshot. A `campaign_created` intent embeds the complete
-`hylo-campaign/v1` snapshot, its complete scenario manifest, and its
-fingerprint; a `scenario_admitted` intent does the same for one
-`hylo-scenario/v1`. Attempts remain blocked until every manifest member is
-admitted. This keeps later folds independent of mutable campaign files and
-prevents selective admission of easy cases.
-
-New Hylo, HCTP, and CRF identity use the published
-`hylo-canonical-json/v1` profile. A campaign that enables the
-`hylo-trial/v1` protocol must set
-`"canonical_json_profile":"hylo-canonical-json/v1"`; every registered trial
-must repeat that binding, and canonical JSON SHA-256 commitments use the
-profile-specific `sha256-hylo-canonical-json-v1` algorithm label. Legacy Hylo
-campaigns reject the profile field. Released DCP-v2 packet identity remains on
-its frozen legacy writer; adopting this profile for DCP requires a versioned
-DCP-v3 migration. The new profile is deliberately narrower and more explicit
-than a claim of complete RFC 8785 support:
-
-- JSON `integer` values retain their exact signed 64-bit value. Arbitrary
-  `number_string` values and non-finite floats are rejected.
-- Finite `f64` values use shortest-round-trip Ryu digits with the pinned
-  ECMAScript fixed/scientific thresholds and exponent spelling; negative zero
-  is `0`.
-- Strings and keys must be valid UTF-8. Their code points are preserved without
-  Unicode normalization, escapes are fixed, and object keys sort by raw UTF-8
-  bytes. RFC 8785 instead specifies UTF-16 code-unit key order.
-
-The executable corpus, including RFC 8785 Appendix B numeric samples and
-profile-specific Unicode, key-order, escape, integer, and digest vectors, is
-`testdata/hctp-v1/canonical-json-v1.json`. Identity-bearing code must use the
-shared codec rather than language-default float formatting.
-
-The profile's repo-owned layout and threshold logic consumes shortest decimal
-digits from the Zig 0.16 standard library's explicit Ryu renderer; the Ryu
-implementation is not vendored. A Zig toolchain upgrade must pass this corpus
-before it can author identity bytes. If it cannot preserve the locked bytes,
-the profile must be versioned and existing identities migrated explicitly. In
-addition to every RFC 8785 Appendix B case, the tests bind a deterministic
-16,384-bit-pattern digest and verify finite-value round trips. This is a broad
-compatibility lock, not an exhaustive proof over all 64-bit floating-point bit
-patterns.
-
-For Git-backed targets, capture the exact tree projection used by a replay:
-
-```bash
-ledger --source hylo snapshot-target \
-  --repo /path/to/repo \
-  --revision INDEX \
-  --input target-roots.json
-```
-
-The request is `hylo-target-snapshot-request/v1` with ordered `roots`. Use
-`INDEX` for a staged candidate. A baseline input such as `HEAD` is resolved in
-the receipt to its full immutable commit SHA; scenario and attempt contracts
-store that resolved SHA rather than the moving name. Comparable attempts in a
-commit-authorized campaign embed the receipt's revision, snapshot, and
-fingerprint.
-
-A target bundle fingerprint is semantic identity modulo artifact locator: the
-entrypoint, path/mode/content fingerprints, target-content fingerprint, loader
-contract, and dependency bundle fingerprints are identity-bearing, while a
-`content_ref` that merely relocates the same verified bytes is not. Moving
-identical content therefore cannot manufacture a new treatment. The complete
-admitted manifest remains retained as provenance and its referenced bytes are
-verified independently.
-
-Only `append` mutates the logical Hylo event store; the current JSONL adapter
-retains the default path above:
-
-```bash
-ledger --source hylo append --repo /path/to/repo --json event-intent.json
-```
-
-The native source supplies global and per-campaign sequence numbers,
-timestamps, predecessor digests, canonical body digests, and event digests. It
-then validates the proposed state transition inside one exclusive durable
-event-store session, appends against the loaded revision, and enforces a strict
-post-append reload cap. `doctor` replays both hash chains and all transition
-laws from genesis.
-
-The fold distinguishes two baselines:
-
-- `historical_baseline` records and grades the response that actually happened;
-  its grades are diagnostic and cannot enter progress denominators.
-- `replay_baseline` is a fresh blind controlled replay of the frozen baseline
-  target; its attempt must predate the candidate attempt for the same scenario.
-  Only eligible blind replays can be compared with candidates.
-
-For comparable pass/fail grades, Ledger re-derives the aggregate from the
-campaign's frozen dimension weights. It rejects duplicate eligible grades for
-one attempt, target/environment/replay-policy drift, grader drift, historical
-comparison, non-blind comparison, pass/fail labels that contradict policy, and
-critical oracles without evidence from their declared authority. Candidate
-comparison requires a like-for-like controlled replay baseline. Ledger freezes
-declared judge and dimension authority in campaign syntax and oracle authority
-in scenario syntax before replay; the referenced receipts or human
-confirmations establish authenticity outside this declaration-consistency
-check.
-
-Hylo does not edit a target or create a commit by itself. An authorized owner
-workflow may apply the change and, only when the campaign grants publication
-authority, create the commit. An applied change must be the exact staged
-`git-index:HEAD` diff: Ledger re-derives its fingerprint, requires the staged
-path set to equal the event paths, and rejects tracked or untracked
-contamination under every target root. Each candidate attempt rechecks that
-diff and recomputes its staged snapshot. Only practice evidence may motivate
-repair; once an eligible holdout or challenge grade is exposed, the campaign
-rejects further applied changes. A committed publication must cite exactly the
-latest configured repeat cohort for every frozen scenario, and the entire
-cohort must pass. The append path independently resolves the cited Git commit,
-tree, and exact changed-path set, then requires the committed target projection
-to equal the snapshot used by every promotion attempt. One promotion trial may
-authorize at most one committed publication; a second committed publication is
-rejected atomically even when it uses a distinct publication ID.
-
-Derive a current view without storing a mutable summary:
-
-```bash
-ledger --source hylo progress \
-  --repo /path/to/repo \
-  --campaign-id cmp-example \
-  --format json
-```
-
-The `hylo-progress/v1` projection reports current-target split results,
-target-by-split summaries, per-dimension means, current-target scenario
-outcomes, repeat-aware frontier cases, and grader-stable cross-target edges.
-Passing repeats are consecutive in the latest current-target cohort, so a new
-failure reopens the frontier. Its fingerprint is bound to the campaign chain
-head. A changed rubric,
-visibility policy, environment observation surface, grader configuration, or
-replay policy requires a new campaign rather than a misleading continuation.
-
-The causal frontier retains typed state through
-`failure_signature_recorded`, `hypothesis_recorded`, `experiment_recorded`,
-and `next_step_recorded` events. Ledger derives experiment eligibility,
-Pareto dominance, and the next-step decision from the current immutable
-campaign state; `next_step_recorded` must match that recomputed decision
-exactly.
-
-Inspect the complete frontier or only its `RUN`, `OBSERVE`, or `STOP`
-decision without mutating campaign state:
-
-```bash
-ledger --source hylo frontier \
-  --repo /path/to/repo \
-  --campaign-id cmp-example \
-  --format json
-
-ledger --source hylo next-experiment \
-  --repo /path/to/repo \
-  --campaign-id cmp-example
-```
-
-These projections always report `authority_granted:false` and
-`target_mutated:false`. `RUN` selects one non-dominated eligible experiment;
-it does not authorize an edit. `OBSERVE` selects a bounded read-only probe.
-`STOP` is the expected result when no eligible intervention exists or when
-multiple non-dominated alternatives remain and no bounded probe can
-discriminate among them.
-
 ## Stateless validation
 
 `ledger validate` is the pure validation surface for supported immutable
@@ -437,25 +178,13 @@ artifacts:
 ```bash
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
-ledger validate hylo-replay-episode --input episode.json
-ledger validate hylo-runner-input --input runner-input.json
-ledger validate hylo-stimulus --input stimulus.json
-ledger validate hylo-target-bundle --input target-bundle.json
-ledger validate hylo-world-snapshot --input world-snapshot.json
-ledger validate hylo-world-availability-receipt --input world-availability.json
-ledger validate hylo-runtime-contract --input runtime-contract.json
-ledger validate hylo-counterfactual-cut-receipt --input cut-receipt.json
-ledger validate hylo-redaction-receipt --input redaction-receipt.json
-ledger validate hylo-custody-manifest --input custody-manifest.json
 ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
 Input is canonical JSON from a file or `-` for stdin. General governance
 contracts emit `ledger-validate-decision/v1`. Every invocation exits `0` for
 `pass` and `2` for a blocked or malformed artifact. Every decision records
-`authority_granted:false` and `storage_mutated:false`. The Hylo validators are
-schema decisions only; their availability does not admit the macOS-only replay
-or HCTP product routes.
+`authority_granted:false` and `storage_mutated:false`.
 
 `source-memory-checkpoint/v1` validation requires exactly one Learnings,
 Synesthesia, and Negative Ledger disposition, checks source-specific IDs and

@@ -1261,9 +1261,9 @@ fn validateLane(lane: Lane) !void {
     if (std.mem.eql(u8, lane.inquiry_mode, "retrospective") and !std.mem.eql(u8, lane.temporal_horizon, "outcome_aware")) return error.BadLaneHorizon;
 }
 
-test "HCTP replay mode is one-fork pre-decision only" {
+test "replay mode is one-fork pre-decision only" {
     const replay = Lane{
-        .lane_id = "lane-hctp",
+        .lane_id = "lane-replay",
         .temporal_horizon = "pre_decision",
         .inquiry_mode = "replay",
         .fork_count = 1,
@@ -2480,10 +2480,9 @@ fn buildLaneHandleSnapshot(
     };
 }
 
-/// Serializes the packaged FIR-v1 envelope used by both live session inquiry
-/// lanes and HCTP runner integration. Keeping one serializer at this boundary
-/// prevents the trial adapter from accepting a fixture shape that the packaged
-/// CAS command cannot emit.
+/// Serializes the packaged FIR-v1 envelope used by live session-inquiry lanes.
+/// Keeping one serializer at this boundary prevents callers from accepting a
+/// fixture shape that the packaged CAS command cannot emit.
 pub fn packagedFirReceiptJsonAlloc(allocator: std.mem.Allocator, fields: anytype) ![]u8 {
     const receipt = .{
         .fork_inquiry_receipt = .{

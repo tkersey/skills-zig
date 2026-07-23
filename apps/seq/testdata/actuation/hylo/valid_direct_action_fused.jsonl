@@ -1,7 +1,0 @@
-{"type":"session_meta","timestamp":"2026-07-02T10:00:00Z","payload":{"id":"valid_direct_action_fused","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-direct"}}}
-{"type":"event_msg","timestamp":"2026-07-02T10:00:01Z","payload":{"type":"task_started","turn_id":"t1"}}
-{"type":"event_msg","timestamp":"2026-07-02T10:00:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating implement one direct action fixture."}}
-{"type":"event_msg","timestamp":"2026-07-02T10:00:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"direct_action_fused: yes\nproof_patch: direct_action_fused\nfold:\n  verdict: complete\n  current_artifact_bound: yes\nstop_rule:\n  success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
-{"type":"response_item","timestamp":"2026-07-02T10:00:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: direct.txt\n+ok\n*** End Patch"}}
-{"type":"response_item","timestamp":"2026-07-02T10:00:05Z","payload":{"type":"function_call_output","call_id":"patch-1","output":"Success. Updated the following files:\nM direct.txt\n"}}
-{"type":"event_msg","timestamp":"2026-07-02T10:00:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}

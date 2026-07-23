@@ -5,38 +5,12 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const HctpProductAvailable = builtin.os.tag == .macos;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas",
     .help_text = UsageText,
 };
 
-const CapabilitiesText: []const u8 = if (HctpProductAvailable) CapabilitiesTextMacos else CapabilitiesTextWithoutHctp;
-const CapabilitiesJson: []const u8 = if (HctpProductAvailable) CapabilitiesJsonMacos else CapabilitiesJsonWithoutHctp;
-
-const CapabilitiesTextMacos =
-    \\session_inquiry_v1=true
-    \\hylo_trial_runner_v1=true
-    \\hylo_trial_runner_v2=true
-    \\hylo_fd_lane_lease_v1=true
-    \\hylo_signed_run_receipt_v1=true
-    \\hylo_signed_run_receipt_v2=true
-    \\hylo_private_lane_materialization_fd_v1=true
-    \\hylo_target_common_projection_opening_v1=true
-    \\hylo_private_receipt_redaction_v1=true
-    \\hylo_trial_route_projection_v1=true
-    \\hylo_internal_historical_replay_v1=true
-    \\dcp_v1=true
-    \\dcp_v2=true
-    \\cas_rer_opaque_request_binding_v1=true
-    \\cas_review_scoped_instructions_v1=true
-    \\cas_codex_0145_structured_review_v1=true
-    \\cas_codex_0145_structured_review_v2=true
-    \\cas_codex_0145_structured_review_v3=true
-    \\cas_codex_0145_structured_review_v4=true
-;
-
-const CapabilitiesTextWithoutHctp =
+const CapabilitiesText =
     \\session_inquiry_v1=true
     \\dcp_v1=true
     \\dcp_v2=true
@@ -48,41 +22,7 @@ const CapabilitiesTextWithoutHctp =
     \\cas_codex_0145_structured_review_v4=true
 ;
 
-const CapabilitiesJsonMacos =
-    \\{
-    \\  "cas_capabilities": {
-    \\    "features": {
-    \\      "session_inquiry_v1": true,
-    \\      "hylo_trial_runner_v1": true,
-    \\      "hylo_trial_runner_v2": true,
-    \\      "hylo_fd_lane_lease_v1": true,
-    \\      "hylo_signed_run_receipt_v1": true,
-    \\      "hylo_signed_run_receipt_v2": true,
-    \\      "hylo_private_lane_materialization_fd_v1": true,
-    \\      "hylo_target_common_projection_opening_v1": true,
-    \\      "hylo_private_receipt_redaction_v1": true,
-    \\      "hylo_trial_route_projection_v1": true,
-    \\      "hylo_internal_historical_replay_v1": true,
-    \\      "dcp_v1": true,
-    \\      "dcp_v2": true,
-    \\      "rip_v1": true,
-    \\      "fir_v1": true,
-    \\      "exact_fork_rollback_anchor": true,
-    \\      "ephemeral_fork": true,
-    \\      "read_only_inquiry": true,
-    \\      "detached_inquiry": true,
-    \\      "cas_rer_opaque_request_binding_v1": true,
-    \\      "cas_review_scoped_instructions_v1": true,
-    \\      "cas_codex_0145_structured_review_v1": true,
-    \\      "cas_codex_0145_structured_review_v2": true,
-    \\      "cas_codex_0145_structured_review_v3": true,
-    \\      "cas_codex_0145_structured_review_v4": true
-    \\    }
-    \\  }
-    \\}
-;
-
-const CapabilitiesJsonWithoutHctp =
+const CapabilitiesJson =
     \\{
     \\  "cas_capabilities": {
     \\    "features": {
@@ -106,47 +46,7 @@ const CapabilitiesJsonWithoutHctp =
     \\}
 ;
 
-const UsageText: []const u8 = if (HctpProductAvailable) UsageTextMacos else UsageTextWithoutHctp;
-
-const UsageTextMacos =
-    \\cas
-    \\
-    \\CAS dispatcher for subcommand-style usage.
-    \\
-    \\Usage:
-    \\  cas <subcommand> [args...]
-    \\
-    \\Subcommands:
-    \\  account                            Run cas_account.
-    \\  capabilities                       Print compiled CAS feature flags.
-    \\  conformance     | conformance-suite  Run cas_conformance_suite.
-    \\  goal                                 Run cas_goal.
-    \\  instance_runner | instance-runner   Run cas_instance_runner.
-    \\  review                              Run tuple-bound review attempts.
-    \\  session_inquiry | session-inquiry   Run cas_session_inquiry.
-    \\  trial                                Run cas_trial.
-    \\  smoke_check     | smoke-check       Run cas_smoke_check.
-    \\
-    \\Examples:
-    \\  cas capabilities --json
-    \\  cas account status --cwd /path/to/repo --json
-    \\  cas conformance --cwd /path/to/repo --json
-    \\  cas goal resolve --cwd /path/to/repo --latest --json
-    \\  cas instance_runner --cwd /path/to/repo --instances 4
-    \\  cas review run --cwd /path/to/repo --base main --json
-    \\  cas review start --cwd /path/to/repo --uncommitted --json
-    \\  cas review wait --cwd /path/to/repo --latest --json
-    \\  cas session_inquiry preflight --json
-    \\  cas trial preflight --trial trial.json --lane-id LANE --json
-    \\  cas trial run --trial trial.json --lane-id LANE ... --materialization-fd 5
-    \\  cas smoke_check --cwd /path/to/repo --json
-    \\
-    \\Options:
-    \\  --help                              Show this help.
-    \\  --version | version                 Show version.
-;
-
-const UsageTextWithoutHctp =
+const UsageText =
     \\cas
     \\
     \\CAS dispatcher for subcommand-style usage.
@@ -181,10 +81,9 @@ const UsageTextWithoutHctp =
     \\  --version | version                 Show version.
 ;
 
-const InstalledBinarySet: []const u8 = if (HctpProductAvailable)
-    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, cas_session_inquiry, cas_trial, cas_conformance_suite, cas_goal"
-else
-    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, cas_session_inquiry, cas_conformance_suite, cas_goal";
+const InstalledBinarySet =
+    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
+    "cas_session_inquiry, cas_conformance_suite, cas_goal";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -329,9 +228,6 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "session_inquiry") or std.mem.eql(u8, subcommand, "session-inquiry")) {
         return "cas_session_inquiry";
     }
-    if (HctpProductAvailable and std.mem.eql(u8, subcommand, "trial")) {
-        return "cas_trial";
-    }
     if (std.mem.eql(u8, subcommand, "smoke_check") or std.mem.eql(u8, subcommand, "smoke-check")) {
         return "cas_smoke_check";
     }
@@ -380,11 +276,7 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expect(resolveTarget("review-session") == null);
     try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session_inquiry").?);
     try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session-inquiry").?);
-    if (HctpProductAvailable) {
-        try std.testing.expectEqualStrings("cas_trial", resolveTarget("trial").?);
-    } else {
-        try std.testing.expect(resolveTarget("trial") == null);
-    }
+    try std.testing.expect(resolveTarget("trial") == null);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke_check").?);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke-check").?);
     try std.testing.expect(resolveTarget("unknown") == null);
@@ -486,36 +378,4 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);
     try std.testing.expect(features.get("cas_review_history_v2") == null);
     try std.testing.expect(features.get("dcp_v2").?.bool);
-    const hctp_capabilities = [_][]const u8{
-        "hylo_trial_runner_v1",
-        "hylo_trial_runner_v2",
-        "hylo_fd_lane_lease_v1",
-        "hylo_signed_run_receipt_v1",
-        "hylo_signed_run_receipt_v2",
-        "hylo_private_lane_materialization_fd_v1",
-        "hylo_target_common_projection_opening_v1",
-        "hylo_private_receipt_redaction_v1",
-        "hylo_trial_route_projection_v1",
-        "hylo_internal_historical_replay_v1",
-    };
-    for (hctp_capabilities) |feature| {
-        const advertised = features.get(feature);
-        try std.testing.expectEqual(HctpProductAvailable, advertised != null);
-        if (advertised) |value| try std.testing.expect(value.bool);
-        try std.testing.expectEqual(
-            HctpProductAvailable,
-            std.mem.indexOf(u8, text_output.written(), feature) != null,
-        );
-    }
-}
-
-test "help and packaged binary guidance follow HCTP admission" {
-    try std.testing.expectEqual(
-        HctpProductAvailable,
-        std.mem.indexOf(u8, UsageText, "cas trial preflight") != null,
-    );
-    try std.testing.expectEqual(
-        HctpProductAvailable,
-        std.mem.indexOf(u8, InstalledBinarySet, "cas_trial") != null,
-    );
 }
