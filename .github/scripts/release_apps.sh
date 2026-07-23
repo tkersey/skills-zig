@@ -54,6 +54,10 @@ case "$mode" in
       mark_app memory-note
     }
 
+    mark_jsonl_core_consumers() {
+      mark_durable_store_consumers
+    }
+
     mark_retrace_core_consumers() {
       mark_app seq
       mark_app cas
@@ -258,6 +262,14 @@ case "$mode" in
               fi
               matched=1
               ;;
+            *"jsonl_core"*|*"jsonl-core"*|*"libs/jsonl_core/"*)
+              if [[ -n "$current_app" ]]; then
+                mark_app "$current_app"
+              else
+                mark_jsonl_core_consumers
+              fi
+              matched=1
+              ;;
             *"retrace_core"*|*"libs/retrace_core/"*)
               if [[ -n "$current_app" ]]; then
                 mark_app "$current_app"
@@ -304,6 +316,9 @@ case "$mode" in
           ;;
         libs/durable_store/*)
           mark_durable_store_consumers
+          ;;
+        libs/jsonl_core/*)
+          mark_jsonl_core_consumers
           ;;
         libs/retrace_core/*)
           mark_retrace_core_consumers

@@ -43,18 +43,29 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const jsonl_core = b.createModule(.{
+        .root_source_file = b.path("libs/jsonl_core/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const durable_store = b.createModule(.{
         .root_source_file = b.path("libs/durable_store/src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
     });
     const retrace_core = b.createModule(.{
         .root_source_file = b.path("libs/retrace_core/src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
     });
     const jsonl_stream_release_fast = b.createModule(.{
-        .root_source_file = b.path("libs/retrace_core/src/jsonl_stream.zig"),
+        .root_source_file = b.path("libs/jsonl_core/src/lib.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -409,6 +420,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cron_cli", .module = cron_root },
         },
     });
+    const durable_store_perf_root = b.createModule(.{
+        .root_source_file = b.path("tools/durable_store_perf.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+        },
+    });
 
     const seq = addExecutable(b, "seq", seq_root);
     seq.root_module.linkSystemLibrary("c", .{});
@@ -436,6 +455,7 @@ pub fn build(b: *std.Build) void {
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
+    const durable_store_perf = addExecutable(b, "durable-store-perf", durable_store_perf_root);
 
     const seq_install = addInstallStep(b, seq);
     const seq_perf_install = addInstallStep(b, seq_perf);
@@ -525,6 +545,12 @@ pub fn build(b: *std.Build) void {
         cas_budget_perf,
         "bench-cas-budget-governor",
         "Run budget_governor performance harness",
+    );
+    addBenchStep(
+        b,
+        durable_store_perf,
+        "perf-durable-store-local",
+        "Measure durable_store scan and append resource use",
     );
 
     const run_cas_budget_governor_tests = addTestStep(
@@ -693,6 +719,12 @@ pub fn build(b: *std.Build) void {
         "test-durable-store",
         "Run durable_store tests",
     );
+    const run_jsonl_core_tests = addTestStep(
+        b,
+        jsonl_core,
+        "test-jsonl-core",
+        "Run shared JSONL framing tests",
+    );
     const run_execution_policy_core_tests = addTestStep(
         b,
         execution_policy_core,
@@ -713,6 +745,11 @@ pub fn build(b: *std.Build) void {
         "Run the greater-than-256-MiB streaming regression in ReleaseFast",
     );
     run_retrace_core_tests.step.dependOn(&run_retrace_large_tests.step);
+    const test_jsonl_stream_large = b.step(
+        "test-jsonl-stream-large",
+        "Run the greater-than-256-MiB streaming regression in ReleaseFast",
+    );
+    test_jsonl_stream_large.dependOn(&run_retrace_large_tests.step);
     const run_retrace_corpus_tests = addTestStep(
         b,
         retrace_corpus_tests_root,
@@ -801,6 +838,7 @@ pub fn build(b: *std.Build) void {
     }
     test_all.dependOn(&run_perf_hub_tests.step);
     test_all.dependOn(&run_durable_store_tests.step);
+    test_all.dependOn(&run_jsonl_core_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
 
@@ -1005,6 +1043,7 @@ fn buildLintStep(
     lint_builder.addPaths(.{
         .include = &.{
             b.path("libs/core"),
+            b.path("libs/jsonl_core"),
             b.path("libs/retrace_core"),
             b.path("build.zig"),
             b.path("tools"),

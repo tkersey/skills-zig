@@ -130,6 +130,7 @@ assert_ambiguous_build_diff() {
 }
 
 assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
+assert_case "libs/jsonl_core/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/execution_policy_core/src/root.zig" "seq"
 assert_case "libs/retrace_core/src/lib.zig" "seq,cas"
 assert_case "apps/ledger/scripts/actuation.zig" "seq,ledger"
@@ -144,4 +145,4 @@ assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memo
 assert_version_case "apps/img/VERSION" "img"
 assert_ambiguous_build_diff
 
-echo "release app classifier: 14/14 cases passed"
+echo "release app classifier: 15/15 cases passed"
