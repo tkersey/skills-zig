@@ -129,6 +129,24 @@ assert_ambiguous_build_diff() {
   assert_observed "ambiguous shared build diff" "seq,lift,cas,cron,ledger,memory-note,img"
 }
 
+assert_owned_durable_store_build_diff() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const jsonl_core = b.createModule(.{' \
+    '    .root_source_file = b.path("libs/jsonl_core/src/lib.zig"),' \
+    '});' \
+    'addBenchStep(' \
+    '    b,' \
+    '    durable_store_perf,' \
+    '    "perf-durable-store-local",' \
+    '    "Measure durable_store scan and append resource use",' \
+    ');' >> "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "add durable store build wiring"
+  assert_observed "owned durable store build diff" "seq,cas,ledger,memory-note"
+}
+
 assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/jsonl_core/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/execution_policy_core/src/root.zig" "seq"
@@ -143,6 +161,7 @@ assert_case ".github/workflows/pr-ci.yml" ""
 assert_case ".github/workflows/pr-ci.yml" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
 assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
 assert_version_case "apps/img/VERSION" "img"
+assert_owned_durable_store_build_diff
 assert_ambiguous_build_diff
 
-echo "release app classifier: 15/15 cases passed"
+echo "release app classifier: 16/16 cases passed"

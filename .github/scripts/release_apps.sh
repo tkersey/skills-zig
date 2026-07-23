@@ -80,7 +80,7 @@ case "$mode" in
         local raw="$1"
         local compact="${raw//[[:space:]]/}"
         case "$compact" in
-          ".{"|"},"|"});"|");"|"b,"|"_=addTestStepWithOptions("|".filters=&.{")
+          ".{"|"},"|"});"|");"|"b,"|"addBenchStep("|"_=addTestStepWithOptions("|".filters=&.{")
             return 0
             ;;
         esac
@@ -130,6 +130,10 @@ case "$mode" in
             ;;
           *"jsonl_stream_release_fast"*|*"canonical_json_release_fast"*|*"retrace_large_tests_root"*|*"retrace_corpus_tests_root"*|*"run_retrace_large_tests"*|*"run_retrace_corpus_tests"*)
             current_app="__retrace_core"
+            return
+            ;;
+          *"const jsonl_core = b.createModule"*|*"const durable_store = b.createModule"*|*"durable_store_perf"*|*"run_durable_store_tests"*|*"run_jsonl_core_tests"*|*"test-jsonl-core"*)
+            current_app="__durable_store"
             return
             ;;
           *"ledger_routine_test_filters"*|*"run_ledger_portable_ceiling"*|*"ledger_validation_qualification_root"*)
@@ -246,6 +250,9 @@ case "$mode" in
           matched=1
         elif [[ "$current_app" == "__retrace_core" ]]; then
           mark_retrace_core_consumers
+          matched=1
+        elif [[ "$current_app" == "__durable_store" ]]; then
+          mark_durable_store_consumers
           matched=1
         elif [[ "$current_app" == "ledger" && "$raw" == *"[]const u8,"* ]]; then
           mark_app ledger
