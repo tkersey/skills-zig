@@ -55,10 +55,10 @@ expect_count() {
 }
 
 expect_count 1 "zig build build-seq -Doptimize=Debug --summary all"
-expect_count 1 "zig build -Doptimize=ReleaseFast --summary all"
-expect_count 1 "working-directory: apps/seq"
+expect_count 0 "ReleaseFast"
+expect_count 0 "working-directory: apps/seq"
 expect_count 1 "zig build test-seq --summary all"
 expect_count 1 "zig build test-retrace-core --summary all"
-expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq"
+expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq"
 
 echo "Seq CI proof matrix is valid."
