@@ -81,10 +81,11 @@ base="$(git -C "$tmp" rev-parse HEAD)"
 assert_observed() {
   local label="$1"
   local expected="$2"
+  local mode="${3:-affected}"
   local observed
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$base" HEAD | paste -sd, -)"
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh "$mode" "$base" HEAD | paste -sd, -)"
   if [[ "$observed" != "$expected" ]]; then
-    echo "classifier mismatch for $label: expected $expected; observed $observed" >&2
+    echo "classifier mismatch for $mode $label: expected $expected; observed $observed" >&2
     exit 1
   fi
 }
@@ -92,13 +93,14 @@ assert_observed() {
 assert_case() {
   local path="$1"
   local expected="$2"
+  local mode="${3:-affected}"
   git -C "$tmp" reset --hard --quiet "$base"
   git -C "$tmp" clean -fdq
   mkdir -p "$(dirname "$tmp/$path")"
   printf 'changed\n' > "$tmp/$path"
   git -C "$tmp" add "$path"
   git -C "$tmp" commit --quiet -m "change $path"
-  assert_observed "$path" "$expected"
+  assert_observed "$path" "$expected" "$mode"
 }
 
 assert_version_case() {
@@ -136,7 +138,10 @@ assert_case "apps/img/src/main.zig" "img"
 assert_case ".github/workflows/release-img.yml" "img"
 assert_case ".github/scripts/verify_cas_archive.sh" "cas"
 assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
+assert_case ".github/workflows/pr-ci.yml" ""
+assert_case ".github/workflows/pr-ci.yml" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
+assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
 assert_version_case "apps/img/VERSION" "img"
 assert_ambiguous_build_diff
 
-echo "release app classifier: 11/11 cases passed"
+echo "release app classifier: 14/14 cases passed"

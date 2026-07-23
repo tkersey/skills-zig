@@ -59,7 +59,7 @@ jobs:
           declare -A selected=()
           while IFS= read -r app; do
             selected["$app"]=true
-          done < <(.github/scripts/release_apps.sh affected "$base" "$head")
+          done < <(.github/scripts/release_apps.sh ci-affected "$base" "$head")
 
           changed_paths="$(git diff --name-only "$base" "$head")"
           if grep -Fxq ".github/scripts/linux_fuzz_gate.sh" <<<"$changed_paths"; then
@@ -169,6 +169,8 @@ jobs:
         run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
       - name: Test seq
         run: zig build test-seq --summary all
+      - name: Test Retrace core contracts
+        run: zig build test-retrace-core --summary all
       - name: Verify non-macOS seq command and capability admission
         run: apps/seq/scripts/release/command_surface_gate.sh apps/seq/zig-out/bin/seq
 

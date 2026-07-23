@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <affected|version-changed> <base> <head>" >&2
+  echo "usage: $0 <affected|ci-affected|version-changed> <base> <head>" >&2
   exit 1
 fi
 
@@ -33,7 +33,7 @@ base="$(resolve_ref "$base_ref")"
 head="$(resolve_ref "$head_ref")"
 
 case "$mode" in
-  affected)
+  affected|ci-affected)
     declare -A affected=()
 
     mark_app() {
@@ -370,6 +370,16 @@ case "$mode" in
           ;;
       esac
     done < <(git diff --name-only "$base" "$head")
+
+    if [[ "$mode" == "ci-affected" ]]; then
+      while IFS= read -r path; do
+        case "$path" in
+          .github/workflows/pr-ci.yml|.github/scripts/*)
+            mark_all
+            ;;
+        esac
+      done < <(git diff --name-only "$base" "$head")
+    fi
 
     for app in "${apps[@]}"; do
       if [[ -n "${affected[$app]:-}" ]]; then
