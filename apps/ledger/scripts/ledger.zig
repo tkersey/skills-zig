@@ -253,6 +253,7 @@ const Date = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     runtime_io = init.io;
+    durable_store.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argvSource(argv)) |source| {
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
@@ -537,11 +538,6 @@ fn cmdInit(allocator: std.mem.Allocator, path: []const u8) !u8 {
     var snapshot = try store.snapshot(allocator, MaxStoreBytes);
     defer snapshot.deinit(allocator);
     if (!snapshot.exists) {
-        try durable_store.ensureLockSidecarGitignored(
-            allocator,
-            defaultIo(),
-            path,
-        );
         var receipt = try store.replace(allocator, &.{}, .{ .revision = snapshot.revision, .exists = false }, MaxStoreBytes);
         defer receipt.deinit(allocator);
         try printJsonLine(allocator, .init, "initialized", path, 0);
@@ -3188,6 +3184,13 @@ test "symbolic HEAD is resolved and empty artifact identity cannot activate" {
     const head_output = try testRunCommand(std.testing.allocator, root, &.{ "git", "rev-parse", "HEAD" });
     defer std.testing.allocator.free(head_output);
     const head = std.mem.trim(u8, head_output, " \t\r\n");
+    const gitignore = try std.fs.path.join(std.testing.allocator, &.{ root, ".gitignore" });
+    defer std.testing.allocator.free(gitignore);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "*.jsonl.lock\n.durable-store-locks/\n",
+    );
 
     const store = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
     defer std.testing.allocator.free(store);

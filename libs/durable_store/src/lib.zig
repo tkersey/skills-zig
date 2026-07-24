@@ -2,6 +2,19 @@ const std = @import("std");
 const jsonl_core = @import("jsonl_core");
 
 const Io = std.Io.Threaded.global_single_threaded;
+const GitCheckOutputLimit = 4 * 1024;
+threadlocal var runtime_io: ?std.Io = null;
+
+/// Installs the process-owned I/O implementation used by default persistent
+/// store constructors reached through composed CLI subcommands.
+pub fn installRuntimeIo(io: std.Io) void {
+    runtime_io = io;
+}
+
+fn mutationAdmissionIo() !std.Io {
+    return runtime_io orelse
+        if (@import("builtin").is_test) std.testing.io else error.EventStoreIoUnavailable;
+}
 
 pub const JsonlIssue = struct {
     line: usize,
@@ -300,6 +313,10 @@ pub const PersistentEventStore = struct {
         return .{ .adapter = JsonlEventStore.init(locator) };
     }
 
+    pub fn initWithIo(locator: []const u8, io: std.Io) PersistentEventStore {
+        return .{ .adapter = JsonlEventStore.initWithIo(locator, io) };
+    }
+
     pub fn eventStore(self: *PersistentEventStore) EventStore {
         return self.adapter.eventStore();
     }
@@ -307,10 +324,16 @@ pub const PersistentEventStore = struct {
 
 pub const JsonlEventStore = struct {
     path: []const u8,
+    io: ?std.Io = null,
     scan_active: bool = false,
+    mutation_admission_checked: bool = false,
 
     pub fn init(path: []const u8) JsonlEventStore {
         return .{ .path = path };
+    }
+
+    pub fn initWithIo(path: []const u8, io: std.Io) JsonlEventStore {
+        return .{ .path = path, .io = io };
     }
 
     pub fn eventStore(self: *JsonlEventStore) EventStore {
@@ -434,6 +457,11 @@ pub const JsonlEventStore = struct {
     fn acquireExclusive(context: *anyopaque, allocator: std.mem.Allocator) !EventStoreExclusive {
         const self = cast(context);
         if (self.scan_active) return error.EventStoreBusy;
+        if (!self.mutation_admission_checked) {
+            const io = self.io orelse try mutationAdmissionIo();
+            try ensureLockSidecarGitignored(allocator, io, self.path);
+            self.mutation_admission_checked = true;
+        }
         const exclusive = try allocator.create(ExclusiveContext);
         errdefer allocator.destroy(exclusive);
         const lock = acquireEventStoreExclusiveLock(allocator, self.path) catch |err| switch (err) {
@@ -2587,12 +2615,20 @@ pub fn writeTextCreateNew(
 ) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
-    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+    if (parent.len == 0 or
+        base.len == 0 or
+        std.mem.eql(u8, base, ".") or
+        std.mem.eql(u8, base, ".."))
+    {
         return error.InvalidPath;
     }
     if (options.reject_symlinks) {
         try ensureDirectoryPathNoSymlinks(parent);
-        const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const existing_stat = std.Io.Dir.cwd().statFile(
+            Io.io(),
+            path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -2708,7 +2744,7 @@ fn writeTempAndRename(
     try dir.rename(tmp_name, dir.*, base, Io.io());
 }
 
-fn addCopiedBytesBelowLimit(
+fn addCopiedBytesWithinLimit(
     copied_bytes: usize,
     read_bytes: usize,
     max_existing_bytes: usize,
@@ -2718,7 +2754,7 @@ fn addCopiedBytesBelowLimit(
         copied_bytes,
         read_bytes,
     ) catch return error.StreamTooLong;
-    if (next >= max_existing_bytes) return error.StreamTooLong;
+    if (next > max_existing_bytes) return error.StreamTooLong;
     return next;
 }
 
@@ -2765,7 +2801,7 @@ pub fn appendLineAtomic(
         const stat = try file.stat(Io.io());
         if (stat.kind == .sym_link) return error.SymlinkComponent;
         if (stat.kind != .file) return error.NotFile;
-        if (stat.size >= max_existing_bytes) return error.StreamTooLong;
+        if (stat.size > max_existing_bytes) return error.StreamTooLong;
     }
 
     const tmp_name = try std.fmt.allocPrint(
@@ -2795,7 +2831,7 @@ pub fn appendLineAtomic(
         while (true) { // tiger: event-loop -- bounded by source EOF.
             const read = try reader.interface.readSliceShort(&buffer);
             if (read == 0) break;
-            copied_bytes = try addCopiedBytesBelowLimit(
+            copied_bytes = try addCopiedBytesWithinLimit(
                 copied_bytes,
                 read,
                 max_existing_bytes,
@@ -2823,12 +2859,20 @@ pub fn appendLineStreaming(
 ) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
-    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+    if (parent.len == 0 or
+        base.len == 0 or
+        std.mem.eql(u8, base, ".") or
+        std.mem.eql(u8, base, ".."))
+    {
         return error.InvalidPath;
     }
     if (options.reject_symlinks) {
         try ensureDirectoryPathNoSymlinks(parent);
-        const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        const existing_stat = std.Io.Dir.cwd().statFile(
+            Io.io(),
+            path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -3271,6 +3315,10 @@ fn openEventStoreSidecarExclusive(path: []const u8) !std.Io.File {
 
 fn openEventStoreDataExclusive(store_path: []const u8) !?std.Io.File {
     _ = (try statRegularFileNoSymlink(store_path)) orelse return null;
+    // Windows byte-range locks conflict with the exclusive session's own
+    // reopened scan and append handles. The stable sidecar remains the
+    // canonical same-store exclusion witness on that platform.
+    if (@import("builtin").os.tag == .windows) return null;
     var file = (if (std.fs.path.isAbsolute(store_path))
         std.Io.Dir.openFileAbsolute(Io.io(), store_path, .{
             .allow_directory = true,
@@ -3399,9 +3447,27 @@ fn acquireExclusiveLockPathRetry(
 }
 
 pub fn findGitRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
-    const current_real = try std.Io.Dir.cwd().realPathFileAlloc(Io.io(), start, allocator);
-    defer allocator.free(current_real);
-    var current: []u8 = try allocator.dupe(u8, current_real);
+    var candidate = try std.fs.path.resolve(allocator, &.{start});
+    defer allocator.free(candidate);
+    var current: []u8 = while (true) { // tiger: event-loop -- bounded by ancestors.
+        const real = std.Io.Dir.cwd().realPathFileAlloc(
+            Io.io(),
+            candidate,
+            allocator,
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                const parent = std.fs.path.dirname(candidate) orelse return err;
+                if (std.mem.eql(u8, parent, candidate)) return err;
+                const next = try allocator.dupe(u8, parent);
+                allocator.free(candidate);
+                candidate = next;
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(real);
+        break try allocator.dupe(u8, real);
+    };
     errdefer allocator.free(current);
     while (true) {
         const marker = try std.fmt.allocPrint(allocator, "{s}/.git", .{current});
@@ -3422,7 +3488,10 @@ pub fn ensureLockSidecarGitignored(
     store_path: []const u8,
 ) !void {
     const parent = std.fs.path.dirname(store_path) orelse ".";
-    const git_root = findGitRootAlloc(allocator, parent) catch return;
+    const git_root = findGitRootAlloc(allocator, parent) catch |err| switch (err) {
+        error.GitCommandFailed => return,
+        else => return err,
+    };
     defer allocator.free(git_root);
 
     const public_path = try lockPathAlloc(allocator, store_path);
@@ -3439,10 +3508,15 @@ fn ensurePathGitignored(
     git_root: []const u8,
     path: []const u8,
 ) !void {
-    const relative_path = if (std.fs.path.isAbsolute(path))
-        try std.fs.path.relative(allocator, git_root, null, git_root, path)
-    else
-        try allocator.dupe(u8, path);
+    const absolute_path = try std.fs.path.resolve(allocator, &.{path});
+    defer allocator.free(absolute_path);
+    const relative_path = try std.fs.path.relative(
+        allocator,
+        git_root,
+        null,
+        git_root,
+        absolute_path,
+    );
     defer allocator.free(relative_path);
 
     var argv = [_][]const u8{
@@ -3456,8 +3530,8 @@ fn ensurePathGitignored(
     };
     const result = try std.process.run(allocator, io, .{
         .argv = &argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
+        .stdout_limit = .limited(GitCheckOutputLimit),
+        .stderr_limit = .limited(GitCheckOutputLimit),
     });
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -3526,6 +3600,83 @@ test "lock ignore admission covers public and advisory paths" {
         std.testing.io,
         store_path,
     );
+}
+
+test "persistent mutation enforces shared lock ignore admission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const git_result = try std.process.run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .argv = &.{ "git", "init", "--quiet" },
+            .cwd = .{ .path = root },
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(1024),
+        },
+    );
+    defer std.testing.allocator.free(git_result.stdout);
+    defer std.testing.allocator.free(git_result.stderr);
+    try std.testing.expect(
+        git_result.term == .exited and git_result.term.exited == 0,
+    );
+
+    const gitignore = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".gitignore" },
+    );
+    defer std.testing.allocator.free(gitignore);
+    try writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "events.jsonl.lock\n",
+    );
+    const store_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer std.testing.allocator.free(store_path);
+    try writeTextAtomic(std.testing.allocator, store_path, "{\"sequence\":0}\n");
+    var backend = JsonlEventStore.initWithIo(store_path, std.testing.io);
+    try std.testing.expectError(
+        error.LockSidecarNotGitignored,
+        backend.eventStore().acquireExclusive(std.testing.allocator),
+    );
+
+    try writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "events.jsonl.lock\n.durable-store-locks/\n",
+    );
+    var exclusive = try backend.eventStore().acquireExclusive(
+        std.testing.allocator,
+    );
+    exclusive.release();
+
+    try writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "*.jsonl.lock\n.durable-store-locks/\n",
+    );
+    const prospective_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "missing", "nested", "prospective.jsonl" },
+    );
+    defer std.testing.allocator.free(prospective_path);
+    var prospective = JsonlEventStore.initWithIo(
+        prospective_path,
+        std.testing.io,
+    );
+    var prospective_exclusive = try prospective.eventStore().acquireExclusive(
+        std.testing.allocator,
+    );
+    prospective_exclusive.release();
 }
 
 test "durable concurrency records render canonical json" {
@@ -4047,19 +4198,38 @@ test "appendLineAtomic appends newline-delimited records" {
     try std.testing.expectEqualStrings("{\"n\":1}\n{\"n\":2}\n", data);
 }
 
-test "atomic copy byte budget remains strict after preflight" {
+test "atomic copy byte budget includes the exact cap" {
+    try std.testing.expectEqual(
+        @as(usize, 8),
+        try addCopiedBytesWithinLimit(3, 5, 8),
+    );
     try std.testing.expectEqual(
         @as(usize, 7),
-        try addCopiedBytesBelowLimit(3, 4, 8),
+        try addCopiedBytesWithinLimit(3, 4, 8),
     );
     try std.testing.expectError(
         error.StreamTooLong,
-        addCopiedBytesBelowLimit(3, 5, 8),
+        addCopiedBytesWithinLimit(3, 6, 8),
     );
     try std.testing.expectError(
         error.StreamTooLong,
-        addCopiedBytesBelowLimit(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+        addCopiedBytesWithinLimit(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
     );
+}
+
+test "appendLineAtomic accepts an existing source at the exact cap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "store.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    try writeTextAtomic(std.testing.allocator, path, "12345678");
+    try appendLineAtomic(std.testing.allocator, path, "{}", 8);
+    const data = try tryReadForTest(path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("12345678\n{}\n", data);
 }
 
 test "appendLineStreaming appends without reading capped existing log" {
@@ -5079,6 +5249,23 @@ test "findGitRootAlloc walks parents without spawning git" {
     const nested = try std.fs.path.join(std.testing.allocator, &.{ root, "a", "b", "c" });
     defer std.testing.allocator.free(nested);
     const found = try findGitRootAlloc(std.testing.allocator, nested);
+    defer std.testing.allocator.free(found);
+    try std.testing.expectEqualStrings(root, found);
+}
+
+test "findGitRootAlloc starts from the nearest existing ancestor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(Io.io(), ".git");
+
+    const prospective = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "missing", "nested" },
+    );
+    defer std.testing.allocator.free(prospective);
+    const found = try findGitRootAlloc(std.testing.allocator, prospective);
     defer std.testing.allocator.free(found);
     try std.testing.expectEqualStrings(root, found);
 }
