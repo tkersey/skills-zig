@@ -270,6 +270,7 @@ const NormalizedInput = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    durable_store.installRuntimeIo(init.io);
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     try runWithArgv(allocator, argv, init.environ_map.get("CODEX_HOME") orelse "");
@@ -534,28 +535,32 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     };
 }
 
-fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8, args: Args, codex_home: []const u8) !void {
+fn cmdDoctor(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    args: Args,
+    codex_home: []const u8,
+) !void {
     const path = try resolveJsonlPathAlloc(allocator, repo_root, args.path);
     defer allocator.free(path);
     var persistence = durable_store.PersistentEventStore.init(path);
-    var snapshot = persistence.eventStore().snapshot(allocator, MaxStoreBytes) catch |err| {
+    var fold = SynesthesiaDoctorFold{ .allocator = allocator };
+    var summary = persistence.eventStore().scan(
+        allocator,
+        MaxStoreBytes,
+        fold.visitor(),
+    ) catch |err| {
         try printDoctorJson(allocator, "invalid", path, 0, @errorName(err));
         return;
     };
-    defer snapshot.deinit(allocator);
-    const exists = snapshot.exists;
+    defer summary.deinit(allocator);
+    const exists = summary.exists;
     var status: []const u8 = "missing";
     var lines: usize = 0;
-    var first_issue: []const u8 = "";
+    const first_issue: []const u8 = "";
     if (exists) {
-        const validation = validateSnapshotRecords(allocator, snapshot);
-        if (validation) |count| {
-            lines = count;
-            status = "current";
-        } else |err| {
-            first_issue = @errorName(err);
-            status = "invalid";
-        }
+        lines = fold.lines;
+        status = "current";
     } else if (try synesthesiaNotesExist(allocator, codex_home)) {
         status = "notes-only";
     }
@@ -1175,13 +1180,21 @@ fn findDuplicateByFingerprintInSnapshotAlloc(
     return null;
 }
 
-fn validateSnapshotRecords(allocator: std.mem.Allocator, snapshot: durable_store.EventSnapshot) !usize {
-    for (snapshot.records) |event| {
-        var record = try parseStoredRecordAlloc(allocator, event.payload);
-        record.deinit(allocator);
+const SynesthesiaDoctorFold = struct {
+    allocator: std.mem.Allocator,
+    lines: usize = 0,
+
+    fn visitor(self: *SynesthesiaDoctorFold) durable_store.EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
     }
-    return snapshot.records.len;
-}
+
+    fn visit(context: *anyopaque, event: durable_store.EventRecordView) !void {
+        const self: *SynesthesiaDoctorFold = @ptrCast(@alignCast(context));
+        var record = try parseStoredRecordAlloc(self.allocator, event.payload);
+        record.deinit(self.allocator);
+        self.lines += 1;
+    }
+};
 
 fn collectNoteRows(allocator: std.mem.Allocator, notes_dir: []const u8, rows: *std.ArrayList([]u8)) !void {
     var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), notes_dir, .{ .iterate = true }) catch |err| switch (err) {

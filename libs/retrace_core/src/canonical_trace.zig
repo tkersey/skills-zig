@@ -1,5 +1,5 @@
 const std = @import("std");
-const jsonl_stream = @import("jsonl_stream.zig");
+const jsonl_stream = @import("jsonl_core");
 
 pub const TraceFormat = enum {
     new_044_plus,

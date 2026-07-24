@@ -18,10 +18,12 @@ on:
       - "libs/core/**"
       - "libs/durable_store/**"
       - "libs/execution_policy_core/**"
+      - "libs/jsonl_core/**"
       - "libs/retrace_core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
+      - "tools/durable_store_perf.zig"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
@@ -169,6 +171,12 @@ jobs:
         run: zig build test-seq --summary all
       - name: Test Retrace core contracts
         run: zig build test-retrace-core --summary all
+      - name: Test JSONL core contracts
+        run: zig build test-jsonl-core --summary all
+      - name: Test durable store contracts
+        run: zig build test-durable-store --summary all
+      - name: Test durable store performance contracts
+        run: zig build test-durable-store-perf --summary all
       - name: Verify non-macOS seq command and capability admission
         run: apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq
 
@@ -186,7 +194,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz seq (Linux)
-        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli --dep retrace_core -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig -Mretrace_core=../../libs/retrace_core/src/lib.zig -ffuzz --test-filter "fuzz "
+        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli --dep retrace_core -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig --dep jsonl_core -Mretrace_core=../../libs/retrace_core/src/lib.zig -Mjsonl_core=../../libs/jsonl_core/src/lib.zig -ffuzz --test-filter "fuzz "
 
   lift:
     needs: changes

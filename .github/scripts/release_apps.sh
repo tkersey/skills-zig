@@ -54,6 +54,10 @@ case "$mode" in
       mark_app memory-note
     }
 
+    mark_jsonl_core_consumers() {
+      mark_durable_store_consumers
+    }
+
     mark_retrace_core_consumers() {
       mark_app seq
       mark_app cas
@@ -76,7 +80,7 @@ case "$mode" in
         local raw="$1"
         local compact="${raw//[[:space:]]/}"
         case "$compact" in
-          ".{"|"},"|"});"|");"|"b,"|"_=addTestStepWithOptions("|".filters=&.{")
+          ".{"|"},"|"});"|");"|"b,"|"addBenchStep("|"_=addTestStepWithOptions("|".filters=&.{")
             return 0
             ;;
         esac
@@ -120,12 +124,20 @@ case "$mode" in
             current_app="ledger"
             return
             ;;
-          *"run_retrace_core_tests"*|*"test-retrace-core"*)
+          *"const retrace_core"*"= b.createModule"*|*"run_retrace_core_tests"*|*"test-retrace-core"*)
             current_app="__retrace_core"
             return
             ;;
           *"jsonl_stream_release_fast"*|*"canonical_json_release_fast"*|*"retrace_large_tests_root"*|*"retrace_corpus_tests_root"*|*"run_retrace_large_tests"*|*"run_retrace_corpus_tests"*)
             current_app="__retrace_core"
+            return
+            ;;
+          *"const jsonl_core"*"= b.createModule"*|*"const durable_store"*"= b.createModule"*|*"durable_store_perf"*|*"run_durable_store_tests"*|*"run_jsonl_core_tests"*|*"test-jsonl-core"*)
+            current_app="__durable_store"
+            return
+            ;;
+          *"const execution_policy_core = b.createModule"*)
+            current_app="__execution_policy_core"
             return
             ;;
           *"ledger_routine_test_filters"*|*"run_ledger_portable_ceiling"*|*"ledger_validation_qualification_root"*)
@@ -243,6 +255,12 @@ case "$mode" in
         elif [[ "$current_app" == "__retrace_core" ]]; then
           mark_retrace_core_consumers
           matched=1
+        elif [[ "$current_app" == "__durable_store" ]]; then
+          mark_durable_store_consumers
+          matched=1
+        elif [[ "$current_app" == "__execution_policy_core" ]]; then
+          mark_execution_policy_core_consumers
+          matched=1
         elif [[ "$current_app" == "ledger" && "$raw" == *"[]const u8,"* ]]; then
           mark_app ledger
           matched=1
@@ -255,6 +273,14 @@ case "$mode" in
                 mark_app "$current_app"
               else
                 mark_durable_store_consumers
+              fi
+              matched=1
+              ;;
+            *"jsonl_core"*|*"jsonl-core"*|*"libs/jsonl_core/"*)
+              if [[ -n "$current_app" ]]; then
+                mark_app "$current_app"
+              else
+                mark_jsonl_core_consumers
               fi
               matched=1
               ;;
@@ -305,11 +331,19 @@ case "$mode" in
         libs/durable_store/*)
           mark_durable_store_consumers
           ;;
+        libs/jsonl_core/*)
+          mark_jsonl_core_consumers
+          ;;
         libs/retrace_core/*)
           mark_retrace_core_consumers
           ;;
         libs/execution_policy_core/*)
           mark_execution_policy_core_consumers
+          ;;
+        tools/durable_store_perf.zig)
+          if [[ "$mode" == "ci-affected" ]]; then
+            mark_app seq
+          fi
           ;;
         .github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas

@@ -11,6 +11,7 @@ on:
       - "libs/core/**"
       - "libs/durable_store/**"
       - "libs/execution_policy_core/**"
+      - "libs/jsonl_core/**"
       - "libs/retrace_core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"

@@ -253,6 +253,7 @@ const Date = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     runtime_io = init.io;
+    durable_store.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argvSource(argv)) |source| {
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
@@ -539,39 +540,11 @@ fn cmdInit(allocator: std.mem.Allocator, path: []const u8) !u8 {
     if (!snapshot.exists) {
         var receipt = try store.replace(allocator, &.{}, .{ .revision = snapshot.revision, .exists = false }, MaxStoreBytes);
         defer receipt.deinit(allocator);
-        try ensureInitLockSidecarGitignored(allocator, path);
         try printJsonLine(allocator, .init, "initialized", path, 0);
         return 0;
     }
     try printJsonLine(allocator, .init, "already_initialized", path, 0);
     return 0;
-}
-
-fn ensureInitLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []const u8) !void {
-    const parent = std.fs.path.dirname(store_path) orelse ".";
-    const git_root = durable_store.findGitRootAlloc(allocator, parent) catch return;
-    defer allocator.free(git_root);
-
-    const lock_path = try durable_store.lockPathAlloc(allocator, store_path);
-    defer allocator.free(lock_path);
-    const lock_rel = if (std.fs.path.isAbsolute(lock_path))
-        try std.fs.path.relative(allocator, git_root, null, git_root, lock_path)
-    else
-        try allocator.dupe(u8, lock_path);
-    defer allocator.free(lock_rel);
-
-    const argv = [_][]const u8{ "git", "-C", git_root, "check-ignore", "-q", "--", lock_rel };
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term == .exited and result.term.exited == 0) return;
-    if (result.term == .exited and result.term.exited == 1) return error.LockSidecarNotGitignored;
-    return error.GitCommandFailed;
 }
 
 fn cmdCapture(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -985,9 +958,11 @@ fn cmdHandoff(allocator: std.mem.Allocator, path: []const u8) !u8 {
 
 fn cmdDoctor(allocator: std.mem.Allocator, path: []const u8) !u8 {
     var backend = durable_store.PersistentEventStore.init(path);
-    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
-    defer snapshot.deinit(allocator);
-    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
+    var fold = LedgerScanFold.init(allocator);
+    defer fold.deinit();
+    var summary = try backend.eventStore().scan(allocator, MaxStoreBytes, fold.visitor());
+    defer summary.deinit(allocator);
+    var loaded = fold.finish();
     defer loaded.deinit(allocator);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -995,7 +970,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, path: []const u8) !u8 {
     try out.writer.print("{{\"command\":\"doctor\",\"ok\":{s},\"records\":{d},\"blank_lines\":{d},\"issues\":{d}", .{
         if (ok) "true" else "false",
         loaded.records.items.len,
-        snapshot.blank_entries,
+        summary.blank_entries,
         loaded.validation.issue_count,
     });
     if (loaded.validation.first_issue) |message| {
@@ -1163,7 +1138,19 @@ fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadRes
 
 fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: *const durable_store.EventSnapshot) !LoadResult {
     var records = std.ArrayList(Record).empty;
+    errdefer deinitRecords(allocator, &records);
     var validation = ValidationIssue{};
+    try foldRecordsFromSnapshot(allocator, snapshot, &records, &validation);
+    for (records.items) |record| validateProjectedRecord(record, &validation);
+    return .{ .records = records, .validation = validation };
+}
+
+fn foldRecordsFromSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: *const durable_store.EventSnapshot,
+    records: *std.ArrayList(Record),
+    validation: *ValidationIssue,
+) !void {
     for (snapshot.records) |stored| {
         const line = stored.payload;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
@@ -1304,9 +1291,57 @@ fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: *const durabl
         record.source_event_count = 1;
         try records.append(allocator, record);
     }
-    for (records.items) |record| validateProjectedRecord(record, &validation);
-    return .{ .records = records, .validation = validation };
 }
+
+const LedgerScanFold = struct {
+    allocator: std.mem.Allocator,
+    records: std.ArrayList(Record) = .empty,
+    validation: ValidationIssue = .{},
+
+    fn init(allocator: std.mem.Allocator) LedgerScanFold {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *LedgerScanFold) void {
+        deinitRecords(self.allocator, &self.records);
+    }
+
+    fn visitor(self: *LedgerScanFold) durable_store.EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+
+    fn visit(context: *anyopaque, view: durable_store.EventRecordView) !void {
+        const self: *LedgerScanFold = @ptrCast(@alignCast(context));
+        var records = [_]durable_store.EventRecord{.{
+            .payload = @constCast(view.payload),
+            .ordinal = view.ordinal,
+            .diagnostic_position = view.diagnostic_position,
+        }};
+        const snapshot = durable_store.EventSnapshot{
+            .logical_ref = &.{},
+            .exists = true,
+            .revision = &.{},
+            .content_digest = &.{},
+            .records = &records,
+        };
+        try foldRecordsFromSnapshot(
+            self.allocator,
+            &snapshot,
+            &self.records,
+            &self.validation,
+        );
+    }
+
+    fn finish(self: *LedgerScanFold) LoadResult {
+        for (self.records.items) |record| validateProjectedRecord(record, &self.validation);
+        const loaded = LoadResult{
+            .records = self.records,
+            .validation = self.validation,
+        };
+        self.records = .empty;
+        return loaded;
+    }
+};
 
 fn initRecordFromObject(allocator: std.mem.Allocator, neg_id: []const u8, status: []const u8, raw_record: std.json.Value) !Record {
     const record_obj = switch (raw_record) {
@@ -2512,7 +2547,11 @@ test "init lock check accepts an ignored store inside a git repository" {
 
     const store = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultStorePath });
     defer std.testing.allocator.free(store);
-    try ensureInitLockSidecarGitignored(std.testing.allocator, store);
+    try durable_store.ensureLockSidecarGitignored(
+        std.testing.allocator,
+        std.testing.io,
+        store,
+    );
 }
 
 test "migrate parses explicit from and to paths" {
@@ -3145,6 +3184,13 @@ test "symbolic HEAD is resolved and empty artifact identity cannot activate" {
     const head_output = try testRunCommand(std.testing.allocator, root, &.{ "git", "rev-parse", "HEAD" });
     defer std.testing.allocator.free(head_output);
     const head = std.mem.trim(u8, head_output, " \t\r\n");
+    const gitignore = try std.fs.path.join(std.testing.allocator, &.{ root, ".gitignore" });
+    defer std.testing.allocator.free(gitignore);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "*.jsonl.lock\n.durable-store-locks/\n",
+    );
 
     const store = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
     defer std.testing.allocator.free(store);

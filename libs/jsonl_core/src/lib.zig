@@ -7,6 +7,16 @@ pub const default_max_line_bytes: usize = 256 * 1024 * 1024;
 
 pub const Options = struct {
     max_line_bytes: usize = default_max_line_bytes,
+    chunk_observer: ?ChunkObserver = null,
+};
+
+pub const ChunkObserver = struct {
+    context: *anyopaque,
+    observeFn: *const fn (context: *anyopaque, bytes: []const u8) anyerror!void,
+
+    pub fn observe(self: ChunkObserver, bytes: []const u8) !void {
+        try self.observeFn(self.context, bytes);
+    }
 };
 
 pub const Line = struct {
@@ -21,6 +31,7 @@ pub const Stream = struct {
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     max_line_bytes: usize,
+    chunk_observer: ?ChunkObserver,
     line: std.ArrayList(u8) = .empty,
     chunk: [chunk_size]u8 = undefined,
     chunk_pos: usize = 0,
@@ -39,6 +50,7 @@ pub const Stream = struct {
             .allocator = allocator,
             .reader = reader,
             .max_line_bytes = options.max_line_bytes,
+            .chunk_observer = options.chunk_observer,
         };
     }
 
@@ -72,6 +84,7 @@ pub const Stream = struct {
             self.chunk_len = try self.reader.readSliceShort(self.chunk[0..]);
             self.chunk_pos = 0;
             self.bytes_read += self.chunk_len;
+            if (self.chunk_observer) |observer| try observer.observe(self.chunk[0..self.chunk_len]);
             if (self.chunk_len == 0) self.eof = true;
         }
     }
@@ -128,4 +141,24 @@ test "stream rejects only an oversized record" {
     defer stream.deinit();
 
     try std.testing.expectError(error.LineTooLong, stream.next());
+}
+
+test "stream observes each raw byte exactly once" {
+    const Observer = struct {
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn observe(context: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var observer = Observer{};
+    defer observer.bytes.deinit(std.testing.allocator);
+    var reader = std.Io.Reader.fixed("first\n\nlast");
+    var stream = try Stream.init(std.testing.allocator, &reader, .{
+        .chunk_observer = .{ .context = &observer, .observeFn = Observer.observe },
+    });
+    defer stream.deinit();
+    while (try stream.next()) |_| {}
+    try std.testing.expectEqualStrings("first\n\nlast", observer.bytes.items);
 }

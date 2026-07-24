@@ -21,15 +21,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const jsonl_core = b.createModule(.{
+        .root_source_file = b.path("../../libs/jsonl_core/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const retrace_core = b.createModule(.{
         .root_source_file = b.path("../../libs/retrace_core/src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
     });
     const durable_store = b.createModule(.{
         .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
     });
     const execution_policy_core = b.createModule(.{
         .root_source_file = b.path("../../libs/execution_policy_core/src/root.zig"),
