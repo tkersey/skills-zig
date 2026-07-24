@@ -180,7 +180,9 @@ const AuditState = struct {
     head_digest: []const u8 = GenesisDigest,
     current_construction: ?std.json.Value = null,
     current_construction_ref: ?[]const u8 = null,
+    current_subject_digest: ?[]const u8 = null,
     latest_counterexample_set_ref: ?[]const u8 = null,
+    latest_counterexample_set_subject_digest: ?[]const u8 = null,
 };
 
 const VerifiedEvent = struct {
@@ -305,6 +307,8 @@ fn auditCurrentProofState(state: *AuditState) !void {
             state.current_construction_ref,
             state.classes.items,
             state.latest_counterexample_set_ref,
+            state.current_subject_digest,
+            state.latest_counterexample_set_subject_digest,
             &state.counts,
         );
     } else auditMissingConstruction(state.classes.items, &state.counts);
@@ -315,8 +319,13 @@ fn applyArtifactState(state: *AuditState, event: VerifiedEvent, in_window: bool)
         state.classes.clearRetainingCapacity();
         state.current_construction = null;
         state.current_construction_ref = null;
+        state.current_subject_digest = null;
         state.latest_counterexample_set_ref = null;
+        state.latest_counterexample_set_subject_digest = null;
         if (in_window) resetConstructionChecks(&state.counts);
+    }
+    if (try optionalStringField(event.object, "subject_digest")) |subject| {
+        state.current_subject_digest = subject;
     }
     if (std.mem.eql(u8, event.kind, "counterexample_set_registered")) {
         state.latest_counterexample_set_ref = try applyCounterexampleSet(
@@ -326,6 +335,8 @@ fn applyArtifactState(state: *AuditState, event: VerifiedEvent, in_window: bool)
             in_window,
             &state.counts,
         );
+        state.latest_counterexample_set_subject_digest =
+            try counterexampleSetSubjectDigest(event.body);
     }
     if (std.mem.eql(u8, event.kind, "construction_contract_registered")) {
         state.current_construction = event.body;
@@ -338,6 +349,8 @@ fn applyArtifactState(state: *AuditState, event: VerifiedEvent, in_window: bool)
             state.current_construction_ref,
             state.classes.items,
             state.latest_counterexample_set_ref,
+            state.current_subject_digest,
+            state.latest_counterexample_set_subject_digest,
             &ignored,
         );
     }
@@ -358,6 +371,8 @@ fn applyCountedWindowEvent(state: *AuditState, event: VerifiedEvent) !void {
             try optionalStringField(event.object, "construction_ref"),
             state.classes.items,
             state.latest_counterexample_set_ref,
+            state.current_subject_digest,
+            state.latest_counterexample_set_subject_digest,
             &state.counts,
         );
     } else if (std.mem.eql(u8, event.kind, "effect_recorded")) {
@@ -375,6 +390,8 @@ fn applyCountedWindowEvent(state: *AuditState, event: VerifiedEvent) !void {
                 state.current_construction_ref,
                 state.classes.items,
                 state.latest_counterexample_set_ref,
+                state.current_subject_digest,
+                state.latest_counterexample_set_subject_digest,
                 &state.counts,
             );
         } else auditMissingConstruction(state.classes.items, &state.counts);
@@ -452,11 +469,22 @@ fn applyCounterexampleSet(
     return artifact_id;
 }
 
+fn counterexampleSetSubjectDigest(body_value: std.json.Value) ![]const u8 {
+    const artifact = try artifactObject(body_value, "counterexample-set/v1");
+    const payload = try asObject(try field(artifact, "payload"));
+    const subject = try asObject(try field(payload, "subject"));
+    const digest = try stringField(subject, "artifact_digest");
+    try requireDigest(digest);
+    return digest;
+}
+
 fn auditConstruction(
     body_value: std.json.Value,
     construction_ref: ?[]const u8,
     classes: []const ClassState,
     latest_counterexample_set_ref: ?[]const u8,
+    current_subject_digest: ?[]const u8,
+    latest_counterexample_set_subject_digest: ?[]const u8,
     counts: *Counts,
 ) !void {
     resetConstructionChecks(counts);
@@ -482,6 +510,8 @@ fn auditConstruction(
         construction_ref,
         requirements[0..requirement_count],
         latest_counterexample_set_ref,
+        current_subject_digest,
+        latest_counterexample_set_subject_digest,
     );
     counts.accepted_class_checks = audit.accepted_class_checks;
     counts.recurrent_class_checks = audit.recurrent_class_checks;
@@ -1006,13 +1036,15 @@ const TestBodies = [_][]const u8{
         "\",\"payload\":{\"classes\":[{\"boundary_key\":\"boundary\"," ++
         "\"class_id\":\"class-1\",\"law_ref\":\"law-1\"," ++
         "\"owner_boundary\":\"src\",\"severity\":\"medium\"," ++
-        "\"status\":\"accepted\"}]},\"predecessor_refs\":[]," ++
+        "\"status\":\"accepted\"}],\"subject\":{\"artifact_digest\":\"" ++
+        TestSubjectDigest ++ "\"}},\"predecessor_refs\":[]," ++
         "\"schema\":\"counterexample-set/v1\"}}",
     "{\"artifact\":{\"artifact_id\":\"" ++ TestSetTwoDigest ++
         "\",\"payload\":{\"classes\":[{\"boundary_key\":\"boundary\"," ++
         "\"class_id\":\"class-1\",\"law_ref\":\"law-1\"," ++
         "\"owner_boundary\":\"src\",\"severity\":\"medium\"," ++
-        "\"status\":\"accepted\"}]},\"predecessor_refs\":[\"" ++
+        "\"status\":\"accepted\"}],\"subject\":{\"artifact_digest\":\"" ++
+        TestSubjectDigest ++ "\"}},\"predecessor_refs\":[\"" ++
         TestSetOneDigest ++ "\"]," ++
         "\"schema\":\"counterexample-set/v1\"}}",
     "{\"artifact\":{\"artifact_id\":\"" ++ TestConstructionDigest ++
@@ -1389,7 +1421,15 @@ test "kernel audit binds Construction envelope to artifact identity" {
     var counts = Counts{};
     try std.testing.expectError(
         error.ConstructionRefMismatch,
-        auditConstruction(parsed.value, TestSetOneDigest, &.{}, null, &counts),
+        auditConstruction(
+            parsed.value,
+            TestSetOneDigest,
+            &.{},
+            null,
+            null,
+            null,
+            &counts,
+        ),
     );
 }
 
@@ -1456,7 +1496,15 @@ test "kernel audit rejects every legacy Construction schema" {
         var counts = Counts{};
         try std.testing.expectError(
             error.LegacyConstructionUnsupported,
-            auditConstruction(parsed.value, TestConstructionDigest, &.{}, null, &counts),
+            auditConstruction(
+                parsed.value,
+                TestConstructionDigest,
+                &.{},
+                null,
+                null,
+                null,
+                &counts,
+            ),
         );
     }
 }
@@ -1493,6 +1541,8 @@ test "kernel audit rejects proof coverage from another owner" {
         TestConstructionDigest,
         &classes,
         TestSetOneDigest,
+        TestSubjectDigest,
+        TestSubjectDigest,
         &counts,
     );
     try std.testing.expectEqual(@as(usize, 0), counts.owner_local_covered);
@@ -1523,6 +1573,8 @@ test "kernel strict audit observes the latest Counterexample Set binding" {
         TestConstructionDigest,
         &classes,
         TestSetOneDigest,
+        TestSubjectDigest,
+        TestSubjectDigest,
         &counts,
     );
     try std.testing.expect(!counts.current_review_binding);
@@ -1531,9 +1583,21 @@ test "kernel strict audit observes the latest Counterexample Set binding" {
         TestConstructionDigest,
         &classes,
         TestSetTwoDigest,
+        TestSubjectDigest,
+        TestSubjectDigest,
         &counts,
     );
     try std.testing.expect(counts.current_review_binding);
+    try auditConstruction(
+        parsed.value,
+        TestConstructionDigest,
+        &classes,
+        TestSetTwoDigest,
+        TestChangedDigest,
+        TestSubjectDigest,
+        &counts,
+    );
+    try std.testing.expect(!counts.current_review_binding);
 }
 
 test "kernel strict audit resolves the surface completeness proof" {
@@ -1558,6 +1622,8 @@ test "kernel strict audit resolves the surface completeness proof" {
         TestConstructionDigest,
         &.{},
         TestSetOneDigest,
+        TestSubjectDigest,
+        TestSubjectDigest,
         &counts,
     );
     try std.testing.expect(!counts.surface_completeness_bound);
@@ -1604,6 +1670,8 @@ test "kernel audit rechecks active proof when a class recurs" {
         TestConstructionDigest,
         state.classes.items,
         TestSetOneDigest,
+        TestSubjectDigest,
+        TestSubjectDigest,
         &state.counts,
     );
     try applyWindowEvent(&state, .{

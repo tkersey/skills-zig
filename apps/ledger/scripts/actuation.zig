@@ -254,6 +254,7 @@ const State = struct {
     classes: std.ArrayList(ClassRecord) = .empty,
     counterexample_sets: std.ArrayList([]const u8) = .empty,
     latest_counterexample_set_construction_ref: ?[]const u8 = null,
+    latest_counterexample_set_subject_digest: ?[]const u8 = null,
     pending: ?Pending = null,
     used_steps: std.ArrayList([]const u8) = .empty,
     used_keys: std.ArrayList([]const u8) = .empty,
@@ -1017,7 +1018,17 @@ fn validateConstructionPayload(schema: []const u8, value: std.json.Value) !void 
         false,
     );
     _ = try validateStringArray(try field(payload, "invalid_states_eliminated"), false);
-    _ = try validateStringArray(try field(payload, "counterexample_class_refs"), false);
+    const counterexample_refs = try validateStringArray(
+        try field(payload, "counterexample_class_refs"),
+        false,
+    );
+    for (counterexample_refs.items, 0..) |item, index| {
+        if (index > 0 and
+            !std.mem.lessThan(u8, counterexample_refs.items[index - 1].string, item.string))
+        {
+            return error.NonCanonicalStringOrder;
+        }
+    }
     const preserved_observations = try validateStringArray(
         try field(payload, "preserved_observations"),
         false,
@@ -1043,6 +1054,12 @@ pub const CandidateFamily = enum {
     @"admitted-domain-restriction",
     @"representation-or-owner-strengthening",
     @"ablation-normalization",
+};
+const ConstructionV3CandidateFamilies = [_]CandidateFamily{
+    .@"realization-preserve",
+    .@"admitted-domain-restriction",
+    .@"representation-or-owner-strengthening",
+    .@"ablation-normalization",
 };
 const CandidateStatus = enum { selected, dominated, incomparable, obstructed };
 const CandidateDerivation = enum { @"incumbent-relative", @"incumbent-independent" };
@@ -1182,13 +1199,13 @@ fn validateConstructionStructure(structure: ConstructionStructure) !void {
             return error.MissingCounterexampleSetRef;
         try requireDigest(set_ref);
     }
-    if (recompilation.candidates.len != @typeInfo(CandidateFamily).@"enum".fields.len) {
+    if (recompilation.candidates.len != ConstructionV3CandidateFamilies.len) {
         return error.IncompleteCandidateFamilies;
     }
     var selected: ?Candidate = null;
     var independent_count: usize = 0;
     for (recompilation.candidates, 0..) |candidate, index| {
-        const expected_family: CandidateFamily = @enumFromInt(index);
+        const expected_family = ConstructionV3CandidateFamilies[index];
         if (candidate.family != expected_family) return error.NonCanonicalCandidateFamilies;
         try requireNonBlank(candidate.candidate_id);
         try requireUniqueCandidateId(recompilation.candidates[0..index], candidate.candidate_id);
@@ -1316,7 +1333,10 @@ fn validateSupersession(surface: SemanticSurface, supersession: Supersession) !v
         {
             return error.InvalidUnchangedSupersession;
         },
-        .normalized => if (supersession.introduced_factor_refs.len != 0 or
+        .normalized => if (factorInventoriesEqual(
+            surface.predecessor_factors,
+            surface.successor_factors,
+        ) or supersession.introduced_factor_refs.len != 0 or
             supersession.essential_additions.len != 0 or
             (supersession.retired_factor_refs.len == 0 and
                 supersession.replacement_relations.len == 0))
@@ -1950,6 +1970,7 @@ fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
         state.classes = .empty;
         state.counterexample_sets = .empty;
         state.latest_counterexample_set_construction_ref = null;
+        state.latest_counterexample_set_subject_digest = null;
     } else if (view.predecessors.items.len != 0) return error.InvalidInitialGoal;
     state.goal = view;
 }
@@ -1996,7 +2017,7 @@ fn validateConstructionAgainstState(
     try validateConstructionModeAndLineage(state, view, payload);
     try validateConstructionOwners(payload);
     try validateConstructionScope(goal.payload, payload);
-    try validateConstructionLaws(goal.payload, payload);
+    try validateConstructionLaws(goal.payload, state.construction, payload);
     try validateConstructionAcceptance(goal.payload, payload);
     try validateConstructionCounterexamples(state, payload, true);
 }
@@ -2130,6 +2151,7 @@ fn pathWithinScope(path: []const u8, scope: []const u8) bool {
 
 fn validateConstructionLaws(
     goal_value: std.json.Value,
+    predecessor: ?ArtifactView,
     construction: std.json.ObjectMap,
 ) !void {
     const goal = try asObject(goal_value);
@@ -2152,12 +2174,22 @@ fn validateConstructionLaws(
             return error.UncoveredGoalLaw;
         }
     }
-    try validateConstructionSemanticReferences(laws, obligations, construction);
+    const predecessor_obligations = if (predecessor) |view| blk: {
+        const predecessor_payload = try asObject(view.payload);
+        break :blk try asArray(try field(predecessor_payload, "proof_obligations"));
+    } else obligations;
+    try validateConstructionSemanticReferences(
+        laws,
+        predecessor_obligations,
+        obligations,
+        construction,
+    );
 }
 
 fn validateConstructionSemanticReferences(
     laws: std.json.Array,
-    obligations: std.json.Array,
+    predecessor_obligations: std.json.Array,
+    successor_obligations: std.json.Array,
     construction: std.json.ObjectMap,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2170,25 +2202,25 @@ fn validateConstructionSemanticReferences(
     );
     for (structure.recompilation.candidates) |candidate| {
         try validateLawReferenceSlice(laws, candidate.law_refs);
-        try validateProofReferenceSlice(obligations, candidate.observation_refs);
-        try validateFactorReferences(laws, obligations, candidate.factors);
+        try validateProofReferenceSlice(successor_obligations, candidate.observation_refs);
+        try validateFactorReferences(laws, successor_obligations, candidate.factors);
     }
     try validateFactorReferences(
         laws,
-        obligations,
+        predecessor_obligations,
         structure.semantic_surface.predecessor_factors,
     );
     try validateFactorReferences(
         laws,
-        obligations,
+        successor_obligations,
         structure.semantic_surface.successor_factors,
     );
     for (structure.supersession.essential_additions) |addition| {
         try validateLawReferenceSlice(laws, addition.law_refs);
-        try validateProofReferenceSlice(obligations, addition.proof_refs);
+        try validateProofReferenceSlice(successor_obligations, addition.proof_refs);
     }
     if (!hasObjectId(
-        obligations,
+        successor_obligations,
         "obligation_id",
         structure.supersession.surface_completeness_proof_ref,
     )) return error.UnknownConstructionProofRef;
@@ -2364,6 +2396,26 @@ fn validateConstructionCounterexamples(
     {
         return error.CounterexampleSetPredecessorMismatch;
     }
+    if (admitting_successor and
+        (state.latest_counterexample_set_subject_digest == null or
+            state.subject_digest == null or
+            !std.mem.eql(
+                u8,
+                state.latest_counterexample_set_subject_digest.?,
+                state.subject_digest.?,
+            )))
+    {
+        return error.StaleCounterexampleSetSubject;
+    }
+    if (admitting_successor and accepted_count == 0) {
+        const predecessor_payload = try asObject(state.construction.?.payload);
+        const predecessor_refs = try asArray(
+            try field(predecessor_payload, "counterexample_class_refs"),
+        );
+        if (predecessor_refs.items.len == 0) {
+            return error.UnnecessaryReviewRecompilation;
+        }
+    }
 }
 
 fn obligationProvidesImplementationProof(
@@ -2420,6 +2472,8 @@ pub fn auditConstruction(
     construction_ref: ?[]const u8,
     classes: []const ConstructionClassRequirement,
     latest_counterexample_set_ref: ?[]const u8,
+    current_subject_digest: ?[]const u8,
+    latest_counterexample_set_subject_digest: ?[]const u8,
 ) !ConstructionAudit {
     const document = try asObject(body_value);
     const artifact = try asObject(try field(document, "artifact"));
@@ -2458,11 +2512,18 @@ pub fn auditConstruction(
             structure.recompilation.counterexample_set_ref == null,
         .@"accepted-review-fold" => exact_class_set and
             latest_counterexample_set_ref != null and
+            current_subject_digest != null and
+            latest_counterexample_set_subject_digest != null and
             structure.recompilation.counterexample_set_ref != null and
             std.mem.eql(
                 u8,
                 latest_counterexample_set_ref.?,
                 structure.recompilation.counterexample_set_ref.?,
+            ) and
+            std.mem.eql(
+                u8,
+                current_subject_digest.?,
+                latest_counterexample_set_subject_digest.?,
             ),
     };
     var result = ConstructionAudit{
@@ -2581,6 +2642,9 @@ fn applyCounterexampleRegistration(state: *State, event: ParsedEvent) !void {
     try state.counterexample_sets.append(state.allocator, view.artifact_id);
     state.latest_counterexample_set_construction_ref =
         state.construction.?.artifact_id;
+    const subject = try asObject(try field(payload, "subject"));
+    state.latest_counterexample_set_subject_digest =
+        try stringField(subject, "artifact_digest");
 }
 
 fn validateCounterexampleSubject(state: *State, payload: std.json.ObjectMap) !void {
@@ -4724,6 +4788,104 @@ test "actuation: Construction v3 candidate and factor surface is closed" {
     );
 }
 
+test "actuation: Construction v3 candidate family order is schema-owned" {
+    try std.testing.expectEqualSlices(
+        CandidateFamily,
+        &.{
+            .@"realization-preserve",
+            .@"admitted-domain-restriction",
+            .@"representation-or-owner-strengthening",
+            .@"ablation-normalization",
+        },
+        &ConstructionV3CandidateFamilies,
+    );
+}
+
+test "actuation: Construction v3 counterexample refs require canonical order" {
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        null,
+        "initial",
+        TestDigest1,
+        "[\"class-z\",\"class-a\"]",
+        null,
+    );
+    defer std.testing.allocator.free(construction);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        construction,
+        .{},
+    );
+    defer parsed.deinit();
+    const document = try asObject(parsed.value);
+    const artifact = try asObject(try field(document, "artifact"));
+    try std.testing.expectError(
+        error.NonCanonicalStringOrder,
+        validateConstructionPayload(
+            ConstructionSchema,
+            try field(artifact, "payload"),
+        ),
+    );
+}
+
+test "actuation: normalized supersession requires a factor delta" {
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        TestDigest1,
+        "realization-repair",
+        TestDigest1,
+        "[\"class-a\"]",
+        TestDigest2,
+    );
+    defer std.testing.allocator.free(successor);
+    const normalized = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor,
+        "\"disposition\":\"unchanged-realization\"",
+        "\"disposition\":\"normalized\"",
+    );
+    defer std.testing.allocator.free(normalized);
+    const unpreserved = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        normalized,
+        "\"preserved_factor_refs\":[\"factor-owner\"]",
+        "\"preserved_factor_refs\":[]",
+    );
+    defer std.testing.allocator.free(unpreserved);
+    const identity_replacement = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        unpreserved,
+        "\"replacement_relations\":[]",
+        "\"replacement_relations\":[{\"predecessor_factor_refs\":" ++
+            "[\"factor-owner\"],\"rationale\":\"identity replacement\"," ++
+            "\"relation_id\":\"replace-owner\",\"successor_factor_refs\":" ++
+            "[\"factor-owner\"]}]",
+    );
+    defer std.testing.allocator.free(identity_replacement);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        identity_replacement,
+        .{},
+    );
+    defer parsed.deinit();
+    const document = try asObject(parsed.value);
+    const artifact = try asObject(try field(document, "artifact"));
+    try std.testing.expectError(
+        error.InvalidNormalizedSupersession,
+        validateConstructionPayload(
+            ConstructionSchema,
+            try field(artifact, "payload"),
+        ),
+    );
+}
+
 test "actuation: Construction v3 semantic references resolve to owned namespaces" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
@@ -4769,6 +4931,84 @@ test "actuation: Construction v3 semantic references resolve to owned namespaces
     try std.testing.expectError(
         error.UnknownConstructionProofRef,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", unknown_proof),
+    );
+}
+
+test "actuation: predecessor factor proofs resolve through predecessor artifact" {
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        TestDigest0,
+        TestDigest1,
+        "realization-repair",
+        TestDigest0,
+        "[]",
+        TestDigest2,
+    );
+    defer std.testing.allocator.free(successor);
+    const predecessor_prefix =
+        "\"semantic_surface\":{\"predecessor_factors\":[{" ++
+        "\"description\":\"owner remains authoritative\"," ++
+        "\"factor_id\":\"factor-owner\",\"kind\":\"law-owner\"," ++
+        "\"law_refs\":[\"law-1\"],\"observation_refs\":[\"proof-1\"]";
+    const predecessor_replacement =
+        "\"semantic_surface\":{\"predecessor_factors\":[{" ++
+        "\"description\":\"owner remains authoritative\"," ++
+        "\"factor_id\":\"factor-owner\",\"kind\":\"law-owner\"," ++
+        "\"law_refs\":[\"law-1\"],\"observation_refs\":[\"predecessor-proof\"]";
+    const artifact = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        successor,
+        predecessor_prefix,
+        predecessor_replacement,
+    );
+    defer std.testing.allocator.free(artifact);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        artifact,
+        .{},
+    );
+    defer parsed.deinit();
+    var laws = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"law_id\":\"law-1\"}]",
+        .{},
+    );
+    defer laws.deinit();
+    var predecessor_obligations = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"obligation_id\":\"predecessor-proof\"}]",
+        .{},
+    );
+    defer predecessor_obligations.deinit();
+    var empty_obligations = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[]",
+        .{},
+    );
+    defer empty_obligations.deinit();
+    const document = try asObject(parsed.value);
+    const envelope = try asObject(try field(document, "artifact"));
+    const payload = try asObject(try field(envelope, "payload"));
+    const successor_obligations = try asArray(try field(payload, "proof_obligations"));
+    try validateConstructionSemanticReferences(
+        try asArray(laws.value),
+        try asArray(predecessor_obligations.value),
+        successor_obligations,
+        payload,
+    );
+    try std.testing.expectError(
+        error.UnknownConstructionProofRef,
+        validateConstructionSemanticReferences(
+            try asArray(laws.value),
+            try asArray(empty_obligations.value),
+            successor_obligations,
+            payload,
+        ),
     );
 }
 
@@ -4920,6 +5160,76 @@ test "actuation: resolved review debt admits a clearing successor" {
         "{\"schema\":\"operation-aborted/v1\",\"step_id\":\"cleared-edit\"," ++
             "\"reason\":\"test complete\"}",
         null,
+    );
+}
+
+test "actuation: rejected-only review cannot authorize a clearing successor" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-a", "law-1", "owner", "medium", "rejected");
+    const rejected_set = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(rejected_set);
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[]",
+        rejected_set,
+    );
+    defer std.testing.allocator.free(successor);
+    try std.testing.expectError(
+        error.UnnecessaryReviewRecompilation,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor),
+    );
+}
+
+test "actuation: edit makes prior review subject stale for a successor" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-a", "law-1", "owner", "medium", "rejected");
+    const rejected_set = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(rejected_set);
+    var edit = try testPrepare(&harness, "post-review-edit", "edit", "[\"proof-1\"]");
+    defer edit.deinit(std.testing.allocator);
+    try testAppendOwner(
+        &harness,
+        "effect_recorded",
+        TestDigest1,
+        "{\"schema\":\"effect-recorded/v1\",\"step_id\":\"post-review-edit\"," ++
+            "\"pre_effect_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+            "\"changed_paths\":[\"src/file.zig\"]}",
+        edit.capability,
+    );
+    try testAppendOwner(
+        &harness,
+        "operation_observed",
+        null,
+        "{\"schema\":\"operation-observed/v1\",\"step_id\":\"post-review-edit\"," ++
+            "\"status\":\"passed\",\"discharged_refs\":[\"proof-1\"]," ++
+            "\"evidence_refs\":[\"" ++ TestDigest2 ++ "\"]}",
+        null,
+    );
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest1,
+        "[]",
+        rejected_set,
+    );
+    defer std.testing.allocator.free(successor);
+    try std.testing.expectError(
+        error.StaleCounterexampleSetSubject,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor),
     );
 }
 
