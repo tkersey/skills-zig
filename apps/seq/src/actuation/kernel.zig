@@ -48,6 +48,17 @@ const Counts = struct {
     operation_prepared: usize = 0,
     operation_observed: usize = 0,
     subject_changes: usize = 0,
+    candidate_count: usize = 0,
+    incumbent_independent_candidates: usize = 0,
+    predecessor_factor_count: usize = 0,
+    successor_factor_count: usize = 0,
+    preserved_factor_count: usize = 0,
+    retired_factor_count: usize = 0,
+    introduced_factor_count: usize = 0,
+    replacement_relation_count: usize = 0,
+    essential_addition_count: usize = 0,
+    surface_completeness_bound: bool = false,
+    review_recompilation: bool = false,
 };
 
 pub fn auditEvidenceStoreAlloc(
@@ -85,6 +96,13 @@ pub fn hasStrictFailure(allocator: std.mem.Allocator, rendered: []const u8) !boo
         "owner_local_implementation_missing",
         "recurrent_example_only_violations",
     }) |name| if (try integerField(checks, name) > 0) return true;
+    if (try integerField(checks, "candidate_count") !=
+        @typeInfo(ledger_actuation_core.CandidateFamily).@"enum".fields.len)
+    {
+        return true;
+    }
+    if (try integerField(checks, "incumbent_independent_candidates") == 0) return true;
+    if (!try boolField(checks, "surface_completeness_bound")) return true;
     return false;
 }
 
@@ -431,58 +449,46 @@ fn auditConstruction(
     classes: []const ClassState,
     counts: *Counts,
 ) !void {
-    const artifact = try constructionArtifactObject(body_value);
-    const artifact_id = try stringField(artifact, "artifact_id");
-    const construction_schema = try stringField(artifact, "schema");
-    try requireDigest(artifact_id);
-    if (construction_ref == null or !std.mem.eql(u8, construction_ref.?, artifact_id)) {
-        return error.ConstructionRefMismatch;
-    }
     resetConstructionChecks(counts);
-    const payload = try asObject(try field(artifact, "payload"));
-    const refs = try asArray(try field(payload, "counterexample_class_refs"));
-    const architecture = try asObject(try field(payload, "architecture"));
-    const laws = try asArray(try field(architecture, "governing_law_refs"));
-    const obligations = try asArray(try field(payload, "proof_obligations"));
+    var requirements = try std.heap.page_allocator.alloc(
+        ledger_actuation_core.ConstructionClassRequirement,
+        classes.len,
+    );
+    defer std.heap.page_allocator.free(requirements);
+    var requirement_count: usize = 0;
     for (classes) |class| {
         if (!std.mem.eql(u8, class.status, "accepted")) continue;
-        counts.accepted_class_checks += 1;
-        if (class.occurrences > 1) counts.recurrent_class_checks += 1;
-        if (std.mem.eql(u8, construction_schema, "construction-contract/v1")) {
-            counts.owner_local_missing += 1;
-            continue;
-        }
-        const identity_covered = stringArrayContains(refs, class.class_id) and
-            stringArrayContains(laws, class.law_ref);
-        const implementation = obligationCoverage(
-            obligations,
-            class.law_ref,
-            class.owner_boundary,
-            "implementation",
-        );
-        const acceptance = obligationCoverage(
-            obligations,
-            class.law_ref,
-            class.owner_boundary,
-            "acceptance",
-        );
-        const requires_strong = class.occurrences > 1 or
-            std.mem.eql(u8, class.severity, "high") or
-            std.mem.eql(u8, class.severity, "critical");
-        const implementation_sufficient = implementation.any and
-            (!requires_strong or implementation.non_example);
-        if (identity_covered and implementation_sufficient) {
-            counts.owner_local_covered += 1;
-        } else {
-            counts.owner_local_missing += 1;
-            if (identity_covered and acceptance.any and !implementation.any) {
-                counts.aggregate_only += 1;
-            }
-        }
-        if (class.occurrences > 1 and implementation.any and !implementation.non_example) {
-            counts.recurrent_example_only += 1;
-        }
+        requirements[requirement_count] = .{
+            .class_id = class.class_id,
+            .law_ref = class.law_ref,
+            .owner_boundary = class.owner_boundary,
+            .severity = class.severity,
+            .occurrences = class.occurrences,
+        };
+        requirement_count += 1;
     }
+    const audit = try ledger_actuation_core.auditConstruction(
+        body_value,
+        construction_ref,
+        requirements[0..requirement_count],
+    );
+    counts.accepted_class_checks = audit.accepted_class_checks;
+    counts.recurrent_class_checks = audit.recurrent_class_checks;
+    counts.owner_local_covered = audit.owner_local_covered;
+    counts.owner_local_missing = audit.owner_local_missing;
+    counts.recurrent_example_only = audit.recurrent_example_only;
+    counts.aggregate_only = audit.aggregate_only;
+    counts.candidate_count = audit.candidate_count;
+    counts.incumbent_independent_candidates = audit.incumbent_independent_candidates;
+    counts.predecessor_factor_count = audit.predecessor_factor_count;
+    counts.successor_factor_count = audit.successor_factor_count;
+    counts.preserved_factor_count = audit.preserved_factor_count;
+    counts.retired_factor_count = audit.retired_factor_count;
+    counts.introduced_factor_count = audit.introduced_factor_count;
+    counts.replacement_relation_count = audit.replacement_relation_count;
+    counts.essential_addition_count = audit.essential_addition_count;
+    counts.surface_completeness_bound = audit.surface_completeness_bound;
+    counts.review_recompilation = audit.review_recompilation;
 }
 
 fn resetConstructionChecks(counts: *Counts) void {
@@ -492,6 +498,17 @@ fn resetConstructionChecks(counts: *Counts) void {
     counts.owner_local_missing = 0;
     counts.recurrent_example_only = 0;
     counts.aggregate_only = 0;
+    counts.candidate_count = 0;
+    counts.incumbent_independent_candidates = 0;
+    counts.predecessor_factor_count = 0;
+    counts.successor_factor_count = 0;
+    counts.preserved_factor_count = 0;
+    counts.retired_factor_count = 0;
+    counts.introduced_factor_count = 0;
+    counts.replacement_relation_count = 0;
+    counts.essential_addition_count = 0;
+    counts.surface_completeness_bound = false;
+    counts.review_recompilation = false;
 }
 
 fn auditMissingConstruction(classes: []const ClassState, counts: *Counts) void {
@@ -502,31 +519,6 @@ fn auditMissingConstruction(classes: []const ClassState, counts: *Counts) void {
         counts.owner_local_missing += 1;
         if (class.occurrences > 1) counts.recurrent_class_checks += 1;
     }
-}
-
-const ProofCoverage = struct { any: bool = false, non_example: bool = false };
-
-fn obligationCoverage(
-    obligations: std.json.Array,
-    law_ref: []const u8,
-    owner_boundary: ?[]const u8,
-    proof_kind: []const u8,
-) ProofCoverage {
-    var result = ProofCoverage{};
-    for (obligations.items) |item| {
-        const obligation = asObject(item) catch continue;
-        const law = stringField(obligation, "law_ref") catch continue;
-        const kind = stringField(obligation, "proof_kind") catch continue;
-        if (!std.mem.eql(u8, law, law_ref) or !std.mem.eql(u8, kind, proof_kind)) continue;
-        if (owner_boundary) |expected_owner| {
-            const actual_owner = stringField(obligation, "owner_boundary") catch continue;
-            if (!std.mem.eql(u8, actual_owner, expected_owner)) continue;
-        }
-        result.any = true;
-        const mode = stringField(obligation, "proof_mode") catch continue;
-        if (!std.mem.eql(u8, mode, "example-regression")) result.non_example = true;
-    }
-    return result;
 }
 
 fn renderAlloc(
@@ -587,17 +579,43 @@ fn renderAlloc(
 
 fn writeConstructionChecks(writer: *std.Io.Writer, counts: Counts) !void {
     try writer.print(
-        "\"accepted_class_checks\":{d},\"aggregate_only_violations\":{d},",
-        .{ counts.accepted_class_checks, counts.aggregate_only },
+        "\"accepted_class_checks\":{d},\"aggregate_only_violations\":{d}," ++
+            "\"candidate_count\":{d},\"essential_addition_count\":{d}," ++
+            "\"incumbent_independent_candidates\":{d},\"introduced_factor_count\":{d},",
+        .{
+            counts.accepted_class_checks,
+            counts.aggregate_only,
+            counts.candidate_count,
+            counts.essential_addition_count,
+            counts.incumbent_independent_candidates,
+            counts.introduced_factor_count,
+        },
     );
     try writer.print(
         "\"owner_local_implementation_covered\":{d}," ++
-            "\"owner_local_implementation_missing\":{d},",
-        .{ counts.owner_local_covered, counts.owner_local_missing },
+            "\"owner_local_implementation_missing\":{d}," ++
+            "\"predecessor_factor_count\":{d},\"preserved_factor_count\":{d}," ++
+            "\"replacement_relation_count\":{d},\"retired_factor_count\":{d},",
+        .{
+            counts.owner_local_covered,
+            counts.owner_local_missing,
+            counts.predecessor_factor_count,
+            counts.preserved_factor_count,
+            counts.replacement_relation_count,
+            counts.retired_factor_count,
+        },
     );
     try writer.print(
-        "\"recurrent_class_checks\":{d},\"recurrent_example_only_violations\":{d}",
-        .{ counts.recurrent_class_checks, counts.recurrent_example_only },
+        "\"recurrent_class_checks\":{d},\"recurrent_example_only_violations\":{d}," ++
+            "\"review_recompilation\":{},\"successor_factor_count\":{d}," ++
+            "\"surface_completeness_bound\":{}",
+        .{
+            counts.recurrent_class_checks,
+            counts.recurrent_example_only,
+            counts.review_recompilation,
+            counts.successor_factor_count,
+            counts.surface_completeness_bound,
+        },
     );
 }
 
@@ -695,19 +713,6 @@ fn artifactObject(body: std.json.Value, schema: []const u8) !std.json.ObjectMap 
     try requireExactKeys(document, &.{"artifact"});
     const artifact = try asObject(try field(document, "artifact"));
     if (!std.mem.eql(u8, try stringField(artifact, "schema"), schema)) {
-        return error.InvalidRegisteredArtifact;
-    }
-    return artifact;
-}
-
-fn constructionArtifactObject(body: std.json.Value) !std.json.ObjectMap {
-    const document = try asObject(body);
-    try requireExactKeys(document, &.{"artifact"});
-    const artifact = try asObject(try field(document, "artifact"));
-    const schema = try stringField(artifact, "schema");
-    if (!std.mem.eql(u8, schema, "construction-contract/v1") and
-        !std.mem.eql(u8, schema, "construction-contract/v2"))
-    {
         return error.InvalidRegisteredArtifact;
     }
     return artifact;
@@ -818,6 +823,13 @@ fn integerField(object: std.json.ObjectMap, name: []const u8) !i64 {
     };
 }
 
+fn boolField(object: std.json.ObjectMap, name: []const u8) !bool {
+    return switch (try field(object, name)) {
+        .bool => |value| value,
+        else => error.ExpectedBoolean,
+    };
+}
+
 fn requireExactKeys(object: std.json.ObjectMap, keys: []const []const u8) !void {
     if (object.count() != keys.len) return error.UnexpectedField;
     for (keys) |key| if (!object.contains(key)) return error.MissingField;
@@ -909,12 +921,72 @@ fn testEventAlloc(
     return .{ .bytes = try final.toOwnedSlice(), .digest = event_digest };
 }
 
+const TestFactorJson =
+    "{\"description\":\"owner remains authoritative\",\"factor_id\":\"factor-owner\"," ++
+    "\"kind\":\"law-owner\",\"law_refs\":[\"law-1\"]," ++
+    "\"observation_refs\":[\"proof-1\"],\"owner\":\"src\"}";
+
+const TestCandidatesJson =
+    "[{\"candidate_id\":\"candidate-realization\",\"derivation\":\"incumbent-independent\"," ++
+    "\"factors\":[" ++ TestFactorJson ++ "],\"falsifier\":\"realization fails\"," ++
+    "\"family\":\"realization-preserve\",\"law_refs\":[\"law-1\"]," ++
+    "\"observation_refs\":[\"proof-1\"],\"residual_obligations\":[]," ++
+    "\"status\":\"selected\",\"summary\":\"preserve realization\"}," ++
+    "{\"candidate_id\":\"candidate-restriction\",\"derivation\":\"incumbent-relative\"," ++
+    "\"factors\":[" ++ TestFactorJson ++ "],\"falsifier\":\"restriction required\"," ++
+    "\"family\":\"admitted-domain-restriction\",\"law_refs\":[\"law-1\"]," ++
+    "\"observation_refs\":[\"proof-1\"],\"residual_obligations\":[]," ++
+    "\"status\":\"dominated\",\"summary\":\"restrict domain\"}," ++
+    "{\"candidate_id\":\"candidate-strengthening\",\"derivation\":\"incumbent-relative\"," ++
+    "\"factors\":[" ++ TestFactorJson ++ "],\"falsifier\":\"strengthening required\"," ++
+    "\"family\":\"representation-or-owner-strengthening\",\"law_refs\":[\"law-1\"]," ++
+    "\"observation_refs\":[\"proof-1\"],\"residual_obligations\":[]," ++
+    "\"status\":\"dominated\",\"summary\":\"strengthen owner\"}," ++
+    "{\"candidate_id\":\"candidate-ablation\",\"derivation\":\"incumbent-relative\"," ++
+    "\"factors\":[" ++ TestFactorJson ++ "],\"falsifier\":\"ablation required\"," ++
+    "\"family\":\"ablation-normalization\",\"law_refs\":[\"law-1\"]," ++
+    "\"observation_refs\":[\"proof-1\"],\"residual_obligations\":[]," ++
+    "\"status\":\"dominated\",\"summary\":\"ablate mechanism\"}]";
+
+const TestAdjudicationJson =
+    "{\"falsifier\":\"smaller candidate exists\",\"reduction_disposition\":\"minimal\"," ++
+    "\"reduction_reason\":\"no factor can be removed\"," ++
+    "\"selected_reason\":\"smallest law-preserving construction\"}";
+
+const TestInitialRecompilationJson =
+    "{\"adjudication\":" ++ TestAdjudicationJson ++ ",\"candidates\":" ++
+    TestCandidatesJson ++ ",\"counterexample_set_ref\":null," ++
+    "\"evaluated_class_refs\":[],\"selected_candidate_id\":\"candidate-realization\"," ++
+    "\"trigger\":\"initial\"}";
+
+const TestSuccessorRecompilationJson =
+    "{\"adjudication\":" ++ TestAdjudicationJson ++ ",\"candidates\":" ++
+    TestCandidatesJson ++ ",\"counterexample_set_ref\":\"" ++ TestSetTwoDigest ++ "\"," ++
+    "\"evaluated_class_refs\":[\"class-1\"]," ++
+    "\"selected_candidate_id\":\"candidate-realization\"," ++
+    "\"trigger\":\"accepted-review-fold\"}";
+
+const TestInitialSupersessionJson =
+    "{\"disposition\":\"initial\",\"essential_additions\":[]," ++
+    "\"introduced_factor_refs\":[\"factor-owner\"],\"preserved_factor_refs\":[]," ++
+    "\"replacement_relations\":[],\"retired_factor_refs\":[]," ++
+    "\"surface_completeness_proof_ref\":\"proof-1\"}";
+
+const TestSuccessorSupersessionJson =
+    "{\"disposition\":\"unchanged-realization\",\"essential_additions\":[]," ++
+    "\"introduced_factor_refs\":[],\"preserved_factor_refs\":[\"factor-owner\"]," ++
+    "\"replacement_relations\":[],\"retired_factor_refs\":[]," ++
+    "\"surface_completeness_proof_ref\":\"proof-1\"}";
+
 const TestBodies = [_][]const u8{
     "{\"artifact\":{\"payload\":{},\"schema\":\"goal-contract/v3\"}}",
     "{\"artifact\":{\"artifact_id\":\"" ++ TestConstructionDigest ++
         "\",\"payload\":{\"architecture\":{" ++
         "\"governing_law_refs\":[\"law-1\"]},\"counterexample_class_refs\":[]," ++
-        "\"proof_obligations\":[]},\"schema\":\"construction-contract/v2\"}}",
+        "\"proof_obligations\":[],\"recompilation\":" ++ TestInitialRecompilationJson ++
+        ",\"semantic_surface\":{\"predecessor_factors\":[],\"successor_factors\":[" ++
+        TestFactorJson ++ "]},\"supersession\":" ++ TestInitialSupersessionJson ++
+        "},\"schema\":\"construction-contract/v3\"}}",
     "{\"artifact\":{\"artifact_id\":\"" ++ TestSetOneDigest ++
         "\",\"payload\":{\"classes\":[{\"boundary_key\":\"boundary\"," ++
         "\"class_id\":\"class-1\",\"law_ref\":\"law-1\"," ++
@@ -934,8 +1006,12 @@ const TestBodies = [_][]const u8{
         "\"counterexample_class_refs\":[\"class-1\"],\"proof_obligations\":[{" ++
         "\"law_ref\":\"law-1\",\"owner_boundary\":\"src\"," ++
         "\"proof_kind\":\"implementation\"," ++
-        "\"proof_mode\":\"example-regression\"}]}," ++
-        "\"schema\":\"construction-contract/v2\"}}",
+        "\"proof_mode\":\"example-regression\"}],\"recompilation\":" ++
+        TestSuccessorRecompilationJson ++
+        ",\"semantic_surface\":{\"predecessor_factors\":[" ++ TestFactorJson ++
+        "],\"successor_factors\":[" ++ TestFactorJson ++
+        "]},\"supersession\":" ++ TestSuccessorSupersessionJson ++
+        "},\"schema\":\"construction-contract/v3\"}}",
     "{\"changed_paths\":[\"src/main.zig\"],\"pre_effect_subject_digest\":\"" ++
         TestChangedDigest ++
         "\",\"schema\":\"effect-recorded/v1\",\"step_id\":\"edit-1\"}",
@@ -1347,76 +1423,38 @@ test "kernel audit preserves complete Counterexample class identity" {
     );
 }
 
-test "kernel audit treats legacy high severity proof as owner-local debt" {
-    const body =
-        "{\"artifact\":{\"artifact_id\":\"" ++ TestConstructionDigest ++
-        "\",\"payload\":{\"architecture\":{\"governing_law_refs\":[\"law-1\"]}," ++
-        "\"counterexample_class_refs\":[\"class-1\"],\"proof_obligations\":[{" ++
-        "\"law_ref\":\"law-1\",\"proof_kind\":\"implementation\"," ++
-        "\"proof_mode\":\"example-regression\"}]}," ++
-        "\"schema\":\"construction-contract/v1\"}}";
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        body,
-        .{},
-    );
-    defer parsed.deinit();
-    const classes = [_]ClassState{.{
-        .class_id = "class-1",
-        .boundary_key = "boundary",
-        .law_ref = "law-1",
-        .owner_boundary = "src",
-        .severity = "high",
-        .status = "accepted",
-        .set_ref = TestSetOneDigest,
-        .occurrences = 1,
-    }};
-    var counts = Counts{};
-    try auditConstruction(parsed.value, TestConstructionDigest, &classes, &counts);
-    try std.testing.expectEqual(@as(usize, 0), counts.owner_local_covered);
-    try std.testing.expectEqual(@as(usize, 1), counts.owner_local_missing);
-}
-
-test "kernel audit never credits legacy proof as owner-local" {
-    const body =
-        "{\"artifact\":{\"artifact_id\":\"" ++ TestConstructionDigest ++
-        "\",\"payload\":{\"architecture\":{\"governing_law_refs\":[\"law-1\"]}," ++
-        "\"counterexample_class_refs\":[\"class-1\"],\"proof_obligations\":[{" ++
-        "\"law_ref\":\"law-1\",\"proof_kind\":\"implementation\"," ++
-        "\"proof_mode\":\"property-law\"}]}," ++
-        "\"schema\":\"construction-contract/v1\"}}";
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        body,
-        .{},
-    );
-    defer parsed.deinit();
-    const classes = [_]ClassState{.{
-        .class_id = "class-1",
-        .boundary_key = "boundary",
-        .law_ref = "law-1",
-        .owner_boundary = "src",
-        .severity = "medium",
-        .status = "accepted",
-        .set_ref = TestSetOneDigest,
-        .occurrences = 1,
-    }};
-    var counts = Counts{};
-    try auditConstruction(parsed.value, TestConstructionDigest, &classes, &counts);
-    try std.testing.expectEqual(@as(usize, 0), counts.owner_local_covered);
-    try std.testing.expectEqual(@as(usize, 1), counts.owner_local_missing);
+test "kernel audit rejects every legacy Construction schema" {
+    for ([_][]const u8{ "construction-contract/v1", "construction-contract/v2" }) |schema| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"artifact\":{{\"artifact_id\":\"{s}\",\"payload\":{{}},\"schema\":\"{s}\"}}}}",
+            .{ TestConstructionDigest, schema },
+        );
+        defer std.testing.allocator.free(body);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        var counts = Counts{};
+        try std.testing.expectError(
+            error.LegacyConstructionUnsupported,
+            auditConstruction(parsed.value, TestConstructionDigest, &.{}, &counts),
+        );
+    }
 }
 
 test "kernel audit rejects proof coverage from another owner" {
-    const body =
-        "{\"artifact\":{\"artifact_id\":\"" ++ TestConstructionDigest ++
-        "\",\"payload\":{\"architecture\":{\"governing_law_refs\":[\"law-1\"]}," ++
-        "\"counterexample_class_refs\":[\"class-1\"],\"proof_obligations\":[{" ++
-        "\"law_ref\":\"law-1\",\"owner_boundary\":\"other-owner\"," ++
-        "\"proof_kind\":\"implementation\",\"proof_mode\":\"property-law\"}]}," ++
-        "\"schema\":\"construction-contract/v2\"}}";
+    const body = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        TestBodies[4],
+        "\"owner_boundary\":\"src\"",
+        "\"owner_boundary\":\"other-owner\"",
+    );
+    defer std.testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,

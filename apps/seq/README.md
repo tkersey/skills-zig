@@ -279,7 +279,11 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","pa
   `SEQ-ACTKERNEL-v1` counts for formal
   Constructions, effects, Counterexample recurrence, owner-local implementation
   proof coverage, recurrent example-only violations, aggregate-only violations,
-  and legacy v1 proof as owner-local debt because v1 has no owner binding,
+  Construction-v3 candidate-family coverage, incumbent-independent candidates,
+  semantic-factor surface sizes, supersession partitions, and completeness
+  proof binding. It consumes Ledger's checked Construction view rather than
+  maintaining a second Construction schema interpreter. Legacy Construction
+  v1/v2 stores fail closed as `LegacyConstructionUnsupported`,
   timestamp-overlap events excluded for missing session receipts,
   and subject transitions. It never establishes review credit or closure.
 

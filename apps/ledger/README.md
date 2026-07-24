@@ -234,12 +234,17 @@ adapter neither invokes Git nor derives subject identity from the repository.
 Actuating supplies `actuating-operation/v1.expected_subject_digest`; `prepare`
 exact-matches that opaque digest to the current structural subject and records
 it in the durable event envelope. `append` accepts `goal-contract/v3`,
-`construction-contract/v2`, `counterexample-set/v1`, or an
-`actuating-evidence-input/v1` observation. Construction v2 makes owner-local
-implementation proof mandatory for accepted Counterexample classes and
-non-example implementation proof mandatory for recurrent classes. Replay keeps
-previously admitted `construction-contract/v1` events readable under their
-original proof rules, but new v1 Construction appends fail closed. Durable
+`construction-contract/v3`, `counterexample-set/v1`, or an
+`actuating-evidence-input/v1` observation. Construction v3 records exactly four
+ordinary candidate families, one selected candidate, the predecessor and
+successor semantic-factor surfaces, and a total supersession disposition.
+Owner-local implementation proof remains mandatory for accepted
+Counterexample classes; recurrent classes require non-example implementation
+proof. A Review Fold with accepted classes makes the current Construction
+structurally stale until Actuating registers one successor Construction bound
+to the latest Set and exact accepted-class set. Construction v1/v2 stores are
+not migrated: append, replay, state, project, prepare, and doctor reject them as
+`LegacyConstructionUnsupported`. Start a new goal-local store instead. Durable
 evidence uses `actuating-evidence-event/v1`.
 
 `prepare` validates the operation against the current Goal Contract,
@@ -263,6 +268,12 @@ Construction admission derives Counterexample recurrence from immutable Set
 lineage. Every accepted class must have a law-matched `implementation` proof
 obligation; a recurrent accepted class must have a non-example implementation
 proof. Aggregate acceptance checks cannot substitute for owner-local proof.
+The selected candidate's factors must exactly equal the successor semantic
+surface. Supersession must partition every predecessor and successor factor
+exactly once as preserved, retired, introduced, or explicitly replaced;
+preserved factors must remain byte-semantically equal. Ledger validates this
+closed structure but does not select a candidate or decide whether an expansion
+is semantically justified.
 `state` projects current structural evidence. `project` emits a discardable
 `actuating-structural-evidence-projection/v1` with a digest-derived
 `projection_id`. With `--review-contract FILE|-`, `project` instead validates
