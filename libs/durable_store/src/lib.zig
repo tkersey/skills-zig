@@ -2412,6 +2412,101 @@ pub fn lockPathAlloc(
     return std.fmt.allocPrint(allocator, "{s}.lock", .{store_path});
 }
 
+fn caseVariantAlloc(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) !?[]u8 {
+    const variant = try allocator.dupe(u8, name);
+    errdefer allocator.free(variant);
+    for (variant) |*byte| {
+        if (std.ascii.isLower(byte.*)) {
+            byte.* -= 'a' - 'A';
+            return variant;
+        }
+        if (std.ascii.isUpper(byte.*)) {
+            byte.* += 'a' - 'A';
+            return variant;
+        }
+    }
+    allocator.free(variant);
+    return null;
+}
+
+fn nearestExistingPathAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![:0]u8 {
+    var candidate = try std.fs.path.resolve(allocator, &.{path});
+    defer allocator.free(candidate);
+    while (true) { // tiger: event-loop -- bounded by path ancestors.
+        return std.Io.Dir.cwd().realPathFileAlloc(
+            Io.io(),
+            candidate,
+            allocator,
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                const parent = std.fs.path.dirname(candidate) orelse return err;
+                if (std.mem.eql(u8, parent, candidate)) return err;
+                const next = try allocator.dupe(u8, parent);
+                allocator.free(candidate);
+                candidate = next;
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn directoryNamesAreCaseInsensitive(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+) !bool {
+    var canonical = try nearestExistingPathAlloc(allocator, directory);
+    defer allocator.free(canonical);
+    while (true) { // tiger: event-loop -- bounded by path ancestors.
+        const parent = std.fs.path.dirname(canonical) orelse return false;
+        if (std.mem.eql(u8, parent, canonical)) return false;
+        const variant = (try caseVariantAlloc(
+            allocator,
+            std.fs.path.basename(canonical),
+        )) orelse {
+            const next = try allocator.dupeZ(u8, parent);
+            allocator.free(canonical);
+            canonical = next;
+            continue;
+        };
+        defer allocator.free(variant);
+        const alias = try std.fs.path.join(allocator, &.{ parent, variant });
+        defer allocator.free(alias);
+        const alias_real = std.Io.Dir.cwd().realPathFileAlloc(
+            Io.io(),
+            alias,
+            allocator,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer allocator.free(alias_real);
+        return std.mem.eql(u8, canonical, alias_real);
+    }
+}
+
+fn prospectiveStoreBasenameAlloc(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) ![:0]u8 {
+    const basename = std.fs.path.basename(store_path);
+    const identity = try allocator.dupeZ(u8, basename);
+    errdefer allocator.free(identity);
+    const parent = std.fs.path.dirname(store_path) orelse ".";
+    if (try directoryNamesAreCaseInsensitive(allocator, parent)) {
+        for (identity[0..basename.len]) |*byte| {
+            byte.* = std.ascii.toLower(byte.*);
+        }
+    }
+    return identity;
+}
+
 pub fn eventStoreLockPathAlloc(
     allocator: std.mem.Allocator,
     store_path: []const u8,
@@ -2422,9 +2517,9 @@ pub fn eventStoreLockPathAlloc(
         store_path,
         allocator,
     ) catch |err| switch (err) {
-        error.FileNotFound => try allocator.dupeZ(
-            u8,
-            std.fs.path.basename(store_path),
+        error.FileNotFound => try prospectiveStoreBasenameAlloc(
+            allocator,
+            store_path,
         ),
         else => return err,
     };
@@ -4631,7 +4726,10 @@ fn assertEventStoreContract(store: EventStore) !void {
     defer after_first.deinit(std.testing.allocator);
     try std.testing.expect(after_first.exists);
     try std.testing.expectEqual(@as(usize, 1), after_first.records.len);
-    try std.testing.expectEqualStrings("{\"schema\":\"event/v1\",\"sequence\":1}", after_first.records[0].payload);
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"event/v1\",\"sequence\":1}",
+        after_first.records[0].payload,
+    );
     try std.testing.expectEqualStrings(first.revision_after, after_first.revision);
     try std.testing.expectError(error.ExpectationMismatch, store.append(
         std.testing.allocator,
@@ -4648,7 +4746,9 @@ fn assertEventStoreContract(store: EventStore) !void {
     var after_rejected_append = try store.snapshot(std.testing.allocator, 4096);
     defer after_rejected_append.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(after_first.revision, after_rejected_append.revision);
-    const oversized_replacement = [_][]const u8{"{\"schema\":\"event/v1\",\"sequence\":2,\"padding\":\"too-large\"}"};
+    const oversized_replacement = [_][]const u8{
+        "{\"schema\":\"event/v1\",\"sequence\":2,\"padding\":\"too-large\"}",
+    };
     try std.testing.expectError(error.StreamTooLong, store.replace(
         std.testing.allocator,
         &oversized_replacement,
@@ -5196,6 +5296,60 @@ test "EventStore advisory paths preserve existing filesystem case identity" {
     );
     defer std.testing.allocator.free(alias_advisory);
     try std.testing.expectEqualStrings(canonical_advisory, alias_advisory);
+}
+
+test "EventStore prospective case identity follows the host filesystem" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const canonical_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "Events.jsonl" },
+    );
+    defer std.testing.allocator.free(canonical_path);
+    const case_alias = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer std.testing.allocator.free(case_alias);
+    const case_insensitive = try directoryNamesAreCaseInsensitive(
+        std.testing.allocator,
+        root,
+    );
+    const canonical_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        canonical_path,
+    );
+    defer std.testing.allocator.free(canonical_advisory);
+    const alias_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        case_alias,
+    );
+    defer std.testing.allocator.free(alias_advisory);
+    try std.testing.expectEqual(
+        case_insensitive,
+        std.mem.eql(u8, canonical_advisory, alias_advisory),
+    );
+    if (!case_insensitive) return;
+
+    var canonical = JsonlEventStore.initWithIo(
+        canonical_path,
+        std.testing.io,
+    );
+    var exclusive = try canonical.eventStore().acquireExclusive(
+        std.testing.allocator,
+    );
+    defer exclusive.release();
+    var alias = JsonlEventStore.initWithIo(case_alias, std.testing.io);
+    try std.testing.expectError(
+        error.EventStoreBusy,
+        alias.eventStore().snapshot(std.testing.allocator, 4096),
+    );
 }
 
 test "EventStore exclusive sessions bridge public lock protocols" {
