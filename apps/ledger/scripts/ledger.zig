@@ -537,41 +537,18 @@ fn cmdInit(allocator: std.mem.Allocator, path: []const u8) !u8 {
     var snapshot = try store.snapshot(allocator, MaxStoreBytes);
     defer snapshot.deinit(allocator);
     if (!snapshot.exists) {
+        try durable_store.ensureLockSidecarGitignored(
+            allocator,
+            defaultIo(),
+            path,
+        );
         var receipt = try store.replace(allocator, &.{}, .{ .revision = snapshot.revision, .exists = false }, MaxStoreBytes);
         defer receipt.deinit(allocator);
-        try ensureInitLockSidecarGitignored(allocator, path);
         try printJsonLine(allocator, .init, "initialized", path, 0);
         return 0;
     }
     try printJsonLine(allocator, .init, "already_initialized", path, 0);
     return 0;
-}
-
-fn ensureInitLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []const u8) !void {
-    const parent = std.fs.path.dirname(store_path) orelse ".";
-    const git_root = durable_store.findGitRootAlloc(allocator, parent) catch return;
-    defer allocator.free(git_root);
-
-    const lock_path = try durable_store.lockPathAlloc(allocator, store_path);
-    defer allocator.free(lock_path);
-    const lock_rel = if (std.fs.path.isAbsolute(lock_path))
-        try std.fs.path.relative(allocator, git_root, null, git_root, lock_path)
-    else
-        try allocator.dupe(u8, lock_path);
-    defer allocator.free(lock_rel);
-
-    const argv = [_][]const u8{ "git", "-C", git_root, "check-ignore", "-q", "--", lock_rel };
-    const result = try std.process.run(allocator, defaultIo(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.term == .exited and result.term.exited == 0) return;
-    if (result.term == .exited and result.term.exited == 1) return error.LockSidecarNotGitignored;
-    return error.GitCommandFailed;
 }
 
 fn cmdCapture(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2574,7 +2551,11 @@ test "init lock check accepts an ignored store inside a git repository" {
 
     const store = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultStorePath });
     defer std.testing.allocator.free(store);
-    try ensureInitLockSidecarGitignored(std.testing.allocator, store);
+    try durable_store.ensureLockSidecarGitignored(
+        std.testing.allocator,
+        std.testing.io,
+        store,
+    );
 }
 
 test "migrate parses explicit from and to paths" {

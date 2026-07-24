@@ -133,6 +133,8 @@ pub const EventStoreExclusive = struct {
     context: *anyopaque,
     vtable: *const VTable,
     active: bool = true,
+    scan_active: bool = false,
+    release_pending: bool = false,
 
     pub const VTable = struct {
         scan: *const fn (
@@ -160,12 +162,21 @@ pub const EventStoreExclusive = struct {
     };
 
     pub fn scan(
-        self: *const EventStoreExclusive,
+        self: *EventStoreExclusive,
         allocator: std.mem.Allocator,
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
         if (!self.active) return error.EventStoreSessionReleased;
+        if (self.scan_active) return error.EventStoreBusy;
+        self.scan_active = true;
+        defer {
+            self.scan_active = false;
+            if (self.release_pending) {
+                self.release_pending = false;
+                self.vtable.release(self.context);
+            }
+        }
         return self.vtable.scan(self.context, allocator, max_bytes, visitor);
     }
 
@@ -198,8 +209,12 @@ pub const EventStoreExclusive = struct {
 
     pub fn release(self: *EventStoreExclusive) void {
         if (!self.active) return;
-        self.vtable.release(self.context);
         self.active = false;
+        if (self.scan_active) {
+            self.release_pending = true;
+            return;
+        }
+        self.vtable.release(self.context);
     }
 };
 
@@ -2083,6 +2098,7 @@ fn scanJsonlEventStore(
 ) !EventScanSummary {
     var sidecar: ?std.Io.File = null;
     defer if (sidecar) |file| file.close(Io.io());
+    _ = try statRegularFileNoSymlink(logical_ref);
     const open_options: std.Io.Dir.OpenFileOptions = .{
         .allow_directory = true,
         .follow_symlinks = false,
@@ -2347,12 +2363,46 @@ fn jsonlSequenceRequired(allocator: std.mem.Allocator, bytes: []const u8) !?u64 
     return null;
 }
 
-pub fn lockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
+const event_store_lock_dir_name = ".durable-store-locks";
+
+fn rejectEventStoreControlNamespace(path: []const u8) !void {
+    var components = std.fs.path.componentIterator(path);
+    while (components.next()) |component| {
+        if (std.mem.eql(
+            u8,
+            component.name,
+            event_store_lock_dir_name,
+        )) return error.ReservedStorePath;
+    }
+}
+
+pub fn lockPathAlloc(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) ![]u8 {
+    try rejectEventStoreControlNamespace(store_path);
     return std.fmt.allocPrint(allocator, "{s}.lock", .{store_path});
 }
 
-fn eventStoreLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}.event-store.lock", .{store_path});
+pub fn eventStoreLockPathAlloc(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) ![]u8 {
+    try rejectEventStoreControlNamespace(store_path);
+    var digest: [EventHash.digest_length]u8 = undefined;
+    EventHash.hash(std.fs.path.basename(store_path), &digest, .{});
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    const file_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.lock",
+        .{&encoded},
+    );
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{
+        std.fs.path.dirname(store_path) orelse ".",
+        event_store_lock_dir_name,
+        file_name,
+    });
 }
 
 fn casLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
@@ -2437,10 +2487,27 @@ pub fn ensureDirectoryPathNoSymlinks(path: []const u8) !void {
     }
 }
 
-pub fn readRegularFileNoSymlink(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const stat = try std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false });
+fn statRegularFileNoSymlink(path: []const u8) !?std.Io.File.Stat {
+    const stat = std.Io.Dir.cwd().statFile(
+        Io.io(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
     if (stat.kind == .sym_link) return error.SymlinkComponent;
     if (stat.kind != .file) return error.NotFile;
+    return stat;
+}
+
+pub fn readRegularFileNoSymlink(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    const stat = (try statRegularFileNoSymlink(path)) orelse
+        return error.FileNotFound;
     if (stat.size > max_bytes) return error.FileTooBig;
 
     var file = if (std.fs.path.isAbsolute(path))
@@ -3175,23 +3242,26 @@ fn openEventStoreSidecarExclusive(path: []const u8) !std.Io.File {
                 .lock = .exclusive,
                 .lock_nonblocking = true,
             })) catch |create_err| switch (create_err) {
-            error.PathAlreadyExists => (if (std.fs.path.isAbsolute(path))
-                std.Io.Dir.openFileAbsolute(Io.io(), path, .{
-                    .allow_directory = false,
-                    .follow_symlinks = false,
-                    .lock = .exclusive,
-                    .lock_nonblocking = true,
-                })
-            else
-                std.Io.Dir.cwd().openFile(Io.io(), path, .{
-                    .allow_directory = false,
-                    .follow_symlinks = false,
-                    .lock = .exclusive,
-                    .lock_nonblocking = true,
-                })) catch |open_err| switch (open_err) {
-                error.FileNotFound => continue,
-                error.SymLinkLoop => return error.SymlinkComponent,
-                else => return open_err,
+            error.PathAlreadyExists => {
+                _ = (try statRegularFileNoSymlink(path)) orelse continue;
+                return (if (std.fs.path.isAbsolute(path))
+                    std.Io.Dir.openFileAbsolute(Io.io(), path, .{
+                        .allow_directory = false,
+                        .follow_symlinks = false,
+                        .lock = .exclusive,
+                        .lock_nonblocking = true,
+                    })
+                else
+                    std.Io.Dir.cwd().openFile(Io.io(), path, .{
+                        .allow_directory = false,
+                        .follow_symlinks = false,
+                        .lock = .exclusive,
+                        .lock_nonblocking = true,
+                    })) catch |open_err| switch (open_err) {
+                    error.FileNotFound => continue,
+                    error.SymLinkLoop => return error.SymlinkComponent,
+                    else => return open_err,
+                };
             },
             else => return create_err,
         };
@@ -3200,6 +3270,7 @@ fn openEventStoreSidecarExclusive(path: []const u8) !std.Io.File {
 }
 
 fn openEventStoreDataExclusive(store_path: []const u8) !?std.Io.File {
+    _ = (try statRegularFileNoSymlink(store_path)) orelse return null;
     var file = (if (std.fs.path.isAbsolute(store_path))
         std.Io.Dir.openFileAbsolute(Io.io(), store_path, .{
             .allow_directory = true,
@@ -3231,6 +3302,7 @@ fn acquireEventStoreScanSidecar(
 ) !?std.Io.File {
     const path = try eventStoreLockPathAlloc(allocator, store_path);
     defer allocator.free(path);
+    _ = (try statRegularFileNoSymlink(path)) orelse return null;
     var file = (if (std.fs.path.isAbsolute(path))
         std.Io.Dir.openFileAbsolute(Io.io(), path, .{
             .allow_directory = false,
@@ -3261,7 +3333,11 @@ pub fn acquireLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFi
     const path = try lockPathAlloc(allocator, store_path);
     errdefer allocator.free(path);
     try ensureParentPath(path);
-    var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
+    var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{
+        .exclusive = true,
+        .read = true,
+        .truncate = false,
+    });
     file.close(Io.io());
     return .{ .path = path };
 }
@@ -3340,21 +3416,45 @@ pub fn findGitRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
     }
 }
 
-pub fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []const u8) !void {
+pub fn ensureLockSidecarGitignored(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    store_path: []const u8,
+) !void {
     const parent = std.fs.path.dirname(store_path) orelse ".";
     const git_root = findGitRootAlloc(allocator, parent) catch return;
     defer allocator.free(git_root);
 
-    const lock_path = try lockPathAlloc(allocator, store_path);
-    defer allocator.free(lock_path);
-    const lock_rel = if (std.fs.path.isAbsolute(lock_path))
-        try std.fs.path.relative(allocator, git_root, null, git_root, lock_path)
-    else
-        try allocator.dupe(u8, lock_path);
-    defer allocator.free(lock_rel);
+    const public_path = try lockPathAlloc(allocator, store_path);
+    defer allocator.free(public_path);
+    try ensurePathGitignored(allocator, io, git_root, public_path);
+    const advisory_path = try eventStoreLockPathAlloc(allocator, store_path);
+    defer allocator.free(advisory_path);
+    try ensurePathGitignored(allocator, io, git_root, advisory_path);
+}
 
-    var argv = [_][]const u8{ "git", "-C", git_root, "check-ignore", "-q", "--", lock_rel };
-    const result = try std.process.run(allocator, Io.io(), .{
+fn ensurePathGitignored(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    git_root: []const u8,
+    path: []const u8,
+) !void {
+    const relative_path = if (std.fs.path.isAbsolute(path))
+        try std.fs.path.relative(allocator, git_root, null, git_root, path)
+    else
+        try allocator.dupe(u8, path);
+    defer allocator.free(relative_path);
+
+    var argv = [_][]const u8{
+        "git",
+        "-C",
+        git_root,
+        "check-ignore",
+        "-q",
+        "--",
+        relative_path,
+    };
+    const result = try std.process.run(allocator, io, .{
         .argv = &argv,
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
@@ -3365,6 +3465,67 @@ pub fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []c
     if (result.term == .exited and result.term.exited == 0) return;
     if (result.term == .exited and result.term.exited == 1) return error.LockSidecarNotGitignored;
     return error.GitCommandFailed;
+}
+
+test "lock ignore admission covers public and advisory paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const git_result = try std.process.run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .argv = &.{ "git", "init", "--quiet" },
+            .cwd = .{ .path = root },
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(1024),
+        },
+    );
+    defer std.testing.allocator.free(git_result.stdout);
+    defer std.testing.allocator.free(git_result.stderr);
+    try std.testing.expect(
+        git_result.term == .exited and git_result.term.exited == 0,
+    );
+
+    const gitignore = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".gitignore" },
+    );
+    defer std.testing.allocator.free(gitignore);
+    try writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "events.jsonl.lock\n",
+    );
+    const store_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer std.testing.allocator.free(store_path);
+    try std.testing.expectError(
+        error.LockSidecarNotGitignored,
+        ensureLockSidecarGitignored(
+            std.testing.allocator,
+            std.testing.io,
+            store_path,
+        ),
+    );
+
+    try writeTextAtomic(
+        std.testing.allocator,
+        gitignore,
+        "events.jsonl.lock\n.durable-store-locks/\n",
+    );
+    try ensureLockSidecarGitignored(
+        std.testing.allocator,
+        std.testing.io,
+        store_path,
+    );
 }
 
 test "durable concurrency records render canonical json" {
@@ -4037,6 +4198,23 @@ const EventScanProbe = struct {
     }
 };
 
+fn createFifoForTest(path: []const u8) !void {
+    const result = try std.process.run(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .argv = &.{ "mkfifo", path },
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(1024),
+        },
+    );
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        return error.MkfifoFailed;
+    }
+}
+
 const GrowingEventScanProbe = struct {
     path: []const u8,
     count: usize = 0,
@@ -4164,6 +4342,42 @@ const EquivalentHandleEventScanProbe = struct {
     }
 
     fn visitor(self: *EquivalentHandleEventScanProbe) EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+};
+
+const ReleaseDuringExclusiveScanProbe = struct {
+    session: *EventStoreExclusive,
+    contender: EventStore,
+    count: usize = 0,
+    mutation_rejected: bool = false,
+
+    fn visit(context: *anyopaque, _: EventRecordView) !void {
+        const self: *ReleaseDuringExclusiveScanProbe = @ptrCast(
+            @alignCast(context),
+        );
+        self.count += 1;
+        if (self.count != 1) return;
+        self.session.release();
+        if (self.session.active) return error.ExpectedReleasedSession;
+        const replacement = [_][]const u8{"{\"sequence\":99}"};
+        var receipt = self.contender.replace(
+            std.testing.allocator,
+            &replacement,
+            .{},
+            4096,
+        ) catch |err| switch (err) {
+            error.EventStoreBusy, error.PathAlreadyExists => {
+                self.mutation_rejected = true;
+                return;
+            },
+            else => return err,
+        };
+        defer receipt.deinit(std.testing.allocator);
+        return error.ExpectedEventStoreBusy;
+    }
+
+    fn visitor(self: *ReleaseDuringExclusiveScanProbe) EventRecordVisitor {
         return .{ .context = self, .visitFn = visit };
     }
 };
@@ -4516,6 +4730,7 @@ test "jsonl scans require no parent write and tolerate unlocked sidecars" {
     try std.testing.expect(!fileExists(advisory_path));
 
     try parent_dir.setPermissions(Io.io(), writable);
+    try ensureParentPath(advisory_path);
     try writeTextCreateNew(std.testing.allocator, advisory_path, "", .{});
     try parent_dir.setPermissions(Io.io(), read_only);
     var second = try backend.eventStore().snapshot(std.testing.allocator, 4096);
@@ -4551,6 +4766,66 @@ test "jsonl scan classifies a final symlink as SymlinkComponent" {
     );
 }
 
+test "EventStore rejects special data and advisory files before open" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+
+    const special_data = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "special-data.jsonl" },
+    );
+    defer std.testing.allocator.free(special_data);
+    try createFifoForTest(special_data);
+    var data_backend = PersistentEventStore.init(special_data);
+    try std.testing.expectError(
+        error.NotFile,
+        data_backend.eventStore().snapshot(std.testing.allocator, 4096),
+    );
+    try std.testing.expectError(
+        error.NotFile,
+        data_backend.eventStore().acquireExclusive(std.testing.allocator),
+    );
+
+    const regular_data = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "regular-data.jsonl" },
+    );
+    defer std.testing.allocator.free(regular_data);
+    try writeTextAtomic(
+        std.testing.allocator,
+        regular_data,
+        "{\"sequence\":1}\n",
+    );
+    const special_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        regular_data,
+    );
+    defer std.testing.allocator.free(special_advisory);
+    try ensureParentPath(special_advisory);
+    try createFifoForTest(special_advisory);
+    var advisory_backend = PersistentEventStore.init(regular_data);
+    try std.testing.expectError(
+        error.NotFile,
+        advisory_backend.eventStore().snapshot(
+            std.testing.allocator,
+            4096,
+        ),
+    );
+    try std.testing.expectError(
+        error.NotFile,
+        advisory_backend.eventStore().acquireExclusive(
+            std.testing.allocator,
+        ),
+    );
+}
+
 test "jsonl scan preserves completed visitor calls before a terminal error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4583,6 +4858,113 @@ test "ordinary scans reject active exclusive sessions across backends" {
     var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:exclusive-test");
     defer memory_backend.deinit();
     try assertExclusiveEventStoreContract(memory_backend.eventStore());
+}
+
+test "exclusive release requested by a visitor waits for scan completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "release-during-scan.jsonl" },
+    );
+    defer std.testing.allocator.free(path);
+
+    var owner_backend = PersistentEventStore.init(path);
+    const records = [_][]const u8{
+        "{\"sequence\":1}",
+        "{\"sequence\":2}",
+    };
+    var seeded = try owner_backend.eventStore().replace(
+        std.testing.allocator,
+        &records,
+        .{ .exists = false },
+        4096,
+    );
+    defer seeded.deinit(std.testing.allocator);
+
+    var contender_backend = PersistentEventStore.init(path);
+    const contender = contender_backend.eventStore();
+    var exclusive = try owner_backend.eventStore().acquireExclusive(
+        std.testing.allocator,
+    );
+    defer exclusive.release();
+    var probe = ReleaseDuringExclusiveScanProbe{
+        .session = &exclusive,
+        .contender = contender,
+    };
+    var summary = try exclusive.scan(
+        std.testing.allocator,
+        4096,
+        probe.visitor(),
+    );
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expect(probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqual(@as(usize, 2), summary.record_count);
+    try std.testing.expect(!exclusive.active);
+    try std.testing.expect(!exclusive.release_pending);
+
+    var after_scan = try contender.acquireExclusive(std.testing.allocator);
+    after_scan.release();
+}
+
+test "EventStore advisory paths use a disjoint reserved namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const first = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events" },
+    );
+    defer std.testing.allocator.free(first);
+    const formerly_colliding = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events.event-store" },
+    );
+    defer std.testing.allocator.free(formerly_colliding);
+    const first_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        first,
+    );
+    defer std.testing.allocator.free(first_advisory);
+    const second_public = try lockPathAlloc(
+        std.testing.allocator,
+        formerly_colliding,
+    );
+    defer std.testing.allocator.free(second_public);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_advisory,
+        second_public,
+    ));
+
+    const reserved_resource = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, event_store_lock_dir_name, "resource" },
+    );
+    defer std.testing.allocator.free(reserved_resource);
+    try std.testing.expectError(
+        error.ReservedStorePath,
+        lockPathAlloc(std.testing.allocator, reserved_resource),
+    );
+    try std.testing.expectError(
+        error.ReservedStorePath,
+        eventStoreLockPathAlloc(
+            std.testing.allocator,
+            reserved_resource,
+        ),
+    );
 }
 
 test "EventStore exclusive sessions bridge public lock protocols" {
