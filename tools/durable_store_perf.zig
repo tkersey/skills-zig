@@ -1,9 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const durable_store = @import("durable_store");
 
 const Io = std.Io.Threaded.global_single_threaded;
 const default_fixture_bytes: usize = 60 * 1024 * 1024;
 const rounds: usize = 3;
+const target_name = std.fmt.comptimePrint("{s}-{s}-{s}", .{
+    @tagName(builtin.target.cpu.arch),
+    @tagName(builtin.target.os.tag),
+    @tagName(builtin.target.abi),
+});
 const fixture_line =
     "{\"schema\":\"event/v1\",\"sequence\":1," ++
     "\"payload\":\"abcdefghijklmnopqrstuvwxyz\"}\n";
@@ -28,12 +34,22 @@ const Round = struct {
 };
 
 const Measurements = struct {
+    target: []const u8,
+    cpu_model: []const u8,
+    zig_version: []const u8,
+    optimize_mode: []const u8,
+    fixture_sha256: [64]u8,
     actual_bytes: usize,
     record_count: usize,
     scan_elapsed_ns: u64,
     scan_peak_live_bytes: u64,
     append_elapsed_ns: u64,
     append_peak_live_bytes: u64,
+};
+
+const Fixture = struct {
+    actual_bytes: usize,
+    sha256: [64]u8,
 };
 
 const PeakAllocator = struct {
@@ -162,7 +178,8 @@ fn cleanupFixture(path: []const u8) void {
 }
 
 fn measureFixture(fixture_path: []const u8, fixture_bytes: usize) !Measurements {
-    const actual_bytes = try writeFixture(fixture_path, fixture_bytes);
+    const fixture = try writeFixture(fixture_path, fixture_bytes);
+    const actual_bytes = fixture.actual_bytes;
 
     var samples: [rounds]Round = undefined;
     for (&samples) |*sample| sample.* = try measureScan(fixture_path, actual_bytes);
@@ -188,6 +205,11 @@ fn measureFixture(fixture_path: []const u8, fixture_bytes: usize) !Measurements 
     std.mem.sort(u64, &append_peaks, {}, comptime std.sort.asc(u64));
 
     return .{
+        .target = target_name,
+        .cpu_model = builtin.target.cpu.model.name,
+        .zig_version = builtin.zig_version_string,
+        .optimize_mode = @tagName(builtin.mode),
+        .fixture_sha256 = fixture.sha256,
         .actual_bytes = actual_bytes,
         .record_count = samples[0].record_count,
         .scan_elapsed_ns = elapsed[rounds / 2],
@@ -239,8 +261,11 @@ fn writeMeasuredReport(
         append_alloc_reduction >= 80.0 and
         scan_latency_regression <= 5.0 and
         append_latency_regression <= 10.0;
+    try stdout.writeAll(
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\",",
+    );
+    try writeIdentity(stdout, measurements);
     const measured_format =
-        "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
         "\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d}," ++
         "\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d}," ++
         "\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d}," ++
@@ -275,8 +300,11 @@ fn writeUnmeasuredReport(
     cli: Cli,
     measurements: Measurements,
 ) !void {
+    try stdout.writeAll(
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\",",
+    );
+    try writeIdentity(stdout, measurements);
     const unmeasured_format =
-        "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
         "\"fixture_bytes\":{d},\"record_count\":{d},\"rounds\":{d}," ++
         "\"scan_p50_elapsed_ns\":{d},\"scan_p50_peak_live_bytes\":{d}," ++
         "\"append_p50_elapsed_ns\":{d},\"append_p50_peak_live_bytes\":{d}," ++
@@ -295,6 +323,24 @@ fn writeUnmeasuredReport(
         },
     );
     if (cli.strict) return error.MissingBaseline;
+}
+
+fn writeIdentity(
+    stdout: *std.Io.Writer,
+    measurements: Measurements,
+) !void {
+    try stdout.writeAll("\"target\":");
+    try std.json.Stringify.value(measurements.target, .{}, stdout);
+    try stdout.writeAll(",\"cpu_model\":");
+    try std.json.Stringify.value(measurements.cpu_model, .{}, stdout);
+    try stdout.writeAll(",\"zig_version\":");
+    try std.json.Stringify.value(measurements.zig_version, .{}, stdout);
+    try stdout.writeAll(",\"optimize_mode\":");
+    try std.json.Stringify.value(measurements.optimize_mode, .{}, stdout);
+    try stdout.print(
+        ",\"fixture_sha256\":\"{s}\",",
+        .{&measurements.fixture_sha256},
+    );
 }
 
 fn parseCli(argv: []const []const u8) !Cli {
@@ -319,16 +365,23 @@ fn parseCli(argv: []const []const u8) !Cli {
     return cli;
 }
 
-fn writeFixture(path: []const u8, minimum_bytes: usize) !usize {
+fn writeFixture(path: []const u8, minimum_bytes: usize) !Fixture {
     var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .truncate = true });
     defer file.close(Io.io());
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var written: usize = 0;
     while (written < minimum_bytes) {
         try file.writeStreamingAll(Io.io(), fixture_line);
+        hasher.update(fixture_line);
         written += fixture_line.len;
     }
     try file.sync(Io.io());
-    return written;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return .{
+        .actual_bytes = written,
+        .sha256 = std.fmt.bytesToHex(digest, .lower),
+    };
 }
 
 fn ignoreEvent(_: *anyopaque, _: durable_store.EventRecordView) !void {}
@@ -412,6 +465,15 @@ fn baselineFromObject(
 ) !Baseline {
     try requireBaselineString(object, "schema", "durable-store-perf/v1");
     try requireBaselineString(object, "route", "aggregate");
+    try requireBaselineString(object, "target", measurements.target);
+    try requireBaselineString(object, "cpu_model", measurements.cpu_model);
+    try requireBaselineString(object, "zig_version", measurements.zig_version);
+    try requireBaselineString(object, "optimize_mode", measurements.optimize_mode);
+    try requireBaselineString(
+        object,
+        "fixture_sha256",
+        &measurements.fixture_sha256,
+    );
     try requireBaselineUsize(object, "fixture_bytes", measurements.actual_bytes);
     try requireBaselineUsize(object, "record_count", measurements.record_count);
     try requireBaselineUsize(object, "rounds", rounds);
@@ -469,14 +531,16 @@ fn regressionPct(baseline: u64, current: u64) f64 {
         @as(f64, @floatFromInt(baseline)) * 100.0;
 }
 
-test "performance baseline identity is exact" {
-    const valid =
-        \\{"schema":"durable-store-perf/v1","route":"aggregate",
-        \\"fixture_bytes":96,"record_count":3,"rounds":3,
-        \\"scan_p50_elapsed_ns":100,"scan_p50_peak_live_bytes":200,
-        \\"append_p50_elapsed_ns":300,"append_p50_peak_live_bytes":400}
-    ;
-    const measurements = Measurements{
+const test_fixture_sha256 =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn testMeasurements() Measurements {
+    return .{
+        .target = "test-target",
+        .cpu_model = "test-cpu",
+        .zig_version = "test-zig",
+        .optimize_mode = "ReleaseFast",
+        .fixture_sha256 = test_fixture_sha256.*,
         .actual_bytes = 96,
         .record_count = 3,
         .scan_elapsed_ns = 1,
@@ -484,6 +548,39 @@ test "performance baseline identity is exact" {
         .append_elapsed_ns = 1,
         .append_peak_live_bytes = 1,
     };
+}
+
+fn baselineJsonAlloc(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    cpu_model: []const u8,
+    zig_version: []const u8,
+    optimize_mode: []const u8,
+    fixture_sha256: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
+            "\"target\":\"{s}\",\"cpu_model\":\"{s}\",\"zig_version\":\"{s}\"," ++
+            "\"optimize_mode\":\"{s}\",\"fixture_sha256\":\"{s}\"," ++
+            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++
+            "\"scan_p50_elapsed_ns\":100,\"scan_p50_peak_live_bytes\":200," ++
+            "\"append_p50_elapsed_ns\":300,\"append_p50_peak_live_bytes\":400}}",
+        .{ target, cpu_model, zig_version, optimize_mode, fixture_sha256 },
+    );
+}
+
+test "performance baseline identity is exact" {
+    const valid = try baselineJsonAlloc(
+        std.testing.allocator,
+        "test-target",
+        "test-cpu",
+        "test-zig",
+        "ReleaseFast",
+        test_fixture_sha256,
+    );
+    defer std.testing.allocator.free(valid);
+    const measurements = testMeasurements();
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -497,6 +594,10 @@ test "performance baseline identity is exact" {
 }
 
 test "performance baseline rejects mismatched workload metadata" {
+    const identity =
+        "\"target\":\"test-target\",\"cpu_model\":\"test-cpu\"," ++
+        "\"zig_version\":\"test-zig\",\"optimize_mode\":\"ReleaseFast\"," ++
+        "\"fixture_sha256\":\"" ++ test_fixture_sha256 ++ "\",";
     const metrics =
         "\"scan_p50_elapsed_ns\":1," ++
         "\"scan_p50_peak_live_bytes\":1," ++
@@ -504,26 +605,60 @@ test "performance baseline rejects mismatched workload metadata" {
         "\"append_p50_peak_live_bytes\":1";
     const invalid = [_][]const u8{
         "{\"schema\":\"other\",\"route\":\"aggregate\"," ++
-            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+            identity ++ "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
         "{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
-            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+            identity ++ "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
         "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
-            "\"fixture_bytes\":97,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+            identity ++ "\"fixture_bytes\":97,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
         "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
-            "\"fixture_bytes\":96,\"record_count\":4,\"rounds\":3," ++ metrics ++ "}",
+            identity ++ "\"fixture_bytes\":96,\"record_count\":4,\"rounds\":3," ++ metrics ++ "}",
         "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
-            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":4," ++ metrics ++ "}",
+            identity ++ "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":4," ++ metrics ++ "}",
         "{" ++ metrics ++ "}",
     };
-    const measurements = Measurements{
-        .actual_bytes = 96,
-        .record_count = 3,
-        .scan_elapsed_ns = 1,
-        .scan_peak_live_bytes = 1,
-        .append_elapsed_ns = 1,
-        .append_peak_live_bytes = 1,
-    };
+    const measurements = testMeasurements();
     for (invalid) |text| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            text,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidBaseline,
+            baselineFromObject(parsed.value.object, measurements),
+        );
+    }
+}
+
+test "performance baseline rejects mismatched environment and fixture identity" {
+    const mismatch = [_]struct {
+        target: []const u8 = "test-target",
+        cpu_model: []const u8 = "test-cpu",
+        zig_version: []const u8 = "test-zig",
+        optimize_mode: []const u8 = "ReleaseFast",
+        fixture_sha256: []const u8 = test_fixture_sha256,
+    }{
+        .{ .target = "other-target" },
+        .{ .cpu_model = "other-cpu" },
+        .{ .zig_version = "other-zig" },
+        .{ .optimize_mode = "Debug" },
+        .{
+            .fixture_sha256 = "1111111111111111111111111111111111111111111111111111111111111111",
+        },
+    };
+    const measurements = testMeasurements();
+    for (mismatch) |identity| {
+        const text = try baselineJsonAlloc(
+            std.testing.allocator,
+            identity.target,
+            identity.cpu_model,
+            identity.zig_version,
+            identity.optimize_mode,
+            identity.fixture_sha256,
+        );
+        defer std.testing.allocator.free(text);
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
             std.testing.allocator,

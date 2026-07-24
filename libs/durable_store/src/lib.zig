@@ -11,9 +11,9 @@ pub fn installRuntimeIo(io: std.Io) void {
     runtime_io = io;
 }
 
-fn mutationAdmissionIo() !std.Io {
+fn mutationAdmissionIo() std.Io {
     return runtime_io orelse
-        if (@import("builtin").is_test) std.testing.io else error.EventStoreIoUnavailable;
+        if (@import("builtin").is_test) std.testing.io else Io.io();
 }
 
 pub const JsonlIssue = struct {
@@ -458,7 +458,7 @@ pub const JsonlEventStore = struct {
         const self = cast(context);
         if (self.scan_active) return error.EventStoreBusy;
         if (!self.mutation_admission_checked) {
-            const io = self.io orelse try mutationAdmissionIo();
+            const io = self.io orelse mutationAdmissionIo();
             try ensureLockSidecarGitignored(allocator, io, self.path);
             self.mutation_admission_checked = true;
         }
@@ -2417,8 +2417,20 @@ pub fn eventStoreLockPathAlloc(
     store_path: []const u8,
 ) ![]u8 {
     try rejectEventStoreControlNamespace(store_path);
+    const identity_basename: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        store_path,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupeZ(
+            u8,
+            std.fs.path.basename(store_path),
+        ),
+        else => return err,
+    };
+    defer allocator.free(identity_basename);
     var digest: [EventHash.digest_length]u8 = undefined;
-    EventHash.hash(std.fs.path.basename(store_path), &digest, .{});
+    EventHash.hash(std.fs.path.basename(identity_basename), &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);
     const file_name = try std.fmt.allocPrint(
         allocator,
@@ -5135,6 +5147,55 @@ test "EventStore advisory paths use a disjoint reserved namespace" {
             reserved_resource,
         ),
     );
+}
+
+test "EventStore advisory paths preserve existing filesystem case identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const canonical_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "Events.jsonl" },
+    );
+    defer std.testing.allocator.free(canonical_path);
+    const case_alias = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer std.testing.allocator.free(case_alias);
+    try writeTextAtomic(
+        std.testing.allocator,
+        canonical_path,
+        "{\"sequence\":1}\n",
+    );
+
+    const alias_real_path = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        case_alias,
+        std.testing.allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer std.testing.allocator.free(alias_real_path);
+    try std.testing.expectEqualStrings(canonical_path, alias_real_path);
+
+    const canonical_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        canonical_path,
+    );
+    defer std.testing.allocator.free(canonical_advisory);
+    const alias_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        case_alias,
+    );
+    defer std.testing.allocator.free(alias_advisory);
+    try std.testing.expectEqualStrings(canonical_advisory, alias_advisory);
 }
 
 test "EventStore exclusive sessions bridge public lock protocols" {
