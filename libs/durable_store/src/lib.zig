@@ -2396,8 +2396,7 @@ const event_store_lock_dir_name = ".durable-store-locks";
 fn rejectEventStoreControlNamespace(path: []const u8) !void {
     var components = std.fs.path.componentIterator(path);
     while (components.next()) |component| {
-        if (std.mem.eql(
-            u8,
+        if (std.ascii.eqlIgnoreCase(
             component.name,
             event_store_lock_dir_name,
         )) return error.ReservedStorePath;
@@ -2491,14 +2490,23 @@ fn directoryNamesAreCaseInsensitive(
     }
 }
 
-fn prospectiveStoreBasenameAlloc(
+fn eventStoreIdentityBasenameAlloc(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) ![:0]u8 {
-    const basename = std.fs.path.basename(store_path);
+    const identity_path = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        store_path,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupeZ(u8, store_path),
+        else => return err,
+    };
+    defer allocator.free(identity_path);
+    const basename = std.fs.path.basename(identity_path);
     const identity = try allocator.dupeZ(u8, basename);
     errdefer allocator.free(identity);
-    const parent = std.fs.path.dirname(store_path) orelse ".";
+    const parent = std.fs.path.dirname(identity_path) orelse ".";
     if (try directoryNamesAreCaseInsensitive(allocator, parent)) {
         for (identity[0..basename.len]) |*byte| {
             byte.* = std.ascii.toLower(byte.*);
@@ -2512,17 +2520,10 @@ pub fn eventStoreLockPathAlloc(
     store_path: []const u8,
 ) ![]u8 {
     try rejectEventStoreControlNamespace(store_path);
-    const identity_basename: [:0]u8 = std.Io.Dir.cwd().realPathFileAlloc(
-        Io.io(),
-        store_path,
+    const identity_basename = try eventStoreIdentityBasenameAlloc(
         allocator,
-    ) catch |err| switch (err) {
-        error.FileNotFound => try prospectiveStoreBasenameAlloc(
-            allocator,
-            store_path,
-        ),
-        else => return err,
-    };
+        store_path,
+    );
     defer allocator.free(identity_basename);
     var digest: [EventHash.digest_length]u8 = undefined;
     EventHash.hash(std.fs.path.basename(identity_basename), &digest, .{});
@@ -5247,6 +5248,22 @@ test "EventStore advisory paths use a disjoint reserved namespace" {
             reserved_resource,
         ),
     );
+    const reserved_case_alias = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".DURABLE-STORE-LOCKS", "resource" },
+    );
+    defer std.testing.allocator.free(reserved_case_alias);
+    try std.testing.expectError(
+        error.ReservedStorePath,
+        lockPathAlloc(std.testing.allocator, reserved_case_alias),
+    );
+    try std.testing.expectError(
+        error.ReservedStorePath,
+        eventStoreLockPathAlloc(
+            std.testing.allocator,
+            reserved_case_alias,
+        ),
+    );
 }
 
 test "EventStore advisory paths preserve existing filesystem case identity" {
@@ -5345,6 +5362,15 @@ test "EventStore prospective case identity follows the host filesystem" {
         std.testing.allocator,
     );
     defer exclusive.release();
+    var initial = try exclusive.snapshot(std.testing.allocator, 4096);
+    defer initial.deinit(std.testing.allocator);
+    var receipt = try exclusive.append(
+        std.testing.allocator,
+        "{\"schema\":\"event/v1\",\"sequence\":1}",
+        .{ .revision = initial.revision, .exists = false },
+        4096,
+    );
+    defer receipt.deinit(std.testing.allocator);
     var alias = JsonlEventStore.initWithIo(case_alias, std.testing.io);
     try std.testing.expectError(
         error.EventStoreBusy,
