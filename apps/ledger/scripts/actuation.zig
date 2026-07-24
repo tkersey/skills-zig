@@ -329,6 +329,7 @@ const PrepareResult = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    durable_store.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const code = try runWithArgv(init.gpa, init.io, argv);
     if (code != 0) std.process.exit(code);

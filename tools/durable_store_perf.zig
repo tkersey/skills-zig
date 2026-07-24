@@ -146,6 +146,7 @@ const PeakAllocator = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    durable_store.installRuntimeIo(init.io);
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const cli = parseCli(argv) catch return error.InvalidArguments;

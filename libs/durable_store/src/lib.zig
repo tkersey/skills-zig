@@ -11,9 +11,9 @@ pub fn installRuntimeIo(io: std.Io) void {
     runtime_io = io;
 }
 
-fn mutationAdmissionIo() std.Io {
+fn mutationAdmissionIo() !std.Io {
     return runtime_io orelse
-        if (@import("builtin").is_test) std.testing.io else Io.io();
+        if (@import("builtin").is_test) std.testing.io else error.EventStoreIoUnavailable;
 }
 
 pub const JsonlIssue = struct {
@@ -458,7 +458,7 @@ pub const JsonlEventStore = struct {
         const self = cast(context);
         if (self.scan_active) return error.EventStoreBusy;
         if (!self.mutation_admission_checked) {
-            const io = self.io orelse mutationAdmissionIo();
+            const io = self.io orelse try mutationAdmissionIo();
             try ensureLockSidecarGitignored(allocator, io, self.path);
             self.mutation_admission_checked = true;
         }

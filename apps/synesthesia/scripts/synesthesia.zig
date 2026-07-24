@@ -270,6 +270,7 @@ const NormalizedInput = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    durable_store.installRuntimeIo(init.io);
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     try runWithArgv(allocator, argv, init.environ_map.get("CODEX_HOME") orelse "");
