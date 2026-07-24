@@ -23,6 +23,7 @@ on:
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
+      - "tools/durable_store_perf.zig"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"

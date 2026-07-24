@@ -53,6 +53,7 @@ root_build="$repo_root/build.zig"
 for token in \
   'cancel-in-progress: true' \
   '.github/scripts/release_apps.sh affected' \
+  '      - "tools/durable_store_perf.zig"' \
   'zig build test-perf-hub'; do
   if ! grep -Fq "$token" "$pr_workflow"; then
     echo "PR CI orchestration token missing: $token" >&2
@@ -211,6 +212,68 @@ assert_execution_policy_context_reset() {
   fi
 }
 
+assert_durable_release_fast_context_reset() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const jsonl_stream_release_fast = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const durable_store_release_fast = b.createModule(.{' \
+    '    .target = target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "add adjacent ReleaseFast modules"
+  local context_base
+  context_base="$(git -C "$tmp" rev-parse HEAD)"
+  printf '%s\n' \
+    'const jsonl_stream_release_fast = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const durable_store_release_fast = b.createModule(.{' \
+    '    .target = changed_target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "change ReleaseFast durable store target"
+  local observed
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
+  if [[ "$observed" != "seq,cas,ledger,memory-note" ]]; then
+    echo "classifier retained stale retrace context: expected seq,cas,ledger,memory-note; observed $observed" >&2
+    exit 1
+  fi
+}
+
+assert_retrace_core_context_reset() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const durable_store = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const retrace_core = b.createModule(.{' \
+    '    .target = target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "add adjacent durable and retrace modules"
+  local context_base
+  context_base="$(git -C "$tmp" rev-parse HEAD)"
+  printf '%s\n' \
+    'const durable_store = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const retrace_core = b.createModule(.{' \
+    '    .target = changed_target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "change retrace core target"
+  local observed
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
+  if [[ "$observed" != "seq,cas" ]]; then
+    echo "classifier retained stale durable-store context: expected seq,cas; observed $observed" >&2
+    exit 1
+  fi
+}
+
 assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/jsonl_core/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/execution_policy_core/src/root.zig" "seq"
@@ -224,9 +287,13 @@ assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
 assert_case ".github/workflows/pr-ci.yml" ""
 assert_case ".github/workflows/pr-ci.yml" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
 assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
+assert_case "tools/durable_store_perf.zig" ""
+assert_case "tools/durable_store_perf.zig" "seq" "ci-affected"
 assert_version_case "apps/img/VERSION" "img"
 assert_owned_durable_store_build_diff
 assert_execution_policy_context_reset
+assert_durable_release_fast_context_reset
+assert_retrace_core_context_reset
 assert_ambiguous_build_diff
 
-echo "release app classifier: 17/17 cases passed"
+echo "release app classifier: 21/21 cases passed"

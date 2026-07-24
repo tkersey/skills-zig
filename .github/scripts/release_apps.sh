@@ -124,7 +124,7 @@ case "$mode" in
             current_app="ledger"
             return
             ;;
-          *"run_retrace_core_tests"*|*"test-retrace-core"*)
+          *"const retrace_core"*"= b.createModule"*|*"run_retrace_core_tests"*|*"test-retrace-core"*)
             current_app="__retrace_core"
             return
             ;;
@@ -132,7 +132,7 @@ case "$mode" in
             current_app="__retrace_core"
             return
             ;;
-          *"const jsonl_core = b.createModule"*|*"const durable_store = b.createModule"*|*"durable_store_perf"*|*"run_durable_store_tests"*|*"run_jsonl_core_tests"*|*"test-jsonl-core"*)
+          *"const jsonl_core"*"= b.createModule"*|*"const durable_store"*"= b.createModule"*|*"durable_store_perf"*|*"run_durable_store_tests"*|*"run_jsonl_core_tests"*|*"test-jsonl-core"*)
             current_app="__durable_store"
             return
             ;;
@@ -339,6 +339,11 @@ case "$mode" in
           ;;
         libs/execution_policy_core/*)
           mark_execution_policy_core_consumers
+          ;;
+        tools/durable_store_perf.zig)
+          if [[ "$mode" == "ci-affected" ]]; then
+            mark_app seq
+          fi
           ;;
         .github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
           mark_app cas

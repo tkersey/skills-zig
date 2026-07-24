@@ -64,6 +64,10 @@ pub const EventRecordView = struct {
 };
 
 pub const EventRecordVisitor = struct {
+    /// Scans stream records before the complete source is known valid. A later
+    /// read, size, allocation, or visitor error does not roll back completed
+    /// calls. Callers that retry a failed scan must make visitFn side-effect
+    /// free or idempotent for records already observed by that attempt.
     context: *anyopaque,
     visitFn: *const fn (context: *anyopaque, record: EventRecordView) anyerror!void,
 
@@ -288,6 +292,7 @@ pub const PersistentEventStore = struct {
 
 pub const JsonlEventStore = struct {
     path: []const u8,
+    scan_active: bool = false,
 
     pub fn init(path: []const u8) JsonlEventStore {
         return .{ .path = path };
@@ -334,7 +339,11 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        return scanJsonlEventStore(allocator, cast(context).path, max_bytes, visitor);
+        const self = cast(context);
+        if (self.scan_active) return error.EventStoreBusy;
+        self.scan_active = true;
+        defer self.scan_active = false;
+        return scanJsonlEventStore(allocator, self.path, max_bytes, visitor);
     }
 
     fn snapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
@@ -352,6 +361,7 @@ pub const JsonlEventStore = struct {
         expectation: EventAppendExpectation,
         max_bytes: usize,
     ) !EventAppendReceipt {
+        if (cast(context).scan_active) return error.EventStoreBusy;
         var exclusive = acquireExclusive(context, allocator) catch |err| switch (err) {
             error.EventStoreBusy => return error.PathAlreadyExists,
             else => return err,
@@ -367,6 +377,7 @@ pub const JsonlEventStore = struct {
         expectation: EventAppendExpectation,
         max_bytes: usize,
     ) !EventAppendReceipt {
+        if (cast(context).scan_active) return error.EventStoreBusy;
         var exclusive = acquireExclusive(context, allocator) catch |err| switch (err) {
             error.EventStoreBusy => return error.PathAlreadyExists,
             else => return err,
@@ -377,6 +388,7 @@ pub const JsonlEventStore = struct {
 
     fn acquireExclusive(context: *anyopaque, allocator: std.mem.Allocator) !EventStoreExclusive {
         const self = cast(context);
+        if (self.scan_active) return error.EventStoreBusy;
         const exclusive = try allocator.create(ExclusiveContext);
         errdefer allocator.destroy(exclusive);
         const lock = acquireLock(allocator, self.path) catch |err| switch (err) {
@@ -413,6 +425,7 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
     ) !EventAppendReceipt {
         const exclusive = exclusiveCast(context);
+        if (exclusive.store.scan_active) return error.EventStoreBusy;
         try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
@@ -434,6 +447,7 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
     ) !EventAppendReceipt {
         const exclusive = exclusiveCast(context);
+        if (exclusive.store.scan_active) return error.EventStoreBusy;
         for (records) |payload| try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
@@ -3800,15 +3814,24 @@ const GrowingEventScanProbe = struct {
     }
 };
 
-const ReentrantMemoryScanProbe = struct {
+const ReentrantEventScanProbe = struct {
     store: EventStore,
     count: usize = 0,
+    acquisition_rejected: bool = false,
     mutation_rejected: bool = false,
 
     fn visit(context: *anyopaque, _: EventRecordView) !void {
-        const self: *ReentrantMemoryScanProbe = @ptrCast(@alignCast(context));
+        const self: *ReentrantEventScanProbe = @ptrCast(@alignCast(context));
         self.count += 1;
         if (self.count != 1) return;
+        if (self.store.acquireExclusive(std.testing.allocator)) |session| {
+            var exclusive = session;
+            exclusive.release();
+            return error.ExpectedEventStoreBusy;
+        } else |err| switch (err) {
+            error.EventStoreBusy => self.acquisition_rejected = true,
+            else => return err,
+        }
         const replacement = [_][]const u8{"{\"sequence\":99}"};
         var receipt = self.store.replace(
             std.testing.allocator,
@@ -3826,18 +3849,18 @@ const ReentrantMemoryScanProbe = struct {
         return error.ExpectedEventStoreBusy;
     }
 
-    fn visitor(self: *ReentrantMemoryScanProbe) EventRecordVisitor {
+    fn visitor(self: *ReentrantEventScanProbe) EventRecordVisitor {
         return .{ .context = self, .visitFn = visit };
     }
 };
 
-const ReentrantMemoryExclusiveScanProbe = struct {
+const ReentrantExclusiveScanProbe = struct {
     store: *const EventStoreExclusive,
     count: usize = 0,
     mutation_rejected: bool = false,
 
     fn visit(context: *anyopaque, _: EventRecordView) !void {
-        const self: *ReentrantMemoryExclusiveScanProbe = @ptrCast(@alignCast(context));
+        const self: *ReentrantExclusiveScanProbe = @ptrCast(@alignCast(context));
         self.count += 1;
         if (self.count != 1) return;
         const replacement = [_][]const u8{"{\"sequence\":99}"};
@@ -3857,10 +3880,51 @@ const ReentrantMemoryExclusiveScanProbe = struct {
         return error.ExpectedEventStoreBusy;
     }
 
-    fn visitor(self: *ReentrantMemoryExclusiveScanProbe) EventRecordVisitor {
+    fn visitor(self: *ReentrantExclusiveScanProbe) EventRecordVisitor {
         return .{ .context = self, .visitFn = visit };
     }
 };
+
+fn assertEventStoreRejectsReentrantMutation(store: EventStore) !void {
+    const records = [_][]const u8{
+        "{\"sequence\":1}",
+        "{\"sequence\":2}",
+    };
+    var seeded = try store.replace(
+        std.testing.allocator,
+        &records,
+        .{ .exists = false },
+        4096,
+    );
+    defer seeded.deinit(std.testing.allocator);
+
+    var probe = ReentrantEventScanProbe{ .store = store };
+    var summary = try store.scan(std.testing.allocator, 4096, probe.visitor());
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expect(probe.acquisition_rejected);
+    try std.testing.expect(probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqual(@as(usize, 2), summary.record_count);
+
+    var snapshot = try store.snapshot(std.testing.allocator, 4096);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.records.len);
+    try std.testing.expectEqualStrings(records[0], snapshot.records[0].payload);
+    try std.testing.expectEqualStrings(records[1], snapshot.records[1].payload);
+
+    var exclusive = try store.acquireExclusive(std.testing.allocator);
+    defer exclusive.release();
+    var exclusive_probe = ReentrantExclusiveScanProbe{ .store = &exclusive };
+    var exclusive_summary = try exclusive.scan(
+        std.testing.allocator,
+        4096,
+        exclusive_probe.visitor(),
+    );
+    defer exclusive_summary.deinit(std.testing.allocator);
+    try std.testing.expect(exclusive_probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), exclusive_probe.count);
+    try std.testing.expectEqual(@as(usize, 2), exclusive_summary.record_count);
+}
 
 fn assertEventStoreContract(store: EventStore) !void {
     var initial = try store.snapshot(std.testing.allocator, 4096);
@@ -4051,50 +4115,23 @@ test "event store backends share canonical padded-event observations" {
     );
 }
 
-test "memory event store rejects reentrant mutation during scan" {
-    var backend = MemoryEventStore.init(std.testing.allocator, "memory:reentrant");
-    defer backend.deinit();
-    const store = backend.eventStore();
-    const records = [_][]const u8{
-        "{\"sequence\":1}",
-        "{\"sequence\":2}",
-    };
-    var seeded = try store.replace(
-        std.testing.allocator,
-        &records,
-        .{ .exists = false },
-        4096,
-    );
-    defer seeded.deinit(std.testing.allocator);
+test "event store backends reject reentrant mutation during scan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "reentrant.jsonl" });
+    defer std.testing.allocator.free(path);
 
-    var probe = ReentrantMemoryScanProbe{ .store = store };
-    var summary = try store.scan(std.testing.allocator, 4096, probe.visitor());
-    defer summary.deinit(std.testing.allocator);
-    try std.testing.expect(probe.mutation_rejected);
-    try std.testing.expectEqual(@as(usize, 2), probe.count);
-    try std.testing.expectEqual(@as(usize, 2), summary.record_count);
+    var persistent_backend = PersistentEventStore.init(path);
+    try assertEventStoreRejectsReentrantMutation(persistent_backend.eventStore());
 
-    var snapshot = try store.snapshot(std.testing.allocator, 4096);
-    defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), snapshot.records.len);
-    try std.testing.expectEqualStrings(records[0], snapshot.records[0].payload);
-    try std.testing.expectEqualStrings(records[1], snapshot.records[1].payload);
-
-    var exclusive = try store.acquireExclusive(std.testing.allocator);
-    defer exclusive.release();
-    var exclusive_probe = ReentrantMemoryExclusiveScanProbe{ .store = &exclusive };
-    var exclusive_summary = try exclusive.scan(
-        std.testing.allocator,
-        4096,
-        exclusive_probe.visitor(),
-    );
-    defer exclusive_summary.deinit(std.testing.allocator);
-    try std.testing.expect(exclusive_probe.mutation_rejected);
-    try std.testing.expectEqual(@as(usize, 2), exclusive_probe.count);
-    try std.testing.expectEqual(@as(usize, 2), exclusive_summary.record_count);
+    var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:reentrant");
+    defer memory_backend.deinit();
+    try assertEventStoreRejectsReentrantMutation(memory_backend.eventStore());
 }
 
-test "jsonl event store rejects growth beyond scan byte budget" {
+test "jsonl scan preserves completed visitor calls before a terminal error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
