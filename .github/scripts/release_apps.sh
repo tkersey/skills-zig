@@ -136,6 +136,10 @@ case "$mode" in
             current_app="__durable_store"
             return
             ;;
+          *"const execution_policy_core = b.createModule"*)
+            current_app="__execution_policy_core"
+            return
+            ;;
           *"ledger_routine_test_filters"*|*"run_ledger_portable_ceiling"*|*"ledger_validation_qualification_root"*)
             current_app="__ledger_test"
             return
@@ -253,6 +257,9 @@ case "$mode" in
           matched=1
         elif [[ "$current_app" == "__durable_store" ]]; then
           mark_durable_store_consumers
+          matched=1
+        elif [[ "$current_app" == "__execution_policy_core" ]]; then
+          mark_execution_policy_core_consumers
           matched=1
         elif [[ "$current_app" == "ledger" && "$raw" == *"[]const u8,"* ]]; then
           mark_app ledger

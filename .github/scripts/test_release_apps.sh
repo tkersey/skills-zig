@@ -49,12 +49,37 @@ fi
 
 pr_workflow="$repo_root/.github/workflows/pr-ci.yml"
 auto_release_workflow="$repo_root/.github/workflows/auto-release.yml"
+root_build="$repo_root/build.zig"
 for token in \
   'cancel-in-progress: true' \
   '.github/scripts/release_apps.sh affected' \
   'zig build test-perf-hub'; do
   if ! grep -Fq "$token" "$pr_workflow"; then
     echo "PR CI orchestration token missing: $token" >&2
+    exit 1
+  fi
+done
+
+jsonl_release_block="$(
+  sed -n '/const jsonl_stream_release_fast = b.createModule/,/^    });/p' "$root_build"
+)"
+durable_release_block="$(
+  sed -n '/const durable_store_release_fast = b.createModule/,/^    });/p' "$root_build"
+)"
+durable_perf_block="$(
+  sed -n '/const durable_store_perf_root = b.createModule/,/^    });/p' "$root_build"
+)"
+for requirement in \
+  'jsonl_release_block|.optimize = .ReleaseFast' \
+  'durable_release_block|.optimize = .ReleaseFast' \
+  'durable_release_block|.{ .name = "jsonl_core", .module = jsonl_stream_release_fast }' \
+  'durable_perf_block|.optimize = .ReleaseFast' \
+  'durable_perf_block|.{ .name = "durable_store", .module = durable_store_release_fast }'; do
+  block_name="${requirement%%|*}"
+  token="${requirement#*|}"
+  block="${!block_name}"
+  if ! grep -Fq -- "$token" <<<"$block"; then
+    echo "Durable-store ReleaseFast build graph missing token: $token" >&2
     exit 1
   fi
 done
@@ -155,6 +180,37 @@ assert_owned_durable_store_build_diff() {
   assert_observed "owned durable store build diff" "seq,cas,ledger,memory-note"
 }
 
+assert_execution_policy_context_reset() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const durable_store = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const execution_policy_core = b.createModule(.{' \
+    '    .target = target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "add adjacent shared modules"
+  local context_base
+  context_base="$(git -C "$tmp" rev-parse HEAD)"
+  printf '%s\n' \
+    'const durable_store = b.createModule(.{' \
+    '    .target = target,' \
+    '});' \
+    'const execution_policy_core = b.createModule(.{' \
+    '    .target = changed_target,' \
+    '});' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "change execution policy target"
+  local observed
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
+  if [[ "$observed" != "seq" ]]; then
+    echo "classifier retained stale durable-store context: expected seq; observed $observed" >&2
+    exit 1
+  fi
+}
+
 assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/jsonl_core/src/lib.zig" "seq,cas,ledger,memory-note"
 assert_case "libs/execution_policy_core/src/root.zig" "seq"
@@ -170,6 +226,7 @@ assert_case ".github/workflows/pr-ci.yml" "seq,lift,cas,cron,ledger,memory-note,
 assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
 assert_version_case "apps/img/VERSION" "img"
 assert_owned_durable_store_build_diff
+assert_execution_policy_context_reset
 assert_ambiguous_build_diff
 
-echo "release app classifier: 16/16 cases passed"
+echo "release app classifier: 17/17 cases passed"

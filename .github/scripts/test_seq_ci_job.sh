@@ -78,6 +78,9 @@ expect_count 0 "ReleaseFast"
 expect_count 0 "working-directory: apps/seq"
 expect_count 1 "zig build test-seq --summary all"
 expect_count 1 "zig build test-retrace-core --summary all"
+expect_count 1 "zig build test-jsonl-core --summary all"
+expect_count 1 "zig build test-durable-store --summary all"
+expect_count 1 "zig build test-durable-store-perf --summary all"
 expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq"
 
 for token in \

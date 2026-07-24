@@ -56,6 +56,8 @@ pub const EventSnapshot = struct {
 };
 
 pub const EventRecordView = struct {
+    /// Borrowed only for the active EventRecordVisitor.visit call.
+    /// Visitors must copy payload bytes that need to outlive that call.
     payload: []const u8,
     ordinal: u64,
     diagnostic_position: ?usize = null,
@@ -460,6 +462,7 @@ pub const MemoryEventStore = struct {
     logical_ref: []const u8,
     exists: bool = false,
     exclusive_active: bool = false,
+    scan_active: bool = false,
     records: std.ArrayList([]u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, logical_ref: []const u8) MemoryEventStore {
@@ -512,7 +515,11 @@ pub const MemoryEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        return scanMemoryEventStore(allocator, cast(context), max_bytes, visitor);
+        const self = cast(context);
+        if (self.scan_active) return error.EventStoreBusy;
+        self.scan_active = true;
+        defer self.scan_active = false;
+        return scanMemoryEventStore(allocator, self, max_bytes, visitor);
     }
 
     fn snapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
@@ -549,7 +556,7 @@ pub const MemoryEventStore = struct {
 
     fn acquireExclusive(context: *anyopaque, allocator: std.mem.Allocator) !EventStoreExclusive {
         const self = cast(context);
-        if (self.exclusive_active) return error.EventStoreBusy;
+        if (self.exclusive_active or self.scan_active) return error.EventStoreBusy;
         const exclusive = try allocator.create(ExclusiveContext);
         exclusive.* = .{ .allocator = allocator, .store = self };
         self.exclusive_active = true;
@@ -581,6 +588,7 @@ pub const MemoryEventStore = struct {
         max_bytes: usize,
     ) !EventAppendReceipt {
         const self = exclusiveCast(context).store;
+        if (self.scan_active) return error.EventStoreBusy;
         try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
@@ -603,6 +611,7 @@ pub const MemoryEventStore = struct {
         max_bytes: usize,
     ) !EventAppendReceipt {
         const self = exclusiveCast(context).store;
+        if (self.scan_active) return error.EventStoreBusy;
         for (records) |payload| try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
@@ -2052,15 +2061,22 @@ fn scanMemoryEventStore(
 
     var raw_hash = EventHash.init(.{});
     var canonical_hash = EventHash.init(.{});
-    for (store.records.items, 0..) |payload, index| {
+    var record_count: usize = 0;
+    var blank_entries: usize = 0;
+    for (store.records.items) |payload| {
         const canonical_payload = std.mem.trim(u8, payload, " \t\r\n");
         raw_hash.update(payload);
         raw_hash.update("\n");
+        if (canonical_payload.len == 0) {
+            blank_entries += 1;
+            continue;
+        }
+        record_count += 1;
         canonical_hash.update(canonical_payload);
         canonical_hash.update("\n");
         try visitor.visit(.{
             .payload = canonical_payload,
-            .ordinal = @intCast(index + 1),
+            .ordinal = @intCast(record_count),
             .diagnostic_position = null,
         });
     }
@@ -2070,8 +2086,8 @@ fn scanMemoryEventStore(
         store.exists,
         &raw_hash,
         &canonical_hash,
-        store.records.items.len,
-        0,
+        record_count,
+        blank_entries,
         extent_bytes,
         0,
     );
@@ -3780,6 +3796,68 @@ const GrowingEventScanProbe = struct {
     }
 };
 
+const ReentrantMemoryScanProbe = struct {
+    store: EventStore,
+    count: usize = 0,
+    mutation_rejected: bool = false,
+
+    fn visit(context: *anyopaque, _: EventRecordView) !void {
+        const self: *ReentrantMemoryScanProbe = @ptrCast(@alignCast(context));
+        self.count += 1;
+        if (self.count != 1) return;
+        const replacement = [_][]const u8{"{\"sequence\":99}"};
+        var receipt = self.store.replace(
+            std.testing.allocator,
+            &replacement,
+            .{},
+            4096,
+        ) catch |err| switch (err) {
+            error.EventStoreBusy => {
+                self.mutation_rejected = true;
+                return;
+            },
+            else => return err,
+        };
+        defer receipt.deinit(std.testing.allocator);
+        return error.ExpectedEventStoreBusy;
+    }
+
+    fn visitor(self: *ReentrantMemoryScanProbe) EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+};
+
+const ReentrantMemoryExclusiveScanProbe = struct {
+    store: *const EventStoreExclusive,
+    count: usize = 0,
+    mutation_rejected: bool = false,
+
+    fn visit(context: *anyopaque, _: EventRecordView) !void {
+        const self: *ReentrantMemoryExclusiveScanProbe = @ptrCast(@alignCast(context));
+        self.count += 1;
+        if (self.count != 1) return;
+        const replacement = [_][]const u8{"{\"sequence\":99}"};
+        var receipt = self.store.replace(
+            std.testing.allocator,
+            &replacement,
+            .{},
+            4096,
+        ) catch |err| switch (err) {
+            error.EventStoreBusy => {
+                self.mutation_rejected = true;
+                return;
+            },
+            else => return err,
+        };
+        defer receipt.deinit(std.testing.allocator);
+        return error.ExpectedEventStoreBusy;
+    }
+
+    fn visitor(self: *ReentrantMemoryExclusiveScanProbe) EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+};
+
 fn assertEventStoreContract(store: EventStore) !void {
     var initial = try store.snapshot(std.testing.allocator, 4096);
     defer initial.deinit(std.testing.allocator);
@@ -3918,7 +3996,7 @@ test "event store backends share canonical padded-event observations" {
     defer std.testing.allocator.free(root);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "padded.jsonl" });
     defer std.testing.allocator.free(path);
-    try writeTextAtomic(std.testing.allocator, path, "{\"a\":1}\n");
+    try writeTextAtomic(std.testing.allocator, path, " \n{\"a\":1}\n\t\n");
 
     var persistent_backend = PersistentEventStore.init(path);
     var persistent_snapshot = try persistent_backend.eventStore().snapshot(
@@ -3929,10 +4007,13 @@ test "event store backends share canonical padded-event observations" {
 
     var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:padded");
     defer memory_backend.deinit();
-    try memory_backend.records.append(
-        memory_backend.allocator,
-        try memory_backend.allocator.dupe(u8, "  {\"a\":1} \t"),
-    );
+    const padded_records = [_][]const u8{ " ", "  {\"a\":1} \t", "\t" };
+    for (padded_records) |payload| {
+        try memory_backend.records.append(
+            memory_backend.allocator,
+            try memory_backend.allocator.dupe(u8, payload),
+        );
+    }
     memory_backend.exists = true;
     var memory_snapshot = try memory_backend.eventStore().snapshot(
         std.testing.allocator,
@@ -3948,15 +4029,65 @@ test "event store backends share canonical padded-event observations" {
         persistent_snapshot.content_digest,
         memory_snapshot.content_digest,
     );
+    try std.testing.expectEqual(@as(usize, 1), memory_snapshot.records.len);
+    try std.testing.expectEqual(@as(u64, 1), memory_snapshot.records[0].ordinal);
+    try std.testing.expectEqual(
+        persistent_snapshot.blank_entries,
+        memory_snapshot.blank_entries,
+    );
+    try std.testing.expectEqual(@as(usize, 2), memory_snapshot.blank_entries);
     try std.testing.expect(!std.mem.eql(
         u8,
         persistent_snapshot.revision,
         memory_snapshot.revision,
     ));
     try std.testing.expectEqual(
-        @as(usize, "  {\"a\":1} \t\n".len),
+        @as(usize, " \n  {\"a\":1} \t\n\t\n".len),
         memory_snapshot.extent_bytes,
     );
+}
+
+test "memory event store rejects reentrant mutation during scan" {
+    var backend = MemoryEventStore.init(std.testing.allocator, "memory:reentrant");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    const records = [_][]const u8{
+        "{\"sequence\":1}",
+        "{\"sequence\":2}",
+    };
+    var seeded = try store.replace(
+        std.testing.allocator,
+        &records,
+        .{ .exists = false },
+        4096,
+    );
+    defer seeded.deinit(std.testing.allocator);
+
+    var probe = ReentrantMemoryScanProbe{ .store = store };
+    var summary = try store.scan(std.testing.allocator, 4096, probe.visitor());
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expect(probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), probe.count);
+    try std.testing.expectEqual(@as(usize, 2), summary.record_count);
+
+    var snapshot = try store.snapshot(std.testing.allocator, 4096);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.records.len);
+    try std.testing.expectEqualStrings(records[0], snapshot.records[0].payload);
+    try std.testing.expectEqualStrings(records[1], snapshot.records[1].payload);
+
+    var exclusive = try store.acquireExclusive(std.testing.allocator);
+    defer exclusive.release();
+    var exclusive_probe = ReentrantMemoryExclusiveScanProbe{ .store = &exclusive };
+    var exclusive_summary = try exclusive.scan(
+        std.testing.allocator,
+        4096,
+        exclusive_probe.visitor(),
+    );
+    defer exclusive_summary.deinit(std.testing.allocator);
+    try std.testing.expect(exclusive_probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), exclusive_probe.count);
+    try std.testing.expectEqual(@as(usize, 2), exclusive_summary.record_count);
 }
 
 test "jsonl event store rejects growth beyond scan byte budget" {

@@ -170,6 +170,12 @@ jobs:
         run: zig build test-seq --summary all
       - name: Test Retrace core contracts
         run: zig build test-retrace-core --summary all
+      - name: Test JSONL core contracts
+        run: zig build test-jsonl-core --summary all
+      - name: Test durable store contracts
+        run: zig build test-durable-store --summary all
+      - name: Test durable store performance contracts
+        run: zig build test-durable-store-perf --summary all
       - name: Verify non-macOS seq command and capability admission
         run: apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq
 

@@ -218,7 +218,7 @@ fn writeMeasuredReport(
     cli: Cli,
     measurements: Measurements,
 ) !void {
-    const baseline = try loadBaseline(allocator, baseline_path);
+    const baseline = try loadBaseline(allocator, baseline_path, measurements);
     const scan_alloc_reduction = reductionPct(
         baseline.scan_peak_live_bytes,
         measurements.scan_peak_live_bytes,
@@ -385,7 +385,11 @@ fn measureAppend(path: []const u8, fixture_bytes: usize) !Round {
     };
 }
 
-fn loadBaseline(allocator: std.mem.Allocator, path: []const u8) !Baseline {
+fn loadBaseline(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    measurements: Measurements,
+) !Baseline {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         Io.io(),
         path,
@@ -399,12 +403,52 @@ fn loadBaseline(allocator: std.mem.Allocator, path: []const u8) !Baseline {
         .object => |value| value,
         else => return error.InvalidBaseline,
     };
+    return baselineFromObject(object, measurements);
+}
+
+fn baselineFromObject(
+    object: std.json.ObjectMap,
+    measurements: Measurements,
+) !Baseline {
+    try requireBaselineString(object, "schema", "durable-store-perf/v1");
+    try requireBaselineString(object, "route", "aggregate");
+    try requireBaselineUsize(object, "fixture_bytes", measurements.actual_bytes);
+    try requireBaselineUsize(object, "record_count", measurements.record_count);
+    try requireBaselineUsize(object, "rounds", rounds);
     return .{
         .scan_elapsed_ns = try baselineU64(object, "scan_p50_elapsed_ns"),
         .scan_peak_live_bytes = try baselineU64(object, "scan_p50_peak_live_bytes"),
         .append_elapsed_ns = try baselineU64(object, "append_p50_elapsed_ns"),
         .append_peak_live_bytes = try baselineU64(object, "append_p50_peak_live_bytes"),
     };
+}
+
+fn requireBaselineString(
+    object: std.json.ObjectMap,
+    name: []const u8,
+    expected: []const u8,
+) !void {
+    const value = object.get(name) orelse return error.InvalidBaseline;
+    const observed = switch (value) {
+        .string => |string| string,
+        else => return error.InvalidBaseline,
+    };
+    if (!std.mem.eql(u8, expected, observed)) return error.InvalidBaseline;
+}
+
+fn requireBaselineUsize(
+    object: std.json.ObjectMap,
+    name: []const u8,
+    expected: usize,
+) !void {
+    const value = object.get(name) orelse return error.InvalidBaseline;
+    const integer = switch (value) {
+        .integer => |observed| observed,
+        else => return error.InvalidBaseline,
+    };
+    if (integer <= 0) return error.InvalidBaseline;
+    const observed = std.math.cast(usize, integer) orelse return error.InvalidBaseline;
+    if (observed != expected) return error.InvalidBaseline;
 }
 
 fn baselineU64(object: std.json.ObjectMap, name: []const u8) !u64 {
@@ -423,4 +467,69 @@ fn reductionPct(baseline: u64, current: u64) f64 {
 fn regressionPct(baseline: u64, current: u64) f64 {
     return (@as(f64, @floatFromInt(current)) - @as(f64, @floatFromInt(baseline))) /
         @as(f64, @floatFromInt(baseline)) * 100.0;
+}
+
+test "performance baseline identity is exact" {
+    const valid =
+        \\{"schema":"durable-store-perf/v1","route":"aggregate",
+        \\"fixture_bytes":96,"record_count":3,"rounds":3,
+        \\"scan_p50_elapsed_ns":100,"scan_p50_peak_live_bytes":200,
+        \\"append_p50_elapsed_ns":300,"append_p50_peak_live_bytes":400}
+    ;
+    const measurements = Measurements{
+        .actual_bytes = 96,
+        .record_count = 3,
+        .scan_elapsed_ns = 1,
+        .scan_peak_live_bytes = 1,
+        .append_elapsed_ns = 1,
+        .append_peak_live_bytes = 1,
+    };
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        valid,
+        .{},
+    );
+    defer parsed.deinit();
+    const baseline = try baselineFromObject(parsed.value.object, measurements);
+    try std.testing.expectEqual(@as(u64, 100), baseline.scan_elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 400), baseline.append_peak_live_bytes);
+}
+
+test "performance baseline rejects mismatched workload metadata" {
+    const invalid = [_][]const u8{
+        \\{"schema":"other","route":"aggregate","fixture_bytes":96,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+        \\{"schema":"durable-store-perf/v1","route":"streaming","fixture_bytes":96,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":97,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":96,"record_count":4,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":96,"record_count":3,"rounds":4,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+        \\{"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
+        ,
+    };
+    const measurements = Measurements{
+        .actual_bytes = 96,
+        .record_count = 3,
+        .scan_elapsed_ns = 1,
+        .scan_peak_live_bytes = 1,
+        .append_elapsed_ns = 1,
+        .append_peak_live_bytes = 1,
+    };
+    for (invalid) |text| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            text,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidBaseline,
+            baselineFromObject(parsed.value.object, measurements),
+        );
+    }
 }

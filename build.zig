@@ -69,6 +69,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const durable_store_release_fast = b.createModule(.{
+        .root_source_file = b.path("libs/durable_store/src/lib.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_stream_release_fast },
+        },
+    });
     const canonical_json_release_fast = b.createModule(.{
         .root_source_file = b.path("libs/retrace_core/src/canonical_json.zig"),
         .target = target,
@@ -425,7 +433,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
-            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "durable_store", .module = durable_store_release_fast },
         },
     });
 
@@ -719,6 +727,12 @@ pub fn build(b: *std.Build) void {
         "test-durable-store",
         "Run durable_store tests",
     );
+    const run_durable_store_perf_tests = addTestStep(
+        b,
+        durable_store_perf_root,
+        "test-durable-store-perf",
+        "Run durable_store performance-contract tests",
+    );
     const run_jsonl_core_tests = addTestStep(
         b,
         jsonl_core,
@@ -838,6 +852,7 @@ pub fn build(b: *std.Build) void {
     }
     test_all.dependOn(&run_perf_hub_tests.step);
     test_all.dependOn(&run_durable_store_tests.step);
+    test_all.dependOn(&run_durable_store_perf_tests.step);
     test_all.dependOn(&run_jsonl_core_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
