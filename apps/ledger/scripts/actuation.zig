@@ -253,6 +253,7 @@ const State = struct {
     subject_digest: ?[]const u8 = null,
     classes: std.ArrayList(ClassRecord) = .empty,
     counterexample_sets: std.ArrayList([]const u8) = .empty,
+    latest_counterexample_set_construction_ref: ?[]const u8 = null,
     pending: ?Pending = null,
     used_steps: std.ArrayList([]const u8) = .empty,
     used_keys: std.ArrayList([]const u8) = .empty,
@@ -1180,7 +1181,6 @@ fn validateConstructionStructure(structure: ConstructionStructure) !void {
         const set_ref = recompilation.counterexample_set_ref orelse
             return error.MissingCounterexampleSetRef;
         try requireDigest(set_ref);
-        if (recompilation.evaluated_class_refs.len == 0) return error.EmptyArray;
     }
     if (recompilation.candidates.len != @typeInfo(CandidateFamily).@"enum".fields.len) {
         return error.IncompleteCandidateFamilies;
@@ -1949,6 +1949,7 @@ fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
         state.subject_digest = null;
         state.classes = .empty;
         state.counterexample_sets = .empty;
+        state.latest_counterexample_set_construction_ref = null;
     } else if (view.predecessors.items.len != 0) return error.InvalidInitialGoal;
     state.goal = view;
 }
@@ -1997,7 +1998,7 @@ fn validateConstructionAgainstState(
     try validateConstructionScope(goal.payload, payload);
     try validateConstructionLaws(goal.payload, payload);
     try validateConstructionAcceptance(goal.payload, payload);
-    try validateConstructionCounterexamples(state, payload);
+    try validateConstructionCounterexamples(state, payload, true);
 }
 
 fn validateConstructionModeAndLineage(
@@ -2151,6 +2152,75 @@ fn validateConstructionLaws(
             return error.UncoveredGoalLaw;
         }
     }
+    try validateConstructionSemanticReferences(laws, obligations, construction);
+}
+
+fn validateConstructionSemanticReferences(
+    laws: std.json.Array,
+    obligations: std.json.Array,
+    construction: std.json.ObjectMap,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const structure = try parseConstructionStructure(
+        arena.allocator(),
+        try field(construction, "recompilation"),
+        try field(construction, "semantic_surface"),
+        try field(construction, "supersession"),
+    );
+    for (structure.recompilation.candidates) |candidate| {
+        try validateLawReferenceSlice(laws, candidate.law_refs);
+        try validateProofReferenceSlice(obligations, candidate.observation_refs);
+        try validateFactorReferences(laws, obligations, candidate.factors);
+    }
+    try validateFactorReferences(
+        laws,
+        obligations,
+        structure.semantic_surface.predecessor_factors,
+    );
+    try validateFactorReferences(
+        laws,
+        obligations,
+        structure.semantic_surface.successor_factors,
+    );
+    for (structure.supersession.essential_additions) |addition| {
+        try validateLawReferenceSlice(laws, addition.law_refs);
+        try validateProofReferenceSlice(obligations, addition.proof_refs);
+    }
+    if (!hasObjectId(
+        obligations,
+        "obligation_id",
+        structure.supersession.surface_completeness_proof_ref,
+    )) return error.UnknownConstructionProofRef;
+}
+
+fn validateFactorReferences(
+    laws: std.json.Array,
+    obligations: std.json.Array,
+    factors: []const Factor,
+) !void {
+    for (factors) |factor| {
+        try validateLawReferenceSlice(laws, factor.law_refs);
+        try validateProofReferenceSlice(obligations, factor.observation_refs);
+    }
+}
+
+fn validateLawReferenceSlice(
+    laws: std.json.Array,
+    refs: []const []const u8,
+) !void {
+    for (refs) |ref| if (!goalHasLaw(laws, ref)) {
+        return error.UnknownConstructionLawRef;
+    };
+}
+
+fn validateProofReferenceSlice(
+    obligations: std.json.Array,
+    refs: []const []const u8,
+) !void {
+    for (refs) |ref| if (!hasObjectId(obligations, "obligation_id", ref)) {
+        return error.UnknownConstructionProofRef;
+    };
 }
 
 fn validateConstructionAcceptance(
@@ -2204,6 +2274,7 @@ fn goalHasLaw(laws: std.json.Array, law_id: []const u8) bool {
 fn validateConstructionCounterexamples(
     state: *State,
     construction: std.json.ObjectMap,
+    admitting_successor: bool,
 ) !void {
     const refs = try asArray(try field(construction, "counterexample_class_refs"));
     const recompilation = try asObject(try field(construction, "recompilation"));
@@ -2254,25 +2325,44 @@ fn validateConstructionCounterexamples(
             return error.HighSeverityCounterexampleRequiresStrongProof;
         }
     }
+    if (refs.items.len != accepted_count) {
+        return error.RecompilationClassSetMismatch;
+    }
     const trigger = try stringField(recompilation, "trigger");
     if (accepted_count == 0) {
-        if (!std.mem.eql(u8, trigger, "initial") or refs.items.len != 0) {
+        if (std.mem.eql(u8, trigger, "initial")) {
+            if (try optionalStringField(recompilation, "counterexample_set_ref") != null) {
+                return error.UnnecessaryReviewRecompilation;
+            }
+            return;
+        }
+        if (!std.mem.eql(u8, trigger, "accepted-review-fold")) {
             return error.UnnecessaryReviewRecompilation;
         }
     } else {
         if (!std.mem.eql(u8, trigger, "accepted-review-fold")) {
             return error.MissingReviewRecompilation;
         }
-        const set_ref = try optionalStringField(recompilation, "counterexample_set_ref");
-        if (set_ref == null or state.counterexample_sets.items.len == 0 or
+    }
+    const set_ref = try optionalStringField(recompilation, "counterexample_set_ref");
+    if (set_ref == null or state.counterexample_sets.items.len == 0 or
+        !std.mem.eql(
+            u8,
+            set_ref.?,
+            state.counterexample_sets.items[state.counterexample_sets.items.len - 1],
+        ))
+    {
+        return error.StaleCounterexampleSetRef;
+    }
+    if (admitting_successor and
+        (state.latest_counterexample_set_construction_ref == null or
             !std.mem.eql(
                 u8,
-                set_ref.?,
-                state.counterexample_sets.items[state.counterexample_sets.items.len - 1],
-            ))
-        {
-            return error.StaleCounterexampleSetRef;
-        }
+                state.latest_counterexample_set_construction_ref.?,
+                state.construction.?.artifact_id,
+            )))
+    {
+        return error.CounterexampleSetPredecessorMismatch;
     }
 }
 
@@ -2322,12 +2412,14 @@ pub const ConstructionAudit = struct {
     essential_addition_count: usize = 0,
     surface_completeness_bound: bool = false,
     review_recompilation: bool = false,
+    current_review_binding: bool = false,
 };
 
 pub fn auditConstruction(
     body_value: std.json.Value,
     construction_ref: ?[]const u8,
     classes: []const ConstructionClassRequirement,
+    latest_counterexample_set_ref: ?[]const u8,
 ) !ConstructionAudit {
     const document = try asObject(body_value);
     const artifact = try asObject(try field(document, "artifact"));
@@ -2355,8 +2447,24 @@ pub fn auditConstruction(
         try field(payload, "supersession"),
     );
     try validateConstructionStructure(structure);
-    const surface_completeness_bound =
-        structure.supersession.surface_completeness_proof_ref.len != 0;
+    const surface_completeness_bound = hasObjectId(
+        obligations,
+        "obligation_id",
+        structure.supersession.surface_completeness_proof_ref,
+    );
+    const exact_class_set = auditClassSetMatches(refs, classes);
+    const current_review_binding = switch (structure.recompilation.trigger) {
+        .initial => classes.len == 0 and refs.items.len == 0 and
+            structure.recompilation.counterexample_set_ref == null,
+        .@"accepted-review-fold" => exact_class_set and
+            latest_counterexample_set_ref != null and
+            structure.recompilation.counterexample_set_ref != null and
+            std.mem.eql(
+                u8,
+                latest_counterexample_set_ref.?,
+                structure.recompilation.counterexample_set_ref.?,
+            ),
+    };
     var result = ConstructionAudit{
         .candidate_count = structure.recompilation.candidates.len,
         .predecessor_factor_count = structure.semantic_surface.predecessor_factors.len,
@@ -2368,6 +2476,7 @@ pub fn auditConstruction(
         .essential_addition_count = structure.supersession.essential_additions.len,
         .surface_completeness_bound = surface_completeness_bound,
         .review_recompilation = structure.recompilation.trigger == .@"accepted-review-fold",
+        .current_review_binding = current_review_binding,
     };
     for (structure.recompilation.candidates) |candidate| {
         if (candidate.derivation == .@"incumbent-independent") {
@@ -2411,6 +2520,15 @@ pub fn auditConstruction(
         }
     }
     return result;
+}
+
+fn auditClassSetMatches(
+    refs: std.json.Array,
+    classes: []const ConstructionClassRequirement,
+) bool {
+    if (refs.items.len != classes.len) return false;
+    for (classes) |class| if (!hasString(refs, class.class_id)) return false;
+    return true;
 }
 
 const AuditProofCoverage = struct { any: bool = false, non_example: bool = false };
@@ -2461,6 +2579,8 @@ fn applyCounterexampleRegistration(state: *State, event: ParsedEvent) !void {
     const classes = try asArray(try field(payload, "classes"));
     for (classes.items) |item| try admitClass(state, view, try asObject(item));
     try state.counterexample_sets.append(state.allocator, view.artifact_id);
+    state.latest_counterexample_set_construction_ref =
+        state.construction.?.artifact_id;
 }
 
 fn validateCounterexampleSubject(state: *State, payload: std.json.ObjectMap) !void {
@@ -2689,7 +2809,7 @@ fn validateEditAuthorityAndDebt(state: *State) !void {
             return error.AcceptedCounterexampleDebt;
         }
     }
-    try validateConstructionCounterexamples(state, construction);
+    try validateConstructionCounterexamples(state, construction, false);
 }
 
 fn applyEffectRecorded(state: *State, event: ParsedEvent) !void {
@@ -4601,6 +4721,205 @@ test "actuation: Construction v3 candidate and factor surface is closed" {
             "goal-1",
             unjustified_expansion,
         ),
+    );
+}
+
+test "actuation: Construction v3 semantic references resolve to owned namespaces" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const goal_text = try testGoalAlloc(
+        std.testing.allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer std.testing.allocator.free(goal_text);
+    var goal = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", goal_text);
+    defer goal.deinit(std.testing.allocator);
+    const construction = try testConstructionAlloc(
+        std.testing.allocator,
+        goal.artifact_id.?,
+        null,
+        "initial",
+        TestDigest0,
+        "[]",
+        null,
+    );
+    defer std.testing.allocator.free(construction);
+    const unknown_law = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"law_refs\":[\"law-1\"]",
+        "\"law_refs\":[\"not-a-law\"]",
+    );
+    defer std.testing.allocator.free(unknown_law);
+    try std.testing.expectError(
+        error.UnknownConstructionLawRef,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", unknown_law),
+    );
+    const unknown_proof = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        construction,
+        "\"surface_completeness_proof_ref\":\"proof-1\"",
+        "\"surface_completeness_proof_ref\":\"not-a-proof\"",
+    );
+    defer std.testing.allocator.free(unknown_proof);
+    try std.testing.expectError(
+        error.UnknownConstructionProofRef,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", unknown_proof),
+    );
+}
+
+test "actuation: successor requires the exact current accepted class set" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-a", "law-1", "owner", "high", "accepted");
+    try testRegisterClass(&harness, "class-b", "law-1", "owner", "medium", "rejected");
+    const latest_set = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(latest_set);
+    const successor = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-a\",\"class-b\"]",
+        latest_set,
+    );
+    defer std.testing.allocator.free(successor);
+    try std.testing.expectError(
+        error.RecompilationClassSetMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor),
+    );
+}
+
+test "actuation: Review Fold set binds the predecessor Construction once" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-a", "law-1", "owner", "high", "accepted");
+    const set_ref = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(set_ref);
+    const first = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-a\"]",
+        set_ref,
+    );
+    defer std.testing.allocator.free(first);
+    var first_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        first,
+    );
+    defer first_result.deinit(std.testing.allocator);
+    const reused = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        first_result.artifact_id.?,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-a\"]",
+        set_ref,
+    );
+    defer std.testing.allocator.free(reused);
+    try std.testing.expectError(
+        error.CounterexampleSetPredecessorMismatch,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", reused),
+    );
+}
+
+test "actuation: resolved review debt admits a clearing successor" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(&harness, "class-a", "law-1", "owner", "high", "accepted");
+    const accepted_set = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(accepted_set);
+    const covered = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        "realization-repair",
+        TestDigest0,
+        "[\"class-a\"]",
+        accepted_set,
+    );
+    defer std.testing.allocator.free(covered);
+    var covered_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        covered,
+    );
+    defer covered_result.deinit(std.testing.allocator);
+    const revised_classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-a",
+        "law-1",
+        "owner",
+        "high",
+        "rejected",
+    );
+    defer std.testing.allocator.free(revised_classes);
+    const predecessors = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[\"{s}\"]",
+        .{accepted_set},
+    );
+    defer std.testing.allocator.free(predecessors);
+    const revised = try testCurrentCounterexamplesAlloc(
+        &harness,
+        revised_classes,
+        predecessors,
+    );
+    defer std.testing.allocator.free(revised);
+    var revised_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        revised,
+    );
+    defer revised_result.deinit(std.testing.allocator);
+    const clearing = try testConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        covered_result.artifact_id.?,
+        "realization-repair",
+        TestDigest0,
+        "[]",
+        revised_result.artifact_id.?,
+    );
+    defer std.testing.allocator.free(clearing);
+    var clearing_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        clearing,
+    );
+    defer clearing_result.deinit(std.testing.allocator);
+    var edit = try testPrepare(&harness, "cleared-edit", "edit", "[\"proof-1\"]");
+    defer edit.deinit(std.testing.allocator);
+    try testAppendOwner(
+        &harness,
+        "operation_aborted",
+        null,
+        "{\"schema\":\"operation-aborted/v1\",\"step_id\":\"cleared-edit\"," ++
+            "\"reason\":\"test complete\"}",
+        null,
     );
 }
 

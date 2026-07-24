@@ -59,6 +59,7 @@ const Counts = struct {
     essential_addition_count: usize = 0,
     surface_completeness_bound: bool = false,
     review_recompilation: bool = false,
+    current_review_binding: bool = false,
 };
 
 pub fn auditEvidenceStoreAlloc(
@@ -103,6 +104,7 @@ pub fn hasStrictFailure(allocator: std.mem.Allocator, rendered: []const u8) !boo
     }
     if (try integerField(checks, "incumbent_independent_candidates") == 0) return true;
     if (!try boolField(checks, "surface_completeness_bound")) return true;
+    if (!try boolField(checks, "current_review_binding")) return true;
     return false;
 }
 
@@ -178,6 +180,7 @@ const AuditState = struct {
     head_digest: []const u8 = GenesisDigest,
     current_construction: ?std.json.Value = null,
     current_construction_ref: ?[]const u8 = null,
+    latest_counterexample_set_ref: ?[]const u8 = null,
 };
 
 const VerifiedEvent = struct {
@@ -301,6 +304,7 @@ fn auditCurrentProofState(state: *AuditState) !void {
             body,
             state.current_construction_ref,
             state.classes.items,
+            state.latest_counterexample_set_ref,
             &state.counts,
         );
     } else auditMissingConstruction(state.classes.items, &state.counts);
@@ -311,10 +315,11 @@ fn applyArtifactState(state: *AuditState, event: VerifiedEvent, in_window: bool)
         state.classes.clearRetainingCapacity();
         state.current_construction = null;
         state.current_construction_ref = null;
+        state.latest_counterexample_set_ref = null;
         if (in_window) resetConstructionChecks(&state.counts);
     }
     if (std.mem.eql(u8, event.kind, "counterexample_set_registered")) {
-        try applyCounterexampleSet(
+        state.latest_counterexample_set_ref = try applyCounterexampleSet(
             state.allocator,
             &state.classes,
             event.body,
@@ -332,6 +337,7 @@ fn applyArtifactState(state: *AuditState, event: VerifiedEvent, in_window: bool)
             event.body,
             state.current_construction_ref,
             state.classes.items,
+            state.latest_counterexample_set_ref,
             &ignored,
         );
     }
@@ -351,6 +357,7 @@ fn applyCountedWindowEvent(state: *AuditState, event: VerifiedEvent) !void {
             event.body,
             try optionalStringField(event.object, "construction_ref"),
             state.classes.items,
+            state.latest_counterexample_set_ref,
             &state.counts,
         );
     } else if (std.mem.eql(u8, event.kind, "effect_recorded")) {
@@ -367,6 +374,7 @@ fn applyCountedWindowEvent(state: *AuditState, event: VerifiedEvent) !void {
                 body,
                 state.current_construction_ref,
                 state.classes.items,
+                state.latest_counterexample_set_ref,
                 &state.counts,
             );
         } else auditMissingConstruction(state.classes.items, &state.counts);
@@ -395,7 +403,7 @@ fn applyCounterexampleSet(
     body_value: std.json.Value,
     in_window: bool,
     counts: *Counts,
-) !void {
+) ![]const u8 {
     const artifact = try artifactObject(body_value, "counterexample-set/v1");
     const artifact_id = try stringField(artifact, "artifact_id");
     try requireDigest(artifact_id);
@@ -441,12 +449,14 @@ fn applyCounterexampleSet(
             .occurrences = 1,
         });
     }
+    return artifact_id;
 }
 
 fn auditConstruction(
     body_value: std.json.Value,
     construction_ref: ?[]const u8,
     classes: []const ClassState,
+    latest_counterexample_set_ref: ?[]const u8,
     counts: *Counts,
 ) !void {
     resetConstructionChecks(counts);
@@ -471,6 +481,7 @@ fn auditConstruction(
         body_value,
         construction_ref,
         requirements[0..requirement_count],
+        latest_counterexample_set_ref,
     );
     counts.accepted_class_checks = audit.accepted_class_checks;
     counts.recurrent_class_checks = audit.recurrent_class_checks;
@@ -489,6 +500,7 @@ fn auditConstruction(
     counts.essential_addition_count = audit.essential_addition_count;
     counts.surface_completeness_bound = audit.surface_completeness_bound;
     counts.review_recompilation = audit.review_recompilation;
+    counts.current_review_binding = audit.current_review_binding;
 }
 
 fn resetConstructionChecks(counts: *Counts) void {
@@ -509,6 +521,7 @@ fn resetConstructionChecks(counts: *Counts) void {
     counts.essential_addition_count = 0;
     counts.surface_completeness_bound = false;
     counts.review_recompilation = false;
+    counts.current_review_binding = false;
 }
 
 fn auditMissingConstruction(classes: []const ClassState, counts: *Counts) void {
@@ -606,10 +619,12 @@ fn writeConstructionChecks(writer: *std.Io.Writer, counts: Counts) !void {
         },
     );
     try writer.print(
-        "\"recurrent_class_checks\":{d},\"recurrent_example_only_violations\":{d}," ++
+        "\"current_review_binding\":{},\"recurrent_class_checks\":{d}," ++
+            "\"recurrent_example_only_violations\":{d}," ++
             "\"review_recompilation\":{},\"successor_factor_count\":{d}," ++
             "\"surface_completeness_bound\":{}",
         .{
+            counts.current_review_binding,
             counts.recurrent_class_checks,
             counts.recurrent_example_only,
             counts.review_recompilation,
@@ -1374,7 +1389,7 @@ test "kernel audit binds Construction envelope to artifact identity" {
     var counts = Counts{};
     try std.testing.expectError(
         error.ConstructionRefMismatch,
-        auditConstruction(parsed.value, TestSetOneDigest, &.{}, &counts),
+        auditConstruction(parsed.value, TestSetOneDigest, &.{}, null, &counts),
     );
 }
 
@@ -1404,7 +1419,7 @@ test "kernel audit preserves complete Counterexample class identity" {
     var classes: std.ArrayList(ClassState) = .empty;
     defer classes.deinit(std.testing.allocator);
     var counts = Counts{};
-    try applyCounterexampleSet(
+    _ = try applyCounterexampleSet(
         std.testing.allocator,
         &classes,
         first.value,
@@ -1441,7 +1456,7 @@ test "kernel audit rejects every legacy Construction schema" {
         var counts = Counts{};
         try std.testing.expectError(
             error.LegacyConstructionUnsupported,
-            auditConstruction(parsed.value, TestConstructionDigest, &.{}, &counts),
+            auditConstruction(parsed.value, TestConstructionDigest, &.{}, null, &counts),
         );
     }
 }
@@ -1473,9 +1488,79 @@ test "kernel audit rejects proof coverage from another owner" {
         .occurrences = 1,
     }};
     var counts = Counts{};
-    try auditConstruction(parsed.value, TestConstructionDigest, &classes, &counts);
+    try auditConstruction(
+        parsed.value,
+        TestConstructionDigest,
+        &classes,
+        TestSetOneDigest,
+        &counts,
+    );
     try std.testing.expectEqual(@as(usize, 0), counts.owner_local_covered);
     try std.testing.expectEqual(@as(usize, 1), counts.owner_local_missing);
+}
+
+test "kernel strict audit observes the latest Counterexample Set binding" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        TestBodies[4],
+        .{},
+    );
+    defer parsed.deinit();
+    const classes = [_]ClassState{.{
+        .class_id = "class-1",
+        .boundary_key = "boundary",
+        .law_ref = "law-1",
+        .owner_boundary = "src",
+        .severity = "medium",
+        .status = "accepted",
+        .set_ref = TestSetOneDigest,
+        .occurrences = 1,
+    }};
+    var counts = Counts{};
+    try auditConstruction(
+        parsed.value,
+        TestConstructionDigest,
+        &classes,
+        TestSetOneDigest,
+        &counts,
+    );
+    try std.testing.expect(!counts.current_review_binding);
+    try auditConstruction(
+        parsed.value,
+        TestConstructionDigest,
+        &classes,
+        TestSetTwoDigest,
+        &counts,
+    );
+    try std.testing.expect(counts.current_review_binding);
+}
+
+test "kernel strict audit resolves the surface completeness proof" {
+    const body = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        TestBodies[4],
+        "\"surface_completeness_proof_ref\":\"proof-1\"",
+        "\"surface_completeness_proof_ref\":\"not-a-proof\"",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+    var counts = Counts{};
+    try auditConstruction(
+        parsed.value,
+        TestConstructionDigest,
+        &.{},
+        TestSetOneDigest,
+        &counts,
+    );
+    try std.testing.expect(!counts.surface_completeness_bound);
 }
 
 test "kernel audit rechecks active proof when a class recurs" {
@@ -1518,6 +1603,7 @@ test "kernel audit rechecks active proof when a class recurs" {
         construction.value,
         TestConstructionDigest,
         state.classes.items,
+        TestSetOneDigest,
         &state.counts,
     );
     try applyWindowEvent(&state, .{
