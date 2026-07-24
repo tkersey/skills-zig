@@ -497,19 +497,23 @@ test "performance baseline identity is exact" {
 }
 
 test "performance baseline rejects mismatched workload metadata" {
+    const metrics =
+        "\"scan_p50_elapsed_ns\":1," ++
+        "\"scan_p50_peak_live_bytes\":1," ++
+        "\"append_p50_elapsed_ns\":1," ++
+        "\"append_p50_peak_live_bytes\":1";
     const invalid = [_][]const u8{
-        \\{"schema":"other","route":"aggregate","fixture_bytes":96,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
-        \\{"schema":"durable-store-perf/v1","route":"streaming","fixture_bytes":96,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
-        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":97,"record_count":3,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
-        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":96,"record_count":4,"rounds":3,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
-        \\{"schema":"durable-store-perf/v1","route":"aggregate","fixture_bytes":96,"record_count":3,"rounds":4,"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
-        \\{"scan_p50_elapsed_ns":1,"scan_p50_peak_live_bytes":1,"append_p50_elapsed_ns":1,"append_p50_peak_live_bytes":1}
-        ,
+        "{\"schema\":\"other\",\"route\":\"aggregate\"," ++
+            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"streaming\"," ++
+            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
+            "\"fixture_bytes\":97,\"record_count\":3,\"rounds\":3," ++ metrics ++ "}",
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
+            "\"fixture_bytes\":96,\"record_count\":4,\"rounds\":3," ++ metrics ++ "}",
+        "{\"schema\":\"durable-store-perf/v1\",\"route\":\"aggregate\"," ++
+            "\"fixture_bytes\":96,\"record_count\":3,\"rounds\":4," ++ metrics ++ "}",
+        "{" ++ metrics ++ "}",
     };
     const measurements = Measurements{
         .actual_bytes = 96,
