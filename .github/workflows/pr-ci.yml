@@ -18,6 +18,7 @@ on:
       - "libs/core/**"
       - "libs/durable_store/**"
       - "libs/execution_policy_core/**"
+      - "libs/jsonl_core/**"
       - "libs/retrace_core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
@@ -186,7 +187,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz seq (Linux)
-        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli --dep retrace_core -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig -Mretrace_core=../../libs/retrace_core/src/lib.zig -ffuzz --test-filter "fuzz "
+        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli --dep retrace_core -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig --dep jsonl_core -Mretrace_core=../../libs/retrace_core/src/lib.zig -Mjsonl_core=../../libs/jsonl_core/src/lib.zig -ffuzz --test-filter "fuzz "
 
   lift:
     needs: changes

@@ -48,12 +48,20 @@ if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]
 fi
 
 pr_workflow="$repo_root/.github/workflows/pr-ci.yml"
+auto_release_workflow="$repo_root/.github/workflows/auto-release.yml"
 for token in \
   'cancel-in-progress: true' \
   '.github/scripts/release_apps.sh affected' \
   'zig build test-perf-hub'; do
   if ! grep -Fq "$token" "$pr_workflow"; then
     echo "PR CI orchestration token missing: $token" >&2
+    exit 1
+  fi
+done
+
+for workflow in "$pr_workflow" "$auto_release_workflow"; do
+  if ! grep -Fq '      - "libs/jsonl_core/**"' "$workflow"; then
+    echo "Shared JSONL workflow trigger missing from $workflow" >&2
     exit 1
   fi
 done

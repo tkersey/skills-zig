@@ -1934,10 +1934,19 @@ const EventHash = std.crypto.hash.sha2.Sha256;
 
 const RawHashObserver = struct {
     hash: *EventHash,
+    max_bytes: usize,
+    bytes_observed: usize = 0,
     last_byte: ?u8 = null,
 
     fn observe(context: *anyopaque, bytes: []const u8) !void {
         const self: *RawHashObserver = @ptrCast(@alignCast(context));
+        const bytes_observed = std.math.add(
+            usize,
+            self.bytes_observed,
+            bytes.len,
+        ) catch return error.StreamTooLong;
+        if (bytes_observed > self.max_bytes) return error.StreamTooLong;
+        self.bytes_observed = bytes_observed;
         self.hash.update(bytes);
         if (bytes.len != 0) self.last_byte = bytes[bytes.len - 1];
     }
@@ -1981,7 +1990,10 @@ fn scanJsonlEventStore(
 
     var raw_hash = EventHash.init(.{});
     var canonical_hash = EventHash.init(.{});
-    var raw_observer = RawHashObserver{ .hash = &raw_hash };
+    var raw_observer = RawHashObserver{
+        .hash = &raw_hash,
+        .max_bytes = max_bytes,
+    };
     var reader = file.reader(Io.io(), &.{});
     var stream = try jsonl_core.Stream.init(allocator, &reader.interface, .{
         .max_line_bytes = @max(max_bytes, 1),
@@ -2041,12 +2053,13 @@ fn scanMemoryEventStore(
     var raw_hash = EventHash.init(.{});
     var canonical_hash = EventHash.init(.{});
     for (store.records.items, 0..) |payload, index| {
+        const canonical_payload = std.mem.trim(u8, payload, " \t\r\n");
         raw_hash.update(payload);
         raw_hash.update("\n");
-        canonical_hash.update(payload);
+        canonical_hash.update(canonical_payload);
         canonical_hash.update("\n");
         try visitor.visit(.{
-            .payload = payload,
+            .payload = canonical_payload,
             .ordinal = @intCast(index + 1),
             .diagnostic_position = null,
         });
@@ -2481,6 +2494,20 @@ fn writeTempAndRename(
     try dir.rename(tmp_name, dir.*, base, Io.io());
 }
 
+fn addCopiedBytesBelowLimit(
+    copied_bytes: usize,
+    read_bytes: usize,
+    max_existing_bytes: usize,
+) !usize {
+    const next = std.math.add(
+        usize,
+        copied_bytes,
+        read_bytes,
+    ) catch return error.StreamTooLong;
+    if (next >= max_existing_bytes) return error.StreamTooLong;
+    return next;
+}
+
 pub fn appendLineAtomic(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -2547,12 +2574,18 @@ pub fn appendLineAtomic(
     };
 
     var last_byte: ?u8 = null;
+    var copied_bytes: usize = 0;
     if (source) |*file| {
         var reader = file.reader(Io.io(), &.{});
         var buffer: [jsonl_core.chunk_size]u8 = undefined;
         while (true) { // tiger: event-loop -- bounded by source EOF.
             const read = try reader.interface.readSliceShort(&buffer);
             if (read == 0) break;
+            copied_bytes = try addCopiedBytesBelowLimit(
+                copied_bytes,
+                read,
+                max_existing_bytes,
+            );
             try destination.writeStreamingAll(Io.io(), buffer[0..read]);
             last_byte = buffer[read - 1];
         }
@@ -3567,6 +3600,21 @@ test "appendLineAtomic appends newline-delimited records" {
     try std.testing.expectEqualStrings("{\"n\":1}\n{\"n\":2}\n", data);
 }
 
+test "atomic copy byte budget remains strict after preflight" {
+    try std.testing.expectEqual(
+        @as(usize, 7),
+        try addCopiedBytesBelowLimit(3, 4, 8),
+    );
+    try std.testing.expectError(
+        error.StreamTooLong,
+        addCopiedBytesBelowLimit(3, 5, 8),
+    );
+    try std.testing.expectError(
+        error.StreamTooLong,
+        addCopiedBytesBelowLimit(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+    );
+}
+
 test "appendLineStreaming appends without reading capped existing log" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3703,6 +3751,35 @@ const EventScanProbe = struct {
     }
 };
 
+const GrowingEventScanProbe = struct {
+    path: []const u8,
+    count: usize = 0,
+    expanded: bool = false,
+
+    fn visit(context: *anyopaque, _: EventRecordView) !void {
+        const self: *GrowingEventScanProbe = @ptrCast(@alignCast(context));
+        self.count += 1;
+        if (self.expanded) return;
+        self.expanded = true;
+        try appendLineStreaming(
+            std.testing.allocator,
+            self.path,
+            "{\"n\":2}",
+            .{ .sync = false },
+        );
+        try appendLineStreaming(
+            std.testing.allocator,
+            self.path,
+            "{\"n\":3}",
+            .{ .sync = false },
+        );
+    }
+
+    fn visitor(self: *GrowingEventScanProbe) EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+};
+
 fn assertEventStoreContract(store: EventStore) !void {
     var initial = try store.snapshot(std.testing.allocator, 4096);
     defer initial.deinit(std.testing.allocator);
@@ -3832,6 +3909,72 @@ test "event store contract is backend independent" {
     for (persistent_snapshot.records, memory_snapshot.records) |persistent_record, memory_record| {
         try std.testing.expectEqualStrings(persistent_record.payload, memory_record.payload);
     }
+}
+
+test "event store backends share canonical padded-event observations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "padded.jsonl" });
+    defer std.testing.allocator.free(path);
+    try writeTextAtomic(std.testing.allocator, path, "{\"a\":1}\n");
+
+    var persistent_backend = PersistentEventStore.init(path);
+    var persistent_snapshot = try persistent_backend.eventStore().snapshot(
+        std.testing.allocator,
+        4096,
+    );
+    defer persistent_snapshot.deinit(std.testing.allocator);
+
+    var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:padded");
+    defer memory_backend.deinit();
+    try memory_backend.records.append(
+        memory_backend.allocator,
+        try memory_backend.allocator.dupe(u8, "  {\"a\":1} \t"),
+    );
+    memory_backend.exists = true;
+    var memory_snapshot = try memory_backend.eventStore().snapshot(
+        std.testing.allocator,
+        4096,
+    );
+    defer memory_snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        persistent_snapshot.records[0].payload,
+        memory_snapshot.records[0].payload,
+    );
+    try std.testing.expectEqualStrings(
+        persistent_snapshot.content_digest,
+        memory_snapshot.content_digest,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        persistent_snapshot.revision,
+        memory_snapshot.revision,
+    ));
+    try std.testing.expectEqual(
+        @as(usize, "  {\"a\":1} \t\n".len),
+        memory_snapshot.extent_bytes,
+    );
+}
+
+test "jsonl event store rejects growth beyond scan byte budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "growing.jsonl" });
+    defer std.testing.allocator.free(path);
+    try writeTextAtomic(std.testing.allocator, path, "{\"n\":1}\n");
+
+    var backend = JsonlEventStore.init(path);
+    var probe = GrowingEventScanProbe{ .path = path };
+    try std.testing.expectError(
+        error.StreamTooLong,
+        backend.eventStore().scan(std.testing.allocator, 16, probe.visitor()),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
 }
 
 test "event store exclusive sessions preserve effectful transition ownership" {
