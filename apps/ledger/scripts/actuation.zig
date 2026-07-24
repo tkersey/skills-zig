@@ -2355,6 +2355,8 @@ pub fn auditConstruction(
         try field(payload, "supersession"),
     );
     try validateConstructionStructure(structure);
+    const surface_completeness_bound =
+        structure.supersession.surface_completeness_proof_ref.len != 0;
     var result = ConstructionAudit{
         .candidate_count = structure.recompilation.candidates.len,
         .predecessor_factor_count = structure.semantic_surface.predecessor_factors.len,
@@ -2364,7 +2366,7 @@ pub fn auditConstruction(
         .introduced_factor_count = structure.supersession.introduced_factor_refs.len,
         .replacement_relation_count = structure.supersession.replacement_relations.len,
         .essential_addition_count = structure.supersession.essential_additions.len,
-        .surface_completeness_bound = structure.supersession.surface_completeness_proof_ref.len != 0,
+        .surface_completeness_bound = surface_completeness_bound,
         .review_recompilation = structure.recompilation.trigger == .@"accepted-review-fold",
     };
     for (structure.recompilation.candidates) |candidate| {
@@ -3690,7 +3692,10 @@ fn testConstructionAlloc(
     const trigger = if (repair_claims) "accepted-review-fold" else "initial";
     const predecessor_factors =
         if (repair_claims)
-            "[{\"description\":\"owner remains authoritative\",\"factor_id\":\"factor-owner\",\"kind\":\"law-owner\",\"law_refs\":[\"law-1\"],\"observation_refs\":[\"proof-1\"],\"owner\":\"owner\"}]"
+            "[{\"description\":\"owner remains authoritative\"," ++
+                "\"factor_id\":\"factor-owner\",\"kind\":\"law-owner\"," ++
+                "\"law_refs\":[\"law-1\"],\"observation_refs\":[\"proof-1\"]," ++
+                "\"owner\":\"owner\"}]"
         else
             "[]";
     const preserved = if (repair_claims) "[\"factor-owner\"]" else "[]";
