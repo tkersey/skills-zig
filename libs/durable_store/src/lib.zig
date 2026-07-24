@@ -2477,6 +2477,15 @@ fn directoryNamesAreCaseInsensitive(
         defer allocator.free(variant);
         const alias = try std.fs.path.join(allocator, &.{ parent, variant });
         defer allocator.free(alias);
+        const alias_stat = std.Io.Dir.cwd().statFile(
+            Io.io(),
+            alias,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (alias_stat.kind != .directory) return false;
         const alias_real = std.Io.Dir.cwd().realPathFileAlloc(
             Io.io(),
             alias,
@@ -2647,9 +2656,17 @@ pub fn readRegularFileNoSymlink(
     if (stat.size > max_bytes) return error.FileTooBig;
 
     var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(Io.io(), path, .{ .allow_directory = false, .follow_symlinks = false })
+        try std.Io.Dir.openFileAbsolute(
+            Io.io(),
+            path,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        )
     else
-        try std.Io.Dir.cwd().openFile(Io.io(), path, .{ .allow_directory = false, .follow_symlinks = false });
+        try std.Io.Dir.cwd().openFile(
+            Io.io(),
+            path,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
     defer file.close(Io.io());
 
     var reader = file.reader(Io.io(), &.{});
@@ -5375,6 +5392,48 @@ test "EventStore prospective case identity follows the host filesystem" {
     try std.testing.expectError(
         error.EventStoreBusy,
         alias.eventStore().snapshot(std.testing.allocator, 4096),
+    );
+}
+
+test "EventStore case probe does not treat directory symlinks as folding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    if (try directoryNamesAreCaseInsensitive(
+        std.testing.allocator,
+        root,
+    )) return;
+
+    try tmp.dir.createDir(Io.io(), "Foo", .default_dir);
+    try tmp.dir.symLink(Io.io(), "Foo", "foo", .{ .is_directory = true });
+    const upper_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "Foo", "A.jsonl" },
+    );
+    defer std.testing.allocator.free(upper_path);
+    const lower_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "Foo", "a.jsonl" },
+    );
+    defer std.testing.allocator.free(lower_path);
+    const upper_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        upper_path,
+    );
+    defer std.testing.allocator.free(upper_advisory);
+    const lower_advisory = try eventStoreLockPathAlloc(
+        std.testing.allocator,
+        lower_path,
+    );
+    defer std.testing.allocator.free(lower_advisory);
+
+    try std.testing.expect(
+        !std.mem.eql(u8, upper_advisory, lower_advisory),
     );
 }
 
