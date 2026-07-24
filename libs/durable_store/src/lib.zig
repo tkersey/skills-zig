@@ -314,7 +314,12 @@ pub const JsonlEventStore = struct {
     const ExclusiveContext = struct {
         allocator: std.mem.Allocator,
         store: *JsonlEventStore,
-        lock: LockFile,
+        lock: EventStoreExclusiveLock,
+    };
+
+    const ScanOwnership = enum {
+        acquire_shared,
+        exclusive_held,
     };
 
     const exclusive_vtable = EventStoreExclusive.VTable{
@@ -339,30 +344,32 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        const self = cast(context);
-        var lock = acquireEventStoreScanLock(allocator, self.path) catch |err| switch (err) {
-            error.FileNotFound => return emptyEventScanSummary(
-                allocator,
-                self.path,
-                false,
-            ),
-            error.PathAlreadyExists => return error.EventStoreBusy,
-            else => return err,
-        };
-        defer lock.release(allocator);
-        return scanWithHeldLock(self, allocator, max_bytes, visitor);
+        return scanWithOwnership(
+            cast(context),
+            allocator,
+            max_bytes,
+            visitor,
+            .acquire_shared,
+        );
     }
 
-    fn scanWithHeldLock(
+    fn scanWithOwnership(
         self: *JsonlEventStore,
         allocator: std.mem.Allocator,
         max_bytes: usize,
         visitor: EventRecordVisitor,
+        ownership: ScanOwnership,
     ) !EventScanSummary {
         if (self.scan_active) return error.EventStoreBusy;
         self.scan_active = true;
         defer self.scan_active = false;
-        return scanJsonlEventStore(allocator, self.path, max_bytes, visitor);
+        return scanJsonlEventStore(
+            allocator,
+            self.path,
+            max_bytes,
+            visitor,
+            ownership == .acquire_shared,
+        );
     }
 
     fn snapshot(
@@ -414,8 +421,8 @@ pub const JsonlEventStore = struct {
         if (self.scan_active) return error.EventStoreBusy;
         const exclusive = try allocator.create(ExclusiveContext);
         errdefer allocator.destroy(exclusive);
-        const lock = acquireLock(allocator, self.path) catch |err| switch (err) {
-            error.PathAlreadyExists => return error.EventStoreBusy,
+        const lock = acquireEventStoreExclusiveLock(allocator, self.path) catch |err| switch (err) {
+            error.WouldBlock => return error.EventStoreBusy,
             else => return err,
         };
         exclusive.* = .{ .allocator = allocator, .store = self, .lock = lock };
@@ -432,11 +439,12 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        return scanWithHeldLock(
+        return scanWithOwnership(
             exclusiveCast(context).store,
             allocator,
             max_bytes,
             visitor,
+            .exclusive_held,
         );
     }
 
@@ -444,11 +452,12 @@ pub const JsonlEventStore = struct {
         const exclusive = exclusiveCast(context);
         var collector = SnapshotCollector.init(allocator);
         defer collector.deinit();
-        var summary = try scanWithHeldLock(
+        var summary = try scanWithOwnership(
             exclusive.store,
             allocator,
             max_bytes,
             collector.visitor(),
+            .exclusive_held,
         );
         defer summary.deinit(allocator);
         return collector.finish(&summary);
@@ -466,21 +475,23 @@ pub const JsonlEventStore = struct {
         try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scanWithHeldLock(
+        var before = try scanWithOwnership(
             exclusive.store,
             allocator,
             max_bytes,
             visitor,
+            .exclusive_held,
         );
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
         try validateEventAppendFits(before, payload.len, max_bytes);
         try appendLineAtomic(allocator, exclusive.store.path, payload, max_bytes);
-        var after = try scanWithHeldLock(
+        var after = try scanWithOwnership(
             exclusive.store,
             allocator,
             max_bytes,
             visitor,
+            .exclusive_held,
         );
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
@@ -498,11 +509,12 @@ pub const JsonlEventStore = struct {
         for (records) |payload| try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scanWithHeldLock(
+        var before = try scanWithOwnership(
             exclusive.store,
             allocator,
             max_bytes,
             visitor,
+            .exclusive_held,
         );
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
@@ -510,11 +522,12 @@ pub const JsonlEventStore = struct {
         defer allocator.free(text);
         if (text.len > max_bytes) return error.StreamTooLong;
         try writeTextAtomic(allocator, exclusive.store.path, text);
-        var after = try scanWithHeldLock(
+        var after = try scanWithOwnership(
             exclusive.store,
             allocator,
             max_bytes,
             visitor,
+            .exclusive_held,
         );
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
@@ -522,7 +535,7 @@ pub const JsonlEventStore = struct {
 
     fn releaseExclusive(context: *anyopaque) void {
         const exclusive = exclusiveCast(context);
-        exclusive.lock.release(exclusive.allocator);
+        exclusive.lock.release();
         const allocator = exclusive.allocator;
         allocator.destroy(exclusive);
     }
@@ -587,6 +600,16 @@ pub const MemoryEventStore = struct {
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
         const self = cast(context);
+        if (self.exclusive_active) return error.EventStoreBusy;
+        return scanWithOwnedState(self, allocator, max_bytes, visitor);
+    }
+
+    fn scanWithOwnedState(
+        self: *MemoryEventStore,
+        allocator: std.mem.Allocator,
+        max_bytes: usize,
+        visitor: EventRecordVisitor,
+    ) !EventScanSummary {
         if (self.scan_active) return error.EventStoreBusy;
         self.scan_active = true;
         defer self.scan_active = false;
@@ -648,11 +671,26 @@ pub const MemoryEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        return scan(exclusiveCast(context).store, allocator, max_bytes, visitor);
+        return scanWithOwnedState(
+            exclusiveCast(context).store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
     }
 
     fn exclusiveSnapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
-        return snapshot(exclusiveCast(context).store, allocator, max_bytes);
+        const self = exclusiveCast(context).store;
+        var collector = SnapshotCollector.init(allocator);
+        defer collector.deinit();
+        var summary = try scanWithOwnedState(
+            self,
+            allocator,
+            max_bytes,
+            collector.visitor(),
+        );
+        defer summary.deinit(allocator);
+        return collector.finish(&summary);
     }
 
     fn exclusiveAppend(
@@ -667,13 +705,13 @@ pub const MemoryEventStore = struct {
         try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scan(self, allocator, max_bytes, visitor);
+        var before = try scanWithOwnedState(self, allocator, max_bytes, visitor);
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
         try validateEventAppendFits(before, payload.len, max_bytes);
         try self.records.append(self.allocator, try self.allocator.dupe(u8, payload));
         self.exists = true;
-        var after = try scan(self, allocator, max_bytes, visitor);
+        var after = try scanWithOwnedState(self, allocator, max_bytes, visitor);
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
     }
@@ -690,7 +728,7 @@ pub const MemoryEventStore = struct {
         for (records) |payload| try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scan(self, allocator, max_bytes, visitor);
+        var before = try scanWithOwnedState(self, allocator, max_bytes, visitor);
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
         const replacement_text = try renderEventRecordsAlloc(allocator, records);
@@ -708,7 +746,7 @@ pub const MemoryEventStore = struct {
         self.records = replacement;
         replacement = .empty;
         self.exists = true;
-        var after = try scan(self, allocator, max_bytes, visitor);
+        var after = try scanWithOwnedState(self, allocator, max_bytes, visitor);
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
     }
@@ -2041,30 +2079,48 @@ fn scanJsonlEventStore(
     logical_ref: []const u8,
     max_bytes: usize,
     visitor: EventRecordVisitor,
+    acquire_shared: bool,
 ) !EventScanSummary {
+    var sidecar: ?std.Io.File = null;
+    defer if (sidecar) |file| file.close(Io.io());
+    const open_options: std.Io.Dir.OpenFileOptions = .{
+        .allow_directory = true,
+        .follow_symlinks = false,
+        .lock = if (acquire_shared) .shared else .none,
+        .lock_nonblocking = acquire_shared,
+    };
     var file = (if (std.fs.path.isAbsolute(logical_ref))
         std.Io.Dir.openFileAbsolute(
             Io.io(),
             logical_ref,
-            .{ .allow_directory = true, .follow_symlinks = false },
+            open_options,
         )
     else
         std.Io.Dir.cwd().openFile(
             Io.io(),
             logical_ref,
-            .{ .allow_directory = true, .follow_symlinks = false },
+            open_options,
         )) catch |err| switch (err) {
-        error.FileNotFound => return emptyEventScanSummary(
-            allocator,
-            logical_ref,
-            false,
-        ),
+        error.FileNotFound => {
+            if (acquire_shared) {
+                sidecar = try acquireEventStoreScanSidecar(
+                    allocator,
+                    logical_ref,
+                );
+            }
+            return emptyEventScanSummary(allocator, logical_ref, false);
+        },
         error.SymLinkLoop => return error.SymlinkComponent,
+        error.WouldBlock => return error.EventStoreBusy,
         else => return err,
     };
     defer file.close(Io.io());
+    if (acquire_shared) {
+        sidecar = try acquireEventStoreScanSidecar(allocator, logical_ref);
+    }
 
     const stat = try file.stat(Io.io());
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > max_bytes) return error.FileTooBig;
 
@@ -3058,30 +3114,137 @@ pub const LockFile = struct {
     }
 };
 
+const EventStoreExclusiveLock = struct {
+    sidecar: std.Io.File,
+    data: ?std.Io.File,
+
+    fn release(self: *EventStoreExclusiveLock) void {
+        if (self.data) |file| file.close(Io.io());
+        self.sidecar.close(Io.io());
+        self.* = undefined;
+    }
+};
+
+fn acquireEventStoreExclusiveLock(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) !EventStoreExclusiveLock {
+    const lock_path = try lockPathAlloc(allocator, store_path);
+    defer allocator.free(lock_path);
+    try ensureParentPath(lock_path);
+    var sidecar = try openEventStoreSidecarExclusive(lock_path);
+    errdefer sidecar.close(Io.io());
+    const data = try openEventStoreDataExclusive(store_path);
+    errdefer if (data) |file| file.close(Io.io());
+    return .{ .sidecar = sidecar, .data = data };
+}
+
+fn openEventStoreSidecarExclusive(path: []const u8) !std.Io.File {
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        return (if (std.fs.path.isAbsolute(path))
+            std.Io.Dir.createFileAbsolute(Io.io(), path, .{
+                .exclusive = true,
+                .read = true,
+                .truncate = false,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            })
+        else
+            std.Io.Dir.cwd().createFile(Io.io(), path, .{
+                .exclusive = true,
+                .read = true,
+                .truncate = false,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            })) catch |create_err| switch (create_err) {
+            error.PathAlreadyExists => (if (std.fs.path.isAbsolute(path))
+                std.Io.Dir.openFileAbsolute(Io.io(), path, .{
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                    .lock = .exclusive,
+                    .lock_nonblocking = true,
+                })
+            else
+                std.Io.Dir.cwd().openFile(Io.io(), path, .{
+                    .allow_directory = false,
+                    .follow_symlinks = false,
+                    .lock = .exclusive,
+                    .lock_nonblocking = true,
+                })) catch |open_err| switch (open_err) {
+                error.FileNotFound => continue,
+                error.SymLinkLoop => return error.SymlinkComponent,
+                else => return open_err,
+            },
+            else => return create_err,
+        };
+    }
+    return error.FileNotFound;
+}
+
+fn openEventStoreDataExclusive(store_path: []const u8) !?std.Io.File {
+    var file = (if (std.fs.path.isAbsolute(store_path))
+        std.Io.Dir.openFileAbsolute(Io.io(), store_path, .{
+            .allow_directory = true,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        })
+    else
+        std.Io.Dir.cwd().openFile(Io.io(), store_path, .{
+            .allow_directory = true,
+            .follow_symlinks = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        })) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop => return error.SymlinkComponent,
+        else => return err,
+    };
+    errdefer file.close(Io.io());
+    const stat = try file.stat(Io.io());
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    return file;
+}
+
+fn acquireEventStoreScanSidecar(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) !?std.Io.File {
+    const path = try lockPathAlloc(allocator, store_path);
+    defer allocator.free(path);
+    var file = (if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openFileAbsolute(Io.io(), path, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .shared,
+            .lock_nonblocking = true,
+        })
+    else
+        std.Io.Dir.cwd().openFile(Io.io(), path, .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .lock = .shared,
+            .lock_nonblocking = true,
+        })) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        error.SymLinkLoop => return error.SymlinkComponent,
+        error.WouldBlock => return error.EventStoreBusy,
+        else => return err,
+    };
+    errdefer file.close(Io.io());
+    const stat = try file.stat(Io.io());
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    return file;
+}
+
 pub fn acquireLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFile {
     const path = try lockPathAlloc(allocator, store_path);
     errdefer allocator.free(path);
     try ensureParentPath(path);
     var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
-    file.close(Io.io());
-    return .{ .path = path };
-}
-
-fn acquireEventStoreScanLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFile {
-    const path = try lockPathAlloc(allocator, store_path);
-    errdefer allocator.free(path);
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.createFileAbsolute(
-            Io.io(),
-            path,
-            .{ .exclusive = true, .read = true, .truncate = false },
-        )
-    else
-        try std.Io.Dir.cwd().createFile(
-            Io.io(),
-            path,
-            .{ .exclusive = true, .read = true, .truncate = false },
-        );
     file.close(Io.io());
     return .{ .path = path };
 }
@@ -4117,6 +4280,16 @@ fn assertExclusiveEventStoreContract(store: EventStore) !void {
     var exclusive = try store.acquireExclusive(std.testing.allocator);
     defer exclusive.release();
     try std.testing.expectError(error.EventStoreBusy, store.acquireExclusive(std.testing.allocator));
+    var ordinary_probe = EventScanProbe{};
+    try std.testing.expectError(error.EventStoreBusy, store.scan(
+        std.testing.allocator,
+        4096,
+        ordinary_probe.visitor(),
+    ));
+    try std.testing.expectError(
+        error.EventStoreBusy,
+        store.snapshot(std.testing.allocator, 4096),
+    );
 
     var initial = try exclusive.snapshot(std.testing.allocator, 4096);
     defer initial.deinit(std.testing.allocator);
@@ -4288,6 +4461,71 @@ test "jsonl scan maps open-time missing store to an empty summary" {
     try std.testing.expect(!fileExists(lock_path));
 }
 
+test "jsonl scans require no parent write and tolerate unlocked sidecars" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const parent = try std.fs.path.join(std.testing.allocator, &.{ root, "read-only" });
+    defer std.testing.allocator.free(parent);
+    try ensureDirectoryPathNoSymlinks(parent);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ parent, "events.jsonl" });
+    defer std.testing.allocator.free(path);
+    const lock_path = try lockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(lock_path);
+    try writeTextAtomic(std.testing.allocator, path, "{\"n\":1}\n");
+
+    var parent_dir = try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{});
+    defer parent_dir.close(Io.io());
+    const writable = std.Io.File.Permissions.fromMode(0o755);
+    const read_only = std.Io.File.Permissions.fromMode(0o555);
+    try parent_dir.setPermissions(Io.io(), read_only);
+    defer parent_dir.setPermissions(Io.io(), writable) catch |err| {
+        std.debug.panic("restore test directory permissions: {s}", .{
+            @errorName(err),
+        });
+    };
+
+    var backend = JsonlEventStore.init(path);
+    var first = try backend.eventStore().snapshot(std.testing.allocator, 4096);
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), first.records.len);
+    try std.testing.expect(!fileExists(lock_path));
+
+    try parent_dir.setPermissions(Io.io(), writable);
+    try writeTextCreateNew(std.testing.allocator, lock_path, "", .{});
+    try parent_dir.setPermissions(Io.io(), read_only);
+    var second = try backend.eventStore().snapshot(std.testing.allocator, 4096);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(first.revision, second.revision);
+    try std.testing.expect(fileExists(lock_path));
+
+    try parent_dir.setPermissions(Io.io(), writable);
+    var exclusive = try backend.eventStore().acquireExclusive(std.testing.allocator);
+    exclusive.release();
+}
+
+test "jsonl scan classifies a final symlink as SymlinkComponent" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
+    defer std.testing.allocator.free(path);
+    const link = try std.fs.path.join(std.testing.allocator, &.{ root, "events-link.jsonl" });
+    defer std.testing.allocator.free(link);
+    try writeTextAtomic(std.testing.allocator, path, "{\"n\":1}\n");
+    try tmp.dir.symLink(Io.io(), "events.jsonl", "events-link.jsonl", .{});
+
+    var backend = JsonlEventStore.init(link);
+    try std.testing.expectError(
+        error.SymlinkComponent,
+        backend.eventStore().snapshot(std.testing.allocator, 4096),
+    );
+}
+
 test "jsonl scan preserves completed visitor calls before a terminal error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4306,7 +4544,7 @@ test "jsonl scan preserves completed visitor calls before a terminal error" {
     try std.testing.expectEqual(@as(usize, 1), probe.count);
 }
 
-test "event store exclusive sessions preserve effectful transition ownership" {
+test "ordinary scans reject active exclusive sessions across backends" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
