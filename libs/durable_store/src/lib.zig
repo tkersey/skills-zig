@@ -340,6 +340,25 @@ pub const JsonlEventStore = struct {
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
         const self = cast(context);
+        var lock = acquireEventStoreScanLock(allocator, self.path) catch |err| switch (err) {
+            error.FileNotFound => return emptyEventScanSummary(
+                allocator,
+                self.path,
+                false,
+            ),
+            error.PathAlreadyExists => return error.EventStoreBusy,
+            else => return err,
+        };
+        defer lock.release(allocator);
+        return scanWithHeldLock(self, allocator, max_bytes, visitor);
+    }
+
+    fn scanWithHeldLock(
+        self: *JsonlEventStore,
+        allocator: std.mem.Allocator,
+        max_bytes: usize,
+        visitor: EventRecordVisitor,
+    ) !EventScanSummary {
         if (self.scan_active) return error.EventStoreBusy;
         self.scan_active = true;
         defer self.scan_active = false;
@@ -413,12 +432,26 @@ pub const JsonlEventStore = struct {
         max_bytes: usize,
         visitor: EventRecordVisitor,
     ) !EventScanSummary {
-        return scan(exclusiveCast(context).store, allocator, max_bytes, visitor);
+        return scanWithHeldLock(
+            exclusiveCast(context).store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
     }
 
     fn exclusiveSnapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
         const exclusive = exclusiveCast(context);
-        return snapshot(exclusive.store, allocator, max_bytes);
+        var collector = SnapshotCollector.init(allocator);
+        defer collector.deinit();
+        var summary = try scanWithHeldLock(
+            exclusive.store,
+            allocator,
+            max_bytes,
+            collector.visitor(),
+        );
+        defer summary.deinit(allocator);
+        return collector.finish(&summary);
     }
 
     fn exclusiveAppend(
@@ -433,12 +466,22 @@ pub const JsonlEventStore = struct {
         try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scan(exclusive.store, allocator, max_bytes, visitor);
+        var before = try scanWithHeldLock(
+            exclusive.store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
         try validateEventAppendFits(before, payload.len, max_bytes);
         try appendLineAtomic(allocator, exclusive.store.path, payload, max_bytes);
-        var after = try scan(exclusive.store, allocator, max_bytes, visitor);
+        var after = try scanWithHeldLock(
+            exclusive.store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
     }
@@ -455,14 +498,24 @@ pub const JsonlEventStore = struct {
         for (records) |payload| try validateEventPayload(allocator, payload);
         var ignored: u8 = 0;
         const visitor = EventRecordVisitor{ .context = &ignored, .visitFn = ignoreEventRecord };
-        var before = try scan(exclusive.store, allocator, max_bytes, visitor);
+        var before = try scanWithHeldLock(
+            exclusive.store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
         defer before.deinit(allocator);
         try validateEventExpectation(before, expectation);
         const text = try renderEventRecordsAlloc(allocator, records);
         defer allocator.free(text);
         if (text.len > max_bytes) return error.StreamTooLong;
         try writeTextAtomic(allocator, exclusive.store.path, text);
-        var after = try scan(exclusive.store, allocator, max_bytes, visitor);
+        var after = try scanWithHeldLock(
+            exclusive.store,
+            allocator,
+            max_bytes,
+            visitor,
+        );
         defer after.deinit(allocator);
         return eventAppendReceipt(allocator, before, after);
     }
@@ -1989,35 +2042,31 @@ fn scanJsonlEventStore(
     max_bytes: usize,
     visitor: EventRecordVisitor,
 ) !EventScanSummary {
-    const stat = std.Io.Dir.cwd().statFile(
-        Io.io(),
-        logical_ref,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
+    var file = (if (std.fs.path.isAbsolute(logical_ref))
+        std.Io.Dir.openFileAbsolute(
+            Io.io(),
+            logical_ref,
+            .{ .allow_directory = true, .follow_symlinks = false },
+        )
+    else
+        std.Io.Dir.cwd().openFile(
+            Io.io(),
+            logical_ref,
+            .{ .allow_directory = true, .follow_symlinks = false },
+        )) catch |err| switch (err) {
         error.FileNotFound => return emptyEventScanSummary(
             allocator,
             logical_ref,
             false,
         ),
+        error.SymLinkLoop => return error.SymlinkComponent,
         else => return err,
     };
-    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    defer file.close(Io.io());
+
+    const stat = try file.stat(Io.io());
     if (stat.kind != .file) return error.NotFile;
     if (stat.size > max_bytes) return error.FileTooBig;
-
-    var file = if (std.fs.path.isAbsolute(logical_ref))
-        try std.Io.Dir.openFileAbsolute(
-            Io.io(),
-            logical_ref,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        )
-    else
-        try std.Io.Dir.cwd().openFile(
-            Io.io(),
-            logical_ref,
-            .{ .allow_directory = false, .follow_symlinks = false },
-        );
-    defer file.close(Io.io());
 
     var raw_hash = EventHash.init(.{});
     var canonical_hash = EventHash.init(.{});
@@ -3018,6 +3067,25 @@ pub fn acquireLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFi
     return .{ .path = path };
 }
 
+fn acquireEventStoreScanLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFile {
+    const path = try lockPathAlloc(allocator, store_path);
+    errdefer allocator.free(path);
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.createFileAbsolute(
+            Io.io(),
+            path,
+            .{ .exclusive = true, .read = true, .truncate = false },
+        )
+    else
+        try std.Io.Dir.cwd().createFile(
+            Io.io(),
+            path,
+            .{ .exclusive = true, .read = true, .truncate = false },
+        );
+    file.close(Io.io());
+    return .{ .path = path };
+}
+
 pub fn acquireAbsoluteExclusiveLock(allocator: std.mem.Allocator, absolute_path: []const u8) !LockFile {
     if (!std.fs.path.isAbsolute(absolute_path)) return error.NotAbsolute;
     const path = try allocator.dupe(u8, absolute_path);
@@ -3889,6 +3957,37 @@ const ReentrantExclusiveScanProbe = struct {
     }
 };
 
+const EquivalentHandleEventScanProbe = struct {
+    store: EventStore,
+    count: usize = 0,
+    mutation_rejected: bool = false,
+
+    fn visit(context: *anyopaque, _: EventRecordView) !void {
+        const self: *EquivalentHandleEventScanProbe = @ptrCast(@alignCast(context));
+        self.count += 1;
+        if (self.count != 1) return;
+        const replacement = [_][]const u8{"{\"sequence\":99}"};
+        var receipt = self.store.replace(
+            std.testing.allocator,
+            &replacement,
+            .{},
+            4096,
+        ) catch |err| switch (err) {
+            error.EventStoreBusy, error.PathAlreadyExists => {
+                self.mutation_rejected = true;
+                return;
+            },
+            else => return err,
+        };
+        defer receipt.deinit(std.testing.allocator);
+        return error.ExpectedEventStoreBusy;
+    }
+
+    fn visitor(self: *EquivalentHandleEventScanProbe) EventRecordVisitor {
+        return .{ .context = self, .visitFn = visit };
+    }
+};
+
 fn assertEventStoreRejectsReentrantMutation(store: EventStore) !void {
     const records = [_][]const u8{
         "{\"sequence\":1}",
@@ -4130,9 +4229,63 @@ test "event store backends reject reentrant mutation during scan" {
     var persistent_backend = PersistentEventStore.init(path);
     try assertEventStoreRejectsReentrantMutation(persistent_backend.eventStore());
 
+    var equivalent_backend = PersistentEventStore.init(path);
+    var before_alias_scan = try persistent_backend.eventStore().snapshot(
+        std.testing.allocator,
+        4096,
+    );
+    defer before_alias_scan.deinit(std.testing.allocator);
+    var equivalent_probe = EquivalentHandleEventScanProbe{
+        .store = equivalent_backend.eventStore(),
+    };
+    var equivalent_summary = try persistent_backend.eventStore().scan(
+        std.testing.allocator,
+        4096,
+        equivalent_probe.visitor(),
+    );
+    defer equivalent_summary.deinit(std.testing.allocator);
+    try std.testing.expect(equivalent_probe.mutation_rejected);
+    try std.testing.expectEqual(@as(usize, 2), equivalent_probe.count);
+    try std.testing.expectEqual(@as(usize, 2), equivalent_summary.record_count);
+    var after_alias_scan = try persistent_backend.eventStore().snapshot(
+        std.testing.allocator,
+        4096,
+    );
+    defer after_alias_scan.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        before_alias_scan.revision,
+        after_alias_scan.revision,
+    );
+
     var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:reentrant");
     defer memory_backend.deinit();
     try assertEventStoreRejectsReentrantMutation(memory_backend.eventStore());
+}
+
+test "jsonl scan maps open-time missing store to an empty summary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "missing.jsonl" });
+    defer std.testing.allocator.free(path);
+    const lock_path = try lockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(lock_path);
+
+    var backend = JsonlEventStore.init(path);
+    var probe = EventScanProbe{};
+    var summary = try backend.eventStore().scan(
+        std.testing.allocator,
+        4096,
+        probe.visitor(),
+    );
+    defer summary.deinit(std.testing.allocator);
+
+    try std.testing.expect(!summary.exists);
+    try std.testing.expectEqual(@as(usize, 0), summary.record_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.count);
+    try std.testing.expect(!fileExists(path));
+    try std.testing.expect(!fileExists(lock_path));
 }
 
 test "jsonl scan preserves completed visitor calls before a terminal error" {
