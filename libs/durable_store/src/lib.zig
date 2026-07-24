@@ -346,7 +346,11 @@ pub const JsonlEventStore = struct {
         return scanJsonlEventStore(allocator, self.path, max_bytes, visitor);
     }
 
-    fn snapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+    fn snapshot(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        max_bytes: usize,
+    ) !EventSnapshot {
         var collector = SnapshotCollector.init(allocator);
         defer collector.deinit();
         var summary = try scan(context, allocator, max_bytes, collector.visitor());
