@@ -2351,6 +2351,10 @@ pub fn lockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8
     return std.fmt.allocPrint(allocator, "{s}.lock", .{store_path});
 }
 
+fn eventStoreLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.event-store.lock", .{store_path});
+}
+
 fn casLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.cas.lock", .{store_path});
 }
@@ -3115,12 +3119,15 @@ pub const LockFile = struct {
 };
 
 const EventStoreExclusiveLock = struct {
+    allocator: std.mem.Allocator,
+    compatibility: LockFile,
     sidecar: std.Io.File,
     data: ?std.Io.File,
 
     fn release(self: *EventStoreExclusiveLock) void {
         if (self.data) |file| file.close(Io.io());
         self.sidecar.close(Io.io());
+        self.compatibility.release(self.allocator);
         self.* = undefined;
     }
 };
@@ -3129,14 +3136,24 @@ fn acquireEventStoreExclusiveLock(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) !EventStoreExclusiveLock {
-    const lock_path = try lockPathAlloc(allocator, store_path);
+    var compatibility = acquireLock(allocator, store_path) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.EventStoreBusy,
+        else => return err,
+    };
+    errdefer compatibility.release(allocator);
+    const lock_path = try eventStoreLockPathAlloc(allocator, store_path);
     defer allocator.free(lock_path);
     try ensureParentPath(lock_path);
     var sidecar = try openEventStoreSidecarExclusive(lock_path);
     errdefer sidecar.close(Io.io());
     const data = try openEventStoreDataExclusive(store_path);
     errdefer if (data) |file| file.close(Io.io());
-    return .{ .sidecar = sidecar, .data = data };
+    return .{
+        .allocator = allocator,
+        .compatibility = compatibility,
+        .sidecar = sidecar,
+        .data = data,
+    };
 }
 
 fn openEventStoreSidecarExclusive(path: []const u8) !std.Io.File {
@@ -3212,7 +3229,7 @@ fn acquireEventStoreScanSidecar(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) !?std.Io.File {
-    const path = try lockPathAlloc(allocator, store_path);
+    const path = try eventStoreLockPathAlloc(allocator, store_path);
     defer allocator.free(path);
     var file = (if (std.fs.path.isAbsolute(path))
         std.Io.Dir.openFileAbsolute(Io.io(), path, .{
@@ -4472,11 +4489,15 @@ test "jsonl scans require no parent write and tolerate unlocked sidecars" {
     try ensureDirectoryPathNoSymlinks(parent);
     const path = try std.fs.path.join(std.testing.allocator, &.{ parent, "events.jsonl" });
     defer std.testing.allocator.free(path);
-    const lock_path = try lockPathAlloc(std.testing.allocator, path);
-    defer std.testing.allocator.free(lock_path);
+    const public_lock_path = try lockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(public_lock_path);
+    const advisory_path = try eventStoreLockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(advisory_path);
     try writeTextAtomic(std.testing.allocator, path, "{\"n\":1}\n");
 
-    var parent_dir = try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{});
+    var parent_dir = try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{
+        .iterate = true,
+    });
     defer parent_dir.close(Io.io());
     const writable = std.Io.File.Permissions.fromMode(0o755);
     const read_only = std.Io.File.Permissions.fromMode(0o555);
@@ -4491,19 +4512,23 @@ test "jsonl scans require no parent write and tolerate unlocked sidecars" {
     var first = try backend.eventStore().snapshot(std.testing.allocator, 4096);
     defer first.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), first.records.len);
-    try std.testing.expect(!fileExists(lock_path));
+    try std.testing.expect(!fileExists(public_lock_path));
+    try std.testing.expect(!fileExists(advisory_path));
 
     try parent_dir.setPermissions(Io.io(), writable);
-    try writeTextCreateNew(std.testing.allocator, lock_path, "", .{});
+    try writeTextCreateNew(std.testing.allocator, advisory_path, "", .{});
     try parent_dir.setPermissions(Io.io(), read_only);
     var second = try backend.eventStore().snapshot(std.testing.allocator, 4096);
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(first.revision, second.revision);
-    try std.testing.expect(fileExists(lock_path));
+    try std.testing.expect(!fileExists(public_lock_path));
+    try std.testing.expect(fileExists(advisory_path));
 
     try parent_dir.setPermissions(Io.io(), writable);
     var exclusive = try backend.eventStore().acquireExclusive(std.testing.allocator);
     exclusive.release();
+    try std.testing.expect(!fileExists(public_lock_path));
+    try std.testing.expect(fileExists(advisory_path));
 }
 
 test "jsonl scan classifies a final symlink as SymlinkComponent" {
@@ -4558,6 +4583,71 @@ test "ordinary scans reject active exclusive sessions across backends" {
     var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:exclusive-test");
     defer memory_backend.deinit();
     try assertExclusiveEventStoreContract(memory_backend.eventStore());
+}
+
+test "EventStore exclusive sessions bridge public lock protocols" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
+    defer std.testing.allocator.free(path);
+    const public_lock_path = try lockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(public_lock_path);
+    const advisory_path = try eventStoreLockPathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(advisory_path);
+    const counter_path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.counter" });
+    defer std.testing.allocator.free(counter_path);
+    const lease_options: AcquireOptions = .{
+        .owner = .{
+            .process_id = 200,
+            .session_id = "event-store-compatibility-test",
+            .executor = "durable-store-test",
+        },
+        .fencing_counter_path = counter_path,
+    };
+
+    var backend = JsonlEventStore.init(path);
+    const store = backend.eventStore();
+
+    var presence = try acquireLock(std.testing.allocator, path);
+    try std.testing.expectError(
+        error.EventStoreBusy,
+        store.acquireExclusive(std.testing.allocator),
+    );
+    presence.release(std.testing.allocator);
+
+    var lease = try acquireLeaseLock(std.testing.allocator, path, lease_options);
+    try std.testing.expectError(
+        error.EventStoreBusy,
+        store.acquireExclusive(std.testing.allocator),
+    );
+    try releaseLease(std.testing.allocator, &lease, lease.fencing_token);
+
+    var exclusive = try store.acquireExclusive(std.testing.allocator);
+    try std.testing.expect(fileExists(public_lock_path));
+    try std.testing.expect(fileExists(advisory_path));
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        acquireLock(std.testing.allocator, path),
+    );
+    try std.testing.expectError(
+        error.LockBusy,
+        acquireLeaseLock(std.testing.allocator, path, lease_options),
+    );
+    exclusive.release();
+
+    try std.testing.expect(!fileExists(public_lock_path));
+    try std.testing.expect(fileExists(advisory_path));
+
+    var presence_after = try acquireLock(std.testing.allocator, path);
+    presence_after.release(std.testing.allocator);
+    var lease_after = try acquireLeaseLock(std.testing.allocator, path, lease_options);
+    try releaseLease(
+        std.testing.allocator,
+        &lease_after,
+        lease_after.fencing_token,
+    );
 }
 
 test "jsonl event store contains physical diagnostics in its adapter" {
