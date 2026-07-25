@@ -39,6 +39,7 @@ comptime {
     _ = @import("actuation_audit.zig");
     _ = @import("actuation/refactor_kernel.zig");
     _ = @import("cas_review_audit.zig");
+    _ = @import("execution_policy/compile.zig");
     _ = @import("resolve_intent_closed/mod.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
@@ -109,6 +110,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
     try std.testing.expectEqual(lib.Command.actuation_audit, lib.parseCommand("actuation-audit"));
+    try std.testing.expectEqual(lib.Command.execution_policy_compile, lib.parseCommand("execution-policy-compile"));
     try std.testing.expectEqual(lib.Command.execution_policy_audit, lib.parseCommand("execution-policy-audit"));
     try std.testing.expectEqual(lib.Command.policy_calibration, lib.parseCommand("policy-calibration"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
@@ -121,15 +123,21 @@ test "retrace core exposes DCP capsule primitives" {
 }
 
 test "seq uses execution policy core canonical digest" {
-    var policy = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"b\":2,\"a\":1}");
-    defer policy.deinit(std.testing.allocator);
-    var digest_a = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &policy);
-    defer digest_a.deinit(std.testing.allocator);
-
-    var equivalent = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"a\":1,\"b\":2}");
-    defer equivalent.deinit(std.testing.allocator);
-    var digest_b = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &equivalent);
-    defer digest_b.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings(digest_a.text, digest_b.text);
+    var result_a = try execution_policy_core.compilePolicy(std.testing.allocator,
+        \\{"revision":1,"policy_id":"p","declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+    );
+    defer result_a.deinit(std.testing.allocator);
+    var result_b = try execution_policy_core.compilePolicy(std.testing.allocator,
+        \\{"policy_rules":[{"actions":["a"],"id":"r"}],"actions":[{"id":"a"}],"declared_atoms":[],"policy_id":"p","revision":1}
+    );
+    defer result_b.deinit(std.testing.allocator);
+    const digest_a = switch (result_a) {
+        .policy => |policy| policy.digest(),
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    const digest_b = switch (result_b) {
+        .policy => |policy| policy.digest(),
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    try std.testing.expectEqualStrings(digest_a, digest_b);
 }

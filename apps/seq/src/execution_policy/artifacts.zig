@@ -36,18 +36,26 @@ fn parsePolicyArtifact(allocator: std.mem.Allocator, text: []const u8) !?ParsedA
     const json = try extractJsonObjectContaining(allocator, text, "policy_id") orelse return null;
     defer allocator.free(json);
     if (std.mem.indexOf(u8, json, "actions") == null and std.mem.indexOf(u8, json, "policy_rules") == null) return null;
-    var policy = execution_policy_core.parsePolicy(allocator, json) catch return null;
-    defer policy.deinit(allocator);
-    var report = try execution_policy_core.validatePolicy(allocator, &policy);
-    defer report.deinit(allocator);
-    var digest = try execution_policy_core.canonicalPolicyDigest(allocator, &policy);
-    defer digest.deinit(allocator);
-    return .{
-        .kind = .epg,
-        .artifact_id = try artifactIdFromJson(allocator, json, "policy_id", "epg"),
-        .digest = try allocator.dupe(u8, digest.text),
-        .valid = report.ok(),
-    };
+    var result = execution_policy_core.compilePolicy(allocator, json) catch return null;
+    defer result.deinit(allocator);
+    switch (result) {
+        .policy => |policy| return .{
+            .kind = .epg,
+            .artifact_id = try artifactIdFromJson(allocator, json, "policy_id", "epg"),
+            .digest = try allocator.dupe(u8, policy.digest()),
+            .valid = true,
+        },
+        .report => {
+            var digest = execution_policy_core.canonical_json.digestRawJson(allocator, json) catch return null;
+            defer digest.deinit(allocator);
+            return .{
+                .kind = .epg,
+                .artifact_id = try artifactIdFromJson(allocator, json, "policy_id", "epg"),
+                .digest = try allocator.dupe(u8, digest.text),
+                .valid = false,
+            };
+        },
+    }
 }
 
 fn parseStateArtifact(allocator: std.mem.Allocator, text: []const u8) !?ParsedArtifact {

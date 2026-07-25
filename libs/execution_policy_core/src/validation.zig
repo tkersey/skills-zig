@@ -7,9 +7,21 @@ const schema = @import("schema.zig");
 pub fn validatePolicy(allocator: std.mem.Allocator, policy: *const schema.Policy) !errors.ValidationReport {
     var validator = Validator.init(allocator);
     defer validator.deinit();
-    try validator.validate(policy);
+    try validator.validate(policy, .source);
     return validator.finish();
 }
+
+pub fn validateCompiledRuntimePolicy(allocator: std.mem.Allocator, policy: *const schema.Policy) !errors.ValidationReport {
+    var validator = Validator.init(allocator);
+    defer validator.deinit();
+    try validator.validate(policy, .compiled_runtime);
+    return validator.finish();
+}
+
+const ValidationMode = enum {
+    source,
+    compiled_runtime,
+};
 
 const Validator = struct {
     allocator: std.mem.Allocator,
@@ -62,7 +74,7 @@ const Validator = struct {
         return self.builder.finish();
     }
 
-    fn validate(self: *Validator, policy: *const schema.Policy) !void {
+    fn validate(self: *Validator, policy: *const schema.Policy, mode: ValidationMode) !void {
         if (policy.root() != .object) {
             try self.add(.schema_invalid, "$");
             return;
@@ -86,8 +98,10 @@ const Validator = struct {
         try self.validateActionCycles(root);
         try self.validateActionReachability();
         try self.validateRollbackReachability();
-        try self.validateOutcomeClosure(root);
-        try self.validateReadiness(root);
+        if (mode == .source) {
+            try self.validateOutcomeClosure(root);
+            try self.validateReadiness(root);
+        }
     }
 
     fn gatherCustomAuthority(self: *Validator, root: std.json.ObjectMap) !void {

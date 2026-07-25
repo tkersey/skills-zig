@@ -27,6 +27,7 @@ const actuation_compaction = @import("../actuation/compaction.zig");
 const actuation_workers = @import("../actuation/workers.zig");
 const actuation_surface = @import("../actuation/surface.zig");
 const cas_review_audit = @import("../cas_review_audit.zig");
+const execution_policy_compile = @import("../execution_policy/compile.zig");
 const execution_policy_audit = @import("../execution_policy/mod.zig");
 const resolve_intent_closed = @import("../resolve_intent_closed/mod.zig");
 const app_meta = @import("app_meta");
@@ -815,6 +816,7 @@ pub fn run(
     if (!lib.commandAvailable(cmd)) return error.InvalidCommand;
     var opts = try parseOptionsForCommand(cmd, args);
     if (cmd == .decision_capsule and !opts.format_set) opts.format = .json;
+    if (cmd == .execution_policy_compile and !opts.format_set) opts.format = .json;
     if (opts.help) {
         try printCommandHelp(cmd);
         return;
@@ -872,6 +874,7 @@ pub fn run(
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
+        .execution_policy_compile => try cmdExecutionPolicyCompile(allocator, opts),
         .execution_policy_audit => try cmdExecutionPolicyAudit(allocator, sessions_root, opts),
         .policy_calibration => try cmdPolicyCalibration(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
@@ -942,6 +945,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .skill_decision_receipt =>
         \\usage: seq skill-decision-receipt validate --file <receipt.json> [--format json]
+        ,
+        .execution_policy_compile =>
+        \\usage: seq execution-policy-compile --file <policy.json> [--format json]
         ,
         .skill_blocks =>
         \\usage: seq skill-blocks --skill <name> [--mode blocks|body|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
@@ -1293,6 +1299,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         .policy_calibration => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
+        .execution_policy_compile => {
+            if (fmt != .json) return error.InvalidFormatForCommand;
+        },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
@@ -1606,7 +1615,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.contract_text != null, cmd == .skill_decision_audit, "--contract", cmd);
     try ensureOptionAllowed(opts.contract_authority_text != null, cmd == .skill_decision_audit, "--contract-authority", cmd);
     try ensureOptionAllowed(opts.causality_text != null, cmd == .skill_decision_audit, "--causality", cmd);
-    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt or cmd == .decision_capsule, "--file", cmd);
+    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt or cmd == .decision_capsule or cmd == .execution_policy_compile, "--file", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
     try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
@@ -1788,6 +1797,10 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     }
     if (cmd == .skill_decision_receipt) {
         try validateSkillDecisionReceiptArgs(opts);
+    }
+    if (cmd == .execution_policy_compile and opts.file_text == null) {
+        printCliError("error: execution-policy-compile requires --file\n", .{});
+        return error.MissingArgValue;
     }
     if (cmd == .message_audit) {
         if (opts.mode) |text| {
@@ -3417,6 +3430,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "c3_structured_closure_v1": true,
             \\      "actuation_audit_v1": true,
             \\      "actuation_artifact_kernel_audit_v1": true,
+            \\      "execution_policy_compile_v1": true,
             \\      "execution_policy_audit_v1": true,
             \\      "ledger_artifact_root_v1": true,
             \\      "epg_v1": true,
@@ -3482,6 +3496,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "actuation_audit_v1", .enabled = true },
         .{ .name = "actuation_artifact_kernel_audit_v1", .enabled = true },
+        .{ .name = "execution_policy_compile_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
         .{ .name = "ledger_artifact_root_v1", .enabled = true },
         .{ .name = "epg_v1", .enabled = true },
@@ -4514,6 +4529,20 @@ fn validateKernelWindow(start_epoch_s: ?i64, end_epoch_s: ?i64) !void {
         start_epoch_s.? > end_epoch_s.?) return error.InvalidSessionWindow;
 }
 
+fn cmdExecutionPolicyCompile(allocator: std.mem.Allocator, opts: Options) !void {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        defaultIo(),
+        opts.file_text.?,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(content);
+    var report = try execution_policy_compile.compileToJson(allocator, content);
+    defer report.deinit(allocator);
+    try writeTextOutput(report.json, opts.out_path);
+    if (!report.compiled) return error.ExecutionPolicyRejected;
+}
+
 fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const mode = opts.mode orelse "summary";
     var rows: std.ArrayList(query.Row) = .empty;
@@ -4529,7 +4558,7 @@ fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const 
         try writer.writeAll("# Execution Policy Audit\n\n");
         try writer.writeAll("## Corpus/capabilities/denominator\n\n");
         try writer.print("- included_runs: {d}\n", .{rows.items.len});
-        try writer.writeAll("- capabilities: execution_policy_audit_v1, epg_v1, eps_v1, epd_v1, etr_v1, policy_calibration_v1, policy_regret_candidates_v1, policy_transition_dataset_v1\n\n");
+        try writer.writeAll("- capabilities: execution_policy_compile_v1, execution_policy_audit_v1, epg_v1, eps_v1, epd_v1, etr_v1, policy_calibration_v1, policy_regret_candidates_v1, policy_transition_dataset_v1\n\n");
         try writeExecutionPolicyReportSection(writer, "Source and regime", rows.items, &.{ "session_id", "policy_id", "source_current", "regime", "active_or_stale" });
         try writeExecutionPolicyReportSection(writer, "Policy validation and closure", rows.items, &.{ "session_id", "runtime_state", "true_run", "verdict", "strict_findings" });
         try writeExecutionPolicyReportSection(writer, "Unknowns/observations", rows.items, &.{ "session_id", "critical_unknowns", "resolved_unknowns", "premature_mutations", "unexpected" });
@@ -27804,6 +27833,56 @@ test "skill companion command actions parse and validate" {
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_contract, .{}));
 }
 
+test "execution policy compile command reports source digest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{
+            .sub_path = "policy.json",
+            .data =
+            \\{"policy_id":"p","revision":1,"declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+            ,
+        },
+    );
+    const policy_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "policy.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(policy_path);
+    const root_abs = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_abs, "compile.json" },
+    );
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(
+        std.testing.allocator,
+        .execution_policy_compile,
+        &.{ "--file", policy_path },
+        output_path,
+    );
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"compiled\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_digest\": \"sha256:") != null);
+
+    try std.testing.expectError(
+        error.MissingArgValue,
+        validateCommandOptions(.execution_policy_compile, .{}),
+    );
+    try std.testing.expectError(
+        error.InvalidFormatForCommand,
+        validateFormatForCommand(.execution_policy_compile, .{ .format = .table }),
+    );
+}
+
 test "skill contract validation projects receipt binding from the parsed snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27906,6 +27985,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_capsule_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"streaming_session_scanner_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_compile_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

@@ -19,10 +19,20 @@ pub fn canonicalizeAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
     defer parsed.deinit();
 
+    return canonicalizeValueAlloc(allocator, parsed.value);
+}
+
+pub fn canonicalizeValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try writeCanonicalValue(allocator, &out.writer, parsed.value);
+    try writeCanonicalValue(allocator, &out.writer, value);
     return out.toOwnedSlice();
+}
+
+pub fn digestValue(allocator: std.mem.Allocator, value: std.json.Value) !Digest {
+    const canonical = try canonicalizeValueAlloc(allocator, value);
+    defer allocator.free(canonical);
+    return digestCanonicalBytes(allocator, canonical);
 }
 
 pub fn digestCanonicalBytes(allocator: std.mem.Allocator, bytes: []const u8) !Digest {

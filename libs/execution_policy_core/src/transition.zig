@@ -11,9 +11,20 @@ pub fn validateReceipt(
     decision: *const schema.Decision,
     receipt: *const schema.TransitionReceipt,
 ) !errors.ValidationReport {
+    return validateReceiptForDigest(allocator, policy, state, decision, receipt, null);
+}
+
+pub fn validateReceiptForDigest(
+    allocator: std.mem.Allocator,
+    policy: *const schema.Policy,
+    state: *const schema.State,
+    decision: *const schema.Decision,
+    receipt: *const schema.TransitionReceipt,
+    expected_policy_digest: ?[]const u8,
+) !errors.ValidationReport {
     var validator = ReceiptValidator.init(allocator);
     defer validator.deinit();
-    try validator.validate(policy, state, decision, receipt);
+    try validator.validate(policy, state, decision, receipt, expected_policy_digest);
     return validator.finish();
 }
 
@@ -25,7 +36,19 @@ pub fn applyReceipt(
     receipt: *const schema.TransitionReceipt,
     updated_at: []const u8,
 ) !schema.State {
-    var report = try validateReceipt(allocator, policy, state, decision, receipt);
+    return applyReceiptForDigest(allocator, policy, state, decision, receipt, updated_at, null);
+}
+
+pub fn applyReceiptForDigest(
+    allocator: std.mem.Allocator,
+    policy: *const schema.Policy,
+    state: *const schema.State,
+    decision: *const schema.Decision,
+    receipt: *const schema.TransitionReceipt,
+    updated_at: []const u8,
+    expected_policy_digest: ?[]const u8,
+) !schema.State {
+    var report = try validateReceiptForDigest(allocator, policy, state, decision, receipt, expected_policy_digest);
     defer report.deinit(allocator);
     if (!report.ok()) return error.TransitionInvalid;
 
@@ -118,7 +141,14 @@ const ReceiptValidator = struct {
         return self.builder.finish();
     }
 
-    fn validate(self: *ReceiptValidator, policy: *const schema.Policy, state: *const schema.State, decision: *const schema.Decision, receipt: *const schema.TransitionReceipt) !void {
+    fn validate(
+        self: *ReceiptValidator,
+        policy: *const schema.Policy,
+        state: *const schema.State,
+        decision: *const schema.Decision,
+        receipt: *const schema.TransitionReceipt,
+        expected_policy_digest: ?[]const u8,
+    ) !void {
         if (policy.root() != .object or state.root() != .object or decision.root() != .object or receipt.root() != .object) {
             try self.add(.schema_invalid, "$");
             return;
@@ -127,16 +157,20 @@ const ReceiptValidator = struct {
         const state_root = state.root().object;
         const decision_root = decision.root().object;
         const receipt_root = receipt.root().object;
-        var actual_policy_digest = try canonical_json.digestRawJson(self.allocator, policy.raw_json);
-        defer actual_policy_digest.deinit(self.allocator);
+        var owned_policy_digest: ?canonical_json.Digest = null;
+        defer if (owned_policy_digest) |*digest| digest.deinit(self.allocator);
+        const actual_policy_digest = expected_policy_digest orelse digest: {
+            owned_policy_digest = try canonical_json.digestRawJson(self.allocator, policy.raw_json);
+            break :digest owned_policy_digest.?.text;
+        };
 
         try self.expectStringEqual(receipt_root, "policy_id", stringField(policy_root, "policy_id"), .receipt_identity_mismatch, "$.policy_id");
         if (integerField(policy_root, "revision")) |revision| {
             if (integerField(receipt_root, "revision") != revision) try self.add(.receipt_identity_mismatch, "$.revision");
         }
-        try self.expectStringEqual(receipt_root, "policy_digest", actual_policy_digest.text, .receipt_identity_mismatch, "$.policy_digest");
+        try self.expectStringEqual(receipt_root, "policy_digest", actual_policy_digest, .receipt_identity_mismatch, "$.policy_digest");
         if (stringField(state_root, "policy_digest")) |state_policy_digest| {
-            if (!std.mem.eql(u8, state_policy_digest, actual_policy_digest.text)) try self.add(.receipt_identity_mismatch, "$.state.policy_digest");
+            if (!std.mem.eql(u8, state_policy_digest, actual_policy_digest)) try self.add(.receipt_identity_mismatch, "$.state.policy_digest");
         }
         try self.expectStringEqual(receipt_root, "decision_id", stringField(decision_root, "decision_id"), .receipt_identity_mismatch, "$.decision_id");
         const observed = objectField(receipt_root, "observed") orelse {

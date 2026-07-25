@@ -149,6 +149,11 @@ const execution_policy_audit_flags = [_]FlagSpec{
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
 
+const execution_policy_compile_flags = [_]FlagSpec{
+    .{ .name = "--file", .value_kind = .path, .required = true, .help = "EPG-v1 JSON source" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format (json)" },
+};
+
 const policy_calibration_flags = [_]FlagSpec{
     .{ .name = "--root", .value_kind = .path, .help = "Codex sessions root" },
     .{ .name = "--session-id", .value_kind = .string, .help = "Scan one session by id" },
@@ -197,6 +202,7 @@ fn summaryFor(command: lib.Command) []const u8 {
         .decision_capsule => "Freeze one visible historical decision as DCP-v2",
         .actuation_audit => "Audit plan-to-PR actuation control, frontier, proof, compaction, and ship lineage",
         .cas_review_audit => "Audit CAS review-session proof planes and lane backend reliability",
+        .execution_policy_compile => "Compile EPG-v1 source into the opaque execution-policy boundary",
         .execution_policy_audit => "Audit EPG-guided planning/execution policy runtime lineage and calibration",
         .policy_calibration => "Emit execution-policy transition calibration rows",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
@@ -217,6 +223,7 @@ fn usageFor(command: lib.Command) []const u8 {
         .decision_capsule => "seq decision-capsule (--session-id <id>|--path <jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index N] [--mode capsule|candidates|anchors|validate]",
         .actuation_audit => "seq actuation-audit --root <path> (--session-id <id>|--path <jsonl>|(--repo <path>|--workdir <path>) (--last <duration>|--since <iso>|--until <iso>))",
         .cas_review_audit => "seq cas-review-audit [--path <jsonl>|--receipt-path <json>|--repo <path>] [--mode summary|rows|report]",
+        .execution_policy_compile => "seq execution-policy-compile --file <policy.json> [--format json]",
         .execution_policy_audit => "seq execution-policy-audit --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
         .policy_calibration => "seq policy-calibration --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
         .skill_contract => "seq skill-contract validate --file <path>",
@@ -234,6 +241,7 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
         .decision_capsule => decision_capsule_flags[0..],
         .actuation_audit => actuation_audit_flags[0..],
         .cas_review_audit => cas_review_audit_flags[0..],
+        .execution_policy_compile => execution_policy_compile_flags[0..],
         .execution_policy_audit => execution_policy_audit_flags[0..],
         .policy_calibration => policy_calibration_flags[0..],
         .skill_contract => skill_contract_flags[0..],
@@ -250,6 +258,7 @@ fn defaultFormatFor(command: lib.Command) output.Format {
         .decision_capsule => .json,
         .actuation_audit => .table,
         .cas_review_audit => .table,
+        .execution_policy_compile => .json,
         .execution_policy_audit => .table,
         .policy_calibration => .table,
         .skill_decision_audit => .table,
@@ -264,6 +273,7 @@ fn allowedFormatsFor(command: lib.Command) []const output.Format {
         .decision_capsule => &.{ .table, .json, .csv, .jsonl, .markdown },
         .actuation_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .cas_review_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
+        .execution_policy_compile => &.{.json},
         .execution_policy_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .policy_calibration => &.{ .table, .json, .csv, .jsonl },
         .skill_decision_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
