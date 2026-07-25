@@ -188,7 +188,7 @@ test "public API validates and applies transition receipt" {
     try std.testing.expectEqualStrings("s2", next.root().object.get("state_id").?.string);
 }
 
-test "rich EPG compiles to an executable policy with a derived initial state" {
+test "rich EPG compiles and executes from consumer-owned state" {
     var result = try compilePolicy(
         std.testing.allocator,
         @embedFile("fixtures/valid_architectonic_epg.json"),
@@ -201,8 +201,16 @@ test "rich EPG compiles to an executable policy with a derived initial state" {
             return error.ExpectedCompiledPolicy;
         },
     };
-    var state = (try policy.initialState(std.testing.allocator)) orelse
-        return error.ExpectedInitialState;
+    const state_text = try std.fmt.allocPrint(
+        std.testing.allocator,
+        \\{{"policy_id":"compile-demo","revision":1,"policy_digest":"{s}",
+        \\"state_id":"consumer-s0","satisfied_atoms":["fact:START"],
+        \\"completed_actions":[],"failed_actions":[],"potential":[1]}}
+    ,
+        .{policy.digest()},
+    );
+    defer std.testing.allocator.free(state_text);
+    var state = try parseState(std.testing.allocator, state_text);
     defer state.deinit(std.testing.allocator);
     var decision = try select(std.testing.allocator, policy, &state);
     defer decision.deinit(std.testing.allocator);
@@ -215,11 +223,14 @@ test "rich EPG compiles to an executable policy with a derived initial state" {
     );
 }
 
-test "rich EPG cannot self-certify readiness or name an execution handoff" {
+test "rich EPG cannot author runtime state or self-certify authority" {
     const fixture = @embedFile("fixtures/valid_architectonic_epg.json");
     const injections = [_][]const u8{
         "\"gate\":null,\"revision_summary\"",
         "\"handoff\":{},\"revision_summary\"",
+        "\"initial_state\":{},\"revision_summary\"",
+        "\"policy_ready\":true,\"revision_summary\"",
+        "\"execution_authorized\":true,\"revision_summary\"",
     };
     for (injections) |injection| {
         const bytes = try std.mem.replaceOwned(
@@ -313,14 +324,14 @@ test "rich EPG requires source binding and a bounded horizon" {
     }
 }
 
-test "rich EPG rejects source that declares itself stale" {
+test "rich EPG rejects Plan-authored source currentness" {
     const fixture = @embedFile("fixtures/valid_architectonic_epg.json");
     const bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         fixture,
-        "\"current\": \"yes\"",
-        "\"current\": \"no\"",
+        "\"locked_decision_refs\": []",
+        "\"locked_decision_refs\": [], \"current\": \"yes\"",
     );
     defer std.testing.allocator.free(bytes);
 
@@ -329,11 +340,67 @@ test "rich EPG rejects source that declares itself stale" {
     switch (result) {
         .policy => return error.ExpectedCompileRejection,
         .report => |report| {
-            var saw_source_stale = false;
+            var saw_forbidden_currentness = false;
             for (report.errors) |item| {
-                if (item.code == .source_stale) saw_source_stale = true;
+                if (item.code == .self_certification_forbidden and
+                    std.mem.eql(u8, item.path, "$.source.current"))
+                {
+                    saw_forbidden_currentness = true;
+                }
             }
-            try std.testing.expect(saw_source_stale);
+            try std.testing.expect(saw_forbidden_currentness);
+        },
+    }
+}
+
+test "rich EPG accepts architectonic not_required without fabricated seams" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        .{},
+    );
+    defer parsed.deinit();
+
+    const root = parsed.value.object.getPtr("execution_policy_graph").?;
+    const architectonic = root.object.getPtr("architectonic").?;
+    architectonic.object.getPtr("mode").?.* = .{ .string = "not_required" };
+    architectonic.object.getPtr("reason").?.* = .{
+        .string = "One bounded operation inside an unchanged exact boundary.",
+    };
+    architectonic.object.getPtr("seams").?.array.items.len = 0;
+
+    _ = architectonic.object.orderedRemove("composition");
+    _ = architectonic.object.orderedRemove("conceptual_compression");
+
+    const actions = root.object.getPtr("actions").?;
+    for (actions.array.items) |*action| {
+        inline for ([_][]const u8{
+            "architectonic_seam_refs",
+            "realizes_factor_refs",
+            "retires_factor_refs",
+            "preservation_observation_refs",
+        }) |key| {
+            _ = action.object.orderedRemove(key);
+        }
+    }
+    const revision = root.object.getPtr("revision_summary").?;
+    _ = revision.object.orderedRemove("architectonic_changes");
+    _ = revision.object.orderedRemove("plan_transport");
+    _ = revision.object.orderedRemove("square_results");
+
+    const bytes = try canonical_json.canonicalizeValueAlloc(
+        std.testing.allocator,
+        parsed.value,
+    );
+    defer std.testing.allocator.free(bytes);
+    var result = try compilePolicy(std.testing.allocator, bytes);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => {},
+        .report => |report| {
+            std.debug.print("unexpected compile errors: {any}\n", .{report.errors});
+            return error.ExpectedCompiledPolicy;
         },
     }
 }

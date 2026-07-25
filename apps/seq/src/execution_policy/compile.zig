@@ -11,6 +11,9 @@ pub const Report = struct {
     }
 };
 
+const compiler_contract_name = "execution-policy-compiler";
+const compiler_contract_version = "v1";
+
 pub fn compileToJson(allocator: std.mem.Allocator, bytes: []const u8) !Report {
     var result = try execution_policy_core.compilePolicy(allocator, bytes);
     defer result.deinit(allocator);
@@ -18,17 +21,26 @@ pub fn compileToJson(allocator: std.mem.Allocator, bytes: []const u8) !Report {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
-    try writer.writeAll("{\n  \"execution_policy_compile\": {\n    \"compiled\": ");
+    try writer.writeAll(
+        "{\n  \"execution_policy_compile\": {\n" ++
+            "    \"compiler_contract\": {\"name\": \"" ++
+            compiler_contract_name ++
+            "\", \"version\": \"" ++
+            compiler_contract_version ++
+            "\"},\n    \"compiled\": ",
+    );
     switch (result) {
         .policy => |policy| {
-            try writer.writeAll("true,\n    \"policy_digest\": ");
+            try writer.writeAll("true,\n    \"source_policy_digest\": ");
             try writeJsonString(writer, policy.digest());
             try writer.writeAll(",\n    \"errors\": []\n");
             try writer.writeAll("  }\n}\n");
             return .{ .json = try out.toOwnedSlice(), .compiled = true };
         },
         .report => |report| {
-            try writer.writeAll("false,\n    \"policy_digest\": null,\n    \"errors\": [");
+            try writer.writeAll(
+                "false,\n    \"source_policy_digest\": null,\n    \"errors\": [",
+            );
             for (report.errors, 0..) |item, index| {
                 if (index > 0) try writer.writeByte(',');
                 try writer.writeAll("\n      {\"code\": ");
@@ -48,7 +60,7 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, writer);
 }
 
-test "compile report exposes only source digest and errors" {
+test "compile report exposes contract source digest and errors" {
     var report = try compileToJson(std.testing.allocator,
         \\{"policy_id":"p","revision":1,"declared_atoms":[],
         \\"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
@@ -59,7 +71,18 @@ test "compile report exposes only source digest and errors" {
         std.mem.indexOf(u8, report.json, "\"compiled\": true") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, report.json, "\"policy_digest\": \"sha256:") != null,
+        std.mem.indexOf(
+            u8,
+            report.json,
+            "\"compiler_contract\": {\"name\": \"execution-policy-compiler\", \"version\": \"v1\"}",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            report.json,
+            "\"source_policy_digest\": \"sha256:",
+        ) != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, report.json, "runtime_") == null);
 }

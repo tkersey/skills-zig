@@ -14,6 +14,7 @@ pub const ErrorCode = enum {
     architectonic_unbound,
     factor_unearned,
     factor_disposition_conflict,
+    factor_scope_mismatch,
     critical_unknown_unobservable,
     obligation_uncovered,
     risky_action_unshielded,

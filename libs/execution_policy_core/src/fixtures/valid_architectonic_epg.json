@@ -19,8 +19,7 @@
         "head": "",
         "dirty_fingerprint": ""
       },
-      "locked_decision_refs": [],
-      "current": "yes"
+      "locked_decision_refs": []
     },
     "goal": {
       "obligations": [
@@ -38,6 +37,8 @@
       "forbidden_states": []
     },
     "architectonic": {
+      "mode": "explicit",
+      "reason": "The source-to-compiled-policy representation boundary is consequential.",
       "seams": [
         {
           "seam_id": "S",
@@ -280,11 +281,10 @@
         {
           "dimension_id": "open",
           "direction": "minimize",
-          "current_value": 1,
           "terminal_threshold": 0
         }
       ],
-      "initial": {
+      "baseline_expectation": {
         "open": 1
       }
     },
@@ -295,18 +295,6 @@
       "mutation_actions_max": 0,
       "evidence_actions_max": 1,
       "delivery_transitions_max": 0
-    },
-    "initial_state": {
-      "state_id": "S0",
-      "satisfied_atoms": [
-        "fact:START"
-      ],
-      "completed_actions": [],
-      "failed_actions": [],
-      "current_potential": {
-        "open": 1
-      },
-      "active_action_id": null
     },
     "terminal_states": {
       "success": {
@@ -323,15 +311,6 @@
       }
     },
     "invalidators": [],
-    "challenge": {
-      "candidate": "Execute raw policy JSON.",
-      "disposition": "reject",
-      "reason": "It bypasses the compiled policy boundary.",
-      "affected_refs": [
-        "S"
-      ],
-      "source_change_required": false
-    },
     "revision_summary": {
       "parent_diff_ref": null,
       "policy_changes": [

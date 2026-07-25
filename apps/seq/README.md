@@ -314,11 +314,12 @@ Actuation query datasets:
 `capabilities --format json` advertises
 `actuation_artifact_kernel_audit_v1` when the native kernel join is available.
 
-`execution-policy-compile` accepts EPG-v1 JSON, validates the enforced architectonic
-shape and runtime laws, privately normalizes it, and reports only the canonical
-source digest. It does not certify architectural truth or semantic completeness.
-The normalized policy remains opaque and in memory; this command does not persist
-another artifact.
+`execution-policy-compile` accepts EPG-v1 JSON, validates its proportional
+architectonic shape and runtime laws, privately normalizes it, and reports the
+`execution-policy-compiler/v1` contract plus the canonical source-policy digest.
+It does not certify architectural truth, source currentness, execution authority,
+or semantic completeness. The normalized policy remains opaque and in memory;
+this command does not persist another artifact.
 
 ```bash
 seq execution-policy-compile --file policy.json --format json

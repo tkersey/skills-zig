@@ -202,8 +202,8 @@ fn summaryFor(command: lib.Command) []const u8 {
         .decision_capsule => "Freeze one visible historical decision as DCP-v2",
         .actuation_audit => "Audit plan-to-PR actuation control, frontier, proof, compaction, and ship lineage",
         .cas_review_audit => "Audit CAS review-session proof planes and lane backend reliability",
-        .execution_policy_compile => "Compile EPG-v1 source into the opaque " ++
-            "execution-policy boundary",
+        .execution_policy_compile => "Validate and privately lower EPG-v1 source " ++
+            "under the execution-policy compiler contract",
         .execution_policy_audit => "Audit EPG-guided planning/execution policy runtime lineage and calibration",
         .policy_calibration => "Emit execution-policy transition calibration rows",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",

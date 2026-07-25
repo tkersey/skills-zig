@@ -15,24 +15,17 @@ pub const CompiledPolicy = opaque {
     pub fn digest(self: *const CompiledPolicy) []const u8 {
         return policyImpl(self).source_digest_.text;
     }
-
-    pub fn initialState(self: *const CompiledPolicy, allocator: std.mem.Allocator) !?schema.State {
-        const state = policyImpl(self).initial_state_ orelse return null;
-        return try schema.parseArtifact(schema.State, allocator, state.raw_json);
-    }
 };
 
 const CompiledPolicyImpl = struct {
     source_: schema.Policy,
     runtime_: schema.Policy,
     source_digest_: canonical_json.Digest,
-    initial_state_: ?schema.State,
 
     fn deinit(self: *CompiledPolicyImpl, allocator: std.mem.Allocator) void {
         self.source_.deinit(allocator);
         self.runtime_.deinit(allocator);
         self.source_digest_.deinit(allocator);
-        if (self.initial_state_) |*state| state.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -105,7 +98,6 @@ fn compileLegacy(allocator: std.mem.Allocator, bytes: []const u8) !CompileResult
         .source_ = source,
         .runtime_ = runtime,
         .source_digest_ = digest,
-        .initial_state_ = null,
     }) };
 }
 
@@ -134,13 +126,10 @@ fn compileRich(allocator: std.mem.Allocator, rich_value: std.json.Value) !Compil
 
     var digest = try canonical_json.digestRawJson(allocator, source.raw_json);
     errdefer digest.deinit(allocator);
-    var state = try lowerInitialState(allocator, rich_value.object, digest.text);
-    errdefer if (state) |*value| value.deinit(allocator);
     return .{ .policy = try createCompiledPolicy(allocator, .{
         .source_ = source,
         .runtime_ = runtime,
         .source_digest_ = digest,
-        .initial_state_ = state,
     }) };
 }
 
@@ -160,6 +149,7 @@ fn policyImplMut(policy: *CompiledPolicy) *CompiledPolicyImpl {
 
 const Factor = struct {
     id: []const u8,
+    seam_id: []const u8,
     disposition: []const u8,
     realized: bool = false,
     retired: bool = false,
@@ -174,8 +164,14 @@ const RichIds = struct {
 };
 
 const ArchitectonicState = struct {
+    mode: ArchitectonicMode,
     seam_ids: []const []const u8,
     factors: []Factor,
+};
+
+const ArchitectonicMode = enum {
+    not_required,
+    explicit,
 };
 
 const seam_authorities = [_][]const u8{
@@ -258,15 +254,27 @@ fn validateRichEnvelope(
     try requireString(builder, root, "policy_id", "$.policy_id");
     try requireString(builder, root, "plan_id", "$.plan_id");
     try requireInteger(builder, root, "revision", "$.revision");
-    if (root.get("gate") != null) {
-        try builder.add(.self_certification_forbidden, "$.gate");
+    inline for ([_][]const u8{
+        "gate",
+        "handoff",
+        "initial_state",
+        "policy_ready",
+        "downstream_runtime_ready",
+        "mutation_allowed",
+        "execution_authorized",
+    }) |key| {
+        if (root.get(key) != null) {
+            try builder.add(
+                .self_certification_forbidden,
+                try std.fmt.allocPrint(allocator, "$.{s}", .{key}),
+            );
+        }
     }
-    if (root.get("handoff") != null) {
-        try builder.add(.self_certification_forbidden, "$.handoff");
+    if (root.get("challenge") != null) {
+        try builder.add(.schema_invalid, "$.challenge");
     }
     try validateSourceShape(builder, root);
     try validateHorizonShape(builder, root);
-    try validateChallengeShape(builder, root);
     try validateInvalidatorsShape(builder, root, allocator);
     try validateRevisionShape(builder, root, allocator);
 }
@@ -343,11 +351,20 @@ fn validateArchitectonic(
         try builder.add(.architectonic_incomplete, "$.architectonic");
         return null;
     };
+    const mode = parseArchitectonicMode(stringField(architectonic, "mode")) orelse {
+        try builder.add(.schema_invalid, "$.architectonic.mode");
+        return null;
+    };
+    if (emptyStringField(architectonic, "reason")) {
+        try builder.add(.architectonic_incomplete, "$.architectonic.reason");
+    }
     const seams = arrayField(architectonic, "seams") orelse {
         try builder.add(.architectonic_incomplete, "$.architectonic.seams");
         return null;
     };
-    if (seams.len == 0) {
+    if (mode == .explicit and seams.len == 0) {
+        try builder.add(.architectonic_incomplete, "$.architectonic.seams");
+    } else if (mode == .not_required and seams.len != 0) {
         try builder.add(.architectonic_incomplete, "$.architectonic.seams");
     }
     for (seams, 0..) |value, index| {
@@ -362,20 +379,97 @@ fn validateArchitectonic(
         );
     }
     try validateIncumbentFactorRefs(builder, seams, factors.items, allocator);
-    try validateArchitectonicComposition(
-        builder,
-        architectonic,
-        seam_ids.items,
-        allocator,
-    );
-    try validateConceptualCompression(
-        builder,
-        architectonic,
-        ids.obligations,
-        factors.items,
-        allocator,
-    );
-    return .{ .seam_ids = seam_ids.items, .factors = factors.items };
+    if (mode == .explicit) {
+        try validateArchitectonicComposition(
+            builder,
+            architectonic,
+            seam_ids.items,
+            allocator,
+        );
+        try validateConceptualCompression(
+            builder,
+            architectonic,
+            ids.obligations,
+            factors.items,
+            allocator,
+        );
+    } else {
+        try validateArchitectonicNotRequired(builder, architectonic);
+    }
+    return .{
+        .mode = mode,
+        .seam_ids = seam_ids.items,
+        .factors = factors.items,
+    };
+}
+
+fn parseArchitectonicMode(value: ?[]const u8) ?ArchitectonicMode {
+    const mode = value orelse return null;
+    if (std.mem.eql(u8, mode, "not_required")) return .not_required;
+    if (std.mem.eql(u8, mode, "explicit")) return .explicit;
+    return null;
+}
+
+fn validateArchitectonicNotRequired(
+    builder: *errors.Builder,
+    architectonic: std.json.ObjectMap,
+) !void {
+    if (architectonic.get("composition")) |composition_value| {
+        if (composition_value != .object) {
+            try builder.add(.schema_invalid, "$.architectonic.composition");
+        } else {
+            try validateEmptyArray(
+                builder,
+                composition_value.object,
+                "seam_dependency_edges",
+                "$.architectonic.composition.seam_dependency_edges",
+            );
+            try validateEmptyArray(
+                builder,
+                composition_value.object,
+                "independent_seam_sets",
+                "$.architectonic.composition.independent_seam_sets",
+            );
+        }
+    }
+
+    if (architectonic.get("conceptual_compression")) |compression_value| {
+        if (compression_value != .object) {
+            try builder.add(
+                .schema_invalid,
+                "$.architectonic.conceptual_compression",
+            );
+        } else {
+            inline for ([_][]const u8{
+                "live_obligation_refs",
+                "independent_factor_refs",
+                "independent_owner_refs",
+                "exceptional_path_refs",
+                "dominated_factor_refs",
+            }) |key| {
+                try validateEmptyArray(
+                    builder,
+                    compression_value.object,
+                    key,
+                    "$.architectonic.conceptual_compression",
+                );
+            }
+        }
+    }
+}
+
+fn validateEmptyArray(
+    builder: *errors.Builder,
+    object: std.json.ObjectMap,
+    key: []const u8,
+    path: []const u8,
+) !void {
+    const value = object.get(key) orelse return;
+    if (value != .array) {
+        try builder.add(.schema_invalid, path);
+    } else if (value.array.items.len != 0) {
+        try builder.add(.architectonic_incomplete, path);
+    }
 }
 
 fn validateSeam(
@@ -413,6 +507,7 @@ fn validateSeam(
     try validateSeamFactors(
         builder,
         seam,
+        id,
         path,
         ids.obligations,
         factors,
@@ -583,6 +678,7 @@ fn validateSelectedOrganization(
 fn validateSeamFactors(
     builder: *errors.Builder,
     seam: std.json.ObjectMap,
+    seam_id: []const u8,
     path: []const u8,
     obligation_ids: []const []const u8,
     factors: *std.ArrayList(Factor),
@@ -610,6 +706,7 @@ fn validateSeamFactors(
         try validateFactor(
             builder,
             value,
+            seam_id,
             factor_path,
             obligation_ids,
             factors,
@@ -621,6 +718,7 @@ fn validateSeamFactors(
 fn validateFactor(
     builder: *errors.Builder,
     value: std.json.Value,
+    seam_id: []const u8,
     path: []const u8,
     obligation_ids: []const []const u8,
     factors: *std.ArrayList(Factor),
@@ -674,7 +772,11 @@ fn validateFactor(
         obligation_ids,
         try suffix(allocator, path, ".live_obligation_refs"),
     );
-    try factors.append(allocator, .{ .id = id, .disposition = disposition });
+    try factors.append(allocator, .{
+        .id = id,
+        .seam_id = seam_id,
+        .disposition = disposition,
+    });
 }
 
 fn validateIncumbentFactorRefs(
@@ -763,11 +865,59 @@ fn validateActionBindings(
     allocator: std.mem.Allocator,
 ) !void {
     const seam_refs = stringValues(action, "architectonic_seam_refs");
-    if (seam_refs.len == 0) {
-        try builder.add(
-            .architectonic_unbound,
-            try suffix(allocator, path, ".architectonic_seam_refs"),
-        );
+    if (state.mode == .explicit) {
+        inline for ([_][]const u8{
+            "architectonic_seam_refs",
+            "realizes_factor_refs",
+            "retires_factor_refs",
+            "preservation_observation_refs",
+        }) |key| {
+            try requireStringArray(
+                builder,
+                action,
+                key,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{s}.{s}",
+                    .{ path, key },
+                ),
+            );
+        }
+        if (seam_refs.len == 0) {
+            try builder.add(
+                .architectonic_unbound,
+                try suffix(allocator, path, ".architectonic_seam_refs"),
+            );
+        }
+    } else if (state.mode == .not_required) {
+        inline for ([_][]const u8{
+            "architectonic_seam_refs",
+            "realizes_factor_refs",
+            "retires_factor_refs",
+            "preservation_observation_refs",
+        }) |key| {
+            if (action.get(key)) |value| {
+                if (value != .array) {
+                    try builder.add(
+                        .schema_invalid,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "{s}.{s}",
+                            .{ path, key },
+                        ),
+                    );
+                } else if (value.array.items.len != 0) {
+                    try builder.add(
+                        .architectonic_unbound,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "{s}.{s}",
+                            .{ path, key },
+                        ),
+                    );
+                }
+            }
+        }
     }
     for (seam_refs) |value| {
         const ref = valueString(value) orelse continue;
@@ -784,17 +934,20 @@ fn validateActionBindings(
         builder,
         action,
         path,
+        seam_refs,
         state.factors,
         allocator,
     );
-    try validateRefField(
-        builder,
-        action,
-        "preservation_observation_refs",
-        ids.observations,
-        path,
-        allocator,
-    );
+    if (state.mode == .explicit) {
+        try validateRefField(
+            builder,
+            action,
+            "preservation_observation_refs",
+            ids.observations,
+            path,
+            allocator,
+        );
+    }
     for (stringValues(action, "requires_actions")) |value| {
         const ref = valueString(value) orelse continue;
         if (!contains(ids.actions, ref)) {
@@ -816,12 +969,19 @@ fn validateActionFactorRefs(
     builder: *errors.Builder,
     action: std.json.ObjectMap,
     path: []const u8,
+    seam_refs: []const std.json.Value,
     factors: []Factor,
     allocator: std.mem.Allocator,
 ) !void {
     for (stringValues(action, "realizes_factor_refs")) |value| {
         const ref = valueString(value) orelse continue;
         if (factorIndex(factors, ref)) |index| {
+            if (!containsStringValue(seam_refs, factors[index].seam_id)) {
+                try builder.add(
+                    .factor_scope_mismatch,
+                    try suffix(allocator, path, ".realizes_factor_refs"),
+                );
+            }
             if (!factorRetained(factors[index].disposition)) {
                 try builder.add(
                     .factor_disposition_conflict,
@@ -839,6 +999,12 @@ fn validateActionFactorRefs(
     for (stringValues(action, "retires_factor_refs")) |value| {
         const ref = valueString(value) orelse continue;
         if (factorIndex(factors, ref)) |index| {
+            if (!containsStringValue(seam_refs, factors[index].seam_id)) {
+                try builder.add(
+                    .factor_scope_mismatch,
+                    try suffix(allocator, path, ".retires_factor_refs"),
+                );
+            }
             if (factorRetained(factors[index].disposition)) {
                 try builder.add(
                     .factor_disposition_conflict,
@@ -1376,51 +1542,6 @@ fn writeShieldRow(
     try writer.writeByte('}');
 }
 
-fn lowerInitialState(
-    allocator: std.mem.Allocator,
-    root: std.json.ObjectMap,
-    policy_digest: []const u8,
-) !?schema.State {
-    const initial = objectField(root, "initial_state") orelse return null;
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll("{\"artifact\":\"EPS-v1\"");
-    try writer.writeAll(",\"policy_id\":");
-    try writeJsonString(writer, stringField(root, "policy_id").?);
-    try writer.writeAll(",\"revision\":");
-    try writer.print("{d}", .{integerField(root, "revision").?});
-    try writer.writeAll(",\"policy_digest\":");
-    try writeJsonString(writer, policy_digest);
-    try writer.writeAll(",\"state_id\":");
-    try writeJsonString(writer, stringField(initial, "state_id") orelse "initial");
-    try writer.writeAll(",\"satisfied_atoms\":");
-    try writeStringArrayValue(writer, initial.get("satisfied_atoms"));
-    try writer.writeAll(",\"completed_actions\":");
-    try writeStringArrayValue(writer, initial.get("completed_actions"));
-    try writer.writeAll(",\"failed_actions\":");
-    try writeStringArrayValue(writer, initial.get("failed_actions"));
-    if (nullableStringField(initial, "active_action_id")) |active| {
-        try writer.writeAll(",\"active_action_id\":");
-        try writeJsonString(writer, active);
-    }
-    try writer.writeAll(",\"potential\":[");
-    const potential = objectField(root, "potential").?;
-    const order = stringValues(potential, "lexicographic_order");
-    const current = objectField(initial, "current_potential") orelse
-        objectField(potential, "initial").?;
-    for (order, 0..) |dimension_value, index| {
-        const dimension = valueString(dimension_value) orelse continue;
-        if (index > 0) try writer.writeByte(',');
-        const value = current.get(dimension) orelse std.json.Value{ .integer = 0 };
-        try writeValue(writer, value);
-    }
-    try writer.writeAll("]}");
-    const bytes = try out.toOwnedSlice();
-    defer allocator.free(bytes);
-    return try schema.parseArtifact(schema.State, allocator, bytes);
-}
-
 fn collectDeclaredAtoms(
     allocator: std.mem.Allocator,
     root: std.json.ObjectMap,
@@ -1833,13 +1954,9 @@ fn validateSourceShape(builder: *errors.Builder, root: std.json.ObjectMap) !void
         "locked_decision_refs",
         "$.source.locked_decision_refs",
     );
-    const current = stringField(source, "current");
-    if (!oneOf(current, &.{ "yes", "no", "unknown" })) {
-        try builder.add(.schema_invalid, "$.source.current");
-    } else if (!std.mem.eql(u8, current.?, "yes")) {
-        try builder.add(.source_stale, "$.source.current");
+    if (source.get("current") != null) {
+        try builder.add(.self_certification_forbidden, "$.source.current");
     }
-
     const artifact_state = objectField(source, "artifact_state") orelse {
         try builder.add(.schema_invalid, "$.source.artifact_state");
         return;
@@ -1922,44 +2039,6 @@ fn validateHorizonShape(
     }
 }
 
-fn validateChallengeShape(
-    builder: *errors.Builder,
-    root: std.json.ObjectMap,
-) !void {
-    const challenge = objectField(root, "challenge") orelse {
-        try builder.add(.schema_invalid, "$.challenge");
-        return;
-    };
-    if (emptyStringField(challenge, "candidate")) {
-        try builder.add(.schema_invalid, "$.challenge.candidate");
-    }
-    const dispositions = [_][]const u8{
-        "adopt",
-        "reject",
-        "defer",
-        "return_to_spec",
-        "none",
-    };
-    if (!oneOf(stringField(challenge, "disposition"), &dispositions)) {
-        try builder.add(.schema_invalid, "$.challenge.disposition");
-    }
-    if (emptyStringField(challenge, "reason")) {
-        try builder.add(.schema_invalid, "$.challenge.reason");
-    }
-    try requireStringArray(
-        builder,
-        challenge,
-        "affected_refs",
-        "$.challenge.affected_refs",
-    );
-    if (boolField(challenge, "source_change_required") == null) {
-        try builder.add(
-            .schema_invalid,
-            "$.challenge.source_change_required",
-        );
-    }
-}
-
 fn validateInvalidatorsShape(
     builder: *errors.Builder,
     root: std.json.ObjectMap,
@@ -2024,47 +2103,42 @@ fn validateRevisionShape(
     root: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !void {
-    const revision = objectField(root, "revision_summary") orelse {
-        try builder.add(.schema_invalid, "$.revision_summary");
-        return;
-    };
+    const revision = objectField(root, "revision_summary") orelse return;
     inline for ([_][]const u8{ "policy_changes", "semantic_changes", "source_changes" }) |key| {
         const path = try std.fmt.allocPrint(allocator, "$.revision_summary.{s}", .{key});
         try requireStringArray(builder, revision, key, path);
     }
-    const architectonic_changes = revision.get("architectonic_changes") orelse {
-        try builder.add(.schema_invalid, "$.revision_summary.architectonic_changes");
-        return;
-    };
+    const architectonic_changes = revision.get("architectonic_changes") orelse return;
     if (architectonic_changes != .array) {
         try builder.add(
             .schema_invalid,
             "$.revision_summary.architectonic_changes",
         );
+        return;
     }
-    const transport = objectField(revision, "plan_transport") orelse {
+    const transport = objectField(revision, "plan_transport");
+    if (architectonic_changes.array.items.len != 0 and transport == null) {
         try builder.add(.schema_invalid, "$.revision_summary.plan_transport");
-        return;
-    };
-    inline for ([_][]const u8{
-        "preserved_action_refs",
-        "revised_action_refs",
-        "retired_action_refs",
-        "introduced_action_refs",
-    }) |key| {
-        const path = try std.fmt.allocPrint(
-            allocator,
-            "$.revision_summary.plan_transport.{s}",
-            .{key},
-        );
-        try requireStringArray(builder, transport, key, path);
     }
-    const squares = revision.get("square_results") orelse {
-        try builder.add(.schema_invalid, "$.revision_summary.square_results");
-        return;
-    };
-    if (squares != .array) {
-        try builder.add(.schema_invalid, "$.revision_summary.square_results");
+    if (transport) |value| {
+        inline for ([_][]const u8{
+            "preserved_action_refs",
+            "revised_action_refs",
+            "retired_action_refs",
+            "introduced_action_refs",
+        }) |key| {
+            const path = try std.fmt.allocPrint(
+                allocator,
+                "$.revision_summary.plan_transport.{s}",
+                .{key},
+            );
+            try requireStringArray(builder, value, key, path);
+        }
+    }
+    if (revision.get("square_results")) |squares| {
+        if (squares != .array) {
+            try builder.add(.schema_invalid, "$.revision_summary.square_results");
+        }
     }
 }
 
@@ -2263,7 +2337,7 @@ fn validateLoweringShape(
     try validateLoweringActions(builder, root, utility_keys, allocator);
     try validateLoweringRules(builder, policy, allocator);
     try validateLoweringTerminals(builder, root);
-    try validateLoweringPotentialAndState(builder, root);
+    try validateLoweringPotential(builder, root, allocator);
 }
 
 fn validateLoweringObservations(
@@ -2366,10 +2440,6 @@ fn validateLoweringActions(
         const path = try std.fmt.allocPrint(allocator, "$.actions[{d}]", .{index});
         inline for ([_][]const u8{
             "requires_actions",
-            "architectonic_seam_refs",
-            "realizes_factor_refs",
-            "retires_factor_refs",
-            "preservation_observation_refs",
             "expected_observation_refs",
             "failure_observation_refs",
         }) |key| {
@@ -2507,9 +2577,10 @@ fn validateLoweringTerminals(
     }
 }
 
-fn validateLoweringPotentialAndState(
+fn validateLoweringPotential(
     builder: *errors.Builder,
     root: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
 ) !void {
     const potential = objectField(root, "potential") orelse {
         try builder.add(.schema_invalid, "$.potential");
@@ -2534,36 +2605,25 @@ fn validateLoweringPotentialAndState(
             try builder.add(.schema_invalid, "$.potential.dimensions");
         }
     }
-    if (objectField(potential, "initial") == null) {
+    if (objectField(potential, "baseline_expectation") == null) {
+        try builder.add(.schema_invalid, "$.potential.baseline_expectation");
+    }
+    if (potential.get("initial") != null) {
         try builder.add(.schema_invalid, "$.potential.initial");
     }
-    const initial = objectField(root, "initial_state") orelse {
-        try builder.add(.schema_invalid, "$.initial_state");
-        return;
-    };
-    if (emptyStringField(initial, "state_id")) {
-        try builder.add(.schema_invalid, "$.initial_state.state_id");
-    }
-    try requireStringArray(
-        builder,
-        initial,
-        "satisfied_atoms",
-        "$.initial_state.satisfied_atoms",
-    );
-    try requireStringArray(
-        builder,
-        initial,
-        "completed_actions",
-        "$.initial_state.completed_actions",
-    );
-    try requireStringArray(
-        builder,
-        initial,
-        "failed_actions",
-        "$.initial_state.failed_actions",
-    );
-    if (objectField(initial, "current_potential") == null) {
-        try builder.add(.schema_invalid, "$.initial_state.current_potential");
+    if (dimensions == .array) {
+        for (dimensions.array.items, 0..) |value, index| {
+            if (value == .object and value.object.get("current_value") != null) {
+                try builder.add(
+                    .self_certification_forbidden,
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "$.potential.dimensions[{d}].current_value",
+                        .{index},
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -2772,6 +2832,13 @@ fn contains(values: []const []const u8, needle: []const u8) bool {
     return indexOf(values, needle) != null;
 }
 
+fn containsStringValue(values: []const std.json.Value, needle: []const u8) bool {
+    for (values) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, needle)) return true;
+    }
+    return false;
+}
+
 fn indexOf(values: []const []const u8, needle: []const u8) ?usize {
     for (values, 0..) |value, index| if (std.mem.eql(u8, value, needle)) return index;
     return null;
@@ -2899,4 +2966,45 @@ fn writeStringArrayValue(writer: *std.Io.Writer, maybe_value: ?std.json.Value) !
 
 fn emptyCondition() std.json.Value {
     return .null;
+}
+
+test "action factor references are scoped to their owning seams" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"realizes_factor_refs\":[\"FACTOR-B\"],\"retires_factor_refs\":[]}",
+        .{},
+    );
+    defer parsed.deinit();
+    var factors = [_]Factor{.{
+        .id = "FACTOR-B",
+        .seam_id = "SEAM-B",
+        .disposition = "introduce",
+    }};
+    const seam_refs = [_]std.json.Value{.{ .string = "SEAM-A" }};
+    var builder = errors.Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try validateActionFactorRefs(
+        &builder,
+        parsed.value.object,
+        "$.actions[0]",
+        &seam_refs,
+        &factors,
+        arena.allocator(),
+    );
+
+    var report = try builder.finish();
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), report.errors.len);
+    try std.testing.expectEqual(
+        errors.ErrorCode.factor_scope_mismatch,
+        report.errors[0].code,
+    );
+    try std.testing.expectEqualStrings(
+        "$.actions[0].realizes_factor_refs",
+        report.errors[0].path,
+    );
 }

@@ -3435,6 +3435,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "actuation_audit_v1": true,
             \\      "actuation_artifact_kernel_audit_v1": true,
             \\      "execution_policy_compile_v1": true,
+            \\      "execution_policy_compiler_contract_v1": true,
             \\      "execution_policy_audit_v1": true,
             \\      "ledger_artifact_root_v1": true,
             \\      "epg_v1": true,
@@ -3501,6 +3502,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "actuation_audit_v1", .enabled = true },
         .{ .name = "actuation_artifact_kernel_audit_v1", .enabled = true },
         .{ .name = "execution_policy_compile_v1", .enabled = true },
+        .{ .name = "execution_policy_compiler_contract_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
         .{ .name = "ledger_artifact_root_v1", .enabled = true },
         .{ .name = "epg_v1", .enabled = true },
@@ -27841,7 +27843,7 @@ test "skill companion command actions parse and validate" {
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_contract, .{}));
 }
 
-test "execution policy compile command reports source digest" {
+test "execution policy compile command reports contract and source digest" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(
@@ -27880,7 +27882,16 @@ test "execution policy compile command reports source digest" {
     );
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"compiled\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_digest\": \"sha256:") != null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            got,
+            "\"compiler_contract\": {\"name\": \"execution-policy-compiler\", \"version\": \"v1\"}",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, got, "\"source_policy_digest\": \"sha256:") != null,
+    );
 
     try std.testing.expectError(
         error.MissingArgValue,
@@ -27998,6 +28009,11 @@ test "capabilities advertises resolve intent closed audit flags" {
         u8,
         got,
         "\"execution_policy_compile_v1\": true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        "\"execution_policy_compiler_contract_v1\": true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(
