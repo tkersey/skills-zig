@@ -250,6 +250,7 @@ const State = struct {
     goal_id: []const u8,
     goal: ?ArtifactView = null,
     construction: ?ArtifactView = null,
+    lineage_construction: ?ArtifactView = null,
     subject_digest: ?[]const u8 = null,
     classes: std.ArrayList(ClassRecord) = .empty,
     counterexample_sets: std.ArrayList([]const u8) = .empty,
@@ -1966,10 +1967,11 @@ fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
                 return error.GoalSuccessorHasCounterexampleDebt;
             }
         }
+        if (state.construction) |construction| {
+            state.lineage_construction = construction;
+        }
         state.construction = null;
         state.subject_digest = null;
-        state.classes = .empty;
-        state.counterexample_sets = .empty;
         state.latest_counterexample_set_construction_ref = null;
         state.latest_counterexample_set_subject_digest = null;
     } else if (view.predecessors.items.len != 0) return error.InvalidInitialGoal;
@@ -1984,13 +1986,16 @@ fn applyConstructionRegistration(state: *State, event: ParsedEvent) !void {
     {
         return error.ConstructionRefMismatch;
     }
-    try validateConstructionAgainstState(state, view, event.subject_digest);
+    const predecessor = state.construction orelse state.lineage_construction;
+    try validateConstructionAgainstState(state, predecessor, view, event.subject_digest);
     state.construction = view;
+    state.lineage_construction = null;
     state.subject_digest = event.subject_digest;
 }
 
 fn validateConstructionAgainstState(
     state: *State,
+    predecessor: ?ArtifactView,
     view: ArtifactView,
     event_subject: ?[]const u8,
 ) !void {
@@ -2015,16 +2020,17 @@ fn validateConstructionAgainstState(
     {
         return error.StaleConstructionSubject;
     }
-    try validateConstructionModeAndLineage(state, view, payload);
+    try validateConstructionModeAndLineage(state, predecessor, view, payload);
     try validateConstructionOwners(payload);
     try validateConstructionScope(goal.payload, payload);
-    try validateConstructionLaws(goal.payload, state.construction, payload);
+    try validateConstructionLaws(goal.payload, predecessor, payload);
     try validateConstructionAcceptance(goal.payload, payload);
     try validateConstructionCounterexamples(state, payload, true);
 }
 
 fn validateConstructionModeAndLineage(
     state: *State,
+    predecessor: ?ArtifactView,
     view: ArtifactView,
     payload: std.json.ObjectMap,
 ) !void {
@@ -2033,7 +2039,7 @@ fn validateConstructionModeAndLineage(
     const trigger = try stringField(recompilation, "trigger");
     const supersession = try asObject(try field(payload, "supersession"));
     const disposition = try stringField(supersession, "disposition");
-    if (state.construction == null) {
+    if (predecessor == null) {
         if (!std.mem.eql(u8, mode, "initial") or view.predecessors.items.len != 0) {
             return error.InvalidInitialConstruction;
         }
@@ -2053,14 +2059,17 @@ fn validateConstructionModeAndLineage(
         !std.mem.eql(
             u8,
             view.predecessors.items[0].string,
-            state.construction.?.artifact_id,
+            predecessor.?.artifact_id,
         )) return error.InvalidConstructionLineage;
-    if (!std.mem.eql(u8, trigger, "accepted-review-fold") or
-        std.mem.eql(u8, disposition, "initial"))
+    const goal_rebind_successor =
+        state.construction == null and state.lineage_construction != null;
+    if (std.mem.eql(u8, disposition, "initial") or
+        (!std.mem.eql(u8, trigger, "accepted-review-fold") and
+            !(goal_rebind_successor and std.mem.eql(u8, trigger, "initial"))))
     {
         return error.InvalidSuccessorRecompilation;
     }
-    const predecessor_payload = try asObject(state.construction.?.payload);
+    const predecessor_payload = try asObject(predecessor.?.payload);
     const predecessor_surface = try asObject(
         try field(predecessor_payload, "semantic_surface"),
     );
@@ -3854,6 +3863,40 @@ fn testGoalAlloc(
     });
 }
 
+fn testGoalSuccessorAlloc(
+    allocator: std.mem.Allocator,
+    predecessor: []const u8,
+) ![]u8 {
+    const initial = try testGoalAlloc(
+        allocator,
+        "null",
+        "[\"implementation\"]",
+        false,
+    );
+    defer allocator.free(initial);
+    const replacement = try std.fmt.allocPrint(
+        allocator,
+        "\"predecessor_refs\":[\"{s}\"]",
+        .{predecessor},
+    );
+    defer allocator.free(replacement);
+    const successor = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        initial,
+        "\"predecessor_refs\":[]",
+        replacement,
+    );
+    defer allocator.free(successor);
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        successor,
+        "\"non_goals\":[]",
+        "\"non_goals\":[\"changed\"]",
+    );
+}
+
 fn testConstructionAlloc(
     allocator: std.mem.Allocator,
     goal_ref: []const u8,
@@ -3969,6 +4012,31 @@ fn testConstructionAlloc(
         preserved,
         introduced,
     });
+}
+
+fn testGoalRebindConstructionAlloc(
+    allocator: std.mem.Allocator,
+    goal_ref: []const u8,
+    predecessor: []const u8,
+    subject: []const u8,
+) ![]u8 {
+    const review_successor = try testConstructionAlloc(
+        allocator,
+        goal_ref,
+        predecessor,
+        "realization-repair",
+        subject,
+        "[]",
+        null,
+    );
+    defer allocator.free(review_successor);
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        review_successor,
+        "\"trigger\":\"accepted-review-fold\"",
+        "\"trigger\":\"initial\"",
+    );
 }
 
 fn testCounterexamplesAlloc(
@@ -6383,22 +6451,27 @@ test "actuation: event limit rejects before durable append" {
     try std.testing.expectEqual(@as(usize, 0), harness.memory.records.items.len);
 }
 
-test "actuation: Goal successor must change payload and stale operation fails closed" {
+test "actuation: Goal successor preserves Construction lineage without current authority" {
     var harness = TestHarness.init(std.testing.allocator);
     defer harness.deinit();
     const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
     defer std.testing.allocator.free(refs.goal);
     defer std.testing.allocator.free(refs.construction);
-    const stale_operation =
-        "{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
-        "\"construction_ref\":\"" ++ TestDigest2 ++ "\",\"step_id\":\"stale\"," ++
-        "\"expected_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
-        "\"effect\":\"edit\",\"idempotency_key\":\"stale\"," ++
-        "\"owner_boundary\":\"owner\",\"paths\":[\"src/file.zig\"]," ++
-        "\"proof_obligation_refs\":[\"proof-1\"]}";
+    const same_goal_non_review = try testGoalRebindConstructionAlloc(
+        std.testing.allocator,
+        refs.goal,
+        refs.construction,
+        TestDigest0,
+    );
+    defer std.testing.allocator.free(same_goal_non_review);
     try std.testing.expectError(
-        error.ConstructionRefMismatch,
-        prepareOperation(std.testing.allocator, harness.store(), "goal-1", stale_operation),
+        error.InvalidSuccessorRecompilation,
+        appendArtifact(
+            std.testing.allocator,
+            harness.store(),
+            "goal-1",
+            same_goal_non_review,
+        ),
     );
     const initial_goal = try testGoalAlloc(
         std.testing.allocator,
@@ -6425,20 +6498,179 @@ test "actuation: Goal successor must change payload and stale operation fails cl
         error.GoalSuccessorUnchanged,
         appendArtifact(std.testing.allocator, harness.store(), "goal-1", successor),
     );
-    const changed = try std.mem.replaceOwned(
-        u8,
+    const changed = try testGoalSuccessorAlloc(
         std.testing.allocator,
-        successor,
-        "\"non_goals\":[]",
-        "\"non_goals\":[\"changed\"]",
+        refs.goal,
     );
     defer std.testing.allocator.free(changed);
     var result = try appendArtifact(std.testing.allocator, harness.store(), "goal-1", changed);
+    const successor_goal = try std.testing.allocator.dupe(u8, result.artifact_id.?);
+    defer std.testing.allocator.free(successor_goal);
     result.deinit(std.testing.allocator);
     var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
-    defer replay.deinit();
     try std.testing.expect(replay.state.construction == null);
+    try std.testing.expect(replay.state.lineage_construction != null);
+    try std.testing.expect(std.mem.eql(
+        u8,
+        replay.state.lineage_construction.?.artifact_id,
+        refs.construction,
+    ));
     try std.testing.expect(replay.state.subject_digest == null);
+    replay.deinit();
+    const stale_operation =
+        "{\"schema\":\"actuating-operation/v1\",\"goal_id\":\"goal-1\"," ++
+        "\"construction_ref\":\"" ++ TestDigest2 ++ "\",\"step_id\":\"stale\"," ++
+        "\"expected_subject_digest\":\"" ++ TestDigest0 ++ "\"," ++
+        "\"effect\":\"edit\",\"idempotency_key\":\"stale\"," ++
+        "\"owner_boundary\":\"owner\",\"paths\":[\"src/file.zig\"]," ++
+        "\"proof_obligation_refs\":[\"proof-1\"]}";
+    try std.testing.expectError(
+        error.MissingCurrentConstruction,
+        prepareOperation(std.testing.allocator, harness.store(), "goal-1", stale_operation),
+    );
+    const disconnected = try testConstructionAlloc(
+        std.testing.allocator,
+        successor_goal,
+        null,
+        "initial",
+        TestDigest1,
+        "[]",
+        null,
+    );
+    defer std.testing.allocator.free(disconnected);
+    try std.testing.expectError(
+        error.InvalidConstructionLineage,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", disconnected),
+    );
+    const wrong_predecessor = try testGoalRebindConstructionAlloc(
+        std.testing.allocator,
+        successor_goal,
+        TestDigest2,
+        TestDigest1,
+    );
+    defer std.testing.allocator.free(wrong_predecessor);
+    try std.testing.expectError(
+        error.InvalidConstructionLineage,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", wrong_predecessor),
+    );
+    const valid = try testGoalRebindConstructionAlloc(
+        std.testing.allocator,
+        successor_goal,
+        refs.construction,
+        TestDigest1,
+    );
+    defer std.testing.allocator.free(valid);
+    var valid_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        valid,
+    );
+    defer valid_result.deinit(std.testing.allocator);
+    var current = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer current.deinit();
+    try std.testing.expect(current.state.construction != null);
+    try std.testing.expect(current.state.lineage_construction == null);
+    try std.testing.expect(std.mem.eql(
+        u8,
+        current.state.subject_digest.?,
+        TestDigest1,
+    ));
+}
+
+test "actuation: Goal successor preserves Counterexample causal lineage" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    try testRegisterClass(
+        &harness,
+        "class-goal-rebind",
+        "law-1",
+        "owner",
+        "high",
+        "rejected",
+    );
+    const prior_set = try testLatestCounterexampleSetRefAlloc(&harness);
+    defer std.testing.allocator.free(prior_set);
+    const successor_goal_text = try testGoalSuccessorAlloc(
+        std.testing.allocator,
+        refs.goal,
+    );
+    defer std.testing.allocator.free(successor_goal_text);
+    var goal_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        successor_goal_text,
+    );
+    const successor_goal = try std.testing.allocator.dupe(
+        u8,
+        goal_result.artifact_id.?,
+    );
+    defer std.testing.allocator.free(successor_goal);
+    goal_result.deinit(std.testing.allocator);
+    var after_goal = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    try std.testing.expectEqual(@as(usize, 1), after_goal.state.classes.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        after_goal.state.counterexample_sets.items.len,
+    );
+    try std.testing.expect(after_goal.state.latest_counterexample_set_construction_ref == null);
+    try std.testing.expect(after_goal.state.latest_counterexample_set_subject_digest == null);
+    after_goal.deinit();
+    const successor_construction = try testGoalRebindConstructionAlloc(
+        std.testing.allocator,
+        successor_goal,
+        refs.construction,
+        TestDigest1,
+    );
+    defer std.testing.allocator.free(successor_construction);
+    var construction_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        successor_construction,
+    );
+    construction_result.deinit(std.testing.allocator);
+    const classes = try testClassListAlloc(
+        std.testing.allocator,
+        "class-goal-rebind",
+        "law-1",
+        "owner",
+        "high",
+        "rejected",
+    );
+    defer std.testing.allocator.free(classes);
+    const missing = try testCurrentCounterexamplesAlloc(&harness, classes, "[]");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectError(
+        error.MissingCounterexampleSetPredecessor,
+        appendArtifact(std.testing.allocator, harness.store(), "goal-1", missing),
+    );
+    const predecessors = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "[\"{s}\"]",
+        .{prior_set},
+    );
+    defer std.testing.allocator.free(predecessors);
+    const valid = try testCurrentCounterexamplesAlloc(
+        &harness,
+        classes,
+        predecessors,
+    );
+    defer std.testing.allocator.free(valid);
+    var recurrence = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        valid,
+    );
+    defer recurrence.deinit(std.testing.allocator);
+    var replay = try replayStore(std.testing.allocator, harness.store(), "goal-1");
+    defer replay.deinit();
+    try std.testing.expectEqual(@as(usize, 2), replay.state.classes.items[0].occurrences);
 }
 
 test "actuation: hash chain rejects reorder and tamper" {
