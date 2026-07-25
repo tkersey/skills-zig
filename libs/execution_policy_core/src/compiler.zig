@@ -216,6 +216,12 @@ const factor_dispositions = [_][]const u8{
     "normalize",
     "introduce",
 };
+const architectonic_action_ref_fields = [_][]const u8{
+    "architectonic_seam_refs",
+    "realizes_factor_refs",
+    "retires_factor_refs",
+    "preservation_observation_refs",
+};
 
 fn validateRich(
     allocator: std.mem.Allocator,
@@ -864,72 +870,14 @@ fn validateActionBindings(
     seam_bound: []bool,
     allocator: std.mem.Allocator,
 ) !void {
-    const seam_refs = stringValues(action, "architectonic_seam_refs");
-    if (state.mode == .explicit) {
-        inline for ([_][]const u8{
-            "architectonic_seam_refs",
-            "realizes_factor_refs",
-            "retires_factor_refs",
-            "preservation_observation_refs",
-        }) |key| {
-            try requireStringArray(
-                builder,
-                action,
-                key,
-                try std.fmt.allocPrint(
-                    allocator,
-                    "{s}.{s}",
-                    .{ path, key },
-                ),
-            );
-        }
-        if (seam_refs.len == 0) {
-            try builder.add(
-                .architectonic_unbound,
-                try suffix(allocator, path, ".architectonic_seam_refs"),
-            );
-        }
-    } else if (state.mode == .not_required) {
-        inline for ([_][]const u8{
-            "architectonic_seam_refs",
-            "realizes_factor_refs",
-            "retires_factor_refs",
-            "preservation_observation_refs",
-        }) |key| {
-            if (action.get(key)) |value| {
-                if (value != .array) {
-                    try builder.add(
-                        .schema_invalid,
-                        try std.fmt.allocPrint(
-                            allocator,
-                            "{s}.{s}",
-                            .{ path, key },
-                        ),
-                    );
-                } else if (value.array.items.len != 0) {
-                    try builder.add(
-                        .architectonic_unbound,
-                        try std.fmt.allocPrint(
-                            allocator,
-                            "{s}.{s}",
-                            .{ path, key },
-                        ),
-                    );
-                }
-            }
-        }
-    }
-    for (seam_refs) |value| {
-        const ref = valueString(value) orelse continue;
-        if (indexOf(state.seam_ids, ref)) |index| {
-            seam_bound[index] = true;
-        } else {
-            try builder.add(
-                .reference_unknown,
-                try suffix(allocator, path, ".architectonic_seam_refs"),
-            );
-        }
-    }
+    const seam_refs = try validateActionSeamRefs(
+        builder,
+        action,
+        path,
+        state,
+        seam_bound,
+        allocator,
+    );
     try validateActionFactorRefs(
         builder,
         action,
@@ -961,6 +909,78 @@ fn validateActionBindings(
                 .action_cycle,
                 try suffix(allocator, path, ".requires_actions"),
             );
+        }
+    }
+}
+
+fn validateActionSeamRefs(
+    builder: *errors.Builder,
+    action: std.json.ObjectMap,
+    path: []const u8,
+    state: ArchitectonicState,
+    seam_bound: []bool,
+    allocator: std.mem.Allocator,
+) ![]const std.json.Value {
+    const seam_refs = stringValues(action, "architectonic_seam_refs");
+    if (state.mode == .explicit) {
+        inline for (architectonic_action_ref_fields) |key| {
+            try requireStringArray(
+                builder,
+                action,
+                key,
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{s}.{s}",
+                    .{ path, key },
+                ),
+            );
+        }
+        if (seam_refs.len == 0) {
+            try builder.add(
+                .architectonic_unbound,
+                try suffix(allocator, path, ".architectonic_seam_refs"),
+            );
+        }
+    } else {
+        try validateOptionalArchitectonicActionFields(
+            builder,
+            action,
+            path,
+            allocator,
+        );
+    }
+    for (seam_refs) |value| {
+        const ref = valueString(value) orelse continue;
+        if (indexOf(state.seam_ids, ref)) |index| {
+            seam_bound[index] = true;
+        } else {
+            try builder.add(
+                .reference_unknown,
+                try suffix(allocator, path, ".architectonic_seam_refs"),
+            );
+        }
+    }
+    return seam_refs;
+}
+
+fn validateOptionalArchitectonicActionFields(
+    builder: *errors.Builder,
+    action: std.json.ObjectMap,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+) !void {
+    inline for (architectonic_action_ref_fields) |key| {
+        if (action.get(key)) |value| {
+            const field_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}.{s}",
+                .{ path, key },
+            );
+            if (value != .array) {
+                try builder.add(.schema_invalid, field_path);
+            } else if (value.array.items.len != 0) {
+                try builder.add(.architectonic_unbound, field_path);
+            }
         }
     }
 }
