@@ -11,7 +11,10 @@ pub fn validatePolicy(allocator: std.mem.Allocator, policy: *const schema.Policy
     return validator.finish();
 }
 
-pub fn validateCompiledRuntimePolicy(allocator: std.mem.Allocator, policy: *const schema.Policy) !errors.ValidationReport {
+pub fn validateCompiledRuntimePolicy(
+    allocator: std.mem.Allocator,
+    policy: *const schema.Policy,
+) !errors.ValidationReport {
     var validator = Validator.init(allocator);
     defer validator.deinit();
     try validator.validate(policy, .compiled_runtime);

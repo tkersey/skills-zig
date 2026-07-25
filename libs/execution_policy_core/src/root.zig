@@ -41,7 +41,11 @@ pub fn canonicalPolicyDigest(allocator: std.mem.Allocator, policy: *const Compil
     return .{ .text = try allocator.dupe(u8, policy.digest()) };
 }
 
-pub fn select(allocator: std.mem.Allocator, policy: *const CompiledPolicy, state: *const State) !Decision {
+pub fn select(
+    allocator: std.mem.Allocator,
+    policy: *const CompiledPolicy,
+    state: *const State,
+) !Decision {
     return selection.select(allocator, compiler.runtimePolicy(policy), state);
 }
 
@@ -52,7 +56,14 @@ pub fn validateReceipt(
     decision: *const Decision,
     receipt: *const TransitionReceipt,
 ) !ValidationReport {
-    return transition.validateReceiptForDigest(allocator, compiler.runtimePolicy(policy), state, decision, receipt, policy.digest());
+    return transition.validateReceiptForDigest(
+        allocator,
+        compiler.runtimePolicy(policy),
+        state,
+        decision,
+        receipt,
+        policy.digest(),
+    );
 }
 
 pub fn applyReceipt(
@@ -63,7 +74,15 @@ pub fn applyReceipt(
     receipt: *const TransitionReceipt,
     updated_at: []const u8,
 ) !State {
-    return transition.applyReceiptForDigest(allocator, compiler.runtimePolicy(policy), state, decision, receipt, updated_at, policy.digest());
+    return transition.applyReceiptForDigest(
+        allocator,
+        compiler.runtimePolicy(policy),
+        state,
+        decision,
+        receipt,
+        updated_at,
+        policy.digest(),
+    );
 }
 
 pub fn comparePotential(before: []const i64, after: []const i64) PotentialComparison {
@@ -86,14 +105,17 @@ test "public API compiles policy before execution" {
     );
     defer result.deinit(std.testing.allocator);
     switch (result) {
-        .policy => |policy| try std.testing.expect(std.mem.startsWith(u8, policy.digest(), "sha256:")),
+        .policy => |policy| try std.testing.expect(
+            std.mem.startsWith(u8, policy.digest(), "sha256:"),
+        ),
         .report => return error.ExpectedCompiledPolicy,
     }
 }
 
 test "public API exposes digest and potential comparison" {
     var result = try compilePolicy(std.testing.allocator,
-        \\{"policy_id":"p1","revision":1,"declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+        \\{"policy_id":"p1","revision":1,"declared_atoms":[],
+        \\"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
     );
     defer result.deinit(std.testing.allocator);
     switch (result) {
@@ -112,7 +134,11 @@ test "public API exposes digest and potential comparison" {
 
 test "public API validates and applies transition receipt" {
     var result = try compilePolicy(std.testing.allocator,
-        \\{"policy_id":"p","revision":1,"declared_atoms":["fact:done"],"actions":[{"id":"a","results":{"success":["fact:done"]}}],"policy_rules":[{"id":"r1","actions":["a"]},{"id":"r2","condition":{"all":["fact:done"]},"terminal":"success"}],"terminals":[{"id":"success","condition":{"all":["fact:done"]}}]}
+        \\{"policy_id":"p","revision":1,"declared_atoms":["fact:done"],
+        \\"actions":[{"id":"a","results":{"success":["fact:done"]}}],
+        \\"policy_rules":[{"id":"r1","actions":["a"]},
+        \\{"id":"r2","condition":{"all":["fact:done"]},"terminal":"success"}],
+        \\"terminals":[{"id":"success","condition":{"all":["fact:done"]}}]}
     );
     defer result.deinit(std.testing.allocator);
     const policy = switch (result) {
@@ -130,17 +156,34 @@ test "public API validates and applies transition receipt" {
     );
     defer decision.deinit(std.testing.allocator);
     const receipt_text = try std.fmt.allocPrint(std.testing.allocator,
-        \\{{"policy_id":"p","revision":1,"policy_digest":"{s}","decision_id":"d","action_id":"a","result":"success","predicted_effects":["fact:done"],"observed":{{"facts":["fact:done"],"potential":[0]}},"state_after":{{"state_id":"s2","potential":[0]}}}}
+        \\{{"policy_id":"p","revision":1,"policy_digest":"{s}",
+        \\"decision_id":"d","action_id":"a","result":"success",
+        \\"predicted_effects":["fact:done"],
+        \\"observed":{{"facts":["fact:done"],"potential":[0]}},
+        \\"state_after":{{"state_id":"s2","potential":[0]}}}}
     , .{policy.digest()});
     defer std.testing.allocator.free(receipt_text);
     var receipt = try parseTransitionReceipt(std.testing.allocator, receipt_text);
     defer receipt.deinit(std.testing.allocator);
 
-    var report = try validateReceipt(std.testing.allocator, policy, &state, &decision, &receipt);
+    var report = try validateReceipt(
+        std.testing.allocator,
+        policy,
+        &state,
+        &decision,
+        &receipt,
+    );
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(report.ok());
 
-    var next = try applyReceipt(std.testing.allocator, policy, &state, &decision, &receipt, "2026-06-24T00:00:00Z");
+    var next = try applyReceipt(
+        std.testing.allocator,
+        policy,
+        &state,
+        &decision,
+        &receipt,
+        "2026-06-24T00:00:00Z",
+    );
     defer next.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("s2", next.root().object.get("state_id").?.string);
 }
@@ -158,14 +201,18 @@ test "rich EPG compiles to an executable policy with a derived initial state" {
             return error.ExpectedCompiledPolicy;
         },
     };
-    var state = (try policy.initialState(std.testing.allocator)) orelse return error.ExpectedInitialState;
+    var state = (try policy.initialState(std.testing.allocator)) orelse
+        return error.ExpectedInitialState;
     defer state.deinit(std.testing.allocator);
     var decision = try select(std.testing.allocator, policy, &state);
     defer decision.deinit(std.testing.allocator);
     const winner = decision.root().object.get("winner").?.object;
     try std.testing.expectEqualStrings("action", winner.get("kind").?.string);
     try std.testing.expectEqualStrings("A", winner.get("id").?.string);
-    try std.testing.expectEqualStrings(policy.digest(), state.root().object.get("policy_digest").?.string);
+    try std.testing.expectEqualStrings(
+        policy.digest(),
+        state.root().object.get("policy_digest").?.string,
+    );
 }
 
 test "rich EPG cannot self-certify readiness or name an execution handoff" {
@@ -190,7 +237,10 @@ test "rich EPG cannot self-certify readiness or name an execution handoff" {
             .policy => return error.ExpectedCompileRejection,
             .report => |report| {
                 try std.testing.expect(!report.ok());
-                try std.testing.expectEqual(ErrorCode.self_certification_forbidden, report.errors[0].code);
+                try std.testing.expectEqual(
+                    ErrorCode.self_certification_forbidden,
+                    report.errors[0].code,
+                );
             },
         }
     }

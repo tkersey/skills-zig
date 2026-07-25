@@ -46,7 +46,10 @@ fn parsePolicyArtifact(allocator: std.mem.Allocator, text: []const u8) !?ParsedA
             .valid = true,
         },
         .report => {
-            var digest = execution_policy_core.canonical_json.digestRawJson(allocator, json) catch return null;
+            var digest = execution_policy_core.canonical_json.digestRawJson(
+                allocator,
+                json,
+            ) catch return null;
             defer digest.deinit(allocator);
             return .{
                 .kind = .epg,

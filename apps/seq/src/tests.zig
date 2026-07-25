@@ -110,7 +110,10 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
     try std.testing.expectEqual(lib.Command.actuation_audit, lib.parseCommand("actuation-audit"));
-    try std.testing.expectEqual(lib.Command.execution_policy_compile, lib.parseCommand("execution-policy-compile"));
+    try std.testing.expectEqual(
+        lib.Command.execution_policy_compile,
+        lib.parseCommand("execution-policy-compile"),
+    );
     try std.testing.expectEqual(lib.Command.execution_policy_audit, lib.parseCommand("execution-policy-audit"));
     try std.testing.expectEqual(lib.Command.policy_calibration, lib.parseCommand("policy-calibration"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
@@ -124,11 +127,13 @@ test "retrace core exposes DCP capsule primitives" {
 
 test "seq uses execution policy core canonical digest" {
     var result_a = try execution_policy_core.compilePolicy(std.testing.allocator,
-        \\{"revision":1,"policy_id":"p","declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+        \\{"revision":1,"policy_id":"p","declared_atoms":[],
+        \\"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
     );
     defer result_a.deinit(std.testing.allocator);
     var result_b = try execution_policy_core.compilePolicy(std.testing.allocator,
-        \\{"policy_rules":[{"actions":["a"],"id":"r"}],"actions":[{"id":"a"}],"declared_atoms":[],"policy_id":"p","revision":1}
+        \\{"policy_rules":[{"actions":["a"],"id":"r"}],
+        \\"actions":[{"id":"a"}],"declared_atoms":[],"policy_id":"p","revision":1}
     );
     defer result_b.deinit(std.testing.allocator);
     const digest_a = switch (result_a) {

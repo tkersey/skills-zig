@@ -50,12 +50,17 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
 
 test "compile report exposes only source digest and errors" {
     var report = try compileToJson(std.testing.allocator,
-        \\{"policy_id":"p","revision":1,"declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+        \\{"policy_id":"p","revision":1,"declared_atoms":[],
+        \\"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
     );
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(report.compiled);
-    try std.testing.expect(std.mem.indexOf(u8, report.json, "\"compiled\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report.json, "\"policy_digest\": \"sha256:") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, report.json, "\"compiled\": true") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, report.json, "\"policy_digest\": \"sha256:") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, report.json, "runtime_") == null);
 }
 
@@ -63,6 +68,8 @@ test "compile report retains structured rejection paths" {
     var report = try compileToJson(std.testing.allocator, "{}");
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(!report.compiled);
-    try std.testing.expect(std.mem.indexOf(u8, report.json, "\"code\": \"schema_invalid\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, report.json, "\"code\": \"schema_invalid\"") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, report.json, "\"path\": \"$.policy_id\"") != null);
 }

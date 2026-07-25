@@ -202,7 +202,8 @@ fn summaryFor(command: lib.Command) []const u8 {
         .decision_capsule => "Freeze one visible historical decision as DCP-v2",
         .actuation_audit => "Audit plan-to-PR actuation control, frontier, proof, compaction, and ship lineage",
         .cas_review_audit => "Audit CAS review-session proof planes and lane backend reliability",
-        .execution_policy_compile => "Compile EPG-v1 source into the opaque execution-policy boundary",
+        .execution_policy_compile => "Compile EPG-v1 source into the opaque " ++
+            "execution-policy boundary",
         .execution_policy_audit => "Audit EPG-guided planning/execution policy runtime lineage and calibration",
         .policy_calibration => "Emit execution-policy transition calibration rows",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
@@ -223,7 +224,8 @@ fn usageFor(command: lib.Command) []const u8 {
         .decision_capsule => "seq decision-capsule (--session-id <id>|--path <jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index N] [--mode capsule|candidates|anchors|validate]",
         .actuation_audit => "seq actuation-audit --root <path> (--session-id <id>|--path <jsonl>|(--repo <path>|--workdir <path>) (--last <duration>|--since <iso>|--until <iso>))",
         .cas_review_audit => "seq cas-review-audit [--path <jsonl>|--receipt-path <json>|--repo <path>] [--mode summary|rows|report]",
-        .execution_policy_compile => "seq execution-policy-compile --file <policy.json> [--format json]",
+        .execution_policy_compile => "seq execution-policy-compile " ++
+            "--file <policy.json> [--format json]",
         .execution_policy_audit => "seq execution-policy-audit --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
         .policy_calibration => "seq policy-calibration --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
         .skill_contract => "seq skill-contract validate --file <path>",

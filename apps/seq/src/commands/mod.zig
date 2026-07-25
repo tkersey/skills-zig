@@ -1615,7 +1615,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.contract_text != null, cmd == .skill_decision_audit, "--contract", cmd);
     try ensureOptionAllowed(opts.contract_authority_text != null, cmd == .skill_decision_audit, "--contract-authority", cmd);
     try ensureOptionAllowed(opts.causality_text != null, cmd == .skill_decision_audit, "--causality", cmd);
-    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt or cmd == .decision_capsule or cmd == .execution_policy_compile, "--file", cmd);
+    const supports_file = cmd == .skill_contract or
+        cmd == .skill_decision_receipt or
+        cmd == .decision_capsule or
+        cmd == .execution_policy_compile;
+    try ensureOptionAllowed(opts.file_text != null, supports_file, "--file", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
     try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
@@ -4558,7 +4562,11 @@ fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const 
         try writer.writeAll("# Execution Policy Audit\n\n");
         try writer.writeAll("## Corpus/capabilities/denominator\n\n");
         try writer.print("- included_runs: {d}\n", .{rows.items.len});
-        try writer.writeAll("- capabilities: execution_policy_compile_v1, execution_policy_audit_v1, epg_v1, eps_v1, epd_v1, etr_v1, policy_calibration_v1, policy_regret_candidates_v1, policy_transition_dataset_v1\n\n");
+        try writer.writeAll(
+            "- capabilities: execution_policy_compile_v1, execution_policy_audit_v1, " ++
+                "epg_v1, eps_v1, epd_v1, etr_v1, policy_calibration_v1, " ++
+                "policy_regret_candidates_v1, policy_transition_dataset_v1\n\n",
+        );
         try writeExecutionPolicyReportSection(writer, "Source and regime", rows.items, &.{ "session_id", "policy_id", "source_current", "regime", "active_or_stale" });
         try writeExecutionPolicyReportSection(writer, "Policy validation and closure", rows.items, &.{ "session_id", "runtime_state", "true_run", "verdict", "strict_findings" });
         try writeExecutionPolicyReportSection(writer, "Unknowns/observations", rows.items, &.{ "session_id", "critical_unknowns", "resolved_unknowns", "premature_mutations", "unexpected" });
@@ -27841,7 +27849,8 @@ test "execution policy compile command reports source digest" {
         .{
             .sub_path = "policy.json",
             .data =
-            \\{"policy_id":"p","revision":1,"declared_atoms":[],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
+            \\{"policy_id":"p","revision":1,"declared_atoms":[],
+            \\"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]}]}
             ,
         },
     );
@@ -27985,7 +27994,11 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_capsule_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"streaming_session_scanner_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_compile_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        "\"execution_policy_compile_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

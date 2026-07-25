@@ -48,7 +48,14 @@ pub fn applyReceiptForDigest(
     updated_at: []const u8,
     expected_policy_digest: ?[]const u8,
 ) !schema.State {
-    var report = try validateReceiptForDigest(allocator, policy, state, decision, receipt, expected_policy_digest);
+    var report = try validateReceiptForDigest(
+        allocator,
+        policy,
+        state,
+        decision,
+        receipt,
+        expected_policy_digest,
+    );
     defer report.deinit(allocator);
     if (!report.ok()) return error.TransitionInvalid;
 
@@ -164,15 +171,37 @@ const ReceiptValidator = struct {
             break :digest owned_policy_digest.?.text;
         };
 
-        try self.expectStringEqual(receipt_root, "policy_id", stringField(policy_root, "policy_id"), .receipt_identity_mismatch, "$.policy_id");
+        try self.expectStringEqual(
+            receipt_root,
+            "policy_id",
+            stringField(policy_root, "policy_id"),
+            .receipt_identity_mismatch,
+            "$.policy_id",
+        );
         if (integerField(policy_root, "revision")) |revision| {
-            if (integerField(receipt_root, "revision") != revision) try self.add(.receipt_identity_mismatch, "$.revision");
+            if (integerField(receipt_root, "revision") != revision) {
+                try self.add(.receipt_identity_mismatch, "$.revision");
+            }
         }
-        try self.expectStringEqual(receipt_root, "policy_digest", actual_policy_digest, .receipt_identity_mismatch, "$.policy_digest");
+        try self.expectStringEqual(
+            receipt_root,
+            "policy_digest",
+            actual_policy_digest,
+            .receipt_identity_mismatch,
+            "$.policy_digest",
+        );
         if (stringField(state_root, "policy_digest")) |state_policy_digest| {
-            if (!std.mem.eql(u8, state_policy_digest, actual_policy_digest)) try self.add(.receipt_identity_mismatch, "$.state.policy_digest");
+            if (!std.mem.eql(u8, state_policy_digest, actual_policy_digest)) {
+                try self.add(.receipt_identity_mismatch, "$.state.policy_digest");
+            }
         }
-        try self.expectStringEqual(receipt_root, "decision_id", stringField(decision_root, "decision_id"), .receipt_identity_mismatch, "$.decision_id");
+        try self.expectStringEqual(
+            receipt_root,
+            "decision_id",
+            stringField(decision_root, "decision_id"),
+            .receipt_identity_mismatch,
+            "$.decision_id",
+        );
         const observed = objectField(receipt_root, "observed") orelse {
             try self.add(.transition_invalid, "$.observed");
             return;
