@@ -1747,7 +1747,7 @@ fn foldSnapshot(
     var state = State.init(allocator, goal_id);
     for (snapshot.records) |record| {
         const event = try parseEvent(allocator, record.payload);
-        try applyEvent(&state, event);
+        try applyEvent(&state, event, .historical_replay);
     }
     return state;
 }
@@ -1907,7 +1907,16 @@ fn writeOptionalJsonString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     if (value) |text| try writeJsonString(writer, text) else try writer.writeAll("null");
 }
 
-fn applyEvent(state: *State, event: ParsedEvent) !void {
+const EventApplication = enum {
+    historical_replay,
+    current_append,
+};
+
+fn applyEvent(
+    state: *State,
+    event: ParsedEvent,
+    application: EventApplication,
+) !void {
     if (!std.mem.eql(u8, event.goal_id, state.goal_id)) return error.GoalIdMismatch;
     if (event.sequence != state.event_count + 1) return error.SequenceMismatch;
     if (!std.mem.eql(u8, event.previous_digest, state.head_digest)) {
@@ -1915,7 +1924,11 @@ fn applyEvent(state: *State, event: ParsedEvent) !void {
     }
     switch (event.kind) {
         .goal_contract_registered => try applyGoalRegistration(state, event),
-        .construction_contract_registered => try applyConstructionRegistration(state, event),
+        .construction_contract_registered => try applyConstructionRegistration(
+            state,
+            event,
+            application,
+        ),
         .counterexample_set_registered => try applyCounterexampleRegistration(state, event),
         .operation_prepared => try applyOperationPrepared(state, event),
         .effect_recorded => try applyEffectRecorded(state, event),
@@ -1978,7 +1991,11 @@ fn applyGoalRegistration(state: *State, event: ParsedEvent) !void {
     state.goal = view;
 }
 
-fn applyConstructionRegistration(state: *State, event: ParsedEvent) !void {
+fn applyConstructionRegistration(
+    state: *State,
+    event: ParsedEvent,
+    application: EventApplication,
+) !void {
     if (state.goal == null or state.pending != null) return error.InvalidConstructionTransition;
     const view = try verifiedArtifactView(state, event.body, .construction);
     if (event.construction_ref == null or
@@ -1986,11 +2003,31 @@ fn applyConstructionRegistration(state: *State, event: ParsedEvent) !void {
     {
         return error.ConstructionRefMismatch;
     }
-    const predecessor = state.construction orelse state.lineage_construction;
+    var predecessor = state.construction orelse state.lineage_construction;
+    const legacy_goal_reset =
+        application == .historical_replay and
+        state.construction == null and
+        state.lineage_construction != null and
+        try isInitialConstruction(view);
+    if (legacy_goal_reset) {
+        predecessor = null;
+        state.classes = .empty;
+        state.counterexample_sets = .empty;
+    }
     try validateConstructionAgainstState(state, predecessor, view, event.subject_digest);
     state.construction = view;
     state.lineage_construction = null;
     state.subject_digest = event.subject_digest;
+}
+
+fn isInitialConstruction(view: ArtifactView) !bool {
+    const payload = try asObject(view.payload);
+    const recompilation = try asObject(try field(payload, "recompilation"));
+    const supersession = try asObject(try field(payload, "supersession"));
+    return std.mem.eql(u8, try stringField(payload, "mode"), "initial") and
+        view.predecessors.items.len == 0 and
+        std.mem.eql(u8, try stringField(recompilation, "trigger"), "initial") and
+        std.mem.eql(u8, try stringField(supersession, "disposition"), "initial");
 }
 
 fn validateConstructionAgainstState(
@@ -3439,7 +3476,7 @@ fn appendCanonicalEvent(
     );
     defer allocator.free(event_bytes);
     const event = try parseEvent(replay.arena.allocator(), event_bytes);
-    try applyEvent(&replay.state, event);
+    try applyEvent(&replay.state, event, .current_append);
     var receipt = try exclusive.append(
         allocator,
         event_bytes,
@@ -6574,6 +6611,104 @@ test "actuation: Goal successor preserves Construction lineage without current a
     try std.testing.expect(std.mem.eql(
         u8,
         current.state.subject_digest.?,
+        TestDigest1,
+    ));
+}
+
+test "actuation: legacy Goal reset replays without weakening current lineage admission" {
+    var harness = TestHarness.init(std.testing.allocator);
+    defer harness.deinit();
+    const refs = try testAppendGoalAndConstruction(&harness, "[\"implementation\"]", false);
+    defer std.testing.allocator.free(refs.goal);
+    defer std.testing.allocator.free(refs.construction);
+    const successor_goal_text = try testGoalSuccessorAlloc(
+        std.testing.allocator,
+        refs.goal,
+    );
+    defer std.testing.allocator.free(successor_goal_text);
+    var goal_result = try appendArtifact(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+        successor_goal_text,
+    );
+    const successor_goal = try std.testing.allocator.dupe(
+        u8,
+        goal_result.artifact_id.?,
+    );
+    defer std.testing.allocator.free(successor_goal);
+    goal_result.deinit(std.testing.allocator);
+    const legacy_initial = try testConstructionAlloc(
+        std.testing.allocator,
+        successor_goal,
+        null,
+        "initial",
+        TestDigest1,
+        "[]",
+        null,
+    );
+    defer std.testing.allocator.free(legacy_initial);
+    try std.testing.expectError(
+        error.InvalidConstructionLineage,
+        appendArtifact(
+            std.testing.allocator,
+            harness.store(),
+            "goal-1",
+            legacy_initial,
+        ),
+    );
+
+    var materialized = try materializeArtifact(
+        std.testing.allocator,
+        "goal-1",
+        legacy_initial,
+    );
+    defer materialized.deinit(std.testing.allocator);
+    var before = try replayStore(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+    );
+    const legacy_event = try eventBytesAlloc(
+        std.testing.allocator,
+        before.state,
+        .construction_contract_registered,
+        materialized.artifact_id,
+        TestDigest1,
+        materialized.bytes,
+    );
+    defer std.testing.allocator.free(legacy_event);
+    const expected_revision = try std.testing.allocator.dupe(
+        u8,
+        before.snapshot.revision,
+    );
+    defer std.testing.allocator.free(expected_revision);
+    const expected_exists = before.snapshot.exists;
+    before.deinit();
+    var receipt = try harness.store().append(
+        std.testing.allocator,
+        legacy_event,
+        .{ .revision = expected_revision, .exists = expected_exists },
+        MaxStoreBytes,
+    );
+    receipt.deinit(std.testing.allocator);
+
+    var replay = try replayStore(
+        std.testing.allocator,
+        harness.store(),
+        "goal-1",
+    );
+    defer replay.deinit();
+    try std.testing.expect(replay.state.construction != null);
+    try std.testing.expect(replay.state.lineage_construction == null);
+    try std.testing.expect(std.mem.eql(
+        u8,
+        replay.state.construction.?.artifact_id,
+        materialized.artifact_id,
+    ));
+    try std.testing.expect(std.mem.eql(
+        u8,
+        replay.state.subject_digest.?,
         TestDigest1,
     ));
 }
