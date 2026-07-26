@@ -31,7 +31,7 @@ export LEDGER_CACHE_DIR="$repo_dir/cache"
 capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"ledger-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"id":"exact-object","version":1' <<<"$capabilities"
-grep -Fq '"id":"implies","version":1' <<<"$capabilities"
+grep -Fq '"id":"implies","version":2' <<<"$capabilities"
 grep -Fq '"id":"total-partition","version":1' <<<"$capabilities"
 grep -Fq '"id":"total-mapping","version":1' <<<"$capabilities"
 grep -Fq '"id":"all","version":1' <<<"$capabilities"

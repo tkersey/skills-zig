@@ -403,7 +403,7 @@ const Builder = struct {
             .implies => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "input", "if", "equals", "then" },
+                    &.{ "op", "input", "if", "equals", "nonempty", "then" },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -424,6 +424,12 @@ const Builder = struct {
                     const values = try self.allocator.alloc(EnumScalar, 1);
                     values[0] = expected;
                     rule.values = values;
+                }
+                if (try optionalBoolean(object, "nonempty") orelse false) {
+                    if (rule.values.len != 0) {
+                        return error.ConflictingImplicationPredicates;
+                    }
+                    rule.min_count = 1;
                 }
             },
             .total_partition => {
@@ -1038,7 +1044,7 @@ const Builder = struct {
             .implies => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "if", "equals", "then" },
+                    &.{ "op", "if", "equals", "nonempty", "then" },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -1055,6 +1061,12 @@ const Builder = struct {
                     errdefer self.allocator.free(values);
                     values[0] = try parseEnumScalar(self.allocator, value);
                     rule.values = values;
+                }
+                if (try optionalBoolean(object, "nonempty") orelse false) {
+                    if (rule.values.len != 0) {
+                        return error.ConflictingImplicationPredicates;
+                    }
+                    rule.min_count = 1;
                 }
             },
             .one_of, .all_rules, .any_rules, .no_rules => {
@@ -2003,7 +2015,9 @@ fn validateCachedRule(
         },
         .implies => if (rule.pointer_id == null or
             rule.other_pointer_id == null or
-            rule.values.len > 1)
+            rule.values.len > 1 or
+            (rule.min_count != null and rule.min_count.? != 1) or
+            (rule.values.len != 0 and rule.min_count != null))
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -2982,10 +2996,20 @@ fn implicationHolds(
     {
         return true;
     }
+    if (rule.min_count != null and !valueNonempty(condition)) return true;
     return resolve(
         root,
         plan.pointers[rule.other_pointer_id.?],
     ) != null;
+}
+
+fn valueNonempty(value: std.json.Value) bool {
+    return switch (value) {
+        .string => |text| text.len != 0,
+        .array => |array| array.items.len != 0,
+        .object => |object| object.count() != 0,
+        else => false,
+    };
 }
 
 const PartitionEntry = struct {
@@ -4043,7 +4067,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","meta","universe","ordering","accepted","rejected","targets","mappings"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","changes","meta","universe","ordering","accepted","rejected","targets","mappings"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
@@ -4071,6 +4095,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"field-equal","left":"/status","right":"/mirror"},
         \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
         \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure"},
+        \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
         \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
         \\    {"op":"reference-exists","path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"},
         \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
@@ -4126,7 +4151,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -4261,6 +4286,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     defer filtered_reference.deinit(std.testing.allocator);
     try std.testing.expect(!filtered_reference.valid);
 
+    const missing_implication_target_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"changes\":[]",
+        "\"changes\":[\"changed\"]",
+    );
+    defer std.testing.allocator.free(missing_implication_target_bytes);
+    var missing_implication_target = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = missing_implication_target_bytes,
+        }},
+    );
+    defer missing_implication_target.deinit(std.testing.allocator);
+    try std.testing.expect(!missing_implication_target.valid);
+
     const invalid_format_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -4287,7 +4332,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
