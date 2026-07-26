@@ -98,8 +98,10 @@ pub fn compile(
             default_value = try scalar.fromJsonAlloc(allocator, kind, raw);
         }
         if (required and default_value != null) return error.RequiredParameterHasDefault;
+        const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(owned_name);
         try items.append(allocator, .{
-            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .name = owned_name,
             .kind = kind,
             .required = required,
             .default_value = default_value,
@@ -130,9 +132,13 @@ pub fn bind(
         for (items.items) |prior| {
             if (std.mem.eql(u8, prior.name, input.name)) return error.DuplicateParameter;
         }
+        var value = try scalar.parseAlloc(allocator, declaration.kind, input.raw_value);
+        errdefer value.deinit(allocator);
+        const owned_name = try allocator.dupe(u8, input.name);
+        errdefer allocator.free(owned_name);
         try items.append(allocator, .{
-            .name = try allocator.dupe(u8, input.name),
-            .value = try scalar.parseAlloc(allocator, declaration.kind, input.raw_value),
+            .name = owned_name,
+            .value = value,
         });
     }
     for (declarations.items) |declaration| {
@@ -143,9 +149,13 @@ pub fn bind(
         };
         if (found) continue;
         if (declaration.default_value) |default_value| {
+            var value = try cloneValue(allocator, default_value);
+            errdefer value.deinit(allocator);
+            const owned_name = try allocator.dupe(u8, declaration.name);
+            errdefer allocator.free(owned_name);
             try items.append(allocator, .{
-                .name = try allocator.dupe(u8, declaration.name),
-                .value = try cloneValue(allocator, default_value),
+                .name = owned_name,
+                .value = value,
             });
         } else if (declaration.required) {
             return error.MissingParameter;
@@ -227,7 +237,7 @@ test "parameter declarations and values compile to stable typed digests" {
         std.json.Value,
         std.testing.allocator,
         \\{"limit":{"type":"integer","required":false,"default":10},"name":{"type":"safe_identifier","required":true}}
-        ,
+    ,
         .{},
     );
     defer parsed.deinit();

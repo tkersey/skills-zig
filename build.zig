@@ -165,6 +165,16 @@ pub fn build(b: *std.Build) void {
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
+    const ledger_v1_candidate_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/src/v1/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app_meta", .module = ledger_meta },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "ledger_v1_core", .module = ledger_v1_core },
+        },
+    });
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
     const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
     const ledger_actuation_core = b.createModule(.{
@@ -503,6 +513,11 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
+    const ledger_v1_candidate = addExecutable(
+        b,
+        "ledger-v1-candidate",
+        ledger_v1_candidate_root,
+    );
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
@@ -524,6 +539,7 @@ pub fn build(b: *std.Build) void {
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
     const ledger_install = addInstallStep(b, ledger);
+    const ledger_v1_candidate_install = addInstallStep(b, ledger_v1_candidate);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
     const perf_hub_install = addInstallStep(b, perf_hub);
@@ -816,6 +832,22 @@ pub fn build(b: *std.Build) void {
         "test-ledger-v1-core",
         "Run Ledger 1.0 artifact-definition compiler tests",
     );
+    const run_ledger_v1_cli_tests = addTestStep(
+        b,
+        ledger_v1_candidate_root,
+        "test-ledger-v1-cli",
+        "Run Ledger 1.0 candidate command-surface tests",
+    );
+    const ledger_v1_cli_smoke_cmd = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test-ledger-v1-cli.sh",
+    });
+    ledger_v1_cli_smoke_cmd.addArtifactArg(ledger_v1_candidate);
+    const run_ledger_v1_cli_smoke = b.step(
+        "test-ledger-v1-cli-smoke",
+        "Run Ledger 1.0 candidate definition, validation, and materialization smoke tests",
+    );
+    run_ledger_v1_cli_smoke.dependOn(&ledger_v1_cli_smoke_cmd.step);
     const run_execution_policy_core_tests = addTestStep(
         b,
         execution_policy_core,
@@ -936,12 +968,20 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_trace_core_tests.step);
     test_all.dependOn(&run_seq_v1_core_tests.step);
     test_all.dependOn(&run_ledger_v1_core_tests.step);
+    test_all.dependOn(&run_ledger_v1_cli_tests.step);
+    test_all.dependOn(run_ledger_v1_cli_smoke);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
 
     const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
     test_full.dependOn(test_all);
     test_full.dependOn(&run_retrace_corpus_tests.step);
+
+    const build_ledger_v1_candidate = b.step(
+        "build-ledger-v1-candidate",
+        "Build the unreleased Ledger 1.0 exact-candidate binary",
+    );
+    build_ledger_v1_candidate.dependOn(&ledger_v1_candidate_install.step);
 
     const enable_zlinter = b.option(
         bool,

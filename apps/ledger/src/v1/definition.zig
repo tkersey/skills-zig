@@ -224,6 +224,7 @@ pub const Plan = struct {
     owner: []u8,
     closure_digest: [71]u8,
     operator_mask: u128,
+    parameter_declarations: definition_core.parameters.Declarations,
     inputs: []Input,
     storage_kind: StorageKind,
     pointers: [][]u8,
@@ -238,6 +239,7 @@ pub const Plan = struct {
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.owner);
+        self.parameter_declarations.deinit(allocator);
         for (self.inputs) |*input| input.deinit(allocator);
         allocator.free(self.inputs);
         for (self.pointers) |pointer| allocator.free(pointer);
@@ -351,6 +353,7 @@ pub fn compile(
         "owner",
         "imports",
         "requires",
+        "parameters",
         "inputs",
         "canonicalization",
         "shape",
@@ -390,6 +393,11 @@ pub fn compile(
     const operator_mask = try parseRequires(try definition_core.json.object(
         try definition_core.json.field(root, "requires"),
     ));
+    var parameter_declarations = try definition_core.parameters.compile(
+        allocator,
+        root.get("parameters"),
+    );
+    errdefer parameter_declarations.deinit(allocator);
     const inputs = try parseInputs(
         allocator,
         try definition_core.json.object(try definition_core.json.field(root, "inputs")),
@@ -456,6 +464,7 @@ pub fn compile(
         .owner = try allocator.dupe(u8, owner),
         .closure_digest = closure.digest,
         .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
         .inputs = inputs,
         .storage_kind = storage_kind,
         .pointers = pointers,

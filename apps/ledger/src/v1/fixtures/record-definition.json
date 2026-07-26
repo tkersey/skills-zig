@@ -1,0 +1,92 @@
+{
+  "schema": "ledger-artifact-definition/v1",
+  "id": "example/record",
+  "owner": "example",
+  "requires": {
+    "abi": "ledger-artifact-abi/v1",
+    "operators": [
+      "canonical-json",
+      "content-address",
+      "enum",
+      "exact-object",
+      "safe-identifier",
+      "scalar-type",
+      "sorted",
+      "unique"
+    ]
+  },
+  "parameters": {},
+  "inputs": {
+    "record": {
+      "codec": "json",
+      "max_bytes": 4096
+    }
+  },
+  "canonicalization": {
+    "steps": [
+      {
+        "op": "canonical-json",
+        "input": "record"
+      }
+    ]
+  },
+  "shape": {
+    "rules": [
+      {
+        "op": "exact-object",
+        "path": "",
+        "keys": [
+          "record_id",
+          "status",
+          "tags"
+        ]
+      },
+      {
+        "op": "scalar-type",
+        "path": "/record_id",
+        "type": "string"
+      },
+      {
+        "op": "safe-identifier",
+        "path": "/record_id",
+        "max": 64
+      },
+      {
+        "op": "enum",
+        "path": "/status",
+        "values": [
+          "closed",
+          "open"
+        ]
+      },
+      {
+        "op": "unique",
+        "path": "/tags"
+      },
+      {
+        "op": "sorted",
+        "path": "/tags"
+      }
+    ]
+  },
+  "constraints": [],
+  "identity": {
+    "op": "content-address",
+    "input": "record",
+    "exclude": "/record_id"
+  },
+  "storage": {
+    "kind": "pure"
+  },
+  "operations": {},
+  "projections": {},
+  "diagnostics": {},
+  "bounds": {
+    "max_input_bytes": 4096,
+    "max_store_bytes": 4096,
+    "max_records": 1,
+    "max_output_bytes": 4096,
+    "max_diagnostics": 16,
+    "max_reducer_states": 1
+  }
+}

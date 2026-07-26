@@ -91,12 +91,13 @@ pub fn writeDefinitionDescriptionJson(
     var first_operator = true;
     inline for (@typeInfo(definition.Operator).@"enum".fields) |field| {
         const operator: definition.Operator = @enumFromInt(field.value);
-        if (!plan.requires(operator)) continue;
-        if (!first_operator) try writer.writeByte(',');
-        first_operator = false;
-        try writer.writeAll("{\"id\":");
-        try definition_core.canonical_json.writeCanonicalString(writer, operator.id());
-        try writer.print(",\"version\":{d}}}", .{operator.version()});
+        if (plan.requires(operator)) {
+            if (!first_operator) try writer.writeByte(',');
+            first_operator = false;
+            try writer.writeAll("{\"id\":");
+            try definition_core.canonical_json.writeCanonicalString(writer, operator.id());
+            try writer.print(",\"version\":{d}}}", .{operator.version()});
+        }
     }
     try writer.writeAll("],\"operations\":[");
     for (plan.operations, 0..) |operation, index| {
