@@ -80,6 +80,8 @@ pub const Operator = enum {
     @"export",
     text_render,
     declared_field_values,
+    field_absent,
+    object_values,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -137,6 +139,8 @@ pub const Operator = enum {
             .id_lookup => "id-lookup",
             .text_render => "text-render",
             .declared_field_values => "declared-field-values",
+            .field_absent => "field-absent",
+            .object_values => "object-values",
             else => @tagName(self),
         };
     }
@@ -152,8 +156,9 @@ pub const Operator = enum {
     pub fn version(self: Operator) u16 {
         return switch (self) {
             .exact_object => 2,
-            .reference_exists => 7,
-            .implies => 2,
+            .optional_field => 2,
+            .reference_exists => 8,
+            .implies => 3,
             else => 1,
         };
     }
@@ -162,6 +167,7 @@ pub const Operator = enum {
         return switch (self) {
             .exact_object,
             .required_field,
+            .field_absent,
             .optional_field,
             .scalar_type,
             .bounded_string,
@@ -197,6 +203,7 @@ pub const Operator = enum {
             .implies,
             .total_mapping,
             .declared_field_values,
+            .object_values,
             .canonical_json,
             .canonical_text,
             .sha256,

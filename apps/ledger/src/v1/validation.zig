@@ -132,6 +132,7 @@ const CompiledRegexPattern = struct {
 
 const CompiledReferenceTarget = struct {
     pointer_id: u16,
+    optional: bool = false,
     items_pointer_id: ?u16 = null,
     key_pointer_id: ?u16 = null,
     coverage_key_pointer_id: ?u16 = null,
@@ -158,7 +159,9 @@ const CompiledReferenceTarget = struct {
 
 const CompiledReferenceSource = struct {
     pointer_id: u16,
+    items_pointer_id: ?u16 = null,
     reference_pointer_id: u16,
+    optional: bool = false,
     rules: []CompiledRule,
     format_parts: []CompiledFormatPart,
 
@@ -196,9 +199,11 @@ const CompiledRule = struct {
     allow_root: bool = true,
     case_insensitive: bool = false,
     allow_additional: bool = false,
+    allow_null: bool = false,
     total_coverage: bool = false,
     reject_self_reference: bool = false,
     ignore_null_references: bool = false,
+    then_nonempty: bool = false,
     children: []CompiledRule,
     coverage_children: []CompiledRule,
     variants: []CompiledVariant,
@@ -346,10 +351,20 @@ const Builder = struct {
                 true,
                 &rule,
             ),
+            .field_absent => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path" },
+                );
+            },
             .optional_field => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "input", "path", "rules" },
+                    &.{ "op", "input", "path", "rules", "allow_null" },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -362,6 +377,8 @@ const Builder = struct {
                         0,
                     );
                 }
+                rule.allow_null =
+                    try optionalBoolean(object, "allow_null") orelse false;
             },
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
@@ -580,7 +597,15 @@ const Builder = struct {
             .implies => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "input", "if", "equals", "nonempty", "then" },
+                    &.{
+                        "op",
+                        "input",
+                        "if",
+                        "equals",
+                        "nonempty",
+                        "then",
+                        "then_nonempty",
+                    },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -608,6 +633,8 @@ const Builder = struct {
                     }
                     rule.min_count = 1;
                 }
+                rule.then_nonempty =
+                    try optionalBoolean(object, "then_nonempty") orelse false;
             },
             .total_partition => {
                 try definition_core.json.requireExactKeys(
@@ -685,7 +712,7 @@ const Builder = struct {
             .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
                 try definition_core.json.field(object, "paths"),
             ),
-            .one_of, .all_rules, .any_rules, .no_rules => {
+            .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
                 try definition_core.json.requireExactKeys(
                     object,
                     &.{ "op", "input", "path", "rules" },
@@ -950,7 +977,14 @@ const Builder = struct {
             const object = try definition_core.json.object(item);
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "path", "reference", "fragments", "rules" },
+                &.{
+                    "path",
+                    "items",
+                    "reference",
+                    "fragments",
+                    "rules",
+                    "optional",
+                },
             );
             try definition_core.json.requireFields(
                 object,
@@ -960,6 +994,12 @@ const Builder = struct {
                 .pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "path"),
                 ),
+                .items_pointer_id = if (object.get("items")) |raw_items|
+                    try self.internPointer(
+                        try definition_core.json.string(raw_items),
+                    )
+                else
+                    null,
                 .reference_pointer_id = try self.internPointer(
                     try definition_core.json.string(
                         try definition_core.json.field(
@@ -968,6 +1008,7 @@ const Builder = struct {
                         ),
                     ),
                 ),
+                .optional = try optionalBoolean(object, "optional") orelse false,
                 .rules = try self.allocator.alloc(CompiledRule, 0),
                 .format_parts = try self.allocator.alloc(
                     CompiledFormatPart,
@@ -1027,6 +1068,7 @@ const Builder = struct {
                     "rules",
                     "match_rules",
                     "coverage_rules",
+                    "optional",
                 },
             );
             try definition_core.json.requireFields(object, &.{"path"});
@@ -1039,6 +1081,7 @@ const Builder = struct {
                 .pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "path"),
                 ),
+                .optional = try optionalBoolean(object, "optional") orelse false,
                 .items_pointer_id = if (object.get("items")) |raw_items|
                     try self.internPointer(
                         try definition_core.json.string(raw_items),
@@ -1293,7 +1336,7 @@ const Builder = struct {
             .optional_field => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "path", "rules" },
+                    &.{ "op", "path", "rules", "allow_null" },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -1306,8 +1349,11 @@ const Builder = struct {
                         depth + 1,
                     );
                 }
+                rule.allow_null =
+                    try optionalBoolean(object, "allow_null") orelse false;
             },
             .required_field,
+            .field_absent,
             .digest,
             .timestamp,
             .unique,
@@ -1480,7 +1526,14 @@ const Builder = struct {
             .implies => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "if", "equals", "nonempty", "then" },
+                    &.{
+                        "op",
+                        "if",
+                        "equals",
+                        "nonempty",
+                        "then",
+                        "then_nonempty",
+                    },
                 );
                 try definition_core.json.requireFields(
                     object,
@@ -1504,8 +1557,10 @@ const Builder = struct {
                     }
                     rule.min_count = 1;
                 }
+                rule.then_nonempty =
+                    try optionalBoolean(object, "then_nonempty") orelse false;
             },
-            .one_of, .all_rules, .any_rules, .no_rules => {
+            .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
                 try definition_core.json.requireExactKeys(
                     object,
                     &.{ "op", "path", "rules" },
@@ -1707,7 +1762,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(22);
+    try encoder.writeU16(28);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1739,7 +1794,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 22) {
+    if (try decoder.readU16() != 28) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -2022,9 +2077,11 @@ fn encodeCompiledRule(
     try encoder.writeBool(rule.allow_root);
     try encoder.writeBool(rule.case_insensitive);
     try encoder.writeBool(rule.allow_additional);
+    try encoder.writeBool(rule.allow_null);
     try encoder.writeBool(rule.total_coverage);
     try encoder.writeBool(rule.reject_self_reference);
     try encoder.writeBool(rule.ignore_null_references);
+    try encoder.writeBool(rule.then_nonempty);
     try encoder.writeCount(rule.children.len);
     for (rule.children) |child| {
         try encodeCompiledRule(encoder, child, depth);
@@ -2061,7 +2118,9 @@ fn encodeCompiledRule(
     try encoder.writeCount(rule.reference_sources.len);
     for (rule.reference_sources) |source| {
         try encoder.writeU16(source.pointer_id);
+        try writeOptionalU16(encoder, source.items_pointer_id);
         try encoder.writeU16(source.reference_pointer_id);
+        try encoder.writeBool(source.optional);
         try encoder.writeCount(source.rules.len);
         for (source.rules) |source_rule| {
             try encodeCompiledRule(encoder, source_rule, depth);
@@ -2071,6 +2130,7 @@ fn encodeCompiledRule(
     try encoder.writeCount(rule.reference_targets.len);
     for (rule.reference_targets) |target| {
         try encoder.writeU16(target.pointer_id);
+        try encoder.writeBool(target.optional);
         try writeOptionalU16(encoder, target.items_pointer_id);
         try writeOptionalU16(encoder, target.key_pointer_id);
         try writeOptionalU16(encoder, target.coverage_key_pointer_id);
@@ -2206,9 +2266,11 @@ fn decodeCacheRule(
     const allow_root = try decoder.readBool();
     const case_insensitive = try decoder.readBool();
     const allow_additional = try decoder.readBool();
+    const allow_null = try decoder.readBool();
     const total_coverage = try decoder.readBool();
     const reject_self_reference = try decoder.readBool();
     const ignore_null_references = try decoder.readBool();
+    const then_nonempty = try decoder.readBool();
     const children = try decodeCacheRules(
         allocator,
         decoder,
@@ -2309,7 +2371,9 @@ fn decodeCacheRule(
     }
     for (reference_sources) |*source| {
         const source_pointer_id = try decoder.readU16();
+        const source_items_pointer_id = try readOptionalU16(decoder);
         const reference_pointer_id = try decoder.readU16();
+        const source_optional = try decoder.readBool();
         const source_rules = try decodeCacheRules(
             allocator,
             decoder,
@@ -2328,7 +2392,9 @@ fn decodeCacheRule(
         }
         source.* = .{
             .pointer_id = source_pointer_id,
+            .items_pointer_id = source_items_pointer_id,
             .reference_pointer_id = reference_pointer_id,
+            .optional = source_optional,
             .rules = source_rules,
             .format_parts = try decodeCompiledFormatParts(
                 allocator,
@@ -2351,6 +2417,7 @@ fn decodeCacheRule(
     }
     for (reference_targets) |*target| {
         const target_pointer_id = try decoder.readU16();
+        const target_optional = try decoder.readBool();
         const items_pointer_id = try readOptionalU16(decoder);
         const key_pointer_id = try readOptionalU16(decoder);
         const coverage_key_pointer_id = try readOptionalU16(decoder);
@@ -2410,6 +2477,7 @@ fn decodeCacheRule(
         }
         target.* = .{
             .pointer_id = target_pointer_id,
+            .optional = target_optional,
             .items_pointer_id = items_pointer_id,
             .key_pointer_id = key_pointer_id,
             .coverage_key_pointer_id = coverage_key_pointer_id,
@@ -2457,9 +2525,11 @@ fn decodeCacheRule(
         .allow_root = allow_root,
         .case_insensitive = case_insensitive,
         .allow_additional = allow_additional,
+        .allow_null = allow_null,
         .total_coverage = total_coverage,
         .reject_self_reference = reject_self_reference,
         .ignore_null_references = ignore_null_references,
+        .then_nonempty = then_nonempty,
         .children = children,
         .coverage_children = coverage_children,
         .variants = variants,
@@ -2661,6 +2731,9 @@ fn validateCachedRule(
         return error.InvalidRuleBounds;
     }
     switch (rule.operator) {
+        .required_field, .field_absent => if (rule.pointer_id == null) {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .optional_field => if (rule.pointer_id == null or
             rule.children.len > 64)
         {
@@ -2813,7 +2886,7 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .one_of, .all_rules, .any_rules, .no_rules => if (rule.pointer_id == null or
+        .one_of, .all_rules, .any_rules, .no_rules, .object_values => if (rule.pointer_id == null or
             rule.children.len == 0 or rule.children.len > 64)
         {
             return error.CacheRuleConfigurationInvalid;
@@ -2874,6 +2947,9 @@ fn validateCachedRule(
     if (rule.operator != .exact_object and rule.allow_additional) {
         return error.CacheRuleConfigurationInvalid;
     }
+    if (rule.operator != .optional_field and rule.allow_null) {
+        return error.CacheRuleConfigurationInvalid;
+    }
     if (rule.operator != .exact_object and rule.optional_keys.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
@@ -2891,6 +2967,7 @@ fn validateCachedRule(
         rule.operator != .all_rules and
         rule.operator != .any_rules and
         rule.operator != .no_rules and
+        rule.operator != .object_values and
         rule.operator != .reference_exists and
         rule.children.len != 0)
     {
@@ -2908,6 +2985,9 @@ fn validateCachedRule(
     if (rule.operator != .reference_exists and
         rule.ignore_null_references)
     {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .implies and rule.then_nonempty) {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .reference_exists and
@@ -2976,7 +3056,9 @@ fn validateCachedRule(
     }
     for (rule.reference_sources) |source| {
         if (source.pointer_id >= pointer_count or
-            source.reference_pointer_id >= pointer_count)
+            source.reference_pointer_id >= pointer_count or
+            (source.items_pointer_id != null and
+                source.items_pointer_id.? >= pointer_count))
         {
             return error.CacheRuleIndexInvalid;
         }
@@ -3469,8 +3551,10 @@ fn applyRule(
     const path = if (rule.pointer_id) |pointer_id| plan.pointers[pointer_id].raw else "";
     const valid = switch (rule.operator) {
         .required_field => target != null,
+        .field_absent => target == null,
         .optional_field => if (target) |value|
-            rule.children.len == 0 or
+            (rule.allow_null and value == .null) or
+                rule.children.len == 0 or
                 try itemRulesHold(
                     allocator,
                     plan,
@@ -3564,6 +3648,15 @@ fn applyRule(
             )
         else
             false,
+        .object_values => if (target) |value|
+            try objectValuesHold(
+                allocator,
+                plan,
+                rule,
+                value,
+            )
+        else
+            false,
         .set_equality,
         .subset,
         .superset,
@@ -3622,6 +3715,31 @@ fn collectionRuleHolds(
         },
         else => unreachable,
     };
+}
+
+fn objectValuesHold(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+) anyerror!bool {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return false,
+    };
+    if (object.count() > plan.max_records) return false;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!try itemRulesHold(
+            allocator,
+            plan,
+            rule.children,
+            entry.value_ptr.*,
+        )) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn oneOfRulesHold(
@@ -3773,8 +3891,10 @@ fn itemRuleHolds(
         root;
     return switch (rule.operator) {
         .required_field => target != null,
+        .field_absent => target == null,
         .optional_field => if (target) |value|
-            rule.children.len == 0 or
+            (rule.allow_null and value == .null) or
+                rule.children.len == 0 or
                 try itemRulesHold(
                     allocator,
                     plan,
@@ -3839,6 +3959,10 @@ fn itemRuleHolds(
             false,
         .all_rules, .any_rules, .no_rules => if (target) |value|
             collectionRuleHolds(allocator, plan, rule, value)
+        else
+            false,
+        .object_values => if (target) |value|
+            objectValuesHold(allocator, plan, rule, value)
         else
             false,
         else => unreachable,
@@ -3929,10 +4053,11 @@ fn implicationHolds(
         return true;
     }
     if (rule.min_count != null and !valueNonempty(condition)) return true;
-    return resolve(
+    const consequent = resolve(
         root,
         plan.pointers[rule.other_pointer_id.?],
-    ) != null;
+    ) orelse return false;
+    return !rule.then_nonempty or valueNonempty(consequent);
 }
 
 fn valueNonempty(value: std.json.Value) bool {
@@ -4564,30 +4689,66 @@ fn referencesExist(
             const items_value = resolve(
                 source_root,
                 plan.pointers[source.pointer_id],
-            ) orelse return false;
+            ) orelse {
+                if (source.optional) continue;
+                return false;
+            };
             const items = switch (items_value) {
                 .array => |array| array.items,
                 else => return false,
             };
-            source_count = std.math.add(
-                usize,
-                source_count,
-                items.len,
-            ) catch return false;
-            if (source_count > plan.max_records or
-                !try markReferencesFromItems(
-                    allocator,
-                    plan,
-                    rule,
-                    items,
-                    source.reference_pointer_id,
-                    source.rules,
-                    source.format_parts,
-                    &index,
-                    &reference_count,
-                ))
-            {
-                return false;
+            if (source.items_pointer_id) |items_pointer_id| {
+                for (items) |parent| {
+                    const nested_value = resolve(
+                        parent,
+                        plan.pointers[items_pointer_id],
+                    ) orelse return false;
+                    const nested_items = switch (nested_value) {
+                        .array => |array| array.items,
+                        else => return false,
+                    };
+                    source_count = std.math.add(
+                        usize,
+                        source_count,
+                        nested_items.len,
+                    ) catch return false;
+                    if (source_count > plan.max_records or
+                        !try markReferencesFromItems(
+                            allocator,
+                            plan,
+                            rule,
+                            nested_items,
+                            source.reference_pointer_id,
+                            source.rules,
+                            source.format_parts,
+                            &index,
+                            &reference_count,
+                        ))
+                    {
+                        return false;
+                    }
+                }
+            } else {
+                source_count = std.math.add(
+                    usize,
+                    source_count,
+                    items.len,
+                ) catch return false;
+                if (source_count > plan.max_records or
+                    !try markReferencesFromItems(
+                        allocator,
+                        plan,
+                        rule,
+                        items,
+                        source.reference_pointer_id,
+                        source.rules,
+                        source.format_parts,
+                        &index,
+                        &reference_count,
+                    ))
+                {
+                    return false;
+                }
             }
         }
     }
@@ -4776,7 +4937,10 @@ fn indexReferenceTargetUnion(
         const parents_value = resolve(
             target_root,
             plan.pointers[target.pointer_id],
-        ) orelse return false;
+        ) orelse {
+            if (target.optional) continue;
+            return false;
+        };
         const parents = switch (parents_value) {
             .array => |array| array.items,
             else => return false,
@@ -5744,6 +5908,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
     return switch (operator) {
         .exact_object,
         .required_field,
+        .field_absent,
         .optional_field,
         .scalar_type,
         .bounded_string,
@@ -5770,6 +5935,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .all_rules,
         .any_rules,
         .no_rules,
+        .object_values,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -5789,6 +5955,7 @@ fn isItemOperator(operator: definition.Operator) bool {
     return switch (operator) {
         .exact_object,
         .required_field,
+        .field_absent,
         .optional_field,
         .scalar_type,
         .bounded_string,
@@ -5817,6 +5984,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .all_rules,
         .any_rules,
         .no_rules,
+        .object_values,
         => true,
         else => false,
     };
@@ -5871,11 +6039,14 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","optional-field","scalar-type","enum","safe-identifier","regex","unique","sorted","field-equal","keyed-unique","reference-exists","declared-field-values","disjoint","implies","total-partition","total-mapping","path-format","all","any","none"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","field-absent","optional-field","scalar-type","enum","safe-identifier","regex","tagged-union","unique","sorted","field-equal","keyed-unique","reference-exists","declared-field-values","disjoint","implies","total-partition","total-mapping","path-format","all","any","none","object-values"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
         \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","checks","more_checks","guards","changes","meta","universe","ordering","accepted","rejected","targets","mappings","declarations","scored"],"allow_additional":true},
+        \\    {"op":"field-absent","path":"/forbidden"},
+        \\    {"op":"optional-field","path":"/nullable","allow_null":true,"rules":[{"op":"scalar-type","type":"string"}]},
+        \\    {"op":"object-values","path":"/meta","rules":[{"op":"tagged-union","path":"","variants":[{"kind":"string","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"scalar-type","path":"/value","type":"string"}]}]}]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"regex","path":"/record_id","patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64},
@@ -5903,13 +6074,14 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "constraints":[
         \\    {"op":"field-equal","left":"/status","right":"/mirror"},
         \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
-        \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure"},
+        \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure","then_nonempty":true},
         \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
         \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
         \\    {"op":"reference-exists","path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"},
-        \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{"path":"/more_checks","reference":""}],"targets":[
+        \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{"path":"/more_checks","reference":""},{"path":"/groups","items":"/members","reference":"/target_id"},{"path":"/missing_checks","reference":"","optional":true}],"targets":[
         \\      {"path":"/items","key":"/id"},
-        \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]}
+        \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
+        \\      {"path":"/missing_groups","key":"","optional":true}
         \\    ]},
         \\    {"op":"reference-exists","sources":[
         \\      {"path":"/guards","reference":"/ids","rules":[{"op":"enum","path":"/mode","values":["active"]}],"fragments":[{"literal":"id:"},{"value":true}]},
@@ -5972,7 +6144,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10,\"undeclared\":999}}],\"extension\":\"preserved\"}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\",\"target_id\":\"item-1\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10,\"undeclared\":999}}],\"nullable\":null,\"extension\":\"preserved\"}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -6006,6 +6178,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer invalid_pattern.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_pattern.valid);
+
+    const forbidden_field_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"extension\":\"preserved\"",
+        "\"extension\":\"preserved\",\"forbidden\":true",
+    );
+    defer std.testing.allocator.free(forbidden_field_bytes);
+    var forbidden_field = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = forbidden_field_bytes,
+        }},
+    );
+    defer forbidden_field.deinit(std.testing.allocator);
+    try std.testing.expect(!forbidden_field.valid);
 
     const missing_declared_field_bytes = try std.mem.replaceOwned(
         u8,
@@ -6106,6 +6298,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer invalid_optional.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_optional.valid);
+
+    const invalid_object_value_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"meta\":{}",
+        "\"meta\":{\"entry\":{\"value\":1}}",
+    );
+    defer std.testing.allocator.free(invalid_object_value_bytes);
+    var invalid_object_value = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_object_value_bytes,
+        }},
+    );
+    defer invalid_object_value.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_object_value.valid);
 
     const invalid_scalar_reference_bytes = try std.mem.replaceOwned(
         u8,
