@@ -57,12 +57,6 @@ const Args = struct {
     format: []const u8 = "json",
 };
 
-const SourceRef = struct {
-    kind: []const u8,
-    ref: []const u8,
-    summary: []const u8,
-};
-
 const ParsedNote = struct {
     id: []const u8,
     captured_at: []const u8,

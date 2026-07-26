@@ -119,6 +119,12 @@ fn renderAppliedState(
     first = true;
     try writeExistingStringArray(writer, state_root.get("failed_actions"), &first);
     if (!success) try writeJsonStringItem(writer, &first, action_id);
+    try writer.writeAll("],\"proof_refs\":[");
+    first = true;
+    try writeExistingStringArray(writer, state_root.get("proof_refs"), &first);
+    if (success) {
+        try writeExistingStringArray(writer, receipt_root.get("proof_refs"), &first);
+    }
     try writer.writeAll("],\"potential\":");
     if (observed.get("potential")) |value| {
         try writeJsonValue(writer, value);
@@ -242,7 +248,12 @@ const ReceiptValidator = struct {
         try self.validateObservedFacts(receipt_root, observed);
         try self.validateObservedUnknowns(receipt_root, observed);
         try self.validateObservedObligations(receipt_root, observed);
-        try self.validateObservations(policy_root, receipt_root);
+        try self.validateObservations(
+            policy_root,
+            action,
+            receipt_root,
+            result,
+        );
         try self.validateProof(action, receipt_root, result);
         try self.validateSurprise(receipt_root, result);
         try self.validatePotential(receipt_root);
@@ -339,9 +350,26 @@ const ReceiptValidator = struct {
         }
     }
 
-    fn validateObservations(self: *ReceiptValidator, policy: std.json.ObjectMap, receipt: std.json.ObjectMap) !void {
+    fn validateObservations(
+        self: *ReceiptValidator,
+        policy: std.json.ObjectMap,
+        action: std.json.ObjectMap,
+        receipt: std.json.ObjectMap,
+        result: []const u8,
+    ) !void {
         const observed = objectField(receipt, "observed") orelse return;
-        const observations = observed.get("observations") orelse return;
+        const required_key = if (std.mem.eql(u8, result, "success"))
+            "expected_observation_refs"
+        else
+            "failure_observation_refs";
+        const bound_observations = action.get(required_key);
+        const required = arrayField(action, required_key) orelse &.{};
+        const observations = observed.get("observations") orelse {
+            if (bound_observations != null and required.len > 0) {
+                try self.add(.transition_invalid, "$.observed.observations");
+            }
+            return;
+        };
         if (observations != .object) {
             try self.add(.schema_invalid, "$.observed.observations");
             return;
@@ -356,12 +384,32 @@ const ReceiptValidator = struct {
             if (!outcomeAllowed(policy, entry.key_ptr.*, outcome)) {
                 try self.add(.observation_outcome_unknown, "$.observed.observations");
             }
+            if (bound_observations != null and
+                !containsValue(required, entry.key_ptr.*))
+            {
+                try self.add(.transition_invalid, "$.observed.observations");
+            }
+        }
+        if (bound_observations == null) return;
+        for (required) |item| {
+            const observation_id = valueAsString(item) orelse {
+                try self.add(.schema_invalid, "$.actions.observation_refs");
+                continue;
+            };
+            if (observations.object.get(observation_id) == null) {
+                try self.add(.transition_invalid, "$.observed.observations");
+            }
         }
     }
 
     fn validateProof(self: *ReceiptValidator, action: std.json.ObjectMap, receipt: std.json.ObjectMap, result: []const u8) !void {
         if (!std.mem.eql(u8, result, "success")) return;
-        const requires_proof = (boolField(action, "risky") orelse false) or (boolField(action, "prove") orelse false);
+        const obligations = action.get("proof_obligations");
+        const requires_proof = (boolField(action, "risky") orelse false) or
+            (boolField(action, "prove") orelse false) or
+            (obligations != null and
+                obligations.? == .array and
+                obligations.?.array.items.len > 0);
         if (!requires_proof) return;
         const proof_refs = receipt.get("proof_refs") orelse {
             try self.add(.proof_missing, "$.proof_refs");
@@ -376,7 +424,30 @@ const ReceiptValidator = struct {
                 try self.add(.proof_missing, "$.proof_refs");
                 continue;
             };
-            if (proof_ref.len == 0) try self.add(.proof_missing, "$.proof_refs");
+            if (proof_ref.len == 0 or
+                (obligations != null and
+                    !proofObligationExists(obligations.?, proof_ref)))
+            {
+                try self.add(.proof_missing, "$.proof_refs");
+            }
+        }
+        if (obligations == null) return;
+        if (obligations.? != .array) {
+            try self.add(.schema_invalid, "$.actions.proof_obligations");
+            return;
+        }
+        for (obligations.?.array.items) |value| {
+            if (value != .object) {
+                try self.add(.schema_invalid, "$.actions.proof_obligations");
+                continue;
+            }
+            const proof_id = stringField(value.object, "proof_id") orelse {
+                try self.add(.schema_invalid, "$.actions.proof_obligations");
+                continue;
+            };
+            if (!containsValue(proof_refs.array.items, proof_id)) {
+                try self.add(.proof_missing, "$.proof_refs");
+            }
         }
     }
 
@@ -416,6 +487,22 @@ fn actionObject(root: std.json.ObjectMap, id: []const u8) ?std.json.ObjectMap {
         if (std.mem.eql(u8, stringField(row.object, "id") orelse "", id)) return row.object;
     }
     return null;
+}
+
+fn proofObligationExists(
+    obligations: std.json.Value,
+    proof_ref: []const u8,
+) bool {
+    if (obligations != .array) return false;
+    for (obligations.array.items) |value| {
+        if (value != .object) continue;
+        if (std.mem.eql(
+            u8,
+            stringField(value.object, "proof_id") orelse "",
+            proof_ref,
+        )) return true;
+    }
+    return false;
 }
 
 fn outcomeAllowed(policy: std.json.ObjectMap, observation_id: []const u8, outcome: []const u8) bool {

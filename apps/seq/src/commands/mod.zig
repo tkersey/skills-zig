@@ -824,6 +824,11 @@ pub fn run(
     if (opts.format_set) try validateFormatForCommand(cmd, opts);
     try validateCommandOptions(cmd, opts);
 
+    if (cmd == .execution_policy_compile) {
+        try cmdExecutionPolicyCompile(allocator, opts);
+        return;
+    }
+
     const sessions_root = try resolveSessionsRoot(allocator, opts.root);
     defer allocator.free(sessions_root);
 
@@ -874,7 +879,7 @@ pub fn run(
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
-        .execution_policy_compile => try cmdExecutionPolicyCompile(allocator, opts),
+        .execution_policy_compile => unreachable,
         .execution_policy_audit => try cmdExecutionPolicyAudit(allocator, sessions_root, opts),
         .policy_calibration => try cmdPolicyCalibration(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
@@ -4704,36 +4709,6 @@ fn collectExecutionPolicyDatasetRows(
         .exclude_current = paramBool(query_params, "exclude_current") orelse false,
         .include_workers = paramBool(query_params, "include_workers") orelse false,
     };
-    const require_single = opts.path != null or opts.session_id != null;
-    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, require_single);
-    defer freePathList(allocator, &paths);
-
-    const current_thread_id = if (opts.exclude_current)
-        getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch null
-    else
-        null;
-    defer if (current_thread_id) |id| allocator.free(id);
-
-    for (paths.items) |trace_path| {
-        var trace = canonical_trace.parseSessionTrace(allocator, trace_path, traceParseOptions(opts)) catch continue;
-        defer trace.deinit(allocator);
-        if (!executionPolicyTracePassesScope(trace.session, opts, current_thread_id)) continue;
-        var ledger = try execution_policy_audit.compileRunLedger(allocator, trace, .{
-            .root = sessions_root,
-            .repo = opts.repo_text,
-            .policy_root = opts.policy_root_text,
-            .since = opts.since,
-            .until = opts.until,
-            .last = opts.last_text,
-            .exclude_current = opts.exclude_current,
-            .include_workers = opts.include_workers,
-        });
-        defer ledger.deinit(allocator);
-        try appendExecutionPolicyRunRow(allocator, out_rows, ledger);
-    }
-}
-
-fn collectExecutionPolicyRows(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options, out_rows: *std.ArrayList(query.Row)) !void {
     const require_single = opts.path != null or opts.session_id != null;
     var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, require_single);
     defer freePathList(allocator, &paths);

@@ -70,6 +70,22 @@ pub fn compile(allocator: std.mem.Allocator, bytes: []const u8) !CompileResult {
     }
     if (stringField(outer, "policy_version")) |version| {
         if (std.mem.eql(u8, version, "EPG-v1")) return compileRich(allocator, parsed.value);
+        return .{
+            .report = try singleError(
+                allocator,
+                .schema_invalid,
+                "$.policy_version",
+            ),
+        };
+    }
+    if (outer.get("policy_version") != null) {
+        return .{
+            .report = try singleError(
+                allocator,
+                .schema_invalid,
+                "$.policy_version",
+            ),
+        };
     }
     return compileLegacy(allocator, bytes);
 }
@@ -93,7 +109,8 @@ fn compileLegacy(allocator: std.mem.Allocator, bytes: []const u8) !CompileResult
 
     var runtime = try schema.parseArtifact(schema.Policy, allocator, bytes);
     errdefer runtime.deinit(allocator);
-    const digest = try canonical_json.digestRawJson(allocator, source.raw_json);
+    var digest = try canonical_json.digestRawJson(allocator, source.raw_json);
+    errdefer digest.deinit(allocator);
     return .{ .policy = try createCompiledPolicy(allocator, .{
         .source_ = source,
         .runtime_ = runtime,
@@ -222,6 +239,27 @@ const architectonic_action_ref_fields = [_][]const u8{
     "retires_factor_refs",
     "preservation_observation_refs",
 };
+const action_kinds = [_][]const u8{
+    "inspect",
+    "probe",
+    "decide",
+    "mutate",
+    "prove",
+    "stabilize",
+    "deploy",
+    "rollback",
+};
+const unknown_statuses = [_][]const u8{
+    "open",
+    "resolved",
+    "blocked",
+};
+const unknown_urgencies = [_][]const u8{
+    "critical",
+    "high",
+    "medium",
+    "low",
+};
 
 fn validateRich(
     allocator: std.mem.Allocator,
@@ -236,12 +274,20 @@ fn validateRich(
     try validateRichEnvelope(&builder, root, temp);
     const ids = try collectRichIds(temp, &builder, root);
     try validateRegimeShape(&builder, root, ids.observations);
+    try validateBeliefShape(&builder, root, temp);
     if (try validateArchitectonic(&builder, root, ids, temp)) |state| {
         try validateRichActions(&builder, root, ids, state, temp);
     }
     try validatePolicyRules(&builder, root, ids.actions, temp);
     try validateObservationOutcomes(&builder, root, temp);
-    try validateUnknownAndObligationCoverage(&builder, root, ids.obligations);
+    try validateUnknownAndObligationCoverage(
+        &builder,
+        root,
+        ids.obligations,
+        ids.observations,
+    );
+    try validateProofBindings(&builder, root, temp);
+    try validateForbiddenStateResponses(&builder, root);
     try validateRiskShields(&builder, root, ids.actions, temp);
     try validateConditions(&builder, root, temp);
     try validateSquareResults(&builder, root);
@@ -343,6 +389,32 @@ fn collectRichIds(
             "$.actions",
         ),
     };
+}
+
+fn validateBeliefShape(
+    builder: *errors.Builder,
+    root: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !void {
+    const belief = objectField(root, "belief") orelse return;
+    const facts = arrayField(belief, "facts") orelse return;
+    for (facts, 0..) |value, index| {
+        if (value != .object) continue;
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "$.belief.facts[{d}].atom",
+            .{index},
+        );
+        const fact_atom = stringField(value.object, "atom") orelse {
+            try builder.add(.schema_invalid, path);
+            continue;
+        };
+        const parsed = atom.parse(fact_atom) catch {
+            try builder.add(.atom_invalid, path);
+            continue;
+        };
+        if (parsed.kind != .fact) try builder.add(.atom_invalid, path);
+    }
 }
 
 fn validateArchitectonic(
@@ -793,6 +865,7 @@ fn validateIncumbentFactorRefs(
 ) !void {
     for (seams, 0..) |value, index| {
         if (value != .object) continue;
+        const seam_id = stringField(value.object, "seam_id") orelse continue;
         const incumbent = objectField(value.object, "incumbent") orelse continue;
         const path = try std.fmt.allocPrint(
             allocator,
@@ -801,8 +874,12 @@ fn validateIncumbentFactorRefs(
         );
         for (stringValues(incumbent, "factor_refs")) |ref_value| {
             const ref = valueString(ref_value) orelse continue;
-            if (factorIndex(factors, ref) == null) {
+            const factor_index = factorIndex(factors, ref) orelse {
                 try builder.add(.reference_unknown, path);
+                continue;
+            };
+            if (!std.mem.eql(u8, factors[factor_index].seam_id, seam_id)) {
+                try builder.add(.factor_scope_mismatch, path);
             }
         }
     }
@@ -935,7 +1012,11 @@ fn validateActionSeamRefs(
                 ),
             );
         }
-        if (seam_refs.len == 0) {
+        const consequential = seam_refs.len > 0 or
+            stringValues(action, "realizes_factor_refs").len > 0 or
+            stringValues(action, "retires_factor_refs").len > 0 or
+            stringValues(action, "preservation_observation_refs").len > 0;
+        if (consequential and seam_refs.len == 0) {
             try builder.add(
                 .architectonic_unbound,
                 try suffix(allocator, path, ".architectonic_seam_refs"),
@@ -1048,6 +1129,12 @@ fn validateActionEffects(
     ids: RichIds,
     allocator: std.mem.Allocator,
 ) !void {
+    if (!oneOf(stringField(action, "kind"), &action_kinds)) {
+        try builder.add(
+            .schema_invalid,
+            try suffix(allocator, path, ".kind"),
+        );
+    }
     const effects = objectField(action, "expected_effects") orelse {
         try builder.add(
             .schema_invalid,
@@ -1095,7 +1182,8 @@ fn validateActionEffects(
         path,
         allocator,
     );
-    if (isRiskyKind(stringField(action, "kind")) and
+    if ((isRiskyKind(stringField(action, "kind")) or
+        stringEquals(action, "kind", "prove")) and
         emptyArrayField(action, "proof_obligations"))
     {
         try builder.add(
@@ -1123,7 +1211,6 @@ fn validatePolicyRules(
         return;
     };
     if (rules.len == 0) try builder.add(.policy_dead_end, "$.policy.rules");
-    var priorities: std.ArrayList(i64) = .empty;
     var selected_actions: std.ArrayList([]const u8) = .empty;
     for (rules, 0..) |value, index| {
         if (value != .object) continue;
@@ -1133,21 +1220,13 @@ fn validatePolicyRules(
             "$.policy.rules[{d}]",
             .{index},
         );
-        const priority = integerField(rule, "priority") orelse {
+        _ = integerField(rule, "priority") orelse {
             try builder.add(
                 .schema_invalid,
                 try suffix(allocator, path, ".priority"),
             );
             continue;
         };
-        if (containsInt(priorities.items, priority)) {
-            try builder.add(
-                .id_duplicate,
-                try suffix(allocator, path, ".priority"),
-            );
-        } else {
-            try priorities.append(allocator, priority);
-        }
         const candidates = stringValues(rule, "candidate_action_ids");
         for (candidates) |ref| {
             const action_ref = valueString(ref) orelse continue;
@@ -1195,9 +1274,14 @@ fn validateObservationOutcomes(
                 try builder.add(.schema_invalid, "$.observations.outcomes");
                 continue;
             }
+            const outcome = stringField(outcome_value.object, "outcome") orelse "";
             const outcome_atom = stringField(outcome_value.object, "atom") orelse "";
-            const prefix = try std.fmt.allocPrint(allocator, "obs:{s}=", .{id});
-            if (!std.mem.startsWith(u8, outcome_atom, prefix) or !validAtom(outcome_atom)) {
+            const expected = try std.fmt.allocPrint(
+                allocator,
+                "obs:{s}={s}",
+                .{ id, outcome },
+            );
+            if (!std.mem.eql(u8, outcome_atom, expected) or !validAtom(outcome_atom)) {
                 try builder.add(
                     .atom_invalid,
                     try std.fmt.allocPrint(
@@ -1215,6 +1299,7 @@ fn validateUnknownAndObligationCoverage(
     builder: *errors.Builder,
     root: std.json.ObjectMap,
     obligation_ids: []const []const u8,
+    observation_ids: []const []const u8,
 ) !void {
     const unknowns = if (objectField(root, "belief")) |belief|
         arrayField(belief, "unknowns") orelse &.{}
@@ -1225,6 +1310,24 @@ fn validateUnknownAndObligationCoverage(
         if (value != .object) continue;
         const unknown = value.object;
         const id = stringField(unknown, "unknown_id") orelse continue;
+        if (!oneOf(stringField(unknown, "status"), &unknown_statuses)) {
+            try builder.add(.schema_invalid, "$.belief.unknowns.status");
+        }
+        if (!oneOf(stringField(unknown, "urgency"), &unknown_urgencies)) {
+            try builder.add(.schema_invalid, "$.belief.unknowns.urgency");
+        }
+        try requireStringArray(
+            builder,
+            unknown,
+            "observation_refs",
+            "$.belief.unknowns.observation_refs",
+        );
+        try validateStringRefs(
+            builder,
+            stringValues(unknown, "observation_refs"),
+            observation_ids,
+            "$.belief.unknowns.observation_refs",
+        );
         const urgent = oneOf(
             stringField(unknown, "urgency"),
             &.{ "critical", "high" },
@@ -1251,6 +1354,161 @@ fn validateUnknownAndObligationCoverage(
     }
 }
 
+fn validateProofBindings(
+    builder: *errors.Builder,
+    root: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !void {
+    var proof_ids: std.ArrayList([]const u8) = .empty;
+    const actions = arrayField(root, "actions") orelse &.{};
+    for (actions, 0..) |value, action_index| {
+        if (value != .object) continue;
+        const proofs = value.object.get("proof_obligations") orelse {
+            try builder.add(.schema_invalid, "$.actions.proof_obligations");
+            continue;
+        };
+        if (proofs != .array) {
+            try builder.add(.schema_invalid, "$.actions.proof_obligations");
+            continue;
+        }
+        for (proofs.array.items, 0..) |proof_value, proof_index| {
+            const path = try std.fmt.allocPrint(
+                allocator,
+                "$.actions[{d}].proof_obligations[{d}]",
+                .{ action_index, proof_index },
+            );
+            if (proof_value != .object) {
+                try builder.add(.schema_invalid, path);
+                continue;
+            }
+            const proof = proof_value.object;
+            const proof_id = stringField(proof, "proof_id") orelse {
+                try builder.add(.schema_invalid, try suffix(allocator, path, ".proof_id"));
+                continue;
+            };
+            atom.validateStableId(proof_id) catch {
+                try builder.add(.atom_invalid, try suffix(allocator, path, ".proof_id"));
+            };
+            if (contains(proof_ids.items, proof_id)) {
+                try builder.add(.id_duplicate, try suffix(allocator, path, ".proof_id"));
+            } else {
+                try proof_ids.append(allocator, proof_id);
+            }
+            inline for ([_][]const u8{
+                "statement",
+                "evidence_kind",
+                "command_or_evidence",
+                "artifact_binding",
+            }) |key| {
+                if (emptyStringField(proof, key)) {
+                    try builder.add(
+                        .schema_invalid,
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "{s}.{s}",
+                            .{ path, key },
+                        ),
+                    );
+                }
+            }
+        }
+        try validateRollbackBinding(builder, actions, value.object, action_index, allocator);
+    }
+    const terminals = objectField(root, "terminal_states") orelse return;
+    var terminal_iterator = terminals.iterator();
+    while (terminal_iterator.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const terminal = entry.value_ptr.object;
+        if (terminal.get("proof_refs") == null) continue;
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "$.terminal_states.{s}.proof_refs",
+            .{entry.key_ptr.*},
+        );
+        try requireStringArray(builder, terminal, "proof_refs", path);
+        try validateStringRefs(
+            builder,
+            stringValues(terminal, "proof_refs"),
+            proof_ids.items,
+            path,
+        );
+    }
+}
+
+fn validateRollbackBinding(
+    builder: *errors.Builder,
+    actions: []const std.json.Value,
+    action: std.json.ObjectMap,
+    action_index: usize,
+    allocator: std.mem.Allocator,
+) !void {
+    const rollback_value = action.get("rollback") orelse return;
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "$.actions[{d}].rollback",
+        .{action_index},
+    );
+    if (rollback_value != .object) {
+        try builder.add(.schema_invalid, path);
+        return;
+    }
+    const rollback = rollback_value.object;
+    try requireStringArray(
+        builder,
+        rollback,
+        "trigger_atoms",
+        try suffix(allocator, path, ".trigger_atoms"),
+    );
+    const action_id_value = rollback.get("action_id") orelse {
+        try builder.add(.schema_invalid, try suffix(allocator, path, ".action_id"));
+        return;
+    };
+    if (action_id_value == .null) return;
+    if (action_id_value != .string) {
+        try builder.add(.schema_invalid, try suffix(allocator, path, ".action_id"));
+        return;
+    }
+    const rollback_action = sourceAction(actions, action_id_value.string) orelse {
+        try builder.add(.reference_unknown, try suffix(allocator, path, ".action_id"));
+        return;
+    };
+    if (!stringEquals(rollback_action, "kind", "rollback")) {
+        try builder.add(.schema_invalid, try suffix(allocator, path, ".action_id"));
+    }
+}
+
+fn validateForbiddenStateResponses(
+    builder: *errors.Builder,
+    root: std.json.ObjectMap,
+) !void {
+    const goal = objectField(root, "goal") orelse return;
+    const forbidden = arrayField(goal, "forbidden_states") orelse return;
+    const terminals = objectField(root, "terminal_states") orelse return;
+    for (forbidden) |value| {
+        if (value != .object) continue;
+        const forbidden_atom = stringField(value.object, "atom") orelse {
+            try builder.add(.schema_invalid, "$.goal.forbidden_states.atom");
+            continue;
+        };
+        if (!validAtom(forbidden_atom)) {
+            try builder.add(.atom_invalid, "$.goal.forbidden_states.atom");
+        }
+        const response = stringField(value.object, "response_terminal") orelse {
+            try builder.add(
+                .schema_invalid,
+                "$.goal.forbidden_states.response_terminal",
+            );
+            continue;
+        };
+        if (terminals.get(response) == null) {
+            try builder.add(
+                .reference_unknown,
+                "$.goal.forbidden_states.response_terminal",
+            );
+        }
+    }
+}
+
 fn lowerRich(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1268,7 +1526,11 @@ fn lowerRich(allocator: std.mem.Allocator, root: std.json.ObjectMap) ![]u8 {
     try writeCustomAtoms(writer, root, true);
     try writer.writeAll("}],\"forbidden_states\":[{\"custom_atoms\":");
     try writeCustomAtoms(writer, root, false);
-    try writer.writeAll("}],\"observations\":[");
+    try writer.writeAll("}],\"forbidden_responses\":[");
+    try writeForbiddenResponses(writer, root);
+    try writer.writeAll("],\"horizon\":");
+    try writeValue(writer, root.get("horizon").?);
+    try writer.writeAll(",\"observations\":[");
     try writeLoweredObservations(writer, root);
     try writer.writeAll("],\"actions\":[");
     try writeLoweredActions(temp, writer, root);
@@ -1364,6 +1626,10 @@ fn writeLoweredTerminals(
         const condition_value = entry.value_ptr.object.get("when") orelse
             emptyCondition();
         try writeValue(writer, condition_value);
+        if (entry.value_ptr.object.get("proof_refs")) |proof_refs| {
+            try writer.writeAll(",\"proof_refs\":");
+            try writeValue(writer, proof_refs);
+        }
         try writer.writeByte('}');
     }
 }
@@ -1402,6 +1668,8 @@ fn writeLoweredAction(
     const kind = stringField(action, "kind") orelse "";
     try writer.writeByte('{');
     try writeNamedString(writer, "id", action_id);
+    try writer.writeAll(",\"kind\":");
+    try writeJsonString(writer, kind);
     try writer.writeAll(",\"precondition\":");
     try writeValue(writer, action.get("preconditions") orelse emptyCondition());
     try writer.writeAll(",\"requires_actions\":");
@@ -1410,6 +1678,12 @@ fn writeLoweredAction(
     try writer.writeAll(if (boolField(action, "repeatable") orelse false) "true" else "false");
     if (isRiskyKind(kind)) try writer.writeAll(",\"risky\":true");
     if (std.mem.eql(u8, kind, "prove")) try writer.writeAll(",\"prove\":true");
+    try writer.writeAll(",\"expected_observation_refs\":");
+    try writeStringArrayValue(writer, action.get("expected_observation_refs"));
+    try writer.writeAll(",\"failure_observation_refs\":");
+    try writeStringArrayValue(writer, action.get("failure_observation_refs"));
+    try writer.writeAll(",\"proof_obligations\":");
+    try writeValue(writer, action.get("proof_obligations").?);
     try writer.writeAll(",\"results\":{\"success\":");
     try writeLoweredActionResults(allocator, writer, root, action);
     try writer.writeAll(",\"failure\":[]}");
@@ -1521,6 +1795,27 @@ fn writeLoweredShields(writer: *std.Io.Writer, root: std.json.ObjectMap) !void {
     }
 }
 
+fn writeForbiddenResponses(
+    writer: *std.Io.Writer,
+    root: std.json.ObjectMap,
+) !void {
+    const goal = objectField(root, "goal") orelse return;
+    const rows = arrayField(goal, "forbidden_states") orelse return;
+    var first = true;
+    for (rows) |value| {
+        if (value != .object) continue;
+        const forbidden_atom = stringField(value.object, "atom") orelse continue;
+        const response = stringField(value.object, "response_terminal") orelse continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.writeByte('{');
+        try writeNamedString(writer, "atom", forbidden_atom);
+        try writer.writeAll(",\"response_terminal\":");
+        try writeJsonString(writer, response);
+        try writer.writeByte('}');
+    }
+}
+
 fn writeShieldRow(
     writer: *std.Io.Writer,
     action_id: []const u8,
@@ -1567,7 +1862,9 @@ fn collectDeclaredAtoms(
     root: std.json.ObjectMap,
 ) ![]const []const u8 {
     var result: std.ArrayList([]const u8) = .empty;
-    try collectGoalAtoms(&result, allocator, objectField(root, "goal").?);
+    if (objectField(root, "goal")) |goal| {
+        try collectGoalAtoms(&result, allocator, goal);
+    }
     if (objectField(root, "belief")) |belief| {
         try collectBeliefAtoms(&result, allocator, belief);
     }
@@ -1902,6 +2199,18 @@ fn validateRiskShields(
                 ),
             );
         }
+        try requireStringArray(
+            builder,
+            row,
+            "forbids_action_ids",
+            "$.safety_shield.rules.forbids_action_ids",
+        );
+        try requireStringArray(
+            builder,
+            row,
+            "forbids_action_kinds",
+            "$.safety_shield.rules.forbids_action_kinds",
+        );
         for (stringValues(row, "forbids_action_ids")) |ref_value| {
             const ref = valueString(ref_value) orelse continue;
             if (!contains(action_ids, ref)) {
@@ -1909,6 +2218,30 @@ fn validateRiskShields(
                     .reference_unknown,
                     "$.safety_shield.rules.forbids_action_ids",
                 );
+            }
+        }
+        for (stringValues(row, "forbids_action_kinds")) |kind_value| {
+            if (!oneOf(valueString(kind_value), &action_kinds)) {
+                try builder.add(
+                    .schema_invalid,
+                    "$.safety_shield.rules.forbids_action_kinds",
+                );
+            }
+        }
+        if (stringEquals(row, "response", "rollback")) {
+            for (actions) |action_value| {
+                if (action_value != .object) continue;
+                const action = action_value.object;
+                if (!shieldTargetsAction(row, action)) continue;
+                const rollback = objectField(action, "rollback");
+                if (rollback == null or
+                    nullableStringField(rollback.?, "action_id") == null)
+                {
+                    try builder.add(
+                        .schema_invalid,
+                        "$.safety_shield.rules.response",
+                    );
+                }
             }
         }
     }
@@ -1936,12 +2269,48 @@ fn validateSquareResults(builder: *errors.Builder, root: std.json.ObjectMap) !vo
     const revision = objectField(root, "revision_summary") orelse return;
     const squares = arrayField(revision, "square_results") orelse return;
     for (squares) |value| {
-        if (value != .object) continue;
-        const result = stringField(value.object, "result") orelse continue;
-        if (std.mem.eql(u8, result, "fails") or std.mem.eql(u8, result, "underdetermined")) {
+        if (value != .object) {
+            try builder.add(.schema_invalid, "$.revision_summary.square_results");
+            continue;
+        }
+        const result = stringField(value.object, "result") orelse {
+            try builder.add(.schema_invalid, "$.revision_summary.square_results");
+            continue;
+        };
+        if (std.mem.eql(u8, result, "fails")) {
             try builder.add(.architectonic_incomplete, "$.revision_summary.square_results");
+        } else if (std.mem.eql(u8, result, "underdetermined")) {
+            if (!squareHasObservationRoute(root, value.object)) {
+                try builder.add(
+                    .architectonic_incomplete,
+                    "$.revision_summary.square_results",
+                );
+            }
+        } else if (!std.mem.eql(u8, result, "commutes")) {
+            try builder.add(.schema_invalid, "$.revision_summary.square_results");
         }
     }
+}
+
+fn squareHasObservationRoute(
+    root: std.json.ObjectMap,
+    square: std.json.ObjectMap,
+) bool {
+    const seam_ref = stringField(square, "seam_ref") orelse return false;
+    const architectonic = objectField(root, "architectonic") orelse return false;
+    const seams = arrayField(architectonic, "seams") orelse return false;
+    for (seams) |value| {
+        if (value != .object) continue;
+        const seam = value.object;
+        if (!std.mem.eql(
+            u8,
+            stringField(seam, "seam_id") orelse "",
+            seam_ref,
+        )) continue;
+        return stringEquals(seam, "disposition", "evidence_conditioned") and
+            stringValues(seam, "decision_observation_refs").len > 0;
+    }
+    return false;
 }
 
 fn validateSourceShape(builder: *errors.Builder, root: std.json.ObjectMap) !void {
@@ -2818,6 +3187,31 @@ fn factorIndex(factors: []const Factor, id: []const u8) ?usize {
     return null;
 }
 
+fn sourceAction(
+    actions: []const std.json.Value,
+    id: []const u8,
+) ?std.json.ObjectMap {
+    for (actions) |value| {
+        if (value != .object) continue;
+        if (std.mem.eql(
+            u8,
+            stringField(value.object, "action_id") orelse "",
+            id,
+        )) return value.object;
+    }
+    return null;
+}
+
+fn shieldTargetsAction(
+    shield: std.json.ObjectMap,
+    action: std.json.ObjectMap,
+) bool {
+    const action_id = stringField(action, "action_id") orelse return false;
+    const kind = stringField(action, "kind") orelse return false;
+    return stringArrayContains(shield, "forbids_action_ids", action_id) or
+        stringArrayContains(shield, "forbids_action_kinds", kind);
+}
+
 fn factorRetained(disposition: []const u8) bool {
     return std.mem.eql(u8, disposition, "preserve") or
         std.mem.eql(u8, disposition, "factor") or
@@ -2986,6 +3380,38 @@ fn writeStringArrayValue(writer: *std.Io.Writer, maybe_value: ?std.json.Value) !
 
 fn emptyCondition() std.json.Value {
     return .null;
+}
+
+test "incumbent factor references stay within their owning seam" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[{\"seam_id\":\"A\",\"incumbent\":{\"factor_refs\":[\"F-B\"]}}," ++
+            "{\"seam_id\":\"B\",\"incumbent\":{\"factor_refs\":[]}}]",
+        .{},
+    );
+    defer parsed.deinit();
+    var factors = [_]Factor{
+        .{ .id = "F-A", .seam_id = "A", .disposition = "preserve" },
+        .{ .id = "F-B", .seam_id = "B", .disposition = "preserve" },
+    };
+    var builder = errors.Builder.init(std.testing.allocator);
+    defer builder.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try validateIncumbentFactorRefs(
+        &builder,
+        parsed.value.array.items,
+        &factors,
+        arena.allocator(),
+    );
+    var report = try builder.finish();
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), report.errors.len);
+    try std.testing.expectEqual(
+        errors.ErrorCode.factor_scope_mismatch,
+        report.errors[0].code,
+    );
 }
 
 test "action factor references are scoped to their owning seams" {

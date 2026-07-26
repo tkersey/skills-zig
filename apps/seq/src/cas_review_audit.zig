@@ -1,7 +1,6 @@
 const std = @import("std");
 const query = @import("query/engine.zig");
 const session_scan = @import("session_scan.zig");
-const spec = @import("types/spec.zig");
 const time_utils = @import("time_utils.zig");
 
 fn defaultIo() std.Io {
@@ -1419,17 +1418,6 @@ fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
             optEql(status, "no_attempt");
     }
     return false;
-}
-
-fn overrideFlagsSummary(root: std.json.ObjectMap) ?[]const u8 {
-    const value = root.get("overrideFlags") orelse return null;
-    return switch (value) {
-        .array => |array| if (array.items.len == 0) null else switch (array.items[0]) {
-            .string => |text| text,
-            else => "present",
-        },
-        else => null,
-    };
 }
 
 fn backendFromCommand(cmd: []const u8) []const u8 {

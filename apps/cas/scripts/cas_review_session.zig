@@ -7955,19 +7955,6 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
     };
 }
 
-fn receiptHasCompleteTuple(receipt: NormalizedReceipt) bool {
-    return nonEmptyOptional(receipt.base_sha) != null and
-        nonEmptyOptional(receipt.head_sha) != null and
-        nonEmptyOptional(receipt.target_fingerprint) != null;
-}
-
-fn receiptTupleMatchesIdentity(receipt: NormalizedReceipt, identity: TargetIdentity) bool {
-    if (!identityHasCompleteTuple(identity)) return false;
-    return optionalStringsEqual(receipt.base_sha, identity.base_sha) and
-        optionalStringsEqual(receipt.head_sha, identity.head_sha) and
-        optionalStringsEqual(receipt.target_fingerprint, identity.fingerprint);
-}
-
 const CasRerProjectionOptions = struct {
     command_surface: []const u8,
     backend_selected: []const u8,

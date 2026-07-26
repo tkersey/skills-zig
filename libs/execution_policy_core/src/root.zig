@@ -404,3 +404,494 @@ test "rich EPG accepts architectonic not_required without fabricated seams" {
         },
     }
 }
+
+fn expectFixtureReplacementRejected(
+    needle: []const u8,
+    replacement: []const u8,
+) !void {
+    const bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        needle,
+        replacement,
+    );
+    defer std.testing.allocator.free(bytes);
+    var result = try compilePolicy(std.testing.allocator, bytes);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => return error.ExpectedCompileRejection,
+        .report => |report| try std.testing.expect(!report.ok()),
+    }
+}
+
+fn compileFixtureReplacement(
+    needle: []const u8,
+    replacement: []const u8,
+) !CompileResult {
+    const bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        needle,
+        replacement,
+    );
+    defer std.testing.allocator.free(bytes);
+    return compilePolicy(std.testing.allocator, bytes);
+}
+
+fn fixtureState(
+    allocator: std.mem.Allocator,
+    digest: []const u8,
+    atoms_json: []const u8,
+    proof_refs_json: []const u8,
+) !State {
+    const bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"policy_id\":\"compile-demo\",\"revision\":1," ++
+            "\"policy_digest\":\"{s}\",\"satisfied_atoms\":{s}," ++
+            "\"completed_actions\":[],\"failed_actions\":[]," ++
+            "\"proof_refs\":{s},\"potential\":[1]}}",
+        .{ digest, atoms_json, proof_refs_json },
+    );
+    defer allocator.free(bytes);
+    return parseState(allocator, bytes);
+}
+
+fn expectWinnerKind(decision: *const Decision, kind: []const u8) !void {
+    const winner = decision.root().object.get("winner").?.object;
+    try std.testing.expectEqualStrings(kind, winner.get("kind").?.string);
+}
+
+const nonconsequential_action_json =
+    \\{
+    \\  "action_id":"B",
+    \\  "kind":"inspect",
+    \\  "preconditions":{"all":[],"any":[],"none":[]},
+    \\  "requires_actions":[],
+    \\  "architectonic_seam_refs":[],
+    \\  "realizes_factor_refs":[],
+    \\  "retires_factor_refs":[],
+    \\  "preservation_observation_refs":[],
+    \\  "expected_effects":{"facts_added":[],"unknowns_resolved":[],"obligations_closed":[]},
+    \\  "expected_observation_refs":[],
+    \\  "failure_observation_refs":[],
+    \\  "proof_obligations":[],
+    \\  "rollback":{"trigger_atoms":[],"action_id":null},
+    \\  "utility":{"obligation_reduction":0,"information_gain":1,
+    \\    "downstream_unlock":0,"proof_gain":0,"execution_cost":1,
+    \\    "irreversible_risk":0,"semantic_surface_growth":0,"rework_risk":0},
+    \\  "repeatable":false
+    \\}
+;
+
+test "rich compiler fails closed on malformed source enums and mappings" {
+    const cases = [_]struct {
+        needle: []const u8,
+        replacement: []const u8,
+    }{
+        .{
+            .needle = "\"policy_version\": \"EPG-v1\"",
+            .replacement = "\"policy_version\": \"EPG-v2\"",
+        },
+        .{ .needle = "\"goal\": {", .replacement = "\"missing_goal\": {" },
+        .{ .needle = "\"kind\": \"probe\"", .replacement = "\"kind\": \"mutaet\"" },
+        .{ .needle = "\"status\": \"open\"", .replacement = "\"status\": \"opne\"" },
+        .{ .needle = "\"urgency\": \"critical\"", .replacement = "\"urgency\": \"critcal\"" },
+        .{
+            .needle = "\"atom\": \"fact:START\"",
+            .replacement = "\"missing_atom\": \"fact:START\"",
+        },
+        .{ .needle = "\"atom\": \"obs:OBS=ok\"", .replacement = "\"atom\": \"obs:OBS=bad\"" },
+        .{
+            .needle = "\"observation_refs\": [\n            \"OBS\"\n" ++
+                "          ],\n          \"status\": \"open\"",
+            .replacement = "\"observation_refs\": [\"MISSING\"],\n" ++
+                "          \"status\": \"open\"",
+        },
+    };
+    for (cases) |case| {
+        try expectFixtureReplacementRejected(case.needle, case.replacement);
+    }
+}
+
+test "unsupported explicit version is never reinterpreted as legacy" {
+    var result = try compilePolicy(
+        std.testing.allocator,
+        "{\"policy_version\":\"EPG-v2\",\"policy_id\":\"p\"," ++
+            "\"revision\":1,\"declared_atoms\":[],\"actions\":[{\"id\":\"a\"}]," ++
+            "\"policy_rules\":[{\"id\":\"r\",\"actions\":[\"a\"]}]}",
+    );
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => return error.ExpectedCompileRejection,
+        .report => |report| {
+            try std.testing.expectEqual(ErrorCode.schema_invalid, report.errors[0].code);
+            try std.testing.expectEqualStrings("$.policy_version", report.errors[0].path);
+        },
+    }
+}
+
+test "explicit architectonics permit unrelated unbound actions" {
+    const fixture = @embedFile("fixtures/valid_architectonic_epg.json");
+    const actions_end = "\n    ],\n    \"policy\": {";
+    try std.testing.expect(std.mem.indexOf(u8, fixture, actions_end) != null);
+    const inserted = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        fixture,
+        actions_end,
+        "," ++ nonconsequential_action_json ++ actions_end,
+    );
+    defer std.testing.allocator.free(inserted);
+    const candidates = "\"candidate_action_ids\": [\n            \"A\"\n          ]";
+    try std.testing.expect(std.mem.indexOf(u8, inserted, candidates) != null);
+    const bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        inserted,
+        candidates,
+        "\"candidate_action_ids\": [\"A\", \"B\"]",
+    );
+    defer std.testing.allocator.free(bytes);
+    var result = try compilePolicy(std.testing.allocator, bytes);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => {},
+        .report => |report| {
+            std.debug.print("unexpected compile errors: {any}\n", .{report.errors});
+            return error.ExpectedCompiledPolicy;
+        },
+    }
+}
+
+test "equal policy priorities remain utility ordered" {
+    var result = try compileFixtureReplacement(
+        "\"rule_id\": \"R-S\",\n          \"priority\": 2",
+        "\"rule_id\": \"R-S\",\n          \"priority\": 1",
+    );
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => {},
+        .report => return error.ExpectedCompiledPolicy,
+    }
+}
+
+test "underdetermined square compiles only with an observation route" {
+    const square =
+        \\[
+        \\  {"seam_ref":"S","horizontal_before_refs":["A"],
+        \\   "vertical_change_refs":["S"],"horizontal_after_refs":["A"],
+        \\   "preserved_observation_refs":["OBS"],"result":"underdetermined",
+        \\   "falsifier":"The deciding observation is unavailable."}
+        \\]
+    ;
+    var result = try compileFixtureReplacement(
+        "\"square_results\": []",
+        "\"square_results\": " ++ square,
+    );
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => {},
+        .report => return error.ExpectedCompiledPolicy,
+    }
+
+    const selected_fixture = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        "\"disposition\": \"evidence_conditioned\"",
+        "\"disposition\": \"selected\"",
+    );
+    defer std.testing.allocator.free(selected_fixture);
+    const selected_square = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        selected_fixture,
+        "\"square_results\": []",
+        "\"square_results\": " ++ square,
+    );
+    defer std.testing.allocator.free(selected_square);
+    var rejected = try compilePolicy(std.testing.allocator, selected_square);
+    defer rejected.deinit(std.testing.allocator);
+    switch (rejected) {
+        .policy => return error.ExpectedCompileRejection,
+        .report => {},
+    }
+}
+
+fn compileProofBoundFixture() !CompileResult {
+    const proof =
+        \\[{"proof_id":"PROOF-A","statement":"Action A is proved.",
+        \\"evidence_kind":"command","command_or_evidence":"zig build test",
+        \\"artifact_binding":"action"}]
+    ;
+    const with_action_proof = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        "\"proof_obligations\": []",
+        "\"proof_obligations\": " ++ proof,
+    );
+    defer std.testing.allocator.free(with_action_proof);
+    const with_terminal_proof = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_action_proof,
+        "\"proof_refs\": []",
+        "\"proof_refs\": [\"PROOF-A\"]",
+    );
+    defer std.testing.allocator.free(with_terminal_proof);
+    return compilePolicy(std.testing.allocator, with_terminal_proof);
+}
+
+fn fixtureReceipt(
+    allocator: std.mem.Allocator,
+    digest: []const u8,
+    observations_json: []const u8,
+    proof_refs_json: []const u8,
+) !TransitionReceipt {
+    const bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"policy_id\":\"compile-demo\",\"revision\":1," ++
+            "\"policy_digest\":\"{s}\",\"decision_id\":\"d\"," ++
+            "\"action_id\":\"A\",\"result\":\"success\"," ++
+            "\"predicted_effects\":[\"unknown:U=resolved\",\"obligation:O=closed\"]," ++
+            "\"observed\":{{\"observations\":{s},\"resolved_unknowns\":[\"U\"]," ++
+            "\"closed_obligations\":[\"O\"],\"potential\":[0]}}," ++
+            "\"state_after\":{{\"state_id\":\"s1\",\"potential\":[0]}}," ++
+            "\"proof_refs\":{s}}}",
+        .{ digest, observations_json, proof_refs_json },
+    );
+    defer allocator.free(bytes);
+    return parseTransitionReceipt(allocator, bytes);
+}
+
+test "rich receipt preserves action observation and proof bindings" {
+    var result = try compileProofBoundFixture();
+    defer result.deinit(std.testing.allocator);
+    const policy = switch (result) {
+        .policy => |value| value,
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    var state = try fixtureState(
+        std.testing.allocator,
+        policy.digest(),
+        "[\"fact:START\"]",
+        "[]",
+    );
+    defer state.deinit(std.testing.allocator);
+    var decision = try select(std.testing.allocator, policy, &state);
+    defer decision.deinit(std.testing.allocator);
+
+    var missing_observation = try fixtureReceipt(
+        std.testing.allocator,
+        policy.digest(),
+        "{}",
+        "[\"PROOF-A\"]",
+    );
+    defer missing_observation.deinit(std.testing.allocator);
+    var observation_report = try validateReceipt(
+        std.testing.allocator,
+        policy,
+        &state,
+        &decision,
+        &missing_observation,
+    );
+    defer observation_report.deinit(std.testing.allocator);
+    try std.testing.expect(!observation_report.ok());
+
+    var wrong_proof = try fixtureReceipt(
+        std.testing.allocator,
+        policy.digest(),
+        "{\"OBS\":\"ok\"}",
+        "[\"PROOF-OTHER\"]",
+    );
+    defer wrong_proof.deinit(std.testing.allocator);
+    var proof_report = try validateReceipt(
+        std.testing.allocator,
+        policy,
+        &state,
+        &decision,
+        &wrong_proof,
+    );
+    defer proof_report.deinit(std.testing.allocator);
+    try std.testing.expect(!proof_report.ok());
+}
+
+test "successful proof receipt unlocks proof-bound terminal" {
+    var result = try compileProofBoundFixture();
+    defer result.deinit(std.testing.allocator);
+    const policy = switch (result) {
+        .policy => |value| value,
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    const terminal_atoms =
+        "[\"unknown:U=resolved\",\"obligation:O=closed\",\"obs:OBS=ok\"]";
+    var unproved = try fixtureState(
+        std.testing.allocator,
+        policy.digest(),
+        terminal_atoms,
+        "[]",
+    );
+    defer unproved.deinit(std.testing.allocator);
+    var blocked = try select(std.testing.allocator, policy, &unproved);
+    defer blocked.deinit(std.testing.allocator);
+    try expectWinnerKind(&blocked, "policy_dead_end");
+
+    var initial = try fixtureState(
+        std.testing.allocator,
+        policy.digest(),
+        "[\"fact:START\"]",
+        "[]",
+    );
+    defer initial.deinit(std.testing.allocator);
+    var decision = try select(std.testing.allocator, policy, &initial);
+    defer decision.deinit(std.testing.allocator);
+    var receipt = try fixtureReceipt(
+        std.testing.allocator,
+        policy.digest(),
+        "{\"OBS\":\"ok\"}",
+        "[\"PROOF-A\"]",
+    );
+    defer receipt.deinit(std.testing.allocator);
+    var proved = try applyReceipt(
+        std.testing.allocator,
+        policy,
+        &initial,
+        &decision,
+        &receipt,
+        "2026-07-25T00:00:00Z",
+    );
+    defer proved.deinit(std.testing.allocator);
+    var terminal = try select(std.testing.allocator, policy, &proved);
+    defer terminal.deinit(std.testing.allocator);
+    try expectWinnerKind(&terminal, "terminal");
+}
+
+test "runtime selection enforces the compiled action horizon" {
+    var result = try compileFixtureReplacement(
+        "\"evidence_actions_max\": 1",
+        "\"evidence_actions_max\": 0",
+    );
+    defer result.deinit(std.testing.allocator);
+    const policy = switch (result) {
+        .policy => |value| value,
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    var state = try fixtureState(
+        std.testing.allocator,
+        policy.digest(),
+        "[\"fact:START\"]",
+        "[]",
+    );
+    defer state.deinit(std.testing.allocator);
+    var decision = try select(std.testing.allocator, policy, &state);
+    defer decision.deinit(std.testing.allocator);
+    try expectWinnerKind(&decision, "policy_dead_end");
+}
+
+test "forbidden source state selects its declared response terminal" {
+    const forbidden =
+        \\[{"forbidden_id":"FORBIDDEN","statement":"Stop here.",
+        \\"atom":"custom:forbidden","response_terminal":"success"}]
+    ;
+    var result = try compileFixtureReplacement(
+        "\"forbidden_states\": []",
+        "\"forbidden_states\": " ++ forbidden,
+    );
+    defer result.deinit(std.testing.allocator);
+    const policy = switch (result) {
+        .policy => |value| value,
+        .report => return error.ExpectedCompiledPolicy,
+    };
+    var state = try fixtureState(
+        std.testing.allocator,
+        policy.digest(),
+        "[\"custom:forbidden\"]",
+        "[]",
+    );
+    defer state.deinit(std.testing.allocator);
+    var decision = try select(std.testing.allocator, policy, &state);
+    defer decision.deinit(std.testing.allocator);
+    try expectWinnerKind(&decision, "terminal");
+}
+
+test "rollback shield requires a concrete rollback action" {
+    const shield =
+        \\{"rules":[{"shield_id":"S","when":{"all":[],"any":[],"none":[]},
+        \\"forbids_action_ids":["A"],"forbids_action_kinds":[],
+        \\"requires_atoms":[],"response":"rollback","reason":"Rollback A."}]}
+    ;
+    try expectFixtureReplacementRejected(
+        "\"safety_shield\": {\n      \"rules\": []\n    }",
+        "\"safety_shield\": " ++ shield,
+    );
+}
+
+test "compiled rich policy rejects a dangling action outcome" {
+    const with_fact = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        "\"fact_id\": \"START\",\n          \"atom\": \"fact:START\"",
+        "\"fact_id\": \"START\",\n          \"atom\": \"fact:START\"" ++
+            "},{\"fact_id\":\"UNUSED\",\"atom\":\"fact:UNUSED\"",
+    );
+    defer std.testing.allocator.free(with_fact);
+    const with_effect = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_fact,
+        "\"facts_added\": []",
+        "\"facts_added\": [\"UNUSED\"]",
+    );
+    defer std.testing.allocator.free(with_effect);
+    const bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        with_effect,
+        "\"expected_observation_refs\": [\n          \"OBS\"\n        ]," ++
+            "\n        \"failure_observation_refs\": [\n          \"OBS\"\n        ]",
+        "\"expected_observation_refs\": []," ++
+            "\n        \"failure_observation_refs\": []",
+    );
+    defer std.testing.allocator.free(bytes);
+    var result = try compilePolicy(std.testing.allocator, bytes);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .policy => return error.ExpectedCompileRejection,
+        .report => |report| {
+            var saw_dangling = false;
+            for (report.errors) |item| {
+                if (item.code == .outcome_dangling) saw_dangling = true;
+            }
+            try std.testing.expect(saw_dangling);
+        },
+    }
+}
+
+fn compileLegacyForAllocationFailure(allocator: std.mem.Allocator) !void {
+    var result = compilePolicy(
+        allocator,
+        "{\"policy_id\":\"p\",\"revision\":1,\"declared_atoms\":[]," ++
+            "\"actions\":[{\"id\":\"a\"}]," ++
+            "\"policy_rules\":[{\"id\":\"r\",\"actions\":[\"a\"]}]}",
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer result.deinit(allocator);
+    switch (result) {
+        .policy => {},
+        .report => return error.ExpectedCompiledPolicy,
+    }
+}
+
+test "legacy compiler releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileLegacyForAllocationFailure,
+        .{},
+    );
+}

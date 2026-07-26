@@ -104,6 +104,8 @@ const Validator = struct {
         if (mode == .source) {
             try self.validateOutcomeClosure(root);
             try self.validateReadiness(root);
+        } else {
+            try self.validateCompiledOutcomeClosure(root);
         }
     }
 
@@ -501,6 +503,96 @@ const Validator = struct {
         }
     }
 
+    fn validateCompiledOutcomeClosure(
+        self: *Validator,
+        root: std.json.ObjectMap,
+    ) !void {
+        const actions = root.get("actions") orelse return;
+        if (actions != .array) return;
+        for (actions.array.items, 0..) |row, index| {
+            if (row != .object) continue;
+            const expected = arrayField(
+                row.object,
+                "expected_observation_refs",
+            ) orelse &.{};
+            const failure = arrayField(
+                row.object,
+                "failure_observation_refs",
+            ) orelse &.{};
+            if (expected.len == 0 and failure.len == 0) {
+                try self.validateActionOutcomeClosure(row.object, index);
+                continue;
+            }
+            try self.validateObservationClosure(
+                root,
+                expected,
+                index,
+                ".expected_observation_refs",
+            );
+            try self.validateObservationClosure(
+                root,
+                failure,
+                index,
+                ".failure_observation_refs",
+            );
+        }
+    }
+
+    fn validateActionOutcomeClosure(
+        self: *Validator,
+        action: std.json.ObjectMap,
+        action_index: usize,
+    ) !void {
+        const results = action.get("results") orelse return;
+        if (results != .object) return;
+        var result_iterator = results.object.iterator();
+        while (result_iterator.next()) |entry| {
+            if (entry.value_ptr.* != .array) continue;
+            for (entry.value_ptr.array.items, 0..) |item, atom_index| {
+                if (item != .string or self.atomIsClosed(item.string)) continue;
+                try self.addIndex2(
+                    .outcome_dangling,
+                    "$.actions",
+                    action_index,
+                    ".results",
+                    atom_index,
+                    "",
+                );
+            }
+        }
+    }
+
+    fn validateObservationClosure(
+        self: *Validator,
+        root: std.json.ObjectMap,
+        refs: []const std.json.Value,
+        action_index: usize,
+        path_suffix: []const u8,
+    ) !void {
+        for (refs) |ref_value| {
+            if (ref_value != .string) continue;
+            const observation = observationObject(root, ref_value.string) orelse
+                continue;
+            for (arrayField(observation, "outcomes") orelse &.{}) |outcome| {
+                if (outcome != .string) continue;
+                const outcome_atom = try std.fmt.allocPrint(
+                    self.allocator,
+                    "obs:{s}={s}",
+                    .{ ref_value.string, outcome.string },
+                );
+                defer self.allocator.free(outcome_atom);
+                if (!self.atomIsClosed(outcome_atom)) {
+                    try self.addIndex(
+                        .outcome_dangling,
+                        "$.actions",
+                        action_index,
+                        path_suffix,
+                    );
+                }
+            }
+        }
+    }
+
     fn validateReadiness(self: *Validator, root: std.json.ObjectMap) !void {
         const readiness = root.get("readiness") orelse return;
         if (readiness != .object) {
@@ -750,6 +842,31 @@ fn actionObject(root: std.json.ObjectMap, id: []const u8) ?std.json.ObjectMap {
         if (std.mem.eql(u8, row_id, id)) return row.object;
     }
     return null;
+}
+
+fn observationObject(
+    root: std.json.ObjectMap,
+    id: []const u8,
+) ?std.json.ObjectMap {
+    const observations = root.get("observations") orelse return null;
+    if (observations != .array) return null;
+    for (observations.array.items) |row| {
+        if (row != .object) continue;
+        const row_id = stringField(row.object, "id") orelse continue;
+        if (std.mem.eql(u8, row_id, id)) return row.object;
+    }
+    return null;
+}
+
+fn arrayField(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) ?[]const std.json.Value {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .array => |array| array.items,
+        else => null,
+    };
 }
 
 fn contains(items: []const []const u8, needle: []const u8) bool {

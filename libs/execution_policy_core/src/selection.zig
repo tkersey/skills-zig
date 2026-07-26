@@ -18,6 +18,8 @@ pub fn select(allocator: std.mem.Allocator, policy: *const schema.Policy, state:
     defer freeStrings(allocator, completed);
     const failed = try stringArrayField(allocator, state_root, "failed_actions");
     defer freeStrings(allocator, failed);
+    const proof_refs = try stringArrayField(allocator, state_root, "proof_refs");
+    defer freeStrings(allocator, proof_refs);
 
     var active_shields: std.ArrayList(ShieldedCandidate) = .empty;
     defer active_shields.deinit(allocator);
@@ -30,6 +32,13 @@ pub fn select(allocator: std.mem.Allocator, policy: *const schema.Policy, state:
     defer eligible_actions.deinit(allocator);
     var eligible_terminals: std.ArrayList(TerminalCandidate) = .empty;
     defer eligible_terminals.deinit(allocator);
+    if (forbiddenResponse(policy_root, satisfied)) |terminal_id| {
+        try eligible_terminals.append(allocator, .{
+            .rule_id = "forbidden_state",
+            .terminal_id = terminal_id,
+            .priority = std.math.minInt(i64),
+        });
+    }
 
     const rules = policy_root.get("policy_rules") orelse return error.PolicyDeadEnd;
     if (rules != .array) return error.SchemaInvalid;
@@ -40,7 +49,13 @@ pub fn select(allocator: std.mem.Allocator, policy: *const schema.Policy, state:
         const rule_id = stringField(rule, "id") orelse "";
         const priority = integerField(rule, "priority") orelse std.math.maxInt(i64);
         if (stringField(rule, "terminal")) |terminal_id| {
-            if (try terminalConditionMatches(allocator, policy_root, terminal_id, satisfied)) {
+            if (try terminalConditionMatches(
+                allocator,
+                policy_root,
+                terminal_id,
+                satisfied,
+                proof_refs,
+            )) {
                 try eligible_terminals.append(allocator, .{
                     .rule_id = rule_id,
                     .terminal_id = terminal_id,
@@ -54,7 +69,14 @@ pub fn select(allocator: std.mem.Allocator, policy: *const schema.Policy, state:
                 if (action_value != .string) continue;
                 const action_id = action_value.string;
                 const action = actionObject(policy_root, action_id) orelse continue;
-                if (!try actionEligible(allocator, action, satisfied, completed, failed)) continue;
+                if (!try actionEligible(
+                    allocator,
+                    policy_root,
+                    action,
+                    satisfied,
+                    completed,
+                    failed,
+                )) continue;
                 if (shieldResponseFor(active_shields.items, action_id)) |response| {
                     try appendShielded(allocator, &shielded_candidates, action_id, response);
                     continue;
@@ -176,6 +198,7 @@ fn appendShielded(allocator: std.mem.Allocator, out: *std.ArrayList(ShieldedCand
 
 fn actionEligible(
     allocator: std.mem.Allocator,
+    policy_root: std.json.ObjectMap,
     action: std.json.ObjectMap,
     satisfied: []const []const u8,
     completed: []const []const u8,
@@ -183,6 +206,7 @@ fn actionEligible(
 ) !bool {
     const id = stringField(action, "id") orelse return false;
     if (!try conditionMatches(allocator, action.get("precondition"), satisfied)) return false;
+    if (!horizonAllows(policy_root, action, completed, failed)) return false;
     const repeatable = boolField(action, "repeatable") orelse false;
     if (!repeatable and (contains(completed, id) or contains(failed, id))) return false;
     if (action.get("requires_actions")) |requires| {
@@ -194,16 +218,102 @@ fn actionEligible(
     return true;
 }
 
-fn terminalConditionMatches(allocator: std.mem.Allocator, policy_root: std.json.ObjectMap, terminal_id: []const u8, satisfied: []const []const u8) !bool {
+fn terminalConditionMatches(
+    allocator: std.mem.Allocator,
+    policy_root: std.json.ObjectMap,
+    terminal_id: []const u8,
+    satisfied: []const []const u8,
+    proof_refs: []const []const u8,
+) !bool {
     const terminals = policy_root.get("terminals") orelse return true;
     if (terminals != .array) return false;
     for (terminals.array.items) |row_value| {
         if (row_value != .object) continue;
         const row = row_value.object;
         const id = stringField(row, "id") orelse stringField(row, "name") orelse continue;
-        if (std.mem.eql(u8, id, terminal_id)) return conditionMatches(allocator, row.get("condition"), satisfied);
+        if (!std.mem.eql(u8, id, terminal_id)) continue;
+        if (!containsAll(proof_refs, row.get("proof_refs"))) return false;
+        return conditionMatches(allocator, row.get("condition"), satisfied);
     }
     return false;
+}
+
+fn forbiddenResponse(
+    policy_root: std.json.ObjectMap,
+    satisfied: []const []const u8,
+) ?[]const u8 {
+    const responses = policy_root.get("forbidden_responses") orelse return null;
+    if (responses != .array) return null;
+    for (responses.array.items) |value| {
+        if (value != .object) continue;
+        const forbidden_atom = stringField(value.object, "atom") orelse continue;
+        if (!contains(satisfied, forbidden_atom)) continue;
+        return stringField(value.object, "response_terminal");
+    }
+    return null;
+}
+
+fn horizonAllows(
+    policy_root: std.json.ObjectMap,
+    action: std.json.ObjectMap,
+    completed: []const []const u8,
+    failed: []const []const u8,
+) bool {
+    const horizon = objectField(policy_root, "horizon") orelse return true;
+    const limit_key = horizonKey(stringField(action, "kind") orelse "") orelse
+        return false;
+    const limit = integerField(horizon, limit_key) orelse return false;
+    var consumed: i64 = 0;
+    for (completed) |id| {
+        if (actionHasHorizonKey(policy_root, id, limit_key)) consumed += 1;
+    }
+    for (failed) |id| {
+        if (actionHasHorizonKey(policy_root, id, limit_key)) consumed += 1;
+    }
+    return consumed < limit;
+}
+
+fn actionHasHorizonKey(
+    policy_root: std.json.ObjectMap,
+    action_id: []const u8,
+    expected_key: []const u8,
+) bool {
+    const action = actionObject(policy_root, action_id) orelse return false;
+    const actual_key = horizonKey(stringField(action, "kind") orelse "") orelse
+        return false;
+    return std.mem.eql(u8, actual_key, expected_key);
+}
+
+fn horizonKey(kind: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, kind, "inspect") or
+        std.mem.eql(u8, kind, "probe") or
+        std.mem.eql(u8, kind, "decide") or
+        std.mem.eql(u8, kind, "prove"))
+    {
+        return "evidence_actions_max";
+    }
+    if (std.mem.eql(u8, kind, "mutate") or
+        std.mem.eql(u8, kind, "stabilize") or
+        std.mem.eql(u8, kind, "rollback"))
+    {
+        return "mutation_actions_max";
+    }
+    if (std.mem.eql(u8, kind, "deploy")) {
+        return "delivery_transitions_max";
+    }
+    return null;
+}
+
+fn containsAll(
+    actual: []const []const u8,
+    maybe_expected: ?std.json.Value,
+) bool {
+    const expected = maybe_expected orelse return true;
+    if (expected != .array) return false;
+    for (expected.array.items) |item| {
+        if (item != .string or !contains(actual, item.string)) return false;
+    }
+    return true;
 }
 
 fn conditionMatches(allocator: std.mem.Allocator, maybe_value: ?std.json.Value, satisfied: []const []const u8) !bool {
@@ -326,6 +436,17 @@ fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .string => |text| text,
+        else => null,
+    };
+}
+
+fn objectField(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .object => |map| map,
         else => null,
     };
 }
