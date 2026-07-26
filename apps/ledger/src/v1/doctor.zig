@@ -1,0 +1,137 @@
+const std = @import("std");
+const durable_store = @import("durable_store");
+const custody = @import("custody.zig");
+const definition = @import("definition.zig");
+const replay = @import("replay.zig");
+const storage = @import("storage.zig");
+
+pub const SlotStatus = struct {
+    name: []u8,
+    logical_ref: []u8,
+    revision: ?[]u8,
+    binding_rows: usize,
+    healthy: bool,
+    error_code: ?[]u8,
+
+    fn deinit(self: *SlotStatus, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.logical_ref);
+        if (self.revision) |revision| allocator.free(revision);
+        if (self.error_code) |code| allocator.free(code);
+        self.* = undefined;
+    }
+};
+
+pub const Result = struct {
+    definition_id: []u8,
+    definition_digest: [71]u8,
+    pending_transactions: usize,
+    slots: []SlotStatus,
+    healthy: bool,
+    authority_granted: bool = false,
+    storage_mutated: bool = false,
+
+    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+        allocator.free(self.definition_id);
+        for (self.slots) |*slot| slot.deinit(allocator);
+        allocator.free(self.slots);
+        self.* = undefined;
+    }
+};
+
+pub fn execute(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    repo_root: []const u8,
+) !Result {
+    if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const pending_transactions = try durable_store.countPendingTransactions(
+        allocator,
+        transactions_dir,
+    );
+    const slots = try allocator.alloc(SlotStatus, storage_plan.slots.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (slots[0..initialized]) |*slot| slot.deinit(allocator);
+        allocator.free(slots);
+    }
+    var healthy = pending_transactions == 0;
+    for (storage_plan.slots, 0..) |slot, index| {
+        slots[index] = inspectSlot(
+            allocator,
+            definition_plan.id,
+            repo_root,
+            slot,
+        ) catch |err| try unhealthySlot(allocator, slot, err);
+        initialized += 1;
+        if (!slots[index].healthy) healthy = false;
+    }
+    return .{
+        .definition_id = try allocator.dupe(u8, definition_plan.id),
+        .definition_digest = definition_plan.closure_digest,
+        .pending_transactions = pending_transactions,
+        .slots = slots,
+        .healthy = healthy,
+    };
+}
+
+fn inspectSlot(
+    allocator: std.mem.Allocator,
+    definition_id: []const u8,
+    repo_root: []const u8,
+    slot: storage.Slot,
+) !SlotStatus {
+    var snapshot = try custody.readSlot(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+    );
+    defer snapshot.deinit(allocator);
+    _ = try replay.validateSlot(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        &snapshot,
+    );
+    const name = try allocator.dupe(u8, slot.name);
+    errdefer allocator.free(name);
+    const logical_ref = try allocator.dupe(u8, slot.relative_path);
+    errdefer allocator.free(logical_ref);
+    const revision = try allocator.dupe(u8, snapshot.revision);
+    return .{
+        .name = name,
+        .logical_ref = logical_ref,
+        .revision = revision,
+        .binding_rows = snapshot.binding.rows.len,
+        .healthy = true,
+        .error_code = null,
+    };
+}
+
+fn unhealthySlot(
+    allocator: std.mem.Allocator,
+    slot: storage.Slot,
+    err: anyerror,
+) !SlotStatus {
+    const name = try allocator.dupe(u8, slot.name);
+    errdefer allocator.free(name);
+    const logical_ref = try allocator.dupe(u8, slot.relative_path);
+    errdefer allocator.free(logical_ref);
+    const error_code = try allocator.dupe(u8, @errorName(err));
+    return .{
+        .name = name,
+        .logical_ref = logical_ref,
+        .revision = null,
+        .binding_rows = 0,
+        .healthy = false,
+        .error_code = error_code,
+    };
+}

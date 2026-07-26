@@ -58,6 +58,35 @@ grep -Fq '"semantic_authority_granted":false' <<<"$transaction_output"
 grep -Fq '"storage_mutated":true' <<<"$transaction_output"
 test -f "$repo_dir/.ledger/example/events.jsonl"
 test -d "$repo_dir/.ledger/.bindings"
+test -d "$repo_dir/.ledger/.definitions"
+compgen -G "$repo_dir/.ledger/.definitions/*.json" >/dev/null
+
+projection_output=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"schema":"ledger-projection-result/v1"' <<<"$projection_output"
+grep -Fq '"data":[{"kind":"one","value":1}]' <<<"$projection_output"
+grep -Fq '"authority_granted":false' <<<"$projection_output"
+grep -Fq '"storage_mutated":false' <<<"$projection_output"
+
+projection_payload=$("$binary" project \
+  --definition "$event_definition" \
+  --projection latest \
+  --repo "$repo_dir" \
+  --payload-only \
+  --format json)
+test "$projection_payload" = '[{"kind":"one","value":1}]'
+
+doctor_output=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"schema":"ledger-doctor-result/v1"' <<<"$doctor_output"
+grep -Fq '"healthy":true' <<<"$doctor_output"
+grep -Fq '"binding_rows":1' <<<"$doctor_output"
+grep -Fq '"storage_mutated":false' <<<"$doctor_output"
 
 idempotent_output=$("$binary" transact \
   --definition "$event_definition" \
@@ -84,3 +113,15 @@ grep -Fq '"schema":"ledger-transaction-error/v1"' <<<"$conflict_output"
 grep -Fq '"code":"IdempotencyConflict"' <<<"$conflict_output"
 grep -Fq '"storage_mutated":null' <<<"$conflict_output"
 grep -Fq '"storage_mutation_state":"unknown"' <<<"$conflict_output"
+
+printf '%s\n' '{"kind":"one","value":9}' >"$repo_dir/.ledger/example/events.jsonl"
+set +e
+tamper_output=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$repo_dir" \
+  --format json)
+tamper_status=$?
+set -e
+test "$tamper_status" -eq 2
+grep -Fq '"healthy":false' <<<"$tamper_output"
+grep -Fq '"error_code":"StoreBindingRevisionMismatch"' <<<"$tamper_output"

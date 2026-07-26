@@ -1,12 +1,12 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
+const custody = @import("custody.zig");
 const definition = @import("definition.zig");
+const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
-
-const BindingMaxBytes = 16 * 1024 * 1024;
 
 pub const EffectReceipt = struct {
     slot: []u8,
@@ -45,21 +45,6 @@ pub const Result = struct {
     }
 };
 
-const BindingSnapshot = struct {
-    exists: bool,
-    bytes: []u8,
-    digest: ?[]u8,
-    last_revision: ?[]u8,
-    idempotency_match: bool,
-
-    fn deinit(self: *BindingSnapshot, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
-        if (self.digest) |digest| allocator.free(digest);
-        if (self.last_revision) |revision| allocator.free(revision);
-        self.* = undefined;
-    }
-};
-
 const PreparedEffect = struct {
     slot_index: u16,
     kind: storage.EffectKind,
@@ -69,7 +54,7 @@ const PreparedEffect = struct {
     slot_before_digest: ?[]u8,
     slot_after: []u8,
     slot_after_digest: []u8,
-    binding_before: BindingSnapshot,
+    binding_before: custody.BindingSnapshot,
     binding_after: []u8,
     canonical_input: []u8,
     idempotency_match: bool,
@@ -95,6 +80,8 @@ pub fn installRuntimeIo(io: std.Io) void {
 pub fn transact(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
+    definition_closure: *const definition_core.Closure,
+    definition_entry_path: []const u8,
     validation_plan: *const validation.Plan,
     storage_plan: *const storage.Plan,
     operation_name: []const u8,
@@ -103,6 +90,11 @@ pub fn transact(
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
+    if (!std.mem.eql(
+        u8,
+        definition_plan.closure_digest[0..],
+        definition_closure.digestSlice(),
+    )) return error.DefinitionClosureDigestMismatch;
     const operation = storage_plan.findOperation(operation_name) orelse
         return error.UnknownOperation;
     var execution = try validation.execute(allocator, validation_plan, documents);
@@ -136,10 +128,24 @@ pub fn transact(
         &.{ ledger_root, ".bindings" },
     );
     defer allocator.free(bindings_dir);
+    const definitions_dir = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".definitions" },
+    );
+    defer allocator.free(definitions_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(ledger_root);
     try durable_store.ensureDirectoryPathNoSymlinks(transactions_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(bindings_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(definitions_dir);
     try durable_store.ensureNoPendingTransactions(allocator, transactions_dir);
+    var archive = try definition_archive.prepare(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        definition_entry_path,
+        definition_closure,
+    );
+    defer archive.deinit(allocator);
 
     const prepared = try prepareEffects(
         allocator,
@@ -162,11 +168,19 @@ pub fn transact(
     if (duplicate_count != 0 and duplicate_count != prepared.len) {
         return error.PartialIdempotencyMatch;
     }
+    if (duplicate_count != 0 and !archive.exists) {
+        return error.DefinitionArchiveMissing;
+    }
 
     var transaction_id: ?[]u8 = null;
     var storage_mutated = false;
     if (duplicate_count == 0) {
-        const mutations = try buildMutations(allocator, storage_plan, prepared);
+        const mutations = try buildMutations(
+            allocator,
+            storage_plan,
+            prepared,
+            &archive,
+        );
         defer allocator.free(mutations);
         const counter_path = try std.fs.path.join(
             allocator,
@@ -269,7 +283,7 @@ fn prepareEffect(
         &.{ repo_root, ".ledger", slot.relative_path },
     );
     errdefer allocator.free(slot_path);
-    const binding_path = try bindingPathAlloc(
+    const binding_path = try custody.bindingPathAlloc(
         allocator,
         repo_root,
         slot.relative_path,
@@ -311,6 +325,11 @@ fn prepareEffect(
         definition_plan.inputs[effect.input_index].codec,
     );
     errdefer allocator.free(canonical_input);
+    const canonical_input_digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        canonical_input,
+    );
+    defer allocator.free(canonical_input_digest);
     const slot_after = try slotContentAfter(
         allocator,
         slot,
@@ -326,22 +345,26 @@ fn prepareEffect(
     );
     errdefer allocator.free(slot_after_digest);
     const idempotency_key = if (effect.idempotency_parameter) |parameter_name|
-        parameterText(parameters, parameter_name)
+        parameterText(parameters, parameter_name) orelse
+            return error.MissingOperationParameter
     else
         null;
     const input_digest = execution.inputDigest(
         definition_plan.inputs[effect.input_index].name,
     ) orelse return error.InputDigestMissing;
-    var binding_before = try readBindingSnapshot(
+    var binding_before = try custody.readBindingSnapshot(
         allocator,
         binding_path,
         definition_plan.id,
         slot.name,
         slot.relative_path,
         slot_before_digest,
-        operation_name,
-        idempotency_key,
-        input_digest,
+        if (idempotency_key) |key| .{
+            .definition_digest = definition_plan.closure_digest[0..],
+            .operation = operation_name,
+            .key = key,
+            .input_digest = input_digest,
+        } else null,
     );
     errdefer binding_before.deinit(allocator);
     if (slot_before != null and !binding_before.exists) return error.UnboundStore;
@@ -350,13 +373,14 @@ fn prepareEffect(
     const binding_after = if (binding_before.idempotency_match)
         try allocator.dupe(u8, binding_before.bytes)
     else
-        try appendBindingRowAlloc(
+        try custody.appendBindingRowAlloc(
             allocator,
             binding_before.bytes,
             definition_plan,
             slot,
             operation_name,
             input_digest,
+            canonical_input_digest,
             slot_before_digest,
             slot_after_digest,
             idempotency_key,
@@ -409,227 +433,16 @@ fn slotContentAfter(
     return output.toOwnedSlice();
 }
 
-fn readBindingSnapshot(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    definition_id: []const u8,
-    slot_name: []const u8,
-    logical_path: []const u8,
-    current_revision: ?[]const u8,
-    operation: []const u8,
-    idempotency_key: ?[]const u8,
-    expected_input_digest: []const u8,
-) !BindingSnapshot {
-    const bytes = durable_store.readRegularFileNoSymlink(
-        allocator,
-        path,
-        BindingMaxBytes,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return .{
-            .exists = false,
-            .bytes = try allocator.alloc(u8, 0),
-            .digest = null,
-            .last_revision = null,
-            .idempotency_match = false,
-        },
-        else => return err,
-    };
-    errdefer allocator.free(bytes);
-    const digest = try definition_core.canonical_json.digestBytesAlloc(allocator, bytes);
-    errdefer allocator.free(digest);
-    var last_revision: ?[]u8 = null;
-    errdefer if (last_revision) |revision| allocator.free(revision);
-    var idempotency_match = false;
-    var row_count: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line_with_cr| {
-        const line = std.mem.trim(u8, line_with_cr, " \t\r");
-        if (line.len == 0) continue;
-        row_count += 1;
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            line,
-            .{ .duplicate_field_behavior = .@"error" },
-        );
-        defer parsed.deinit();
-        const object = try definition_core.json.object(parsed.value);
-        try definition_core.json.requireExactKeys(object, &.{
-            "schema",
-            "slot",
-            "logical_path",
-            "definition_id",
-            "definition_digest",
-            "abi",
-            "operation",
-            "input_digest",
-            "revision_before",
-            "revision_after",
-            "idempotency_key",
-        });
-        try definition_core.json.requireFields(object, &.{
-            "schema",
-            "slot",
-            "logical_path",
-            "definition_id",
-            "definition_digest",
-            "abi",
-            "operation",
-            "input_digest",
-            "revision_before",
-            "revision_after",
-            "idempotency_key",
-        });
-        if (!std.mem.eql(
-            u8,
-            try definition_core.json.requiredString(object, "schema"),
-            "ledger-store-binding/v1",
-        )) return error.InvalidStoreBinding;
-        if (!std.mem.eql(
-            u8,
-            try definition_core.json.requiredString(object, "slot"),
-            slot_name,
-        )) return error.StoreBindingSlotMismatch;
-        if (!std.mem.eql(
-            u8,
-            try definition_core.json.requiredString(object, "logical_path"),
-            logical_path,
-        )) return error.StoreBindingPathMismatch;
-        const row_definition_id = try definition_core.json.requiredString(
-            object,
-            "definition_id",
-        );
-        try definition_core.json.safeIdentifier(row_definition_id, 256);
-        if (!std.mem.eql(u8, row_definition_id, definition_id)) {
-            return error.StoreBindingDefinitionMismatch;
-        }
-        try definition_core.json.digest(
-            try definition_core.json.requiredString(object, "definition_digest"),
-        );
-        if (!std.mem.eql(
-            u8,
-            try definition_core.json.requiredString(object, "abi"),
-            definition.abi,
-        )) return error.StoreBindingAbiMismatch;
-        const row_input_digest = try definition_core.json.requiredString(
-            object,
-            "input_digest",
-        );
-        try definition_core.json.digest(row_input_digest);
-        const revision_before = try definition_core.json.optionalString(
-            object,
-            "revision_before",
-        );
-        if (revision_before) |revision| try definition_core.json.digest(revision);
-        const revision_after = try definition_core.json.requiredString(
-            object,
-            "revision_after",
-        );
-        try definition_core.json.digest(revision_after);
-        if (last_revision) |prior| {
-            if (revision_before == null or
-                !std.mem.eql(u8, revision_before.?, prior))
-            {
-                return error.StoreBindingChainMismatch;
-            }
-            allocator.free(prior);
-        }
-        last_revision = try allocator.dupe(u8, revision_after);
-        const row_idempotency = try definition_core.json.optionalString(
-            object,
-            "idempotency_key",
-        );
-        if (idempotency_key != null and row_idempotency != null and
-            std.mem.eql(u8, idempotency_key.?, row_idempotency.?) and
-            std.mem.eql(
-                u8,
-                operation,
-                try definition_core.json.requiredString(object, "operation"),
-            ))
-        {
-            if (!std.mem.eql(u8, expected_input_digest, row_input_digest)) {
-                return error.IdempotencyConflict;
-            }
-            idempotency_match = true;
-        }
-    }
-    if (row_count == 0 or last_revision == null) return error.InvalidStoreBinding;
-    if (current_revision == null or
-        !std.mem.eql(u8, current_revision.?, last_revision.?))
-    {
-        return error.StoreBindingRevisionMismatch;
-    }
-    return .{
-        .exists = true,
-        .bytes = bytes,
-        .digest = digest,
-        .last_revision = last_revision,
-        .idempotency_match = idempotency_match,
-    };
-}
-
-fn appendBindingRowAlloc(
-    allocator: std.mem.Allocator,
-    before: []const u8,
-    definition_plan: *const definition.Plan,
-    slot: storage.Slot,
-    operation: []const u8,
-    input_digest: []const u8,
-    revision_before: ?[]const u8,
-    revision_after: []const u8,
-    idempotency_key: ?[]const u8,
-) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try output.writer.writeAll(before);
-    if (before.len != 0 and before[before.len - 1] != '\n') {
-        try output.writer.writeByte('\n');
-    }
-    try output.writer.writeAll(
-        "{\"abi\":\"ledger-artifact-abi/v1\",\"definition_digest\":",
-    );
-    try definition_core.canonical_json.writeCanonicalString(
-        &output.writer,
-        definition_plan.closure_digest[0..],
-    );
-    try output.writer.writeAll(",\"definition_id\":");
-    try definition_core.canonical_json.writeCanonicalString(
-        &output.writer,
-        definition_plan.id,
-    );
-    try output.writer.writeAll(",\"idempotency_key\":");
-    try writeOptionalString(&output.writer, idempotency_key);
-    try output.writer.writeAll(",\"input_digest\":");
-    try definition_core.canonical_json.writeCanonicalString(&output.writer, input_digest);
-    try output.writer.writeAll(",\"logical_path\":");
-    try definition_core.canonical_json.writeCanonicalString(
-        &output.writer,
-        slot.relative_path,
-    );
-    try output.writer.writeAll(",\"operation\":");
-    try definition_core.canonical_json.writeCanonicalString(&output.writer, operation);
-    try output.writer.writeAll(",\"revision_after\":");
-    try definition_core.canonical_json.writeCanonicalString(
-        &output.writer,
-        revision_after,
-    );
-    try output.writer.writeAll(",\"revision_before\":");
-    try writeOptionalString(&output.writer, revision_before);
-    try output.writer.writeAll(",\"schema\":\"ledger-store-binding/v1\",\"slot\":");
-    try definition_core.canonical_json.writeCanonicalString(&output.writer, slot.name);
-    try output.writer.writeAll("}\n");
-    if (output.written().len > BindingMaxBytes) return error.StoreBindingTooLarge;
-    return output.toOwnedSlice();
-}
-
 fn buildMutations(
     allocator: std.mem.Allocator,
     storage_plan: *const storage.Plan,
     prepared: []const PreparedEffect,
+    archive: *const definition_archive.Candidate,
 ) ![]durable_store.TransactionMutation {
+    const archive_count: usize = if (archive.exists) 0 else 1;
     const mutations = try allocator.alloc(
         durable_store.TransactionMutation,
-        prepared.len * 2,
+        prepared.len * 2 + archive_count,
     );
     for (prepared, 0..) |effect, index| {
         const slot = storage_plan.slots[effect.slot_index];
@@ -651,7 +464,16 @@ fn buildMutations(
                 .expected_exists = effect.binding_before.exists,
             },
             .content_mode = .raw,
-            .max_bytes = BindingMaxBytes,
+            .max_bytes = custody.binding_max_bytes,
+        };
+    }
+    if (!archive.exists) {
+        mutations[prepared.len * 2] = .{
+            .path = archive.path,
+            .text = archive.content,
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = definition_archive.max_bytes,
         };
     }
     return mutations;
@@ -699,24 +521,6 @@ fn buildReceipts(
     return receipts;
 }
 
-fn bindingPathAlloc(
-    allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    logical_path: []const u8,
-) ![]u8 {
-    const digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        logical_path,
-    );
-    defer allocator.free(digest);
-    const file_name = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{digest[7..]});
-    defer allocator.free(file_name);
-    return std.fs.path.join(
-        allocator,
-        &.{ repo_root, ".ledger", ".bindings", file_name },
-    );
-}
-
 fn parameterText(
     bindings: *const definition_core.parameters.Bindings,
     name: []const u8,
@@ -734,14 +538,6 @@ fn parameterText(
         };
     }
     return null;
-}
-
-fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |text| {
-        try definition_core.canonical_json.writeCanonicalString(writer, text);
-    } else {
-        try writer.writeAll("null");
-    }
 }
 
 test "transaction appends an event and binding in one durable transaction" {
@@ -794,6 +590,8 @@ test "transaction appends an event and binding in one durable transaction" {
     var first = try transact(
         std.testing.allocator,
         &definition_plan,
+        &closure,
+        "protocol.json",
         &validation_plan,
         &storage_plan,
         "append",
@@ -809,6 +607,8 @@ test "transaction appends an event and binding in one durable transaction" {
     var second = try transact(
         std.testing.allocator,
         &definition_plan,
+        &closure,
+        "protocol.json",
         &validation_plan,
         &storage_plan,
         "append",
@@ -844,7 +644,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "{\"kind\":\"one\",\"value\":1}\n{\"kind\":\"two\",\"value\":2}\n",
         events,
     );
-    const binding_path = try bindingPathAlloc(
+    const binding_path = try custody.bindingPathAlloc(
         std.testing.allocator,
         repo_root,
         "example/events.jsonl",
@@ -852,16 +652,14 @@ test "transaction appends an event and binding in one durable transaction" {
     defer std.testing.allocator.free(binding_path);
     try std.testing.expectError(
         error.StoreBindingDefinitionMismatch,
-        readBindingSnapshot(
+        custody.readBindingSnapshot(
             std.testing.allocator,
             binding_path,
             "example/other-events",
             "events",
             "example/events.jsonl",
             second.effects[0].revision_after,
-            "append",
             null,
-            second.effects[0].revision_after,
         ),
     );
 
@@ -885,6 +683,8 @@ test "transaction appends an event and binding in one durable transaction" {
         transact(
             std.testing.allocator,
             &definition_plan,
+            &closure,
+            "protocol.json",
             &validation_plan,
             &storage_plan,
             "append",
@@ -956,6 +756,8 @@ test "transaction fails closed for an unbound existing store" {
         transact(
             std.testing.allocator,
             &definition_plan,
+            &closure,
+            "protocol.json",
             &validation_plan,
             &storage_plan,
             "append",

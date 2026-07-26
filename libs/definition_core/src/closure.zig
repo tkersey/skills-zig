@@ -207,7 +207,7 @@ pub fn loadFromDir(
     errdefer builder.deinit();
     try builder.visit(normalized_entry, 1);
     std.mem.sort(ClosureFile, builder.files.items, {}, lessThanClosureFile);
-    const digest = closureDigest(builder.files.items);
+    const digest = digestFiles(builder.files.items);
     const files = try builder.files.toOwnedSlice(allocator);
     builder.states.deinit(allocator);
     return .{
@@ -215,6 +215,160 @@ pub fn loadFromDir(
         .digest = digest,
         .total_definition_bytes = builder.total_definition_bytes,
     };
+}
+
+pub fn fromCanonicalFiles(
+    allocator: std.mem.Allocator,
+    source_files: []const ClosureFile,
+    entry_path: []const u8,
+    limits: Limits,
+) !Closure {
+    try limits.validate();
+    if (source_files.len == 0 or source_files.len > limits.max_files) {
+        return error.TooManyDefinitionFiles;
+    }
+    const normalized_entry = try normalizeRelativeAlloc(
+        allocator,
+        "",
+        entry_path,
+    );
+    defer allocator.free(normalized_entry);
+    if (!std.mem.eql(u8, normalized_entry, entry_path)) {
+        return error.InvalidDefinitionPath;
+    }
+    const files = try allocator.alloc(ClosureFile, source_files.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |*file| file.deinit(allocator);
+        allocator.free(files);
+    }
+    var total_definition_bytes: usize = 0;
+    for (source_files, 0..) |source, index| {
+        const normalized = try normalizeRelativeAlloc(allocator, "", source.path);
+        defer allocator.free(normalized);
+        if (!std.mem.eql(u8, normalized, source.path)) {
+            return error.InvalidDefinitionPath;
+        }
+        if (source.canonical_json.len > limits.max_file_bytes) {
+            return error.DefinitionFileTooLarge;
+        }
+        total_definition_bytes = std.math.add(
+            usize,
+            total_definition_bytes,
+            source.canonical_json.len,
+        ) catch return error.DefinitionClosureTooLarge;
+        if (total_definition_bytes > limits.max_total_bytes) {
+            return error.DefinitionClosureTooLarge;
+        }
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            source.canonical_json,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        ) catch return error.InvalidDefinitionJson;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.DefinitionRootNotObject;
+        const canonical = try canonical_json.canonicalJsonAlloc(
+            allocator,
+            parsed.value,
+        );
+        errdefer allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, source.canonical_json)) {
+            return error.NonCanonicalDefinitionArchive;
+        }
+        files[index] = .{
+            .path = try allocator.dupe(u8, source.path),
+            .canonical_json = canonical,
+        };
+        initialized += 1;
+    }
+    std.mem.sort(ClosureFile, files, {}, lessThanClosureFile);
+    for (files[1..], 1..) |file, index| {
+        if (std.mem.eql(u8, files[index - 1].path, file.path)) {
+            return error.DuplicateDefinitionPath;
+        }
+    }
+    var validator = CanonicalClosureValidator{
+        .allocator = allocator,
+        .files = files,
+        .limits = limits,
+    };
+    defer validator.states.deinit(allocator);
+    try validator.visit(entry_path, 1);
+    if (validator.complete_count != files.len) {
+        return error.UnreachableDefinitionFile;
+    }
+    return .{
+        .files = files,
+        .digest = digestFiles(files),
+        .total_definition_bytes = total_definition_bytes,
+    };
+}
+
+const CanonicalClosureValidator = struct {
+    allocator: std.mem.Allocator,
+    files: []const ClosureFile,
+    limits: Limits,
+    states: std.StringHashMapUnmanaged(VisitState) = .empty,
+    complete_count: usize = 0,
+
+    fn visit(
+        self: *CanonicalClosureValidator,
+        path: []const u8,
+        depth: usize,
+    ) !void {
+        if (depth > self.limits.max_import_depth) {
+            return error.ImportDepthExceeded;
+        }
+        if (self.states.get(path)) |state| {
+            if (state == .visiting) return error.ImportCycle;
+            return;
+        }
+        const file = findFile(self.files, path) orelse
+            return error.ImportedDefinitionMissing;
+        try self.states.put(self.allocator, file.path, .visiting);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            self.allocator,
+            file.canonical_json,
+            .{ .duplicate_field_behavior = .@"error" },
+        );
+        defer parsed.deinit();
+        var imports: std.ArrayList([]u8) = .empty;
+        defer {
+            for (imports.items) |item| self.allocator.free(item);
+            imports.deinit(self.allocator);
+        }
+        try collectImports(
+            self.allocator,
+            parsed.value.object,
+            std.fs.path.dirname(file.path) orelse "",
+            &imports,
+        );
+        std.mem.sort([]u8, imports.items, {}, lessThanPath);
+        for (imports.items) |import_path| {
+            try self.visit(import_path, depth + 1);
+        }
+        self.states.getPtr(file.path).?.* = .complete;
+        self.complete_count += 1;
+    }
+};
+
+fn findFile(files: []const ClosureFile, path: []const u8) ?*const ClosureFile {
+    var low: usize = 0;
+    var high = files.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, files[mid].path, path)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &files[mid],
+        }
+    }
+    return null;
 }
 
 fn collectImports(
@@ -332,7 +486,7 @@ fn rejectAbsoluteSymlinkComponents(path: []const u8) !void {
     }
 }
 
-fn closureDigest(files: []const ClosureFile) [71]u8 {
+pub fn digestFiles(files: []const ClosureFile) [71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("skill-definition-closure/v1\x00");
     var length_bytes: [8]u8 = undefined;

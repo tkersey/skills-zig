@@ -1,6 +1,7 @@
 pub const canonical_json = @import("canonical_json.zig");
 pub const closure = @import("closure.zig");
 pub const json = @import("json.zig");
+pub const json_pointer = @import("json_pointer.zig");
 pub const scalar = @import("scalar.zig");
 pub const parameters = @import("parameters.zig");
 pub const manifest = @import("manifest.zig");
@@ -17,6 +18,7 @@ test {
     _ = canonical_json;
     _ = closure;
     _ = json;
+    _ = json_pointer;
     _ = scalar;
     _ = parameters;
     _ = manifest;

@@ -64,12 +64,40 @@ const TransactionArgs = struct {
     }
 };
 
+const ProjectionArgs = struct {
+    definition_path: []const u8,
+    projection: []const u8,
+    repo_path: []const u8,
+    format: Format,
+    parameter_specs: []const []const u8,
+    payload_only: bool,
+
+    fn deinit(self: *ProjectionArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.parameter_specs);
+        self.* = undefined;
+    }
+};
+
+const DoctorArgs = struct {
+    definition_path: []const u8,
+    repo_path: []const u8,
+    format: Format,
+    parameter_specs: []const []const u8,
+
+    fn deinit(self: *DoctorArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.parameter_specs);
+        self.* = undefined;
+    }
+};
+
 const DefinitionContext = struct {
     closure: definition_core.Closure,
+    entry_path: []u8,
     plan: ledger.definition.Plan,
 
     fn deinit(self: *DefinitionContext, allocator: std.mem.Allocator) void {
         self.plan.deinit(allocator);
+        allocator.free(self.entry_path);
         self.closure.deinit(allocator);
         self.* = undefined;
     }
@@ -136,10 +164,11 @@ pub fn runWithArgv(
     if (std.mem.eql(u8, argv[1], "transact")) {
         return runTransact(allocator, argv[2..]);
     }
-    if (std.mem.eql(u8, argv[1], "project") or
-        std.mem.eql(u8, argv[1], "doctor"))
-    {
-        return error.CommandKernelNotImplemented;
+    if (std.mem.eql(u8, argv[1], "project")) {
+        return runProject(allocator, argv[2..]);
+    }
+    if (std.mem.eql(u8, argv[1], "doctor")) {
+        return runDoctor(allocator, argv[2..]);
     }
     return error.UnknownCommand;
 }
@@ -180,6 +209,8 @@ fn runTransact(
     var result = ledger.transaction.transact(
         allocator,
         &context.plan,
+        &context.closure,
+        context.entry_path,
         &validation_plan,
         &storage_plan,
         args.operation,
@@ -193,6 +224,88 @@ fn runTransact(
     defer result.deinit(allocator);
     try emitTransaction(allocator, args.common.format, &result);
     return if (result.validation_result.valid) 0 else 2;
+}
+
+fn runDoctor(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    var args = try parseDoctorArgs(allocator, argv);
+    defer args.deinit(allocator);
+    var context = try loadDefinition(allocator, args.definition_path);
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.plan.parameter_declarations,
+        args.parameter_specs,
+    );
+    defer bindings.deinit(allocator);
+    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
+    defer storage_plan.deinit(allocator);
+    try durable_store.rejectSymlinkComponents(args.repo_path);
+    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        args.repo_path,
+        allocator,
+    );
+    defer allocator.free(repo_root);
+    var result = try ledger.doctor.execute(
+        allocator,
+        &context.plan,
+        &storage_plan,
+        repo_root,
+    );
+    defer result.deinit(allocator);
+    try emitDoctor(allocator, args.format, &result);
+    return if (result.healthy) 0 else 2;
+}
+
+fn runProject(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    var args = try parseProjectionArgs(allocator, argv);
+    defer args.deinit(allocator);
+    var context = try loadDefinition(allocator, args.definition_path);
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.plan.parameter_declarations,
+        args.parameter_specs,
+    );
+    defer bindings.deinit(allocator);
+    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
+    defer storage_plan.deinit(allocator);
+    var projection_plan = try ledger.projection.compile(
+        allocator,
+        &context.plan,
+        &storage_plan,
+    );
+    defer projection_plan.deinit(allocator);
+    try durable_store.rejectSymlinkComponents(args.repo_path);
+    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        args.repo_path,
+        allocator,
+    );
+    defer allocator.free(repo_root);
+    var result = try ledger.projection.execute(
+        allocator,
+        &context.plan,
+        &storage_plan,
+        &projection_plan,
+        args.projection,
+        repo_root,
+        &bindings,
+    );
+    defer result.deinit(allocator);
+    try emitProjection(
+        allocator,
+        args.format,
+        args.payload_only,
+        &result,
+    );
+    return 0;
 }
 
 fn runDefinitionCheck(
@@ -210,6 +323,12 @@ fn runDefinitionCheck(
         &context.plan,
     );
     defer storage_plan.deinit(allocator);
+    var projection_plan = try ledger.projection.compile(
+        allocator,
+        &context.plan,
+        &storage_plan,
+    );
+    defer projection_plan.deinit(allocator);
     switch (args.format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
@@ -485,6 +604,121 @@ fn parseTransactionArgs(
     };
 }
 
+fn parseProjectionArgs(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !ProjectionArgs {
+    var definition_path: ?[]const u8 = null;
+    var projection: ?[]const u8 = null;
+    var repo_path: ?[]const u8 = null;
+    var format: Format = .json;
+    var payload_only = false;
+    var parameters: std.ArrayList([]const u8) = .empty;
+    errdefer parameters.deinit(allocator);
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const token = argv[index];
+        if (std.mem.eql(u8, token, "--definition")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (definition_path != null) return error.DuplicateDefinitionOption;
+            definition_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--projection")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (projection != null) return error.DuplicateProjectionOption;
+            projection = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--repo")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (repo_path != null) return error.DuplicateRepositoryOption;
+            repo_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--format")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            format = try Format.parse(argv[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--param")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            try parameters.append(allocator, argv[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--payload-only")) {
+            if (payload_only) return error.DuplicatePayloadOnlyOption;
+            payload_only = true;
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    if (payload_only and format != .json) {
+        return error.PayloadOnlyRequiresJson;
+    }
+    return .{
+        .definition_path = definition_path orelse return error.MissingDefinition,
+        .projection = projection orelse return error.MissingProjection,
+        .repo_path = repo_path orelse return error.MissingRepository,
+        .format = format,
+        .parameter_specs = try parameters.toOwnedSlice(allocator),
+        .payload_only = payload_only,
+    };
+}
+
+fn parseDoctorArgs(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !DoctorArgs {
+    var definition_path: ?[]const u8 = null;
+    var repo_path: ?[]const u8 = null;
+    var format: Format = .json;
+    var parameters: std.ArrayList([]const u8) = .empty;
+    errdefer parameters.deinit(allocator);
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const token = argv[index];
+        if (std.mem.eql(u8, token, "--definition")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (definition_path != null) return error.DuplicateDefinitionOption;
+            definition_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--repo")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (repo_path != null) return error.DuplicateRepositoryOption;
+            repo_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--format")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            format = try Format.parse(argv[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--param")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            try parameters.append(allocator, argv[index]);
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    return .{
+        .definition_path = definition_path orelse return error.MissingDefinition,
+        .repo_path = repo_path orelse return error.MissingRepository,
+        .format = format,
+        .parameter_specs = try parameters.toOwnedSlice(allocator),
+    };
+}
+
 fn loadDefinition(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -509,8 +743,14 @@ fn loadDefinition(
         .{},
     );
     errdefer closure.deinit(allocator);
+    const entry_path = try allocator.dupe(u8, entry);
+    errdefer allocator.free(entry_path);
     const plan = try ledger.definition.compile(allocator, &closure, entry);
-    return .{ .closure = closure, .plan = plan };
+    return .{
+        .closure = closure,
+        .entry_path = entry_path,
+        .plan = plan,
+    };
 }
 
 fn readDocuments(
@@ -692,6 +932,60 @@ fn emitTransactionError(err: anyerror) !void {
         err,
     );
     try stdout_writer.interface.writeByte('\n');
+}
+
+fn emitProjection(
+    allocator: std.mem.Allocator,
+    format: Format,
+    payload_only: bool,
+    result: *const ledger.projection.Result,
+) !void {
+    if (payload_only) {
+        try writeStdout(result.payload);
+        try writeStdout("\n");
+        return;
+    }
+    switch (format) {
+        .json => {
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            try ledger.envelope.writeProjectionJson(&output.writer, result);
+            try output.writer.writeByte('\n');
+            try writeStdout(output.written());
+        },
+        .text => {
+            try writeStdout(result.payload);
+            try writeStdout("\n");
+        },
+    }
+}
+
+fn emitDoctor(
+    allocator: std.mem.Allocator,
+    format: Format,
+    result: *const ledger.doctor.Result,
+) !void {
+    switch (format) {
+        .json => {
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            try ledger.envelope.writeDoctorJson(&output.writer, result);
+            try output.writer.writeByte('\n');
+            try writeStdout(output.written());
+        },
+        .text => {
+            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            try stdout_writer.interface.print(
+                "{s} {s}@{s}; pending_transactions={d}\n",
+                .{
+                    if (result.healthy) "healthy" else "unhealthy",
+                    result.definition_id,
+                    result.definition_digest[0..],
+                    result.pending_transactions,
+                },
+            );
+        },
+    }
 }
 
 fn emitCapabilities(argv: []const []const u8) !u8 {

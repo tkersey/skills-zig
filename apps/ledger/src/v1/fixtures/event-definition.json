@@ -8,13 +8,16 @@
       "atomic-transaction",
       "compare-and-append",
       "exact-object",
-      "idempotency-key"
+      "idempotency-key",
+      "latest",
+      "limit",
+      "select"
     ]
   },
   "parameters": {
     "request": {
       "type": "safe_identifier",
-      "required": true
+      "required": false
     }
   },
   "inputs": {
@@ -63,7 +66,40 @@
       ]
     }
   },
-  "projections": {},
+  "projections": {
+    "all": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "select",
+          "fields": {
+            "kind": "/kind",
+            "value": "/value"
+          }
+        },
+        {
+          "op": "limit",
+          "count": 100
+        }
+      ]
+    },
+    "latest": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "latest",
+          "path": "/value"
+        },
+        {
+          "op": "select",
+          "fields": {
+            "kind": "/kind",
+            "value": "/value"
+          }
+        }
+      ]
+    }
+  },
   "diagnostics": {},
   "bounds": {
     "max_input_bytes": 4096,

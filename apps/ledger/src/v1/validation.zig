@@ -36,17 +36,7 @@ pub const Result = struct {
     }
 };
 
-const Pointer = struct {
-    raw: []u8,
-    segments: [][]u8,
-
-    fn deinit(self: *Pointer, allocator: std.mem.Allocator) void {
-        allocator.free(self.raw);
-        for (self.segments) |segment| allocator.free(segment);
-        allocator.free(self.segments);
-        self.* = undefined;
-    }
-};
+const Pointer = definition_core.json_pointer.Pointer;
 
 const JsonKind = enum {
     string,
@@ -141,7 +131,10 @@ const Builder = struct {
             if (std.mem.eql(u8, pointer.raw, raw)) return @intCast(index);
         }
         if (self.pointers.items.len == 65_535) return error.TooManyJsonPointers;
-        try self.pointers.append(self.allocator, try compilePointer(self.allocator, raw));
+        try self.pointers.append(
+            self.allocator,
+            try definition_core.json_pointer.compile(self.allocator, raw),
+        );
         return @intCast(self.pointers.items.len - 1);
     }
 
@@ -610,24 +603,7 @@ fn countPresent(plan: *const Plan, root: std.json.Value, rule: CompiledRule) boo
 }
 
 fn resolve(root: std.json.Value, pointer: Pointer) ?std.json.Value {
-    var current = root;
-    for (pointer.segments) |segment| {
-        current = switch (current) {
-            .object => |object| object.get(segment) orelse return null,
-            .array => |array| blk: {
-                if (segment.len == 0 or
-                    (segment.len > 1 and segment[0] == '0'))
-                {
-                    return null;
-                }
-                const index = std.fmt.parseInt(usize, segment, 10) catch return null;
-                if (index >= array.items.len) return null;
-                break :blk array.items[index];
-            },
-            else => return null,
-        };
-    }
-    return current;
+    return definition_core.json_pointer.lookup(root, pointer);
 }
 
 fn exactObject(value: std.json.Value, keys: []const []u8) bool {
@@ -869,41 +845,6 @@ fn validateJsonl(
         };
         parsed.deinit();
     }
-}
-
-fn compilePointer(allocator: std.mem.Allocator, raw: []const u8) !Pointer {
-    if (raw.len != 0 and raw[0] != '/') return error.InvalidJsonPointer;
-    var segments: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (segments.items) |segment| allocator.free(segment);
-        segments.deinit(allocator);
-    }
-    if (raw.len != 0) {
-        var iterator = std.mem.splitScalar(u8, raw[1..], '/');
-        while (iterator.next()) |encoded| {
-            var decoded: std.Io.Writer.Allocating = .init(allocator);
-            errdefer decoded.deinit();
-            var index: usize = 0;
-            while (index < encoded.len) : (index += 1) {
-                if (encoded[index] != '~') {
-                    try decoded.writer.writeByte(encoded[index]);
-                    continue;
-                }
-                if (index + 1 >= encoded.len) return error.InvalidJsonPointer;
-                index += 1;
-                try decoded.writer.writeByte(switch (encoded[index]) {
-                    '0' => '~',
-                    '1' => '/',
-                    else => return error.InvalidJsonPointer,
-                });
-            }
-            try segments.append(allocator, try decoded.toOwnedSlice());
-        }
-    }
-    return .{
-        .raw = try allocator.dupe(u8, raw),
-        .segments = try segments.toOwnedSlice(allocator),
-    };
 }
 
 fn parseStringSet(

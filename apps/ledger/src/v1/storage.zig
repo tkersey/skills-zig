@@ -334,6 +334,13 @@ fn compileEffect(
     if (kind == .compare_append and slots[slot_index].kind != .event_log) {
         return error.AppendRequiresEventLogSlot;
     }
+    const input_codec = definition_plan.inputs[input_index].codec;
+    if (kind == .compare_append and input_codec != .json) {
+        return error.AppendInputMustBeJson;
+    }
+    if (kind != .compare_append and input_codec != slots[slot_index].codec) {
+        return error.StorageInputCodecMismatch;
+    }
     const expected_revision_parameter = try optionalParameterName(
         allocator,
         definition_plan,

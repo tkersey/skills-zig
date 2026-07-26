@@ -4,6 +4,8 @@ const definition = @import("definition.zig");
 const validation = @import("validation.zig");
 const materialization = @import("materialization.zig");
 const transaction = @import("transaction.zig");
+const projection_runtime = @import("projection.zig");
+const doctor = @import("doctor.zig");
 
 pub fn writeValidationJson(
     writer: *std.Io.Writer,
@@ -240,6 +242,115 @@ pub fn writeTransactionErrorJson(
     );
     try writer.writeAll(
         ",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
+    );
+}
+
+pub fn writeProjectionJson(
+    writer: *std.Io.Writer,
+    result: *const projection_runtime.Result,
+) !void {
+    try writer.writeAll(
+        "{\"schema\":\"ledger-projection-result/v1\",\"definition\":{\"id\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.definition_id,
+    );
+    try writer.writeAll(",\"digest\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.definition_digest[0..],
+    );
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(definition.abi);
+    try writer.writeAll("\"},\"store\":{\"logical_ref\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.logical_ref,
+    );
+    try writer.writeAll(",\"revision\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.revision,
+    );
+    try writer.writeAll("},\"projection\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.projection,
+    );
+    try writer.writeAll(",\"data\":");
+    try writer.writeAll(result.payload);
+    try writer.print(
+        ",\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"limitations\":[",
+        .{
+            result.stats.records_scanned,
+            result.stats.records_matched,
+            result.stats.records_emitted,
+        },
+    );
+    for (result.limitations, 0..) |limitation, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            limitation,
+        );
+    }
+    try writer.writeAll(
+        "],\"authority_granted\":false,\"storage_mutated\":false}",
+    );
+}
+
+pub fn writeDoctorJson(
+    writer: *std.Io.Writer,
+    result: *const doctor.Result,
+) !void {
+    try writer.writeAll(
+        "{\"schema\":\"ledger-doctor-result/v1\",\"definition\":{\"id\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.definition_id,
+    );
+    try writer.writeAll(",\"digest\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.definition_digest[0..],
+    );
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(definition.abi);
+    try writer.print(
+        "\"}},\"healthy\":{s},\"pending_transactions\":{d},\"slots\":[",
+        .{
+            if (result.healthy) "true" else "false",
+            result.pending_transactions,
+        },
+    );
+    for (result.slots, 0..) |slot, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"name\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            slot.name,
+        );
+        try writer.writeAll(",\"logical_ref\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            slot.logical_ref,
+        );
+        try writer.writeAll(",\"revision\":");
+        try writeOptionalString(writer, slot.revision);
+        try writer.print(
+            ",\"binding_rows\":{d},\"healthy\":{s},\"error_code\":",
+            .{
+                slot.binding_rows,
+                if (slot.healthy) "true" else "false",
+            },
+        );
+        try writeOptionalString(writer, slot.error_code);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll(
+        "],\"authority_granted\":false,\"storage_mutated\":false}",
     );
 }
 
