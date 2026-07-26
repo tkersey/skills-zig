@@ -91,6 +91,7 @@ const CompiledRule = struct {
     other_pointer_id: ?u16 = null,
     path_ids: []u16,
     keys: [][]u8,
+    optional_keys: [][]u8,
     values: []EnumScalar,
     scalar_kind: ?JsonKind = null,
     min_count: ?usize = null,
@@ -107,6 +108,8 @@ const CompiledRule = struct {
         allocator.free(self.path_ids);
         for (self.keys) |key| allocator.free(key);
         allocator.free(self.keys);
+        for (self.optional_keys) |key| allocator.free(key);
+        allocator.free(self.optional_keys);
         for (self.values) |*value| value.deinit(allocator);
         allocator.free(self.values);
         for (self.children) |*child| child.deinit(allocator);
@@ -200,15 +203,18 @@ const Builder = struct {
             .pointer_id = source.pointer_id,
             .path_ids = try self.allocator.alloc(u16, 0),
             .keys = try self.allocator.alloc([]u8, 0),
+            .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
         };
         errdefer rule.deinit(self.allocator);
 
         switch (source.operator) {
-            .exact_object => rule.keys = try parseStringSet(
+            .exact_object => try compileExactObjectRule(
                 self.allocator,
-                try definition_core.json.field(object, "keys"),
+                object,
+                true,
+                &rule,
             ),
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
@@ -631,21 +637,18 @@ const Builder = struct {
             .pointer_id = pointer_id,
             .path_ids = try self.allocator.alloc(u16, 0),
             .keys = try self.allocator.alloc([]u8, 0),
+            .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
         };
         errdefer rule.deinit(self.allocator);
         switch (operator) {
-            .exact_object => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "keys" },
-                );
-                rule.keys = try parseStringSet(
-                    self.allocator,
-                    try definition_core.json.field(object, "keys"),
-                );
-            },
+            .exact_object => try compileExactObjectRule(
+                self.allocator,
+                object,
+                false,
+                &rule,
+            ),
             .required_field,
             .optional_field,
             .digest,
@@ -894,7 +897,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(6);
+    try encoder.writeU16(7);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -926,7 +929,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 6) {
+    if (try decoder.readU16() != 7) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1125,6 +1128,8 @@ fn encodeCompiledRule(
     for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
     try encoder.writeCount(rule.keys.len);
     for (rule.keys) |key| try encoder.writeBytes(key);
+    try encoder.writeCount(rule.optional_keys.len);
+    for (rule.optional_keys) |key| try encoder.writeBytes(key);
     try encoder.writeCount(rule.values.len);
     for (rule.values) |value| try encodeEnumScalar(encoder, value);
     try encoder.writeBool(rule.scalar_kind != null);
@@ -1212,6 +1217,11 @@ fn decodeCacheRule(
         for (keys) |key| allocator.free(key);
         allocator.free(keys);
     }
+    const optional_keys = try decodeKeys(allocator, decoder);
+    errdefer {
+        for (optional_keys) |key| allocator.free(key);
+        allocator.free(optional_keys);
+    }
     const values = try decodeEnumScalars(allocator, decoder);
     errdefer {
         for (values) |*value| value.deinit(allocator);
@@ -1268,6 +1278,7 @@ fn decodeCacheRule(
         .other_pointer_id = other_pointer_id,
         .path_ids = path_ids,
         .keys = keys,
+        .optional_keys = optional_keys,
         .values = values,
         .scalar_kind = scalar_kind,
         .min_count = min_count,
@@ -1510,6 +1521,18 @@ fn validateCachedRule(
         rule.keys.len != 0)
     {
         return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .exact_object and rule.optional_keys.len != 0) {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator == .exact_object) {
+        for (rule.keys) |required| {
+            for (rule.optional_keys) |optional| {
+                if (std.mem.eql(u8, required, optional)) {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+            }
+        }
     }
     if (rule.operator != .one_of and
         rule.operator != .all_rules and
@@ -1878,7 +1901,7 @@ fn applyRule(
     const valid = switch (rule.operator) {
         .required_field => target != null,
         .optional_field => true,
-        .exact_object => if (target) |value| exactObject(value, rule.keys) else false,
+        .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
@@ -2045,7 +2068,7 @@ fn itemRuleHolds(
     return switch (rule.operator) {
         .required_field => target != null,
         .optional_field => true,
-        .exact_object => if (target) |value| exactObject(value, rule.keys) else false,
+        .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
@@ -2371,13 +2394,25 @@ fn resolve(root: std.json.Value, pointer: Pointer) ?std.json.Value {
     return definition_core.json_pointer.lookup(root, pointer);
 }
 
-fn exactObject(value: std.json.Value, keys: []const []u8) bool {
+fn exactObject(value: std.json.Value, rule: CompiledRule) bool {
     const object = switch (value) {
         .object => |object| object,
         else => return false,
     };
-    if (object.count() != keys.len) return false;
-    for (keys) |key| if (!object.contains(key)) return false;
+    if (object.count() < rule.keys.len or
+        object.count() > rule.keys.len + rule.optional_keys.len)
+    {
+        return false;
+    }
+    for (rule.keys) |key| if (!object.contains(key)) return false;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsString(rule.keys, entry.key_ptr.*) and
+            !containsString(rule.optional_keys, entry.key_ptr.*))
+        {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2822,6 +2857,52 @@ fn compileRelativePathRule(
     }
 }
 
+fn compileExactObjectRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    allow_input: bool,
+    rule: *CompiledRule,
+) !void {
+    if (allow_input) {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{
+                "op",
+                "input",
+                "path",
+                "keys",
+                "required_keys",
+                "optional_keys",
+            },
+        );
+    } else {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "keys", "required_keys", "optional_keys" },
+        );
+    }
+    if (object.get("keys")) |raw| {
+        if (object.contains("required_keys") or
+            object.contains("optional_keys"))
+        {
+            return error.AmbiguousExactObjectKeys;
+        }
+        rule.keys = try parseStringSet(allocator, raw);
+        return;
+    }
+    const required = object.get("required_keys") orelse
+        return error.MissingExactObjectKeys;
+    rule.keys = try parseStringSet(allocator, required);
+    if (object.get("optional_keys")) |raw| {
+        rule.optional_keys = try parseStringSet(allocator, raw);
+    }
+    for (rule.keys) |required_key| {
+        if (containsString(rule.optional_keys, required_key)) {
+            return error.OverlappingExactObjectKeys;
+        }
+    }
+}
+
 fn parseStringSet(
     allocator: std.mem.Allocator,
     raw: std.json.Value,
@@ -2847,6 +2928,13 @@ fn parseStringSet(
         if (std.mem.eql(u8, out[index - 1], value)) return error.DuplicateRuleValue;
     }
     return out;
+}
+
+fn containsString(values: []const []u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
 }
 
 fn parseEnumValues(
@@ -3343,7 +3431,7 @@ test "definition references compile imported validators and survive cache round 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "packet.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/packet","owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["receipt"]},{"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/packet","owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","required_keys":["receipt"],"optional_keys":["metadata"]},{"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -3414,6 +3502,18 @@ test "definition references compile imported validators and survive cache round 
     defer valid.deinit(std.testing.allocator);
     try std.testing.expect(valid.valid);
 
+    var valid_with_optional = try validate(
+        std.testing.allocator,
+        &cached_definition,
+        &cached,
+        &.{.{
+            .name = "packet",
+            .bytes = "{\"metadata\":{},\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+        }},
+    );
+    defer valid_with_optional.deinit(std.testing.allocator);
+    try std.testing.expect(valid_with_optional.valid);
+
     var invalid = try validate(
         std.testing.allocator,
         &cached_definition,
@@ -3425,6 +3525,18 @@ test "definition references compile imported validators and survive cache round 
     );
     defer invalid.deinit(std.testing.allocator);
     try std.testing.expect(!invalid.valid);
+
+    var unknown_key = try validate(
+        std.testing.allocator,
+        &cached_definition,
+        &cached,
+        &.{.{
+            .name = "packet",
+            .bytes = "{\"other\":{},\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+        }},
+    );
+    defer unknown_key.deinit(std.testing.allocator);
+    try std.testing.expect(!unknown_key.valid);
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
