@@ -811,11 +811,12 @@ fn prepareEffect(
         .bind_existing => return error.BindingOperationRequiresMigrationPath,
     }
     if (effect.expected_revision_parameter) |parameter_name| {
-        if (parameterText(parameters, parameter_name)) |expected_revision| {
-            const actual = slot_before_digest orelse return error.RevisionMismatch;
-            if (!std.mem.eql(u8, actual, expected_revision)) {
-                return error.RevisionMismatch;
-            }
+        const expected_revision =
+            parameterText(parameters, parameter_name) orelse
+            return error.MissingOperationParameter;
+        const actual = slot_before_digest orelse return error.RevisionMismatch;
+        if (!std.mem.eql(u8, actual, expected_revision)) {
+            return error.RevisionMismatch;
         }
     }
 
@@ -1708,7 +1709,7 @@ test "document replacements replay from immutable prior revisions" {
     try definition_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "document.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/document-history","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-replace","create-new","exact-object","idempotency-key"]},"parameters":{"request":{"type":"safe_identifier","required":false}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"addressed-document","slots":{"current":{"path":"example/current.json","kind":"document","codec":"json","max_bytes":4096}}},"operations":{"create":{"effects":[{"op":"create-new","slot":"current","input":"record"}]},"replace":{"effects":[{"op":"compare-and-replace","slot":"current","input":"record","idempotency_param":"request"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/document-history","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-replace","create-new","exact-object","idempotency-key"]},"parameters":{"request":{"type":"safe_identifier","required":false},"revision":{"type":"digest","required":false}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"addressed-document","slots":{"current":{"path":"example/current.json","kind":"document","codec":"json","max_bytes":4096}}},"operations":{"create":{"effects":[{"op":"create-new","slot":"current","input":"record"}]},"replace":{"effects":[{"op":"compare-and-replace","slot":"current","input":"record","expected_revision_param":"revision","idempotency_param":"request"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -1763,6 +1764,34 @@ test "document replacements replay from immutable prior revisions" {
         &parameters,
     );
     defer created.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.MissingOperationParameter,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "document.json",
+            &validation_plan,
+            &storage_plan,
+            null,
+            "replace",
+            repo_root,
+            &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
+            &parameters,
+        ),
+    );
+    var replace_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "request", .raw_value = "replace-once" },
+            .{
+                .name = "revision",
+                .raw_value = created.effects[0].revision_after,
+            },
+        },
+    );
+    defer replace_parameters.deinit(std.testing.allocator);
     var replaced = try transact(
         std.testing.allocator,
         &definition_plan,
@@ -1774,11 +1803,23 @@ test "document replacements replay from immutable prior revisions" {
         "replace",
         repo_root,
         &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
-        &parameters,
+        &replace_parameters,
     );
     defer replaced.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("created", created.effects[0].result);
     try std.testing.expectEqualStrings("replaced", replaced.effects[0].result);
+    var duplicate_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "request", .raw_value = "replace-once" },
+            .{
+                .name = "revision",
+                .raw_value = replaced.effects[0].revision_after,
+            },
+        },
+    );
+    defer duplicate_parameters.deinit(std.testing.allocator);
     var duplicate = try transact(
         std.testing.allocator,
         &definition_plan,
@@ -1790,7 +1831,7 @@ test "document replacements replay from immutable prior revisions" {
         "replace",
         repo_root,
         &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
-        &parameters,
+        &duplicate_parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(!duplicate.storage_mutated);
@@ -1851,7 +1892,7 @@ test "document replacements replay from immutable prior revisions" {
             "replace",
             repo_root,
             &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
-            &parameters,
+            &duplicate_parameters,
         ),
     );
     try std.testing.expectError(
