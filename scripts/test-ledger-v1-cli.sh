@@ -8,6 +8,9 @@ invalid_input=apps/ledger/src/v1/fixtures/record-invalid.json
 event_definition=apps/ledger/src/v1/fixtures/event-definition.json
 event_input=apps/ledger/src/v1/fixtures/event-one.json
 event_two=apps/ledger/src/v1/fixtures/event-two.json
+event_snapshot_definition=apps/ledger/src/v1/fixtures/event-snapshot-definition.json
+event_snapshot_initial=apps/ledger/src/v1/fixtures/event-snapshot-initial.jsonl
+event_snapshot_replacement=apps/ledger/src/v1/fixtures/event-snapshot-replacement.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 repo_dir=$(mktemp -d "$temp_base/ledger-v1-smoke.XXXXXX")
 legacy_repo=$(mktemp -d "$temp_base/ledger-v1-bind.XXXXXX")
@@ -214,6 +217,51 @@ mixed_doctor=$("$binary" doctor \
 grep -Fq '"healthy":true' <<<"$mixed_doctor"
 grep -Fq '"binding_rows":2' <<<"$mixed_doctor"
 cp "$legacy_repo/.ledger/example/events.jsonl" "$legacy_repo/events.after-append"
+test ! -d "$repo_dir/.ledger/.revisions" ||
+  test -z "$(find "$repo_dir/.ledger/.revisions" -type f -print -quit)"
+
+snapshot_create=$("$binary" transact \
+  --definition "$event_snapshot_definition" \
+  --operation create \
+  --repo "$repo_dir" \
+  --input "snapshot=$event_snapshot_initial" \
+  --format json)
+grep -Fq '"result":"created"' <<<"$snapshot_create"
+
+snapshot_replace=$("$binary" transact \
+  --definition "$event_snapshot_definition" \
+  --operation replace \
+  --repo "$repo_dir" \
+  --input "snapshot=$event_snapshot_replacement" \
+  --param request=snapshot-replace \
+  --format json)
+grep -Fq '"result":"replaced"' <<<"$snapshot_replace"
+compgen -G "$repo_dir/.ledger/.revisions/*.bin" >/dev/null
+
+snapshot_duplicate=$("$binary" transact \
+  --definition "$event_snapshot_definition" \
+  --operation replace \
+  --repo "$repo_dir" \
+  --input "snapshot=$event_snapshot_replacement" \
+  --param request=snapshot-replace \
+  --format json)
+grep -Fq '"result":"idempotent"' <<<"$snapshot_duplicate"
+grep -Fq '"storage_mutated":false' <<<"$snapshot_duplicate"
+
+snapshot_projection=$("$binary" project \
+  --definition "$event_snapshot_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"data":[{"kind":"three","value":3}]' \
+  <<<"$snapshot_projection"
+
+snapshot_doctor=$("$binary" doctor \
+  --definition "$event_snapshot_definition" \
+  --repo "$repo_dir" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$snapshot_doctor"
+grep -Fq '"binding_rows":2' <<<"$snapshot_doctor"
 
 set +e
 duplicate_binding=$("$binary" transact \

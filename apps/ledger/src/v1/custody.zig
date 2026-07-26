@@ -75,6 +75,7 @@ pub const BindingSnapshot = struct {
     last_revision: ?[]u8,
     rows: []BindingRow,
     idempotency_match: bool,
+    idempotency_match_index: ?usize,
 
     pub fn deinit(self: *BindingSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.bytes);
@@ -197,6 +198,7 @@ pub fn readBindingSnapshot(
             .last_revision = null,
             .rows = try allocator.alloc(BindingRow, 0),
             .idempotency_match = false,
+            .idempotency_match_index = null,
         },
         else => return err,
     };
@@ -214,6 +216,7 @@ pub fn readBindingSnapshot(
     var last_revision: ?[]u8 = null;
     errdefer if (last_revision) |revision| allocator.free(revision);
     var idempotency_match = false;
+    var idempotency_match_index: ?usize = null;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
@@ -370,7 +373,11 @@ pub fn readBindingSnapshot(
                     query.input_digest,
                     row_input_digest,
                 )) return error.IdempotencyConflict;
+                if (idempotency_match_index != null) {
+                    return error.DuplicateIdempotencyMatch;
+                }
                 idempotency_match = true;
+                idempotency_match_index = rows.items.len;
             }
         }
         const owned_definition_digest = try allocator.dupe(
@@ -429,6 +436,7 @@ pub fn readBindingSnapshot(
         .last_revision = last_revision,
         .rows = try rows.toOwnedSlice(allocator),
         .idempotency_match = idempotency_match,
+        .idempotency_match_index = idempotency_match_index,
     };
 }
 

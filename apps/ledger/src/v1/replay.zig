@@ -4,6 +4,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
+const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
@@ -96,108 +97,241 @@ pub fn validateSlot(
         .definition_id = definition_id,
     };
     defer cache.deinit();
-    const records_validated = switch (slot.kind) {
-        .event_log => try validateEventLog(
-            allocator,
-            &cache,
-            slot,
-            snapshot,
-        ),
-        .document => try validateDocument(
-            allocator,
-            &cache,
-            slot,
-            snapshot,
-        ),
-    };
+    const records_validated = try validateHistory(
+        allocator,
+        &cache,
+        slot,
+        snapshot,
+    );
     return .{
         .records_validated = records_validated,
         .definition_versions = cache.plans.items.len,
     };
 }
 
-fn validateEventLog(
+fn validateHistory(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
     current_slot: storage.Slot,
     snapshot: *const custody.SlotSnapshot,
 ) !usize {
+    if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
+    var epoch_start: usize = 0;
+    for (snapshot.binding.rows, 0..) |row, index| {
+        const resolved = try resolveEffect(cache, current_slot, row);
+        if (row.kind == .admission and
+            resolved.effect.kind == .compare_replace)
+        {
+            if (index == epoch_start) {
+                return error.HistoricalReplaceWithoutState;
+            }
+            const prior_revision = row.revision_before orelse
+                return error.HistoricalReplaceWithoutState;
+            const prior_content = try revision_archive.load(
+                allocator,
+                cache.repo_root,
+                prior_revision,
+                resolved.slot.max_bytes,
+            );
+            defer allocator.free(prior_content);
+            _ = try validateEpoch(
+                allocator,
+                cache,
+                current_slot,
+                snapshot.binding.rows[epoch_start..index],
+                prior_content,
+            );
+            epoch_start = index;
+        }
+    }
+    return validateEpoch(
+        allocator,
+        cache,
+        current_slot,
+        snapshot.binding.rows[epoch_start..],
+        snapshot.content,
+    );
+}
+
+const ResolvedEffect = struct {
+    archived: *const ArchivedPlan,
+    effect: storage.Effect,
+    slot: storage.Slot,
+};
+
+fn resolveEffect(
+    cache: *PlanCache,
+    current_slot: storage.Slot,
+    row: custody.BindingRow,
+) !ResolvedEffect {
+    const archived = try cache.get(row.definition_digest);
+    const operation = archived.storage_plan.findOperation(
+        row.operation,
+    ) orelse return error.HistoricalOperationMissing;
+    const effect = findEffectForSlot(
+        &archived.storage_plan,
+        operation,
+        current_slot,
+    ) orelse return error.HistoricalEffectMissing;
+    const historical_slot = archived.storage_plan.slots[effect.slot_index];
+    if (historical_slot.kind != current_slot.kind or
+        historical_slot.codec != current_slot.codec)
+    {
+        return error.HistoricalSlotShapeMismatch;
+    }
+    return .{
+        .archived = archived,
+        .effect = effect,
+        .slot = historical_slot,
+    };
+}
+
+fn validateEpoch(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    current_slot: storage.Slot,
+    rows: []const custody.BindingRow,
+    content: []const u8,
+) !usize {
+    if (rows.len == 0) return error.InvalidStoreBinding;
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        content,
+    );
+    defer allocator.free(digest);
+    if (!std.mem.eql(u8, digest, rows[rows.len - 1].revision_after)) {
+        return error.HistoricalRevisionMismatch;
+    }
+    return switch (current_slot.kind) {
+        .document => validateDocumentEpoch(
+            allocator,
+            cache,
+            current_slot,
+            rows,
+            content,
+        ),
+        .event_log => validateEventEpoch(
+            allocator,
+            cache,
+            current_slot,
+            rows,
+            content,
+        ),
+    };
+}
+
+fn validateDocumentEpoch(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    current_slot: storage.Slot,
+    rows: []const custody.BindingRow,
+    content: []const u8,
+) !usize {
+    if (rows.len != 1) return error.HistoricalDocumentReplayInvalid;
+    const row = rows[0];
+    try validateBoundExtent(allocator, row, content);
+    if (row.record_start != null or row.record_end != null or
+        row.extent_start != 0 or row.extent_end != content.len)
+    {
+        return error.StoreBindingExtentMismatch;
+    }
+    const resolved = try resolveEffect(cache, current_slot, row);
+    switch (row.kind) {
+        .existing_store_binding => {
+            if (resolved.effect.kind != .bind_existing) {
+                return error.HistoricalEffectKindMismatch;
+            }
+        },
+        .admission => if (resolved.effect.kind != .create_new and
+            resolved.effect.kind != .compare_replace)
+        {
+            return error.HistoricalEffectKindMismatch;
+        },
+    }
+    try validateInput(
+        allocator,
+        resolved.archived,
+        resolved.effect,
+        content,
+        row.kind == .admission,
+    );
+    return 1;
+}
+
+fn validateEventEpoch(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    current_slot: storage.Slot,
+    rows: []const custody.BindingRow,
+    content: []const u8,
+) !usize {
     var records: std.ArrayList([]const u8) = .empty;
     defer records.deinit(allocator);
-    var lines = std.mem.splitScalar(u8, snapshot.content, '\n');
+    var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
         if (line.len == 0) continue;
         try records.append(allocator, line);
     }
+    if (records.items.len == 0) return error.HistoricalArtifactInvalid;
     var expected_start: usize = 0;
-    for (snapshot.binding.rows) |row| {
+    for (rows, 0..) |row, index| {
         const record_start = row.record_start orelse
             return error.StoreBindingRecordRangeMissing;
         const record_end = row.record_end orelse
             return error.StoreBindingRecordRangeMissing;
-        if (record_start != expected_start or record_end > records.items.len) {
+        if (record_start != expected_start or
+            record_end > records.items.len)
+        {
             return error.StoreBindingRecordCountMismatch;
         }
-        try validateBoundExtent(allocator, row, snapshot.content);
+        try validateBoundExtent(allocator, row, content);
+        const resolved = try resolveEffect(cache, current_slot, row);
         switch (row.kind) {
             .existing_store_binding => {
-                const archived = try cache.get(row.definition_digest);
-                const operation = archived.storage_plan.findOperation(
-                    row.operation,
-                ) orelse return error.HistoricalOperationMissing;
-                const effect = findEffectForSlot(
-                    &archived.storage_plan,
-                    operation,
-                    current_slot,
-                ) orelse return error.HistoricalEffectMissing;
-                if (effect.kind != .bind_existing) {
+                if (index != 0 or resolved.effect.kind != .bind_existing) {
                     return error.HistoricalEffectKindMismatch;
                 }
                 for (records.items[record_start..record_end]) |record| {
                     try validateInput(
                         allocator,
-                        archived,
-                        effect,
+                        resolved.archived,
+                        resolved.effect,
                         record,
                         false,
                     );
                 }
             },
-            .admission => {
-                const archived = try cache.get(row.definition_digest);
-                const operation = archived.storage_plan.findOperation(
-                    row.operation,
-                ) orelse return error.HistoricalOperationMissing;
-                const effect = findEffectForSlot(
-                    &archived.storage_plan,
-                    operation,
-                    current_slot,
-                ) orelse return error.HistoricalEffectMissing;
-                if (effect.kind == .compare_append) {
+            .admission => switch (resolved.effect.kind) {
+                .compare_append => {
                     if (record_end != record_start + 1) {
                         return error.StoreBindingRecordCountMismatch;
                     }
                     try validateInput(
                         allocator,
-                        archived,
-                        effect,
-                        records.items[record_start],
+                        resolved.archived,
+                        resolved.effect,
+                        content[row.extent_start..row.extent_end],
                         true,
                     );
-                } else if (effect.kind == .create_new or
-                    effect.kind == .compare_replace)
-                {
+                },
+                .create_new, .compare_replace => {
+                    if (index != 0 or record_start != 0 or
+                        record_end != records.items.len or
+                        row.extent_start != 0 or
+                        row.extent_end != content.len)
+                    {
+                        return error.StoreBindingExtentMismatch;
+                    }
                     try validateInput(
                         allocator,
-                        archived,
-                        effect,
-                        snapshot.content[row.extent_start..row.extent_end],
+                        resolved.archived,
+                        resolved.effect,
+                        content,
                         true,
                     );
-                } else {
-                    return error.HistoricalEffectKindMismatch;
-                }
+                },
+                .bind_existing => return error.HistoricalEffectKindMismatch,
             },
         }
         expected_start = record_end;
@@ -208,52 +342,14 @@ fn validateEventLog(
     return records.items.len;
 }
 
-fn validateDocument(
-    allocator: std.mem.Allocator,
-    cache: *PlanCache,
-    current_slot: storage.Slot,
-    snapshot: *const custody.SlotSnapshot,
-) !usize {
-    if (snapshot.binding.rows.len != 1) {
-        return error.HistoricalDocumentReplayUnsupported;
-    }
-    const row = snapshot.binding.rows[0];
-    try validateBoundExtent(allocator, row, snapshot.content);
-    const archived = try cache.get(row.definition_digest);
-    const operation = archived.storage_plan.findOperation(row.operation) orelse
-        return error.HistoricalOperationMissing;
-    const effect = findEffectForSlot(
-        &archived.storage_plan,
-        operation,
-        current_slot,
-    ) orelse return error.HistoricalEffectMissing;
-    const expected_kind: storage.EffectKind = switch (row.kind) {
-        .existing_store_binding => .bind_existing,
-        .admission => effect.kind,
-    };
-    if (expected_kind != .bind_existing and
-        expected_kind != .create_new and
-        expected_kind != .compare_replace)
-    {
-        return error.HistoricalEffectKindMismatch;
-    }
-    if (effect.kind != expected_kind) return error.HistoricalEffectKindMismatch;
-    try validateInput(
-        allocator,
-        archived,
-        effect,
-        snapshot.content,
-        row.kind == .admission,
-    );
-    return 1;
-}
-
 fn validateBoundExtent(
     allocator: std.mem.Allocator,
     row: custody.BindingRow,
     content: []const u8,
 ) !void {
-    if (row.extent_start > row.extent_end or row.extent_end > content.len) {
+    if (row.extent_start > row.extent_end or
+        row.extent_end > content.len)
+    {
         return error.StoreBindingExtentMismatch;
     }
     const digest = try definition_core.canonical_json.digestBytesAlloc(

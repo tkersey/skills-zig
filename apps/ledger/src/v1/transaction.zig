@@ -5,6 +5,8 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
+const replay = @import("replay.zig");
+const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
@@ -57,6 +59,7 @@ const PreparedEffect = struct {
     binding_before: custody.BindingSnapshot,
     binding_after: []u8,
     canonical_input: []u8,
+    revision_archive: ?revision_archive.Candidate,
     idempotency_match: bool,
 
     fn deinit(self: *PreparedEffect, allocator: std.mem.Allocator) void {
@@ -69,6 +72,7 @@ const PreparedEffect = struct {
         self.binding_before.deinit(allocator);
         allocator.free(self.binding_after);
         allocator.free(self.canonical_input);
+        if (self.revision_archive) |*archive| archive.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -149,10 +153,18 @@ pub fn transact(
         &.{ ledger_root, ".definitions" },
     );
     defer allocator.free(definitions_dir);
+    const revisions_dir = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".revisions" },
+    );
+    defer allocator.free(revisions_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(ledger_root);
     try durable_store.ensureDirectoryPathNoSymlinks(transactions_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(bindings_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(definitions_dir);
+    if (operationNeedsRevisionArchive(operation)) {
+        try durable_store.ensureDirectoryPathNoSymlinks(revisions_dir);
+    }
     try durable_store.ensureNoPendingTransactions(allocator, transactions_dir);
     var archive = try definition_archive.prepare(
         allocator,
@@ -187,7 +199,6 @@ pub fn transact(
     if (duplicate_count != 0 and !archive.exists) {
         return error.DefinitionArchiveMissing;
     }
-
     var transaction_id: ?[]u8 = null;
     var storage_mutated = false;
     if (duplicate_count == 0) {
@@ -276,6 +287,13 @@ fn isBindingOperation(operation: *const storage.Operation) bool {
         if (effect.kind != .bind_existing) return false;
     }
     return true;
+}
+
+fn operationNeedsRevisionArchive(operation: *const storage.Operation) bool {
+    for (operation.effects) |effect| {
+        if (effect.kind == .compare_replace) return true;
+    }
+    return false;
 }
 
 fn bindExisting(
@@ -367,15 +385,18 @@ fn bindExisting(
             .max_bytes = custody.binding_max_bytes,
         };
     }
+    var mutation_index = prepared.len * 2;
     if (!archive.exists) {
-        mutations[prepared.len * 2] = .{
+        mutations[mutation_index] = .{
             .path = archive.path,
             .text = archive.content,
             .expectation = .{ .expected_exists = false },
             .content_mode = .raw,
             .max_bytes = definition_archive.max_bytes,
         };
+        mutation_index += 1;
     }
+    std.debug.assert(mutation_index == mutations.len);
     const counter_path = try std.fs.path.join(
         allocator,
         &.{ ledger_root, ".fencing.counter" },
@@ -783,6 +804,30 @@ fn prepareEffect(
     errdefer binding_before.deinit(allocator);
     if (slot_before != null and !binding_before.exists) return error.UnboundStore;
     if (slot_before == null and binding_before.exists) return error.OrphanedStoreBinding;
+    var revision_candidate: ?revision_archive.Candidate = null;
+    errdefer if (revision_candidate) |*candidate| candidate.deinit(allocator);
+    if (effect.kind == .compare_replace and binding_before.idempotency_match) {
+        const match_index = binding_before.idempotency_match_index orelse
+            return error.InvalidIdempotencyBinding;
+        const prior_revision =
+            binding_before.rows[match_index].revision_before orelse
+            return error.InvalidIdempotencyBinding;
+        const prior_content = try revision_archive.load(
+            allocator,
+            repo_root,
+            prior_revision,
+            slot.max_bytes,
+        );
+        defer allocator.free(prior_content);
+    } else if (effect.kind == .compare_replace) {
+        revision_candidate = try revision_archive.prepare(
+            allocator,
+            repo_root,
+            slot_before_digest.?,
+            slot_before.?,
+            slot.max_bytes,
+        );
+    }
 
     const binding_after = if (binding_before.idempotency_match)
         try allocator.dupe(u8, binding_before.bytes)
@@ -812,6 +857,7 @@ fn prepareEffect(
         .binding_before = binding_before,
         .binding_after = binding_after,
         .canonical_input = canonical_input,
+        .revision_archive = revision_candidate,
         .idempotency_match = binding_before.idempotency_match,
     };
 }
@@ -893,9 +939,10 @@ fn buildMutations(
     archive: *const definition_archive.Candidate,
 ) ![]durable_store.TransactionMutation {
     const archive_count: usize = if (archive.exists) 0 else 1;
+    const revision_count = countMissingRevisionArchives(prepared);
     const mutations = try allocator.alloc(
         durable_store.TransactionMutation,
-        prepared.len * 2 + archive_count,
+        prepared.len * 2 + revision_count + archive_count,
     );
     for (prepared, 0..) |effect, index| {
         const slot = storage_plan.slots[effect.slot_index];
@@ -920,16 +967,62 @@ fn buildMutations(
             .max_bytes = custody.binding_max_bytes,
         };
     }
+    var mutation_index = prepared.len * 2;
+    for (prepared, 0..) |effect, index| {
+        const revision = effect.revision_archive orelse continue;
+        if (revision.exists or revisionAppearedEarlier(prepared, index)) {
+            continue;
+        }
+        const slot = storage_plan.slots[effect.slot_index];
+        mutations[mutation_index] = .{
+            .path = revision.path,
+            .text = effect.slot_before.?,
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = slot.max_bytes,
+        };
+        mutation_index += 1;
+    }
     if (!archive.exists) {
-        mutations[prepared.len * 2] = .{
+        mutations[mutation_index] = .{
             .path = archive.path,
             .text = archive.content,
             .expectation = .{ .expected_exists = false },
             .content_mode = .raw,
             .max_bytes = definition_archive.max_bytes,
         };
+        mutation_index += 1;
     }
+    std.debug.assert(mutation_index == mutations.len);
     return mutations;
+}
+
+fn countMissingRevisionArchives(prepared: []const PreparedEffect) usize {
+    var count: usize = 0;
+    for (prepared, 0..) |effect, index| {
+        const revision = effect.revision_archive orelse continue;
+        if (!revision.exists and !revisionAppearedEarlier(prepared, index)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn revisionAppearedEarlier(
+    prepared: []const PreparedEffect,
+    index: usize,
+) bool {
+    for (prepared[0..index]) |prior| {
+        const prior_revision = prior.revision_archive orelse continue;
+        if (std.mem.eql(
+            u8,
+            prior_revision.path,
+            prepared[index].revision_archive.?.path,
+        )) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn buildReceipts(
@@ -1145,6 +1238,157 @@ test "transaction appends an event and binding in one durable transaction" {
             repo_root,
             &.{.{ .name = "event", .bytes = "{\"kind\":\"three\",\"value\":3}" }},
             &parameters,
+        ),
+    );
+}
+
+test "document replacements replay from immutable prior revisions" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "document.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/document-history","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-replace","create-new","exact-object","idempotency-key"]},"parameters":{"request":{"type":"safe_identifier","required":false}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"addressed-document","slots":{"current":{"path":"example/current.json","kind":"document","codec":"json","max_bytes":4096}}},"operations":{"create":{"effects":[{"op":"create-new","slot":"current","input":"record"}]},"replace":{"effects":[{"op":"compare-and-replace","slot":"current","input":"record","idempotency_param":"request"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "document.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "document.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "request", .raw_value = "replace-once" }},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+
+    var created = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "document.json",
+        &validation_plan,
+        &storage_plan,
+        "create",
+        repo_root,
+        &.{.{ .name = "record", .bytes = "{\"value\": 1}" }},
+        &parameters,
+    );
+    defer created.deinit(std.testing.allocator);
+    var replaced = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "document.json",
+        &validation_plan,
+        &storage_plan,
+        "replace",
+        repo_root,
+        &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
+        &parameters,
+    );
+    defer replaced.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("created", created.effects[0].result);
+    try std.testing.expectEqualStrings("replaced", replaced.effects[0].result);
+    var duplicate = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "document.json",
+        &validation_plan,
+        &storage_plan,
+        "replace",
+        repo_root,
+        &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
+        &parameters,
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expectEqualStrings(
+        "idempotent",
+        duplicate.effects[0].result,
+    );
+
+    var snapshot = try custody.readSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        storage_plan.slots[0],
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.binding.rows.len);
+    const stats = try replay.validateSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        storage_plan.slots[0],
+        &snapshot,
+    );
+    try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
+    try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
+    try std.testing.expectEqualStrings("{\"value\":2}", snapshot.content);
+
+    const first_revision_path = try revision_archive.pathAlloc(
+        std.testing.allocator,
+        repo_root,
+        snapshot.binding.rows[1].revision_before.?,
+    );
+    defer std.testing.allocator.free(first_revision_path);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        first_revision_path,
+        "{\"value\":9}",
+    );
+    try std.testing.expectError(
+        error.RevisionArchiveDigestMismatch,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "document.json",
+            &validation_plan,
+            &storage_plan,
+            "replace",
+            repo_root,
+            &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
+            &parameters,
+        ),
+    );
+    try std.testing.expectError(
+        error.RevisionArchiveDigestMismatch,
+        replay.validateSlot(
+            std.testing.allocator,
+            repo_root,
+            definition_plan.id,
+            storage_plan.slots[0],
+            &snapshot,
         ),
     );
 }
