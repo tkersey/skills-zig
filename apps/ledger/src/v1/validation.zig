@@ -55,6 +55,19 @@ const JsonKind = enum {
     }
 };
 
+const IdentifierStyle = enum {
+    portable,
+    lowercase_component,
+
+    fn parse(text: []const u8) !IdentifierStyle {
+        if (std.mem.eql(u8, text, "portable")) return .portable;
+        if (std.mem.eql(u8, text, "lowercase-component")) {
+            return .lowercase_component;
+        }
+        return error.UnsupportedIdentifierStyle;
+    }
+};
+
 const EnumScalar = union(enum) {
     string: []u8,
     integer: i64,
@@ -82,6 +95,9 @@ const CompiledRule = struct {
     max_count: ?usize = null,
     min_number: ?f64 = null,
     max_number: ?f64 = null,
+    identifier_style: IdentifierStyle = .portable,
+    allow_root: bool = true,
+    case_insensitive: bool = false,
     children: []CompiledRule,
 
     fn deinit(self: *CompiledRule, allocator: std.mem.Allocator) void {
@@ -193,13 +209,10 @@ const Builder = struct {
             .bounded_string,
             .bounded_array,
             .bounded_object,
-            .safe_identifier,
             => {
                 rule.min_count = try optionalUnsigned(object, "min");
                 rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count == null and rule.max_count == null and
-                    source.operator != .safe_identifier)
-                {
+                if (rule.min_count == null and rule.max_count == null) {
                     return error.MissingRuleBound;
                 }
                 if (rule.min_count != null and rule.max_count != null and
@@ -207,6 +220,27 @@ const Builder = struct {
                 {
                     return error.InvalidRuleBounds;
                 }
+            },
+            .safe_identifier => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "min", "max", "style" },
+                );
+                rule.min_count = try optionalUnsigned(object, "min");
+                rule.max_count = try optionalUnsigned(object, "max");
+                if (rule.min_count != null and rule.max_count != null and
+                    rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+                if (object.get("style")) |raw| {
+                    rule.identifier_style = try IdentifierStyle.parse(
+                        try definition_core.json.string(raw),
+                    );
+                }
+            },
+            .safe_relative_path => {
+                try compileRelativePathRule(self.allocator, object, &rule);
             },
             .bounded_number => {
                 rule.min_number = try optionalNumber(object, "min");
@@ -522,7 +556,6 @@ const Builder = struct {
             .optional_field,
             .digest,
             .timestamp,
-            .safe_relative_path,
             .unique,
             .sorted,
             => try definition_core.json.requireExactKeys(
@@ -541,7 +574,6 @@ const Builder = struct {
             .bounded_string,
             .bounded_array,
             .bounded_object,
-            .safe_identifier,
             => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -549,9 +581,7 @@ const Builder = struct {
                 );
                 rule.min_count = try optionalUnsigned(object, "min");
                 rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count == null and rule.max_count == null and
-                    operator != .safe_identifier)
-                {
+                if (rule.min_count == null and rule.max_count == null) {
                     return error.MissingRuleBound;
                 }
                 if (rule.min_count != null and rule.max_count != null and
@@ -559,6 +589,27 @@ const Builder = struct {
                 {
                     return error.InvalidRuleBounds;
                 }
+            },
+            .safe_identifier => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "min", "max", "style" },
+                );
+                rule.min_count = try optionalUnsigned(object, "min");
+                rule.max_count = try optionalUnsigned(object, "max");
+                if (rule.min_count != null and rule.max_count != null and
+                    rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+                if (object.get("style")) |raw| {
+                    rule.identifier_style = try IdentifierStyle.parse(
+                        try definition_core.json.string(raw),
+                    );
+                }
+            },
+            .safe_relative_path => {
+                try compileRelativePathRule(self.allocator, object, &rule);
             },
             .bounded_number => {
                 try definition_core.json.requireExactKeys(
@@ -722,7 +773,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeCount(plan.inputs.len);
     for (plan.inputs) |input| {
         try encoder.writeBytes(input.name);
@@ -743,7 +794,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     const inputs = try decodeCacheInputs(allocator, decoder);
@@ -909,6 +960,9 @@ fn encodeCompiledRule(
     try writeOptionalUsize(encoder, rule.max_count);
     try writeOptionalF64(encoder, rule.min_number);
     try writeOptionalF64(encoder, rule.max_number);
+    try encoder.writeEnum(rule.identifier_style);
+    try encoder.writeBool(rule.allow_root);
+    try encoder.writeBool(rule.case_insensitive);
     try encoder.writeCount(rule.children.len);
     for (rule.children) |child| try encodeCompiledRule(encoder, child);
 }
@@ -984,6 +1038,9 @@ fn decodeCacheRule(
     const max_count = try readOptionalUsize(decoder);
     const min_number = try readOptionalF64(decoder);
     const max_number = try readOptionalF64(decoder);
+    const identifier_style = try decoder.readEnum(IdentifierStyle);
+    const allow_root = try decoder.readBool();
+    const case_insensitive = try decoder.readBool();
     const children = try decodeCacheRules(
         allocator,
         decoder,
@@ -1010,6 +1067,9 @@ fn decodeCacheRule(
         .max_count = max_count,
         .min_number = min_number,
         .max_number = max_number,
+        .identifier_style = identifier_style,
+        .allow_root = allow_root,
+        .case_insensitive = case_insensitive,
         .children = children,
     };
     try validateCachedRule(rule, input_count, pointer_count);
@@ -1131,6 +1191,17 @@ fn validateCachedRule(
         .enum_value => if (rule.values.len == 0) {
             return error.CacheRuleConfigurationInvalid;
         },
+        .safe_relative_path => {
+            if (rule.keys.len > 64) {
+                return error.CacheRuleConfigurationInvalid;
+            }
+            for (rule.keys) |root| {
+                definition_core.json.repositoryRelativePath(
+                    root,
+                    false,
+                ) catch return error.CacheRuleConfigurationInvalid;
+            }
+        },
         .set_equality,
         .subset,
         .superset,
@@ -1187,6 +1258,22 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         },
         else => {},
+    }
+    if (rule.operator != .safe_identifier and
+        rule.identifier_style != .portable)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .safe_relative_path and
+        (!rule.allow_root or rule.case_insensitive))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .exact_object and
+        rule.operator != .safe_relative_path and
+        rule.keys.len != 0)
+    {
+        return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .all_rules and
         rule.operator != .any_rules and
@@ -1552,8 +1639,8 @@ fn applyRule(
         .enum_value => if (target) |value| enumContains(rule.values, value) else false,
         .digest => if (target) |value| validateScalar(value, .digest) else false,
         .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
-        .safe_identifier => if (target) |value| safeIdentifier(value, rule.max_count) else false,
-        .safe_relative_path => if (target) |value| validateScalar(value, .relative_path) else false,
+        .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
+        .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value| arraySorted(value) else false,
         .keyed_unique => if (target) |value|
@@ -1691,8 +1778,8 @@ fn itemRuleHolds(
         .enum_value => if (target) |value| enumContains(rule.values, value) else false,
         .digest => if (target) |value| validateScalar(value, .digest) else false,
         .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
-        .safe_identifier => if (target) |value| safeIdentifier(value, rule.max_count) else false,
-        .safe_relative_path => if (target) |value| validateScalar(value, .relative_path) else false,
+        .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
+        .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value| arraySorted(value) else false,
         .keyed_unique => if (target) |value|
@@ -2071,12 +2158,57 @@ fn validateScalar(value: std.json.Value, kind: definition_core.scalar.Kind) bool
     return true;
 }
 
-fn safeIdentifier(value: std.json.Value, maximum: ?usize) bool {
+fn safeIdentifier(value: std.json.Value, rule: CompiledRule) bool {
     const text = switch (value) {
         .string => |text| text,
         else => return false,
     };
-    definition_core.json.safeIdentifier(text, maximum orelse 128) catch return false;
+    if (rule.min_count) |minimum| if (text.len < minimum) return false;
+    const maximum = rule.max_count orelse 128;
+    return switch (rule.identifier_style) {
+        .portable => portable: {
+            definition_core.json.safeIdentifier(text, maximum) catch
+                break :portable false;
+            break :portable true;
+        },
+        .lowercase_component => lowercase: {
+            if (text.len == 0 or text.len > maximum) break :lowercase false;
+            for (text, 0..) |byte, index| {
+                const alphanumeric =
+                    std.ascii.isLower(byte) or std.ascii.isDigit(byte);
+                if (!alphanumeric and
+                    byte != '-' and byte != '_' and byte != '.')
+                {
+                    break :lowercase false;
+                }
+                if (index == 0 and !alphanumeric) break :lowercase false;
+            }
+            break :lowercase true;
+        },
+    };
+}
+
+fn safeRelativePath(value: std.json.Value, rule: CompiledRule) bool {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return false,
+    };
+    definition_core.json.repositoryRelativePath(
+        text,
+        rule.allow_root,
+    ) catch return false;
+    for (rule.keys) |root| {
+        const exact = if (rule.case_insensitive)
+            std.ascii.eqlIgnoreCase(text, root)
+        else
+            std.mem.eql(u8, text, root);
+        const descendant = text.len > root.len and text[root.len] == '/' and
+            (if (rule.case_insensitive)
+                std.ascii.eqlIgnoreCase(text[0..root.len], root)
+            else
+                std.mem.eql(u8, text[0..root.len], root));
+        if (exact or descendant) return false;
+    }
     return true;
 }
 
@@ -2365,6 +2497,32 @@ fn validateJsonl(
     }
 }
 
+fn compileRelativePathRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(object, &.{
+        "op",
+        "input",
+        "path",
+        "allow_root",
+        "reserved_roots",
+        "case_insensitive_reserved",
+    });
+    rule.allow_root = try optionalBoolean(object, "allow_root") orelse true;
+    rule.case_insensitive =
+        try optionalBoolean(object, "case_insensitive_reserved") orelse false;
+    if (object.get("reserved_roots")) |raw| {
+        const roots = try definition_core.json.array(raw);
+        if (roots.items.len > 64) return error.TooManyReservedPathRoots;
+        rule.keys = try parseStringSet(allocator, raw);
+        for (rule.keys) |root| {
+            try definition_core.json.repositoryRelativePath(root, false);
+        }
+    }
+}
+
 fn parseStringSet(
     allocator: std.mem.Allocator,
     raw: std.json.Value,
@@ -2442,6 +2600,11 @@ fn optionalUnsigned(object: std.json.ObjectMap, name: []const u8) !?usize {
 fn optionalNumber(object: std.json.ObjectMap, name: []const u8) !?f64 {
     const raw = object.get(name) orelse return null;
     return jsonNumber(raw) orelse error.ExpectedNumber;
+}
+
+fn optionalBoolean(object: std.json.ObjectMap, name: []const u8) !?bool {
+    const raw = object.get(name) orelse return null;
+    return try definition_core.json.boolean(raw);
 }
 
 fn findInput(inputs: []const definition.Input, name: []const u8) ?usize {
@@ -2724,6 +2887,85 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         validateForAllocationFailure,
         .{ &definition_plan, &plan, valid_bytes },
     );
+}
+
+test "compiled identifier and repository path policies preserve exact boundaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","exact-object","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&definition_plan},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
+
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"goal_id\":\"goal-1\",\"paths\":[\".\",\".github\",\"src/lib\"]}",
+        }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    const invalid_cases = [_][]const u8{
+        "{\"goal_id\":\"Goal-1\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\".goal\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\"goal-1\",\"paths\":[\".GIT/config\"]}",
+        "{\"goal_id\":\"goal-1\",\"paths\":[\".ledger\"]}",
+        "{\"goal_id\":\"goal-1\",\"paths\":[\"src/../lib\"]}",
+    };
+    for (invalid_cases) |bytes| {
+        var rejected = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = bytes }},
+        );
+        defer rejected.deinit(std.testing.allocator);
+        try std.testing.expect(!rejected.valid);
+    }
 }
 
 test "validation reports missing and malformed inputs without granting authority" {
