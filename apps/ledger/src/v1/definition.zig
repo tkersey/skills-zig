@@ -147,8 +147,11 @@ pub const Operator = enum {
         return error.UnsupportedArtifactOperator;
     }
 
-    pub fn version(_: Operator) u16 {
-        return 1;
+    pub fn version(self: Operator) u16 {
+        return switch (self) {
+            .reference_exists => 2,
+            else => 1,
+        };
     }
 
     pub fn supported(self: Operator) bool {
