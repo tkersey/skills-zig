@@ -36,6 +36,7 @@ pub const Result = struct {
     transaction_id: ?[]u8,
     effects: []EffectReceipt,
     returned_content: ?[]u8,
+    generated_outputs: []protocol.GeneratedOutput,
     semantic_authority_granted: bool = false,
     storage_mutated: bool,
 
@@ -46,6 +47,8 @@ pub const Result = struct {
         for (self.effects) |*effect| effect.deinit(allocator);
         allocator.free(self.effects);
         if (self.returned_content) |content| allocator.free(content);
+        for (self.generated_outputs) |*output| output.deinit(allocator);
+        allocator.free(self.generated_outputs);
         self.* = undefined;
     }
 };
@@ -62,6 +65,7 @@ const PreparedEffect = struct {
     binding_before: custody.BindingSnapshot,
     binding_after: []u8,
     canonical_input: []u8,
+    generated_outputs: []protocol.GeneratedOutput,
     revision_archive: ?revision_archive.Candidate,
     idempotency_match: bool,
 
@@ -75,6 +79,8 @@ const PreparedEffect = struct {
         self.binding_before.deinit(allocator);
         allocator.free(self.binding_after);
         allocator.free(self.canonical_input);
+        for (self.generated_outputs) |*output| output.deinit(allocator);
+        allocator.free(self.generated_outputs);
         if (self.revision_archive) |*archive| archive.deinit(allocator);
         self.* = undefined;
     }
@@ -142,6 +148,7 @@ pub fn transact(
             .transaction_id = null,
             .effects = try allocator.alloc(EffectReceipt, 0),
             .returned_content = null,
+            .generated_outputs = try allocator.alloc(protocol.GeneratedOutput, 0),
             .storage_mutated = false,
         };
     }
@@ -263,6 +270,11 @@ pub fn transact(
     else
         null;
     errdefer if (returned_content) |content| allocator.free(content);
+    const generated_outputs = try collectGeneratedOutputsAlloc(
+        allocator,
+        prepared,
+    );
+    errdefer deinitGeneratedOutputs(allocator, generated_outputs);
     const owned_operation = try allocator.dupe(u8, operation_name);
     errdefer allocator.free(owned_operation);
     const validation_result = try execution.takeResult(allocator, definition_plan);
@@ -272,6 +284,7 @@ pub fn transact(
         .transaction_id = transaction_id,
         .effects = receipts,
         .returned_content = returned_content,
+        .generated_outputs = generated_outputs,
         .storage_mutated = storage_mutated,
     };
 }
@@ -468,6 +481,9 @@ fn bindExisting(
     errdefer allocator.free(transaction_id);
     const owned_operation = try allocator.dupe(u8, operation_name);
     errdefer allocator.free(owned_operation);
+    const generated_outputs =
+        try allocator.alloc(protocol.GeneratedOutput, 0);
+    errdefer allocator.free(generated_outputs);
     const validation_result = try bindingValidationResult(
         allocator,
         definition_plan,
@@ -480,6 +496,7 @@ fn bindExisting(
         .transaction_id = transaction_id,
         .effects = receipts,
         .returned_content = null,
+        .generated_outputs = generated_outputs,
         .storage_mutated = true,
     };
 }
@@ -944,6 +961,11 @@ fn prepareEffect(
     defer if (protocol_state) |*state| state.deinit(allocator);
     var canonical_input_storage: ?[]u8 = null;
     errdefer if (canonical_input_storage) |bytes| allocator.free(bytes);
+    var generated_outputs = try allocator.alloc(
+        protocol.GeneratedOutput,
+        0,
+    );
+    errdefer deinitGeneratedOutputs(allocator, generated_outputs);
     if (binding_before.idempotency_match and effect.event != null) {
         const content = slot_before orelse return error.InvalidIdempotencyBinding;
         const match_index = binding_before.idempotency_match_index orelse
@@ -963,15 +985,21 @@ fn prepareEffect(
         if (protocol_state == null) {
             protocol_state = protocol.ReplayState.init(current_protocol);
         }
-        canonical_input_storage = try protocol.materializeEventAlloc(
+        var materialized_event = try protocol.materializeEvent(
             allocator,
             current_protocol,
             &protocol_state.?,
             &effect.event.?,
             execution.inputJson(effect.input_index) orelse
                 return error.ProtocolInputMustBeJson,
+            parameters,
             currentUnixSeconds(),
+            defaultIo(),
         );
+        allocator.free(generated_outputs);
+        canonical_input_storage = materialized_event.content;
+        generated_outputs = materialized_event.generated_outputs;
+        materialized_event = undefined;
         try protocol.applyBound(
             allocator,
             current_protocol,
@@ -1105,6 +1133,7 @@ fn prepareEffect(
         .binding_before = binding_before,
         .binding_after = binding_after,
         .canonical_input = canonical_input,
+        .generated_outputs = generated_outputs,
         .revision_archive = revision_candidate,
         .idempotency_match = binding_before.idempotency_match,
     };
@@ -1321,6 +1350,70 @@ fn buildReceipts(
     return receipts;
 }
 
+fn collectGeneratedOutputsAlloc(
+    allocator: std.mem.Allocator,
+    prepared: []const PreparedEffect,
+) ![]protocol.GeneratedOutput {
+    var count: usize = 0;
+    for (prepared) |effect| {
+        count = std.math.add(
+            usize,
+            count,
+            effect.generated_outputs.len,
+        ) catch return error.GeneratedOutputCountOverflow;
+    }
+    if (count > 1024) return error.GeneratedOutputCountExceeded;
+    const outputs = try allocator.alloc(protocol.GeneratedOutput, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (outputs[0..initialized]) |*output| output.deinit(allocator);
+        allocator.free(outputs);
+    }
+    for (prepared) |effect| {
+        for (effect.generated_outputs) |output| {
+            const name = try allocator.dupe(u8, output.name);
+            errdefer allocator.free(name);
+            const value = try allocator.dupe(u8, output.value);
+            errdefer allocator.free(value);
+            outputs[initialized] = .{
+                .name = name,
+                .value = value,
+            };
+            initialized += 1;
+        }
+    }
+    std.mem.sort(
+        protocol.GeneratedOutput,
+        outputs,
+        {},
+        struct {
+            fn lessThan(
+                _: void,
+                left: protocol.GeneratedOutput,
+                right: protocol.GeneratedOutput,
+            ) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.lessThan,
+    );
+    if (outputs.len > 1) {
+        for (outputs[1..], 1..) |output, index| {
+            if (std.mem.eql(u8, outputs[index - 1].name, output.name)) {
+                return error.DuplicateGeneratedOutput;
+            }
+        }
+    }
+    return outputs;
+}
+
+fn deinitGeneratedOutputs(
+    allocator: std.mem.Allocator,
+    outputs: []protocol.GeneratedOutput,
+) void {
+    for (outputs) |*output| output.deinit(allocator);
+    allocator.free(outputs);
+}
+
 fn parameterText(
     bindings: *const definition_core.parameters.Bindings,
     name: []const u8,
@@ -1341,11 +1434,14 @@ fn parameterText(
 }
 
 fn currentUnixSeconds() i64 {
-    const io = runtime_io orelse std.Io.Threaded.global_single_threaded.io();
     return @intCast(@divFloor(
-        std.Io.Clock.real.now(io).nanoseconds,
+        std.Io.Clock.real.now(defaultIo()).nanoseconds,
         std.time.ns_per_s,
     ));
+}
+
+fn defaultIo() std.Io {
+    return runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
 const ChainedEvent = struct {
@@ -1656,7 +1752,7 @@ test "transaction materializes passive event requests before chained append" {
     try definition_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","idempotency-key","previous-digest","replay","sequence"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"request":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"request"}]},"shape":{"rules":[{"op":"exact-object","input":"request","path":"","keys":["body","construction_ref","goal_id","kind","subject_digest"]},{"op":"event-envelope","input":"request","keys":["body","body_digest","construction_ref","event_digest","event_id","goal_id","kind","previous_digest","recorded_at","schema","sequence","subject_digest"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/materialized-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","idempotency_param":"request","event":{"body_input_field":"body","fields":[{"field":"construction_ref","input_field":"construction_ref"},{"field":"event_id","sequence_text_prefix":"e-"},{"field":"goal_id","input_field":"goal_id"},{"field":"kind","input_field":"kind"},{"field":"recorded_at","unix_seconds":true},{"field":"schema","literal":"example-event/v1"},{"field":"subject_digest","input_field":"subject_digest"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","idempotency-key","previous-digest","replay","secure-token","sequence","sha256"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"request":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"request"}]},"shape":{"rules":[{"op":"exact-object","input":"request","path":"","keys":["body","construction_ref","goal_id","kind","subject_digest"]},{"op":"event-envelope","input":"request","keys":["body","body_digest","construction_ref","event_digest","event_id","goal_id","kind","previous_digest","recorded_at","schema","sequence","subject_digest"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/materialized-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","idempotency_param":"request","event":{"body_input_field":"body","fields":[{"field":"construction_ref","input_field":"construction_ref"},{"field":"event_id","sequence_text_prefix":"e-"},{"field":"goal_id","input_field":"goal_id"},{"field":"kind","input_field":"kind"},{"field":"recorded_at","unix_seconds":true},{"field":"schema","literal":"example-event/v1"},{"field":"subject_digest","input_field":"subject_digest"}],"generate":[{"name":"capability","op":"secure-token","prefix":"AKC2-","bytes":32}],"body_fields":[{"field":"capability_digest","generated_sha256":"capability"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -1747,8 +1843,32 @@ test "transaction materializes passive event requests before chained append" {
     );
     defer first.deinit(std.testing.allocator);
     try std.testing.expect(first.storage_mutated);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        first.generated_outputs.len,
+    );
+    try std.testing.expectEqualStrings(
+        "capability",
+        first.generated_outputs[0].name,
+    );
+    try std.testing.expectEqual(
+        @as(usize, "AKC2-".len + 64),
+        first.generated_outputs[0].value.len,
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        first.generated_outputs[0].value,
+        "AKC2-",
+    ));
     const first_event = first.returned_content orelse
         return error.TestExpectedEqual;
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            first_event,
+            first.generated_outputs[0].value,
+        ) == null,
+    );
     var first_parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -1757,6 +1877,22 @@ test "transaction materializes passive event requests before chained append" {
     );
     defer first_parsed.deinit();
     const first_object = try definition_core.json.object(first_parsed.value);
+    const first_body = try definition_core.json.object(
+        try definition_core.json.field(first_object, "body"),
+    );
+    const capability_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            std.testing.allocator,
+            first.generated_outputs[0].value,
+        );
+    defer std.testing.allocator.free(capability_digest);
+    try std.testing.expectEqualStrings(
+        capability_digest,
+        try definition_core.json.requiredString(
+            first_body,
+            "capability_digest",
+        ),
+    );
     try std.testing.expectEqual(
         @as(i64, 1),
         try definition_core.json.integer(
@@ -1798,6 +1934,10 @@ test "transaction materializes passive event requests before chained append" {
         &second_parameters,
     );
     defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        second.generated_outputs.len,
+    );
     const second_event = second.returned_content orelse
         return error.TestExpectedEqual;
     var second_parsed = try std.json.parseFromSlice(
@@ -1836,6 +1976,10 @@ test "transaction materializes passive event requests before chained append" {
     );
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        duplicate.generated_outputs.len,
+    );
     try std.testing.expectEqualStrings(
         second_event,
         duplicate.returned_content.?,
@@ -1865,6 +2009,308 @@ test "transaction materializes passive event requests before chained append" {
     );
     defer replay_stats.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), replay_stats.records_validated);
+}
+
+test "transaction keeps generated capabilities transient and checks retained custody" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{
+        \\  "schema":"ledger-artifact-definition/v1",
+        \\  "id":"example/capability-protocol",
+        \\  "owner":"example",
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","cross-input-equal","enum","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","reducer","replay","secure-token","sequence","sha256"]},
+        \\  "parameters":{
+        \\    "capability":{"type":"string","required":false},
+        \\    "stream":{"type":"safe_identifier","required":true}
+        \\  },
+        \\  "inputs":{
+        \\    "abort":{"codec":"json","required":false,"max_bytes":4096},
+        \\    "consume":{"codec":"json","required":false,"max_bytes":4096},
+        \\    "prepare":{"codec":"json","required":false,"max_bytes":4096}
+        \\  },
+        \\  "canonicalization":{"steps":[
+        \\    {"op":"canonical-json","input":"abort"},
+        \\    {"op":"canonical-json","input":"consume"},
+        \\    {"op":"canonical-json","input":"prepare"}
+        \\  ]},
+        \\  "shape":{"rules":[
+        \\    {"op":"exact-object","input":"abort","path":"","keys":["body","kind","stream_id"]},
+        \\    {"op":"enum","input":"abort","path":"/kind","values":["aborted"]},
+        \\    {"op":"exact-object","input":"abort","path":"/body","keys":["step_id"]},
+        \\    {"op":"exact-object","input":"consume","path":"","keys":["body","kind","stream_id"]},
+        \\    {"op":"enum","input":"consume","path":"/kind","values":["consumed"]},
+        \\    {"op":"exact-object","input":"consume","path":"/body","keys":["step_id"]},
+        \\    {"op":"exact-object","input":"prepare","path":"","keys":["body","kind","stream_id"]},
+        \\    {"op":"enum","input":"prepare","path":"/kind","values":["prepared"]},
+        \\    {"op":"exact-object","input":"prepare","path":"/body","keys":["step_id"]},
+        \\    {"op":"event-envelope","input":"prepare","keys":["body","body_digest","event_digest","kind","previous_digest","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}
+        \\  ]},
+        \\  "constraints":[
+        \\    {"op":"sequence","start":1},
+        \\    {"op":"previous-digest","genesis":null},
+        \\    {"op":"body-digest"},
+        \\    {"op":"event-digest"},
+        \\    {"op":"event-kinds","values":["aborted","consumed","prepared"]},
+        \\    {"op":"reducer","mode":"retained","event_kind":"/kind",
+        \\      "registers":[{"name":"pending","max_bytes":4096}],
+        \\      "admissions":[
+        \\        {"on":"prepared","requires":[],"forbids":["pending"],"rules":[],"actions":[{"op":"set","register":"pending","input":"event","path":"/body"}]},
+        \\        {"on":"consumed","requires":["pending"],"forbids":[],"rules":[
+        \\          {"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/capability_digest","right_input":"pending","right":"/capability_digest"},
+        \\          {"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/step_id","right_input":"pending","right":"/step_id"}
+        \\        ],"actions":[{"op":"clear","register":"pending"}]},
+        \\        {"on":"aborted","requires":["pending"],"forbids":[],"rules":[
+        \\          {"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/capability_digest","right_input":"pending","right":"/capability_digest"},
+        \\          {"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/step_id","right_input":"pending","right":"/step_id"}
+        \\        ],"actions":[{"op":"clear","register":"pending"}]}
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "identity":{},
+        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/capabilities.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+        \\  "operations":{
+        \\    "abort":{"effects":[{"op":"compare-and-append","slot":"events","input":"abort","event":{
+        \\      "body_input_field":"body",
+        \\      "fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],
+        \\      "body_fields":[{"field":"capability_digest","state_value":{"register":"pending","path":"/capability_digest"}}],
+        \\      "forbidden_parameters":["capability"]
+        \\    }}]},
+        \\    "consume":{"effects":[{"op":"compare-and-append","slot":"events","input":"consume","event":{
+        \\      "body_input_field":"body",
+        \\      "fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],
+        \\      "body_fields":[{"field":"capability_digest","parameter_sha256":{"parameter":"capability","expected_state":{"register":"pending","path":"/capability_digest"}}}]
+        \\    }}]},
+        \\    "prepare":{"effects":[{"op":"compare-and-append","slot":"events","input":"prepare","event":{
+        \\      "body_input_field":"body",
+        \\      "fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],
+        \\      "generate":[{"name":"capability","op":"secure-token","prefix":"AKC2-","bytes":32}],
+        \\      "body_fields":[{"field":"capability_digest","generated_sha256":"capability"}],
+        \\      "forbidden_parameters":["capability"]
+        \\    }}]}
+        \\  },
+        \\  "projections":{},
+        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var storage_encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer storage_encoder.deinit();
+    try storage.encodeCache(&storage_plan, &storage_encoder);
+    const storage_payload = try storage_encoder.toOwnedSlice();
+    defer std.testing.allocator.free(storage_payload);
+    var storage_decoder = definition_core.cache.Decoder.init(
+        storage_payload,
+    );
+    var cached_storage = try storage.decodeCache(
+        std.testing.allocator,
+        &storage_decoder,
+    );
+    defer cached_storage.deinit(std.testing.allocator);
+    try storage_decoder.finish();
+    try storage.validateCachePlan(&cached_storage, &definition_plan);
+    var cached_protocol = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &cached_storage,
+    )).?;
+    defer cached_protocol.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    var base_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "stream-1" }},
+    );
+    defer base_parameters.deinit(std.testing.allocator);
+    const prepare_input =
+        "{\"body\":{\"step_id\":\"step-1\"},\"kind\":\"prepared\",\"stream_id\":\"stream-1\"}";
+    var prepared = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "prepare",
+        repo_root,
+        &.{.{ .name = "prepare", .bytes = prepare_input }},
+        &base_parameters,
+    );
+    defer prepared.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        prepared.generated_outputs.len,
+    );
+    const raw_capability = prepared.generated_outputs[0].value;
+    var wrong_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "capability", .raw_value = "AKC2-wrong" },
+            .{ .name = "stream", .raw_value = "stream-1" },
+        },
+    );
+    defer wrong_parameters.deinit(std.testing.allocator);
+    const consume_input =
+        "{\"body\":{\"step_id\":\"step-1\"},\"kind\":\"consumed\",\"stream_id\":\"stream-1\"}";
+    try std.testing.expectError(
+        error.EventCapabilityMismatch,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "protocol.json",
+            &validation_plan,
+            &storage_plan,
+            &protocol_plan,
+            "consume",
+            repo_root,
+            &.{.{ .name = "consume", .bytes = consume_input }},
+            &wrong_parameters,
+        ),
+    );
+    var correct_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "capability", .raw_value = raw_capability },
+            .{ .name = "stream", .raw_value = "stream-1" },
+        },
+    );
+    defer correct_parameters.deinit(std.testing.allocator);
+    var consumed = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "consume",
+        repo_root,
+        &.{.{ .name = "consume", .bytes = consume_input }},
+        &correct_parameters,
+    );
+    defer consumed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        consumed.generated_outputs.len,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            consumed.returned_content.?,
+            raw_capability,
+        ) == null,
+    );
+    const second_prepare_input =
+        "{\"body\":{\"step_id\":\"step-2\"},\"kind\":\"prepared\",\"stream_id\":\"stream-1\"}";
+    var second_prepared = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "prepare",
+        repo_root,
+        &.{.{ .name = "prepare", .bytes = second_prepare_input }},
+        &base_parameters,
+    );
+    defer second_prepared.deinit(std.testing.allocator);
+    const second_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            std.testing.allocator,
+            second_prepared.generated_outputs[0].value,
+        );
+    defer std.testing.allocator.free(second_digest);
+    const abort_input =
+        "{\"body\":{\"step_id\":\"step-2\"},\"kind\":\"aborted\",\"stream_id\":\"stream-1\"}";
+    var aborted = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "abort",
+        repo_root,
+        &.{.{ .name = "abort", .bytes = abort_input }},
+        &base_parameters,
+    );
+    defer aborted.deinit(std.testing.allocator);
+    try std.testing.expect(
+        std.mem.indexOf(u8, aborted.returned_content.?, second_digest) != null,
+    );
+    var forbidden_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "capability", .raw_value = raw_capability },
+            .{ .name = "stream", .raw_value = "stream-1" },
+        },
+    );
+    defer forbidden_parameters.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.ForbiddenEventParameter,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "protocol.json",
+            &validation_plan,
+            &storage_plan,
+            &protocol_plan,
+            "prepare",
+            repo_root,
+            &.{.{ .name = "prepare", .bytes = prepare_input }},
+            &forbidden_parameters,
+        ),
+    );
 }
 
 test "transaction admits and replays a definition-bound event chain" {

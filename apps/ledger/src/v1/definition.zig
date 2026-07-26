@@ -82,6 +82,7 @@ pub const Operator = enum {
     declared_field_values,
     field_absent,
     object_values,
+    secure_token,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -141,6 +142,7 @@ pub const Operator = enum {
             .declared_field_values => "declared-field-values",
             .field_absent => "field-absent",
             .object_values => "object-values",
+            .secure_token => "secure-token",
             else => @tagName(self),
         };
     }
@@ -215,6 +217,7 @@ pub const Operator = enum {
             .total_mapping,
             .declared_field_values,
             .object_values,
+            .secure_token,
             .canonical_json,
             .canonical_text,
             .sha256,

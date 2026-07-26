@@ -232,6 +232,20 @@ pub fn writeTransactionJson(
     }
     try writer.writeAll("],\"returned_content\":");
     try writeOptionalString(writer, result.returned_content);
+    try writer.writeAll(",\"generated_outputs\":{");
+    for (result.generated_outputs, 0..) |output, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            output.name,
+        );
+        try writer.writeByte(':');
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            output.value,
+        );
+    }
+    try writer.writeByte('}');
     try writer.writeAll(",\"valid\":");
     try writer.writeAll(if (result.validation_result.valid) "true" else "false");
     try writer.writeAll(",\"structural_claims\":[],\"compile_stats\":");

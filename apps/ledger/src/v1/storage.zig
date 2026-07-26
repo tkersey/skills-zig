@@ -115,10 +115,73 @@ pub const RequestLiteral = struct {
     }
 };
 
+pub const SecureTokenGeneration = struct {
+    name: []u8,
+    prefix: []u8,
+    byte_count: u8,
+
+    fn deinit(self: *SecureTokenGeneration, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
+pub const StateValueSource = struct {
+    register: []u8,
+    pointer: definition_core.json_pointer.Pointer,
+
+    fn deinit(self: *StateValueSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.register);
+        self.pointer.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ParameterSha256Source = struct {
+    parameter: []u8,
+    expected_state: StateValueSource,
+
+    fn deinit(self: *ParameterSha256Source, allocator: std.mem.Allocator) void {
+        allocator.free(self.parameter);
+        self.expected_state.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const EventBodyFieldSource = union(enum) {
+    generated_sha256: []u8,
+    parameter_sha256: ParameterSha256Source,
+    state_value: StateValueSource,
+
+    fn deinit(self: *EventBodyFieldSource, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .generated_sha256 => |name| allocator.free(name),
+            .parameter_sha256 => |*source| source.deinit(allocator),
+            .state_value => |*source| source.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const EventBodyField = struct {
+    field: []u8,
+    source: EventBodyFieldSource,
+
+    fn deinit(self: *EventBodyField, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        self.source.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const EventMaterialization = struct {
     body_input_field: []u8,
     fields: []EventField,
     request_literals: []RequestLiteral,
+    generate: []SecureTokenGeneration,
+    body_fields: []EventBodyField,
+    forbidden_parameters: [][]u8,
 
     fn deinit(self: *EventMaterialization, allocator: std.mem.Allocator) void {
         allocator.free(self.body_input_field);
@@ -126,6 +189,12 @@ pub const EventMaterialization = struct {
         allocator.free(self.fields);
         for (self.request_literals) |*literal| literal.deinit(allocator);
         allocator.free(self.request_literals);
+        for (self.generate) |*item| item.deinit(allocator);
+        allocator.free(self.generate);
+        for (self.body_fields) |*field| field.deinit(allocator);
+        allocator.free(self.body_fields);
+        for (self.forbidden_parameters) |name| allocator.free(name);
+        allocator.free(self.forbidden_parameters);
         self.* = undefined;
     }
 };
@@ -338,7 +407,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(4);
+    try encoder.writeU16(5);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -387,6 +456,36 @@ pub fn encodeCache(
                     try encoder.writeBytes(literal.field);
                     try encoder.writeBytes(literal.literal);
                 }
+                try encoder.writeCount(event.generate.len);
+                for (event.generate) |item| {
+                    try encoder.writeBytes(item.name);
+                    try encoder.writeBytes(item.prefix);
+                    try encoder.writeByte(item.byte_count);
+                }
+                try encoder.writeCount(event.body_fields.len);
+                for (event.body_fields) |field| {
+                    try encoder.writeBytes(field.field);
+                    try encoder.writeEnum(std.meta.activeTag(field.source));
+                    switch (field.source) {
+                        .generated_sha256 => |name| {
+                            try encoder.writeBytes(name);
+                        },
+                        .parameter_sha256 => |source| {
+                            try encoder.writeBytes(source.parameter);
+                            try encodeStateValueSource(
+                                source.expected_state,
+                                encoder,
+                            );
+                        },
+                        .state_value => |source| {
+                            try encodeStateValueSource(source, encoder);
+                        },
+                    }
+                }
+                try encoder.writeCount(event.forbidden_parameters.len);
+                for (event.forbidden_parameters) |name| {
+                    try encoder.writeBytes(name);
+                }
             }
         }
     }
@@ -396,7 +495,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 4) {
+    if (try decoder.readU16() != 5) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -423,6 +522,14 @@ pub fn decodeCache(
         .slots = slots,
         .operations = operations,
     };
+}
+
+fn encodeStateValueSource(
+    source: StateValueSource,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeBytes(source.register);
+    try encoder.writeBytes(source.pointer.raw);
 }
 
 pub fn validateCachePlan(
@@ -507,6 +614,10 @@ pub fn validateCachePlan(
                     return error.CacheStoragePlanMismatch;
                 }
                 try validateCachedEventMaterialization(event);
+                validateEventMaterializationAgainstDefinition(
+                    event,
+                    definition_plan,
+                ) catch return error.CacheStoragePlanMismatch;
             }
         }
     }
@@ -743,13 +854,174 @@ fn decodeEventMaterialization(
         decoder,
     );
     errdefer deinitRequestLiterals(allocator, request_literals);
+    const generate = try decodeSecureTokenGenerations(
+        allocator,
+        decoder,
+    );
+    errdefer deinitSecureTokenGenerations(allocator, generate);
+    const body_fields = try decodeEventBodyFields(
+        allocator,
+        decoder,
+    );
+    errdefer deinitEventBodyFields(allocator, body_fields);
+    const forbidden_parameters = try decodeSortedNames(
+        allocator,
+        decoder,
+        64,
+    );
+    errdefer deinitNames(allocator, forbidden_parameters);
     const result: EventMaterialization = .{
         .body_input_field = body_input_field,
         .fields = fields,
         .request_literals = request_literals,
+        .generate = generate,
+        .body_fields = body_fields,
+        .forbidden_parameters = forbidden_parameters,
     };
     try validateEventMaterialization(allocator, &result);
     return result;
+}
+
+fn decodeSecureTokenGenerations(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]SecureTokenGeneration {
+    const count = try decoder.readCount(16);
+    const items = try allocator.alloc(SecureTokenGeneration, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    for (items, 0..) |*item, index| {
+        var name: ?[]u8 = try decoder.readBytesAlloc(allocator, 128);
+        errdefer if (name) |value| allocator.free(value);
+        var prefix: ?[]u8 = try decoder.readBytesAlloc(allocator, 64);
+        errdefer if (prefix) |value| allocator.free(value);
+        const byte_count = try decoder.readByte();
+        const candidate: SecureTokenGeneration = .{
+            .name = name.?,
+            .prefix = prefix.?,
+            .byte_count = byte_count,
+        };
+        try validateSecureTokenGeneration(&candidate);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                items[index - 1].name,
+                candidate.name,
+            ) != .lt)
+        {
+            return error.EventGenerationsNotSorted;
+        }
+        item.* = candidate;
+        name = null;
+        prefix = null;
+        initialized += 1;
+    }
+    return items;
+}
+
+fn decodeEventBodyFields(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]EventBodyField {
+    const count = try decoder.readCount(64);
+    const fields = try allocator.alloc(EventBodyField, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields, 0..) |*field, index| {
+        var name: ?[]u8 = try decoder.readBytesAlloc(allocator, 128);
+        errdefer if (name) |value| allocator.free(value);
+        const source_tag = try decoder.readEnum(
+            std.meta.Tag(EventBodyFieldSource),
+        );
+        var source: ?EventBodyFieldSource = switch (source_tag) {
+            .generated_sha256 => .{ .generated_sha256 = try decoder.readBytesAlloc(allocator, 128) },
+            .parameter_sha256 => .{ .parameter_sha256 = try decodeParameterSha256Source(allocator, decoder) },
+            .state_value => .{ .state_value = try decodeStateValueSource(allocator, decoder) },
+        };
+        errdefer if (source) |*value| value.deinit(allocator);
+        const candidate: EventBodyField = .{
+            .field = name.?,
+            .source = source.?,
+        };
+        try validateEventBodyField(&candidate);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                fields[index - 1].field,
+                candidate.field,
+            ) != .lt)
+        {
+            return error.EventBodyFieldsNotSorted;
+        }
+        field.* = candidate;
+        name = null;
+        source = null;
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn decodeParameterSha256Source(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !ParameterSha256Source {
+    const parameter = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(parameter);
+    return .{
+        .parameter = parameter,
+        .expected_state = try decodeStateValueSource(
+            allocator,
+            decoder,
+        ),
+    };
+}
+
+fn decodeStateValueSource(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !StateValueSource {
+    const register = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(register);
+    const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+    defer allocator.free(raw_pointer);
+    return .{
+        .register = register,
+        .pointer = try definition_core.json_pointer.compile(
+            allocator,
+            raw_pointer,
+        ),
+    };
+}
+
+fn decodeSortedNames(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    max_count: usize,
+) ![][]u8 {
+    const count = try decoder.readCount(max_count);
+    const names = try allocator.alloc([]u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (names, 0..) |*name, index| {
+        name.* = try decoder.readBytesAlloc(allocator, 128);
+        initialized += 1;
+        try definition_core.json.safeIdentifier(name.*, 128);
+        if (index != 0 and
+            std.mem.order(u8, names[index - 1], name.*) != .lt)
+        {
+            return error.EventParameterNamesNotSorted;
+        }
+    }
+    return names;
 }
 
 fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
@@ -766,6 +1038,7 @@ fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
     if (binding_effects != 0 and binding_effects != effects.len) {
         return error.BindingOperationCannotMixEffects;
     }
+    try validateGeneratedOutputNames(effects);
 }
 
 fn compileSlots(
@@ -936,6 +1209,7 @@ fn compileOperations(
             return error.BindingOperationCannotMixEffects;
         }
         if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
+        try validateGeneratedOutputNames(effects);
         const owned_name = try allocator.dupe(u8, source.name);
         errdefer allocator.free(owned_name);
         try operations.append(allocator, .{
@@ -945,6 +1219,21 @@ fn compileOperations(
         });
     }
     return operations.toOwnedSlice(allocator);
+}
+
+fn validateGeneratedOutputNames(effects: []const Effect) !void {
+    for (effects, 0..) |effect, effect_index| {
+        const event = effect.event orelse continue;
+        for (event.generate) |generated| {
+            for (effects[0..effect_index]) |prior_effect| {
+                const prior_event = prior_effect.event orelse continue;
+                if (findSecureTokenGeneration(
+                    prior_event.generate,
+                    generated.name,
+                ) != null) return error.DuplicateGeneratedOutput;
+            }
+        }
+    }
 }
 
 fn compileEffect(
@@ -1012,7 +1301,11 @@ fn compileEffect(
         return error.BindingEffectHasAdmissionParameter;
     }
     var event = if (object.get("event")) |raw_event|
-        try compileEventMaterialization(allocator, raw_event)
+        try compileEventMaterialization(
+            allocator,
+            definition_plan,
+            raw_event,
+        )
     else
         null;
     errdefer if (event) |*value| value.deinit(allocator);
@@ -1031,12 +1324,20 @@ fn compileEffect(
 
 fn compileEventMaterialization(
     allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
     raw: std.json.Value,
 ) !EventMaterialization {
     const object = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "body_input_field", "fields", "request_literals" },
+        &.{
+            "body_input_field",
+            "fields",
+            "request_literals",
+            "generate",
+            "body_fields",
+            "forbidden_parameters",
+        },
     );
     try definition_core.json.requireFields(
         object,
@@ -1077,13 +1378,325 @@ fn compileEventMaterialization(
     else
         try allocator.alloc(RequestLiteral, 0);
     errdefer deinitRequestLiterals(allocator, request_literals);
+    const generate = if (object.get("generate")) |raw_generate|
+        try compileSecureTokenGenerations(
+            allocator,
+            definition_plan,
+            raw_generate,
+        )
+    else
+        try allocator.alloc(SecureTokenGeneration, 0);
+    errdefer deinitSecureTokenGenerations(allocator, generate);
+    const body_fields = if (object.get("body_fields")) |raw_body_fields|
+        try compileEventBodyFields(
+            allocator,
+            definition_plan,
+            raw_body_fields,
+        )
+    else
+        try allocator.alloc(EventBodyField, 0);
+    errdefer deinitEventBodyFields(allocator, body_fields);
+    const forbidden_parameters =
+        if (object.get("forbidden_parameters")) |raw_parameters|
+            try compileParameterNames(
+                allocator,
+                definition_plan,
+                raw_parameters,
+            )
+        else
+            try allocator.alloc([]u8, 0);
+    errdefer deinitNames(allocator, forbidden_parameters);
     const result: EventMaterialization = .{
         .body_input_field = body_input_field,
         .fields = fields,
         .request_literals = request_literals,
+        .generate = generate,
+        .body_fields = body_fields,
+        .forbidden_parameters = forbidden_parameters,
     };
     try validateEventMaterialization(allocator, &result);
+    try validateEventMaterializationAgainstDefinition(
+        &result,
+        definition_plan,
+    );
     return result;
+}
+
+fn compileSecureTokenGenerations(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) ![]SecureTokenGeneration {
+    if (!definition_plan.requires(.secure_token)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 16) {
+        return error.InvalidEventGenerationCount;
+    }
+    const items = try allocator.alloc(
+        SecureTokenGeneration,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "op", "prefix", "bytes" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "prefix", "bytes" },
+        );
+        if (!std.mem.eql(
+            u8,
+            try definition_core.json.requiredString(object, "op"),
+            "secure-token",
+        )) return error.UnsupportedEventGeneration;
+        const byte_count = try definition_core.json.unsigned(
+            try definition_core.json.field(object, "bytes"),
+        );
+        if (byte_count > std.math.maxInt(u8)) {
+            return error.SecureTokenByteCountInvalid;
+        }
+        var name: ?[]u8 = try allocator.dupe(
+            u8,
+            try definition_core.json.requiredString(object, "name"),
+        );
+        errdefer if (name) |owned| allocator.free(owned);
+        var prefix: ?[]u8 = try allocator.dupe(
+            u8,
+            try definition_core.json.requiredString(object, "prefix"),
+        );
+        errdefer if (prefix) |owned| allocator.free(owned);
+        const candidate: SecureTokenGeneration = .{
+            .name = name.?,
+            .prefix = prefix.?,
+            .byte_count = @intCast(byte_count),
+        };
+        try validateSecureTokenGeneration(&candidate);
+        items[index] = candidate;
+        name = null;
+        prefix = null;
+        initialized += 1;
+    }
+    std.mem.sort(
+        SecureTokenGeneration,
+        items,
+        {},
+        struct {
+            fn lessThan(
+                _: void,
+                left: SecureTokenGeneration,
+                right: SecureTokenGeneration,
+            ) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.lessThan,
+    );
+    for (items[1..], 1..) |item, index| {
+        if (std.mem.eql(u8, items[index - 1].name, item.name)) {
+            return error.DuplicateEventGeneration;
+        }
+    }
+    return items;
+}
+
+fn compileEventBodyFields(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) ![]EventBodyField {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidEventBodyFieldCount;
+    }
+    const fields = try allocator.alloc(EventBodyField, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (values.items, 0..) |value, index| {
+        fields[index] = try compileEventBodyField(
+            allocator,
+            definition_plan,
+            value,
+        );
+        initialized += 1;
+    }
+    std.mem.sort(EventBodyField, fields, {}, struct {
+        fn lessThan(
+            _: void,
+            left: EventBodyField,
+            right: EventBodyField,
+        ) bool {
+            return std.mem.lessThan(u8, left.field, right.field);
+        }
+    }.lessThan);
+    for (fields[1..], 1..) |field, index| {
+        if (std.mem.eql(u8, fields[index - 1].field, field.field)) {
+            return error.DuplicateEventBodyField;
+        }
+    }
+    return fields;
+}
+
+fn compileEventBodyField(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) !EventBodyField {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(object, &.{
+        "field",
+        "generated_sha256",
+        "parameter_sha256",
+        "state_value",
+    });
+    try definition_core.json.requireFields(object, &.{"field"});
+    const field = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "field"),
+    );
+    errdefer allocator.free(field);
+    var source_count: usize = 0;
+    source_count += @intFromBool(object.get("generated_sha256") != null);
+    source_count += @intFromBool(object.get("parameter_sha256") != null);
+    source_count += @intFromBool(object.get("state_value") != null);
+    if (source_count != 1) return error.InvalidEventBodyFieldSource;
+    var source: EventBodyFieldSource =
+        if (object.get("generated_sha256")) |value| blk: {
+            if (!definition_plan.requires(.sha256)) {
+                return error.UndeclaredArtifactOperator;
+            }
+            break :blk .{ .generated_sha256 = try allocator.dupe(
+                u8,
+                try definition_core.json.string(value),
+            ) };
+        } else if (object.get("parameter_sha256")) |value| blk: {
+            if (!definition_plan.requires(.sha256)) {
+                return error.UndeclaredArtifactOperator;
+            }
+            const config = try definition_core.json.object(value);
+            try definition_core.json.requireExactKeys(
+                config,
+                &.{ "parameter", "expected_state" },
+            );
+            try definition_core.json.requireFields(
+                config,
+                &.{ "parameter", "expected_state" },
+            );
+            const parameter = try allocator.dupe(
+                u8,
+                try definition_core.json.requiredString(
+                    config,
+                    "parameter",
+                ),
+            );
+            errdefer allocator.free(parameter);
+            const declaration =
+                definition_plan.parameter_declarations.find(parameter) orelse
+                return error.UnknownOperationParameter;
+            if (declaration.kind == .integer or
+                declaration.kind == .boolean)
+            {
+                return error.EventHashParameterMustBeText;
+            }
+            break :blk .{ .parameter_sha256 = .{
+                .parameter = parameter,
+                .expected_state = try compileStateValueSource(
+                    allocator,
+                    try definition_core.json.field(
+                        config,
+                        "expected_state",
+                    ),
+                ),
+            } };
+        } else blk: {
+            if (!definition_plan.requires(.reducer)) {
+                return error.UndeclaredArtifactOperator;
+            }
+            break :blk .{ .state_value = try compileStateValueSource(
+                allocator,
+                object.get("state_value").?,
+            ) };
+        };
+    errdefer source.deinit(allocator);
+    const result: EventBodyField = .{
+        .field = field,
+        .source = source,
+    };
+    try validateEventBodyField(&result);
+    return result;
+}
+
+fn compileStateValueSource(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !StateValueSource {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "register", "path" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "register", "path" },
+    );
+    const register = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "register"),
+    );
+    errdefer allocator.free(register);
+    return .{
+        .register = register,
+        .pointer = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.requiredString(object, "path"),
+        ),
+    };
+}
+
+fn compileParameterNames(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) ![][]u8 {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > 64) return error.EventParameterCountInvalid;
+    const names = try allocator.alloc([]u8, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (values.items, 0..) |value, index| {
+        const name = try definition_core.json.string(value);
+        if (definition_plan.parameter_declarations.find(name) == null) {
+            return error.UnknownOperationParameter;
+        }
+        names[index] = try allocator.dupe(u8, name);
+        initialized += 1;
+    }
+    std.mem.sort([]u8, names, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    if (names.len > 1) {
+        for (names[1..], 1..) |name, index| {
+            if (std.mem.eql(u8, names[index - 1], name)) {
+                return error.DuplicateEventParameter;
+            }
+        }
+    }
+    return names;
 }
 
 fn compileEventField(
@@ -1317,6 +1930,7 @@ fn validateEventMaterialization(
         error.EventRequestLiteralsNotSorted,
         error.EventLiteralTooLarge,
     );
+    try validateEventMaterializationExtensions(event);
 }
 
 fn validateCachedEventMaterialization(
@@ -1373,6 +1987,153 @@ fn validateCachedEventMaterialization(
         error.CacheStoragePlanMismatch,
         error.CacheStoragePlanMismatch,
     );
+    validateEventMaterializationExtensions(event) catch
+        return error.CacheStoragePlanMismatch;
+}
+
+fn validateEventMaterializationExtensions(
+    event: *const EventMaterialization,
+) !void {
+    if (event.generate.len > 16 or event.body_fields.len > 64 or
+        event.forbidden_parameters.len > 64)
+    {
+        return error.InvalidEventMaterializationBounds;
+    }
+    for (event.generate, 0..) |*item, index| {
+        try validateSecureTokenGeneration(item);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                event.generate[index - 1].name,
+                item.name,
+            ) != .lt)
+        {
+            return error.EventGenerationsNotSorted;
+        }
+    }
+    for (event.body_fields, 0..) |*field, index| {
+        try validateEventBodyField(field);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                event.body_fields[index - 1].field,
+                field.field,
+            ) != .lt)
+        {
+            return error.EventBodyFieldsNotSorted;
+        }
+    }
+    for (event.forbidden_parameters, 0..) |name, index| {
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                event.forbidden_parameters[index - 1],
+                name,
+            ) != .lt)
+        {
+            return error.EventParameterNamesNotSorted;
+        }
+    }
+}
+
+fn validateEventMaterializationAgainstDefinition(
+    event: *const EventMaterialization,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (event.generate.len != 0 and
+        !definition_plan.requires(.secure_token))
+    {
+        return error.UndeclaredArtifactOperator;
+    }
+    for (event.body_fields) |field| switch (field.source) {
+        .generated_sha256 => |name| {
+            if (!definition_plan.requires(.sha256) or
+                findSecureTokenGeneration(event.generate, name) == null)
+            {
+                return error.EventBodyGenerationMissing;
+            }
+        },
+        .parameter_sha256 => |source| {
+            const declaration =
+                definition_plan.parameter_declarations.find(
+                    source.parameter,
+                ) orelse return error.EventBodyParameterMissing;
+            if (!definition_plan.requires(.sha256) or
+                declaration.kind == .integer or
+                declaration.kind == .boolean)
+            {
+                return error.EventBodyParameterMissing;
+            }
+        },
+        .state_value => {
+            if (!definition_plan.requires(.reducer)) {
+                return error.UndeclaredArtifactOperator;
+            }
+        },
+    };
+    for (event.forbidden_parameters) |name| {
+        if (definition_plan.parameter_declarations.find(name) == null) {
+            return error.EventForbiddenParameterMissing;
+        }
+    }
+}
+
+fn validateSecureTokenGeneration(
+    item: *const SecureTokenGeneration,
+) !void {
+    try definition_core.json.safeIdentifier(item.name, 128);
+    if (!std.unicode.utf8ValidateSlice(item.prefix) or
+        item.prefix.len > 64 or
+        std.mem.indexOfScalar(u8, item.prefix, 0) != null or
+        item.byte_count < 16 or
+        item.byte_count > 64)
+    {
+        return error.SecureTokenGenerationInvalid;
+    }
+    for (item.prefix) |byte| {
+        if (byte < 0x21 or byte > 0x7e) {
+            return error.SecureTokenPrefixInvalid;
+        }
+    }
+}
+
+fn validateEventBodyField(field: *const EventBodyField) !void {
+    try definition_core.json.safeIdentifier(field.field, 128);
+    switch (field.source) {
+        .generated_sha256 => |name| {
+            try definition_core.json.safeIdentifier(name, 128);
+        },
+        .parameter_sha256 => |source| {
+            try definition_core.json.safeIdentifier(source.parameter, 128);
+            try validateStateValueSource(&source.expected_state);
+        },
+        .state_value => |source| try validateStateValueSource(&source),
+    }
+}
+
+fn validateStateValueSource(source: *const StateValueSource) !void {
+    try definition_core.json.safeIdentifier(source.register, 128);
+    if (source.pointer.raw.len > 1024) {
+        return error.EventStatePointerTooLarge;
+    }
+}
+
+fn findSecureTokenGeneration(
+    items: []const SecureTokenGeneration,
+    name: []const u8,
+) ?*const SecureTokenGeneration {
+    var low: usize = 0;
+    var high = items.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, items[mid].name, name)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &items[mid],
+        }
+    }
+    return null;
 }
 
 fn validateRequestLiterals(
@@ -1419,6 +2180,30 @@ fn deinitRequestLiterals(
 ) void {
     for (literals) |*literal| literal.deinit(allocator);
     allocator.free(literals);
+}
+
+fn deinitSecureTokenGenerations(
+    allocator: std.mem.Allocator,
+    items: []SecureTokenGeneration,
+) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
+}
+
+fn deinitEventBodyFields(
+    allocator: std.mem.Allocator,
+    fields: []EventBodyField,
+) void {
+    for (fields) |*field| field.deinit(allocator);
+    allocator.free(fields);
+}
+
+fn deinitNames(
+    allocator: std.mem.Allocator,
+    names: [][]u8,
+) void {
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
 }
 
 fn optionalParameterName(

@@ -112,6 +112,10 @@ pub const State = struct {
     }
 };
 
+pub fn hasRegister(plan: *const Plan, name: []const u8) bool {
+    return findRegister(plan.registers, name) != null;
+}
+
 pub fn isRetainedRule(
     allocator: std.mem.Allocator,
     rule: definition.Rule,
