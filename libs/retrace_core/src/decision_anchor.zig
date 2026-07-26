@@ -1,5 +1,5 @@
 const std = @import("std");
-const canonical_trace = @import("canonical_trace.zig");
+const canonical_trace = @import("trace_core");
 
 pub const Anchor = struct {
     available: bool,

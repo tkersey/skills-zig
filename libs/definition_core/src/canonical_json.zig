@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Canonical JSON support for generic retrace artifacts. This is not a claim
+/// Canonical JSON support for bounded passive definitions and artifacts. This is not a claim
 /// of full RFC 8785 compatibility: integers retain their exact i64 value,
 /// object keys are ordered by their raw UTF-8 bytes rather than by UTF-16 code
 /// units, and an integer-shaped f64 outside the parser's i64 domain uses

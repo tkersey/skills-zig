@@ -56,12 +56,32 @@ pub fn build(b: *std.Build) void {
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
+    const definition_core_canonical_json = b.createModule(.{
+        .root_source_file = b.path("libs/definition_core/src/canonical_json.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const definition_core = b.createModule(.{
+        .root_source_file = b.path("libs/definition_core/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const trace_core = b.createModule(.{
+        .root_source_file = b.path("libs/trace_core/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "jsonl_core", .module = jsonl_core },
+        },
+    });
     const retrace_core = b.createModule(.{
         .root_source_file = b.path("libs/retrace_core/src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "jsonl_core", .module = jsonl_core },
+            .{ .name = "canonical_json", .module = definition_core_canonical_json },
+            .{ .name = "trace_core", .module = trace_core },
         },
     });
     const jsonl_stream_release_fast = b.createModule(.{
@@ -78,7 +98,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const canonical_json_release_fast = b.createModule(.{
-        .root_source_file = b.path("libs/retrace_core/src/canonical_json.zig"),
+        .root_source_file = b.path("libs/definition_core/src/canonical_json.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -108,6 +128,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const seq_v1_core = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/v1/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "trace_core", .module = trace_core },
+        },
+    });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
     const seq_perf_cli = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/perf_cli.zig"),
@@ -117,6 +146,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "trace_core", .module = trace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
@@ -172,6 +203,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "trace_core", .module = trace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "durable_store", .module = durable_store },
@@ -195,6 +228,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "trace_core", .module = trace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
             .{ .name = "durable_store", .module = durable_store },
@@ -739,6 +774,34 @@ pub fn build(b: *std.Build) void {
         "test-jsonl-core",
         "Run shared JSONL framing tests",
     );
+    const run_definition_core_tests = addTestStep(
+        b,
+        definition_core,
+        "test-definition-core",
+        "Run passive-definition closure and canonicalization tests",
+    );
+    const definition_core_guard_cmd = b.addSystemCommand(&.{
+        "bash",
+        "scripts/guards/definition-core-domain.sh",
+    });
+    const run_definition_core_guard = b.step(
+        "test-definition-core-guard",
+        "Reject domain vocabulary in the neutral definition library",
+    );
+    run_definition_core_guard.dependOn(&definition_core_guard_cmd.step);
+    const run_trace_core_tests = addTestStepWithOptions(
+        b,
+        trace_core,
+        "test-trace-core",
+        "Run canonical physical trace tests",
+        .{ .cwd = b.path("apps/seq") },
+    );
+    const run_seq_v1_core_tests = addTestStep(
+        b,
+        seq_v1_core,
+        "test-seq-v1-core",
+        "Run Seq 1.0 observation-definition compiler tests",
+    );
     const run_execution_policy_core_tests = addTestStep(
         b,
         execution_policy_core,
@@ -854,6 +917,10 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_durable_store_tests.step);
     test_all.dependOn(&run_durable_store_perf_tests.step);
     test_all.dependOn(&run_jsonl_core_tests.step);
+    test_all.dependOn(&run_definition_core_tests.step);
+    test_all.dependOn(run_definition_core_guard);
+    test_all.dependOn(&run_trace_core_tests.step);
+    test_all.dependOn(&run_seq_v1_core_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
 
