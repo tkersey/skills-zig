@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 
 const max_regex_subject_bytes: usize = 16 * 1024 * 1024;
+const max_sha256_subject_bytes: usize = 16 * 1024 * 1024;
 
 pub const InputDocument = struct {
     name: []const u8,
@@ -132,6 +133,11 @@ const CompiledRegexPattern = struct {
     }
 };
 
+const Sha256Mode = enum {
+    canonical_json_null,
+    framed_items,
+};
+
 const CompiledReferenceTarget = struct {
     pointer_id: u16,
     optional: bool = false,
@@ -211,6 +217,8 @@ const CompiledRule = struct {
     variants: []CompiledVariant,
     format_parts: []CompiledFormatPart,
     regex_patterns: []CompiledRegexPattern,
+    sha256_mode: ?Sha256Mode = null,
+    sha256_prefix: ?[]u8 = null,
     reference_sources: []CompiledReferenceSource,
     reference_targets: []CompiledReferenceTarget,
 
@@ -232,6 +240,7 @@ const CompiledRule = struct {
         allocator.free(self.format_parts);
         for (self.regex_patterns) |*pattern| pattern.deinit(allocator);
         allocator.free(self.regex_patterns);
+        if (self.sha256_prefix) |prefix| allocator.free(prefix);
         for (self.reference_sources) |*source| source.deinit(allocator);
         allocator.free(self.reference_sources);
         for (self.reference_targets) |*target| target.deinit(allocator);
@@ -444,6 +453,7 @@ const Builder = struct {
                     try definition_core.json.field(object, "patterns"),
                 );
             },
+            .sha256 => try self.compileSha256Rule(object, true, &rule),
             .safe_identifier => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1671,6 +1681,7 @@ const Builder = struct {
                     try definition_core.json.field(object, "patterns"),
                 );
             },
+            .sha256 => try self.compileSha256Rule(object, false, &rule),
             .safe_identifier => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1937,6 +1948,120 @@ const Builder = struct {
         return rule;
     }
 
+    fn compileSha256Rule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        allow_input: bool,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (allow_input) {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{
+                    "op",
+                    "input",
+                    "path",
+                    "mode",
+                    "field",
+                    "null",
+                    "items",
+                    "prefix",
+                    "fragments",
+                    "max_bytes",
+                },
+            );
+        } else {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{
+                    "op",
+                    "path",
+                    "mode",
+                    "field",
+                    "null",
+                    "items",
+                    "prefix",
+                    "fragments",
+                    "max_bytes",
+                },
+            );
+        }
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "mode", "field", "max_bytes" },
+        );
+        const mode = try definition_core.json.requiredString(object, "mode");
+        rule.sha256_mode = if (std.mem.eql(
+            u8,
+            mode,
+            "canonical-json-null",
+        ))
+            .canonical_json_null
+        else if (std.mem.eql(u8, mode, "framed-items"))
+            .framed_items
+        else
+            return error.UnsupportedSha256Mode;
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "field"),
+        );
+        if (self.pointers.items[rule.other_pointer_id.?].raw.len == 0) {
+            return error.Sha256FieldPointerEmpty;
+        }
+        rule.max_count = try optionalUnsigned(object, "max_bytes") orelse
+            return error.MissingSha256Bound;
+        if (rule.max_count.? == 0 or
+            rule.max_count.? > max_sha256_subject_bytes)
+        {
+            return error.InvalidSha256Bound;
+        }
+        switch (rule.sha256_mode.?) {
+            .canonical_json_null => {
+                try definition_core.json.requireFields(
+                    object,
+                    &.{"null"},
+                );
+                if (object.get("items") != null or
+                    object.get("prefix") != null or
+                    object.get("fragments") != null)
+                {
+                    return error.ConflictingSha256ModeFields;
+                }
+                rule.path_ids = try self.allocator.alloc(u16, 1);
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "null"),
+                );
+                if (self.pointers.items[rule.path_ids[0]].raw.len == 0) {
+                    return error.Sha256NullPointerEmpty;
+                }
+            },
+            .framed_items => {
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "items", "prefix", "fragments" },
+                );
+                if (object.get("null") != null) {
+                    return error.ConflictingSha256ModeFields;
+                }
+                rule.path_ids = try self.allocator.alloc(u16, 1);
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "items"),
+                );
+                const prefix = try definition_core.json.requiredString(
+                    object,
+                    "prefix",
+                );
+                if (prefix.len > 4096) {
+                    return error.Sha256PrefixBytesExceeded;
+                }
+                rule.sha256_prefix = try self.allocator.dupe(u8, prefix);
+                rule.format_parts = try self.compileFormatParts(
+                    try definition_core.json.field(object, "fragments"),
+                    false,
+                );
+            },
+        }
+    }
+
     fn compileTaggedUnion(
         self: *Builder,
         object: std.json.ObjectMap,
@@ -2112,7 +2237,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(28);
+    try encoder.writeU16(29);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -2144,7 +2269,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 28) {
+    if (try decoder.readU16() != 29) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -2465,6 +2590,9 @@ fn encodeCompiledRule(
             try encoder.writeEnum(atom.quantifier);
         }
     }
+    try encoder.writeBool(rule.sha256_mode != null);
+    if (rule.sha256_mode) |mode| try encoder.writeEnum(mode);
+    try encoder.writeOptionalBytes(rule.sha256_prefix);
     try encoder.writeCount(rule.reference_sources.len);
     for (rule.reference_sources) |source| {
         try encoder.writeU16(source.pointer_id);
@@ -2707,6 +2835,15 @@ fn decodeCacheRule(
         for (regex_patterns) |*pattern| pattern.deinit(allocator);
         allocator.free(regex_patterns);
     }
+    const sha256_mode = if (try decoder.readBool())
+        try decoder.readEnum(Sha256Mode)
+    else
+        null;
+    const sha256_prefix = try decoder.readOptionalBytesAlloc(
+        allocator,
+        4096,
+    );
+    errdefer if (sha256_prefix) |prefix| allocator.free(prefix);
     const reference_source_count = try decoder.readCount(64);
     const reference_sources = try allocator.alloc(
         CompiledReferenceSource,
@@ -2885,6 +3022,8 @@ fn decodeCacheRule(
         .variants = variants,
         .format_parts = format_parts,
         .regex_patterns = regex_patterns,
+        .sha256_mode = sha256_mode,
+        .sha256_prefix = sha256_prefix,
         .reference_sources = reference_sources,
         .reference_targets = reference_targets,
     };
@@ -3130,6 +3269,32 @@ fn validateCachedRule(
                 }
             }
         },
+        .sha256 => if (rule.max_count == null or
+            rule.max_count.? == 0 or
+            rule.max_count.? > max_sha256_subject_bytes or
+            rule.other_pointer_id == null or
+            rule.path_ids.len != 1 or
+            rule.sha256_mode == null)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        } else switch (rule.sha256_mode.?) {
+            .canonical_json_null => {
+                if (rule.sha256_prefix != null or
+                    rule.format_parts.len != 0)
+                {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+            },
+            .framed_items => {
+                if (rule.sha256_prefix == null or
+                    rule.sha256_prefix.?.len > 4096 or
+                    rule.format_parts.len == 0 or
+                    rule.format_parts.len > 32)
+                {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+            },
+        },
         .bounded_number => if (rule.min_number == null and
             rule.max_number == null)
         {
@@ -3358,7 +3523,15 @@ fn validateCachedRule(
     if (rule.operator != .tagged_union and rule.variants.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
-    if (rule.operator != .path_format and rule.format_parts.len != 0) {
+    if (rule.operator != .path_format and
+        rule.operator != .sha256 and
+        rule.format_parts.len != 0)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .sha256 and
+        (rule.sha256_mode != null or rule.sha256_prefix != null))
+    {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .regex and rule.regex_patterns.len != 0) {
@@ -3950,6 +4123,10 @@ fn applyRule(
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .regex => if (target) |value| regexHolds(value, rule) else false,
+        .sha256 => if (target) |value|
+            try sha256Holds(allocator, plan, rule, value)
+        else
+            false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
         .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
         .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
@@ -4316,6 +4493,10 @@ fn itemRuleHolds(
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .regex => if (target) |value| regexHolds(value, rule) else false,
+        .sha256 => if (target) |value|
+            try sha256Holds(allocator, plan, rule, value)
+        else
+            false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
         .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
         .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
@@ -4787,6 +4968,103 @@ fn regexHolds(value: std.json.Value, rule: CompiledRule) bool {
         if (compiledRegexMatches(text, pattern)) return true;
     }
     return false;
+}
+
+fn sha256Holds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+) !bool {
+    if (plan.pointers[rule.other_pointer_id.?].raw.len == 0 or
+        plan.pointers[rule.path_ids[0]].raw.len == 0)
+    {
+        return false;
+    }
+    const expected_value = resolve(
+        value,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return false;
+    const expected = switch (expected_value) {
+        .string => |text| text,
+        else => return false,
+    };
+    if (!validateScalar(expected_value, .digest)) return false;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    switch (rule.sha256_mode.?) {
+        .canonical_json_null => {
+            var mutable = value;
+            const null_field = definition_core.json_pointer.lookupPtr(
+                &mutable,
+                plan.pointers[rule.path_ids[0]],
+            ) orelse return false;
+            const preserved = null_field.*;
+            defer null_field.* = preserved;
+            null_field.* = .null;
+            const canonical =
+                definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    mutable,
+                ) catch |err| switch (err) {
+                    error.WriteFailed => return error.OutOfMemory,
+                    else => return err,
+                };
+            defer allocator.free(canonical);
+            if (canonical.len > rule.max_count.?) return false;
+            hasher.update(canonical);
+        },
+        .framed_items => {
+            const prefix = rule.sha256_prefix.?;
+            var total_bytes = prefix.len;
+            if (total_bytes > rule.max_count.?) return false;
+            hasher.update(prefix);
+            const items = switch (resolve(
+                value,
+                plan.pointers[rule.path_ids[0]],
+            ) orelse return false) {
+                .array => |array| array.items,
+                else => return false,
+            };
+            if (items.len > plan.max_records) return false;
+            for (items) |item| {
+                const key: FormattedReferenceKey = .{
+                    .parent = value,
+                    .item = item,
+                    .value = item,
+                    .parts = rule.format_parts,
+                };
+                for (rule.format_parts) |part| {
+                    const fragment = formattedReferenceFragment(
+                        plan,
+                        key,
+                        part,
+                    ) orelse return false;
+                    total_bytes = std.math.add(
+                        usize,
+                        total_bytes,
+                        fragment.len,
+                    ) catch return false;
+                    if (total_bytes > rule.max_count.?) return false;
+                    hasher.update(fragment);
+                }
+            }
+        },
+    }
+    return sha256FinalMatches(&hasher, expected);
+}
+
+fn sha256FinalMatches(
+    hasher: *std.crypto.hash.sha2.Sha256,
+    expected: []const u8,
+) bool {
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    var computed: [71]u8 = undefined;
+    @memcpy(computed[0..7], "sha256:");
+    @memcpy(computed[7..], &hex);
+    return std.mem.eql(u8, expected, &computed);
 }
 
 fn compiledRegexMatches(
@@ -6740,6 +7018,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .scalar_type,
         .bounded_string,
         .regex,
+        .sha256,
         .bounded_number,
         .bounded_array,
         .bounded_object,
@@ -6789,6 +7068,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .scalar_type,
         .bounded_string,
         .regex,
+        .sha256,
         .bounded_number,
         .bounded_array,
         .bounded_object,
@@ -7712,6 +7992,131 @@ test "compiled namespace uniqueness and nested reference coverage survive cache"
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.valid, result.valid);
     }
+}
+
+test "compiled sha256 validates canonical subdocuments and framed item streams" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
+        \\{"op":"sha256","path":"/review","mode":"canonical-json-null","field":"/contract_digest","null":"/contract_digest","max_bytes":4096},
+        \\{"op":"object-values","path":"/manifests","rules":[{"op":"sha256","mode":"framed-items","field":"/contract_digest","items":"/resources","prefix":"lens-contract/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/digest"},{"literal":"\u0000"}],"max_bytes":4096}]}
+        \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    const review_basis =
+        "{\"contract_digest\":null,\"contract_id\":\"review\",\"schema\":\"review/v1\"}";
+    const review_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            std.testing.allocator,
+            review_basis,
+        );
+    defer std.testing.allocator.free(review_digest);
+    const resource_digest =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    var framed_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    framed_hasher.update("lens-contract/v1\x00");
+    framed_hasher.update("lens.md");
+    framed_hasher.update("\x00");
+    framed_hasher.update(resource_digest);
+    framed_hasher.update("\x00");
+    var framed_raw: [32]u8 = undefined;
+    framed_hasher.final(&framed_raw);
+    const framed_hex = std.fmt.bytesToHex(framed_raw, .lower);
+    const framed_digest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "sha256:{s}",
+        .{framed_hex},
+    );
+    defer std.testing.allocator.free(framed_digest);
+    const valid_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}}}}",
+        .{ framed_digest, resource_digest, review_digest },
+    );
+    defer std.testing.allocator.free(valid_bytes);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = valid_bytes }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    const wrong_digest =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const invalid_review_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        review_digest,
+        wrong_digest,
+    );
+    defer std.testing.allocator.free(invalid_review_bytes);
+    var invalid_review = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = invalid_review_bytes }},
+    );
+    defer invalid_review.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_review.valid);
+
+    const invalid_manifest_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        framed_digest,
+        wrong_digest,
+    );
+    defer std.testing.allocator.free(invalid_manifest_bytes);
+    var invalid_manifest = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = invalid_manifest_bytes }},
+    );
+    defer invalid_manifest.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_manifest.valid);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        validateForAllocationFailure,
+        .{ &definition_plan, &plan, valid_bytes },
+    );
 }
 
 test "definition references compile imported validators and survive cache round trips" {

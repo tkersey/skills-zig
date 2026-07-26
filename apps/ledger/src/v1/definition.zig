@@ -163,6 +163,7 @@ pub const Operator = enum {
             .exactly_one, .at_least_one => 2,
             .keyed_unique => 2,
             .regex => 2,
+            .sha256 => 2,
             else => 1,
         };
     }
