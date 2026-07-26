@@ -159,6 +159,10 @@ pub const Operator = enum {
             .optional_field => 2,
             .reference_exists => 8,
             .implies => 3,
+            .sorted => 2,
+            .exactly_one, .at_least_one => 2,
+            .keyed_unique => 2,
+            .regex => 2,
             else => 1,
         };
     }
@@ -196,11 +200,13 @@ pub const Operator = enum {
             .any_rules,
             .no_rules,
             .keyed_unique,
+            .keyed_join,
             .reference_exists,
             .field_equal,
             .field_not_equal,
             .cross_input_equal,
             .implies,
+            .predecessor_successor,
             .total_mapping,
             .declared_field_values,
             .object_values,
@@ -1448,7 +1454,7 @@ test "artifact definition rejects named but unimplemented operators" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["keyed-join"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["set-order"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(

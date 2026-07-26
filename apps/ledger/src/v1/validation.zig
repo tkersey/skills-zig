@@ -2,6 +2,8 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 
+const max_regex_subject_bytes: usize = 16 * 1024 * 1024;
+
 pub const InputDocument = struct {
     name: []const u8,
     bytes: []const u8,
@@ -432,7 +434,9 @@ const Builder = struct {
                 );
                 rule.max_count = try optionalUnsigned(object, "max") orelse
                     return error.MissingRegexBound;
-                if (rule.max_count.? == 0 or rule.max_count.? > 4096) {
+                if (rule.max_count.? == 0 or
+                    rule.max_count.? > max_regex_subject_bytes)
+                {
                     return error.InvalidRegexBound;
                 }
                 rule.regex_patterns = try compileRegexPatterns(
@@ -460,6 +464,21 @@ const Builder = struct {
             },
             .safe_relative_path => {
                 try compileRelativePathRule(self.allocator, object, &rule);
+            },
+            .sorted => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "key" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path" },
+                );
+                if (object.get("key")) |raw_key| {
+                    rule.other_pointer_id = try self.internPointer(
+                        try definition_core.json.string(raw_key),
+                    );
+                }
             },
             .bounded_number => {
                 rule.min_number = try optionalNumber(object, "min");
@@ -709,9 +728,155 @@ const Builder = struct {
                 );
             },
             .path_format => try self.compilePathFormat(object, &rule),
-            .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
-                try definition_core.json.field(object, "paths"),
-            ),
+            .exactly_one, .at_least_one => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "paths", "rules" },
+                );
+                const has_path = object.get("path") != null;
+                const has_paths = object.get("paths") != null;
+                if (has_path == has_paths) {
+                    return error.ConflictingCountRuleTargets;
+                }
+                if (has_path) {
+                    if (source.pointer_id == null) {
+                        return error.CountRuleCollectionMissing;
+                    }
+                    rule.children = try self.compileItemRules(
+                        try definition_core.json.field(object, "rules"),
+                        input_index,
+                        0,
+                    );
+                } else {
+                    if (object.get("rules") != null) {
+                        return error.CountRuleRulesUnexpected;
+                    }
+                    rule.path_ids = try self.parsePaths(
+                        try definition_core.json.field(object, "paths"),
+                    );
+                }
+            },
+            .keyed_join => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "input",
+                        "collection",
+                        "key",
+                        "selector",
+                        "value",
+                        "equals",
+                        "rules",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{
+                        "op",
+                        "collection",
+                        "key",
+                        "selector",
+                        "value",
+                        "equals",
+                    },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "collection",
+                    ),
+                );
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "equals"),
+                );
+                rule.path_ids = try self.allocator.alloc(u16, 3);
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "key"),
+                );
+                rule.path_ids[1] = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "selector",
+                    ),
+                );
+                rule.path_ids[2] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "value"),
+                );
+                if (object.get("rules")) |raw_rules| {
+                    rule.children = try self.compileItemRules(
+                        raw_rules,
+                        input_index,
+                        0,
+                    );
+                }
+            },
+            .predecessor_successor => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "input",
+                        "predecessor",
+                        "predecessor_key",
+                        "successor",
+                        "successor_key",
+                        "preserved",
+                        "retired",
+                        "introduced",
+                        "mappings",
+                        "mapping_predecessors",
+                        "mapping_successors",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{
+                        "op",
+                        "predecessor",
+                        "predecessor_key",
+                        "successor",
+                        "successor_key",
+                        "preserved",
+                        "retired",
+                        "introduced",
+                        "mappings",
+                        "mapping_predecessors",
+                        "mapping_successors",
+                    },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "predecessor",
+                    ),
+                );
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "successor",
+                    ),
+                );
+                const pointer_names = [_][]const u8{
+                    "predecessor_key",
+                    "successor_key",
+                    "preserved",
+                    "retired",
+                    "introduced",
+                    "mappings",
+                    "mapping_predecessors",
+                    "mapping_successors",
+                };
+                rule.path_ids = try self.allocator.alloc(
+                    u16,
+                    pointer_names.len,
+                );
+                for (pointer_names, 0..) |name, index| {
+                    rule.path_ids[index] = try self.internPointer(
+                        try definition_core.json.requiredString(object, name),
+                    );
+                }
+            },
             .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -795,18 +960,33 @@ const Builder = struct {
             .keyed_unique => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "input", "path", "key" },
+                    &.{ "op", "input", "path", "key", "sources" },
                 );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "key" },
-                );
-                if (source.pointer_id == null) {
-                    return error.KeyedUniqueCollectionMissing;
+                const has_path = object.get("path") != null;
+                const has_sources = object.get("sources") != null;
+                if (has_path == has_sources) {
+                    return error.ConflictingKeyedUniqueSources;
                 }
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "key"),
-                );
+                if (has_path) {
+                    try definition_core.json.requireFields(
+                        object,
+                        &.{ "op", "path", "key" },
+                    );
+                    if (source.pointer_id == null) {
+                        return error.KeyedUniqueCollectionMissing;
+                    }
+                    rule.other_pointer_id = try self.internPointer(
+                        try definition_core.json.requiredString(object, "key"),
+                    );
+                } else {
+                    if (object.get("key") != null) {
+                        return error.KeyedUniqueKeyUnexpected;
+                    }
+                    rule.pointer_id = null;
+                    rule.reference_sources = try self.compileKeySources(
+                        try definition_core.json.field(object, "sources"),
+                    );
+                }
             },
             .reference_exists => {
                 try definition_core.json.requireExactKeys(
@@ -1030,6 +1210,53 @@ const Builder = struct {
                 );
             }
             sources[index] = source;
+            initialized += 1;
+        }
+        return sources;
+    }
+
+    fn compileKeySources(
+        self: *Builder,
+        raw: std.json.Value,
+    ) anyerror![]CompiledReferenceSource {
+        const items = try definition_core.json.array(raw);
+        if (items.items.len < 2 or items.items.len > 64) {
+            return error.KeyedUniqueSourceCountInvalid;
+        }
+        const sources = try self.allocator.alloc(
+            CompiledReferenceSource,
+            items.items.len,
+        );
+        var initialized: usize = 0;
+        errdefer {
+            for (sources[0..initialized]) |*source| {
+                source.deinit(self.allocator);
+            }
+            self.allocator.free(sources);
+        }
+        for (items.items, 0..) |item, index| {
+            const object = try definition_core.json.object(item);
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "path", "key" },
+            );
+            try definition_core.json.requireFields(
+                object,
+                &.{ "path", "key" },
+            );
+            sources[index] = .{
+                .pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "path"),
+                ),
+                .reference_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "key"),
+                ),
+                .rules = try self.allocator.alloc(CompiledRule, 0),
+                .format_parts = try self.allocator.alloc(
+                    CompiledFormatPart,
+                    0,
+                ),
+            };
             initialized += 1;
         }
         return sources;
@@ -1357,11 +1584,21 @@ const Builder = struct {
             .digest,
             .timestamp,
             .unique,
-            .sorted,
             => try definition_core.json.requireExactKeys(
                 object,
                 &.{ "op", "path" },
             ),
+            .sorted => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "key" },
+                );
+                if (object.get("key")) |raw_key| {
+                    rule.other_pointer_id = try self.internPointer(
+                        try definition_core.json.string(raw_key),
+                    );
+                }
+            },
             .scalar_type => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1424,7 +1661,9 @@ const Builder = struct {
                 );
                 rule.max_count = try optionalUnsigned(object, "max") orelse
                     return error.MissingRegexBound;
-                if (rule.max_count.? == 0 or rule.max_count.? > 4096) {
+                if (rule.max_count.? == 0 or
+                    rule.max_count.? > max_regex_subject_bytes)
+                {
                     return error.InvalidRegexBound;
                 }
                 rule.regex_patterns = try compileRegexPatterns(
@@ -1505,11 +1744,30 @@ const Builder = struct {
             .exactly_one, .at_least_one => {
                 try definition_core.json.requireExactKeys(
                     object,
-                    &.{ "op", "paths" },
+                    &.{ "op", "path", "paths", "rules" },
                 );
-                rule.path_ids = try self.parsePaths(
-                    try definition_core.json.field(object, "paths"),
-                );
+                const has_path = object.get("path") != null;
+                const has_paths = object.get("paths") != null;
+                if (has_path == has_paths) {
+                    return error.ConflictingCountRuleTargets;
+                }
+                if (has_path) {
+                    if (pointer_id == null) {
+                        return error.CountRuleCollectionMissing;
+                    }
+                    rule.children = try self.compileItemRules(
+                        try definition_core.json.field(object, "rules"),
+                        input_index,
+                        depth + 1,
+                    );
+                } else {
+                    if (object.get("rules") != null) {
+                        return error.CountRuleRulesUnexpected;
+                    }
+                    rule.path_ids = try self.parsePaths(
+                        try definition_core.json.field(object, "paths"),
+                    );
+                }
             },
             .keyed_unique => {
                 try definition_core.json.requireExactKeys(
@@ -1522,6 +1780,98 @@ const Builder = struct {
                 rule.other_pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "key"),
                 );
+            },
+            .reference_exists => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "path",
+                        "reference",
+                        "target",
+                        "target_items",
+                        "target_rules",
+                        "coverage_rules",
+                        "key",
+                        "coverage",
+                        "self_reference",
+                        "ignore_null",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "reference", "target", "key" },
+                );
+                if (pointer_id == null) {
+                    return error.ReferenceCollectionMissing;
+                }
+                rule.other_input_index = input_index;
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.string(
+                        try definition_core.json.field(
+                            object,
+                            "reference",
+                        ),
+                    ),
+                );
+                const target_items = if (object.get("target_items")) |raw|
+                    try self.internPointer(
+                        try definition_core.json.string(raw),
+                    )
+                else
+                    null;
+                rule.path_ids = try self.allocator.alloc(
+                    u16,
+                    if (target_items == null) 2 else 3,
+                );
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "target"),
+                );
+                rule.path_ids[1] = try self.internPointer(
+                    try definition_core.json.string(
+                        try definition_core.json.field(object, "key"),
+                    ),
+                );
+                if (target_items) |target_items_pointer_id| {
+                    rule.path_ids[2] = target_items_pointer_id;
+                }
+                if (object.get("target_rules")) |raw_rules| {
+                    rule.children = try self.compileItemRules(
+                        raw_rules,
+                        input_index,
+                        depth + 1,
+                    );
+                }
+                if (object.get("coverage_rules")) |raw_rules| {
+                    rule.coverage_children = try self.compileItemRules(
+                        raw_rules,
+                        input_index,
+                        depth + 1,
+                    );
+                }
+                if (object.get("coverage")) |raw_coverage| {
+                    const coverage = try definition_core.json.string(
+                        raw_coverage,
+                    );
+                    if (!std.mem.eql(u8, coverage, "all-targets")) {
+                        return error.UnsupportedReferenceCoverage;
+                    }
+                    rule.total_coverage = true;
+                }
+                if (object.get("self_reference")) |raw_policy| {
+                    const policy = try definition_core.json.string(
+                        raw_policy,
+                    );
+                    if (!std.mem.eql(u8, policy, "reject")) {
+                        return error.UnsupportedSelfReferencePolicy;
+                    }
+                    if (rule.path_ids[0] != pointer_id) {
+                        return error.SelfReferenceRequiresOneCollection;
+                    }
+                    rule.reject_self_reference = true;
+                }
+                rule.ignore_null_references =
+                    try optionalBoolean(object, "ignore_null") orelse false;
             },
             .implies => {
                 try definition_core.json.requireExactKeys(
@@ -2754,7 +3104,7 @@ fn validateCachedRule(
         },
         .regex => if (rule.max_count == null or
             rule.max_count.? == 0 or
-            rule.max_count.? > 4096 or
+            rule.max_count.? > max_regex_subject_bytes or
             rule.regex_patterns.len == 0 or
             rule.regex_patterns.len > 32)
         {
@@ -2799,6 +3149,11 @@ fn validateCachedRule(
                 ) catch return error.CacheRuleConfigurationInvalid;
             }
         },
+        .sorted => if (rule.pointer_id == null or
+            rule.path_ids.len != 0)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .set_equality,
         .subset,
         .superset,
@@ -2817,11 +3172,29 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .exactly_one, .at_least_one => if (rule.path_ids.len == 0) {
-            return error.CacheRuleConfigurationInvalid;
+        .exactly_one, .at_least_one => {
+            const field_mode = rule.path_ids.len != 0 and
+                rule.pointer_id == null and rule.children.len == 0;
+            const collection_mode = rule.path_ids.len == 0 and
+                rule.pointer_id != null and rule.children.len != 0;
+            if (!field_mode and !collection_mode) {
+                return error.CacheRuleConfigurationInvalid;
+            }
         },
-        .keyed_unique => if (rule.pointer_id == null or
-            rule.other_pointer_id == null)
+        .keyed_unique => {
+            const collection_mode = rule.pointer_id != null and
+                rule.other_pointer_id != null and
+                rule.reference_sources.len == 0;
+            const source_mode = rule.pointer_id == null and
+                rule.other_pointer_id == null and
+                rule.reference_sources.len >= 2;
+            if (!collection_mode and !source_mode) {
+                return error.CacheRuleConfigurationInvalid;
+            }
+        },
+        .keyed_join => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or
+            rule.path_ids.len != 3)
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -2875,6 +3248,12 @@ fn validateCachedRule(
         .total_mapping => if (rule.pointer_id == null or
             rule.other_pointer_id == null or
             rule.path_ids.len != 3)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .predecessor_successor => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or
+            rule.path_ids.len != 8)
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -2969,6 +3348,9 @@ fn validateCachedRule(
         rule.operator != .no_rules and
         rule.operator != .object_values and
         rule.operator != .reference_exists and
+        rule.operator != .keyed_join and
+        rule.operator != .exactly_one and
+        rule.operator != .at_least_one and
         rule.children.len != 0)
     {
         return error.CacheRuleConfigurationInvalid;
@@ -2996,6 +3378,7 @@ fn validateCachedRule(
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .reference_exists and
+        rule.operator != .keyed_unique and
         rule.reference_sources.len != 0)
     {
         return error.CacheRuleConfigurationInvalid;
@@ -3576,16 +3959,31 @@ fn applyRule(
         .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
         .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
         .unique => if (target) |value| arrayUnique(value) else false,
-        .sorted => if (target) |value| arraySorted(value) else false,
-        .keyed_unique => if (target) |value|
-            try keyedUnique(
-                allocator,
-                value,
-                plan.pointers[rule.other_pointer_id.?],
-                plan.max_records,
-            )
+        .sorted => if (target) |value|
+            arraySorted(value, if (rule.other_pointer_id) |pointer_id|
+                plan.pointers[pointer_id]
+            else
+                null)
         else
             false,
+        .keyed_unique => if (rule.reference_sources.len == 0)
+            if (target) |value|
+                try keyedUnique(
+                    allocator,
+                    value,
+                    plan.pointers[rule.other_pointer_id.?],
+                    plan.max_records,
+                )
+            else
+                false
+        else
+            try keyedUniqueSources(allocator, plan, root, rule),
+        .keyed_join => try selectedKeyedJoin(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
         .declared_field_values => if (target) |value|
             try declaredFieldValuesHold(
                 allocator,
@@ -3616,6 +4014,12 @@ fn applyRule(
             rule,
         ),
         .total_mapping => try totalMapping(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
+        .predecessor_successor => try predecessorSuccessorHolds(
             allocator,
             plan,
             root,
@@ -3667,7 +4071,10 @@ fn applyRule(
         .field_not_equal,
         .cross_input_equal,
         => compareRule(plan, loaded, rule),
-        .exactly_one, .at_least_one => countPresent(plan, root, rule),
+        .exactly_one, .at_least_one => if (rule.children.len == 0)
+            countPresent(plan, root, rule)
+        else
+            try countMatching(allocator, plan, root, rule),
         else => true,
     };
     if (!valid) {
@@ -3918,7 +4325,13 @@ fn itemRuleHolds(
         .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
         .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
         .unique => if (target) |value| arrayUnique(value) else false,
-        .sorted => if (target) |value| arraySorted(value) else false,
+        .sorted => if (target) |value|
+            arraySorted(value, if (rule.other_pointer_id) |pointer_id|
+                plan.pointers[pointer_id]
+            else
+                null)
+        else
+            false,
         .keyed_unique => if (target) |value|
             try keyedUnique(
                 allocator,
@@ -3974,7 +4387,10 @@ fn itemRuleHolds(
         .field_not_equal,
         .cross_input_equal,
         => compareRuleRoots(plan, rule, root, root),
-        .exactly_one, .at_least_one => countPresent(plan, root, rule),
+        .exactly_one, .at_least_one => if (rule.children.len == 0)
+            countPresent(plan, root, rule)
+        else
+            try countMatching(allocator, plan, root, rule),
         .one_of => if (target) |value|
             oneOfRulesHold(allocator, plan, rule, value)
         else
@@ -4075,6 +4491,31 @@ fn countPresent(plan: *const Plan, root: std.json.Value, rule: CompiledRule) boo
         if (resolve(root, plan.pointers[pointer_id]) != null) count += 1;
     }
     return if (rule.operator == .exactly_one) count == 1 else count >= 1;
+}
+
+fn countMatching(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    const items = switch (resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records) return false;
+    var count: usize = 0;
+    for (items) |item| {
+        if (try itemRulesHold(allocator, plan, rule.children, item)) {
+            count += 1;
+            if (rule.operator == .exactly_one and count > 1) return false;
+            if (rule.operator == .at_least_one) return true;
+        }
+    }
+    return count == 1;
 }
 
 fn implicationHolds(
@@ -4604,14 +5045,30 @@ fn arrayUnique(value: std.json.Value) bool {
     return true;
 }
 
-fn arraySorted(value: std.json.Value) bool {
+fn arraySorted(
+    value: std.json.Value,
+    key_pointer: ?Pointer,
+) bool {
     const items = switch (value) {
         .array => |array| array.items,
         else => return false,
     };
     if (items.len < 2) return true;
     for (items[1..], 1..) |item, index| {
-        if (valueOrder(items[index - 1], item) == .gt) return false;
+        const left = if (key_pointer) |pointer|
+            resolve(items[index - 1], pointer) orelse return false
+        else
+            items[index - 1];
+        const right = if (key_pointer) |pointer|
+            resolve(item, pointer) orelse return false
+        else
+            item;
+        const order = valueOrder(left, right);
+        if (key_pointer != null) {
+            if (order != .lt) return false;
+        } else if (order == .gt) {
+            return false;
+        }
     }
     return true;
 }
@@ -4638,6 +5095,340 @@ fn keyedUnique(
             return error.KeyedUniqueDigestCollision;
         }
         result.value_ptr.* = key;
+    }
+    return true;
+}
+
+fn keyedUniqueSources(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    var seen: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
+    defer seen.deinit(allocator);
+    var item_count: usize = 0;
+    for (rule.reference_sources) |source| {
+        const items = switch (resolve(
+            root,
+            plan.pointers[source.pointer_id],
+        ) orelse return false) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        item_count = std.math.add(
+            usize,
+            item_count,
+            items.len,
+        ) catch return false;
+        if (item_count > plan.max_records) return false;
+        for (items) |item| {
+            const key = resolve(
+                item,
+                plan.pointers[source.reference_pointer_id],
+            ) orelse return false;
+            const digest = scalarKeyDigest(key) orelse return false;
+            const result = try seen.getOrPut(allocator, digest);
+            if (result.found_existing) {
+                if (valuesEqual(result.value_ptr.*, key)) return false;
+                return error.KeyedUniqueDigestCollision;
+            }
+            result.value_ptr.* = key;
+        }
+    }
+    return true;
+}
+
+fn selectedKeyedJoin(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    const collection = switch (resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (collection.len > plan.max_records) return false;
+    const selector = resolve(
+        root,
+        plan.pointers[rule.path_ids[1]],
+    ) orelse return false;
+    const selector_digest = scalarKeyDigest(selector) orelse return false;
+    const expected = resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return false;
+
+    var index: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
+    defer index.deinit(allocator);
+    for (collection) |item| {
+        const key = resolve(
+            item,
+            plan.pointers[rule.path_ids[0]],
+        ) orelse return false;
+        const digest = scalarKeyDigest(key) orelse return false;
+        const result = try index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            const prior_key = resolve(
+                result.value_ptr.*,
+                plan.pointers[rule.path_ids[0]],
+            ) orelse return false;
+            if (valuesEqual(prior_key, key)) return false;
+            return error.KeyedJoinDigestCollision;
+        }
+        result.value_ptr.* = item;
+    }
+    const selected = index.get(selector_digest) orelse return false;
+    const selected_key = resolve(
+        selected,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    if (!valuesEqual(selected_key, selector)) {
+        return error.KeyedJoinDigestCollision;
+    }
+    if (rule.children.len != 0 and
+        !try itemRulesHold(allocator, plan, rule.children, selected))
+    {
+        return false;
+    }
+    const actual = resolve(
+        selected,
+        plan.pointers[rule.path_ids[2]],
+    ) orelse return false;
+    return valuesEqual(actual, expected);
+}
+
+const CorrespondenceEntry = struct {
+    key: std.json.Value,
+    value: std.json.Value,
+    classified: bool = false,
+};
+
+fn predecessorSuccessorHolds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    var predecessors: std.AutoHashMapUnmanaged(
+        [32]u8,
+        CorrespondenceEntry,
+    ) = .empty;
+    defer predecessors.deinit(allocator);
+    var successors: std.AutoHashMapUnmanaged(
+        [32]u8,
+        CorrespondenceEntry,
+    ) = .empty;
+    defer successors.deinit(allocator);
+    if (!try indexCorrespondenceCollection(
+        allocator,
+        plan,
+        root,
+        rule.pointer_id.?,
+        rule.path_ids[0],
+        &predecessors,
+    ) or !try indexCorrespondenceCollection(
+        allocator,
+        plan,
+        root,
+        rule.other_pointer_id.?,
+        rule.path_ids[1],
+        &successors,
+    )) return false;
+
+    var reference_count: usize = 0;
+    const max_reference_count = plan.max_records *| 8;
+    const preserved = try correspondenceReferences(
+        plan,
+        root,
+        rule.path_ids[2],
+    ) orelse return false;
+    if (!try markPreservedCorrespondence(
+        preserved,
+        &predecessors,
+        &successors,
+        &reference_count,
+        max_reference_count,
+    )) return false;
+    const retired = try correspondenceReferences(
+        plan,
+        root,
+        rule.path_ids[3],
+    ) orelse return false;
+    if (!try markCorrespondenceReferences(
+        retired,
+        &predecessors,
+        &reference_count,
+        max_reference_count,
+    )) return false;
+    const introduced = try correspondenceReferences(
+        plan,
+        root,
+        rule.path_ids[4],
+    ) orelse return false;
+    if (!try markCorrespondenceReferences(
+        introduced,
+        &successors,
+        &reference_count,
+        max_reference_count,
+    )) return false;
+
+    const mappings = switch (resolve(
+        root,
+        plan.pointers[rule.path_ids[5]],
+    ) orelse return false) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (mappings.len > plan.max_records) return false;
+    for (mappings) |mapping| {
+        const predecessor_refs = switch (resolve(
+            mapping,
+            plan.pointers[rule.path_ids[6]],
+        ) orelse return false) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        const successor_refs = switch (resolve(
+            mapping,
+            plan.pointers[rule.path_ids[7]],
+        ) orelse return false) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        if (predecessor_refs.len > plan.max_records or
+            successor_refs.len > plan.max_records or
+            !try markCorrespondenceReferences(
+                predecessor_refs,
+                &predecessors,
+                &reference_count,
+                max_reference_count,
+            ) or !try markCorrespondenceReferences(
+            successor_refs,
+            &successors,
+            &reference_count,
+            max_reference_count,
+        )) {
+            return false;
+        }
+    }
+    return correspondenceComplete(&predecessors) and
+        correspondenceComplete(&successors);
+}
+
+fn indexCorrespondenceCollection(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    collection_pointer_id: u16,
+    key_pointer_id: u16,
+    index: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+) !bool {
+    const items = switch (resolve(
+        root,
+        plan.pointers[collection_pointer_id],
+    ) orelse return false) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records) return false;
+    for (items) |item| {
+        const key = resolve(
+            item,
+            plan.pointers[key_pointer_id],
+        ) orelse return false;
+        const digest = scalarKeyDigest(key) orelse return false;
+        const result = try index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (valuesEqual(result.value_ptr.key, key)) return false;
+            return error.PredecessorSuccessorDigestCollision;
+        }
+        result.value_ptr.* = .{ .key = key, .value = item };
+    }
+    return true;
+}
+
+fn correspondenceReferences(
+    plan: *const Plan,
+    root: std.json.Value,
+    pointer_id: u16,
+) !?[]const std.json.Value {
+    return switch (resolve(
+        root,
+        plan.pointers[pointer_id],
+    ) orelse return null) {
+        .array => |array| array.items,
+        else => null,
+    };
+}
+
+fn markPreservedCorrespondence(
+    references: []const std.json.Value,
+    predecessors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    successors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    reference_count: *usize,
+    max_reference_count: usize,
+) !bool {
+    for (references) |reference| {
+        reference_count.* = std.math.add(
+            usize,
+            reference_count.*,
+            2,
+        ) catch return false;
+        if (reference_count.* > max_reference_count) return false;
+        const digest = scalarKeyDigest(reference) orelse return false;
+        const predecessor = predecessors.getPtr(digest) orelse return false;
+        const successor = successors.getPtr(digest) orelse return false;
+        if (!valuesEqual(predecessor.key, reference) or
+            !valuesEqual(successor.key, reference))
+        {
+            return error.PredecessorSuccessorDigestCollision;
+        }
+        if (predecessor.classified or successor.classified or
+            !valuesEqual(predecessor.value, successor.value))
+        {
+            return false;
+        }
+        predecessor.classified = true;
+        successor.classified = true;
+    }
+    return true;
+}
+
+fn markCorrespondenceReferences(
+    references: []const std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    reference_count: *usize,
+    max_reference_count: usize,
+) !bool {
+    for (references) |reference| {
+        reference_count.* = std.math.add(
+            usize,
+            reference_count.*,
+            1,
+        ) catch return false;
+        if (reference_count.* > max_reference_count) return false;
+        const digest = scalarKeyDigest(reference) orelse return false;
+        const entry = index.getPtr(digest) orelse return false;
+        if (!valuesEqual(entry.key, reference)) {
+            return error.PredecessorSuccessorDigestCollision;
+        }
+        if (entry.classified) return false;
+        entry.classified = true;
+    }
+    return true;
+}
+
+fn correspondenceComplete(
+    index: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+) bool {
+    var iterator = index.valueIterator();
+    while (iterator.next()) |entry| {
+        if (!entry.classified) return false;
     }
     return true;
 }
@@ -5976,9 +6767,11 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .field_not_equal,
         .cross_input_equal,
         .keyed_unique,
+        .keyed_join,
         .declared_field_values,
         .reference_exists,
         .implies,
+        .predecessor_successor,
         .total_partition,
         .total_mapping,
         .path_format,
@@ -6013,9 +6806,12 @@ fn isItemOperator(operator: definition.Operator) bool {
         .subset,
         .superset,
         .disjoint,
+        .field_equal,
+        .field_not_equal,
         .exactly_one,
         .at_least_one,
         .keyed_unique,
+        .reference_exists,
         .implies,
         .all_rules,
         .any_rules,
@@ -6772,6 +7568,150 @@ test "validation reports missing and malformed inputs without granting authority
     try std.testing.expect(!malformed.valid);
     try std.testing.expect(!malformed.authority_granted);
     try std.testing.expect(!malformed.storage_mutated);
+}
+
+test "compiled correspondence rules bind selected values and total successor partitions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/correspondence","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one","keyed-join","predecessor-successor","sorted"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
+        \\{"op":"sorted","path":"/successors","key":"/id"},
+        \\{"op":"exactly-one","path":"/candidates","rules":[{"op":"enum","path":"/status","values":["selected"]}]},
+        \\{"op":"at-least-one","path":"/candidates","rules":[{"op":"enum","path":"/derivation","values":["independent"]}]}
+        \\]},"constraints":[
+        \\{"op":"keyed-join","collection":"/candidates","key":"/id","selector":"/selected_id","value":"/factors","equals":"/surface","rules":[{"op":"enum","path":"/status","values":["selected"]}]},
+        \\{"op":"predecessor-successor","predecessor":"/predecessors","predecessor_key":"/id","successor":"/successors","successor_key":"/id","preserved":"/preserved","retired":"/retired","introduced":"/introduced","mappings":"/mappings","mapping_predecessors":"/from","mapping_successors":"/to"}
+        \\],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":32,"max_output_bytes":8192,"max_diagnostics":16,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+
+    const valid_bytes =
+        \\{"candidates":[{"derivation":"independent","factors":["factor-a"],"id":"candidate-a","status":"selected"},{"derivation":"relative","factors":["factor-b"],"id":"candidate-b","status":"dominated"}],"introduced":["factor-c"],"mappings":[],"predecessors":[{"id":"factor-a","value":"same"},{"id":"factor-b","value":"old"}],"preserved":["factor-a"],"retired":["factor-b"],"selected_id":"candidate-a","successors":[{"id":"factor-a","value":"same"},{"id":"factor-c","value":"new"}],"surface":["factor-a"]}
+    ;
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = valid_bytes }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    const invalid_cases = [_][]const u8{
+        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"selected\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
+        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-b\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-b\"]}",
+        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"changed\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
+        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
+        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-c\",\"value\":\"new\"},{\"id\":\"factor-a\",\"value\":\"same\"}],\"surface\":[\"factor-a\"]}",
+    };
+    for (invalid_cases) |bytes| {
+        var rejected = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = bytes }},
+        );
+        defer rejected.deinit(std.testing.allocator);
+        try std.testing.expect(!rejected.valid);
+    }
+}
+
+test "compiled namespace uniqueness and nested reference coverage survive cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/namespaces","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["keyed-unique","reference-exists","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[
+        \\{"op":"keyed-unique","sources":[{"path":"/first","key":"/id"},{"path":"/second","key":"/name"}]},
+        \\{"op":"tagged-union","path":"","tag":"/mode","variants":[{"value":"expanded","rules":[{"op":"reference-exists","path":"/introduced","reference":"","target":"/additions","key":"/id","coverage":"all-targets"}]},{"value":"plain","rules":[]}]}
+        \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+
+    const cases = [_]struct { bytes: []const u8, valid: bool }{
+        .{
+            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"retirement-1\"}]}",
+            .valid = true,
+        },
+        .{
+            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"proof-1\"}]}",
+            .valid = false,
+        },
+        .{
+            .bytes = "{\"additions\":[],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"retirement-1\"}]}",
+            .valid = false,
+        },
+    };
+    for (cases) |case| {
+        var result = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = case.bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.valid, result.valid);
+    }
 }
 
 test "definition references compile imported validators and survive cache round trips" {

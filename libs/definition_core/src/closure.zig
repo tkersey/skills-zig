@@ -740,15 +740,15 @@ fn defaultIo() std.Io {
 
 test "canonical definition packages admit cross-package imports" {
     const external = try admittedLocation(
-        "/opt/config/skills/actuating/definitions/ledger/evidence.json",
+        "/opt/config/packages/first/definitions/ledger/record.json",
         "/workspace/target",
     );
     try std.testing.expectEqualStrings(
-        "/opt/config/skills",
+        "/opt/config/packages",
         external.root,
     );
     try std.testing.expectEqualStrings(
-        "actuating/definitions/ledger/evidence.json",
+        "first/definitions/ledger/record.json",
         external.entry,
     );
     const local = try admittedLocation(
