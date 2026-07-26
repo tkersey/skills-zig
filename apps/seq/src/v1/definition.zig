@@ -587,6 +587,14 @@ fn validateStepShape(operator: Operator, object: std.json.ObjectMap) !void {
             object,
             &.{ "op", "input", "name" },
         ),
+        .sort => try definition_core.json.requireFields(
+            object,
+            &.{ "op", "input", "as", "by" },
+        ),
+        .distinct => try definition_core.json.requireFields(
+            object,
+            &.{ "op", "input", "as", "keys" },
+        ),
         .literal_match,
         .regex_match,
         .multi_literal_match,

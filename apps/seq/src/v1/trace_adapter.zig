@@ -85,12 +85,13 @@ pub fn observeFile(
                 options.structured_limits,
             );
             break :structured_result try structured.observe(
+                allocator,
                 program,
                 &structured_index,
                 output,
             );
         },
-        else => try observeTrace(program, &trace, output),
+        else => try observeTrace(allocator, program, &trace, output),
     };
 
     return .{
@@ -103,6 +104,7 @@ pub fn observeFile(
 }
 
 pub fn observeTrace(
+    allocator: std.mem.Allocator,
     program: *const execution.Program,
     trace: *const trace_core.CanonicalSessionTrace,
     output: []execution.Value,
@@ -111,7 +113,12 @@ pub fn observeTrace(
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
     };
-    var runner = try execution.Runner.init(program, output);
+    var runner = try execution.Runner.initAlloc(
+        allocator,
+        program,
+        output,
+    );
+    defer runner.deinit();
     var row: [256]execution.Value = undefined;
 
     switch (relation) {
@@ -217,7 +224,7 @@ pub fn observeTrace(
         .structured_values,
         => return error.UnsupportedTracePhysicalRelation,
     }
-    return runner.result();
+    return runner.finish();
 }
 
 fn supported(relation: physical.Relation) bool {

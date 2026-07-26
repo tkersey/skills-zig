@@ -9,6 +9,8 @@ pub fn supports(operator: definition.Operator) bool {
         .filter,
         .project,
         .limit,
+        .sort,
+        .distinct,
         .named_relation,
         .result_projection,
         => true,
@@ -158,18 +160,68 @@ pub const Limit = union(enum) {
     parameter: u16,
 };
 
+pub const SortDirection = enum {
+    ascending,
+    descending,
+
+    fn parse(raw: []const u8) !SortDirection {
+        if (std.mem.eql(u8, raw, "asc")) return .ascending;
+        if (std.mem.eql(u8, raw, "desc")) return .descending;
+        return error.InvalidObservationSortDirection;
+    }
+};
+
+pub const NullOrder = enum {
+    first,
+    last,
+
+    fn parse(raw: []const u8) !NullOrder {
+        if (std.mem.eql(u8, raw, "first")) return .first;
+        if (std.mem.eql(u8, raw, "last")) return .last;
+        return error.InvalidObservationNullOrder;
+    }
+};
+
+pub const SortKey = struct {
+    field_index: u16,
+    direction: SortDirection,
+    nulls: NullOrder,
+};
+
+pub const Sort = struct {
+    keys: []SortKey,
+
+    fn deinit(self: *Sort, allocator: std.mem.Allocator) void {
+        allocator.free(self.keys);
+        self.* = undefined;
+    }
+};
+
+pub const Distinct = struct {
+    field_indices: []u16,
+
+    fn deinit(self: *Distinct, allocator: std.mem.Allocator) void {
+        allocator.free(self.field_indices);
+        self.* = undefined;
+    }
+};
+
 pub const Operation = union(enum) {
     scan: Scan,
     filter: Filter,
     project: Project,
     alias,
     limit: Limit,
+    sort: Sort,
+    distinct: Distinct,
 
     fn deinit(self: *Operation, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .scan => |*value| value.deinit(allocator),
             .filter => |*value| value.deinit(allocator),
             .project => |*value| value.deinit(allocator),
+            .sort => |*value| value.deinit(allocator),
+            .distinct => |*value| value.deinit(allocator),
             .alias, .limit => {},
         }
         self.* = undefined;
@@ -394,6 +446,44 @@ fn compileStage(
                 source_ref.?,
             );
         },
+        .sort => {
+            source_ref = try resolveSource(
+                definition_plan,
+                prior_stages,
+                source.input_names[0],
+            );
+            schema = try cloneSourceSchema(
+                allocator,
+                definition_plan,
+                prior_stages,
+                source_ref.?,
+            );
+            errdefer schema.deinit(allocator);
+            operation = .{ .sort = try compileSort(
+                allocator,
+                &schema,
+                object,
+            ) };
+        },
+        .distinct => {
+            source_ref = try resolveSource(
+                definition_plan,
+                prior_stages,
+                source.input_names[0],
+            );
+            schema = try cloneSourceSchema(
+                allocator,
+                definition_plan,
+                prior_stages,
+                source_ref.?,
+            );
+            errdefer schema.deinit(allocator);
+            operation = .{ .distinct = try compileDistinct(
+                allocator,
+                &schema,
+                object,
+            ) };
+        },
         else => return error.ObservationOperatorPlanNotCompiled,
     }
     errdefer operation.deinit(allocator);
@@ -404,6 +494,77 @@ fn compileStage(
         .operation = operation,
         .schema = schema,
     };
+}
+
+fn compileSort(
+    allocator: std.mem.Allocator,
+    schema: *const Schema,
+    object: std.json.ObjectMap,
+) !Sort {
+    const values = try definition_core.json.array(
+        try definition_core.json.field(object, "by"),
+    );
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidObservationSortKeyCount;
+    }
+    const keys = try allocator.alloc(SortKey, values.items.len);
+    errdefer allocator.free(keys);
+    for (values.items, 0..) |value, index| {
+        const key = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            key,
+            &.{ "field", "direction", "nulls" },
+        );
+        try definition_core.json.requireFields(key, &.{"field"});
+        const field_index = schema.find(
+            try definition_core.json.requiredString(key, "field"),
+        ) orelse return error.UnknownObservationSortField;
+        for (keys[0..index]) |prior| {
+            if (prior.field_index == field_index) {
+                return error.DuplicateObservationSortField;
+            }
+        }
+        keys[index] = .{
+            .field_index = field_index,
+            .direction = if (key.get("direction")) |raw|
+                try SortDirection.parse(
+                    try definition_core.json.string(raw),
+                )
+            else
+                .ascending,
+            .nulls = if (key.get("nulls")) |raw|
+                try NullOrder.parse(try definition_core.json.string(raw))
+            else
+                .last,
+        };
+    }
+    return .{ .keys = keys };
+}
+
+fn compileDistinct(
+    allocator: std.mem.Allocator,
+    schema: *const Schema,
+    object: std.json.ObjectMap,
+) !Distinct {
+    const values = try definition_core.json.array(
+        try definition_core.json.field(object, "keys"),
+    );
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidObservationDistinctKeyCount;
+    }
+    const fields = try allocator.alloc(u16, values.items.len);
+    errdefer allocator.free(fields);
+    for (values.items, 0..) |value, index| {
+        fields[index] = schema.find(
+            try definition_core.json.string(value),
+        ) orelse return error.UnknownObservationDistinctField;
+        for (fields[0..index]) |prior| {
+            if (prior == fields[index]) {
+                return error.DuplicateObservationDistinctField;
+            }
+        }
+    }
+    return .{ .field_indices = fields };
 }
 
 fn compilePredicates(
@@ -804,7 +965,7 @@ pub fn encodeCache(
     native_plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeCount(native_plan.stages.len);
     for (native_plan.stages) |stage| {
         try encoder.writeBytes(stage.name);
@@ -835,7 +996,7 @@ pub fn decodeCache(
     decoder: *definition_core.cache.Decoder,
     definition_plan: *const definition.Plan,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.SeqNativePlanCacheVersionMismatch;
     }
     const stage_count = try decoder.readCount(256);
@@ -1069,6 +1230,53 @@ pub fn validateCachePlan(
                     },
                 }
             },
+            .sort => {
+                const sort = switch (stage.operation) {
+                    .sort => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateSameSchema(&stage.schema, source_schema.?);
+                if (sort.keys.len == 0 or sort.keys.len > 64) {
+                    return error.InvalidObservationSortKeyCount;
+                }
+                for (sort.keys, 0..) |key, key_index| {
+                    if (key.field_index >= source_schema.?.columnCount()) {
+                        return error.CacheObservationSortFieldInvalid;
+                    }
+                    for (sort.keys[0..key_index]) |prior| {
+                        if (prior.field_index == key.field_index) {
+                            return error.DuplicateObservationSortField;
+                        }
+                    }
+                }
+            },
+            .distinct => {
+                const distinct = switch (stage.operation) {
+                    .distinct => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateSameSchema(&stage.schema, source_schema.?);
+                if (distinct.field_indices.len == 0 or
+                    distinct.field_indices.len > 64)
+                {
+                    return error.InvalidObservationDistinctKeyCount;
+                }
+                for (
+                    distinct.field_indices,
+                    0..,
+                ) |field_index, distinct_index| {
+                    if (field_index >= source_schema.?.columnCount()) {
+                        return error.CacheObservationDistinctFieldInvalid;
+                    }
+                    for (
+                        distinct.field_indices[0..distinct_index],
+                    ) |prior| {
+                        if (prior == field_index) {
+                            return error.DuplicateObservationDistinctField;
+                        }
+                    }
+                }
+            },
             else => return error.ObservationOperatorPlanNotCompiled,
         }
     }
@@ -1300,6 +1508,20 @@ fn encodeOperation(
                 .parameter => |index| try encoder.writeU16(index),
             }
         },
+        .sort => |sort| {
+            try encoder.writeCount(sort.keys.len);
+            for (sort.keys) |key| {
+                try encoder.writeU16(key.field_index);
+                try encoder.writeEnum(key.direction);
+                try encoder.writeEnum(key.nulls);
+            }
+        },
+        .distinct => |distinct| {
+            try encoder.writeCount(distinct.field_indices.len);
+            for (distinct.field_indices) |field_index| {
+                try encoder.writeU16(field_index);
+            }
+        },
     }
 }
 
@@ -1319,6 +1541,16 @@ fn decodeOperation(
         .project => .{ .project = try decodeProject(allocator, decoder) },
         .alias => .alias,
         .limit => .{ .limit = try decodeLimit(decoder) },
+        .sort => .{ .sort = try decodeSort(
+            allocator,
+            decoder,
+            schema,
+        ) },
+        .distinct => .{ .distinct = try decodeDistinct(
+            allocator,
+            decoder,
+            schema,
+        ) },
     };
 }
 
@@ -1443,6 +1675,56 @@ fn decodeLimit(
         .fixed => .{ .fixed = try decoder.readUsize() },
         .parameter => .{ .parameter = try decoder.readU16() },
     };
+}
+
+fn decodeSort(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !Sort {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidObservationSortKeyCount;
+    const keys = try allocator.alloc(SortKey, count);
+    errdefer allocator.free(keys);
+    for (keys, 0..) |*key, index| {
+        key.* = .{
+            .field_index = try decoder.readU16(),
+            .direction = try decoder.readEnum(SortDirection),
+            .nulls = try decoder.readEnum(NullOrder),
+        };
+        if (key.field_index >= schema.columns.len) {
+            return error.CacheObservationSortFieldInvalid;
+        }
+        for (keys[0..index]) |prior| {
+            if (prior.field_index == key.field_index) {
+                return error.DuplicateObservationSortField;
+            }
+        }
+    }
+    return .{ .keys = keys };
+}
+
+fn decodeDistinct(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !Distinct {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidObservationDistinctKeyCount;
+    const fields = try allocator.alloc(u16, count);
+    errdefer allocator.free(fields);
+    for (fields, 0..) |*field_index, index| {
+        field_index.* = try decoder.readU16();
+        if (field_index.* >= schema.columns.len) {
+            return error.CacheObservationDistinctFieldInvalid;
+        }
+        for (fields[0..index]) |prior| {
+            if (prior == field_index.*) {
+                return error.DuplicateObservationDistinctField;
+            }
+        }
+    }
+    return .{ .field_indices = fields };
 }
 
 fn decodeSource(
@@ -1603,5 +1885,65 @@ test "external relations compile to the same typed native stage schema" {
     try std.testing.expectEqualStrings(
         "id",
         plan.stages[1].schema.columns[0].name,
+    );
+}
+
+test "sort and distinct plans cache compiled field indices" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data =
+        \\{"schema":"seq-observation-definition/v1","id":"example/order","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"first"},{"field":"id"}]},{"op":"distinct","input":"ranked","as":"rows","keys":["group"]}],"projections":{"rows":{"relation":"rows","schema":"example-order/v1","fields":["id","group","score"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "observation.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var native_plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer native_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 2), native_plan.stages[0].operation.sort.keys[0].field_index);
+    try std.testing.expectEqual(SortDirection.descending, native_plan.stages[0].operation.sort.keys[0].direction);
+    try std.testing.expectEqual(NullOrder.first, native_plan.stages[0].operation.sort.keys[0].nulls);
+    try std.testing.expectEqual(@as(u16, 1), native_plan.stages[1].operation.distinct.field_indices[0]);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&native_plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(
+        std.testing.allocator,
+        &decoder,
+        &definition_plan,
+    );
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(
+        native_plan.stages[0].operation.sort.keys[0],
+        cached.stages[0].operation.sort.keys[0],
+    );
+    try std.testing.expectEqualSlices(
+        u16,
+        native_plan.stages[1].operation.distinct.field_indices,
+        cached.stages[1].operation.distinct.field_indices,
     );
 }

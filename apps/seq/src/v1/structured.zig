@@ -156,6 +156,7 @@ pub fn build(
 }
 
 pub fn observe(
+    allocator: std.mem.Allocator,
     program: *const execution.Program,
     index: *const Index,
     output: []execution.Value,
@@ -164,7 +165,12 @@ pub fn observe(
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
     };
-    var runner = try execution.Runner.init(program, output);
+    var runner = try execution.Runner.initAlloc(
+        allocator,
+        program,
+        output,
+    );
+    defer runner.deinit();
     var row: [256]execution.Value = undefined;
     switch (relation) {
         .structured_documents => for (index.documents.items) |*document| {
@@ -189,7 +195,7 @@ pub fn observe(
         },
         else => return error.ObservationRequiresStructuredRelation,
     }
-    return runner.result();
+    return runner.finish();
 }
 
 fn fillDocument(
@@ -597,7 +603,12 @@ test "structured index canonicalizes and flattens tool result JSON" {
     );
     defer program.deinit(std.testing.allocator);
     var output: [4]execution.Value = undefined;
-    const result = try observe(&program, &index, &output);
+    const result = try observe(
+        std.testing.allocator,
+        &program,
+        &index,
+        &output,
+    );
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqualStrings(
         index.documents.items[0].id(),

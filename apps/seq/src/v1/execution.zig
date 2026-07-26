@@ -34,6 +34,7 @@ pub const Result = struct {
     width: usize,
     row_count: usize,
     source_row_count: usize,
+    materialized_row_count: usize,
 
     pub fn rows(self: Result) Rows {
         return .{
@@ -60,12 +61,25 @@ const PredicateRange = struct {
     len: u16,
 };
 
+const RuntimeSortKey = struct {
+    field_index: u16,
+    direction: plan.SortDirection,
+    nulls: plan.NullOrder,
+};
+
+const FieldRange = struct {
+    start: u16,
+    len: u16,
+};
+
 const RuntimeOperation = union(enum) {
     filter: PredicateRange,
     limit: struct {
         count: usize,
         state_index: u16,
     },
+    sort: FieldRange,
+    distinct: FieldRange,
 };
 
 pub const Program = struct {
@@ -75,14 +89,19 @@ pub const Program = struct {
     source_row_bound: ?usize,
     operations: []RuntimeOperation,
     predicates: []RuntimePredicate,
+    sort_keys: []RuntimeSortKey,
+    distinct_fields: []u16,
     output_field_indices: []u16,
     limit_state_count: u16,
+    first_blocking_operation: ?u16,
     max_rows: usize,
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
         allocator.free(self.source_field_indices);
         allocator.free(self.operations);
         allocator.free(self.predicates);
+        allocator.free(self.sort_keys);
+        allocator.free(self.distinct_fields);
         allocator.free(self.output_field_indices);
         self.* = undefined;
     }
@@ -159,7 +178,12 @@ pub fn compile(
     errdefer predicates.deinit(allocator);
     var operations: std.ArrayList(RuntimeOperation) = .empty;
     errdefer operations.deinit(allocator);
+    var sort_keys: std.ArrayList(RuntimeSortKey) = .empty;
+    errdefer sort_keys.deinit(allocator);
+    var distinct_fields: std.ArrayList(u16) = .empty;
+    errdefer distinct_fields.deinit(allocator);
     var limit_state_count: u16 = 0;
+    var first_blocking_operation: ?u16 = null;
 
     var path_index = stage_count;
     while (path_index > 0) {
@@ -222,6 +246,51 @@ pub fn compile(
                 });
                 limit_state_count += 1;
             },
+            .sort => |sort| {
+                if (first_blocking_operation == null) {
+                    first_blocking_operation = @intCast(operations.items.len);
+                }
+                const start = sort_keys.items.len;
+                for (sort.keys) |key| {
+                    if (key.field_index >= field_count) {
+                        return error.ObservationFieldIndexInvalid;
+                    }
+                    try sort_keys.append(allocator, .{
+                        .field_index = field_map[key.field_index],
+                        .direction = key.direction,
+                        .nulls = key.nulls,
+                    });
+                }
+                try operations.append(allocator, .{
+                    .sort = .{
+                        .start = @intCast(start),
+                        .len = @intCast(sort_keys.items.len - start),
+                    },
+                });
+            },
+            .distinct => |distinct| {
+                if (first_blocking_operation == null) {
+                    first_blocking_operation = @intCast(operations.items.len);
+                }
+                const start = distinct_fields.items.len;
+                for (distinct.field_indices) |field_index| {
+                    if (field_index >= field_count) {
+                        return error.ObservationFieldIndexInvalid;
+                    }
+                    try distinct_fields.append(
+                        allocator,
+                        field_map[field_index],
+                    );
+                }
+                try operations.append(allocator, .{
+                    .distinct = .{
+                        .start = @intCast(start),
+                        .len = @intCast(
+                            distinct_fields.items.len - start,
+                        ),
+                    },
+                });
+            },
         }
     }
 
@@ -240,6 +309,11 @@ pub fn compile(
     errdefer allocator.free(operation_slice);
     const predicate_slice = try predicates.toOwnedSlice(allocator);
     errdefer allocator.free(predicate_slice);
+    const sort_key_slice = try sort_keys.toOwnedSlice(allocator);
+    errdefer allocator.free(sort_key_slice);
+    const distinct_field_slice =
+        try distinct_fields.toOwnedSlice(allocator);
+    errdefer allocator.free(distinct_field_slice);
 
     return .{
         .source = source,
@@ -248,8 +322,11 @@ pub fn compile(
         .source_row_bound = source_row_bound,
         .operations = operation_slice,
         .predicates = predicate_slice,
+        .sort_keys = sort_key_slice,
+        .distinct_fields = distinct_field_slice,
         .output_field_indices = output_fields,
         .limit_state_count = limit_state_count,
+        .first_blocking_operation = first_blocking_operation,
         .max_rows = native_plan.max_rows,
     };
 }
@@ -259,20 +336,32 @@ pub const Feed = enum {
     stop,
 };
 
+const max_materialized_cells: usize = 4_000_000;
+
+const RowRef = struct {
+    row_index: usize,
+    ordinal: usize,
+};
+
 pub const Runner = struct {
     program: *const Program,
     output: []Value,
+    allocator: ?std.mem.Allocator = null,
+    materialized: []Value = &.{},
+    row_refs: []RowRef = &.{},
+    auxiliary_refs: []RowRef = &.{},
+    duplicate_marks: []bool = &.{},
     limit_states: [256]usize = undefined,
     source_row_count: usize = 0,
+    materialized_row_count: usize = 0,
     output_row_count: usize = 0,
     stopped: bool = false,
+    finalized: bool = false,
 
     pub fn init(program: *const Program, output: []Value) !Runner {
-        if (program.source_width == 0) {
-            return error.InvalidObservationSourceWidth;
-        }
-        if (program.output_field_indices.len == 0) {
-            return error.InvalidObservationOutputWidth;
+        try validateRunnerInputs(program);
+        if (program.first_blocking_operation != null) {
+            return error.ObservationMaterializationWorkspaceRequired;
         }
         var runner = Runner{
             .program = program,
@@ -282,60 +371,283 @@ pub const Runner = struct {
         return runner;
     }
 
+    pub fn initAlloc(
+        allocator: std.mem.Allocator,
+        program: *const Program,
+        output: []Value,
+    ) !Runner {
+        try validateRunnerInputs(program);
+        if (program.first_blocking_operation == null) {
+            return init(program, output);
+        }
+        const materialized_cells = std.math.mul(
+            usize,
+            program.max_rows,
+            program.source_width,
+        ) catch return error.ObservationMaterializationCellBoundExceeded;
+        if (materialized_cells > max_materialized_cells) {
+            return error.ObservationMaterializationCellBoundExceeded;
+        }
+        const materialized = try allocator.alloc(
+            Value,
+            materialized_cells,
+        );
+        errdefer allocator.free(materialized);
+        const row_refs = try allocator.alloc(RowRef, program.max_rows);
+        errdefer allocator.free(row_refs);
+        const auxiliary_refs = try allocator.alloc(
+            RowRef,
+            program.max_rows,
+        );
+        errdefer allocator.free(auxiliary_refs);
+        const duplicate_marks = try allocator.alloc(
+            bool,
+            program.max_rows,
+        );
+        errdefer allocator.free(duplicate_marks);
+        var runner = Runner{
+            .program = program,
+            .output = output,
+            .allocator = allocator,
+            .materialized = materialized,
+            .row_refs = row_refs,
+            .auxiliary_refs = auxiliary_refs,
+            .duplicate_marks = duplicate_marks,
+        };
+        @memset(runner.limit_states[0..program.limit_state_count], 0);
+        return runner;
+    }
+
+    pub fn deinit(self: *Runner) void {
+        if (self.allocator) |allocator| {
+            allocator.free(self.materialized);
+            allocator.free(self.row_refs);
+            allocator.free(self.auxiliary_refs);
+            allocator.free(self.duplicate_marks);
+        }
+        self.* = undefined;
+    }
+
     pub fn feed(self: *Runner, row: []const Value) !Feed {
         if (self.stopped) return .stop;
+        if (self.finalized) return error.ObservationAlreadyFinalized;
         if (row.len != self.program.source_width) {
             return error.ObservationSourceWidthMismatch;
         }
         if (self.program.source_row_bound) |bound| {
-            if (self.source_row_count == bound) {
+            if (self.source_row_count >= bound) {
                 return error.ObservationSourceRowBoundExceeded;
             }
         }
         self.source_row_count += 1;
 
-        var accepted = true;
-        var stop_after_row = false;
-        for (self.program.operations) |operation| {
-            switch (operation) {
-                .filter => |range| {
-                    const end = @as(usize, range.start) + range.len;
-                    for (self.program.predicates[range.start..end]) |predicate| {
-                        if (!matches(row[predicate.field_index], predicate)) {
-                            accepted = false;
-                            break;
-                        }
-                    }
-                    if (!accepted) break;
-                },
-                .limit => |limit| {
-                    if (self.limit_states[limit.state_index] == limit.count) {
-                        self.stopped = true;
-                        return .stop;
-                    }
-                    self.limit_states[limit.state_index] += 1;
-                    stop_after_row = stop_after_row or
-                        self.limit_states[limit.state_index] == limit.count;
-                },
+        const operation_end = self.program.first_blocking_operation orelse
+            self.program.operations.len;
+        const disposition = try self.applyStreaming(
+            row,
+            self.program.operations[0..operation_end],
+        );
+        if (disposition.accepted) {
+            if (self.program.first_blocking_operation != null) {
+                try self.materialize(row);
+            } else {
+                try self.append(row);
             }
         }
-        if (accepted) {
-            try self.append(row);
-        }
-        if (stop_after_row) {
+        if (disposition.stop_after_row) {
             self.stopped = true;
             return .stop;
         }
         return .continue_scanning;
     }
 
-    pub fn result(self: *Runner) Result {
+    pub fn finish(self: *Runner) !Result {
+        if (self.finalized) return self.currentResult();
+        if (self.program.first_blocking_operation) |start| {
+            var active_count = self.materialized_row_count;
+            for (self.row_refs[0..active_count], 0..) |*ref, index| {
+                ref.* = .{ .row_index = index, .ordinal = index };
+            }
+            for (self.program.operations[start..]) |operation| {
+                active_count = switch (operation) {
+                    .filter => |range| self.filterRows(
+                        active_count,
+                        range,
+                    ),
+                    .limit => |limit| @min(active_count, limit.count),
+                    .sort => |range| self.sortRows(active_count, range),
+                    .distinct => |range| self.distinctRows(
+                        active_count,
+                        range,
+                    ),
+                };
+                resetOrdinals(self.row_refs[0..active_count]);
+            }
+            for (self.row_refs[0..active_count]) |ref| {
+                try self.append(self.materializedRow(ref.row_index));
+            }
+        }
+        self.finalized = true;
+        return self.currentResult();
+    }
+
+    fn currentResult(self: *Runner) Result {
         return .{
             .values = self.output,
             .width = self.program.output_field_indices.len,
             .row_count = self.output_row_count,
             .source_row_count = self.source_row_count,
+            .materialized_row_count = self.materialized_row_count,
         };
+    }
+
+    const StreamingDisposition = struct {
+        accepted: bool,
+        stop_after_row: bool,
+    };
+
+    fn applyStreaming(
+        self: *Runner,
+        row: []const Value,
+        operations: []const RuntimeOperation,
+    ) !StreamingDisposition {
+        var accepted = true;
+        var stop_after_row = false;
+        for (operations) |operation| {
+            switch (operation) {
+                .filter => |range| {
+                    if (!self.rowMatches(row, range)) {
+                        accepted = false;
+                        break;
+                    }
+                },
+                .limit => |limit| {
+                    if (self.limit_states[limit.state_index] == limit.count) {
+                        self.stopped = true;
+                        return .{
+                            .accepted = false,
+                            .stop_after_row = true,
+                        };
+                    }
+                    self.limit_states[limit.state_index] += 1;
+                    stop_after_row = stop_after_row or
+                        self.limit_states[limit.state_index] == limit.count;
+                },
+                .sort, .distinct => {
+                    return error.ObservationBlockingOperatorInStreamingPrefix;
+                },
+            }
+        }
+        return .{
+            .accepted = accepted,
+            .stop_after_row = stop_after_row,
+        };
+    }
+
+    fn rowMatches(
+        self: *const Runner,
+        row: []const Value,
+        range: PredicateRange,
+    ) bool {
+        const end = @as(usize, range.start) + range.len;
+        for (self.program.predicates[range.start..end]) |predicate| {
+            if (!matches(row[predicate.field_index], predicate)) return false;
+        }
+        return true;
+    }
+
+    fn materialize(self: *Runner, row: []const Value) !void {
+        if (self.materialized_row_count == self.program.max_rows) {
+            return error.ObservationMaterializationRowBoundExceeded;
+        }
+        const start = self.materialized_row_count * self.program.source_width;
+        @memcpy(
+            self.materialized[start..][0..self.program.source_width],
+            row,
+        );
+        self.materialized_row_count += 1;
+    }
+
+    fn materializedRow(
+        self: *const Runner,
+        row_index: usize,
+    ) []const Value {
+        const start = row_index * self.program.source_width;
+        return self.materialized[start..][0..self.program.source_width];
+    }
+
+    fn filterRows(
+        self: *Runner,
+        active_count: usize,
+        range: PredicateRange,
+    ) usize {
+        var output_index: usize = 0;
+        for (self.row_refs[0..active_count]) |ref| {
+            if (!self.rowMatches(
+                self.materializedRow(ref.row_index),
+                range,
+            )) continue;
+            self.row_refs[output_index] = ref;
+            output_index += 1;
+        }
+        return output_index;
+    }
+
+    fn sortRows(
+        self: *Runner,
+        active_count: usize,
+        range: FieldRange,
+    ) usize {
+        const end = @as(usize, range.start) + range.len;
+        std.mem.sort(
+            RowRef,
+            self.row_refs[0..active_count],
+            SortContext{
+                .runner = self,
+                .keys = self.program.sort_keys[range.start..end],
+            },
+            SortContext.lessThan,
+        );
+        return active_count;
+    }
+
+    fn distinctRows(
+        self: *Runner,
+        active_count: usize,
+        range: FieldRange,
+    ) usize {
+        if (active_count < 2) return active_count;
+        @memcpy(
+            self.auxiliary_refs[0..active_count],
+            self.row_refs[0..active_count],
+        );
+        const end = @as(usize, range.start) + range.len;
+        const fields = self.program.distinct_fields[range.start..end];
+        std.mem.sort(
+            RowRef,
+            self.auxiliary_refs[0..active_count],
+            DistinctContext{
+                .runner = self,
+                .fields = fields,
+            },
+            DistinctContext.lessThan,
+        );
+        @memset(self.duplicate_marks[0..active_count], false);
+        var prior = self.auxiliary_refs[0];
+        for (self.auxiliary_refs[1..active_count]) |current| {
+            if (distinctKeysEqual(self, prior, current, fields)) {
+                self.duplicate_marks[current.ordinal] = true;
+            } else {
+                prior = current;
+            }
+        }
+        var output_index: usize = 0;
+        for (self.row_refs[0..active_count]) |ref| {
+            if (self.duplicate_marks[ref.ordinal]) continue;
+            self.row_refs[output_index] = ref;
+            output_index += 1;
+        }
+        return output_index;
     }
 
     fn append(self: *Runner, row: []const Value) !void {
@@ -363,20 +675,204 @@ pub const Runner = struct {
     }
 };
 
+fn validateRunnerInputs(program: *const Program) !void {
+    if (program.source_width == 0) {
+        return error.InvalidObservationSourceWidth;
+    }
+    if (program.output_field_indices.len == 0) {
+        return error.InvalidObservationOutputWidth;
+    }
+}
+
+fn resetOrdinals(refs: []RowRef) void {
+    for (refs, 0..) |*ref, index| ref.ordinal = index;
+}
+
+const SortContext = struct {
+    runner: *const Runner,
+    keys: []const RuntimeSortKey,
+
+    fn lessThan(context: SortContext, left: RowRef, right: RowRef) bool {
+        const left_row = context.runner.materializedRow(left.row_index);
+        const right_row = context.runner.materializedRow(right.row_index);
+        for (context.keys) |key| {
+            const left_value = left_row[key.field_index];
+            const right_value = right_row[key.field_index];
+            const order = compareForSort(
+                left_value,
+                right_value,
+                key.nulls,
+            );
+            if (order == .eq) continue;
+            if (left_value == .null or right_value == .null) {
+                return order == .lt;
+            }
+            return if (key.direction == .ascending)
+                order == .lt
+            else
+                order == .gt;
+        }
+        return left.ordinal < right.ordinal;
+    }
+};
+
+const DistinctContext = struct {
+    runner: *const Runner,
+    fields: []const u16,
+
+    fn lessThan(context: DistinctContext, left: RowRef, right: RowRef) bool {
+        const left_row = context.runner.materializedRow(left.row_index);
+        const right_row = context.runner.materializedRow(right.row_index);
+        for (context.fields) |field_index| {
+            const order = compareValues(
+                left_row[field_index],
+                right_row[field_index],
+            );
+            if (order != .eq) return order == .lt;
+        }
+        return left.ordinal < right.ordinal;
+    }
+};
+
+fn distinctKeysEqual(
+    runner: *const Runner,
+    left: RowRef,
+    right: RowRef,
+    fields: []const u16,
+) bool {
+    const left_row = runner.materializedRow(left.row_index);
+    const right_row = runner.materializedRow(right.row_index);
+    for (fields) |field_index| {
+        if (!valuesEqual(
+            left_row[field_index],
+            right_row[field_index],
+            false,
+        )) return false;
+    }
+    return true;
+}
+
+fn compareForSort(
+    left: Value,
+    right: Value,
+    nulls: plan.NullOrder,
+) std.math.Order {
+    if (left == .null or right == .null) {
+        if (left == .null and right == .null) return .eq;
+        const left_first = nulls == .first;
+        return if (left == .null)
+            if (left_first) .lt else .gt
+        else if (left_first)
+            .gt
+        else
+            .lt;
+    }
+    return compareValues(left, right);
+}
+
+fn compareValues(left: Value, right: Value) std.math.Order {
+    return switch (left) {
+        .string => |left_text| switch (right) {
+            .string => |right_text| std.mem.order(
+                u8,
+                left_text,
+                right_text,
+            ),
+            else => compareValueTags(left, right),
+        },
+        .integer => |left_number| switch (right) {
+            .integer => |right_number| std.math.order(
+                left_number,
+                right_number,
+            ),
+            .float => |right_number| compareFloat(
+                @floatFromInt(left_number),
+                right_number,
+            ),
+            else => compareValueTags(left, right),
+        },
+        .float => |left_number| switch (right) {
+            .integer => |right_number| compareFloat(
+                left_number,
+                @floatFromInt(right_number),
+            ),
+            .float => |right_number| compareFloat(
+                left_number,
+                right_number,
+            ),
+            else => compareValueTags(left, right),
+        },
+        .boolean => |left_flag| switch (right) {
+            .boolean => |right_flag| std.math.order(
+                @intFromBool(left_flag),
+                @intFromBool(right_flag),
+            ),
+            else => compareValueTags(left, right),
+        },
+        .json => |left_json| switch (right) {
+            .json => |right_json| std.mem.order(
+                u8,
+                left_json,
+                right_json,
+            ),
+            else => compareValueTags(left, right),
+        },
+        .null => if (right == .null) .eq else .lt,
+    };
+}
+
+fn compareFloat(left: f64, right: f64) std.math.Order {
+    if (left < right) return .lt;
+    if (left > right) return .gt;
+    return .eq;
+}
+
+fn compareValueTags(left: Value, right: Value) std.math.Order {
+    return std.math.order(
+        @intFromEnum(std.meta.activeTag(left)),
+        @intFromEnum(std.meta.activeTag(right)),
+    );
+}
+
 pub fn execute(
     program: *const Program,
     source_rows: Rows,
     output: []Value,
 ) !Result {
+    if (program.first_blocking_operation != null) {
+        return error.ObservationMaterializationWorkspaceRequired;
+    }
+    return executeRunner(program, source_rows, output, null);
+}
+
+pub fn executeAlloc(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+    source_rows: Rows,
+    output: []Value,
+) !Result {
+    return executeRunner(program, source_rows, output, allocator);
+}
+
+fn executeRunner(
+    program: *const Program,
+    source_rows: Rows,
+    output: []Value,
+    allocator: ?std.mem.Allocator,
+) !Result {
     if (source_rows.width != program.source_width) {
         return error.ObservationSourceWidthMismatch;
     }
     const source_row_count = try source_rows.count();
-    var runner = try Runner.init(program, output);
+    var runner = if (allocator) |value|
+        try Runner.initAlloc(value, program, output)
+    else
+        try Runner.init(program, output);
+    defer runner.deinit();
     for (0..source_row_count) |row_index| {
         if (try runner.feed(source_rows.row(row_index)) == .stop) break;
     }
-    return runner.result();
+    return runner.finish();
 }
 
 fn matches(value: Value, predicate: RuntimePredicate) bool {
@@ -646,6 +1142,7 @@ test "compiled execution filters projects and limits without intermediate rows" 
 
     var streamed_output: [4]Value = undefined;
     var runner = try Runner.init(&program, &streamed_output);
+    defer runner.deinit();
     try std.testing.expectEqual(
         Feed.continue_scanning,
         try runner.feed(source[0..3]),
@@ -659,7 +1156,7 @@ test "compiled execution filters projects and limits without intermediate rows" 
         try runner.feed(source[6..9]),
     );
     try std.testing.expectEqual(Feed.stop, try runner.feed(source[9..12]));
-    const streamed = runner.result();
+    const streamed = try runner.finish();
     try std.testing.expectEqual(@as(usize, 3), runner.source_row_count);
     try std.testing.expectEqual(result.row_count, streamed.row_count);
     try std.testing.expectEqualStrings(
@@ -739,5 +1236,112 @@ test "ordered limits retain their position before later filters" {
     try std.testing.expectEqualStrings(
         "second",
         result.rows().row(0)[0].string,
+    );
+}
+
+fn executeBlockingForAllocationFailure(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+    source: []const Value,
+) !void {
+    var output: [10]Value = undefined;
+    _ = try executeAlloc(
+        allocator,
+        program,
+        .{ .values = source, .width = 3 },
+        &output,
+    );
+}
+
+test "compiled sort and distinct preserve stable bounded semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data =
+        \\{"schema":"seq-observation-definition/v1","id":"example/ranked-distinct","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct","limit","project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":5,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"last"}]},{"op":"distinct","input":"ranked","as":"unique","keys":["group"]},{"op":"limit","input":"unique","as":"bounded","limit":3},{"op":"project","input":"bounded","as":"rows","fields":["id","score"]}],"projections":{"rows":{"relation":"rows","schema":"example-ranked/v1","fields":["id","score"],"renderers":["json"]}},"bounds":{"max_rows":5,"max_output_bytes":4096,"max_fold_states":2}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "observation.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var native_plan = try plan.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer native_plan.deinit(std.testing.allocator);
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    var program = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &native_plan,
+        &bindings,
+        "rows",
+    );
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u16, 0), program.first_blocking_operation);
+    try std.testing.expectEqualSlices(
+        u16,
+        &.{ 0, 1, 2 },
+        program.source_field_indices,
+    );
+    const source = [_]Value{
+        .{ .string = "a" }, .{ .string = "x" }, .{ .integer = 2 },
+        .{ .string = "b" }, .{ .string = "y" }, .null,
+        .{ .string = "c" }, .{ .string = "x" }, .{ .integer = 3 },
+        .{ .string = "d" }, .{ .string = "x" }, .{ .integer = 3 },
+        .{ .string = "e" }, .{ .string = "z" }, .{ .integer = 1 },
+    };
+    var output: [10]Value = undefined;
+    try std.testing.expectError(
+        error.ObservationMaterializationWorkspaceRequired,
+        execute(
+            &program,
+            .{ .values = &source, .width = 3 },
+            &output,
+        ),
+    );
+    const result = try executeAlloc(
+        std.testing.allocator,
+        &program,
+        .{ .values = &source, .width = 3 },
+        &output,
+    );
+    try std.testing.expectEqual(@as(usize, 5), result.source_row_count);
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
+    try std.testing.expectEqualStrings(
+        "c",
+        result.rows().row(0)[0].string,
+    );
+    try std.testing.expectEqual(@as(i64, 3), result.rows().row(0)[1].integer);
+    try std.testing.expectEqualStrings(
+        "e",
+        result.rows().row(1)[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "b",
+        result.rows().row(2)[0].string,
+    );
+    try std.testing.expect(result.rows().row(2)[1] == .null);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        executeBlockingForAllocationFailure,
+        .{ &program, &source },
     );
 }

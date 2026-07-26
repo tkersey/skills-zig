@@ -331,7 +331,6 @@ fn runObserve(
             corpus_digest = &observation.corpus_digest;
             files_opened = 1;
             bytes_read = observation.metrics.bytes_read;
-            rows_materialized = observation.result.source_row_count;
             break :physical_result observation.result;
         },
         .external => |input_index| external_result: {
@@ -350,14 +349,15 @@ fn runObserve(
             corpus_digest = &relation.raw_digest;
             files_opened = 1;
             bytes_read = relation.input_bytes;
-            rows_materialized = relation.row_count;
             break :external_result try seq.external_input.execute(
+                allocator,
                 &program,
                 relation,
                 output,
             );
         },
     };
+    rows_materialized = result.materialized_row_count;
     rows = result.rows();
     const execution_ns = elapsedNanoseconds(execution_start);
     var execution_stats = definition_core.result.ExecutionStats{

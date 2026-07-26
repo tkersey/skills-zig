@@ -5,6 +5,8 @@ binary=$1
 message_definition=apps/seq/src/v1/fixtures/message-observation.json
 external_definition=apps/seq/src/v1/fixtures/external-observation.json
 external_facts=apps/seq/src/v1/fixtures/external-facts.json
+ranked_definition=apps/seq/src/v1/fixtures/ranked-observation.json
+ranked_facts=apps/seq/src/v1/fixtures/ranked-facts.json
 rollout=apps/seq/src/v1/fixtures/rollout.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
@@ -50,6 +52,7 @@ grep -Fq '"text":"Observed FAILURE evidence"' <<<"$observation_output"
 grep -Fq '"source_event_id":"sha256:' <<<"$observation_output"
 grep -Fq '"physical_passes":1' <<<"$observation_output"
 grep -Fq '"files_opened":1' <<<"$observation_output"
+grep -Fq '"rows_materialized":0' <<<"$observation_output"
 grep -Fq '"authority_granted":false' <<<"$observation_output"
 
 external_output=$("$binary" observe \
@@ -61,12 +64,26 @@ grep -Fq '"adapter":"immutable-relation-json/v1"' <<<"$external_output"
 grep -Fq '"rows":[{"id":"second"}]' <<<"$external_output"
 grep -Fq '"authority_granted":false' <<<"$external_output"
 
+ranked_output=$("$binary" observe \
+  --definition "$ranked_definition" \
+  --projection rows \
+  --input "facts=$ranked_facts" \
+  --format json)
+grep -Fq \
+  '"rows":[{"id":"c","score":3},{"id":"e","score":1},{"id":"b","score":null}]' \
+  <<<"$ranked_output"
+grep -Fq '"rows_scanned":5' <<<"$ranked_output"
+grep -Fq '"rows_materialized":5' <<<"$ranked_output"
+grep -Fq '"output_rows":3' <<<"$ranked_output"
+
 capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"seq-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"
 grep -Fq '"id":"scan","version":1' <<<"$capabilities"
 grep -Fq '"id":"filter","version":1' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
+grep -Fq '"id":"sort","version":1' <<<"$capabilities"
+grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
 if grep -Eq '"id":"(join|aggregate|ordered-fold|reachability)"' \
   <<<"$capabilities"
 then

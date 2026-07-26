@@ -1,0 +1,97 @@
+{
+  "schema": "seq-observation-definition/v1",
+  "id": "example/ranked-observation",
+  "requires": {
+    "abi": "seq-observation-abi/v1",
+    "operators": [
+      "sort",
+      "distinct",
+      "limit",
+      "project"
+    ]
+  },
+  "parameters": {},
+  "selectors": [],
+  "relations": [],
+  "inputs": [
+    {
+      "name": "facts",
+      "schema": "example-ranked-facts/v1",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "group",
+          "type": "string",
+          "nullable": false
+        },
+        {
+          "name": "score",
+          "type": "integer",
+          "nullable": true
+        }
+      ],
+      "max_rows": 5,
+      "max_bytes": 4096
+    }
+  ],
+  "pipeline": [
+    {
+      "op": "sort",
+      "input": "facts",
+      "as": "ranked",
+      "by": [
+        {
+          "field": "score",
+          "direction": "desc",
+          "nulls": "last"
+        }
+      ]
+    },
+    {
+      "op": "distinct",
+      "input": "ranked",
+      "as": "unique",
+      "keys": [
+        "group"
+      ]
+    },
+    {
+      "op": "limit",
+      "input": "unique",
+      "as": "bounded",
+      "limit": 3
+    },
+    {
+      "op": "project",
+      "input": "bounded",
+      "as": "rows",
+      "fields": [
+        "id",
+        "score"
+      ]
+    }
+  ],
+  "projections": {
+    "rows": {
+      "relation": "rows",
+      "schema": "example-ranked/v1",
+      "fields": [
+        "id",
+        "score"
+      ],
+      "renderers": [
+        "json"
+      ]
+    }
+  },
+  "bounds": {
+    "max_rows": 5,
+    "max_output_bytes": 8192,
+    "max_fold_states": 2,
+    "max_input_bytes": 4096
+  }
+}

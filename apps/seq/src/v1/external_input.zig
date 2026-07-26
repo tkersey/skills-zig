@@ -161,6 +161,7 @@ pub fn parseBytes(
 }
 
 pub fn execute(
+    allocator: std.mem.Allocator,
     program: *const execution.Program,
     relation: *const Relation,
     output: []execution.Value,
@@ -171,7 +172,12 @@ pub fn execute(
         },
         .physical => return error.ExternalInputProgramMismatch,
     }
-    return execution.execute(program, relation.rows(), output);
+    return execution.executeAlloc(
+        allocator,
+        program,
+        relation.rows(),
+        output,
+    );
 }
 
 fn validateRowKeys(
@@ -347,7 +353,12 @@ test "external immutable relations validate schema fields and canonical json" {
     );
     defer program.deinit(std.testing.allocator);
     var output: [10]execution.Value = undefined;
-    const result = try execute(&program, &relation, &output);
+    const result = try execute(
+        std.testing.allocator,
+        &program,
+        &relation,
+        &output,
+    );
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
     try std.testing.expectEqualStrings(
         "b",
