@@ -82,6 +82,7 @@ const CompiledRule = struct {
     max_count: ?usize = null,
     min_number: ?f64 = null,
     max_number: ?f64 = null,
+    children: []CompiledRule,
 
     fn deinit(self: *CompiledRule, allocator: std.mem.Allocator) void {
         allocator.free(self.path_ids);
@@ -89,6 +90,8 @@ const CompiledRule = struct {
         allocator.free(self.keys);
         for (self.values) |*value| value.deinit(allocator);
         allocator.free(self.values);
+        for (self.children) |*child| child.deinit(allocator);
+        allocator.free(self.children);
         self.* = undefined;
     }
 };
@@ -117,6 +120,7 @@ const Builder = struct {
     definition_plan: *const definition.Plan,
     pointers: std.ArrayList(Pointer) = .empty,
     rules: std.ArrayList(CompiledRule) = .empty,
+    item_rule_count: usize = 0,
 
     fn deinit(self: *Builder) void {
         for (self.pointers.items) |*pointer| pointer.deinit(self.allocator);
@@ -131,10 +135,12 @@ const Builder = struct {
             if (std.mem.eql(u8, pointer.raw, raw)) return @intCast(index);
         }
         if (self.pointers.items.len == 65_535) return error.TooManyJsonPointers;
-        try self.pointers.append(
+        var pointer = try definition_core.json_pointer.compile(
             self.allocator,
-            try definition_core.json_pointer.compile(self.allocator, raw),
+            raw,
         );
+        errdefer pointer.deinit(self.allocator);
+        try self.pointers.append(self.allocator, pointer);
         return @intCast(self.pointers.items.len - 1);
     }
 
@@ -172,6 +178,7 @@ const Builder = struct {
             .path_ids = try self.allocator.alloc(u16, 0),
             .keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
+            .children = try self.allocator.alloc(CompiledRule, 0),
         };
         errdefer rule.deinit(self.allocator);
 
@@ -364,6 +371,21 @@ const Builder = struct {
             .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
                 try definition_core.json.field(object, "paths"),
             ),
+            .all_rules, .any_rules, .no_rules => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "rules" },
+                );
+                rule.children = try self.compileItemRules(
+                    try definition_core.json.field(object, "rules"),
+                    input_index,
+                    0,
+                );
+            },
             .keyed_unique => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -423,6 +445,233 @@ const Builder = struct {
         try self.rules.append(self.allocator, rule);
     }
 
+    fn compileItemRules(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+        depth: usize,
+    ) anyerror![]CompiledRule {
+        if (depth > 16) return error.ItemRuleDepthExceeded;
+        const items = try definition_core.json.array(raw);
+        if (items.items.len == 0 or items.items.len > 64) {
+            return error.ItemRuleCountInvalid;
+        }
+        self.item_rule_count = std.math.add(
+            usize,
+            self.item_rule_count,
+            items.items.len,
+        ) catch return error.TooManyItemRules;
+        if (self.item_rule_count > 65_535) return error.TooManyItemRules;
+        const rules = try self.allocator.alloc(CompiledRule, items.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rules[0..initialized]) |*rule| rule.deinit(self.allocator);
+            self.allocator.free(rules);
+        }
+        for (items.items, 0..) |item, index| {
+            rules[index] = try self.compileItemRule(
+                try definition_core.json.object(item),
+                input_index,
+                depth,
+            );
+            initialized += 1;
+        }
+        return rules;
+    }
+
+    fn compileItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+    ) anyerror!CompiledRule {
+        const operator = try definition.Operator.parse(
+            try definition_core.json.requiredString(object, "op"),
+        );
+        if (!self.definition_plan.requires(operator)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        if (!isItemOperator(operator)) return error.UnsupportedItemOperator;
+        if (object.contains("input")) return error.ItemRuleInputForbidden;
+        const pointer_id = if (object.get("path")) |raw|
+            try self.internPointer(try definition_core.json.string(raw))
+        else
+            null;
+        var rule: CompiledRule = .{
+            .operator = operator,
+            .input_index = input_index,
+            .pointer_id = pointer_id,
+            .path_ids = try self.allocator.alloc(u16, 0),
+            .keys = try self.allocator.alloc([]u8, 0),
+            .values = try self.allocator.alloc(EnumScalar, 0),
+            .children = try self.allocator.alloc(CompiledRule, 0),
+        };
+        errdefer rule.deinit(self.allocator);
+        switch (operator) {
+            .exact_object => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "keys" },
+                );
+                rule.keys = try parseStringSet(
+                    self.allocator,
+                    try definition_core.json.field(object, "keys"),
+                );
+            },
+            .required_field,
+            .optional_field,
+            .digest,
+            .timestamp,
+            .safe_relative_path,
+            .unique,
+            .sorted,
+            => try definition_core.json.requireExactKeys(
+                object,
+                &.{ "op", "path" },
+            ),
+            .scalar_type => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "type" },
+                );
+                rule.scalar_kind = try JsonKind.parse(
+                    try definition_core.json.requiredString(object, "type"),
+                );
+            },
+            .bounded_string,
+            .bounded_array,
+            .bounded_object,
+            .safe_identifier,
+            => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "min", "max" },
+                );
+                rule.min_count = try optionalUnsigned(object, "min");
+                rule.max_count = try optionalUnsigned(object, "max");
+                if (rule.min_count == null and rule.max_count == null and
+                    operator != .safe_identifier)
+                {
+                    return error.MissingRuleBound;
+                }
+                if (rule.min_count != null and rule.max_count != null and
+                    rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+            },
+            .bounded_number => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "min", "max" },
+                );
+                rule.min_number = try optionalNumber(object, "min");
+                rule.max_number = try optionalNumber(object, "max");
+                if (rule.min_number == null and rule.max_number == null) {
+                    return error.MissingRuleBound;
+                }
+                if (rule.min_number != null and rule.max_number != null and
+                    rule.min_number.? > rule.max_number.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+            },
+            .enum_value => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "values" },
+                );
+                rule.values = try parseEnumValues(
+                    self.allocator,
+                    try definition_core.json.field(object, "values"),
+                );
+            },
+            .set_equality,
+            .subset,
+            .superset,
+            .disjoint,
+            .field_equal,
+            .field_not_equal,
+            => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "left", "right" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "left", "right" },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "left"),
+                );
+                rule.other_input_index = input_index;
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "right"),
+                );
+            },
+            .exactly_one, .at_least_one => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "paths" },
+                );
+                rule.path_ids = try self.parsePaths(
+                    try definition_core.json.field(object, "paths"),
+                );
+            },
+            .keyed_unique => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "key" },
+                );
+                if (pointer_id == null) {
+                    return error.KeyedUniqueCollectionMissing;
+                }
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "key"),
+                );
+            },
+            .implies => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "if", "equals", "then" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "if", "then" },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "if"),
+                );
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "then"),
+                );
+                if (object.get("equals")) |value| {
+                    const values = try self.allocator.alloc(EnumScalar, 1);
+                    errdefer self.allocator.free(values);
+                    values[0] = try parseEnumScalar(self.allocator, value);
+                    rule.values = values;
+                }
+            },
+            .all_rules, .any_rules, .no_rules => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "rules" },
+                );
+                rule.children = try self.compileItemRules(
+                    try definition_core.json.field(object, "rules"),
+                    input_index,
+                    depth + 1,
+                );
+            },
+            else => unreachable,
+        }
+        return rule;
+    }
+
     fn parsePaths(self: *Builder, raw: std.json.Value) ![]u16 {
         const items = try definition_core.json.array(raw);
         if (items.items.len == 0 or items.items.len > 1024) {
@@ -473,7 +722,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeCount(plan.inputs.len);
     for (plan.inputs) |input| {
         try encoder.writeBytes(input.name);
@@ -484,25 +733,7 @@ pub fn encodeCache(
     try encoder.writeCount(plan.pointers.len);
     for (plan.pointers) |pointer| try encoder.writeBytes(pointer.raw);
     try encoder.writeCount(plan.rules.len);
-    for (plan.rules) |rule| {
-        try encoder.writeEnum(rule.operator);
-        try encoder.writeByte(rule.input_index);
-        try writeOptionalU16(encoder, rule.pointer_id);
-        try writeOptionalByte(encoder, rule.other_input_index);
-        try writeOptionalU16(encoder, rule.other_pointer_id);
-        try encoder.writeCount(rule.path_ids.len);
-        for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
-        try encoder.writeCount(rule.keys.len);
-        for (rule.keys) |key| try encoder.writeBytes(key);
-        try encoder.writeCount(rule.values.len);
-        for (rule.values) |value| try encodeEnumScalar(encoder, value);
-        try encoder.writeBool(rule.scalar_kind != null);
-        if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
-        try writeOptionalUsize(encoder, rule.min_count);
-        try writeOptionalUsize(encoder, rule.max_count);
-        try writeOptionalF64(encoder, rule.min_number);
-        try writeOptionalF64(encoder, rule.max_number);
-    }
+    for (plan.rules) |rule| try encodeCompiledRule(encoder, rule);
     try encoder.writeUsize(plan.max_input_bytes);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_diagnostics);
@@ -512,7 +743,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     const inputs = try decodeCacheInputs(allocator, decoder);
@@ -525,11 +756,14 @@ pub fn decodeCache(
         for (pointers) |*pointer| pointer.deinit(allocator);
         allocator.free(pointers);
     }
+    var total_rule_count: usize = 0;
     const rules = try decodeCacheRules(
         allocator,
         decoder,
         inputs.len,
         pointers.len,
+        0,
+        &total_rule_count,
     );
     errdefer {
         for (rules) |*rule| rule.deinit(allocator);
@@ -575,9 +809,24 @@ pub fn validateCachePlan(
         }
     }
     for (plan.rules) |rule| {
-        if (!definition_plan.requires(rule.operator)) {
+        try validateRuleAgainstDefinition(rule, definition_plan);
+    }
+}
+
+fn validateRuleAgainstDefinition(
+    rule: CompiledRule,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (!definition_plan.requires(rule.operator)) {
+        return error.CacheValidationPlanMismatch;
+    }
+    for (rule.children) |child| {
+        if (child.input_index != rule.input_index or
+            !isItemOperator(child.operator))
+        {
             return error.CacheValidationPlanMismatch;
         }
+        try validateRuleAgainstDefinition(child, definition_plan);
     }
 }
 
@@ -639,13 +888,49 @@ fn decodeCachePointers(
     return pointers;
 }
 
+fn encodeCompiledRule(
+    encoder: *definition_core.cache.Encoder,
+    rule: CompiledRule,
+) !void {
+    try encoder.writeEnum(rule.operator);
+    try encoder.writeByte(rule.input_index);
+    try writeOptionalU16(encoder, rule.pointer_id);
+    try writeOptionalByte(encoder, rule.other_input_index);
+    try writeOptionalU16(encoder, rule.other_pointer_id);
+    try encoder.writeCount(rule.path_ids.len);
+    for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
+    try encoder.writeCount(rule.keys.len);
+    for (rule.keys) |key| try encoder.writeBytes(key);
+    try encoder.writeCount(rule.values.len);
+    for (rule.values) |value| try encodeEnumScalar(encoder, value);
+    try encoder.writeBool(rule.scalar_kind != null);
+    if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
+    try writeOptionalUsize(encoder, rule.min_count);
+    try writeOptionalUsize(encoder, rule.max_count);
+    try writeOptionalF64(encoder, rule.min_number);
+    try writeOptionalF64(encoder, rule.max_number);
+    try encoder.writeCount(rule.children.len);
+    for (rule.children) |child| try encodeCompiledRule(encoder, child);
+}
+
 fn decodeCacheRules(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
     input_count: usize,
     pointer_count: usize,
+    depth: usize,
+    total_rule_count: *usize,
 ) ![]CompiledRule {
     const count = try decoder.readCount(65_535);
+    if (depth > 16 and count != 0) {
+        return error.CacheItemRuleDepthExceeded;
+    }
+    total_rule_count.* = std.math.add(
+        usize,
+        total_rule_count.*,
+        count,
+    ) catch return error.CacheRuleCountExceeded;
+    if (total_rule_count.* > 65_535) return error.CacheRuleCountExceeded;
     const rules = try allocator.alloc(CompiledRule, count);
     var initialized: usize = 0;
     errdefer {
@@ -653,30 +938,82 @@ fn decodeCacheRules(
         allocator.free(rules);
     }
     for (rules) |*destination| {
-        var rule: CompiledRule = .{
-            .operator = try decoder.readEnum(definition.Operator),
-            .input_index = try decoder.readByte(),
-            .pointer_id = try readOptionalU16(decoder),
-            .other_input_index = try readOptionalByte(decoder),
-            .other_pointer_id = try readOptionalU16(decoder),
-            .path_ids = try decodePathIds(allocator, decoder),
-            .keys = try decodeKeys(allocator, decoder),
-            .values = try decodeEnumScalars(allocator, decoder),
-            .scalar_kind = if (try decoder.readBool())
-                try decoder.readEnum(JsonKind)
-            else
-                null,
-            .min_count = try readOptionalUsize(decoder),
-            .max_count = try readOptionalUsize(decoder),
-            .min_number = try readOptionalF64(decoder),
-            .max_number = try readOptionalF64(decoder),
-        };
-        errdefer rule.deinit(allocator);
-        try validateCachedRule(rule, input_count, pointer_count);
-        destination.* = rule;
+        destination.* = try decodeCacheRule(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth,
+            total_rule_count,
+        );
         initialized += 1;
     }
     return rules;
+}
+
+fn decodeCacheRule(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    input_count: usize,
+    pointer_count: usize,
+    depth: usize,
+    total_rule_count: *usize,
+) anyerror!CompiledRule {
+    const operator = try decoder.readEnum(definition.Operator);
+    const input_index = try decoder.readByte();
+    const pointer_id = try readOptionalU16(decoder);
+    const other_input_index = try readOptionalByte(decoder);
+    const other_pointer_id = try readOptionalU16(decoder);
+    const path_ids = try decodePathIds(allocator, decoder);
+    errdefer allocator.free(path_ids);
+    const keys = try decodeKeys(allocator, decoder);
+    errdefer {
+        for (keys) |key| allocator.free(key);
+        allocator.free(keys);
+    }
+    const values = try decodeEnumScalars(allocator, decoder);
+    errdefer {
+        for (values) |*value| value.deinit(allocator);
+        allocator.free(values);
+    }
+    const scalar_kind = if (try decoder.readBool())
+        try decoder.readEnum(JsonKind)
+    else
+        null;
+    const min_count = try readOptionalUsize(decoder);
+    const max_count = try readOptionalUsize(decoder);
+    const min_number = try readOptionalF64(decoder);
+    const max_number = try readOptionalF64(decoder);
+    const children = try decodeCacheRules(
+        allocator,
+        decoder,
+        input_count,
+        pointer_count,
+        depth + 1,
+        total_rule_count,
+    );
+    errdefer {
+        for (children) |*child| child.deinit(allocator);
+        allocator.free(children);
+    }
+    const rule: CompiledRule = .{
+        .operator = operator,
+        .input_index = input_index,
+        .pointer_id = pointer_id,
+        .other_input_index = other_input_index,
+        .other_pointer_id = other_pointer_id,
+        .path_ids = path_ids,
+        .keys = keys,
+        .values = values,
+        .scalar_kind = scalar_kind,
+        .min_count = min_count,
+        .max_count = max_count,
+        .min_number = min_number,
+        .max_number = max_number,
+        .children = children,
+    };
+    try validateCachedRule(rule, input_count, pointer_count);
+    return rule;
 }
 
 fn decodePathIds(
@@ -844,7 +1181,27 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
+        .all_rules, .any_rules, .no_rules => if (rule.pointer_id == null or
+            rule.children.len == 0 or rule.children.len > 64)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         else => {},
+    }
+    if (rule.operator != .all_rules and
+        rule.operator != .any_rules and
+        rule.operator != .no_rules and
+        rule.children.len != 0)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    for (rule.children) |child| {
+        if (child.input_index != rule.input_index or
+            !isItemOperator(child.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        try validateCachedRule(child, input_count, pointer_count);
     }
 }
 
@@ -1219,6 +1576,15 @@ fn applyRule(
             root,
             rule,
         ),
+        .all_rules, .any_rules, .no_rules => if (target) |value|
+            try collectionRuleHolds(
+                allocator,
+                plan,
+                rule,
+                value,
+            )
+        else
+            false,
         .set_equality,
         .subset,
         .superset,
@@ -1237,6 +1603,120 @@ fn applyRule(
             "artifact does not satisfy the compiled structural rule",
         );
     }
+}
+
+fn collectionRuleHolds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+) anyerror!bool {
+    const items = switch (value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records) return false;
+    return switch (rule.operator) {
+        .all_rules => {
+            for (items) |item| {
+                if (!try itemRulesHold(allocator, plan, rule.children, item)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .any_rules => {
+            for (items) |item| {
+                if (try itemRulesHold(allocator, plan, rule.children, item)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        .no_rules => {
+            for (items) |item| {
+                if (try itemRulesHold(allocator, plan, rule.children, item)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        else => unreachable,
+    };
+}
+
+fn itemRulesHold(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rules: []const CompiledRule,
+    root: std.json.Value,
+) anyerror!bool {
+    for (rules) |rule| {
+        if (!try itemRuleHolds(allocator, plan, rule, root)) return false;
+    }
+    return true;
+}
+
+fn itemRuleHolds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    root: std.json.Value,
+) anyerror!bool {
+    const target = if (rule.pointer_id) |pointer_id|
+        resolve(root, plan.pointers[pointer_id])
+    else
+        root;
+    return switch (rule.operator) {
+        .required_field => target != null,
+        .optional_field => true,
+        .exact_object => if (target) |value| exactObject(value, rule.keys) else false,
+        .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
+        .bounded_string => if (target) |value| boundedString(value, rule) else false,
+        .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
+        .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
+        .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
+        .enum_value => if (target) |value| enumContains(rule.values, value) else false,
+        .digest => if (target) |value| validateScalar(value, .digest) else false,
+        .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
+        .safe_identifier => if (target) |value| safeIdentifier(value, rule.max_count) else false,
+        .safe_relative_path => if (target) |value| validateScalar(value, .relative_path) else false,
+        .unique => if (target) |value| arrayUnique(value) else false,
+        .sorted => if (target) |value| arraySorted(value) else false,
+        .keyed_unique => if (target) |value|
+            try keyedUnique(
+                allocator,
+                value,
+                plan.pointers[rule.other_pointer_id.?],
+                plan.max_records,
+            )
+        else
+            false,
+        .implies => implicationHolds(plan, root, rule),
+        .set_equality,
+        .subset,
+        .superset,
+        .disjoint,
+        .field_equal,
+        .field_not_equal,
+        => {
+            const left = resolve(
+                root,
+                plan.pointers[rule.pointer_id.?],
+            ) orelse return false;
+            const right = resolve(
+                root,
+                plan.pointers[rule.other_pointer_id.?],
+            ) orelse return false;
+            return compareValues(rule.operator, left, right);
+        },
+        .exactly_one, .at_least_one => countPresent(plan, root, rule),
+        .all_rules, .any_rules, .no_rules => if (target) |value|
+            collectionRuleHolds(allocator, plan, rule, value)
+        else
+            false,
+        else => unreachable,
+    };
 }
 
 fn compareRule(
@@ -2004,6 +2484,9 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .disjoint,
         .exactly_one,
         .at_least_one,
+        .all_rules,
+        .any_rules,
+        .no_rules,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -2012,6 +2495,39 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .implies,
         .total_partition,
         .total_mapping,
+        => true,
+        else => false,
+    };
+}
+
+fn isItemOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .exact_object,
+        .required_field,
+        .optional_field,
+        .scalar_type,
+        .bounded_string,
+        .bounded_number,
+        .bounded_array,
+        .bounded_object,
+        .enum_value,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .safe_relative_path,
+        .unique,
+        .sorted,
+        .set_equality,
+        .subset,
+        .superset,
+        .disjoint,
+        .exactly_one,
+        .at_least_one,
+        .keyed_unique,
+        .implies,
+        .all_rules,
+        .any_rules,
+        .no_rules,
         => true,
         else => false,
     };
@@ -2032,6 +2548,30 @@ fn validateForAllocationFailure(
     defer result.deinit(allocator);
 }
 
+fn compileForAllocationFailure(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+) !void {
+    var plan = compile(allocator, definition_plan) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+}
+
+fn decodeForAllocationFailure(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var plan = decodeCache(allocator, &decoder) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+    try decoder.finish();
+}
+
 test "compiled validation plan accepts valid structure and rejects invalid structure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2042,7 +2582,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping","all","any","none"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
@@ -2053,7 +2593,15 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"unique","path":"/tags"},
         \\    {"op":"sorted","path":"/tags"},
         \\    {"op":"keyed-unique","path":"/items","key":"/id"},
-        \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"}
+        \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"},
+        \\    {"op":"all","path":"/items","rules":[
+        \\      {"op":"exact-object","keys":["id","labels"]},
+        \\      {"op":"scalar-type","path":"/id","type":"string"},
+        \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
+        \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
+        \\    ]},
+        \\    {"op":"any","path":"/items","rules":[{"op":"enum","path":"/id","values":["item-2"]}]},
+        \\    {"op":"none","path":"/items","rules":[{"op":"enum","path":"/id","values":["forbidden"]}]}
         \\  ]},
         \\  "constraints":[
         \\    {"op":"field-equal","left":"/status","right":"/mirror"},
@@ -2100,9 +2648,19 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expectEqual(plan.inputs.len, cached.inputs.len);
     try std.testing.expectEqual(plan.pointers.len, cached.pointers.len);
     try std.testing.expectEqual(plan.rules.len, cached.rules.len);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&definition_plan},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-2\"}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"]},{\"id\":\"item-2\",\"labels\":[\"b\"]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -2123,7 +2681,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-1\"}],\"links\":[{\"item_refs\":[\"missing\"],\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"]},{\"id\":\"item-1\",\"labels\":[]}],\"links\":[{\"item_refs\":[\"missing\"],\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
@@ -2132,6 +2690,8 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     var saw_implication = false;
     var saw_partition = false;
     var saw_mapping = false;
+    var saw_all = false;
+    var saw_any = false;
     for (invalid.diagnostics.items.items) |diagnostic| {
         saw_implication = saw_implication or
             std.mem.eql(u8, diagnostic.code, "implies");
@@ -2139,10 +2699,14 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
             std.mem.eql(u8, diagnostic.code, "total-partition");
         saw_mapping = saw_mapping or
             std.mem.eql(u8, diagnostic.code, "total-mapping");
+        saw_all = saw_all or std.mem.eql(u8, diagnostic.code, "all");
+        saw_any = saw_any or std.mem.eql(u8, diagnostic.code, "any");
     }
     try std.testing.expect(saw_implication);
     try std.testing.expect(saw_partition);
     try std.testing.expect(saw_mapping);
+    try std.testing.expect(saw_all);
+    try std.testing.expect(saw_any);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         validateForAllocationFailure,
