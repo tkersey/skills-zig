@@ -263,6 +263,104 @@ const Builder = struct {
                     try definition_core.json.requiredString(object, "right"),
                 );
             },
+            .implies => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "if", "equals", "then" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "if", "then" },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "if"),
+                );
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "then"),
+                );
+                if (object.get("equals")) |value| {
+                    var expected = try parseEnumScalar(
+                        self.allocator,
+                        value,
+                    );
+                    errdefer expected.deinit(self.allocator);
+                    const values = try self.allocator.alloc(EnumScalar, 1);
+                    values[0] = expected;
+                    rule.values = values;
+                }
+            },
+            .total_partition => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "universe", "parts" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "universe", "parts" },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "universe",
+                    ),
+                );
+                rule.path_ids = try self.parsePaths(
+                    try definition_core.json.field(object, "parts"),
+                );
+                if (rule.path_ids.len < 2) {
+                    return error.TotalPartitionRequiresMultipleParts;
+                }
+            },
+            .total_mapping => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "input",
+                        "source",
+                        "target",
+                        "mapping",
+                        "from",
+                        "to",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{
+                        "op",
+                        "source",
+                        "target",
+                        "mapping",
+                        "from",
+                        "to",
+                    },
+                );
+                rule.pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "source",
+                    ),
+                );
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "target",
+                    ),
+                );
+                rule.path_ids = try self.allocator.alloc(u16, 3);
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "mapping",
+                    ),
+                );
+                rule.path_ids[1] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "from"),
+                );
+                rule.path_ids[2] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "to"),
+                );
+            },
             .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
                 try definition_core.json.field(object, "paths"),
             ),
@@ -375,7 +473,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeCount(plan.inputs.len);
     for (plan.inputs) |input| {
         try encoder.writeBytes(input.name);
@@ -414,7 +512,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     const inputs = try decodeCacheInputs(allocator, decoder);
@@ -726,6 +824,23 @@ fn validateCachedRule(
             rule.other_input_index == null or
             rule.other_pointer_id == null or
             rule.path_ids.len != 2)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .implies => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or
+            rule.values.len > 1)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .total_partition => if (rule.pointer_id == null or
+            rule.path_ids.len < 2)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .total_mapping => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or
+            rule.path_ids.len != 3)
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -1091,6 +1206,19 @@ fn applyRule(
             )
         else
             false,
+        .implies => implicationHolds(plan, root, rule),
+        .total_partition => try totalPartition(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
+        .total_mapping => try totalMapping(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
         .set_equality,
         .subset,
         .superset,
@@ -1167,6 +1295,202 @@ fn countPresent(plan: *const Plan, root: std.json.Value, rule: CompiledRule) boo
         if (resolve(root, plan.pointers[pointer_id]) != null) count += 1;
     }
     return if (rule.operator == .exactly_one) count == 1 else count >= 1;
+}
+
+fn implicationHolds(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) bool {
+    const condition = resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return true;
+    if (rule.values.len == 1 and
+        !enumEqual(rule.values[0], condition))
+    {
+        return true;
+    }
+    return resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) != null;
+}
+
+const PartitionEntry = struct {
+    value: std.json.Value,
+    admitted: bool = false,
+};
+
+fn totalPartition(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    const universe_value = resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false;
+    const universe = switch (universe_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (universe.len > plan.max_records) return false;
+
+    var index: std.AutoHashMapUnmanaged([32]u8, PartitionEntry) = .empty;
+    defer index.deinit(allocator);
+    for (universe) |value| {
+        const digest = scalarKeyDigest(value) orelse return false;
+        const result = try index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (!valuesEqual(result.value_ptr.value, value)) {
+                return error.TotalPartitionDigestCollision;
+            }
+            return false;
+        }
+        result.value_ptr.* = .{ .value = value };
+    }
+
+    var admitted_count: usize = 0;
+    for (rule.path_ids) |path_id| {
+        const part_value = resolve(
+            root,
+            plan.pointers[path_id],
+        ) orelse return false;
+        const part = switch (part_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        for (part) |value| {
+            admitted_count = std.math.add(
+                usize,
+                admitted_count,
+                1,
+            ) catch return false;
+            if (admitted_count > plan.max_records) return false;
+            const digest = scalarKeyDigest(value) orelse return false;
+            const entry = index.getPtr(digest) orelse return false;
+            if (!valuesEqual(entry.value, value)) {
+                return error.TotalPartitionDigestCollision;
+            }
+            if (entry.admitted) return false;
+            entry.admitted = true;
+        }
+    }
+    if (admitted_count != universe.len) return false;
+    var iterator = index.valueIterator();
+    while (iterator.next()) |entry| {
+        if (!entry.admitted) return false;
+    }
+    return true;
+}
+
+const MappingSource = struct {
+    value: std.json.Value,
+    mapped: bool = false,
+};
+
+fn totalMapping(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    const source_value = resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false;
+    const target_value = resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return false;
+    const mapping_value = resolve(
+        root,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    const sources = switch (source_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    const targets = switch (target_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    const mappings = switch (mapping_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (sources.len > plan.max_records or
+        targets.len > plan.max_records or
+        mappings.len > plan.max_records or
+        mappings.len != sources.len)
+    {
+        return false;
+    }
+
+    var source_index: std.AutoHashMapUnmanaged(
+        [32]u8,
+        MappingSource,
+    ) = .empty;
+    defer source_index.deinit(allocator);
+    for (sources) |value| {
+        const digest = scalarKeyDigest(value) orelse return false;
+        const result = try source_index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (!valuesEqual(result.value_ptr.value, value)) {
+                return error.TotalMappingDigestCollision;
+            }
+            return false;
+        }
+        result.value_ptr.* = .{ .value = value };
+    }
+
+    var target_index: std.AutoHashMapUnmanaged(
+        [32]u8,
+        std.json.Value,
+    ) = .empty;
+    defer target_index.deinit(allocator);
+    for (targets) |value| {
+        const digest = scalarKeyDigest(value) orelse return false;
+        const result = try target_index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (!valuesEqual(result.value_ptr.*, value)) {
+                return error.TotalMappingDigestCollision;
+            }
+            return false;
+        }
+        result.value_ptr.* = value;
+    }
+
+    for (mappings) |mapping| {
+        const from = resolve(
+            mapping,
+            plan.pointers[rule.path_ids[1]],
+        ) orelse return false;
+        const to = resolve(
+            mapping,
+            plan.pointers[rule.path_ids[2]],
+        ) orelse return false;
+        const from_digest = scalarKeyDigest(from) orelse return false;
+        const source = source_index.getPtr(from_digest) orelse return false;
+        if (!valuesEqual(source.value, from)) {
+            return error.TotalMappingDigestCollision;
+        }
+        if (source.mapped) return false;
+        source.mapped = true;
+
+        const to_digest = scalarKeyDigest(to) orelse return false;
+        const target = target_index.get(to_digest) orelse return false;
+        if (!valuesEqual(target, to)) {
+            return error.TotalMappingDigestCollision;
+        }
+    }
+    var iterator = source_index.valueIterator();
+    while (iterator.next()) |source| {
+        if (!source.mapped) return false;
+    }
+    return true;
 }
 
 fn resolve(root: std.json.Value, pointer: Pointer) ?std.json.Value {
@@ -1589,21 +1913,33 @@ fn parseEnumValues(
         allocator.free(out);
     }
     for (items.items, 0..) |item, index| {
-        out[index] = switch (item) {
-            .string => |text| .{ .string = try allocator.dupe(u8, text) },
-            .integer => |number| .{ .integer = number },
-            .float => |number| .{ .float = number },
-            .number_string => |number| .{
-                .float = std.fmt.parseFloat(f64, number) catch
-                    return error.InvalidEnumValue,
-            },
-            .bool => |flag| .{ .boolean = flag },
-            .null => .null,
-            else => return error.InvalidEnumValue,
-        };
+        out[index] = try parseEnumScalar(allocator, item);
         initialized += 1;
     }
     return out;
+}
+
+fn parseEnumScalar(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !EnumScalar {
+    return switch (value) {
+        .string => |text| .{ .string = try allocator.dupe(u8, text) },
+        .integer => |number| .{ .integer = number },
+        .float => |number| if (std.math.isFinite(number))
+            .{ .float = number }
+        else
+            error.InvalidEnumValue,
+        .number_string => |number| number: {
+            const parsed = std.fmt.parseFloat(f64, number) catch
+                return error.InvalidEnumValue;
+            if (!std.math.isFinite(parsed)) return error.InvalidEnumValue;
+            break :number .{ .float = parsed };
+        },
+        .bool => |flag| .{ .boolean = flag },
+        .null => .null,
+        else => error.InvalidEnumValue,
+    };
 }
 
 fn optionalUnsigned(object: std.json.ObjectMap, name: []const u8) !?usize {
@@ -1673,9 +2009,27 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .cross_input_equal,
         .keyed_unique,
         .reference_exists,
+        .implies,
+        .total_partition,
+        .total_mapping,
         => true,
         else => false,
     };
+}
+
+fn validateForAllocationFailure(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const Plan,
+    bytes: []const u8,
+) !void {
+    var result = try validate(
+        allocator,
+        definition_plan,
+        validation_plan,
+        &.{.{ .name = "record", .bytes = bytes }},
+    );
+    defer result.deinit(allocator);
 }
 
 test "compiled validation plan accepts valid structure and rejects invalid structure" {
@@ -1688,11 +2042,11 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links","meta","universe","accepted","rejected","targets","mappings"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
@@ -1703,7 +2057,10 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  ]},
         \\  "constraints":[
         \\    {"op":"field-equal","left":"/status","right":"/mirror"},
-        \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"}
+        \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
+        \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure"},
+        \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
+        \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
         \\  ],
         \\  "identity":{},
         \\  "storage":{"kind":"pure"},
@@ -1744,13 +2101,15 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expectEqual(plan.pointers.len, cached.pointers.len);
     try std.testing.expectEqual(plan.rules.len, cached.rules.len);
 
+    const valid_bytes =
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-2\"}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-2\"}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}]}",
+            .bytes = valid_bytes,
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -1764,12 +2123,31 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"unknown\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-1\"}],\"links\":[{\"item_refs\":[\"missing\"],\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-1\"}],\"links\":[{\"item_refs\":[\"missing\"],\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
     try std.testing.expect(!invalid.valid);
     try std.testing.expect(invalid.diagnostics.items.items.len >= 5);
+    var saw_implication = false;
+    var saw_partition = false;
+    var saw_mapping = false;
+    for (invalid.diagnostics.items.items) |diagnostic| {
+        saw_implication = saw_implication or
+            std.mem.eql(u8, diagnostic.code, "implies");
+        saw_partition = saw_partition or
+            std.mem.eql(u8, diagnostic.code, "total-partition");
+        saw_mapping = saw_mapping or
+            std.mem.eql(u8, diagnostic.code, "total-mapping");
+    }
+    try std.testing.expect(saw_implication);
+    try std.testing.expect(saw_partition);
+    try std.testing.expect(saw_mapping);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        validateForAllocationFailure,
+        .{ &definition_plan, &plan, valid_bytes },
+    );
 }
 
 test "validation reports missing and malformed inputs without granting authority" {
