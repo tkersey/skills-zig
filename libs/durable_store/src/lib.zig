@@ -1051,11 +1051,17 @@ pub const TransactionMutation = struct {
     expectation: CasExpectation = .{},
     content_mode: TransactionContentMode = .jsonl_sequence_required,
     max_bytes: usize = default_snapshot_max_bytes,
+    action: TransactionMutationAction = .write,
 };
 
 pub const TransactionContentMode = enum {
     jsonl_sequence_required,
     raw,
+};
+
+pub const TransactionMutationAction = enum {
+    write,
+    check_only,
 };
 
 pub const CommitTransactionReceipt = struct {
@@ -1741,6 +1747,7 @@ pub fn commitTextTransaction(
         }
         expected_count += 1;
 
+        if (mutation.action == .check_only) continue;
         if (mutation.text.len > mutation.max_bytes) return error.FileTooBig;
         if (mutation.content_mode == .jsonl_sequence_required) {
             const validation = validateJsonlBytes(allocator, mutation.text);
@@ -1772,6 +1779,7 @@ pub fn commitTextTransaction(
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .prepared, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), true);
 
     for (ordered) |mutation| {
+        if (mutation.action == .check_only) continue;
         var receipt = try writeTextAtomicCasBounded(
             allocator,
             mutation.path,
@@ -4367,6 +4375,120 @@ test "transaction recovery hashes admitted stores above the snapshot allocation 
         &.{},
     );
     try std.testing.expectEqual(@as(?usize, 1), published);
+}
+
+test "durable transactions compare check-only participants without rewriting them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "transactions" },
+    );
+    defer std.testing.allocator.free(transactions_dir);
+    const counter = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer std.testing.allocator.free(counter);
+    const guarded_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "guarded.jsonl" },
+    );
+    defer std.testing.allocator.free(guarded_path);
+    const metadata_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "binding.jsonl" },
+    );
+    defer std.testing.allocator.free(metadata_path);
+    const guarded = "{\"seq\":1}\n";
+    try writeTextAtomic(std.testing.allocator, guarded_path, guarded);
+    const guarded_digest = try digestBytesAlloc(
+        std.testing.allocator,
+        guarded,
+    );
+    defer std.testing.allocator.free(guarded_digest);
+    const mutations = [_]TransactionMutation{
+        .{
+            .path = guarded_path,
+            .text = "",
+            .expectation = .{
+                .expected_digest = guarded_digest,
+                .expected_exists = true,
+            },
+            .content_mode = .raw,
+            .max_bytes = 4096,
+            .action = .check_only,
+        },
+        .{
+            .path = metadata_path,
+            .text = "{\"bound\":true}\n",
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = 4096,
+        },
+    };
+    var receipt = try commitTextTransaction(
+        std.testing.allocator,
+        transactions_dir,
+        &mutations,
+        .{
+            .owner = .{
+                .process_id = 400,
+                .session_id = "check-only",
+                .executor = "test",
+            },
+            .fencing_counter_path = counter,
+        },
+    );
+    defer receipt.deinit(std.testing.allocator);
+    const guarded_after = try readRegularFileNoSymlink(
+        std.testing.allocator,
+        guarded_path,
+        4096,
+    );
+    defer std.testing.allocator.free(guarded_after);
+    try std.testing.expectEqualStrings(guarded, guarded_after);
+    const metadata = try readRegularFileNoSymlink(
+        std.testing.allocator,
+        metadata_path,
+        4096,
+    );
+    defer std.testing.allocator.free(metadata);
+    try std.testing.expectEqualStrings("{\"bound\":true}\n", metadata);
+
+    const stale = [_]TransactionMutation{.{
+        .path = guarded_path,
+        .text = "",
+        .expectation = .{
+            .expected_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            .expected_exists = true,
+        },
+        .content_mode = .raw,
+        .max_bytes = 4096,
+        .action = .check_only,
+    }};
+    try std.testing.expectError(
+        error.DigestMismatch,
+        commitTextTransaction(
+            std.testing.allocator,
+            transactions_dir,
+            &stale,
+            .{
+                .owner = .{
+                    .process_id = 401,
+                    .session_id = "check-only-stale",
+                    .executor = "test",
+                },
+                .fencing_counter_path = counter,
+            },
+        ),
+    );
 }
 
 test "durable transactions commit and recover from prepared records" {

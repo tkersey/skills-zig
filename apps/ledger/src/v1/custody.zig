@@ -14,7 +14,36 @@ pub const IdempotencyQuery = struct {
     input_digest: []const u8,
 };
 
+pub const BindingKind = enum {
+    admission,
+    existing_store_binding,
+
+    fn parse(value: []const u8) !BindingKind {
+        if (std.mem.eql(u8, value, "admission")) return .admission;
+        if (std.mem.eql(u8, value, "existing-store-binding")) {
+            return .existing_store_binding;
+        }
+        return error.InvalidStoreBindingKind;
+    }
+
+    fn text(self: BindingKind) []const u8 {
+        return switch (self) {
+            .admission => "admission",
+            .existing_store_binding => "existing-store-binding",
+        };
+    }
+};
+
+pub const BindingExtent = struct {
+    kind: BindingKind,
+    record_start: ?usize,
+    record_end: ?usize,
+    extent_start: usize,
+    extent_end: usize,
+};
+
 pub const BindingRow = struct {
+    kind: BindingKind,
     definition_digest: []u8,
     operation: []u8,
     input_digest: []u8,
@@ -22,6 +51,10 @@ pub const BindingRow = struct {
     revision_before: ?[]u8,
     revision_after: []u8,
     idempotency_key: ?[]u8,
+    record_start: ?usize,
+    record_end: ?usize,
+    extent_start: usize,
+    extent_end: usize,
 
     fn deinit(self: *BindingRow, allocator: std.mem.Allocator) void {
         allocator.free(self.definition_digest);
@@ -195,6 +228,7 @@ pub fn readBindingSnapshot(
         const object = try definition_core.json.object(parsed.value);
         try definition_core.json.requireExactKeys(object, &.{
             "schema",
+            "binding_kind",
             "slot",
             "logical_path",
             "definition_id",
@@ -203,12 +237,17 @@ pub fn readBindingSnapshot(
             "operation",
             "input_digest",
             "canonical_input_digest",
+            "extent_start",
+            "extent_end",
+            "record_start",
+            "record_end",
             "revision_before",
             "revision_after",
             "idempotency_key",
         });
         try definition_core.json.requireFields(object, &.{
             "schema",
+            "binding_kind",
             "slot",
             "logical_path",
             "definition_id",
@@ -217,6 +256,10 @@ pub fn readBindingSnapshot(
             "operation",
             "input_digest",
             "canonical_input_digest",
+            "extent_start",
+            "extent_end",
+            "record_start",
+            "record_end",
             "revision_before",
             "revision_after",
             "idempotency_key",
@@ -226,6 +269,9 @@ pub fn readBindingSnapshot(
             try definition_core.json.requiredString(object, "schema"),
             "ledger-store-binding/v1",
         )) return error.InvalidStoreBinding;
+        const binding_kind = try BindingKind.parse(
+            try definition_core.json.requiredString(object, "binding_kind"),
+        );
         if (!std.mem.eql(
             u8,
             try definition_core.json.requiredString(object, "slot"),
@@ -295,6 +341,20 @@ pub fn readBindingSnapshot(
             "idempotency_key",
         );
         if (row_idempotency) |key| try definition_core.json.safeIdentifier(key, 128);
+        const record_start = try optionalUnsigned(object, "record_start");
+        const record_end = try optionalUnsigned(object, "record_end");
+        if ((record_start == null) != (record_end == null) or
+            (record_start != null and record_start.? >= record_end.?))
+        {
+            return error.InvalidStoreBindingRange;
+        }
+        const extent_start = try definition_core.json.unsigned(
+            try definition_core.json.field(object, "extent_start"),
+        );
+        const extent_end = try definition_core.json.unsigned(
+            try definition_core.json.field(object, "extent_end"),
+        );
+        if (extent_start > extent_end) return error.InvalidStoreBindingExtent;
         if (idempotency) |query| {
             if (row_idempotency != null and
                 std.mem.eql(u8, query.key, row_idempotency.?) and
@@ -340,6 +400,7 @@ pub fn readBindingSnapshot(
             null;
         errdefer if (owned_idempotency_key) |key| allocator.free(key);
         try rows.append(allocator, .{
+            .kind = binding_kind,
             .definition_digest = owned_definition_digest,
             .operation = owned_operation,
             .input_digest = owned_input_digest,
@@ -347,6 +408,10 @@ pub fn readBindingSnapshot(
             .revision_before = owned_revision_before,
             .revision_after = owned_revision_after,
             .idempotency_key = owned_idempotency_key,
+            .record_start = record_start,
+            .record_end = record_end,
+            .extent_start = extent_start,
+            .extent_end = extent_end,
         });
     }
     if (rows.items.len == 0 or last_revision == null) {
@@ -375,10 +440,20 @@ pub fn appendBindingRowAlloc(
     operation: []const u8,
     input_digest: []const u8,
     canonical_input_digest: []const u8,
+    extent: BindingExtent,
     revision_before: ?[]const u8,
     revision_after: []const u8,
     idempotency_key: ?[]const u8,
 ) ![]u8 {
+    if ((extent.record_start == null) != (extent.record_end == null) or
+        (extent.record_start != null and
+            extent.record_start.? >= extent.record_end.?))
+    {
+        return error.InvalidStoreBindingRange;
+    }
+    if (extent.extent_start > extent.extent_end) {
+        return error.InvalidStoreBindingExtent;
+    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeAll(before);
@@ -386,8 +461,13 @@ pub fn appendBindingRowAlloc(
         try output.writer.writeByte('\n');
     }
     try output.writer.writeAll(
-        "{\"abi\":\"ledger-artifact-abi/v1\",\"canonical_input_digest\":",
+        "{\"abi\":\"ledger-artifact-abi/v1\",\"binding_kind\":",
     );
+    try definition_core.canonical_json.writeCanonicalString(
+        &output.writer,
+        extent.kind.text(),
+    );
+    try output.writer.writeAll(",\"canonical_input_digest\":");
     try definition_core.canonical_json.writeCanonicalString(
         &output.writer,
         canonical_input_digest,
@@ -401,6 +481,10 @@ pub fn appendBindingRowAlloc(
     try definition_core.canonical_json.writeCanonicalString(
         &output.writer,
         definition_plan.id,
+    );
+    try output.writer.print(
+        ",\"extent_end\":{d},\"extent_start\":{d}",
+        .{ extent.extent_end, extent.extent_start },
     );
     try output.writer.writeAll(",\"idempotency_key\":");
     try writeOptionalString(&output.writer, idempotency_key);
@@ -419,6 +503,10 @@ pub fn appendBindingRowAlloc(
         &output.writer,
         operation,
     );
+    try output.writer.writeAll(",\"record_end\":");
+    try writeOptionalUnsigned(&output.writer, extent.record_end);
+    try output.writer.writeAll(",\"record_start\":");
+    try writeOptionalUnsigned(&output.writer, extent.record_start);
     try output.writer.writeAll(",\"revision_after\":");
     try definition_core.canonical_json.writeCanonicalString(
         &output.writer,
@@ -466,4 +554,21 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     } else {
         try writer.writeAll("null");
     }
+}
+
+fn writeOptionalUnsigned(writer: *std.Io.Writer, value: ?usize) !void {
+    if (value) |number| {
+        try writer.print("{d}", .{number});
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn optionalUnsigned(
+    object: std.json.ObjectMap,
+    name: []const u8,
+) !?usize {
+    const value = object.get(name) orelse return null;
+    if (value == .null) return null;
+    return @as(?usize, try definition_core.json.unsigned(value));
 }

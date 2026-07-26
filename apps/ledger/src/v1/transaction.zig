@@ -97,6 +97,22 @@ pub fn transact(
     )) return error.DefinitionClosureDigestMismatch;
     const operation = storage_plan.findOperation(operation_name) orelse
         return error.UnknownOperation;
+    if (isBindingOperation(operation)) {
+        if (documents.len != 0) {
+            return error.BindingOperationRejectsExternalInput;
+        }
+        return bindExisting(
+            allocator,
+            definition_plan,
+            definition_closure,
+            definition_entry_path,
+            validation_plan,
+            storage_plan,
+            operation,
+            operation_name,
+            repo_root,
+        );
+    }
     var execution = try validation.execute(allocator, validation_plan, documents);
     defer execution.deinit();
     if (!execution.isValid()) {
@@ -235,6 +251,402 @@ pub fn transact(
     };
 }
 
+const PreparedBinding = struct {
+    slot_index: u16,
+    input_index: u8,
+    slot_path: []u8,
+    slot_content: []u8,
+    slot_digest: []u8,
+    binding_path: []u8,
+    binding_after: []u8,
+
+    fn deinit(self: *PreparedBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.slot_path);
+        allocator.free(self.slot_content);
+        allocator.free(self.slot_digest);
+        allocator.free(self.binding_path);
+        allocator.free(self.binding_after);
+        self.* = undefined;
+    }
+};
+
+fn isBindingOperation(operation: *const storage.Operation) bool {
+    if (operation.effects.len == 0) return false;
+    for (operation.effects) |effect| {
+        if (effect.kind != .bind_existing) return false;
+    }
+    return true;
+}
+
+fn bindExisting(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    definition_closure: *const definition_core.Closure,
+    definition_entry_path: []const u8,
+    validation_plan: *const validation.Plan,
+    storage_plan: *const storage.Plan,
+    operation: *const storage.Operation,
+    operation_name: []const u8,
+    repo_root: []const u8,
+) !Result {
+    const ledger_root = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger" },
+    );
+    defer allocator.free(ledger_root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const bindings_dir = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".bindings" },
+    );
+    defer allocator.free(bindings_dir);
+    const definitions_dir = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".definitions" },
+    );
+    defer allocator.free(definitions_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(ledger_root);
+    try durable_store.ensureDirectoryPathNoSymlinks(transactions_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(bindings_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(definitions_dir);
+    try durable_store.ensureNoPendingTransactions(allocator, transactions_dir);
+    var archive = try definition_archive.prepare(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        definition_entry_path,
+        definition_closure,
+    );
+    defer archive.deinit(allocator);
+    const prepared = try allocator.alloc(PreparedBinding, operation.effects.len);
+    var prepared_count: usize = 0;
+    defer {
+        for (prepared[0..prepared_count]) |*item| item.deinit(allocator);
+        allocator.free(prepared);
+    }
+    for (operation.effects, 0..) |effect, index| {
+        prepared[index] = try prepareExistingBinding(
+            allocator,
+            definition_plan,
+            validation_plan,
+            storage_plan,
+            effect,
+            operation_name,
+            repo_root,
+        );
+        prepared_count += 1;
+    }
+    const archive_count: usize = if (archive.exists) 0 else 1;
+    const mutations = try allocator.alloc(
+        durable_store.TransactionMutation,
+        prepared.len * 2 + archive_count,
+    );
+    defer allocator.free(mutations);
+    for (prepared, 0..) |item, index| {
+        const slot = storage_plan.slots[item.slot_index];
+        mutations[index * 2] = .{
+            .path = item.slot_path,
+            .text = "",
+            .expectation = .{
+                .expected_digest = item.slot_digest,
+                .expected_exists = true,
+            },
+            .content_mode = .raw,
+            .max_bytes = slot.max_bytes,
+            .action = .check_only,
+        };
+        mutations[index * 2 + 1] = .{
+            .path = item.binding_path,
+            .text = item.binding_after,
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = custody.binding_max_bytes,
+        };
+    }
+    if (!archive.exists) {
+        mutations[prepared.len * 2] = .{
+            .path = archive.path,
+            .text = archive.content,
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = definition_archive.max_bytes,
+        };
+    }
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ ledger_root, ".fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    var commit = try durable_store.commitTextTransaction(
+        allocator,
+        transactions_dir,
+        mutations,
+        .{
+            .owner = .{
+                .process_id = 0,
+                .session_id = "ledger-artifact-abi-v1",
+                .executor = "ledger",
+            },
+            .fencing_counter_path = counter_path,
+            .reject_symlinks = true,
+        },
+    );
+    defer commit.deinit(allocator);
+    const receipts = try allocator.alloc(EffectReceipt, prepared.len);
+    var receipt_count: usize = 0;
+    errdefer {
+        for (receipts[0..receipt_count]) |*receipt| receipt.deinit(allocator);
+        allocator.free(receipts);
+    }
+    for (prepared, 0..) |item, index| {
+        const slot = storage_plan.slots[item.slot_index];
+        {
+            const owned_slot = try allocator.dupe(u8, slot.name);
+            errdefer allocator.free(owned_slot);
+            const owned_ref = try allocator.dupe(u8, slot.relative_path);
+            errdefer allocator.free(owned_ref);
+            const revision_before = try allocator.dupe(u8, item.slot_digest);
+            errdefer allocator.free(revision_before);
+            const revision_after = try allocator.dupe(u8, item.slot_digest);
+            errdefer allocator.free(revision_after);
+            const result = try allocator.dupe(u8, "bound");
+            errdefer allocator.free(result);
+            receipts[index] = .{
+                .slot = owned_slot,
+                .logical_ref = owned_ref,
+                .revision_before = revision_before,
+                .revision_after = revision_after,
+                .result = result,
+            };
+        }
+        receipt_count += 1;
+    }
+    const transaction_id = try allocator.dupe(u8, commit.transaction_id);
+    errdefer allocator.free(transaction_id);
+    const owned_operation = try allocator.dupe(u8, operation_name);
+    errdefer allocator.free(owned_operation);
+    const validation_result = try bindingValidationResult(
+        allocator,
+        definition_plan,
+        storage_plan,
+        prepared,
+    );
+    return .{
+        .validation_result = validation_result,
+        .operation = owned_operation,
+        .transaction_id = transaction_id,
+        .effects = receipts,
+        .returned_content = null,
+        .storage_mutated = true,
+    };
+}
+
+fn prepareExistingBinding(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    storage_plan: *const storage.Plan,
+    effect: storage.Effect,
+    operation_name: []const u8,
+    repo_root: []const u8,
+) !PreparedBinding {
+    if (effect.kind != .bind_existing) {
+        return error.BindingOperationCannotMixEffects;
+    }
+    const slot = storage_plan.slots[effect.slot_index];
+    const slot_path = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", slot.relative_path },
+    );
+    errdefer allocator.free(slot_path);
+    try durable_store.rejectSymlinkComponents(slot_path);
+    const slot_content = try durable_store.readRegularFileNoSymlink(
+        allocator,
+        slot_path,
+        slot.max_bytes,
+    );
+    errdefer allocator.free(slot_content);
+    const slot_digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        slot_content,
+    );
+    errdefer allocator.free(slot_digest);
+    const binding_path = try custody.bindingPathAlloc(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    errdefer allocator.free(binding_path);
+    var before = try custody.readBindingSnapshot(
+        allocator,
+        binding_path,
+        definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        slot_digest,
+        null,
+    );
+    defer before.deinit(allocator);
+    if (before.exists) return error.StoreAlreadyBound;
+    const record_count = try validateExistingContent(
+        allocator,
+        definition_plan,
+        validation_plan,
+        effect.input_index,
+        slot,
+        slot_content,
+    );
+    const binding_after = try custody.appendBindingRowAlloc(
+        allocator,
+        before.bytes,
+        definition_plan,
+        slot,
+        operation_name,
+        slot_digest,
+        slot_digest,
+        .{
+            .kind = .existing_store_binding,
+            .record_start = if (record_count) |_| 0 else null,
+            .record_end = record_count,
+            .extent_start = 0,
+            .extent_end = slot_content.len,
+        },
+        null,
+        slot_digest,
+        null,
+    );
+    return .{
+        .slot_index = effect.slot_index,
+        .input_index = effect.input_index,
+        .slot_path = slot_path,
+        .slot_content = slot_content,
+        .slot_digest = slot_digest,
+        .binding_path = binding_path,
+        .binding_after = binding_after,
+    };
+}
+
+fn validateExistingContent(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    input_index: u8,
+    slot: storage.Slot,
+    content: []const u8,
+) !?usize {
+    const input = definition_plan.inputs[input_index];
+    if (slot.kind == .document) {
+        try validateExistingDocument(
+            allocator,
+            validation_plan,
+            input.name,
+            content,
+        );
+        return null;
+    }
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_with_cr| {
+        const line = std.mem.trim(u8, line_with_cr, " \t\r");
+        if (line.len == 0) continue;
+        count += 1;
+        if (count > definition_plan.bounds.max_records) {
+            return error.ExistingStoreRecordBoundsExceeded;
+        }
+        try validateExistingDocument(
+            allocator,
+            validation_plan,
+            input.name,
+            line,
+        );
+    }
+    if (count == 0) return error.ExistingStoreEmpty;
+    return count;
+}
+
+fn validateExistingDocument(
+    allocator: std.mem.Allocator,
+    validation_plan: *const validation.Plan,
+    input_name: []const u8,
+    bytes: []const u8,
+) !void {
+    var execution = try validation.execute(
+        allocator,
+        validation_plan,
+        &.{.{ .name = input_name, .bytes = bytes }},
+    );
+    defer execution.deinit();
+    if (!execution.isValid()) return error.ExistingStoreValidationFailed;
+}
+
+fn bindingValidationResult(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    prepared: []const PreparedBinding,
+) !validation.Result {
+    const input_digests = try allocator.alloc(
+        validation.InputDigest,
+        prepared.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (input_digests[0..initialized]) |digest| {
+            allocator.free(digest.name);
+            allocator.free(digest.digest);
+        }
+        allocator.free(input_digests);
+    }
+    for (prepared, 0..) |item, index| {
+        const slot = storage_plan.slots[item.slot_index];
+        {
+            const name = try allocator.dupe(u8, slot.name);
+            errdefer allocator.free(name);
+            const digest = try allocator.dupe(u8, item.slot_digest);
+            errdefer allocator.free(digest);
+            input_digests[index] = .{
+                .name = name,
+                .digest = digest,
+            };
+        }
+        initialized += 1;
+    }
+    std.mem.sort(
+        validation.InputDigest,
+        input_digests,
+        {},
+        struct {
+            fn lessThan(
+                _: void,
+                left: validation.InputDigest,
+                right: validation.InputDigest,
+            ) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.lessThan,
+    );
+    const definition_id = try allocator.dupe(u8, definition_plan.id);
+    errdefer allocator.free(definition_id);
+    return .{
+        .definition_id = definition_id,
+        .definition_digest = definition_plan.closure_digest,
+        .input_digests = input_digests,
+        .diagnostics = definition_core.diagnostics.Collector.init(
+            allocator,
+            .{
+                .max_count = definition_plan.bounds.max_diagnostics,
+                .max_total_bytes = 64 * 1024,
+                .max_message_bytes = 2048,
+            },
+        ),
+        .valid = true,
+    };
+}
+
 fn prepareEffects(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -308,6 +720,7 @@ fn prepareEffect(
         .create_new => if (slot_before != null) return error.StorageSlotAlreadyExists,
         .compare_append => {},
         .compare_replace => if (slot_before == null) return error.StorageSlotMissing,
+        .bind_existing => return error.BindingOperationRequiresMigrationPath,
     }
     if (effect.expected_revision_parameter) |parameter_name| {
         if (parameterText(parameters, parameter_name)) |expected_revision| {
@@ -330,13 +743,14 @@ fn prepareEffect(
         canonical_input,
     );
     defer allocator.free(canonical_input_digest);
-    const slot_after = try slotContentAfter(
+    const slot_content = try slotContentAfter(
         allocator,
         slot,
         effect.kind,
         slot_before,
         canonical_input,
     );
+    const slot_after = slot_content.bytes;
     errdefer allocator.free(slot_after);
     if (slot_after.len > slot.max_bytes) return error.StorageSlotBoundsExceeded;
     const slot_after_digest = try definition_core.canonical_json.digestBytesAlloc(
@@ -381,6 +795,7 @@ fn prepareEffect(
             operation_name,
             input_digest,
             canonical_input_digest,
+            slot_content.extent,
             slot_before_digest,
             slot_after_digest,
             idempotency_key,
@@ -401,14 +816,39 @@ fn prepareEffect(
     };
 }
 
+const SlotContent = struct {
+    bytes: []u8,
+    extent: custody.BindingExtent,
+};
+
 fn slotContentAfter(
     allocator: std.mem.Allocator,
     slot: storage.Slot,
     kind: storage.EffectKind,
     before: ?[]const u8,
     canonical_input: []const u8,
-) ![]u8 {
-    if (kind != .compare_append) return allocator.dupe(u8, canonical_input);
+) !SlotContent {
+    if (kind != .compare_append) {
+        const record_count: ?usize = if (slot.kind == .event_log) blk: {
+            const result = durable_store.validateJsonlBytes(
+                allocator,
+                canonical_input,
+            );
+            if (!result.ok()) return error.InvalidEventLogInput;
+            if (result.lines == 0) return error.InvalidEventLogInput;
+            break :blk result.lines;
+        } else null;
+        return .{
+            .bytes = try allocator.dupe(u8, canonical_input),
+            .extent = .{
+                .kind = .admission,
+                .record_start = if (record_count != null) 0 else null,
+                .record_end = record_count,
+                .extent_start = 0,
+                .extent_end = canonical_input.len,
+            },
+        };
+    }
     if (slot.kind != .event_log) return error.AppendRequiresEventLogSlot;
     var parsed = std.json.parseFromSlice(
         std.json.Value,
@@ -420,17 +860,30 @@ fn slotContentAfter(
     if (parsed.value != .object) return error.EventPayloadMustBeObject;
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
+    var record_start: usize = 0;
     if (before) |bytes| {
         const jsonl_validation = durable_store.validateJsonlBytes(allocator, bytes);
         if (!jsonl_validation.ok()) return error.InvalidExistingEventLog;
+        record_start = jsonl_validation.lines;
         try output.writer.writeAll(bytes);
         if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') {
             try output.writer.writeByte('\n');
         }
     }
+    const extent_start = output.written().len;
     try output.writer.writeAll(canonical_input);
+    const extent_end = output.written().len;
     try output.writer.writeByte('\n');
-    return output.toOwnedSlice();
+    return .{
+        .bytes = try output.toOwnedSlice(),
+        .extent = .{
+            .kind = .admission,
+            .record_start = record_start,
+            .record_end = record_start + 1,
+            .extent_start = extent_start,
+            .extent_end = extent_end,
+        },
+    };
 }
 
 fn buildMutations(
@@ -513,6 +966,7 @@ fn buildReceipts(
                     .create_new => "created",
                     .compare_append => "appended",
                     .compare_replace => "replaced",
+                    .bind_existing => "bound",
                 },
             ),
         };

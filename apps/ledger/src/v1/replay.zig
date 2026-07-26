@@ -122,28 +122,90 @@ fn validateEventLog(
     current_slot: storage.Slot,
     snapshot: *const custody.SlotSnapshot,
 ) !usize {
+    var records: std.ArrayList([]const u8) = .empty;
+    defer records.deinit(allocator);
     var lines = std.mem.splitScalar(u8, snapshot.content, '\n');
-    var row_index: usize = 0;
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
         if (line.len == 0) continue;
-        if (row_index >= snapshot.binding.rows.len) {
+        try records.append(allocator, line);
+    }
+    var expected_start: usize = 0;
+    for (snapshot.binding.rows) |row| {
+        const record_start = row.record_start orelse
+            return error.StoreBindingRecordRangeMissing;
+        const record_end = row.record_end orelse
+            return error.StoreBindingRecordRangeMissing;
+        if (record_start != expected_start or record_end > records.items.len) {
             return error.StoreBindingRecordCountMismatch;
         }
-        try validateBoundInput(
-            allocator,
-            cache,
-            current_slot,
-            snapshot.binding.rows[row_index],
-            line,
-            .compare_append,
-        );
-        row_index += 1;
+        try validateBoundExtent(allocator, row, snapshot.content);
+        switch (row.kind) {
+            .existing_store_binding => {
+                const archived = try cache.get(row.definition_digest);
+                const operation = archived.storage_plan.findOperation(
+                    row.operation,
+                ) orelse return error.HistoricalOperationMissing;
+                const effect = findEffectForSlot(
+                    &archived.storage_plan,
+                    operation,
+                    current_slot,
+                ) orelse return error.HistoricalEffectMissing;
+                if (effect.kind != .bind_existing) {
+                    return error.HistoricalEffectKindMismatch;
+                }
+                for (records.items[record_start..record_end]) |record| {
+                    try validateInput(
+                        allocator,
+                        archived,
+                        effect,
+                        record,
+                        false,
+                    );
+                }
+            },
+            .admission => {
+                const archived = try cache.get(row.definition_digest);
+                const operation = archived.storage_plan.findOperation(
+                    row.operation,
+                ) orelse return error.HistoricalOperationMissing;
+                const effect = findEffectForSlot(
+                    &archived.storage_plan,
+                    operation,
+                    current_slot,
+                ) orelse return error.HistoricalEffectMissing;
+                if (effect.kind == .compare_append) {
+                    if (record_end != record_start + 1) {
+                        return error.StoreBindingRecordCountMismatch;
+                    }
+                    try validateInput(
+                        allocator,
+                        archived,
+                        effect,
+                        records.items[record_start],
+                        true,
+                    );
+                } else if (effect.kind == .create_new or
+                    effect.kind == .compare_replace)
+                {
+                    try validateInput(
+                        allocator,
+                        archived,
+                        effect,
+                        snapshot.content[row.extent_start..row.extent_end],
+                        true,
+                    );
+                } else {
+                    return error.HistoricalEffectKindMismatch;
+                }
+            },
+        }
+        expected_start = record_end;
     }
-    if (row_index != snapshot.binding.rows.len) {
+    if (expected_start != records.items.len) {
         return error.StoreBindingRecordCountMismatch;
     }
-    return row_index;
+    return records.items.len;
 }
 
 fn validateDocument(
@@ -156,6 +218,7 @@ fn validateDocument(
         return error.HistoricalDocumentReplayUnsupported;
     }
     const row = snapshot.binding.rows[0];
+    try validateBoundExtent(allocator, row, snapshot.content);
     const archived = try cache.get(row.definition_digest);
     const operation = archived.storage_plan.findOperation(row.operation) orelse
         return error.HistoricalOperationMissing;
@@ -164,37 +227,52 @@ fn validateDocument(
         operation,
         current_slot,
     ) orelse return error.HistoricalEffectMissing;
-    if (effect.kind != .create_new and effect.kind != .compare_replace) {
+    const expected_kind: storage.EffectKind = switch (row.kind) {
+        .existing_store_binding => .bind_existing,
+        .admission => effect.kind,
+    };
+    if (expected_kind != .bind_existing and
+        expected_kind != .create_new and
+        expected_kind != .compare_replace)
+    {
         return error.HistoricalEffectKindMismatch;
     }
-    try validateBoundInput(
+    if (effect.kind != expected_kind) return error.HistoricalEffectKindMismatch;
+    try validateInput(
         allocator,
-        cache,
-        current_slot,
-        row,
+        archived,
+        effect,
         snapshot.content,
-        effect.kind,
+        row.kind == .admission,
     );
     return 1;
 }
 
-fn validateBoundInput(
+fn validateBoundExtent(
     allocator: std.mem.Allocator,
-    cache: *PlanCache,
-    current_slot: storage.Slot,
     row: custody.BindingRow,
-    bytes: []const u8,
-    expected_kind: storage.EffectKind,
+    content: []const u8,
 ) !void {
-    const archived = try cache.get(row.definition_digest);
-    const operation = archived.storage_plan.findOperation(row.operation) orelse
-        return error.HistoricalOperationMissing;
-    const effect = findEffectForSlot(
-        &archived.storage_plan,
-        operation,
-        current_slot,
-    ) orelse return error.HistoricalEffectMissing;
-    if (effect.kind != expected_kind) return error.HistoricalEffectKindMismatch;
+    if (row.extent_start > row.extent_end or row.extent_end > content.len) {
+        return error.StoreBindingExtentMismatch;
+    }
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        content[row.extent_start..row.extent_end],
+    );
+    defer allocator.free(digest);
+    if (!std.mem.eql(u8, digest, row.canonical_input_digest)) {
+        return error.HistoricalInputDigestMismatch;
+    }
+}
+
+fn validateInput(
+    allocator: std.mem.Allocator,
+    archived: *const ArchivedPlan,
+    effect: storage.Effect,
+    bytes: []const u8,
+    require_canonical: bool,
+) !void {
     const input = archived.definition_plan.inputs[effect.input_index];
     var execution = try validation.execute(
         allocator,
@@ -203,6 +281,7 @@ fn validateBoundInput(
     );
     defer execution.deinit();
     if (!execution.isValid()) return error.HistoricalArtifactInvalid;
+    if (!require_canonical) return;
     const canonical = try materialization.canonicalizeInputAlloc(
         allocator,
         &execution,
@@ -212,14 +291,6 @@ fn validateBoundInput(
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, bytes)) {
         return error.HistoricalArtifactNotCanonical;
-    }
-    const digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        canonical,
-    );
-    defer allocator.free(digest);
-    if (!std.mem.eql(u8, digest, row.canonical_input_digest)) {
-        return error.HistoricalInputDigestMismatch;
     }
 }
 

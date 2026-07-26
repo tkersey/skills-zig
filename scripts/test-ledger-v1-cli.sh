@@ -10,7 +10,9 @@ event_input=apps/ledger/src/v1/fixtures/event-one.json
 event_two=apps/ledger/src/v1/fixtures/event-two.json
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 repo_dir=$(mktemp -d "$temp_base/ledger-v1-smoke.XXXXXX")
-trap 'test -n "${repo_dir:-}" && rm -rf -- "$repo_dir"' EXIT
+legacy_repo=$(mktemp -d "$temp_base/ledger-v1-bind.XXXXXX")
+invalid_repo=$(mktemp -d "$temp_base/ledger-v1-bind-invalid.XXXXXX")
+trap 'for dir in "${repo_dir:-}" "${legacy_repo:-}" "${invalid_repo:-}"; do test -n "$dir" && rm -rf -- "$dir"; done' EXIT
 
 check_output=$("$binary" definition check \
   --definition "$definition" \
@@ -125,3 +127,117 @@ set -e
 test "$tamper_status" -eq 2
 grep -Fq '"healthy":false' <<<"$tamper_output"
 grep -Fq '"error_code":"StoreBindingRevisionMismatch"' <<<"$tamper_output"
+
+mkdir -p "$legacy_repo/.ledger/example"
+printf '%s\n' \
+  '{"kind":"one","value":1}' \
+  '{"kind":"two","value":2}' \
+  >"$legacy_repo/.ledger/example/events.jsonl"
+cp "$legacy_repo/.ledger/example/events.jsonl" "$legacy_repo/events.before"
+
+binding_output=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation bind-existing \
+  --repo "$legacy_repo" \
+  --format json)
+grep -Fq '"schema":"ledger-transaction-result/v1"' <<<"$binding_output"
+grep -Fq '"result":"bound"' <<<"$binding_output"
+grep -Fq '"storage_mutated":true' <<<"$binding_output"
+cmp -s \
+  "$legacy_repo/events.before" \
+  "$legacy_repo/.ledger/example/events.jsonl"
+
+bound_projection=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$legacy_repo" \
+  --format json)
+grep -Fq \
+  '"data":[{"kind":"one","value":1},{"kind":"two","value":2}]' \
+  <<<"$bound_projection"
+
+bound_doctor=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$legacy_repo" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$bound_doctor"
+grep -Fq '"binding_rows":1' <<<"$bound_doctor"
+
+bound_append=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation append \
+  --repo "$legacy_repo" \
+  --input "event=$event_input" \
+  --param request=bound-append \
+  --format json)
+grep -Fq '"result":"appended"' <<<"$bound_append"
+
+mixed_projection=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$legacy_repo" \
+  --format json)
+grep -Fq \
+  '"data":[{"kind":"one","value":1},{"kind":"two","value":2},{"kind":"one","value":1}]' \
+  <<<"$mixed_projection"
+mixed_doctor=$("$binary" doctor \
+  --definition "$event_definition" \
+  --repo "$legacy_repo" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$mixed_doctor"
+grep -Fq '"binding_rows":2' <<<"$mixed_doctor"
+cp "$legacy_repo/.ledger/example/events.jsonl" "$legacy_repo/events.after-append"
+
+set +e
+duplicate_binding=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation bind-existing \
+  --repo "$legacy_repo" \
+  --format json)
+duplicate_binding_status=$?
+set -e
+test "$duplicate_binding_status" -eq 2
+grep -Fq '"code":"StoreAlreadyBound"' <<<"$duplicate_binding"
+cmp -s \
+  "$legacy_repo/events.after-append" \
+  "$legacy_repo/.ledger/example/events.jsonl"
+
+mkdir -p "$invalid_repo/.ledger/example"
+printf '%s\n' '{"kind":"one","value":1}' \
+  >"$invalid_repo/.ledger/example/events.jsonl"
+set +e
+ignored_input_binding=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation bind-existing \
+  --repo "$invalid_repo" \
+  --input "event=$event_input" \
+  --format json)
+ignored_input_binding_status=$?
+set -e
+test "$ignored_input_binding_status" -eq 2
+grep -Fq \
+  '"code":"BindingOperationRejectsExternalInput"' \
+  <<<"$ignored_input_binding"
+test ! -d "$invalid_repo/.ledger/.bindings" ||
+  test -z "$(find "$invalid_repo/.ledger/.bindings" -type f -print -quit)"
+test ! -d "$invalid_repo/.ledger/.definitions" ||
+  test -z "$(find "$invalid_repo/.ledger/.definitions" -type f -print -quit)"
+
+printf '%s\n' '{"kind":"invalid"}' \
+  >"$invalid_repo/.ledger/example/events.jsonl"
+cp "$invalid_repo/.ledger/example/events.jsonl" "$invalid_repo/events.before"
+set +e
+invalid_binding=$("$binary" transact \
+  --definition "$event_definition" \
+  --operation bind-existing \
+  --repo "$invalid_repo" \
+  --format json)
+invalid_binding_status=$?
+set -e
+test "$invalid_binding_status" -eq 2
+grep -Fq '"code":"ExistingStoreValidationFailed"' <<<"$invalid_binding"
+cmp -s \
+  "$invalid_repo/events.before" \
+  "$invalid_repo/.ledger/example/events.jsonl"
+test -z "$(find "$invalid_repo/.ledger/.bindings" -type f -print -quit)"
+test -z "$(find "$invalid_repo/.ledger/.definitions" -type f -print -quit)"

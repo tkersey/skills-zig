@@ -31,12 +31,14 @@ pub const EffectKind = enum {
     create_new,
     compare_append,
     compare_replace,
+    bind_existing,
 
     fn fromOperator(operator: definition.Operator) !EffectKind {
         return switch (operator) {
             .create_new => .create_new,
             .compare_append => .compare_append,
             .compare_replace => .compare_replace,
+            .bind_existing => .bind_existing,
             else => error.UnsupportedStorageEffect,
         };
     }
@@ -291,6 +293,13 @@ fn compileOperations(
                 }
             }
         }
+        var binding_effects: usize = 0;
+        for (effects) |effect| if (effect.kind == .bind_existing) {
+            binding_effects += 1;
+        };
+        if (binding_effects != 0 and binding_effects != effects.len) {
+            return error.BindingOperationCannotMixEffects;
+        }
         if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
         const owned_name = try allocator.dupe(u8, source.name);
         errdefer allocator.free(owned_name);
@@ -335,10 +344,16 @@ fn compileEffect(
         return error.AppendRequiresEventLogSlot;
     }
     const input_codec = definition_plan.inputs[input_index].codec;
-    if (kind == .compare_append and input_codec != .json) {
+    if ((kind == .compare_append or
+        (kind == .bind_existing and slots[slot_index].kind == .event_log)) and
+        input_codec != .json)
+    {
         return error.AppendInputMustBeJson;
     }
-    if (kind != .compare_append and input_codec != slots[slot_index].codec) {
+    if (kind != .compare_append and
+        !(kind == .bind_existing and slots[slot_index].kind == .event_log) and
+        input_codec != slots[slot_index].codec)
+    {
         return error.StorageInputCodecMismatch;
     }
     const expected_revision_parameter = try optionalParameterName(
@@ -354,6 +369,12 @@ fn compileEffect(
         object,
         "idempotency_param",
     );
+    errdefer if (idempotency_parameter) |name| allocator.free(name);
+    if (kind == .bind_existing and
+        (expected_revision_parameter != null or idempotency_parameter != null))
+    {
+        return error.BindingEffectHasAdmissionParameter;
+    }
     return .{
         .kind = kind,
         .slot_index = @intCast(slot_index),

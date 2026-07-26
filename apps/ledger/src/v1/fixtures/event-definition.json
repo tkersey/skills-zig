@@ -6,6 +6,7 @@
     "abi": "ledger-artifact-abi/v1",
     "operators": [
       "atomic-transaction",
+      "bind-existing",
       "compare-and-append",
       "exact-object",
       "idempotency-key",
@@ -62,6 +63,16 @@
           "slot": "events",
           "input": "event",
           "idempotency_param": "request"
+        }
+      ]
+    },
+    "bind-existing": {
+      "op": "atomic-transaction",
+      "effects": [
+        {
+          "op": "bind-existing",
+          "slot": "events",
+          "input": "event"
         }
       ]
     }
