@@ -70,6 +70,7 @@ const RuntimeOperation = union(enum) {
 pub const Program = struct {
     source: Source,
     source_width: u16,
+    source_field_indices: []u16,
     source_row_bound: ?usize,
     operations: []RuntimeOperation,
     predicates: []RuntimePredicate,
@@ -78,6 +79,7 @@ pub const Program = struct {
     max_rows: usize,
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_field_indices);
         allocator.free(self.operations);
         allocator.free(self.predicates);
         allocator.free(self.output_field_indices);
@@ -103,6 +105,7 @@ pub fn compile(
     var current_index = projection.stage_index;
     var source: Source = undefined;
     var source_width: usize = undefined;
+    var physical_field_indices: ?[]const u16 = null;
     var source_row_bound: ?usize = null;
     while (true) {
         if (stage_count == stage_path.len) {
@@ -131,6 +134,7 @@ pub fn compile(
         };
         source = .{ .physical = scan.relation };
         source_width = scan.field_indices.len;
+        physical_field_indices = scan.field_indices;
         break;
     }
 
@@ -142,6 +146,13 @@ pub fn compile(
         field.* = @intCast(index);
     }
     var field_count = source_width;
+    const source_fields = try allocator.alloc(u16, source_width);
+    errdefer allocator.free(source_fields);
+    if (physical_field_indices) |indices| {
+        @memcpy(source_fields, indices);
+    } else {
+        @memcpy(source_fields, field_map[0..source_width]);
+    }
 
     var predicates: std.ArrayList(RuntimePredicate) = .empty;
     errdefer predicates.deinit(allocator);
@@ -232,6 +243,7 @@ pub fn compile(
     return .{
         .source = source,
         .source_width = @intCast(source_width),
+        .source_field_indices = source_fields,
         .source_row_bound = source_row_bound,
         .operations = operation_slice,
         .predicates = predicate_slice,
@@ -240,6 +252,114 @@ pub fn compile(
         .max_rows = native_plan.max_rows,
     };
 }
+
+pub const Feed = enum {
+    continue_scanning,
+    stop,
+};
+
+pub const Runner = struct {
+    program: *const Program,
+    output: []Value,
+    limit_states: [256]usize = undefined,
+    source_row_count: usize = 0,
+    output_row_count: usize = 0,
+    stopped: bool = false,
+
+    pub fn init(program: *const Program, output: []Value) !Runner {
+        if (program.source_width == 0) {
+            return error.InvalidObservationSourceWidth;
+        }
+        if (program.output_field_indices.len == 0) {
+            return error.InvalidObservationOutputWidth;
+        }
+        var runner = Runner{
+            .program = program,
+            .output = output,
+        };
+        @memset(runner.limit_states[0..program.limit_state_count], 0);
+        return runner;
+    }
+
+    pub fn feed(self: *Runner, row: []const Value) !Feed {
+        if (self.stopped) return .stop;
+        if (row.len != self.program.source_width) {
+            return error.ObservationSourceWidthMismatch;
+        }
+        if (self.program.source_row_bound) |bound| {
+            if (self.source_row_count == bound) {
+                return error.ObservationSourceRowBoundExceeded;
+            }
+        }
+        self.source_row_count += 1;
+
+        var accepted = true;
+        var stop_after_row = false;
+        for (self.program.operations) |operation| {
+            switch (operation) {
+                .filter => |range| {
+                    const end = @as(usize, range.start) + range.len;
+                    for (self.program.predicates[range.start..end]) |predicate| {
+                        if (!matches(row[predicate.field_index], predicate)) {
+                            accepted = false;
+                            break;
+                        }
+                    }
+                    if (!accepted) break;
+                },
+                .limit => |limit| {
+                    if (self.limit_states[limit.state_index] == limit.count) {
+                        self.stopped = true;
+                        return .stop;
+                    }
+                    self.limit_states[limit.state_index] += 1;
+                    stop_after_row = stop_after_row or
+                        self.limit_states[limit.state_index] == limit.count;
+                },
+            }
+        }
+        if (accepted) {
+            try self.append(row);
+        }
+        if (stop_after_row) {
+            self.stopped = true;
+            return .stop;
+        }
+        return .continue_scanning;
+    }
+
+    pub fn result(self: *Runner) Result {
+        return .{
+            .values = self.output,
+            .width = self.program.output_field_indices.len,
+            .row_count = self.output_row_count,
+        };
+    }
+
+    fn append(self: *Runner, row: []const Value) !void {
+        if (self.output_row_count == self.program.max_rows) {
+            return error.ObservationRowBoundExceeded;
+        }
+        const output_width = self.program.output_field_indices.len;
+        const output_start = std.math.mul(
+            usize,
+            self.output_row_count,
+            output_width,
+        ) catch return error.ObservationOutputSizeOverflow;
+        const output_end = std.math.add(
+            usize,
+            output_start,
+            output_width,
+        ) catch return error.ObservationOutputSizeOverflow;
+        if (output_end > self.output.len) {
+            return error.ObservationOutputBufferTooSmall;
+        }
+        for (self.program.output_field_indices, 0..) |field_index, index| {
+            self.output[output_start + index] = row[field_index];
+        }
+        self.output_row_count += 1;
+    }
+};
 
 pub fn execute(
     program: *const Program,
@@ -250,76 +370,11 @@ pub fn execute(
         return error.ObservationSourceWidthMismatch;
     }
     const source_row_count = try source_rows.count();
-    if (program.source_row_bound) |bound| {
-        if (source_row_count > bound) {
-            return error.ObservationSourceRowBoundExceeded;
-        }
-    }
-    const output_width = program.output_field_indices.len;
-    if (output_width == 0) return error.InvalidObservationOutputWidth;
-
-    var limit_states: [256]usize = undefined;
-    @memset(limit_states[0..program.limit_state_count], 0);
-    var output_row_count: usize = 0;
+    var runner = try Runner.init(program, output);
     for (0..source_row_count) |row_index| {
-        const row = source_rows.row(row_index);
-        var accepted = true;
-        var stop_after_row = false;
-        for (program.operations) |operation| {
-            switch (operation) {
-                .filter => |range| {
-                    const end = @as(usize, range.start) + range.len;
-                    for (program.predicates[range.start..end]) |predicate| {
-                        if (!matches(row[predicate.field_index], predicate)) {
-                            accepted = false;
-                            break;
-                        }
-                    }
-                    if (!accepted) break;
-                },
-                .limit => |limit| {
-                    if (limit_states[limit.state_index] == limit.count) {
-                        return .{
-                            .values = output,
-                            .width = output_width,
-                            .row_count = output_row_count,
-                        };
-                    }
-                    limit_states[limit.state_index] += 1;
-                    stop_after_row = stop_after_row or
-                        limit_states[limit.state_index] == limit.count;
-                },
-            }
-        }
-        if (accepted) {
-            if (output_row_count == program.max_rows) {
-                return error.ObservationRowBoundExceeded;
-            }
-            const output_start = std.math.mul(
-                usize,
-                output_row_count,
-                output_width,
-            ) catch return error.ObservationOutputSizeOverflow;
-            const output_end = std.math.add(
-                usize,
-                output_start,
-                output_width,
-            ) catch return error.ObservationOutputSizeOverflow;
-            if (output_end > output.len) {
-                return error.ObservationOutputBufferTooSmall;
-            }
-            for (program.output_field_indices, 0..) |field_index, index| {
-                output[output_start + index] = row[field_index];
-            }
-            output_row_count += 1;
-        }
-        if (stop_after_row) break;
+        if (try runner.feed(source_rows.row(row_index)) == .stop) break;
     }
-    return .{
-        .values = output,
-        .width = output_width,
-        .row_count = output_row_count,
-    };
+    return runner.result();
 }
 
 fn matches(value: Value, predicate: RuntimePredicate) bool {
@@ -563,6 +618,11 @@ test "compiled execution filters projects and limits without intermediate rows" 
         "rows",
     );
     defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u16,
+        &.{ 1, 3, 4 },
+        program.source_field_indices,
+    );
 
     const source = [_]Value{
         .{ .string = "s1" }, .{ .string = "assistant" }, .{ .string = "pass" },
@@ -581,6 +641,33 @@ test "compiled execution filters projects and limits without intermediate rows" 
     try std.testing.expectEqualStrings("FAIL one", result.rows().row(0)[1].string);
     try std.testing.expectEqualStrings("s3", result.rows().row(1)[0].string);
     try std.testing.expectEqualStrings("fail two", result.rows().row(1)[1].string);
+
+    var streamed_output: [4]Value = undefined;
+    var runner = try Runner.init(&program, &streamed_output);
+    try std.testing.expectEqual(
+        Feed.continue_scanning,
+        try runner.feed(source[0..3]),
+    );
+    try std.testing.expectEqual(
+        Feed.continue_scanning,
+        try runner.feed(source[3..6]),
+    );
+    try std.testing.expectEqual(
+        Feed.stop,
+        try runner.feed(source[6..9]),
+    );
+    try std.testing.expectEqual(Feed.stop, try runner.feed(source[9..12]));
+    const streamed = runner.result();
+    try std.testing.expectEqual(@as(usize, 3), runner.source_row_count);
+    try std.testing.expectEqual(result.row_count, streamed.row_count);
+    try std.testing.expectEqualStrings(
+        result.rows().row(0)[0].string,
+        streamed.rows().row(0)[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        result.rows().row(1)[1].string,
+        streamed.rows().row(1)[1].string,
+    );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
@@ -629,6 +716,11 @@ test "ordered limits retain their position before later filters" {
         "rows",
     );
     defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(
+        u16,
+        &.{ 0, 1 },
+        program.source_field_indices,
+    );
 
     const source = [_]Value{
         .{ .string = "first" },  .{ .integer = 0 },
