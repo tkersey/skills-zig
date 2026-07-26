@@ -90,7 +90,11 @@ pub fn validateSlot(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
+    current_max_records: usize,
 ) !Stats {
+    if (current_max_records == 0 or current_max_records > 10_000_000) {
+        return error.InvalidReplayRecordBound;
+    }
     var cache = PlanCache{
         .allocator = allocator,
         .repo_root = repo_root,
@@ -102,6 +106,7 @@ pub fn validateSlot(
         &cache,
         slot,
         snapshot,
+        current_max_records,
     );
     return .{
         .records_validated = records_validated,
@@ -114,6 +119,7 @@ fn validateHistory(
     cache: *PlanCache,
     current_slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
+    current_max_records: usize,
 ) !usize {
     if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
     var epoch_start: usize = 0;
@@ -140,6 +146,7 @@ fn validateHistory(
                 current_slot,
                 snapshot.binding.rows[epoch_start..index],
                 prior_content,
+                null,
             );
             epoch_start = index;
         }
@@ -150,6 +157,7 @@ fn validateHistory(
         current_slot,
         snapshot.binding.rows[epoch_start..],
         snapshot.content,
+        current_max_records,
     );
 }
 
@@ -192,6 +200,7 @@ fn validateEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    current_max_records: ?usize,
 ) !usize {
     if (rows.len == 0) return error.InvalidStoreBinding;
     const digest = try definition_core.canonical_json.digestBytesAlloc(
@@ -216,6 +225,7 @@ fn validateEpoch(
             current_slot,
             rows,
             content,
+            current_max_records,
         ),
     };
 }
@@ -264,6 +274,7 @@ fn validateEventEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    current_max_records: ?usize,
 ) !usize {
     var records: std.ArrayList([]const u8) = .empty;
     defer records.deinit(allocator);
@@ -271,9 +282,17 @@ fn validateEventEpoch(
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
         if (line.len == 0) continue;
+        if (records.items.len == 10_000_000) {
+            return error.HistoricalRecordBoundsExceeded;
+        }
         try records.append(allocator, line);
     }
     if (records.items.len == 0) return error.HistoricalArtifactInvalid;
+    if (current_max_records) |limit| {
+        if (records.items.len > limit) {
+            return error.CurrentStoreRecordBoundsExceeded;
+        }
+    }
     var expected_start: usize = 0;
     for (rows, 0..) |row, index| {
         const record_start = row.record_start orelse
@@ -287,6 +306,9 @@ fn validateEventEpoch(
         }
         try validateBoundExtent(allocator, row, content);
         const resolved = try resolveEffect(cache, current_slot, row);
+        if (record_end > resolved.archived.definition_plan.bounds.max_records) {
+            return error.HistoricalRecordBoundsExceeded;
+        }
         switch (row.kind) {
             .existing_store_binding => {
                 if (index != 0 or resolved.effect.kind != .bind_existing) {

@@ -76,7 +76,7 @@ pub fn execute(
     for (resolved_storage.slotSlice(), 0..) |slot, index| {
         slots[index] = inspectSlot(
             allocator,
-            definition_plan.id,
+            definition_plan,
             repo_root,
             slot,
         ) catch |err| try unhealthySlot(allocator, slot, err);
@@ -94,23 +94,24 @@ pub fn execute(
 
 fn inspectSlot(
     allocator: std.mem.Allocator,
-    definition_id: []const u8,
+    definition_plan: *const definition.Plan,
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
 ) !SlotStatus {
     var snapshot = try custody.readSlot(
         allocator,
         repo_root,
-        definition_id,
+        definition_plan.id,
         slot,
     );
     defer snapshot.deinit(allocator);
     _ = try replay.validateSlot(
         allocator,
         repo_root,
-        definition_id,
+        definition_plan.id,
         slot,
         &snapshot,
+        definition_plan.bounds.max_records,
     );
     const name = try allocator.dupe(u8, slot.name);
     errdefer allocator.free(name);

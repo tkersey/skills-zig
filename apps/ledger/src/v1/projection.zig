@@ -708,6 +708,7 @@ pub fn execute(
         definition_plan.id,
         slot,
         &snapshot,
+        definition_plan.bounds.max_records,
     );
     const effective_limit = try resolveLimit(
         compiled.limit,

@@ -779,7 +779,6 @@ fn prepareEffect(
     );
     const slot_after = slot_content.bytes;
     errdefer allocator.free(slot_after);
-    if (slot_after.len > slot.max_bytes) return error.StorageSlotBoundsExceeded;
     const slot_after_digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
         slot_after,
@@ -810,6 +809,16 @@ fn prepareEffect(
     errdefer binding_before.deinit(allocator);
     if (slot_before != null and !binding_before.exists) return error.UnboundStore;
     if (slot_before == null and binding_before.exists) return error.OrphanedStoreBinding;
+    if (!binding_before.idempotency_match) {
+        if (slot_after.len > slot.max_bytes) {
+            return error.StorageSlotBoundsExceeded;
+        }
+        if (slot_content.extent.record_end) |record_end| {
+            if (record_end > definition_plan.bounds.max_records) {
+                return error.TransactionRecordBoundsExceeded;
+            }
+        }
+    }
     var revision_candidate: ?revision_archive.Candidate = null;
     errdefer if (revision_candidate) |*candidate| candidate.deinit(allocator);
     if (effect.kind == .compare_replace and binding_before.idempotency_match) {
@@ -1099,7 +1108,7 @@ test "transaction appends an event and binding in one durable transaction" {
     try definition_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["atomic-transaction","compare-and-append","exact-object"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["kind","value"]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"op":"atomic-transaction","effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["atomic-transaction","compare-and-append","exact-object","idempotency-key"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["kind","value"]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"op":"atomic-transaction","effects":[{"op":"compare-and-append","slot":"events","input":"event","idempotency_param":"request"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -1125,12 +1134,24 @@ test "transaction appends an event and binding in one durable transaction" {
         &definition_plan,
     );
     defer storage_plan.deinit(std.testing.allocator);
-    var parameters = try definition_core.parameters.bind(
+    var first_parameters = try definition_core.parameters.bind(
         std.testing.allocator,
         &definition_plan.parameter_declarations,
-        &.{},
+        &.{.{ .name = "request", .raw_value = "first" }},
     );
-    defer parameters.deinit(std.testing.allocator);
+    defer first_parameters.deinit(std.testing.allocator);
+    var second_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "request", .raw_value = "second" }},
+    );
+    defer second_parameters.deinit(std.testing.allocator);
+    var third_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "request", .raw_value = "third" }},
+    );
+    defer third_parameters.deinit(std.testing.allocator);
     var repo_tmp = std.testing.tmpDir(.{});
     defer repo_tmp.cleanup();
     const repo_root = try repo_tmp.dir.realPathFileAlloc(
@@ -1150,7 +1171,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "append",
         repo_root,
         &.{.{ .name = "event", .bytes = "{\"kind\":\"one\",\"value\":1}" }},
-        &parameters,
+        &first_parameters,
     );
     defer first.deinit(std.testing.allocator);
     try std.testing.expect(first.storage_mutated);
@@ -1167,7 +1188,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "append",
         repo_root,
         &.{.{ .name = "event", .bytes = "{\"kind\":\"two\",\"value\":2}" }},
-        &parameters,
+        &second_parameters,
     );
     defer second.deinit(std.testing.allocator);
     try std.testing.expect(second.storage_mutated);
@@ -1196,6 +1217,64 @@ test "transaction appends an event and binding in one durable transaction" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"one\",\"value\":1}\n{\"kind\":\"two\",\"value\":2}\n",
         events,
+    );
+    var duplicate = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "event", .bytes = "{\"kind\":\"two\",\"value\":2}" }},
+        &second_parameters,
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expectEqualStrings("idempotent", duplicate.effects[0].result);
+    try std.testing.expectEqualStrings(
+        second.effects[0].revision_after,
+        duplicate.effects[0].revision_after,
+    );
+    try std.testing.expectError(
+        error.TransactionRecordBoundsExceeded,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "protocol.json",
+            &validation_plan,
+            &storage_plan,
+            "append",
+            repo_root,
+            &.{.{ .name = "event", .bytes = "{\"kind\":\"three\",\"value\":3}" }},
+            &third_parameters,
+        ),
+    );
+    var resolved_storage = try storage.resolve(
+        std.testing.allocator,
+        &storage_plan,
+        &first_parameters,
+    );
+    defer resolved_storage.deinit(std.testing.allocator);
+    var bounded_snapshot = try custody.readSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_storage.slot(0),
+    );
+    defer bounded_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CurrentStoreRecordBoundsExceeded,
+        replay.validateSlot(
+            std.testing.allocator,
+            repo_root,
+            definition_plan.id,
+            resolved_storage.slot(0),
+            &bounded_snapshot,
+            1,
+        ),
     );
     const binding_path = try custody.bindingPathAlloc(
         std.testing.allocator,
@@ -1243,7 +1322,7 @@ test "transaction appends an event and binding in one durable transaction" {
             "append",
             repo_root,
             &.{.{ .name = "event", .bytes = "{\"kind\":\"three\",\"value\":3}" }},
-            &parameters,
+            &third_parameters,
         ),
     );
 }
@@ -1362,6 +1441,7 @@ test "document replacements replay from immutable prior revisions" {
         definition_plan.id,
         resolved_storage.slot(0),
         &snapshot,
+        definition_plan.bounds.max_records,
     );
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
@@ -1401,6 +1481,7 @@ test "document replacements replay from immutable prior revisions" {
             definition_plan.id,
             resolved_storage.slot(0),
             &snapshot,
+            definition_plan.bounds.max_records,
         ),
     );
 }
