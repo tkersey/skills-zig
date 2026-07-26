@@ -134,6 +134,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "trace_core", .module = trace_core },
         },
     });

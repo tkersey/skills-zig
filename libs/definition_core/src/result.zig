@@ -6,6 +6,7 @@ pub const DefinitionIdentity = struct {
 
 pub const CompileStats = struct {
     cache_hit: bool = false,
+    cache_write_failed: bool = false,
     compile_ns: u64 = 0,
     closure_files: usize = 0,
     closure_bytes: usize = 0,
