@@ -600,9 +600,11 @@ const Builder = struct {
                 else
                     input_index;
                 rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "reference",
+                    try definition_core.json.string(
+                        try definition_core.json.field(
+                            object,
+                            "reference",
+                        ),
                     ),
                 );
                 rule.path_ids = try self.allocator.alloc(u16, 2);
@@ -610,7 +612,9 @@ const Builder = struct {
                     try definition_core.json.requiredString(object, "target"),
                 );
                 rule.path_ids[1] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "key"),
+                    try definition_core.json.string(
+                        try definition_core.json.field(object, "key"),
+                    ),
                 );
             },
             else => {},
@@ -3568,6 +3572,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"field-equal","left":"/status","right":"/mirror"},
         \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
         \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure"},
+        \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
         \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
         \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
         \\  ],
@@ -3675,6 +3680,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer invalid_optional.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_optional.valid);
+
+    const invalid_scalar_reference_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"accepted\":[\"a\"]",
+        "\"accepted\":[\"missing\"]",
+    );
+    defer std.testing.allocator.free(invalid_scalar_reference_bytes);
+    var invalid_scalar_reference = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_scalar_reference_bytes,
+        }},
+    );
+    defer invalid_scalar_reference.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_scalar_reference.valid);
 
     var invalid = try validate(
         std.testing.allocator,
