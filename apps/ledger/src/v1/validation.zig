@@ -130,6 +130,7 @@ const CompiledRule = struct {
     reject_self_reference: bool = false,
     ignore_null_references: bool = false,
     children: []CompiledRule,
+    coverage_children: []CompiledRule,
     variants: []CompiledVariant,
     format_parts: []CompiledFormatPart,
 
@@ -143,6 +144,8 @@ const CompiledRule = struct {
         allocator.free(self.values);
         for (self.children) |*child| child.deinit(allocator);
         allocator.free(self.children);
+        for (self.coverage_children) |*child| child.deinit(allocator);
+        allocator.free(self.coverage_children);
         for (self.variants) |*variant| variant.deinit(allocator);
         allocator.free(self.variants);
         for (self.format_parts) |*part| part.deinit(allocator);
@@ -239,6 +242,7 @@ const Builder = struct {
             .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
+            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
         };
@@ -606,6 +610,7 @@ const Builder = struct {
                         "target",
                         "target_items",
                         "target_rules",
+                        "coverage_rules",
                         "key",
                         "coverage",
                         "self_reference",
@@ -654,6 +659,13 @@ const Builder = struct {
                 }
                 if (object.get("target_rules")) |raw_rules| {
                     rule.children = try self.compileItemRules(
+                        raw_rules,
+                        rule.other_input_index.?,
+                        0,
+                    );
+                }
+                if (object.get("coverage_rules")) |raw_rules| {
+                    rule.coverage_children = try self.compileItemRules(
                         raw_rules,
                         rule.other_input_index.?,
                         0,
@@ -839,6 +851,7 @@ const Builder = struct {
             .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
+            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
         };
@@ -1246,7 +1259,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(13);
+    try encoder.writeU16(14);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1278,7 +1291,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 13) {
+    if (try decoder.readU16() != 14) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1511,6 +1524,10 @@ fn encodeCompiledRule(
     for (rule.children) |child| {
         try encodeCompiledRule(encoder, child, depth);
     }
+    try encoder.writeCount(rule.coverage_children.len);
+    for (rule.coverage_children) |child| {
+        try encodeCompiledRule(encoder, child, depth);
+    }
     try encoder.writeCount(rule.variants.len);
     for (rule.variants) |variant| {
         if (variant.kind) |kind| {
@@ -1654,6 +1671,20 @@ fn decodeCacheRule(
         for (children) |*child| child.deinit(allocator);
         allocator.free(children);
     }
+    const coverage_children = try decodeCacheRules(
+        allocator,
+        decoder,
+        input_count,
+        pointer_count,
+        depth + 1,
+        total_rule_count,
+        plan_depth,
+        imported_plan_count,
+    );
+    errdefer {
+        for (coverage_children) |*child| child.deinit(allocator);
+        allocator.free(coverage_children);
+    }
     const variant_count = try decoder.readCount(64);
     const variants = try allocator.alloc(CompiledVariant, variant_count);
     var variants_initialized: usize = 0;
@@ -1776,6 +1807,7 @@ fn decodeCacheRule(
         .reject_self_reference = reject_self_reference,
         .ignore_null_references = ignore_null_references,
         .children = children,
+        .coverage_children = coverage_children,
         .variants = variants,
         .format_parts = format_parts,
     };
@@ -1964,6 +1996,10 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         } else if (rule.reject_self_reference and rule.path_ids.len != 2) {
             return error.CacheRuleConfigurationInvalid;
+        } else if (rule.coverage_children.len != 0 and
+            !rule.total_coverage)
+        {
+            return error.CacheRuleConfigurationInvalid;
         },
         .implies => if (rule.pointer_id == null or
             rule.other_pointer_id == null or
@@ -2078,6 +2114,11 @@ fn validateCachedRule(
     }
     if (rule.operator != .reference_exists and
         rule.ignore_null_references)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .reference_exists and
+        rule.coverage_children.len != 0)
     {
         return error.CacheRuleConfigurationInvalid;
     }
@@ -3341,6 +3382,7 @@ fn keyedUnique(
 
 const ReferenceTarget = struct {
     value: std.json.Value,
+    required: bool,
     referenced: bool = false,
 };
 
@@ -3459,7 +3501,7 @@ fn referencesExist(
     if (rule.total_coverage) {
         var iterator = index.valueIterator();
         while (iterator.next()) |target| {
-            if (!target.referenced) return false;
+            if (target.required and !target.referenced) return false;
         }
     }
     return true;
@@ -3481,6 +3523,13 @@ fn indexReferenceTarget(
         item,
         plan.pointers[rule.path_ids[1]],
     ) orelse return false;
+    const required = rule.coverage_children.len == 0 or
+        try itemRulesHold(
+            allocator,
+            plan,
+            rule.coverage_children,
+            item,
+        );
     const digest = scalarKeyDigest(key) orelse return false;
     const result = try index.getOrPut(allocator, digest);
     if (result.found_existing) {
@@ -3488,7 +3537,13 @@ fn indexReferenceTarget(
             return error.ReferenceKeyDigestCollision;
         }
     } else {
-        result.value_ptr.* = .{ .value = key };
+        result.value_ptr.* = .{
+            .value = key,
+            .required = required,
+        };
+    }
+    if (required) {
+        result.value_ptr.required = true;
     }
     return true;
 }
@@ -4000,7 +4055,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"reference-exists","path":"/links","reference":"/optional_target","target":"/items","key":"/id","ignore_null":true},
         \\    {"op":"reference-exists","path":"/optional_links","reference":"/item_refs","target":"/items","key":"/id"},
         \\    {"op":"reference-exists","path":"/items","reference":"/related_ids","target":"/items","key":"/id","self_reference":"reject"},
-        \\    {"op":"reference-exists","path":"/selected","reference":"","target":"/containers","target_items":"/entries","target_rules":[{"op":"enum","path":"/status","values":["active"]}],"key":"/id","coverage":"all-targets"},
+        \\    {"op":"reference-exists","path":"/selected","reference":"","target":"/containers","target_items":"/entries","target_rules":[{"op":"enum","path":"/status","values":["active","inactive"]}],"coverage_rules":[{"op":"enum","path":"/status","values":["active"]}],"key":"/id","coverage":"all-targets"},
         \\    {"op":"path-format","path":"/groups","items":"/members","target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
         \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
         \\    {"op":"all","path":"/items","rules":[
@@ -4071,7 +4126,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -4191,7 +4246,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         std.testing.allocator,
         valid_bytes,
         "\"selected\":[\"nested-1\"]",
-        "\"selected\":[\"nested-2\"]",
+        "\"selected\":[\"nested-3\"]",
     );
     defer std.testing.allocator.free(filtered_reference_bytes);
     var filtered_reference = try validate(
@@ -4232,7 +4287,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
