@@ -19,6 +19,57 @@ pub const Limits = struct {
     }
 };
 
+pub const AdmittedLocation = struct {
+    root: []const u8,
+    entry: []const u8,
+};
+
+pub fn admittedLocation(
+    absolute_path: []const u8,
+    current_root: []const u8,
+) !AdmittedLocation {
+    if (!std.fs.path.isAbsolute(absolute_path) or
+        !std.fs.path.isAbsolute(current_root))
+    {
+        return error.DefinitionRootNotAbsolute;
+    }
+    const root = if (pathWithin(absolute_path, current_root))
+        current_root
+    else
+        canonicalPackageRoot(absolute_path) orelse
+            std.fs.path.dirname(absolute_path) orelse
+            return error.InvalidDefinitionPath;
+    return .{
+        .root = root,
+        .entry = relativeWithin(absolute_path, root),
+    };
+}
+
+fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
+    var cursor = std.fs.path.dirname(absolute_path) orelse return null;
+    while (true) {
+        if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
+            const package = std.fs.path.dirname(cursor) orelse return null;
+            return std.fs.path.dirname(package);
+        }
+        const parent = std.fs.path.dirname(cursor) orelse return null;
+        if (std.mem.eql(u8, parent, cursor)) return null;
+        cursor = parent;
+    }
+}
+
+fn pathWithin(path: []const u8, root: []const u8) bool {
+    return std.mem.eql(u8, path, root) or
+        (path.len > root.len and
+            std.mem.startsWith(u8, path, root) and
+            path[root.len] == std.fs.path.sep);
+}
+
+fn relativeWithin(path: []const u8, root: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, root)) return "";
+    return path[root.len + 1 ..];
+}
+
 pub const ClosureFile = struct {
     path: []u8,
     canonical_json: []u8,
@@ -685,6 +736,72 @@ fn lessThanClosureFile(_: void, left: ClosureFile, right: ClosureFile) bool {
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
+}
+
+test "canonical definition packages admit cross-package imports" {
+    const external = try admittedLocation(
+        "/opt/config/skills/actuating/definitions/ledger/evidence.json",
+        "/workspace/target",
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/config/skills",
+        external.root,
+    );
+    try std.testing.expectEqualStrings(
+        "actuating/definitions/ledger/evidence.json",
+        external.entry,
+    );
+    const local = try admittedLocation(
+        "/workspace/target/definitions/ledger/local.json",
+        "/workspace/target",
+    );
+    try std.testing.expectEqualStrings("/workspace/target", local.root);
+    try std.testing.expectEqualStrings(
+        "definitions/ledger/local.json",
+        local.entry,
+    );
+    const standalone = try admittedLocation(
+        "/tmp/standalone.json",
+        "/workspace/target",
+    );
+    try std.testing.expectEqualStrings("/tmp", standalone.root);
+    try std.testing.expectEqualStrings("standalone.json", standalone.entry);
+}
+
+test "closure resolves explicit imports across admitted packages" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        std.testing.io,
+        "first/definitions/ledger",
+    );
+    try tmp.dir.createDirPath(
+        std.testing.io,
+        "second/definitions/ledger",
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "first/definitions/ledger/root.json",
+        .data =
+        \\{"imports":[{"id":"second/child","path":"../../../second/definitions/ledger/child.json"}],"schema":"example/v1"}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "second/definitions/ledger/child.json",
+        .data =
+        \\{"schema":"example-child/v1"}
+        ,
+    });
+    var closure = try loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "first/definitions/ledger/root.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), closure.files.len);
+    try std.testing.expect(
+        closure.find("second/definitions/ledger/child.json") != null,
+    );
 }
 
 test "closure is canonical, deterministically ordered, and content addressed" {

@@ -547,20 +547,13 @@ fn definitionLocation(
     defer allocator.free(cwd);
     const absolute = try std.fs.path.resolve(allocator, &.{ cwd, path });
     defer allocator.free(absolute);
-    const within_cwd = pathWithin(absolute, cwd);
-    const root = if (within_cwd)
-        try allocator.dupe(u8, cwd)
-    else
-        try allocator.dupe(
-            u8,
-            std.fs.path.dirname(absolute) orelse
-                return error.InvalidDefinitionPath,
-        );
+    const location = try definition_core.closure.admittedLocation(
+        absolute,
+        cwd,
+    );
+    const root = try allocator.dupe(u8, location.root);
     errdefer allocator.free(root);
-    const entry = if (within_cwd)
-        try allocator.dupe(u8, relativeWithin(absolute, cwd))
-    else
-        try allocator.dupe(u8, std.fs.path.basename(absolute));
+    const entry = try allocator.dupe(u8, location.entry);
     return .{ .root = root, .entry = entry };
 }
 
@@ -761,18 +754,6 @@ fn environmentValue(comptime key: [:0]const u8) ?[]const u8 {
     const value = std.c.getenv(key) orelse return null;
     const bytes = std.mem.span(value);
     return if (bytes.len == 0) null else bytes;
-}
-
-fn pathWithin(path: []const u8, root: []const u8) bool {
-    return std.mem.eql(u8, path, root) or
-        (path.len > root.len and
-            std.mem.startsWith(u8, path, root) and
-            path[root.len] == std.fs.path.sep);
-}
-
-fn relativeWithin(path: []const u8, root: []const u8) []const u8 {
-    if (std.mem.eql(u8, path, root)) return "";
-    return path[root.len + 1 ..];
 }
 
 fn monotonicNanoseconds() i128 {

@@ -735,21 +735,16 @@ fn loadDefinition(
     defer allocator.free(cwd);
     const absolute = try std.fs.path.resolve(allocator, &.{ cwd, path });
     defer allocator.free(absolute);
-    const within_cwd = pathWithin(absolute, cwd);
-    const root = if (within_cwd)
-        cwd
-    else
-        std.fs.path.dirname(absolute) orelse return error.InvalidDefinitionPath;
-    const entry = if (within_cwd)
-        relativeWithin(absolute, cwd)
-    else
-        std.fs.path.basename(absolute);
+    const location = try definition_core.closure.admittedLocation(
+        absolute,
+        cwd,
+    );
     const cache_dir = try ledgerCacheDirAlloc(allocator, cwd);
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
         allocator,
-        root,
-        entry,
+        location.root,
+        location.entry,
         route,
         Version,
         .{ .cache_dir = cache_dir },
@@ -1110,18 +1105,6 @@ fn findValidationInput(
         if (std.mem.eql(u8, input.name, name)) return index;
     }
     return null;
-}
-
-fn pathWithin(path: []const u8, root: []const u8) bool {
-    return std.mem.eql(u8, path, root) or
-        (path.len > root.len and
-            std.mem.startsWith(u8, path, root) and
-            path[root.len] == std.fs.path.sep);
-}
-
-fn relativeWithin(path: []const u8, root: []const u8) []const u8 {
-    if (std.mem.eql(u8, path, root)) return "";
-    return path[root.len + 1 ..];
 }
 
 fn defaultIo() std.Io {
