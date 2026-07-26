@@ -148,6 +148,69 @@ pub const Operator = enum {
     pub fn version(_: Operator) u16 {
         return 1;
     }
+
+    pub fn supported(self: Operator) bool {
+        return switch (self) {
+            .exact_object,
+            .required_field,
+            .optional_field,
+            .scalar_type,
+            .bounded_string,
+            .bounded_number,
+            .bounded_array,
+            .bounded_object,
+            .enum_value,
+            .digest,
+            .timestamp,
+            .safe_identifier,
+            .safe_relative_path,
+            .unique,
+            .sorted,
+            .set_equality,
+            .subset,
+            .superset,
+            .disjoint,
+            .exactly_one,
+            .at_least_one,
+            .keyed_unique,
+            .reference_exists,
+            .field_equal,
+            .field_not_equal,
+            .cross_input_equal,
+            .canonical_json,
+            .canonical_text,
+            .sha256,
+            .content_address,
+            .path_format,
+            .immutable_document,
+            .append_only_log,
+            .event_envelope,
+            .sequence,
+            .previous_digest,
+            .body_digest,
+            .event_digest,
+            .event_kinds,
+            .transition_table,
+            .reducer,
+            .idempotency_key,
+            .compare_append,
+            .compare_replace,
+            .create_new,
+            .bind_existing,
+            .exclusive_custody,
+            .atomic_transaction,
+            .replay,
+            .filter,
+            .select,
+            .limit,
+            .id_lookup,
+            .latest,
+            .fold,
+            .@"export",
+            => true,
+            else => false,
+        };
+    }
 };
 
 pub const Codec = enum {
@@ -541,7 +604,10 @@ pub fn decodeCache(
     const operator_mask = try decoder.readU128();
     var known_operator_mask: u128 = 0;
     inline for (@typeInfo(Operator).@"enum".fields) |field| {
-        known_operator_mask |= operatorBit(@enumFromInt(field.value));
+        const operator: Operator = @enumFromInt(field.value);
+        if (operator.supported()) {
+            known_operator_mask |= operatorBit(operator);
+        }
     }
     if ((operator_mask & ~known_operator_mask) != 0) {
         return error.CacheArtifactOperatorInvalid;
@@ -780,6 +846,9 @@ fn parseRequires(object: std.json.ObjectMap) !u128 {
     var mask: u128 = 0;
     for (items.items) |item| {
         const operator = try Operator.parse(try definition_core.json.string(item));
+        if (!operator.supported()) {
+            return error.ArtifactOperatorNotImplemented;
+        }
         const bit = operatorBit(operator);
         if ((mask & bit) != 0) return error.DuplicateArtifactOperator;
         mask |= bit;
@@ -1135,6 +1204,28 @@ test "artifact definition rejects executable hooks and undeclared operators" {
     try std.testing.expectError(
         error.UndeclaredArtifactOperator,
         compile(std.testing.allocator, &operator_closure, "operator.json"),
+    );
+}
+
+test "artifact definition rejects named but unimplemented operators" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["regex"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.ArtifactOperatorNotImplemented,
+        compile(std.testing.allocator, &closure, "artifact.json"),
     );
 }
 

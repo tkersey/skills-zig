@@ -1067,8 +1067,8 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         .{ Version, ledger.definition.abi },
     );
     var first = true;
-    inline for (@typeInfo(ledger.definition.Operator).@"enum".fields) |field| {
-        const operator: ledger.definition.Operator = @enumFromInt(field.value);
+    for (std.enums.values(ledger.definition.Operator)) |operator| {
+        if (!operator.supported()) continue;
         if (!first) try stdout_writer.interface.writeByte(',');
         first = false;
         try stdout_writer.interface.writeAll("{\"id\":");

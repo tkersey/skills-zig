@@ -28,6 +28,24 @@ invalid_repo=$(mktemp -d "$temp_base/ledger-v1-bind-invalid.XXXXXX")
 trap 'for dir in "${repo_dir:-}" "${protocol_repo:-}" "${protocol_bind_repo:-}" "${protocol_bind_invalid_repo:-}" "${legacy_repo:-}" "${invalid_repo:-}"; do test -n "$dir" && rm -rf -- "$dir"; done' EXIT
 export LEDGER_CACHE_DIR="$repo_dir/cache"
 
+capabilities=$("$binary" capabilities --format json)
+grep -Fq '"schema":"ledger-capabilities/v1"' <<<"$capabilities"
+grep -Fq '"id":"exact-object","version":1' <<<"$capabilities"
+grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
+grep -Fq '"id":"compare-and-append","version":1' <<<"$capabilities"
+if grep -Eq \
+  '"id":"(regex|tagged-union|composite-identity|relevance|text-render)"' \
+  <<<"$capabilities"
+then
+  exit 1
+fi
+if grep -Eq \
+  'actuat|universal|learnings|negative-ledger|synesthesia|SKDC|SDR|EPG' \
+  <<<"$capabilities"
+then
+  exit 1
+fi
+
 check_output=$("$binary" definition check \
   --definition "$definition" \
   --format json)
