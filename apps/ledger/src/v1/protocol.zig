@@ -528,7 +528,11 @@ pub fn materializeEventAlloc(
     if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
     try validateEventMaterialization(plan, materialization);
     const request_object = try definition_core.json.object(request);
-    try validateRequestKeys(request_object, materialization);
+    try validateRequestKeys(
+        allocator,
+        request_object,
+        materialization,
+    );
     const body = request_object.get(
         materialization.body_input_field,
     ) orelse return error.EventBodyInputMissing;
@@ -600,14 +604,19 @@ pub fn reconstructInputAlloc(
     try validateEnvelopeKeys(event_object, plan.envelope.keys);
     const Mapping = struct {
         key: []const u8,
-        value: std.json.Value,
+        value: union(enum) {
+            json: std.json.Value,
+            literal: []const u8,
+        },
     };
-    var mappings: [65]Mapping = undefined;
+    var mappings: [129]Mapping = undefined;
     var count: usize = 0;
     mappings[count] = .{
         .key = materialization.body_input_field,
-        .value = event_object.get(plan.envelope.body_key) orelse
-            return error.EventEnvelopeFieldMissing,
+        .value = .{
+            .json = event_object.get(plan.envelope.body_key) orelse
+                return error.EventEnvelopeFieldMissing,
+        },
     };
     count += 1;
     for (materialization.fields) |field| {
@@ -615,7 +624,10 @@ pub fn reconstructInputAlloc(
             return error.EventEnvelopeFieldMissing;
         switch (field.source) {
             .input_field => |input_field| {
-                mappings[count] = .{ .key = input_field, .value = value };
+                mappings[count] = .{
+                    .key = input_field,
+                    .value = .{ .json = value },
+                };
                 count += 1;
             },
             .literal => |literal| {
@@ -649,6 +661,13 @@ pub fn reconstructInputAlloc(
             },
         }
     }
+    for (materialization.request_literals) |literal| {
+        mappings[count] = .{
+            .key = literal.field,
+            .value = .{ .literal = literal.literal },
+        };
+        count += 1;
+    }
     std.mem.sort(Mapping, mappings[0..count], {}, struct {
         fn lessThan(_: void, left: Mapping, right: Mapping) bool {
             return std.mem.lessThan(u8, left.key, right.key);
@@ -669,21 +688,27 @@ pub fn reconstructInputAlloc(
             mapping.key,
         );
         try output.writer.writeByte(':');
-        try definition_core.canonical_json.writeCanonicalJson(
-            allocator,
-            &output.writer,
-            mapping.value,
-        );
+        switch (mapping.value) {
+            .json => |value| {
+                try definition_core.canonical_json.writeCanonicalJson(
+                    allocator,
+                    &output.writer,
+                    value,
+                );
+            },
+            .literal => |literal| try output.writer.writeAll(literal),
+        }
     }
     try output.writer.writeByte('}');
     return output.toOwnedSlice();
 }
 
 fn validateRequestKeys(
+    allocator: std.mem.Allocator,
     request: std.json.ObjectMap,
     materialization: *const storage.EventMaterialization,
 ) !void {
-    var expected: usize = 1;
+    var expected: usize = 1 + materialization.request_literals.len;
     for (materialization.fields) |field| switch (field.source) {
         .input_field => expected += 1,
         else => {},
@@ -700,6 +725,19 @@ fn validateRequestKeys(
         },
         else => {},
     };
+    for (materialization.request_literals) |literal| {
+        const actual = request.get(literal.field) orelse
+            return error.EventRequestFieldMissing;
+        const canonical =
+            try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                actual,
+            );
+        defer allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, literal.literal)) {
+            return error.EventRequestLiteralMismatch;
+        }
+    }
 }
 
 fn writePreviousDigest(
@@ -1512,6 +1550,159 @@ test "retained reducer validates events against compiled current state" {
         apply(std.testing.allocator, &cached, &state, stale),
     );
     try std.testing.expectEqual(@as(usize, 2), state.records);
+}
+
+test "event materialization reconstructs validated request literals" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{
+        \\  "schema":"ledger-artifact-definition/v1",
+        \\  "id":"example/request-literals",
+        \\  "owner":"example",
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","exact-object","previous-digest","replay","sequence"]},
+        \\  "parameters":{},
+        \\  "inputs":{"request":{"codec":"json","max_bytes":4096}},
+        \\  "canonicalization":{},
+        \\  "shape":{"rules":[
+        \\    {"op":"exact-object","input":"request","path":"","keys":["body","kind","schema"]},
+        \\    {"op":"enum","input":"request","path":"/schema","values":["example-request/v1"]},
+        \\    {"op":"event-envelope","input":"request","keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}
+        \\  ]},
+        \\  "constraints":[
+        \\    {"op":"sequence","start":1},
+        \\    {"op":"previous-digest","genesis":null},
+        \\    {"op":"body-digest"},
+        \\    {"op":"event-digest"},
+        \\    {"op":"event-kinds","values":["created"]}
+        \\  ],
+        \\  "identity":{},
+        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+        \\  "operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{
+        \\    "body_input_field":"body",
+        \\    "fields":[
+        \\      {"field":"kind","input_field":"kind"},
+        \\      {"field":"schema","literal":"example-event/v1"}
+        \\    ],
+        \\    "request_literals":[{"field":"schema","literal":"example-request/v1"}]
+        \\  }}]}},
+        \\  "projections":{},
+        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        256 * 1024,
+    );
+    defer encoder.deinit();
+    try storage.encodeCache(&storage_plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached_storage = try storage.decodeCache(
+        std.testing.allocator,
+        &decoder,
+    );
+    defer cached_storage.deinit(std.testing.allocator);
+    try decoder.finish();
+    try storage.validateCachePlan(&cached_storage, &definition_plan);
+    var plan = (try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &cached_storage,
+    )).?;
+    defer plan.deinit(std.testing.allocator);
+    const operation = cached_storage.findOperation("append").?;
+    const materialization = &operation.effects[0].event.?;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        materialization.request_literals.len,
+    );
+
+    var state = ReplayState.init(&plan);
+    defer state.deinit(std.testing.allocator);
+    var request = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+        .{ .allocate = .alloc_always },
+    );
+    defer request.deinit();
+    const event = try materializeEventAlloc(
+        std.testing.allocator,
+        &plan,
+        &state,
+        materialization,
+        request.value,
+        7,
+    );
+    defer std.testing.allocator.free(event);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            event,
+            "\"schema\":\"example-event/v1\"",
+        ) != null,
+    );
+    var parsed_event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        event,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed_event.deinit();
+    const reconstructed = try reconstructInputAlloc(
+        std.testing.allocator,
+        &plan,
+        &state,
+        materialization,
+        parsed_event.value,
+    );
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqualStrings(
+        "{\"body\":{\"id\":\"item-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\"}",
+        reconstructed,
+    );
+
+    var invalid_request = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"schema\":\"wrong/v1\",\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+        .{ .allocate = .alloc_always },
+    );
+    defer invalid_request.deinit();
+    try std.testing.expectError(
+        error.EventRequestLiteralMismatch,
+        materializeEventAlloc(
+            std.testing.allocator,
+            &plan,
+            &state,
+            materialization,
+            invalid_request.value,
+            7,
+        ),
+    );
 }
 
 test "event protocol rejects unknown kinds and broken digest links" {

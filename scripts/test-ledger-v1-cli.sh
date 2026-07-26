@@ -52,7 +52,9 @@ grep -Fq '"id":"any","version":1' <<<"$capabilities"
 grep -Fq '"id":"none","version":1' <<<"$capabilities"
 grep -Fq '"id":"composite-identity","version":1' <<<"$capabilities"
 grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
-grep -Fq '"id":"compare-and-append","version":1' <<<"$capabilities"
+grep -Fq '"id":"reducer","version":2' <<<"$capabilities"
+grep -Fq '"id":"compare-and-append","version":2' <<<"$capabilities"
+grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
 if grep -Eq \
   '"id":"(relevance|text-render)"' \

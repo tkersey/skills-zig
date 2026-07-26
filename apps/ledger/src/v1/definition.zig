@@ -165,6 +165,7 @@ pub const Operator = enum {
             .regex => 2,
             .sha256 => 2,
             .reducer => 2,
+            .compare_append, .bind_existing => 2,
             else => 1,
         };
     }

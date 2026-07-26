@@ -104,14 +104,28 @@ pub const EventField = struct {
     }
 };
 
+pub const RequestLiteral = struct {
+    field: []u8,
+    literal: []u8,
+
+    fn deinit(self: *RequestLiteral, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        allocator.free(self.literal);
+        self.* = undefined;
+    }
+};
+
 pub const EventMaterialization = struct {
     body_input_field: []u8,
     fields: []EventField,
+    request_literals: []RequestLiteral,
 
     fn deinit(self: *EventMaterialization, allocator: std.mem.Allocator) void {
         allocator.free(self.body_input_field);
         for (self.fields) |*field| field.deinit(allocator);
         allocator.free(self.fields);
+        for (self.request_literals) |*literal| literal.deinit(allocator);
+        allocator.free(self.request_literals);
         self.* = undefined;
     }
 };
@@ -324,7 +338,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -368,6 +382,11 @@ pub fn encodeCache(
                         .unix_seconds => {},
                     }
                 }
+                try encoder.writeCount(event.request_literals.len);
+                for (event.request_literals) |literal| {
+                    try encoder.writeBytes(literal.field);
+                    try encoder.writeBytes(literal.literal);
+                }
             }
         }
     }
@@ -377,7 +396,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -719,9 +738,15 @@ fn decodeEventMaterialization(
         source = null;
         initialized += 1;
     }
+    const request_literals = try decodeRequestLiterals(
+        allocator,
+        decoder,
+    );
+    errdefer deinitRequestLiterals(allocator, request_literals);
     const result: EventMaterialization = .{
         .body_input_field = body_input_field,
         .fields = fields,
+        .request_literals = request_literals,
     };
     try validateEventMaterialization(allocator, &result);
     return result;
@@ -1011,7 +1036,7 @@ fn compileEventMaterialization(
     const object = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "body_input_field", "fields" },
+        &.{ "body_input_field", "fields", "request_literals" },
     );
     try definition_core.json.requireFields(
         object,
@@ -1047,9 +1072,15 @@ fn compileEventMaterialization(
             return std.mem.lessThan(u8, left.field, right.field);
         }
     }.lessThan);
+    const request_literals = if (object.get("request_literals")) |raw_literals|
+        try compileRequestLiterals(allocator, raw_literals)
+    else
+        try allocator.alloc(RequestLiteral, 0);
+    errdefer deinitRequestLiterals(allocator, request_literals);
     const result: EventMaterialization = .{
         .body_input_field = body_input_field,
         .fields = fields,
+        .request_literals = request_literals,
     };
     try validateEventMaterialization(allocator, &result);
     return result;
@@ -1115,6 +1146,96 @@ fn compileEventField(
         .unix_seconds => {},
     }
     return .{ .field = field, .source = source };
+}
+
+fn compileRequestLiterals(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) ![]RequestLiteral {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > 64) {
+        return error.InvalidEventRequestLiteralCount;
+    }
+    const literals = try allocator.alloc(RequestLiteral, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (literals[0..initialized]) |*literal| {
+            literal.deinit(allocator);
+        }
+        allocator.free(literals);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "field", "literal" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "field", "literal" },
+        );
+        const field = try allocator.dupe(
+            u8,
+            try definition_core.json.requiredString(object, "field"),
+        );
+        errdefer allocator.free(field);
+        try definition_core.json.safeIdentifier(field, 128);
+        const literal =
+            try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                try definition_core.json.field(object, "literal"),
+            );
+        errdefer allocator.free(literal);
+        if (literal.len > 4096) return error.EventLiteralTooLarge;
+        try validateCanonicalScalar(allocator, literal);
+        literals[index] = .{ .field = field, .literal = literal };
+        initialized += 1;
+    }
+    std.mem.sort(RequestLiteral, literals, {}, struct {
+        fn lessThan(
+            _: void,
+            left: RequestLiteral,
+            right: RequestLiteral,
+        ) bool {
+            return std.mem.lessThan(u8, left.field, right.field);
+        }
+    }.lessThan);
+    return literals;
+}
+
+fn decodeRequestLiterals(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]RequestLiteral {
+    const count = try decoder.readCount(64);
+    const literals = try allocator.alloc(RequestLiteral, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (literals[0..initialized]) |*literal| {
+            literal.deinit(allocator);
+        }
+        allocator.free(literals);
+    }
+    for (literals, 0..) |*literal, index| {
+        const field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(field);
+        try definition_core.json.safeIdentifier(field, 128);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                literals[index - 1].field,
+                field,
+            ) != .lt)
+        {
+            return error.EventRequestLiteralsNotSorted;
+        }
+        const value = try decoder.readBytesAlloc(allocator, 4096);
+        errdefer allocator.free(value);
+        try validateCanonicalScalar(allocator, value);
+        literal.* = .{ .field = field, .literal = value };
+        initialized += 1;
+    }
+    return literals;
 }
 
 fn validateCanonicalScalar(
@@ -1189,6 +1310,13 @@ fn validateEventMaterialization(
             .unix_seconds => {},
         }
     }
+    try validateRequestLiterals(
+        event,
+        error.EventInputFieldCollision,
+        error.DuplicateEventInputField,
+        error.EventRequestLiteralsNotSorted,
+        error.EventLiteralTooLarge,
+    );
 }
 
 fn validateCachedEventMaterialization(
@@ -1238,6 +1366,59 @@ fn validateCachedEventMaterialization(
             .unix_seconds => {},
         }
     }
+    try validateRequestLiterals(
+        event,
+        error.CacheStoragePlanMismatch,
+        error.CacheStoragePlanMismatch,
+        error.CacheStoragePlanMismatch,
+        error.CacheStoragePlanMismatch,
+    );
+}
+
+fn validateRequestLiterals(
+    event: *const EventMaterialization,
+    collision_error: anyerror,
+    duplicate_error: anyerror,
+    order_error: anyerror,
+    bounds_error: anyerror,
+) !void {
+    if (event.request_literals.len > 64) return bounds_error;
+    for (event.request_literals, 0..) |literal, index| {
+        try definition_core.json.safeIdentifier(literal.field, 128);
+        if (literal.literal.len == 0 or literal.literal.len > 4096) {
+            return bounds_error;
+        }
+        if (std.mem.eql(
+            u8,
+            literal.field,
+            event.body_input_field,
+        )) return collision_error;
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                event.request_literals[index - 1].field,
+                literal.field,
+            ) != .lt)
+        {
+            return order_error;
+        }
+        for (event.fields) |field| switch (field.source) {
+            .input_field => |input_field| {
+                if (std.mem.eql(u8, literal.field, input_field)) {
+                    return duplicate_error;
+                }
+            },
+            else => {},
+        };
+    }
+}
+
+fn deinitRequestLiterals(
+    allocator: std.mem.Allocator,
+    literals: []RequestLiteral,
+) void {
+    for (literals) |*literal| literal.deinit(allocator);
+    allocator.free(literals);
 }
 
 fn optionalParameterName(
