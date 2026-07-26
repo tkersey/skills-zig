@@ -405,7 +405,7 @@ const Builder = struct {
             .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
                 try definition_core.json.field(object, "paths"),
             ),
-            .all_rules, .any_rules, .no_rules => {
+            .one_of, .all_rules, .any_rules, .no_rules => {
                 try definition_core.json.requireExactKeys(
                     object,
                     &.{ "op", "input", "path", "rules" },
@@ -703,7 +703,7 @@ const Builder = struct {
                     rule.values = values;
                 }
             },
-            .all_rules, .any_rules, .no_rules => {
+            .one_of, .all_rules, .any_rules, .no_rules => {
                 try definition_core.json.requireExactKeys(
                     object,
                     &.{ "op", "path", "rules" },
@@ -1252,7 +1252,7 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .all_rules, .any_rules, .no_rules => if (rule.pointer_id == null or
+        .one_of, .all_rules, .any_rules, .no_rules => if (rule.pointer_id == null or
             rule.children.len == 0 or rule.children.len > 64)
         {
             return error.CacheRuleConfigurationInvalid;
@@ -1275,7 +1275,8 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
-    if (rule.operator != .all_rules and
+    if (rule.operator != .one_of and
+        rule.operator != .all_rules and
         rule.operator != .any_rules and
         rule.operator != .no_rules and
         rule.children.len != 0)
@@ -1675,6 +1676,10 @@ fn applyRule(
             root,
             rule,
         ),
+        .one_of => if (target) |value|
+            try oneOfRulesHold(allocator, plan, rule, value)
+        else
+            false,
         .all_rules, .any_rules, .no_rules => if (target) |value|
             try collectionRuleHolds(
                 allocator,
@@ -1744,6 +1749,22 @@ fn collectionRuleHolds(
     };
 }
 
+fn oneOfRulesHold(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+) anyerror!bool {
+    var matches: usize = 0;
+    for (rule.children) |child| {
+        if (try itemRuleHolds(allocator, plan, child, value)) {
+            matches += 1;
+            if (matches > 1) return false;
+        }
+    }
+    return matches == 1;
+}
+
 fn itemRulesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -1810,6 +1831,10 @@ fn itemRuleHolds(
             return compareValues(rule.operator, left, right);
         },
         .exactly_one, .at_least_one => countPresent(plan, root, rule),
+        .one_of => if (target) |value|
+            oneOfRulesHold(allocator, plan, rule, value)
+        else
+            false,
         .all_rules, .any_rules, .no_rules => if (target) |value|
             collectionRuleHolds(allocator, plan, rule, value)
         else
@@ -2651,6 +2676,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .timestamp,
         .safe_identifier,
         .safe_relative_path,
+        .one_of,
         .unique,
         .sorted,
         .set_equality,
@@ -2690,6 +2716,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .timestamp,
         .safe_identifier,
         .safe_relative_path,
+        .one_of,
         .unique,
         .sorted,
         .set_equality,
@@ -2895,7 +2922,7 @@ test "compiled identifier and repository path policies preserve exact boundaries
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","exact-object","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","identity","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -2943,18 +2970,31 @@ test "compiled identifier and repository path policies preserve exact boundaries
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"goal_id\":\"goal-1\",\"paths\":[\".\",\".github\",\"src/lib\"]}",
+            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".\",\".github\",\"src/lib\"]}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
     try std.testing.expect(valid.valid);
 
+    var valid_digest = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"paths\":[\"src\"]}",
+        }},
+    );
+    defer valid_digest.deinit(std.testing.allocator);
+    try std.testing.expect(valid_digest.valid);
+
     const invalid_cases = [_][]const u8{
-        "{\"goal_id\":\"Goal-1\",\"paths\":[\"src\"]}",
-        "{\"goal_id\":\".goal\",\"paths\":[\"src\"]}",
-        "{\"goal_id\":\"goal-1\",\"paths\":[\".GIT/config\"]}",
-        "{\"goal_id\":\"goal-1\",\"paths\":[\".ledger\"]}",
-        "{\"goal_id\":\"goal-1\",\"paths\":[\"src/../lib\"]}",
+        "{\"goal_id\":\"Goal-1\",\"identity\":null,\"paths\":[\"src\"]}",
+        "{\"goal_id\":\".goal\",\"identity\":null,\"paths\":[\"src\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".GIT/config\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".ledger\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\"src/../lib\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":\"not-a-digest\",\"paths\":[\"src\"]}",
     };
     for (invalid_cases) |bytes| {
         var rejected = try validate(
