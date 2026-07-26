@@ -115,6 +115,7 @@ const CompiledRule = struct {
     identifier_style: IdentifierStyle = .portable,
     allow_root: bool = true,
     case_insensitive: bool = false,
+    total_coverage: bool = false,
     children: []CompiledRule,
     variants: []CompiledVariant,
 
@@ -586,6 +587,7 @@ const Builder = struct {
                         "target_input",
                         "target",
                         "key",
+                        "coverage",
                     },
                 );
                 try definition_core.json.requireFields(
@@ -616,6 +618,15 @@ const Builder = struct {
                         try definition_core.json.field(object, "key"),
                     ),
                 );
+                if (object.get("coverage")) |raw_coverage| {
+                    const coverage = try definition_core.json.string(
+                        raw_coverage,
+                    );
+                    if (!std.mem.eql(u8, coverage, "all-targets")) {
+                        return error.UnsupportedReferenceCoverage;
+                    }
+                    rule.total_coverage = true;
+                }
             },
             else => {},
         }
@@ -1091,7 +1102,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(9);
+    try encoder.writeU16(10);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1123,7 +1134,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 9) {
+    if (try decoder.readU16() != 10) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1349,6 +1360,7 @@ fn encodeCompiledRule(
     try encoder.writeEnum(rule.identifier_style);
     try encoder.writeBool(rule.allow_root);
     try encoder.writeBool(rule.case_insensitive);
+    try encoder.writeBool(rule.total_coverage);
     try encoder.writeCount(rule.children.len);
     for (rule.children) |child| {
         try encodeCompiledRule(encoder, child, depth);
@@ -1462,6 +1474,7 @@ fn decodeCacheRule(
     const identifier_style = try decoder.readEnum(IdentifierStyle);
     const allow_root = try decoder.readBool();
     const case_insensitive = try decoder.readBool();
+    const total_coverage = try decoder.readBool();
     const children = try decodeCacheRules(
         allocator,
         decoder,
@@ -1557,6 +1570,7 @@ fn decodeCacheRule(
         .identifier_style = identifier_style,
         .allow_root = allow_root,
         .case_insensitive = case_insensitive,
+        .total_coverage = total_coverage,
         .children = children,
         .variants = variants,
     };
@@ -1800,6 +1814,9 @@ fn validateCachedRule(
     if (rule.operator != .safe_relative_path and
         (!rule.allow_root or rule.case_insensitive))
     {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .reference_exists and rule.total_coverage) {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .exact_object and
@@ -2991,6 +3008,11 @@ fn keyedUnique(
     return true;
 }
 
+const ReferenceTarget = struct {
+    value: std.json.Value,
+    referenced: bool = false,
+};
+
 fn referencesExist(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -3015,7 +3037,7 @@ fn referencesExist(
     };
     if (target_items.len > plan.max_records) return false;
 
-    var index: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
+    var index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty;
     defer index.deinit(allocator);
     for (target_items) |item| {
         const key = resolve(
@@ -3025,11 +3047,11 @@ fn referencesExist(
         const digest = scalarKeyDigest(key) orelse return false;
         const result = try index.getOrPut(allocator, digest);
         if (result.found_existing) {
-            if (!valuesEqual(result.value_ptr.*, key)) {
+            if (!valuesEqual(result.value_ptr.value, key)) {
                 return error.ReferenceKeyDigestCollision;
             }
         } else {
-            result.value_ptr.* = key;
+            result.value_ptr.* = .{ .value = key };
         }
     }
 
@@ -3043,7 +3065,7 @@ fn referencesExist(
             .array => |array| for (array.items) |reference| {
                 reference_count += 1;
                 if (reference_count > plan.max_records or
-                    !try scalarIndexContains(&index, reference))
+                    !try markScalarReference(&index, reference))
                 {
                     return false;
                 }
@@ -3051,25 +3073,32 @@ fn referencesExist(
             else => {
                 reference_count += 1;
                 if (reference_count > plan.max_records or
-                    !try scalarIndexContains(&index, references))
+                    !try markScalarReference(&index, references))
                 {
                     return false;
                 }
             },
         }
     }
+    if (rule.total_coverage) {
+        var iterator = index.valueIterator();
+        while (iterator.next()) |target| {
+            if (!target.referenced) return false;
+        }
+    }
     return true;
 }
 
-fn scalarIndexContains(
-    index: *const std.AutoHashMapUnmanaged([32]u8, std.json.Value),
+fn markScalarReference(
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     key: std.json.Value,
 ) !bool {
     const digest = scalarKeyDigest(key) orelse return false;
-    const indexed = index.get(digest) orelse return false;
-    if (!valuesEqual(indexed, key)) {
+    const indexed = index.getPtr(digest) orelse return false;
+    if (!valuesEqual(indexed.value, key)) {
         return error.ReferenceKeyDigestCollision;
     }
+    indexed.referenced = true;
     return true;
 }
 
@@ -3550,12 +3579,13 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links","optional_links","meta","universe","accepted","rejected","targets","mappings"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links","optional_links","meta","universe","ordering","accepted","rejected","targets","mappings"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
         \\    {"op":"unique","path":"/tags"},
         \\    {"op":"sorted","path":"/tags"},
+        \\    {"op":"unique","path":"/ordering"},
         \\    {"op":"keyed-unique","path":"/items","key":"/id"},
         \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"},
         \\    {"op":"reference-exists","path":"/optional_links","reference":"/item_refs","target":"/items","key":"/id"},
@@ -3574,6 +3604,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
         \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure"},
         \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
+        \\    {"op":"reference-exists","path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"},
         \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
         \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
         \\  ],
@@ -3627,7 +3658,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"]},{\"id\":\"item-2\",\"labels\":[\"b\"]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"]},{\"id\":\"item-2\",\"labels\":[\"b\"]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -3701,6 +3732,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer invalid_scalar_reference.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_scalar_reference.valid);
+
+    const incomplete_coverage_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"ordering\":[\"a\",\"b\"]",
+        "\"ordering\":[\"a\"]",
+    );
+    defer std.testing.allocator.free(incomplete_coverage_bytes);
+    var incomplete_coverage = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = incomplete_coverage_bytes,
+        }},
+    );
+    defer incomplete_coverage.deinit(std.testing.allocator);
+    try std.testing.expect(!incomplete_coverage.valid);
 
     var invalid = try validate(
         std.testing.allocator,
