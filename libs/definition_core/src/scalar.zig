@@ -89,6 +89,23 @@ pub fn parseAlloc(
     };
 }
 
+pub fn validateString(kind: Kind, raw: []const u8) !void {
+    switch (kind) {
+        .string => if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidUtf8,
+        .integer => _ = std.fmt.parseInt(i64, raw, 10) catch
+            return error.InvalidInteger,
+        .boolean => if (!std.mem.eql(u8, raw, "true") and
+            !std.mem.eql(u8, raw, "false"))
+        {
+            return error.InvalidBoolean;
+        },
+        .digest => try json.digest(raw),
+        .timestamp => try validateTimestamp(raw),
+        .safe_identifier => try json.safeIdentifier(raw, 128),
+        .relative_path => try json.repositoryRelativePath(raw, true),
+    }
+}
+
 pub fn fromJsonAlloc(
     allocator: std.mem.Allocator,
     kind: Kind,

@@ -137,6 +137,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "trace_core", .module = trace_core },
         },
     });
+    const ledger_v1_core = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/src/v1/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "definition_core", .module = definition_core },
+        },
+    });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
     const seq_perf_cli = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/perf_cli.zig"),
@@ -802,6 +810,12 @@ pub fn build(b: *std.Build) void {
         "test-seq-v1-core",
         "Run Seq 1.0 observation-definition compiler tests",
     );
+    const run_ledger_v1_core_tests = addTestStep(
+        b,
+        ledger_v1_core,
+        "test-ledger-v1-core",
+        "Run Ledger 1.0 artifact-definition compiler tests",
+    );
     const run_execution_policy_core_tests = addTestStep(
         b,
         execution_policy_core,
@@ -921,6 +935,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(run_definition_core_guard);
     test_all.dependOn(&run_trace_core_tests.step);
     test_all.dependOn(&run_seq_v1_core_tests.step);
+    test_all.dependOn(&run_ledger_v1_core_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
 
