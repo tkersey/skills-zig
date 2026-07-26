@@ -551,6 +551,9 @@ const Builder = struct {
             .subset,
             .superset,
             .disjoint,
+            .path_scope_subset,
+            .path_scope_disjoint,
+            .member_of,
             .field_equal,
             .field_not_equal,
             => {
@@ -1778,6 +1781,9 @@ const Builder = struct {
             .subset,
             .superset,
             .disjoint,
+            .path_scope_subset,
+            .path_scope_disjoint,
+            .member_of,
             .field_equal,
             .field_not_equal,
             => {
@@ -3504,6 +3510,9 @@ fn validateCachedRule(
         .subset,
         .superset,
         .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -4487,6 +4496,9 @@ fn applyRule(
         .subset,
         .superset,
         .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -4807,6 +4819,9 @@ fn itemRuleHolds(
         .subset,
         .superset,
         .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -4891,27 +4906,50 @@ fn compareRuleRoots(
                 item,
                 plan.pointers[rule.other_pointer_id.?],
             ) orelse return false;
-            if (!compareValues(rule.operator, left, right)) return false;
+            if (!compareValues(
+                rule.operator,
+                left,
+                right,
+                plan.max_records,
+            )) return false;
         }
         return true;
     }
     const left = resolve(left_root, plan.pointers[rule.pointer_id.?]) orelse return false;
     const right = resolve(right_root, plan.pointers[rule.other_pointer_id.?]) orelse return false;
-    return compareValues(rule.operator, left, right);
+    return compareValues(
+        rule.operator,
+        left,
+        right,
+        plan.max_records,
+    );
 }
 
 fn compareValues(
     operator: definition.Operator,
     left: std.json.Value,
     right: std.json.Value,
+    max_records: usize,
 ) bool {
     return switch (operator) {
         .field_equal, .cross_input_equal => valuesEqual(left, right),
         .field_not_equal => !valuesEqual(left, right),
-        .set_equality => setSubset(left, right) and setSubset(right, left),
-        .subset => setSubset(left, right),
-        .superset => setSubset(right, left),
-        .disjoint => setsDisjoint(left, right),
+        .set_equality => setSubset(left, right, max_records) and
+            setSubset(right, left, max_records),
+        .subset => setSubset(left, right, max_records),
+        .superset => setSubset(right, left, max_records),
+        .disjoint => setsDisjoint(left, right, max_records),
+        .path_scope_subset => pathScopesContain(
+            left,
+            right,
+            max_records,
+        ),
+        .path_scope_disjoint => pathScopesDisjoint(
+            left,
+            right,
+            max_records,
+        ),
+        .member_of => valueMemberOf(left, right, max_records),
         else => false,
     };
 }
@@ -6764,7 +6802,11 @@ fn scalarKeyDigest(value: std.json.Value) ?[32]u8 {
     return digest;
 }
 
-fn setSubset(left: std.json.Value, right: std.json.Value) bool {
+fn setSubset(
+    left: std.json.Value,
+    right: std.json.Value,
+    max_records: usize,
+) bool {
     const left_items = switch (left) {
         .array => |array| array.items,
         else => return false,
@@ -6773,6 +6815,9 @@ fn setSubset(left: std.json.Value, right: std.json.Value) bool {
         .array => |array| array.items,
         else => return false,
     };
+    if (left_items.len > max_records or right_items.len > max_records) {
+        return false;
+    }
     for (left_items) |item| {
         var found = false;
         for (right_items) |candidate| {
@@ -6786,7 +6831,11 @@ fn setSubset(left: std.json.Value, right: std.json.Value) bool {
     return true;
 }
 
-fn setsDisjoint(left: std.json.Value, right: std.json.Value) bool {
+fn setsDisjoint(
+    left: std.json.Value,
+    right: std.json.Value,
+    max_records: usize,
+) bool {
     const left_items = switch (left) {
         .array => |array| array.items,
         else => return false,
@@ -6795,10 +6844,107 @@ fn setsDisjoint(left: std.json.Value, right: std.json.Value) bool {
         .array => |array| array.items,
         else => return false,
     };
+    if (left_items.len > max_records or right_items.len > max_records) {
+        return false;
+    }
     for (left_items) |item| {
         for (right_items) |candidate| if (valuesEqual(item, candidate)) return false;
     }
     return true;
+}
+
+fn valueMemberOf(
+    value: std.json.Value,
+    collection: std.json.Value,
+    max_records: usize,
+) bool {
+    if (scalarKeyDigest(value) == null) return false;
+    const items = switch (collection) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > max_records) return false;
+    var found = false;
+    for (items) |item| {
+        if (scalarKeyDigest(item) == null) return false;
+        found = found or valuesEqual(value, item);
+    }
+    return found;
+}
+
+fn pathScopesContain(
+    left: std.json.Value,
+    right: std.json.Value,
+    max_records: usize,
+) bool {
+    const paths = pathArray(left, max_records) orelse return false;
+    const scopes = pathArray(right, max_records) orelse return false;
+    for (paths) |path_value| {
+        const path = path_value.string;
+        var covered = false;
+        for (scopes) |scope_value| {
+            const scope = scope_value.string;
+            if (pathWithinScope(path, scope)) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+fn pathScopesDisjoint(
+    left: std.json.Value,
+    right: std.json.Value,
+    max_records: usize,
+) bool {
+    const left_scopes = pathArray(left, max_records) orelse return false;
+    const right_scopes = pathArray(right, max_records) orelse return false;
+    for (left_scopes) |left_value| {
+        const left_path = left_value.string;
+        for (right_scopes) |right_value| {
+            const right_path = right_value.string;
+            if (pathWithinScope(left_path, right_path) or
+                pathWithinScope(right_path, left_path))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn pathArray(
+    value: std.json.Value,
+    max_records: usize,
+) ?[]const std.json.Value {
+    const items = switch (value) {
+        .array => |array| array.items,
+        else => return null,
+    };
+    if (items.len > max_records) return null;
+    for (items) |item| _ = validRepositoryPath(item) orelse return null;
+    return items;
+}
+
+fn validRepositoryPath(value: std.json.Value) ?[]const u8 {
+    const path = switch (value) {
+        .string => |text| text,
+        else => return null,
+    };
+    definition_core.json.repositoryRelativePath(
+        path,
+        true,
+    ) catch return null;
+    return path;
+}
+
+fn pathWithinScope(path: []const u8, scope: []const u8) bool {
+    return std.mem.eql(u8, scope, ".") or
+        std.mem.eql(u8, scope, path) or
+        (path.len > scope.len and path[scope.len] == '/' and
+            std.mem.eql(u8, path[0..scope.len], scope));
 }
 
 fn valuesEqual(left: std.json.Value, right: std.json.Value) bool {
@@ -7310,6 +7456,9 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .subset,
         .superset,
         .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
         .exactly_one,
         .at_least_one,
         .all_rules,
@@ -7360,6 +7509,9 @@ fn isItemOperator(operator: definition.Operator) bool {
         .subset,
         .superset,
         .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
         .field_equal,
         .field_not_equal,
         .exactly_one,
@@ -8076,6 +8228,99 @@ test "compiled identifier and repository path policies preserve exact boundaries
         defer rejected.deinit(std.testing.allocator);
         try std.testing.expect(!rejected.valid);
     }
+}
+
+test "compiled path scope comparisons preserve hierarchy and bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","member-of","path-scope-disjoint","path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["allowed","choices","paths","prohibited","selection"]}]},"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{"op":"member-of","left":"/selection","right":"/choices"}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&definition_plan},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
+
+    const valid_cases = [_][]const u8{
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",\"edit\"],\"paths\":[\"src/file.zig\"],\"prohibited\":[\"docs\"],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\".\"],\"choices\":[1,2],\"paths\":[\"src\"],\"prohibited\":[],\"selection\":2}",
+        "{\"allowed\":[\"src\",\"tests\"],\"choices\":[true],\"paths\":[],\"prohibited\":[\".git\"],\"selection\":true}",
+    };
+    for (valid_cases) |bytes| {
+        var result = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.valid);
+    }
+
+    const invalid_cases = [_][]const u8{
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"vendor/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src\"],\"prohibited\":[\"src/generated\"],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\"src\",\"bad/../scope\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\".\"],\"choices\":[\"inspect\"],\"paths\":[\"a\",\"b\",\"c\",\"d\",\"e\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"edit\"}",
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",{}],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+    };
+    for (invalid_cases) |bytes| {
+        var result = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.valid);
+    }
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        validateForAllocationFailure,
+        .{
+            &definition_plan,
+            &plan,
+            valid_cases[0],
+        },
+    );
 }
 
 test "validation reports missing and malformed inputs without granting authority" {
