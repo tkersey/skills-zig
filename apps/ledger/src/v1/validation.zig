@@ -224,6 +224,7 @@ const Builder = struct {
             .field_equal,
             .field_not_equal,
             => {
+                const scope_pointer_id = source.pointer_id;
                 const left_input = if (object.get("left_input")) |raw|
                     try self.inputIndex(try definition_core.json.string(raw))
                 else
@@ -240,6 +241,13 @@ const Builder = struct {
                 rule.other_pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "right"),
                 );
+                if (scope_pointer_id) |scope| {
+                    if (left_input != right_input) {
+                        return error.ScopedComparisonInputsConflict;
+                    }
+                    rule.path_ids = try self.allocator.alloc(u16, 1);
+                    rule.path_ids[0] = scope;
+                }
             },
             .cross_input_equal => {
                 rule.input_index = try self.inputIndex(
@@ -258,6 +266,60 @@ const Builder = struct {
             .exactly_one, .at_least_one => rule.path_ids = try self.parsePaths(
                 try definition_core.json.field(object, "paths"),
             ),
+            .keyed_unique => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "key" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "key" },
+                );
+                if (source.pointer_id == null) {
+                    return error.KeyedUniqueCollectionMissing;
+                }
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "key"),
+                );
+            },
+            .reference_exists => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "input",
+                        "path",
+                        "reference",
+                        "target_input",
+                        "target",
+                        "key",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "reference", "target", "key" },
+                );
+                if (source.pointer_id == null) {
+                    return error.ReferenceCollectionMissing;
+                }
+                rule.other_input_index = if (object.get("target_input")) |raw|
+                    try self.inputIndex(try definition_core.json.string(raw))
+                else
+                    input_index;
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "reference",
+                    ),
+                );
+                rule.path_ids = try self.allocator.alloc(u16, 2);
+                rule.path_ids[0] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "target"),
+                );
+                rule.path_ids[1] = try self.internPointer(
+                    try definition_core.json.requiredString(object, "key"),
+                );
+            },
             else => {},
         }
         try self.rules.append(self.allocator, rule);
@@ -646,8 +708,25 @@ fn validateCachedRule(
             rule.other_pointer_id == null)
         {
             return error.CacheRuleConfigurationInvalid;
+        } else if (rule.path_ids.len > 1 or
+            (rule.path_ids.len == 1 and
+                rule.input_index != rule.other_input_index.?))
+        {
+            return error.CacheRuleConfigurationInvalid;
         },
         .exactly_one, .at_least_one => if (rule.path_ids.len == 0) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .keyed_unique => if (rule.pointer_id == null or
+            rule.other_pointer_id == null)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .reference_exists => if (rule.pointer_id == null or
+            rule.other_input_index == null or
+            rule.other_pointer_id == null or
+            rule.path_ids.len != 2)
+        {
             return error.CacheRuleConfigurationInvalid;
         },
         else => {},
@@ -930,7 +1009,13 @@ pub fn execute(
         }
     }
     for (validation_plan.rules) |rule| {
-        try applyRule(validation_plan, loaded, rule, &diagnostics);
+        try applyRule(
+            allocator,
+            validation_plan,
+            loaded,
+            rule,
+            &diagnostics,
+        );
     }
     std.mem.sort(InputDigest, digests.items, {}, struct {
         fn lessThan(_: void, left: InputDigest, right: InputDigest) bool {
@@ -958,6 +1043,7 @@ pub fn validate(
 }
 
 fn applyRule(
+    allocator: std.mem.Allocator,
     plan: *const Plan,
     loaded: []const LoadedInput,
     rule: CompiledRule,
@@ -986,6 +1072,25 @@ fn applyRule(
         .safe_relative_path => if (target) |value| validateScalar(value, .relative_path) else false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value| arraySorted(value) else false,
+        .keyed_unique => if (target) |value|
+            try keyedUnique(
+                allocator,
+                value,
+                plan.pointers[rule.other_pointer_id.?],
+                plan.max_records,
+            )
+        else
+            false,
+        .reference_exists => if (target) |value|
+            try referencesExist(
+                allocator,
+                plan,
+                loaded,
+                rule,
+                value,
+            )
+        else
+            false,
         .set_equality,
         .subset,
         .superset,
@@ -1013,9 +1118,39 @@ fn compareRule(
 ) bool {
     const left_root = (loaded[rule.input_index].parsed_json orelse return false).value;
     const right_root = (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
+    if (rule.path_ids.len == 1) {
+        const items = switch (resolve(
+            left_root,
+            plan.pointers[rule.path_ids[0]],
+        ) orelse return false) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        if (items.len > plan.max_records) return false;
+        for (items) |item| {
+            const left = resolve(
+                item,
+                plan.pointers[rule.pointer_id.?],
+            ) orelse return false;
+            const right = resolve(
+                item,
+                plan.pointers[rule.other_pointer_id.?],
+            ) orelse return false;
+            if (!compareValues(rule.operator, left, right)) return false;
+        }
+        return true;
+    }
     const left = resolve(left_root, plan.pointers[rule.pointer_id.?]) orelse return false;
     const right = resolve(right_root, plan.pointers[rule.other_pointer_id.?]) orelse return false;
-    return switch (rule.operator) {
+    return compareValues(rule.operator, left, right);
+}
+
+fn compareValues(
+    operator: definition.Operator,
+    left: std.json.Value,
+    right: std.json.Value,
+) bool {
+    return switch (operator) {
         .field_equal, .cross_input_equal => valuesEqual(left, right),
         .field_not_equal => !valuesEqual(left, right),
         .set_equality => setSubset(left, right) and setSubset(right, left),
@@ -1150,6 +1285,141 @@ fn arraySorted(value: std.json.Value) bool {
         if (valueOrder(items[index - 1], item) == .gt) return false;
     }
     return true;
+}
+
+fn keyedUnique(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    key_pointer: Pointer,
+    max_records: usize,
+) !bool {
+    const items = switch (value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > max_records) return false;
+    var seen: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
+    defer seen.deinit(allocator);
+    for (items) |item| {
+        const key = resolve(item, key_pointer) orelse return false;
+        const digest = scalarKeyDigest(key) orelse return false;
+        const result = try seen.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (valuesEqual(result.value_ptr.*, key)) return false;
+            return error.KeyedUniqueDigestCollision;
+        }
+        result.value_ptr.* = key;
+    }
+    return true;
+}
+
+fn referencesExist(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rule: CompiledRule,
+    source_value: std.json.Value,
+) !bool {
+    const source_items = switch (source_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (source_items.len > plan.max_records) return false;
+    const target_root =
+        (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
+    const target_value = resolve(
+        target_root,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    const target_items = switch (target_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (target_items.len > plan.max_records) return false;
+
+    var index: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
+    defer index.deinit(allocator);
+    for (target_items) |item| {
+        const key = resolve(
+            item,
+            plan.pointers[rule.path_ids[1]],
+        ) orelse return false;
+        const digest = scalarKeyDigest(key) orelse return false;
+        const result = try index.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (!valuesEqual(result.value_ptr.*, key)) {
+                return error.ReferenceKeyDigestCollision;
+            }
+        } else {
+            result.value_ptr.* = key;
+        }
+    }
+
+    var reference_count: usize = 0;
+    for (source_items) |item| {
+        const references = resolve(
+            item,
+            plan.pointers[rule.other_pointer_id.?],
+        ) orelse return false;
+        switch (references) {
+            .array => |array| for (array.items) |reference| {
+                reference_count += 1;
+                if (reference_count > plan.max_records or
+                    !try scalarIndexContains(&index, reference))
+                {
+                    return false;
+                }
+            },
+            else => {
+                reference_count += 1;
+                if (reference_count > plan.max_records or
+                    !try scalarIndexContains(&index, references))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+fn scalarIndexContains(
+    index: *const std.AutoHashMapUnmanaged([32]u8, std.json.Value),
+    key: std.json.Value,
+) !bool {
+    const digest = scalarKeyDigest(key) orelse return false;
+    const indexed = index.get(digest) orelse return false;
+    if (!valuesEqual(indexed, key)) {
+        return error.ReferenceKeyDigestCollision;
+    }
+    return true;
+}
+
+fn scalarKeyDigest(value: std.json.Value) ?[32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    switch (value) {
+        .null => hasher.update("null"),
+        .bool => |flag| {
+            hasher.update("bool:");
+            hasher.update(if (flag) "true" else "false");
+        },
+        .string => |text| {
+            hasher.update("string:");
+            hasher.update(text);
+        },
+        .integer, .float, .number_string => {
+            const number = jsonNumber(value) orelse return null;
+            if (!std.math.isFinite(number)) return null;
+            const normalized: f64 = if (number == 0) 0 else number;
+            const bits: u64 = @bitCast(normalized);
+            hasher.update("number:");
+            hasher.update(std.mem.asBytes(&bits));
+        },
+        .array, .object => return null,
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
 }
 
 fn setSubset(left: std.json.Value, right: std.json.Value) bool {
@@ -1401,6 +1671,8 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
+        .keyed_unique,
+        .reference_exists,
         => true,
         else => false,
     };
@@ -1416,18 +1688,23 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
         \\    {"op":"unique","path":"/tags"},
-        \\    {"op":"sorted","path":"/tags"}
+        \\    {"op":"sorted","path":"/tags"},
+        \\    {"op":"keyed-unique","path":"/items","key":"/id"},
+        \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"}
         \\  ]},
-        \\  "constraints":[{"op":"field-equal","left":"/status","right":"/mirror"}],
+        \\  "constraints":[
+        \\    {"op":"field-equal","left":"/status","right":"/mirror"},
+        \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"}
+        \\  ],
         \\  "identity":{},
         \\  "storage":{"kind":"pure"},
         \\  "operations":{},
@@ -1473,7 +1750,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\"}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-2\"}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}]}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -1487,7 +1764,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"unknown\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"unknown\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\"},{\"id\":\"item-1\"}],\"links\":[{\"item_refs\":[\"missing\"],\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
