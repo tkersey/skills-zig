@@ -166,6 +166,7 @@ pub const Operator = enum {
             .timestamp,
             .safe_identifier,
             .safe_relative_path,
+            .tagged_union,
             .one_of,
             .definition_ref,
             .unique,

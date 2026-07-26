@@ -81,6 +81,19 @@ const EnumScalar = union(enum) {
     }
 };
 
+const CompiledVariant = struct {
+    kind: ?JsonKind = null,
+    tag_value: ?EnumScalar = null,
+    rules: []CompiledRule,
+
+    fn deinit(self: *CompiledVariant, allocator: std.mem.Allocator) void {
+        if (self.tag_value) |*value| value.deinit(allocator);
+        for (self.rules) |*rule| rule.deinit(allocator);
+        allocator.free(self.rules);
+        self.* = undefined;
+    }
+};
+
 const CompiledRule = struct {
     operator: definition.Operator,
     input_index: u8,
@@ -103,6 +116,7 @@ const CompiledRule = struct {
     allow_root: bool = true,
     case_insensitive: bool = false,
     children: []CompiledRule,
+    variants: []CompiledVariant,
 
     fn deinit(self: *CompiledRule, allocator: std.mem.Allocator) void {
         allocator.free(self.path_ids);
@@ -114,6 +128,8 @@ const CompiledRule = struct {
         allocator.free(self.values);
         for (self.children) |*child| child.deinit(allocator);
         allocator.free(self.children);
+        for (self.variants) |*variant| variant.deinit(allocator);
+        allocator.free(self.variants);
         if (self.imported_plan) |plan| {
             plan.deinit(allocator);
             allocator.destroy(plan);
@@ -206,6 +222,7 @@ const Builder = struct {
             .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
+            .variants = try self.allocator.alloc(CompiledVariant, 0),
         };
         errdefer rule.deinit(self.allocator);
 
@@ -460,6 +477,13 @@ const Builder = struct {
                     0,
                 );
             },
+            .tagged_union => try self.compileTaggedUnion(
+                object,
+                input_index,
+                0,
+                true,
+                &rule,
+            ),
             .definition_ref => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -640,6 +664,7 @@ const Builder = struct {
             .optional_keys = try self.allocator.alloc([]u8, 0),
             .values = try self.allocator.alloc(EnumScalar, 0),
             .children = try self.allocator.alloc(CompiledRule, 0),
+            .variants = try self.allocator.alloc(CompiledVariant, 0),
         };
         errdefer rule.deinit(self.allocator);
         switch (operator) {
@@ -842,9 +867,141 @@ const Builder = struct {
                     depth + 1,
                 );
             },
+            .tagged_union => try self.compileTaggedUnion(
+                object,
+                input_index,
+                depth,
+                false,
+                &rule,
+            ),
             else => unreachable,
         }
         return rule;
+    }
+
+    fn compileTaggedUnion(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        allow_input: bool,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (allow_input) {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "op", "input", "path", "tag", "variants" },
+            );
+        } else {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "op", "path", "tag", "variants" },
+            );
+        }
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "path", "variants" },
+        );
+        if (object.get("tag")) |raw_tag| {
+            rule.other_pointer_id = try self.internPointer(
+                try definition_core.json.string(raw_tag),
+            );
+        }
+        const raw_variants = try definition_core.json.array(
+            try definition_core.json.field(object, "variants"),
+        );
+        if (raw_variants.items.len == 0 or raw_variants.items.len > 64) {
+            return error.TaggedUnionVariantCountInvalid;
+        }
+        const variants = try self.allocator.alloc(
+            CompiledVariant,
+            raw_variants.items.len,
+        );
+        var initialized: usize = 0;
+        errdefer {
+            for (variants[0..initialized]) |*variant| {
+                variant.deinit(self.allocator);
+            }
+            self.allocator.free(variants);
+        }
+        for (raw_variants.items, 0..) |raw_variant, index| {
+            const variant_object =
+                try definition_core.json.object(raw_variant);
+            if (rule.other_pointer_id != null) {
+                try definition_core.json.requireExactKeys(
+                    variant_object,
+                    &.{ "value", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    variant_object,
+                    &.{ "value", "rules" },
+                );
+            } else {
+                try definition_core.json.requireExactKeys(
+                    variant_object,
+                    &.{ "kind", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    variant_object,
+                    &.{ "kind", "rules" },
+                );
+            }
+            var variant: CompiledVariant = .{
+                .kind = if (rule.other_pointer_id == null)
+                    try JsonKind.parse(
+                        try definition_core.json.requiredString(
+                            variant_object,
+                            "kind",
+                        ),
+                    )
+                else
+                    null,
+                .tag_value = if (rule.other_pointer_id != null)
+                    try parseEnumScalar(
+                        self.allocator,
+                        try definition_core.json.field(
+                            variant_object,
+                            "value",
+                        ),
+                    )
+                else
+                    null,
+                .rules = try self.compileVariantRules(
+                    try definition_core.json.field(variant_object, "rules"),
+                    input_index,
+                    depth + 1,
+                ),
+            };
+            errdefer variant.deinit(self.allocator);
+            for (variants[0..initialized]) |prior| {
+                if ((variant.kind != null and prior.kind == variant.kind) or
+                    (variant.tag_value != null and
+                        prior.tag_value != null and
+                        enumScalarsEqual(
+                            variant.tag_value.?,
+                            prior.tag_value.?,
+                        )))
+                {
+                    return error.DuplicateTaggedUnionVariant;
+                }
+            }
+            variants[index] = variant;
+            initialized += 1;
+        }
+        rule.variants = variants;
+    }
+
+    fn compileVariantRules(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+        depth: usize,
+    ) anyerror![]CompiledRule {
+        const items = try definition_core.json.array(raw);
+        if (items.items.len == 0) {
+            return self.allocator.alloc(CompiledRule, 0);
+        }
+        return self.compileItemRules(raw, input_index, depth);
     }
 
     fn parsePaths(self: *Builder, raw: std.json.Value) ![]u16 {
@@ -897,7 +1054,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(7);
+    try encoder.writeU16(8);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -929,7 +1086,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 7) {
+    if (try decoder.readU16() != 8) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1053,6 +1210,19 @@ fn validateRuleAgainstDefinition(
         }
         try validateRuleAgainstDefinition(child, definition_plan);
     }
+    for (rule.variants) |variant| {
+        for (variant.rules) |variant_rule| {
+            if (variant_rule.input_index != rule.input_index or
+                !isItemOperator(variant_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+            try validateRuleAgainstDefinition(
+                variant_rule,
+                definition_plan,
+            );
+        }
+    }
 }
 
 fn decodeCacheInputs(
@@ -1145,6 +1315,22 @@ fn encodeCompiledRule(
     try encoder.writeCount(rule.children.len);
     for (rule.children) |child| {
         try encodeCompiledRule(encoder, child, depth);
+    }
+    try encoder.writeCount(rule.variants.len);
+    for (rule.variants) |variant| {
+        if (variant.kind) |kind| {
+            try encoder.writeByte(0);
+            try encoder.writeEnum(kind);
+        } else if (variant.tag_value) |tag_value| {
+            try encoder.writeByte(1);
+            try encodeEnumScalar(encoder, tag_value);
+        } else {
+            return error.TaggedUnionVariantInvalid;
+        }
+        try encoder.writeCount(variant.rules.len);
+        for (variant.rules) |variant_rule| {
+            try encodeCompiledRule(encoder, variant_rule, depth);
+        }
     }
     try encoder.writeBool(rule.imported_plan != null);
     if (rule.imported_plan) |imported_plan| {
@@ -1253,6 +1439,51 @@ fn decodeCacheRule(
         for (children) |*child| child.deinit(allocator);
         allocator.free(children);
     }
+    const variant_count = try decoder.readCount(64);
+    const variants = try allocator.alloc(CompiledVariant, variant_count);
+    var variants_initialized: usize = 0;
+    errdefer {
+        for (variants[0..variants_initialized]) |*variant| {
+            variant.deinit(allocator);
+        }
+        allocator.free(variants);
+    }
+    for (variants) |*variant| {
+        const kind_or_tag = try decoder.readByte();
+        var tag_value: ?EnumScalar = null;
+        errdefer if (tag_value) |*value| value.deinit(allocator);
+        const kind: ?JsonKind = switch (kind_or_tag) {
+            0 => try decoder.readEnum(JsonKind),
+            1 => tag: {
+                tag_value = try decodeEnumScalar(allocator, decoder);
+                break :tag null;
+            },
+            else => return error.CacheTaggedUnionVariantInvalid,
+        };
+        const variant_rules = try decodeCacheRules(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth + 1,
+            total_rule_count,
+            plan_depth,
+            imported_plan_count,
+        );
+        errdefer {
+            for (variant_rules) |*variant_rule| {
+                variant_rule.deinit(allocator);
+            }
+            allocator.free(variant_rules);
+        }
+        variant.* = .{
+            .kind = kind,
+            .tag_value = tag_value,
+            .rules = variant_rules,
+        };
+        tag_value = null;
+        variants_initialized += 1;
+    }
     const imported_plan = if (try decoder.readBool()) blk: {
         const plan = try allocator.create(Plan);
         errdefer allocator.destroy(plan);
@@ -1290,6 +1521,7 @@ fn decodeCacheRule(
         .allow_root = allow_root,
         .case_insensitive = case_insensitive,
         .children = children,
+        .variants = variants,
     };
     try validateCachedRule(rule, input_count, pointer_count);
     return rule;
@@ -1343,26 +1575,33 @@ fn decodeEnumScalars(
         allocator.free(values);
     }
     for (values) |*value| {
-        value.* = switch (try decoder.readByte()) {
-            0 => .{ .string = try decoder.readBytesAlloc(
-                allocator,
-                4 * 1024 * 1024,
-            ) },
-            1 => .{ .integer = try decoder.readI64() },
-            2 => blk: {
-                const number = try decoder.readF64();
-                if (!std.math.isFinite(number)) {
-                    return error.CacheNumberInvalid;
-                }
-                break :blk .{ .float = number };
-            },
-            3 => .{ .boolean = try decoder.readBool() },
-            4 => .null,
-            else => return error.CacheEnumScalarInvalid,
-        };
+        value.* = try decodeEnumScalar(allocator, decoder);
         initialized += 1;
     }
     return values;
+}
+
+fn decodeEnumScalar(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EnumScalar {
+    return switch (try decoder.readByte()) {
+        0 => .{ .string = try decoder.readBytesAlloc(
+            allocator,
+            4 * 1024 * 1024,
+        ) },
+        1 => .{ .integer = try decoder.readI64() },
+        2 => blk: {
+            const number = try decoder.readF64();
+            if (!std.math.isFinite(number)) {
+                return error.CacheNumberInvalid;
+            }
+            break :blk .{ .float = number };
+        },
+        3 => .{ .boolean = try decoder.readBool() },
+        4 => .null,
+        else => return error.CacheEnumScalarInvalid,
+    };
 }
 
 fn validateCachedRule(
@@ -1485,6 +1724,11 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
+        .tagged_union => if (rule.pointer_id == null or
+            rule.variants.len == 0 or rule.variants.len > 64)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .definition_ref => if (rule.pointer_id == null or
             rule.import_index == null or
             rule.imported_plan == null or
@@ -1542,6 +1786,9 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
+    if (rule.operator != .tagged_union and rule.variants.len != 0) {
+        return error.CacheRuleConfigurationInvalid;
+    }
     for (rule.children) |child| {
         if (child.input_index != rule.input_index or
             !isItemOperator(child.operator))
@@ -1549,6 +1796,39 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         }
         try validateCachedRule(child, input_count, pointer_count);
+    }
+    for (rule.variants, 0..) |variant, index| {
+        if ((rule.other_pointer_id == null and
+            (variant.kind == null or variant.tag_value != null)) or
+            (rule.other_pointer_id != null and
+                (variant.kind != null or variant.tag_value == null)))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        for (rule.variants[0..index]) |prior| {
+            if ((variant.kind != null and prior.kind == variant.kind) or
+                (variant.tag_value != null and
+                    prior.tag_value != null and
+                    enumScalarsEqual(
+                        variant.tag_value.?,
+                        prior.tag_value.?,
+                    )))
+            {
+                return error.CacheRuleConfigurationInvalid;
+            }
+        }
+        for (variant.rules) |variant_rule| {
+            if (variant_rule.input_index != rule.input_index or
+                !isItemOperator(variant_rule.operator))
+            {
+                return error.CacheRuleConfigurationInvalid;
+            }
+            try validateCachedRule(
+                variant_rule,
+                input_count,
+                pointer_count,
+            );
+        }
     }
     if (rule.imported_plan) |imported_plan| {
         for (imported_plan.rules) |imported_rule| {
@@ -1950,6 +2230,10 @@ fn applyRule(
             try oneOfRulesHold(allocator, plan, rule, value)
         else
             false,
+        .tagged_union => if (target) |value|
+            try taggedUnionHolds(allocator, plan, rule, value)
+        else
+            false,
         .definition_ref => if (target) |value|
             try importedPlanHolds(
                 allocator,
@@ -2043,6 +2327,42 @@ fn oneOfRulesHold(
     return matches == 1;
 }
 
+fn taggedUnionHolds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+) anyerror!bool {
+    if (rule.other_pointer_id) |tag_pointer_id| {
+        const tag = resolve(
+            value,
+            plan.pointers[tag_pointer_id],
+        ) orelse return false;
+        for (rule.variants) |variant| {
+            if (enumEqual(variant.tag_value.?, tag)) {
+                return itemRulesHold(
+                    allocator,
+                    plan,
+                    variant.rules,
+                    value,
+                );
+            }
+        }
+        return false;
+    }
+    for (rule.variants) |variant| {
+        if (valueHasKind(value, variant.kind.?)) {
+            return itemRulesHold(
+                allocator,
+                plan,
+                variant.rules,
+                value,
+            );
+        }
+    }
+    return false;
+}
+
 fn itemRulesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -2111,6 +2431,10 @@ fn itemRuleHolds(
         .exactly_one, .at_least_one => countPresent(plan, root, rule),
         .one_of => if (target) |value|
             oneOfRulesHold(allocator, plan, rule, value)
+        else
+            false,
+        .tagged_union => if (target) |value|
+            taggedUnionHolds(allocator, plan, rule, value)
         else
             false,
         .definition_ref => if (target) |value|
@@ -2480,6 +2804,17 @@ fn enumEqual(candidate: EnumScalar, value: std.json.Value) bool {
         .float => |number| jsonNumber(value) != null and number == jsonNumber(value).?,
         .boolean => |flag| value == .bool and flag == value.bool,
         .null => value == .null,
+    };
+}
+
+fn enumScalarsEqual(left: EnumScalar, right: EnumScalar) bool {
+    return switch (left) {
+        .string => |text| right == .string and
+            std.mem.eql(u8, text, right.string),
+        .integer => |number| right == .integer and number == right.integer,
+        .float => |number| right == .float and number == right.float,
+        .boolean => |flag| right == .boolean and flag == right.boolean,
+        .null => right == .null,
     };
 }
 
@@ -3038,6 +3373,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .timestamp,
         .safe_identifier,
         .safe_relative_path,
+        .tagged_union,
         .one_of,
         .definition_ref,
         .unique,
@@ -3079,6 +3415,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .timestamp,
         .safe_identifier,
         .safe_relative_path,
+        .tagged_union,
         .one_of,
         .definition_ref,
         .unique,
@@ -3425,7 +3762,7 @@ test "definition references compile imported validators and survive cache round 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "receipt.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","enum","scalar-type"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","exact-object","enum","scalar-type","tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","parent","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -3496,7 +3833,7 @@ test "definition references compile imported validators and survive cache round 
         &cached,
         &.{.{
             .name = "packet",
-            .bytes = "{\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+            .bytes = "{\"receipt\":{\"count\":2,\"parent\":null,\"status\":\"complete\"}}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -3508,7 +3845,7 @@ test "definition references compile imported validators and survive cache round 
         &cached,
         &.{.{
             .name = "packet",
-            .bytes = "{\"metadata\":{},\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+            .bytes = "{\"metadata\":{},\"receipt\":{\"count\":2,\"parent\":{\"value\":\"prior\"},\"status\":\"complete\"}}",
         }},
     );
     defer valid_with_optional.deinit(std.testing.allocator);
@@ -3520,7 +3857,7 @@ test "definition references compile imported validators and survive cache round 
         &cached,
         &.{.{
             .name = "packet",
-            .bytes = "{\"receipt\":{\"count\":\"two\",\"status\":\"complete\"}}",
+            .bytes = "{\"receipt\":{\"count\":\"two\",\"parent\":null,\"status\":\"complete\"}}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
@@ -3532,11 +3869,23 @@ test "definition references compile imported validators and survive cache round 
         &cached,
         &.{.{
             .name = "packet",
-            .bytes = "{\"other\":{},\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+            .bytes = "{\"other\":{},\"receipt\":{\"count\":2,\"parent\":null,\"status\":\"complete\"}}",
         }},
     );
     defer unknown_key.deinit(std.testing.allocator);
     try std.testing.expect(!unknown_key.valid);
+
+    var invalid_variant = try validate(
+        std.testing.allocator,
+        &cached_definition,
+        &cached,
+        &.{.{
+            .name = "packet",
+            .bytes = "{\"receipt\":{\"count\":2,\"parent\":{\"value\":\"\"},\"status\":\"complete\"}}",
+        }},
+    );
+    defer invalid_variant.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_variant.valid);
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
