@@ -81,6 +81,7 @@ pub fn execute(
             definition_plan,
             repo_root,
             slot,
+            parameters,
             event_protocol != null and
                 event_protocol.?.target_slot_index == index,
         ) catch |err| try unhealthySlot(allocator, slot, err);
@@ -101,6 +102,7 @@ fn inspectSlot(
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
     var snapshot = try custody.readSlot(
@@ -116,6 +118,7 @@ fn inspectSlot(
         definition_plan.id,
         slot,
         &snapshot,
+        parameters,
         definition_plan.bounds.max_records,
         protocol_required,
     );

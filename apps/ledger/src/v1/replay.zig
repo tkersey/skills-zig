@@ -112,6 +112,7 @@ pub fn validateSlot(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
     current_max_records: usize,
     protocol_required: bool,
 ) !Stats {
@@ -129,6 +130,7 @@ pub fn validateSlot(
         &cache,
         slot,
         snapshot,
+        parameters,
         current_max_records,
         protocol_required,
     );
@@ -149,6 +151,7 @@ fn validateHistory(
     cache: *PlanCache,
     current_slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
     current_max_records: usize,
     protocol_required: bool,
 ) !HistoryResult {
@@ -180,6 +183,7 @@ fn validateHistory(
                 current_slot,
                 snapshot.binding.rows[epoch_start..index],
                 prior_content,
+                parameters,
                 null,
                 false,
             );
@@ -192,6 +196,7 @@ fn validateHistory(
         current_slot,
         snapshot.binding.rows[epoch_start..],
         snapshot.content,
+        parameters,
         current_max_records,
         protocol_required,
     );
@@ -236,6 +241,7 @@ fn validateEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
     current_max_records: ?usize,
     protocol_required: bool,
 ) !HistoryResult {
@@ -268,6 +274,7 @@ fn validateEpoch(
             current_slot,
             rows,
             content,
+            parameters,
             current_max_records,
             protocol_required,
         ),
@@ -318,6 +325,7 @@ fn validateEventEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
     current_max_records: ?usize,
     protocol_required: bool,
 ) !HistoryResult {
@@ -368,6 +376,7 @@ fn validateEventEpoch(
                         protocol_required,
                         resolved,
                         record,
+                        parameters,
                         false,
                     );
                 }
@@ -383,6 +392,7 @@ fn validateEventEpoch(
                         protocol_required,
                         resolved,
                         content[row.extent_start..row.extent_end],
+                        parameters,
                         true,
                     );
                 },
@@ -476,6 +486,7 @@ fn validateEventInput(
     protocol_required: bool,
     resolved: ResolvedEffect,
     bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
     require_canonical: bool,
 ) !void {
     const input =
@@ -530,11 +541,12 @@ fn validateEventInput(
         );
         defer execution.deinit();
         if (!execution.isValid()) return error.HistoricalArtifactInvalid;
-        try protocol.applyValue(
+        try protocol.applyValueBound(
             allocator,
             plan,
             &protocol_state.*.?,
             parsed.value,
+            parameters,
         );
         return;
     }
@@ -563,7 +575,13 @@ fn validateEventInput(
     if (protocol_state.* == null) {
         protocol_state.* = protocol.ReplayState.init(plan);
     }
-    try protocol.applyValue(allocator, plan, &protocol_state.*.?, event);
+    try protocol.applyValueBound(
+        allocator,
+        plan,
+        &protocol_state.*.?,
+        event,
+        parameters,
+    );
 }
 
 fn findEffectForSlot(

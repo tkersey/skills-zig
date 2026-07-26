@@ -62,6 +62,20 @@ pub const Bindings = struct {
     items: []Binding,
     values_digest: [71]u8,
 
+    pub fn find(self: *const Bindings, name: []const u8) ?*const Binding {
+        var low: usize = 0;
+        var high = self.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, self.items[mid].name, name)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return &self.items[mid],
+            }
+        }
+        return null;
+    }
+
     pub fn deinit(self: *Bindings, allocator: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(allocator);
         allocator.free(self.items);

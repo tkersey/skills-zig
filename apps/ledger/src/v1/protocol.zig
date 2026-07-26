@@ -23,6 +23,21 @@ pub fn isConfigured(definition_plan: *const definition.Plan) bool {
     return (definition_plan.operator_mask & protocol_operator_mask) != 0;
 }
 
+const PartitionBinding = struct {
+    parameter: []u8,
+    kind: definition_core.scalar.Kind,
+    event_value: definition_core.json_pointer.Pointer,
+
+    fn deinit(
+        self: *PartitionBinding,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.parameter);
+        self.event_value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const Envelope = struct {
     input_index: u8,
     keys: [][]u8,
@@ -32,6 +47,7 @@ const Envelope = struct {
     body_key: []u8,
     body_digest_key: []u8,
     event_digest_key: []u8,
+    partition_bindings: []PartitionBinding,
 
     fn deinit(self: *Envelope, allocator: std.mem.Allocator) void {
         for (self.keys) |key| allocator.free(key);
@@ -42,6 +58,10 @@ const Envelope = struct {
         allocator.free(self.body_key);
         allocator.free(self.body_digest_key);
         allocator.free(self.event_digest_key);
+        for (self.partition_bindings) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(self.partition_bindings);
         self.* = undefined;
     }
 };
@@ -249,7 +269,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
     try encoder.writeBytes(plan.envelope.sequence_key);
@@ -258,6 +278,12 @@ pub fn encodeCache(
     try encoder.writeBytes(plan.envelope.body_key);
     try encoder.writeBytes(plan.envelope.body_digest_key);
     try encoder.writeBytes(plan.envelope.event_digest_key);
+    try encoder.writeCount(plan.envelope.partition_bindings.len);
+    for (plan.envelope.partition_bindings) |binding| {
+        try encoder.writeBytes(binding.parameter);
+        try encoder.writeEnum(binding.kind);
+        try encoder.writeBytes(binding.event_value.raw);
+    }
     try encoder.writeU64(plan.sequence_start);
     try encoder.writeOptionalBytes(switch (plan.genesis) {
         .null => null,
@@ -280,7 +306,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
@@ -294,6 +320,16 @@ pub fn decodeCache(
             field_key.* = try decoder.readBytesAlloc(allocator, 256);
             initialized += 1;
             try definition_core.json.safeIdentifier(field_key.*, 256);
+        }
+        const partition_bindings = try decodePartitionBindings(
+            allocator,
+            decoder,
+        );
+        errdefer {
+            for (partition_bindings) |*binding| {
+                binding.deinit(allocator);
+            }
+            allocator.free(partition_bindings);
         }
         const sequence_start = try decoder.readU64();
         const raw_genesis = try decoder.readOptionalBytesAlloc(
@@ -336,6 +372,7 @@ pub fn decodeCache(
                 .body_key = field_keys[3],
                 .body_digest_key = field_keys[4],
                 .event_digest_key = field_keys[5],
+                .partition_bindings = partition_bindings,
             },
             .sequence_start = sequence_start,
             .genesis = genesis,
@@ -388,6 +425,10 @@ pub fn validateCachePlan(
         );
         try state_reducer.validateEventKinds(compiled, plan.event_kinds);
     }
+    try validatePartitionBindingsAgainstDefinition(
+        plan.envelope.partition_bindings,
+        definition_plan,
+    );
     const expected_slot = try compileTargetSlot(
         storage_plan,
         plan.envelope.input_index,
@@ -404,6 +445,38 @@ pub fn apply(
     state: *ReplayState,
     event_bytes: []const u8,
 ) !void {
+    return applyWithParameters(
+        allocator,
+        plan,
+        state,
+        event_bytes,
+        null,
+    );
+}
+
+pub fn applyBound(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event_bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    return applyWithParameters(
+        allocator,
+        plan,
+        state,
+        event_bytes,
+        parameters,
+    );
+}
+
+fn applyWithParameters(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event_bytes: []const u8,
+    parameters: ?*const definition_core.parameters.Bindings,
+) !void {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -414,7 +487,13 @@ pub fn apply(
         },
     );
     defer parsed.deinit();
-    return applyValue(allocator, plan, state, parsed.value);
+    return applyValueWithParameters(
+        allocator,
+        plan,
+        state,
+        parsed.value,
+        parameters,
+    );
 }
 
 pub fn applyValue(
@@ -423,11 +502,48 @@ pub fn applyValue(
     state: *ReplayState,
     event: std.json.Value,
 ) !void {
+    return applyValueWithParameters(
+        allocator,
+        plan,
+        state,
+        event,
+        null,
+    );
+}
+
+pub fn applyValueBound(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    return applyValueWithParameters(
+        allocator,
+        plan,
+        state,
+        event,
+        parameters,
+    );
+}
+
+fn applyValueWithParameters(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+    parameters: ?*const definition_core.parameters.Bindings,
+) !void {
     if (state.records >= plan.max_records) {
         return error.ProtocolRecordBoundsExceeded;
     }
     const object = try definition_core.json.object(event);
     try validateEnvelopeKeys(object, plan.envelope.keys);
+    try validatePartitionValues(
+        plan.envelope.partition_bindings,
+        event,
+        parameters,
+    );
 
     const sequence_value = object.get(plan.envelope.sequence_key) orelse
         return error.EventEnvelopeFieldMissing;
@@ -515,6 +631,43 @@ pub fn applyValue(
     state.has_previous_digest = true;
     state.next_sequence += 1;
     state.records += 1;
+}
+
+fn validatePartitionValues(
+    bindings: []const PartitionBinding,
+    event: std.json.Value,
+    parameters: ?*const definition_core.parameters.Bindings,
+) !void {
+    if (bindings.len == 0) return;
+    const bound = parameters orelse
+        return error.ProtocolPartitionParametersMissing;
+    for (bindings) |binding| {
+        const parameter = bound.find(binding.parameter) orelse
+            return error.ProtocolPartitionParameterMissing;
+        if (parameter.value.kind() != binding.kind) {
+            return error.ProtocolPartitionParameterKindMismatch;
+        }
+        const actual = definition_core.json_pointer.lookup(
+            event,
+            binding.event_value,
+        ) orelse return error.EventPartitionValueMissing;
+        const matches = switch (parameter.value) {
+            .string => |expected| stringValueEquals(actual, expected),
+            .digest => |expected| stringValueEquals(actual, expected),
+            .timestamp => |expected| stringValueEquals(actual, expected),
+            .safe_identifier => |expected| stringValueEquals(actual, expected),
+            .relative_path => |expected| stringValueEquals(actual, expected),
+            .integer => |expected| actual == .integer and
+                actual.integer == expected,
+            .boolean => |expected| actual == .bool and
+                actual.bool == expected,
+        };
+        if (!matches) return error.EventPartitionValueMismatch;
+    }
+}
+
+fn stringValueEquals(value: std.json.Value, expected: []const u8) bool {
+    return value == .string and std.mem.eql(u8, value.string, expected);
 }
 
 pub fn materializeEventAlloc(
@@ -820,6 +973,7 @@ fn compileEnvelope(
         "body",
         "body_digest",
         "event_digest",
+        "partition_bindings",
     });
     try definition_core.json.requireFields(object, &.{
         "op",
@@ -874,6 +1028,18 @@ fn compileEnvelope(
             }
         }
     }
+    const partition_bindings = if (object.get("partition_bindings")) |raw|
+        try compilePartitionBindings(
+            allocator,
+            definition_plan,
+            raw,
+        )
+    else
+        try allocator.alloc(PartitionBinding, 0);
+    errdefer {
+        for (partition_bindings) |*binding| binding.deinit(allocator);
+        allocator.free(partition_bindings);
+    }
     return .{
         .input_index = @intCast(input_index),
         .keys = keys,
@@ -883,7 +1049,82 @@ fn compileEnvelope(
         .body_key = field_keys[3],
         .body_digest_key = field_keys[4],
         .event_digest_key = field_keys[5],
+        .partition_bindings = partition_bindings,
     };
+}
+
+fn compilePartitionBindings(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) ![]PartitionBinding {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > 32) {
+        return error.TooManyProtocolPartitionBindings;
+    }
+    const bindings = try allocator.alloc(
+        PartitionBinding,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (bindings[0..initialized]) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(bindings);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "parameter", "event_value" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "parameter", "event_value" },
+        );
+        const parameter = try definition_core.json.requiredString(
+            object,
+            "parameter",
+        );
+        try definition_core.json.safeIdentifier(parameter, 128);
+        const declaration =
+            definition_plan.parameter_declarations.find(parameter) orelse
+            return error.UnknownProtocolPartitionParameter;
+        bindings[index] = .{
+            .parameter = try allocator.dupe(u8, parameter),
+            .kind = declaration.kind,
+            .event_value = try definition_core.json_pointer.compile(
+                allocator,
+                try definition_core.json.requiredString(
+                    object,
+                    "event_value",
+                ),
+            ),
+        };
+        initialized += 1;
+    }
+    std.mem.sort(PartitionBinding, bindings, {}, struct {
+        fn lessThan(
+            _: void,
+            left: PartitionBinding,
+            right: PartitionBinding,
+        ) bool {
+            return std.mem.lessThan(
+                u8,
+                left.parameter,
+                right.parameter,
+            );
+        }
+    }.lessThan);
+    for (bindings[1..], 1..) |binding, index| {
+        if (std.mem.eql(
+            u8,
+            bindings[index - 1].parameter,
+            binding.parameter,
+        )) return error.DuplicateProtocolPartitionParameter;
+    }
+    return bindings;
 }
 
 fn compileSequence(
@@ -1069,6 +1310,48 @@ fn decodeStringSet(
     return out;
 }
 
+fn decodePartitionBindings(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]PartitionBinding {
+    const count = try decoder.readCount(32);
+    const bindings = try allocator.alloc(PartitionBinding, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (bindings[0..initialized]) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(bindings);
+    }
+    for (bindings, 0..) |*binding, index| {
+        const parameter = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(parameter);
+        try definition_core.json.safeIdentifier(parameter, 128);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                bindings[index - 1].parameter,
+                parameter,
+            ) != .lt)
+        {
+            return error.CacheProtocolPartitionBindingsNotSorted;
+        }
+        const kind = try decoder.readEnum(definition_core.scalar.Kind);
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        binding.* = .{
+            .parameter = parameter,
+            .kind = kind,
+            .event_value = try definition_core.json_pointer.compile(
+                allocator,
+                raw_pointer,
+            ),
+        };
+        initialized += 1;
+    }
+    return bindings;
+}
+
 fn deinitStringSet(
     allocator: std.mem.Allocator,
     items: [][]u8,
@@ -1087,6 +1370,21 @@ fn validatePlan(plan: *const Plan) !void {
     }
     try validateSortedStringSet(plan.envelope.keys);
     try validateSortedStringSet(plan.event_kinds);
+    if (plan.envelope.partition_bindings.len > 32) {
+        return error.InvalidProtocolPartitionBindings;
+    }
+    for (plan.envelope.partition_bindings, 0..) |binding, index| {
+        try definition_core.json.safeIdentifier(binding.parameter, 128);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                plan.envelope.partition_bindings[index - 1].parameter,
+                binding.parameter,
+            ) != .lt)
+        {
+            return error.InvalidProtocolPartitionBindings;
+        }
+    }
     const fields = [_][]const u8{
         plan.envelope.sequence_key,
         plan.envelope.kind_key,
@@ -1113,6 +1411,21 @@ fn validatePlan(plan: *const Plan) !void {
     if (plan.reducer_plan) |*compiled| try reducer.validatePlan(compiled);
     if (plan.reducer_plan != null and plan.state_reducer_plan != null) {
         return error.MultipleProtocolReducers;
+    }
+}
+
+fn validatePartitionBindingsAgainstDefinition(
+    bindings: []const PartitionBinding,
+    definition_plan: *const definition.Plan,
+) !void {
+    for (bindings) |binding| {
+        const declaration =
+            definition_plan.parameter_declarations.find(
+                binding.parameter,
+            ) orelse return error.CacheProtocolPartitionBindingMismatch;
+        if (declaration.kind != binding.kind) {
+            return error.CacheProtocolPartitionBindingMismatch;
+        }
     }
 }
 
@@ -1562,14 +1875,14 @@ test "event materialization reconstructs validated request literals" {
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/request-literals",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","exact-object","previous-digest","replay","sequence"]},
-        \\  "parameters":{},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},
+        \\  "parameters":{"stream":{"type":"safe_identifier","required":true}},
         \\  "inputs":{"request":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","input":"request","path":"","keys":["body","kind","schema"]},
+        \\    {"op":"exact-object","input":"request","path":"","keys":["body","kind","schema","stream_id"]},
         \\    {"op":"enum","input":"request","path":"/schema","values":["example-request/v1"]},
-        \\    {"op":"event-envelope","input":"request","keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}
+        \\    {"op":"event-envelope","input":"request","keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}
         \\  ]},
         \\  "constraints":[
         \\    {"op":"sequence","start":1},
@@ -1579,12 +1892,13 @@ test "event materialization reconstructs validated request literals" {
         \\    {"op":"event-kinds","values":["created"]}
         \\  ],
         \\  "identity":{},
-        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
         \\  "operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{
         \\    "body_input_field":"body",
         \\    "fields":[
         \\      {"field":"kind","input_field":"kind"},
-        \\      {"field":"schema","literal":"example-event/v1"}
+        \\      {"field":"schema","literal":"example-event/v1"},
+        \\      {"field":"stream_id","input_field":"stream_id"}
         \\    ],
         \\    "request_literals":[{"field":"schema","literal":"example-request/v1"}]
         \\  }}]}},
@@ -1645,7 +1959,7 @@ test "event materialization reconstructs validated request literals" {
     var request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"}}",
         .{ .allocate = .alloc_always },
     );
     defer request.deinit();
@@ -1681,14 +1995,54 @@ test "event materialization reconstructs validated request literals" {
     );
     defer std.testing.allocator.free(reconstructed);
     try std.testing.expectEqualStrings(
-        "{\"body\":{\"id\":\"item-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\"}",
+        "{\"body\":{\"id\":\"item-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\",\"stream_id\":\"stream-1\"}",
         reconstructed,
+    );
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "stream-1" }},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    try applyBound(
+        std.testing.allocator,
+        &plan,
+        &state,
+        event,
+        &parameters,
+    );
+    var wrong_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "stream-2" }},
+    );
+    defer wrong_parameters.deinit(std.testing.allocator);
+    var wrong_state = ReplayState.init(&plan);
+    defer wrong_state.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.EventPartitionValueMismatch,
+        applyBound(
+            std.testing.allocator,
+            &plan,
+            &wrong_state,
+            event,
+            &wrong_parameters,
+        ),
+    );
+    try std.testing.expectError(
+        error.ProtocolPartitionParametersMissing,
+        apply(
+            std.testing.allocator,
+            &plan,
+            &wrong_state,
+            event,
+        ),
     );
 
     var invalid_request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"wrong/v1\",\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+        "{\"schema\":\"wrong/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"}}",
         .{ .allocate = .alloc_always },
     );
     defer invalid_request.deinit();

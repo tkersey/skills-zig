@@ -127,6 +127,7 @@ pub fn transact(
             operation,
             operation_name,
             repo_root,
+            parameters,
         );
     }
     var execution = try validation.execute(allocator, validation_plan, documents);
@@ -320,6 +321,7 @@ fn bindExisting(
     operation: *const storage.Operation,
     operation_name: []const u8,
     repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     const ledger_root = try std.fs.path.join(
         allocator,
@@ -370,6 +372,7 @@ fn bindExisting(
             effect,
             operation_name,
             repo_root,
+            parameters,
         );
         prepared_count += 1;
     }
@@ -490,6 +493,7 @@ fn prepareExistingBinding(
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
 ) !PreparedBinding {
     if (effect.kind != .bind_existing) {
         return error.BindingOperationCannotMixEffects;
@@ -538,6 +542,7 @@ fn prepareExistingBinding(
         event_protocol,
         effect.slot_index,
         slot_content,
+        parameters,
     );
     const binding_after = try custody.appendBindingRowAlloc(
         allocator,
@@ -578,6 +583,7 @@ fn validateExistingContent(
     event_protocol: ?*const protocol.Plan,
     slot_index: u16,
     content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
 ) !?usize {
     const input_index = effect.input_index;
     const input = definition_plan.inputs[input_index];
@@ -618,6 +624,7 @@ fn validateExistingContent(
                 plan,
                 &protocol_state.?,
                 line,
+                parameters,
             );
         } else {
             try validateExistingDocument(
@@ -656,6 +663,7 @@ fn validateExistingEvent(
     event_protocol: *const protocol.Plan,
     protocol_state: *protocol.ReplayState,
     bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
 ) !void {
     if (event_materialization) |materialized| {
         var parsed = try std.json.parseFromSlice(
@@ -692,11 +700,12 @@ fn validateExistingEvent(
         );
         defer execution.deinit();
         if (!execution.isValid()) return error.ExistingStoreValidationFailed;
-        try protocol.applyValue(
+        try protocol.applyValueBound(
             allocator,
             event_protocol,
             protocol_state,
             parsed.value,
+            parameters,
         );
         return;
     }
@@ -709,11 +718,12 @@ fn validateExistingEvent(
     if (!execution.isValid()) return error.ExistingStoreValidationFailed;
     const event = execution.inputJson(input_index) orelse
         return error.ExistingProtocolInputMustBeJson;
-    try protocol.applyValue(
+    try protocol.applyValueBound(
         allocator,
         event_protocol,
         protocol_state,
         event,
+        parameters,
     );
 }
 
@@ -919,6 +929,7 @@ fn prepareEffect(
             definition_plan.id,
             slot,
             &snapshot,
+            parameters,
             definition_plan.bounds.max_records,
             protocol_required,
         );
@@ -961,11 +972,12 @@ fn prepareEffect(
                 return error.ProtocolInputMustBeJson,
             currentUnixSeconds(),
         );
-        try protocol.apply(
+        try protocol.applyBound(
             allocator,
             current_protocol,
             &protocol_state.?,
             canonical_input_storage.?,
+            parameters,
         );
     } else {
         if (effect.event != null) {
@@ -977,12 +989,13 @@ fn prepareEffect(
             if (protocol_state == null) {
                 protocol_state = protocol.ReplayState.init(current_protocol);
             }
-            try protocol.applyValue(
+            try protocol.applyValueBound(
                 allocator,
                 current_protocol,
                 &protocol_state.?,
                 execution.inputJson(effect.input_index) orelse
                     return error.ProtocolInputMustBeJson,
+                parameters,
             );
         }
     }
@@ -1580,6 +1593,7 @@ test "transaction appends an event and binding in one durable transaction" {
             definition_plan.id,
             resolved_storage.slot(0),
             &bounded_snapshot,
+            &first_parameters,
             1,
             false,
         ),
@@ -1845,6 +1859,7 @@ test "transaction materializes passive event requests before chained append" {
         definition_plan.id,
         resolved_storage.slot(0),
         &snapshot,
+        &first_parameters,
         3,
         true,
     );
@@ -1997,6 +2012,7 @@ test "transaction admits and replays a definition-bound event chain" {
         definition_plan.id,
         resolved_storage.slot(protocol_plan.target_slot_index),
         &snapshot,
+        &parameters,
         definition_plan.bounds.max_records,
         true,
     );
@@ -2015,6 +2031,7 @@ test "transaction admits and replays a definition-bound event chain" {
             definition_plan.id,
             resolved_storage.slot(protocol_plan.target_slot_index),
             &snapshot,
+            &parameters,
             definition_plan.bounds.max_records,
             false,
         ),
@@ -2178,6 +2195,7 @@ test "document replacements replay from immutable prior revisions" {
         definition_plan.id,
         resolved_storage.slot(0),
         &snapshot,
+        &parameters,
         definition_plan.bounds.max_records,
         false,
     );
@@ -2221,6 +2239,7 @@ test "document replacements replay from immutable prior revisions" {
             definition_plan.id,
             resolved_storage.slot(0),
             &snapshot,
+            &parameters,
             definition_plan.bounds.max_records,
             false,
         ),

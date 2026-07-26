@@ -815,6 +815,7 @@ pub fn execute(
         definition_plan.id,
         slot,
         &snapshot,
+        parameters,
         definition_plan.bounds.max_records,
         event_protocol != null and
             event_protocol.?.target_slot_index == compiled.slot_index,
