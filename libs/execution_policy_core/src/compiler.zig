@@ -1676,15 +1676,13 @@ fn writeLoweredDimensions(
     root: std.json.ObjectMap,
 ) !void {
     const potential = objectField(root, "potential").?;
-    for (arrayField(potential, "dimensions").?, 0..) |value, index| {
+    const dimensions = arrayField(potential, "dimensions").?;
+    for (stringValues(potential, "lexicographic_order"), 0..) |value, index| {
         if (index > 0) try writer.writeByte(',');
-        const dimension = value.object;
+        const dimension_id = valueString(value).?;
+        const dimension = sourceDimension(dimensions, dimension_id).?;
         try writer.writeByte('{');
-        try writeNamedString(
-            writer,
-            "id",
-            stringField(dimension, "dimension_id").?,
-        );
+        try writeNamedString(writer, "id", dimension_id);
         try writer.writeAll(",\"direction\":");
         try writeJsonString(writer, stringField(dimension, "direction").?);
         if (dimension.get("terminal_threshold")) |threshold| {
@@ -1713,6 +1711,9 @@ fn writeLoweredAction(
     try writeStringArrayValue(writer, action.get("requires_actions"));
     try writer.writeAll(",\"repeatable\":");
     try writer.writeAll(if (boolField(action, "repeatable") orelse false) "true" else "false");
+    if (actionReferencedAsRollback(root, action_id)) {
+        try writer.writeAll(",\"rollback_only\":true");
+    }
     if (isRiskyKind(kind)) try writer.writeAll(",\"risky\":true");
     if (std.mem.eql(u8, kind, "prove")) try writer.writeAll(",\"prove\":true");
     try writer.writeAll(",\"expected_observation_refs\":");
@@ -1729,6 +1730,8 @@ fn writeLoweredAction(
         try writer.writeAll(",\"rollback_actions\":[");
         try writeJsonString(writer, nullableStringField(rollback.?, "action_id").?);
         try writer.writeByte(']');
+        try writer.writeAll(",\"rollback_trigger_atoms\":");
+        try writeStringArrayValue(writer, rollback.?.get("trigger_atoms"));
     }
     try writer.writeAll(",\"utility\":[");
     try writeLoweredActionUtility(writer, root, action);
@@ -3064,6 +3067,14 @@ fn validateLoweringPotential(
             try builder.add(.schema_invalid, "$.potential.dimensions");
         }
     }
+    if (dimensions == .array) {
+        try validatePotentialOrder(
+            builder,
+            potential,
+            dimensions.array.items,
+            allocator,
+        );
+    }
     if (objectField(potential, "baseline_expectation") == null) {
         try builder.add(.schema_invalid, "$.potential.baseline_expectation");
     }
@@ -3082,6 +3093,51 @@ fn validateLoweringPotential(
                     ),
                 );
             }
+        }
+    }
+}
+
+fn validatePotentialOrder(
+    builder: *errors.Builder,
+    potential: std.json.ObjectMap,
+    dimensions: []const std.json.Value,
+    allocator: std.mem.Allocator,
+) !void {
+    const order = stringValues(potential, "lexicographic_order");
+    if (order.len != dimensions.len) {
+        try builder.add(.schema_invalid, "$.potential.lexicographic_order");
+    }
+    var dimension_ids: std.ArrayList([]const u8) = .empty;
+    for (dimensions) |value| {
+        if (value != .object) continue;
+        const id = stringField(value.object, "dimension_id") orelse continue;
+        if (contains(dimension_ids.items, id)) {
+            try builder.add(.id_duplicate, "$.potential.dimensions");
+        } else {
+            try dimension_ids.append(allocator, id);
+        }
+    }
+    var ordered_ids: std.ArrayList([]const u8) = .empty;
+    for (order) |value| {
+        const id = valueString(value) orelse continue;
+        if (!contains(dimension_ids.items, id)) {
+            try builder.add(
+                .reference_unknown,
+                "$.potential.lexicographic_order",
+            );
+        }
+        if (contains(ordered_ids.items, id)) {
+            try builder.add(.id_duplicate, "$.potential.lexicographic_order");
+        } else {
+            try ordered_ids.append(allocator, id);
+        }
+    }
+    for (dimension_ids.items) |id| {
+        if (!contains(ordered_ids.items, id)) {
+            try builder.add(
+                .reference_unknown,
+                "$.potential.lexicographic_order",
+            );
         }
     }
 }
@@ -3270,6 +3326,35 @@ fn sourceAction(
         )) return value.object;
     }
     return null;
+}
+
+fn sourceDimension(
+    dimensions: []const std.json.Value,
+    id: []const u8,
+) ?std.json.ObjectMap {
+    for (dimensions) |value| {
+        if (value != .object) continue;
+        if (std.mem.eql(
+            u8,
+            stringField(value.object, "dimension_id") orelse "",
+            id,
+        )) return value.object;
+    }
+    return null;
+}
+
+fn actionReferencedAsRollback(
+    root: std.json.ObjectMap,
+    action_id: []const u8,
+) bool {
+    const actions = arrayField(root, "actions") orelse return false;
+    for (actions) |value| {
+        if (value != .object) continue;
+        const rollback = objectField(value.object, "rollback") orelse continue;
+        const target = nullableStringField(rollback, "action_id") orelse continue;
+        if (std.mem.eql(u8, target, action_id)) return true;
+    }
+    return false;
 }
 
 fn shieldTargetsAction(
@@ -3522,5 +3607,89 @@ test "action factor references are scoped to their owning seams" {
     try std.testing.expectEqualStrings(
         "$.actions[0].realizes_factor_refs",
         report.errors[0].path,
+    );
+}
+
+test "lowering orders potential dimensions lexicographically" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"potential\":{\"lexicographic_order\":[\"risk\",\"cost\"]," ++
+            "\"dimensions\":[{\"dimension_id\":\"cost\",\"direction\":\"minimize\"}," ++
+            "{\"dimension_id\":\"risk\",\"direction\":\"maximize\"}]}}",
+        .{},
+    );
+    defer parsed.deinit();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    try writeLoweredDimensions(&out.writer, parsed.value.object);
+    try out.writer.writeByte(']');
+    const bytes = try out.toOwnedSlice();
+    defer std.testing.allocator.free(bytes);
+    var lowered = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        bytes,
+        .{},
+    );
+    defer lowered.deinit();
+    try std.testing.expectEqualStrings(
+        "risk",
+        stringField(lowered.value.array.items[0].object, "id").?,
+    );
+    try std.testing.expectEqualStrings(
+        "cost",
+        stringField(lowered.value.array.items[1].object, "id").?,
+    );
+}
+
+test "lowering preserves rollback trigger atoms" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        @embedFile("fixtures/valid_architectonic_epg.json"),
+        .{},
+    );
+    defer parsed.deinit();
+    const root = objectField(
+        parsed.value.object,
+        "execution_policy_graph",
+    ).?;
+    const action = arrayField(root, "actions").?[0].object;
+    var rollback = objectField(action, "rollback").?;
+    try rollback.put(
+        std.testing.allocator,
+        "action_id",
+        .{ .string = "R" },
+    );
+    const triggers = rollback.getPtr("trigger_atoms").?;
+    try triggers.array.append(.{ .string = "obs:OBS=bad" });
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try writeLoweredAction(
+        arena.allocator(),
+        &out.writer,
+        root,
+        action,
+    );
+    const bytes = try out.toOwnedSlice();
+    defer std.testing.allocator.free(bytes);
+    var lowered = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        bytes,
+        .{},
+    );
+    defer lowered.deinit();
+    try std.testing.expectEqualStrings(
+        "R",
+        lowered.value.object.get("rollback_actions").?.array.items[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "obs:OBS=bad",
+        lowered.value.object.get("rollback_trigger_atoms").?.array.items[0].string,
     );
 }

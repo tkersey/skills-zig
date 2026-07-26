@@ -829,6 +829,13 @@ test "rollback shield requires a concrete rollback action" {
     );
 }
 
+test "potential lexicographic order must be an exact dimension permutation" {
+    try expectFixtureReplacementRejected(
+        "\"lexicographic_order\": [\n        \"open\"\n      ]",
+        "\"lexicographic_order\": [\"open\", \"open\"]",
+    );
+}
+
 test "compiled rich policy rejects a dangling action outcome" {
     const with_fact = try std.mem.replaceOwned(
         u8,

@@ -282,6 +282,33 @@ const Validator = struct {
                 }
                 try self.requireStringArray(rollback, "$.actions", index, ".rollback_actions");
             }
+            if (obj.get("rollback_trigger_atoms")) |triggers| {
+                try self.requireStringArray(
+                    triggers,
+                    "$.actions",
+                    index,
+                    ".rollback_trigger_atoms",
+                );
+                if (obj.get("rollback_actions") == null) {
+                    try self.addIndex(
+                        .schema_invalid,
+                        "$.actions",
+                        index,
+                        ".rollback_trigger_atoms",
+                    );
+                }
+                if (triggers == .array) {
+                    for (triggers.array.items) |item| {
+                        if (item != .string) continue;
+                        try self.validateDeclaredAtom(
+                            item.string,
+                            "$.actions",
+                            index,
+                            ".rollback_trigger_atoms",
+                        );
+                    }
+                }
+            }
             if (obj.get("results")) |results| try self.validateActionResults(results, index);
         }
     }

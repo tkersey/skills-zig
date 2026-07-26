@@ -32,6 +32,16 @@ pub fn select(allocator: std.mem.Allocator, policy: *const schema.Policy, state:
     defer eligible_actions.deinit(allocator);
     var eligible_terminals: std.ArrayList(TerminalCandidate) = .empty;
     defer eligible_terminals.deinit(allocator);
+    try collectTriggeredRollbacks(
+        allocator,
+        policy_root,
+        satisfied,
+        completed,
+        failed,
+        active_shields.items,
+        &eligible_actions,
+        &shielded_candidates,
+    );
     if (forbiddenResponse(policy_root, satisfied)) |terminal_id| {
         try eligible_terminals.append(allocator, .{
             .rule_id = "forbidden_state",
@@ -194,6 +204,62 @@ fn appendShielded(allocator: std.mem.Allocator, out: *std.ArrayList(ShieldedCand
         if (std.mem.eql(u8, candidate.action_id, action_id) and std.mem.eql(u8, candidate.response, response)) return;
     }
     try out.append(allocator, .{ .action_id = action_id, .response = response });
+}
+
+fn collectTriggeredRollbacks(
+    allocator: std.mem.Allocator,
+    policy_root: std.json.ObjectMap,
+    satisfied: []const []const u8,
+    completed: []const []const u8,
+    failed: []const []const u8,
+    active_shields: []const ShieldedCandidate,
+    eligible: *std.ArrayList(ActionCandidate),
+    shielded: *std.ArrayList(ShieldedCandidate),
+) !void {
+    const actions = policy_root.get("actions") orelse return;
+    if (actions != .array) return;
+    for (actions.array.items) |value| {
+        if (value != .object) continue;
+        const source = value.object;
+        const source_id = stringField(source, "id") orelse continue;
+        const triggers = source.get("rollback_trigger_atoms") orelse continue;
+        if (!contains(failed, source_id) or !containsAll(satisfied, triggers)) continue;
+        const rollback_ids = source.get("rollback_actions") orelse continue;
+        if (rollback_ids != .array) continue;
+        for (rollback_ids.array.items) |rollback_id_value| {
+            if (rollback_id_value != .string) continue;
+            const rollback = actionObject(
+                policy_root,
+                rollback_id_value.string,
+            ) orelse continue;
+            if (!try actionEligible(
+                allocator,
+                policy_root,
+                rollback,
+                satisfied,
+                completed,
+                failed,
+            )) continue;
+            if (shieldResponseFor(
+                active_shields,
+                rollback_id_value.string,
+            )) |response| {
+                try appendShielded(
+                    allocator,
+                    shielded,
+                    rollback_id_value.string,
+                    response,
+                );
+                continue;
+            }
+            try eligible.append(allocator, .{
+                .rule_id = "rollback",
+                .action_id = rollback_id_value.string,
+                .priority = std.math.minInt(i64),
+                .utility = utilitySlice(rollback),
+            });
+        }
+    }
 }
 
 fn actionEligible(
@@ -399,10 +465,23 @@ fn actionObject(root: std.json.ObjectMap, id: []const u8) ?std.json.ObjectMap {
 }
 
 fn shieldResponseFor(shielded: []const ShieldedCandidate, id: []const u8) ?[]const u8 {
+    var strongest: ?[]const u8 = null;
     for (shielded) |candidate| {
-        if (std.mem.eql(u8, candidate.action_id, id)) return candidate.response;
+        if (!std.mem.eql(u8, candidate.action_id, id)) continue;
+        if (strongest == null or
+            shieldResponseRank(candidate.response) >
+                shieldResponseRank(strongest.?))
+        {
+            strongest = candidate.response;
+        }
     }
-    return null;
+    return strongest;
+}
+
+fn shieldResponseRank(response: []const u8) u8 {
+    if (std.mem.eql(u8, response, "return_to_spec")) return 2;
+    if (std.mem.eql(u8, response, "rollback")) return 1;
+    return 0;
 }
 
 fn hasShieldResponse(shielded: []const ShieldedCandidate, response: []const u8) bool {
@@ -531,6 +610,62 @@ test "selection emits strongest shield response" {
     defer decision.deinit(std.testing.allocator);
     try expectWinner(&decision, "shield", "response", "rollback");
     try std.testing.expectEqual(@as(usize, 1), decision.root().object.get("shielded_candidates").?.array.items.len);
+}
+
+test "selection resolves overlapping shields independent of source order" {
+    const policy_json =
+        \\{"policy_id":"p","revision":1,
+        \\"actions":[{"id":"a"}],
+        \\"safety_shield":[
+        \\  {"action_id":"a","response":"blocked"},
+        \\  {"action_id":"a","response":"return_to_spec"}
+        \\],
+        \\"policy_rules":[{"id":"r","priority":1,"actions":["a"]}]}
+    ;
+    var policy = try schema.parseArtifact(
+        schema.Policy,
+        std.testing.allocator,
+        policy_json,
+    );
+    defer policy.deinit(std.testing.allocator);
+    var state = try schema.parseArtifact(
+        schema.State,
+        std.testing.allocator,
+        "{\"satisfied_atoms\":[]}",
+    );
+    defer state.deinit(std.testing.allocator);
+
+    var decision = try select(std.testing.allocator, &policy, &state);
+    defer decision.deinit(std.testing.allocator);
+    try expectWinner(&decision, "shield", "response", "return_to_spec");
+}
+
+test "selection exposes a triggered rollback action after failure" {
+    const policy_json =
+        \\{"policy_id":"p","revision":1,
+        \\"actions":[
+        \\  {"id":"a","rollback_trigger_atoms":["obs:check=failed"],
+        \\   "rollback_actions":["undo"]},
+        \\  {"id":"undo","kind":"rollback"}
+        \\],
+        \\"policy_rules":[{"id":"r","priority":1,"actions":["a"]}]}
+    ;
+    var policy = try schema.parseArtifact(
+        schema.Policy,
+        std.testing.allocator,
+        policy_json,
+    );
+    defer policy.deinit(std.testing.allocator);
+    var state = try schema.parseArtifact(
+        schema.State,
+        std.testing.allocator,
+        "{\"satisfied_atoms\":[\"obs:check=failed\"],\"failed_actions\":[\"a\"]}",
+    );
+    defer state.deinit(std.testing.allocator);
+
+    var decision = try select(std.testing.allocator, &policy, &state);
+    defer decision.deinit(std.testing.allocator);
+    try expectWinner(&decision, "action", "id", "undo");
 }
 
 test "selection ignores shields for actions that are not otherwise eligible" {
