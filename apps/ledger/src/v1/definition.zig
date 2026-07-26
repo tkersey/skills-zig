@@ -164,6 +164,7 @@ pub const Operator = enum {
             .keyed_unique => 2,
             .regex => 2,
             .sha256 => 2,
+            .reducer => 2,
             else => 1,
         };
     }

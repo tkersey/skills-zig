@@ -275,6 +275,7 @@ pub const Plan = struct {
 const Builder = struct {
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
+    inputs: []const definition.Input,
     pointers: std.ArrayList(Pointer) = .empty,
     rules: std.ArrayList(CompiledRule) = .empty,
     item_rule_count: usize = 0,
@@ -302,10 +303,49 @@ const Builder = struct {
     }
 
     fn inputIndex(self: Builder, name: []const u8) !u8 {
-        for (self.definition_plan.inputs, 0..) |input, index| {
+        for (self.inputs, 0..) |input, index| {
             if (std.mem.eql(u8, input.name, name)) return @intCast(index);
         }
         return error.UnknownRuleInput;
+    }
+
+    fn compileRawRule(self: *Builder, value: std.json.Value) !void {
+        const object = try definition_core.json.object(value);
+        const operator = try definition.Operator.parse(
+            try definition_core.json.requiredString(object, "op"),
+        );
+        if (!isValidationOperator(operator)) {
+            return error.UnsupportedValidationOperator;
+        }
+        if (!self.definition_plan.requires(operator)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        const pointer_id = if (object.get("path")) |raw_path|
+            try self.internPointer(try definition_core.json.string(raw_path))
+        else
+            null;
+        const import_index = if (operator == .definition_ref)
+            try findImportedDefinition(
+                self.definition_plan,
+                try definition_core.json.requiredString(
+                    object,
+                    "definition",
+                ),
+            )
+        else
+            null;
+        const canonical_config =
+            try definition_core.canonical_json.canonicalJsonAlloc(
+                self.allocator,
+                value,
+            );
+        defer self.allocator.free(canonical_config);
+        try self.compileRule(.{
+            .operator = operator,
+            .pointer_id = pointer_id,
+            .import_index = import_index,
+            .canonical_config = canonical_config,
+        });
     }
 
     fn compileRule(self: *Builder, source: definition.Rule) !void {
@@ -323,7 +363,7 @@ const Builder = struct {
         const object = try definition_core.json.object(parsed.value);
         const input_index = if (object.get("input")) |raw_input|
             try self.inputIndex(try definition_core.json.string(raw_input))
-        else if (self.definition_plan.inputs.len == 1)
+        else if (self.inputs.len == 1)
             0
         else
             return error.AmbiguousRuleInput;
@@ -2208,6 +2248,7 @@ pub fn compile(
     var builder = Builder{
         .allocator = allocator,
         .definition_plan = definition_plan,
+        .inputs = definition_plan.inputs,
     };
     errdefer builder.deinit();
     for (definition_plan.pointers) |pointer| _ = try builder.internPointer(pointer);
@@ -2231,6 +2272,66 @@ pub fn compile(
         .max_records = definition_plan.bounds.max_records,
         .max_diagnostics = definition_plan.bounds.max_diagnostics,
     };
+}
+
+pub fn compileEmbedded(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    inputs: []const definition.Input,
+    raw_rules: std.json.Value,
+    max_input_bytes: usize,
+    max_records: usize,
+    max_diagnostics: usize,
+) !Plan {
+    if (inputs.len == 0 or inputs.len > 64) {
+        return error.InvalidInputCount;
+    }
+    if (max_input_bytes == 0 or max_input_bytes > 256 * 1024 * 1024 or
+        max_records == 0 or max_records > 10_000_000 or
+        max_diagnostics == 0 or max_diagnostics > 1024)
+    {
+        return error.InvalidEmbeddedValidationBounds;
+    }
+    var builder = Builder{
+        .allocator = allocator,
+        .definition_plan = definition_plan,
+        .inputs = inputs,
+    };
+    errdefer builder.deinit();
+    const rules = try definition_core.json.array(raw_rules);
+    if (rules.items.len > 4096) {
+        return error.InvalidEmbeddedRuleCount;
+    }
+    for (rules.items) |rule| try builder.compileRawRule(rule);
+    const owned_inputs = try cloneInputs(allocator, inputs);
+    errdefer {
+        for (owned_inputs) |*input| input.deinit(allocator);
+        allocator.free(owned_inputs);
+    }
+    const pointers = try builder.pointers.toOwnedSlice(allocator);
+    errdefer {
+        for (pointers) |*pointer| pointer.deinit(allocator);
+        allocator.free(pointers);
+    }
+    const compiled_rules = try builder.rules.toOwnedSlice(allocator);
+    return .{
+        .inputs = owned_inputs,
+        .pointers = pointers,
+        .rules = compiled_rules,
+        .max_input_bytes = max_input_bytes,
+        .max_records = max_records,
+        .max_diagnostics = max_diagnostics,
+    };
+}
+
+fn findImportedDefinition(
+    definition_plan: *const definition.Plan,
+    id: []const u8,
+) !u16 {
+    for (definition_plan.imports, 0..) |imported, index| {
+        if (std.mem.eql(u8, imported.id, id)) return @intCast(index);
+    }
+    return error.UnknownImportedDefinition;
 }
 
 pub fn encodeCache(
@@ -2354,6 +2455,37 @@ pub fn validateCachePlan(
             cached.codec != declared.codec or
             cached.required != declared.required or
             cached.max_bytes != declared.max_bytes)
+        {
+            return error.CacheValidationPlanMismatch;
+        }
+    }
+    for (plan.rules) |rule| {
+        try validateRuleAgainstDefinition(rule, definition_plan);
+    }
+}
+
+pub fn validateEmbeddedCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (plan.inputs.len == 0 or plan.inputs.len > 64 or
+        plan.max_input_bytes == 0 or
+        plan.max_input_bytes > 256 * 1024 * 1024 or
+        plan.max_records == 0 or plan.max_records > 10_000_000 or
+        plan.max_diagnostics == 0 or plan.max_diagnostics > 1024)
+    {
+        return error.CacheValidationPlanMismatch;
+    }
+    for (plan.inputs, 0..) |input, index| {
+        try definition_core.json.safeIdentifier(input.name, 128);
+        if (input.codec != .json or input.max_bytes == 0 or
+            input.max_bytes > plan.max_input_bytes or
+            (index != 0 and
+                std.mem.order(
+                    u8,
+                    plan.inputs[index - 1].name,
+                    input.name,
+                ) != .lt))
         {
             return error.CacheValidationPlanMismatch;
         }
@@ -3860,10 +3992,22 @@ fn readOptionalF64(
 const LoadedInput = struct {
     bytes: ?[]const u8 = null,
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
+    borrowed_json: ?std.json.Value = null,
 
     fn deinit(self: *LoadedInput) void {
         if (self.parsed_json) |*parsed| parsed.deinit();
         self.* = undefined;
+    }
+
+    fn json(self: *const LoadedInput) ?std.json.Value {
+        if (self.parsed_json) |parsed| return parsed.value;
+        return self.borrowed_json;
+    }
+
+    fn jsonPtr(self: *LoadedInput) ?*std.json.Value {
+        if (self.parsed_json) |*parsed| return &parsed.value;
+        if (self.borrowed_json != null) return &self.borrowed_json.?;
+        return null;
     }
 };
 
@@ -3896,8 +4040,7 @@ pub const Execution = struct {
 
     pub fn inputJson(self: *const Execution, input_index: usize) ?std.json.Value {
         if (input_index >= self.loaded.len) return null;
-        const parsed = self.loaded[input_index].parsed_json orelse return null;
-        return parsed.value;
+        return self.loaded[input_index].json();
     }
 
     pub fn inputJsonPtr(
@@ -3905,11 +4048,7 @@ pub const Execution = struct {
         input_index: usize,
     ) ?*std.json.Value {
         if (input_index >= self.loaded.len) return null;
-        const parsed = if (self.loaded[input_index].parsed_json) |*value|
-            value
-        else
-            return null;
-        return &parsed.value;
+        return self.loaded[input_index].jsonPtr();
     }
 
     pub fn inputDigest(self: *const Execution, name: []const u8) ?[]const u8 {
@@ -4080,6 +4219,63 @@ pub fn execute(
     };
 }
 
+pub const InputValue = struct {
+    name: []const u8,
+    value: std.json.Value,
+};
+
+pub fn executeValues(
+    allocator: std.mem.Allocator,
+    validation_plan: *const Plan,
+    values: []const InputValue,
+) !Execution {
+    var diagnostics = definition_core.diagnostics.Collector.init(allocator, .{
+        .max_count = validation_plan.max_diagnostics,
+        .max_total_bytes = 64 * 1024,
+        .max_message_bytes = 2048,
+    });
+    errdefer diagnostics.deinit();
+    const loaded = try allocator.alloc(LoadedInput, validation_plan.inputs.len);
+    @memset(loaded, .{});
+    errdefer allocator.free(loaded);
+    const seen = try allocator.alloc(bool, validation_plan.inputs.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    for (values) |value| {
+        const input_index = findInput(
+            validation_plan.inputs,
+            value.name,
+        ) orelse return error.UnknownInputBinding;
+        if (seen[input_index]) return error.DuplicateInputBinding;
+        seen[input_index] = true;
+        loaded[input_index].borrowed_json = value.value;
+    }
+    for (validation_plan.inputs, 0..) |input, index| {
+        if (input.required and !seen[index]) {
+            try diagnostics.add(
+                "artifact.missing-input",
+                input.name,
+                "required input was not supplied",
+            );
+        }
+    }
+    for (validation_plan.rules) |rule| {
+        try applyRule(
+            allocator,
+            validation_plan,
+            loaded,
+            rule,
+            &diagnostics,
+        );
+    }
+    return .{
+        .allocator = allocator,
+        .loaded = loaded,
+        .input_digests = try allocator.alloc(InputDigest, 0),
+        .diagnostics = diagnostics,
+    };
+}
+
 pub fn validate(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -4098,8 +4294,7 @@ fn applyRule(
     rule: CompiledRule,
     diagnostics: *definition_core.diagnostics.Collector,
 ) !void {
-    const parsed = loaded[rule.input_index].parsed_json orelse return;
-    const root = parsed.value;
+    const root = loaded[rule.input_index].json() orelse return;
     const target = if (rule.pointer_id) |pointer_id|
         resolve(root, plan.pointers[pointer_id])
     else
@@ -4178,8 +4373,7 @@ fn applyRule(
                 rule,
                 value,
                 root,
-                (loaded[rule.other_input_index.?].parsed_json orelse
-                    return).value,
+                loaded[rule.other_input_index.?].json() orelse return,
             )
         else
             false,
@@ -4612,8 +4806,8 @@ fn compareRule(
     loaded: []const LoadedInput,
     rule: CompiledRule,
 ) bool {
-    const left_root = (loaded[rule.input_index].parsed_json orelse return false).value;
-    const right_root = (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
+    const left_root = loaded[rule.input_index].json() orelse return false;
+    const right_root = loaded[rule.other_input_index.?].json() orelse return false;
     return compareRuleRoots(plan, rule, left_root, right_root);
 }
 
@@ -8260,4 +8454,88 @@ test "definition references compile imported validators and survive cache round 
         decodeForAllocationFailure,
         .{payload},
     );
+}
+
+test "embedded validation compares borrowed event and retained state values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["cross-input-equal"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var rules = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\[{"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"}]
+    ,
+        .{},
+    );
+    defer rules.deinit();
+    var plan = try compileEmbedded(
+        std.testing.allocator,
+        &definition_plan,
+        definition_plan.inputs,
+        rules.value,
+        8192,
+        8,
+        8,
+    );
+    defer plan.deinit(std.testing.allocator);
+    var event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"goal_id\":\"goal-1\"}",
+        .{},
+    );
+    defer event.deinit();
+    var matching = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"goal_id\":\"goal-1\"}",
+        .{},
+    );
+    defer matching.deinit();
+    var valid = try executeValues(
+        std.testing.allocator,
+        &plan,
+        &.{
+            .{ .name = "event", .value = event.value },
+            .{ .name = "state", .value = matching.value },
+        },
+    );
+    defer valid.deinit();
+    try std.testing.expect(valid.isValid());
+
+    var stale = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"goal_id\":\"goal-2\"}",
+        .{},
+    );
+    defer stale.deinit();
+    var invalid = try executeValues(
+        std.testing.allocator,
+        &plan,
+        &.{
+            .{ .name = "event", .value = event.value },
+            .{ .name = "state", .value = stale.value },
+        },
+    );
+    defer invalid.deinit();
+    try std.testing.expect(!invalid.isValid());
 }

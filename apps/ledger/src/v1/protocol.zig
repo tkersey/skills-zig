@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const reducer = @import("reducer.zig");
+const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 
 const required_operator_mask =
@@ -63,6 +64,7 @@ pub const Plan = struct {
     max_records: usize,
     target_slot_index: u16,
     reducer_plan: ?reducer.Plan,
+    state_reducer_plan: ?state_reducer.Plan,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.envelope.deinit(allocator);
@@ -70,6 +72,7 @@ pub const Plan = struct {
         for (self.event_kinds) |kind| allocator.free(kind);
         allocator.free(self.event_kinds);
         if (self.reducer_plan) |*plan| plan.deinit(allocator);
+        if (self.state_reducer_plan) |*plan| plan.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -80,6 +83,7 @@ pub const ReplayState = struct {
     has_previous_digest: bool = false,
     records: usize = 0,
     reducer_state: reducer.State = .{},
+    state_reducer_state: state_reducer.State = .{},
 
     pub fn init(plan: *const Plan) ReplayState {
         return .{ .next_sequence = plan.sequence_start };
@@ -87,6 +91,7 @@ pub const ReplayState = struct {
 
     pub fn deinit(self: *ReplayState, allocator: std.mem.Allocator) void {
         self.reducer_state.deinit(allocator);
+        self.state_reducer_state.deinit(allocator);
         self.* = undefined;
     }
 
@@ -123,11 +128,6 @@ pub fn compile(
         required_operator_mask)
     {
         return error.IncompleteEventProtocolOperators;
-    }
-    if (definition_plan.requires(.transition_table) !=
-        definition_plan.requires(.reducer))
-    {
-        return error.IncompleteReducerOperators;
     }
     var rules: ProtocolRules = .{};
     for (definition_plan.rules) |rule| switch (rule.operator) {
@@ -190,18 +190,46 @@ pub fn compile(
     );
     var reducer_plan: ?reducer.Plan = null;
     errdefer if (reducer_plan) |*plan| plan.deinit(allocator);
-    if (definition_plan.requires(.transition_table)) {
-        if (rules.transition_table == null or rules.reducer == null) {
-            return error.IncompleteReducerRules;
+    var state_reducer_plan: ?state_reducer.Plan = null;
+    errdefer if (state_reducer_plan) |*plan| plan.deinit(allocator);
+    if (rules.reducer) |reducer_rule| {
+        if (!definition_plan.requires(.reducer)) {
+            return error.UndeclaredReducerRule;
         }
-        reducer_plan = try reducer.compile(
-            allocator,
-            rules.transition_table.?,
-            rules.reducer.?,
-            definition_plan.bounds.max_reducer_states,
-        );
-    } else if (rules.transition_table != null or rules.reducer != null) {
-        return error.UndeclaredReducerRule;
+        if (try state_reducer.isRetainedRule(allocator, reducer_rule)) {
+            if (definition_plan.requires(.transition_table) or
+                rules.transition_table != null)
+            {
+                return error.RetainedReducerRejectsTransitionTable;
+            }
+            state_reducer_plan = try state_reducer.compile(
+                allocator,
+                definition_plan,
+                reducer_rule,
+                definition_plan.inputs[envelope.input_index].max_bytes,
+            );
+            try state_reducer.validateEventKinds(
+                &state_reducer_plan.?,
+                event_kinds,
+            );
+        } else {
+            if (!definition_plan.requires(.transition_table) or
+                rules.transition_table == null)
+            {
+                return error.IncompleteReducerRules;
+            }
+            reducer_plan = try reducer.compile(
+                allocator,
+                rules.transition_table.?,
+                reducer_rule,
+                definition_plan.bounds.max_reducer_states,
+            );
+        }
+    } else if (rules.transition_table != null or
+        definition_plan.requires(.transition_table) or
+        definition_plan.requires(.reducer))
+    {
+        return error.IncompleteReducerRules;
     }
     const result: Plan = .{
         .envelope = envelope,
@@ -211,6 +239,7 @@ pub fn compile(
         .max_records = definition_plan.bounds.max_records,
         .target_slot_index = target_slot_index,
         .reducer_plan = reducer_plan,
+        .state_reducer_plan = state_reducer_plan,
     };
     try validateStorageMaterializations(&result, storage_plan);
     return result;
@@ -220,7 +249,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
     try encoder.writeBytes(plan.envelope.sequence_key);
@@ -241,13 +270,17 @@ pub fn encodeCache(
     if (plan.reducer_plan) |*compiled| {
         try reducer.encodeCache(compiled, encoder);
     }
+    try encoder.writeBool(plan.state_reducer_plan != null);
+    if (plan.state_reducer_plan) |*compiled| {
+        try state_reducer.encodeCache(compiled, encoder);
+    }
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
@@ -277,10 +310,20 @@ pub fn decodeCache(
         errdefer deinitStringSet(allocator, event_kinds);
         var reducer_plan: ?reducer.Plan = null;
         errdefer if (reducer_plan) |*compiled| compiled.deinit(allocator);
+        var state_reducer_plan: ?state_reducer.Plan = null;
+        errdefer if (state_reducer_plan) |*compiled| {
+            compiled.deinit(allocator);
+        };
         const max_records = try decoder.readUsize();
         const target_slot_index = try decoder.readU16();
         if (try decoder.readBool()) {
             reducer_plan = try reducer.decodeCache(allocator, decoder);
+        }
+        if (try decoder.readBool()) {
+            state_reducer_plan = try state_reducer.decodeCache(
+                allocator,
+                decoder,
+            );
         }
         break :plan .{
             .envelope = .{
@@ -300,6 +343,7 @@ pub fn decodeCache(
             .max_records = max_records,
             .target_slot_index = target_slot_index,
             .reducer_plan = reducer_plan,
+            .state_reducer_plan = state_reducer_plan,
         };
     };
     errdefer plan.deinit(allocator);
@@ -312,13 +356,10 @@ pub fn validateCachePlan(
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
 ) !void {
-    const reducer_required = definition_plan.requires(.transition_table) and
-        definition_plan.requires(.reducer);
-    if (definition_plan.requires(.transition_table) !=
-        definition_plan.requires(.reducer))
-    {
-        return error.CacheProtocolPlanMismatch;
-    }
+    const reducer_declared = definition_plan.requires(.reducer);
+    const transition_declared = definition_plan.requires(.transition_table);
+    const legacy_reducer = plan.reducer_plan != null;
+    const retained_reducer = plan.state_reducer_plan != null;
     try validatePlan(plan);
     if (plan.envelope.input_index >= definition_plan.inputs.len or
         definition_plan.inputs[plan.envelope.input_index].codec != .json or
@@ -326,7 +367,9 @@ pub fn validateCachePlan(
         definition_plan.storage_kind != .event_log or
         (definition_plan.operator_mask & required_operator_mask) !=
             required_operator_mask or
-        (plan.reducer_plan != null) != reducer_required)
+        (legacy_reducer and retained_reducer) or
+        reducer_declared != (legacy_reducer or retained_reducer) or
+        transition_declared != legacy_reducer)
     {
         return error.CacheProtocolPlanMismatch;
     }
@@ -336,6 +379,14 @@ pub fn validateCachePlan(
         {
             return error.CacheProtocolPlanMismatch;
         }
+    }
+    if (plan.state_reducer_plan) |*compiled| {
+        try state_reducer.validatePlan(
+            compiled,
+            definition_plan,
+            definition_plan.inputs[plan.envelope.input_index].max_bytes,
+        );
+        try state_reducer.validateEventKinds(compiled, plan.event_kinds);
     }
     const expected_slot = try compileTargetSlot(
         storage_plan,
@@ -449,6 +500,14 @@ pub fn applyValue(
             allocator,
             compiled,
             &state.reducer_state,
+            event,
+        );
+    }
+    if (plan.state_reducer_plan) |*compiled| {
+        try state_reducer.apply(
+            allocator,
+            compiled,
+            &state.state_reducer_state,
             event,
         );
     }
@@ -1014,6 +1073,9 @@ fn validatePlan(plan: *const Plan) !void {
         .digest => |digest| try definition_core.json.digest(digest),
     }
     if (plan.reducer_plan) |*compiled| try reducer.validatePlan(compiled);
+    if (plan.reducer_plan != null and plan.state_reducer_plan != null) {
+        return error.MultipleProtocolReducers;
+    }
 }
 
 fn compileTargetSlot(
@@ -1350,6 +1412,106 @@ test "compiled event protocol validates exact chained envelopes" {
         error.ProtocolRecordBoundsExceeded,
         apply(std.testing.allocator, &plan, &state, third),
     );
+}
+
+test "retained reducer validates events against compiled current state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","cross-input-equal","event-digest","event-envelope","event-kinds","previous-digest","reducer","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]},{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]},{"on":"updated","requires":["current"],"forbids":[],"rules":[{"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/id","right_input":"current","right":"/id"}],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]}]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/retained.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var plan = (try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expect(plan.reducer_plan == null);
+    try std.testing.expect(plan.state_reducer_plan != null);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        256 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan, &storage_plan);
+
+    var state = ReplayState.init(&cached);
+    defer state.deinit(std.testing.allocator);
+    const first = try eventAlloc(
+        std.testing.allocator,
+        1,
+        "created",
+        null,
+        "{\"id\":\"item-1\",\"status\":\"open\"}",
+    );
+    defer std.testing.allocator.free(first);
+    try apply(std.testing.allocator, &cached, &state, first);
+    const current = state.state_reducer_state.get(
+        &cached.state_reducer_plan.?,
+        "current",
+    ).?;
+    var status_pointer = try definition_core.json_pointer.compile(
+        std.testing.allocator,
+        "/status",
+    );
+    defer status_pointer.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "open",
+        definition_core.json_pointer.lookup(
+            current,
+            status_pointer,
+        ).?.string,
+    );
+    const second = try eventAlloc(
+        std.testing.allocator,
+        2,
+        "updated",
+        state.previousDigest(),
+        "{\"id\":\"item-1\",\"status\":\"closed\"}",
+    );
+    defer std.testing.allocator.free(second);
+    try apply(std.testing.allocator, &cached, &state, second);
+    const stale = try eventAlloc(
+        std.testing.allocator,
+        3,
+        "updated",
+        state.previousDigest(),
+        "{\"id\":\"item-2\",\"status\":\"closed\"}",
+    );
+    defer std.testing.allocator.free(stale);
+    try std.testing.expectError(
+        error.ProtocolAdmissionRejected,
+        apply(std.testing.allocator, &cached, &state, stale),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.records);
 }
 
 test "event protocol rejects unknown kinds and broken digest links" {
