@@ -3,6 +3,19 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const physical = @import("physical.zig");
 
+pub fn supports(operator: definition.Operator) bool {
+    return switch (operator) {
+        .scan,
+        .filter,
+        .project,
+        .limit,
+        .named_relation,
+        .result_projection,
+        => true,
+        else => false,
+    };
+}
+
 pub const ColumnKind = enum {
     string,
     integer,

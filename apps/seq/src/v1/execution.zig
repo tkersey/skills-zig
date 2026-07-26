@@ -33,6 +33,7 @@ pub const Result = struct {
     values: []Value,
     width: usize,
     row_count: usize,
+    source_row_count: usize,
 
     pub fn rows(self: Result) Rows {
         return .{
@@ -333,6 +334,7 @@ pub const Runner = struct {
             .values = self.output,
             .width = self.program.output_field_indices.len,
             .row_count = self.output_row_count,
+            .source_row_count = self.source_row_count,
         };
     }
 

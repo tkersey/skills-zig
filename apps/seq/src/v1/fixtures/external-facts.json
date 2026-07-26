@@ -1,0 +1,13 @@
+{
+  "schema": "example-facts/v1",
+  "rows": [
+    {
+      "id": "first",
+      "active": false
+    },
+    {
+      "id": "second",
+      "active": true
+    }
+  ]
+}

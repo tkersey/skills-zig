@@ -148,6 +148,16 @@ pub fn build(b: *std.Build) void {
         },
     });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
+    const seq_v1_candidate_root = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/v1/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "app_meta", .module = seq_meta },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "seq_v1_core", .module = seq_v1_core },
+        },
+    });
     const seq_perf_cli = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/perf_cli.zig"),
         .target = target,
@@ -496,6 +506,11 @@ pub fn build(b: *std.Build) void {
     const seq = addExecutable(b, "seq", seq_root);
     seq.root_module.linkSystemLibrary("c", .{});
     seq.root_module.linkSystemLibrary("sqlite3", .{});
+    const seq_v1_candidate = addExecutable(
+        b,
+        "seq-v1-candidate",
+        seq_v1_candidate_root,
+    );
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
@@ -527,6 +542,7 @@ pub fn build(b: *std.Build) void {
     const durable_store_perf = addExecutable(b, "durable-store-perf", durable_store_perf_root);
 
     const seq_install = addInstallStep(b, seq);
+    const seq_v1_candidate_install = addInstallStep(b, seq_v1_candidate);
     const seq_perf_install = addInstallStep(b, seq_perf);
     const bench_stats_install = addInstallStep(b, bench_stats);
     const perf_report_install = addInstallStep(b, perf_report);
@@ -829,6 +845,22 @@ pub fn build(b: *std.Build) void {
         "test-seq-v1-core",
         "Run Seq 1.0 observation-definition compiler tests",
     );
+    const run_seq_v1_cli_tests = addTestStep(
+        b,
+        seq_v1_candidate_root,
+        "test-seq-v1-cli",
+        "Run Seq 1.0 candidate command-surface tests",
+    );
+    const seq_v1_cli_smoke_cmd = b.addSystemCommand(&.{
+        "bash",
+        "scripts/test-seq-v1-cli.sh",
+    });
+    seq_v1_cli_smoke_cmd.addArtifactArg(seq_v1_candidate);
+    const run_seq_v1_cli_smoke = b.step(
+        "test-seq-v1-cli-smoke",
+        "Run Seq 1.0 candidate definition and observation smoke tests",
+    );
+    run_seq_v1_cli_smoke.dependOn(&seq_v1_cli_smoke_cmd.step);
     const run_ledger_v1_core_tests = addTestStep(
         b,
         ledger_v1_core,
@@ -970,6 +1002,8 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(run_definition_core_guard);
     test_all.dependOn(&run_trace_core_tests.step);
     test_all.dependOn(&run_seq_v1_core_tests.step);
+    test_all.dependOn(&run_seq_v1_cli_tests.step);
+    test_all.dependOn(run_seq_v1_cli_smoke);
     test_all.dependOn(&run_ledger_v1_core_tests.step);
     test_all.dependOn(&run_ledger_v1_cli_tests.step);
     test_all.dependOn(run_ledger_v1_cli_smoke);
@@ -985,6 +1019,11 @@ pub fn build(b: *std.Build) void {
         "Build the unreleased Ledger 1.0 exact-candidate binary",
     );
     build_ledger_v1_candidate.dependOn(&ledger_v1_candidate_install.step);
+    const build_seq_v1_candidate = b.step(
+        "build-seq-v1-candidate",
+        "Build the unreleased Seq 1.0 exact-candidate binary",
+    );
+    build_seq_v1_candidate.dependOn(&seq_v1_candidate_install.step);
 
     const enable_zlinter = b.option(
         bool,

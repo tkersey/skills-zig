@@ -14,6 +14,7 @@ pub const Observation = struct {
     structured_index: structured.Index = .{},
     result: execution.Result,
     metrics: trace_core.StreamMetrics,
+    corpus_digest: [71]u8,
 
     pub fn deinit(self: *Observation, allocator: std.mem.Allocator) void {
         self.structured_index.deinit(allocator);
@@ -49,6 +50,7 @@ pub fn observeFile(
         program.source_field_indices,
         options,
     );
+    var corpus_hasher = CorpusHasher{};
     var trace = if (relation == .sessions)
         try trace_core.parseSessionSummaryTraceReaderWithVisitorMetrics(
             allocator,
@@ -56,8 +58,8 @@ pub fn observeFile(
             &reader.interface,
             stat.mtime.nanoseconds,
             parse_options,
-            {},
-            ignoreLine,
+            &corpus_hasher,
+            CorpusHasher.visit,
             &metrics,
         )
     else
@@ -67,8 +69,8 @@ pub fn observeFile(
             &reader.interface,
             stat.mtime.nanoseconds,
             parse_options,
-            {},
-            ignoreLine,
+            &corpus_hasher,
+            CorpusHasher.visit,
             &metrics,
         );
     errdefer trace.deinit(allocator);
@@ -96,6 +98,7 @@ pub fn observeFile(
         .structured_index = structured_index,
         .result = observation_result,
         .metrics = metrics,
+        .corpus_digest = corpus_hasher.digest(),
     };
 }
 
@@ -264,7 +267,27 @@ fn containsField(fields: []const u16, wanted: u16) bool {
     return false;
 }
 
-fn ignoreLine(_: void, _: []const u8, _: usize) !void {}
+const CorpusHasher = struct {
+    hasher: std.crypto.hash.sha2.Sha256 = .init(.{}),
+
+    fn visit(self: *CorpusHasher, line: []const u8, _: usize) !void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(line.len), .big);
+        self.hasher.update(&length);
+        self.hasher.update(line);
+    }
+
+    fn digest(self: CorpusHasher) [71]u8 {
+        var mutable = self;
+        var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        mutable.hasher.final(&raw);
+        const hex = std.fmt.bytesToHex(raw, .lower);
+        var encoded: [71]u8 = undefined;
+        @memcpy(encoded[0..7], "sha256:");
+        @memcpy(encoded[7..], &hex);
+        return encoded;
+    }
+};
 
 fn fillSourceEvent(
     row: []execution.Value,
@@ -645,6 +668,10 @@ test "trace adapter scans demanded session columns in one file pass" {
     defer observation.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 4), observation.metrics.lines_seen);
+    try std.testing.expectEqualStrings(
+        "sha256:",
+        observation.corpus_digest[0..7],
+    );
     try std.testing.expectEqual(@as(usize, 1), observation.result.row_count);
     try std.testing.expectEqualStrings(
         "session-1",

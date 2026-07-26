@@ -14,6 +14,7 @@ pub const Relation = struct {
     canonical_json_values: [][]u8,
     row_count: usize,
     width: usize,
+    input_bytes: usize,
     raw_digest: [71]u8,
 
     pub fn deinit(self: *Relation, allocator: std.mem.Allocator) void {
@@ -154,6 +155,7 @@ pub fn parseBytes(
         .canonical_json_values = owned_json_values,
         .row_count = rows.items.len,
         .width = input.fields.len,
+        .input_bytes = bytes.len,
         .raw_digest = raw_digest,
     };
 }
