@@ -215,7 +215,7 @@ fn compileFromSource(
                 allocator,
                 &result.definition_plan,
             );
-            result.materialization_plan = try materialization.compile(
+            result.materialization_plan = try materialization.compileForValidation(
                 allocator,
                 &result.definition_plan,
             );

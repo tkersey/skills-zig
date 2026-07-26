@@ -4799,10 +4799,17 @@ fn importedPlanHolds(
     plan: *const Plan,
     root: std.json.Value,
 ) anyerror!bool {
-    for (plan.rules) |rule| {
-        if (!try itemRuleHolds(allocator, plan, rule, root)) return false;
-    }
-    return true;
+    if (plan.inputs.len != 1) return error.ImportedDefinitionNotReusable;
+    var execution = try executeValues(
+        allocator,
+        plan,
+        &.{.{
+            .name = plan.inputs[0].name,
+            .value = root,
+        }},
+    );
+    defer execution.deinit();
+    return execution.isValid();
 }
 
 fn compareRule(
@@ -8458,6 +8465,62 @@ test "definition references compile imported validators and survive cache round 
         decodeForAllocationFailure,
         .{payload},
     );
+}
+
+test "definition references execute imported cross-record constraints" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "record.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/record-set","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","keyed-unique"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["left","right"]}]},"constraints":[{"op":"keyed-unique","sources":[{"path":"/left","key":"/id"},{"path":"/right","key":"/id"}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "wrapper.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record-set","path":"record.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"wrapper":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["record"]},{"op":"definition-ref","path":"/record","definition":"example/record-set"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "wrapper.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "wrapper.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &plan,
+        &.{.{
+            .name = "wrapper",
+            .bytes = "{\"record\":{\"left\":[{\"id\":\"a\"}],\"right\":[{\"id\":\"b\"}]}}",
+        }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    var duplicate = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &plan,
+        &.{.{
+            .name = "wrapper",
+            .bytes = "{\"record\":{\"left\":[{\"id\":\"a\"}],\"right\":[{\"id\":\"a\"}]}}",
+        }},
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate.valid);
 }
 
 test "embedded validation compares borrowed event and retained state values" {

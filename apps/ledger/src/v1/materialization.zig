@@ -212,6 +212,33 @@ pub fn compile(
     };
 }
 
+pub fn compileForValidation(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+) !Plan {
+    return compile(allocator, definition_plan) catch |err| switch (err) {
+        error.MultipleCanonicalOutputs,
+        error.AmbiguousMaterializationInput,
+        => {
+            for (definition_plan.rules) |rule| switch (rule.operator) {
+                .content_address, .composite_identity => return err,
+                else => {},
+            };
+            if (definition_plan.inputs.len == 0) {
+                return error.AmbiguousMaterializationInput;
+            }
+            return .{
+                .input_index = 0,
+                .codec = definition_plan.inputs[0].codec,
+                .normalize_line_endings = false,
+                .trailing_newline = .preserve,
+                .identity = .none,
+            };
+        },
+        else => return err,
+    };
+}
+
 pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
@@ -1598,4 +1625,54 @@ test "composite identity rejects non-scalar and oversized components" {
         try std.testing.expect(!result.validation_result.valid);
         try std.testing.expect(result.artifact_id == null);
     }
+}
+
+test "validation compiles identity-free request families without choosing an output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/request-family","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","exact-object"]},"inputs":{"left":{"codec":"json","required":false,"max_bytes":4096},"right":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"left"},{"op":"canonical-json","input":"right"}]},"shape":{"rules":[{"op":"exact-object","input":"left","path":"","keys":["id"]},{"op":"exact-object","input":"right","path":"","keys":["id"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.MultipleCanonicalOutputs,
+        compile(std.testing.allocator, &definition_plan),
+    );
+    var plan = try compileForValidation(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expect(plan.identity == .none);
+
+    var result = try validateArtifact(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &plan,
+        &.{.{ .name = "right", .bytes = "{\"id\":\"record-1\"}" }},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.valid);
 }
