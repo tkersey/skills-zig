@@ -43,11 +43,15 @@ pub fn compile(
                     else => return error.InvalidJsonPointer,
                 });
             }
-            try segments.append(allocator, try decoded.toOwnedSlice());
+            const segment = try decoded.toOwnedSlice();
+            errdefer allocator.free(segment);
+            try segments.append(allocator, segment);
         }
     }
+    const owned_raw = try allocator.dupe(u8, raw);
+    errdefer allocator.free(owned_raw);
     return .{
-        .raw = try allocator.dupe(u8, raw),
+        .raw = owned_raw,
         .segments = try segments.toOwnedSlice(allocator),
     };
 }

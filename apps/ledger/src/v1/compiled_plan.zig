@@ -3,11 +3,12 @@ const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const materialization = @import("materialization.zig");
+const protocol = @import("protocol.zig");
 const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 1;
+const payload_version: u16 = 2;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -54,11 +55,13 @@ pub const PlanSet = struct {
     validation_plan: ?validation.Plan = null,
     materialization_plan: ?materialization.Plan = null,
     storage_plan: ?storage.Plan = null,
+    protocol_plan: ?protocol.Plan = null,
     projection_plan: ?projection.Plan = null,
     stats: definition_core.result.CompileStats,
 
     pub fn deinit(self: *PlanSet, allocator: std.mem.Allocator) void {
         if (self.projection_plan) |*plan| plan.deinit(allocator);
+        if (self.protocol_plan) |*plan| plan.deinit(allocator);
         if (self.storage_plan) |*plan| plan.deinit(allocator);
         if (self.materialization_plan) |*plan| plan.deinit(allocator);
         if (self.validation_plan) |*plan| plan.deinit(allocator);
@@ -195,6 +198,10 @@ fn compileFromSource(
                 allocator,
                 &result.definition_plan,
             );
+            result.protocol_plan = try protocol.compile(
+                allocator,
+                &result.definition_plan,
+            );
             result.projection_plan = try projection.compile(
                 allocator,
                 &result.definition_plan,
@@ -226,12 +233,20 @@ fn compileFromSource(
                 allocator,
                 &result.definition_plan,
             );
+            result.protocol_plan = try protocol.compile(
+                allocator,
+                &result.definition_plan,
+            );
             if (result.storage_plan.?.findOperation(route.name.?) == null) {
                 return error.UnknownOperation;
             }
         },
         .project => {
             result.storage_plan = try storage.compile(
+                allocator,
+                &result.definition_plan,
+            );
+            result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
             );
@@ -246,6 +261,10 @@ fn compileFromSource(
         },
         .doctor => {
             result.storage_plan = try storage.compile(
+                allocator,
+                &result.definition_plan,
+            );
+            result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
             );
@@ -455,6 +474,10 @@ fn encodePlanSet(
     if (plan_set.storage_plan) |*plan| {
         try storage.encodeCache(plan, encoder);
     }
+    try encoder.writeBool(plan_set.protocol_plan != null);
+    if (plan_set.protocol_plan) |*plan| {
+        try protocol.encodeCache(plan, encoder);
+    }
     try encoder.writeBool(plan_set.projection_plan != null);
     if (plan_set.projection_plan) |*plan| {
         try projection.encodeCache(plan, encoder);
@@ -527,6 +550,12 @@ fn decodePlanSet(
     }
     if (try decoder.readBool()) {
         result.storage_plan = try storage.decodeCache(allocator, &decoder);
+    }
+    if (try decoder.readBool()) {
+        result.protocol_plan = try protocol.decodeCache(
+            allocator,
+            &decoder,
+        );
     }
     if (try decoder.readBool()) {
         result.projection_plan = try projection.decodeCache(
@@ -696,10 +725,13 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
         route.kind == .doctor;
     const required_projection = route.kind == .definition_check or
         route.kind == .project;
+    const required_protocol = required_storage and
+        protocol.isConfigured(&plan_set.definition_plan);
     if ((plan_set.validation_plan != null) != required_validation or
         (plan_set.materialization_plan != null) !=
             required_materialization or
         (plan_set.storage_plan != null) != required_storage or
+        (plan_set.protocol_plan != null) != required_protocol or
         (plan_set.projection_plan != null) != required_projection)
     {
         return error.CachePlanSetShapeMismatch;
@@ -715,6 +747,9 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
     }
     if (plan_set.storage_plan) |*plan| {
         try storage.validateCachePlan(plan, &plan_set.definition_plan);
+    }
+    if (plan_set.protocol_plan) |*plan| {
+        try protocol.validateCachePlan(plan, &plan_set.definition_plan);
     }
     if (plan_set.projection_plan) |*plan| {
         try projection.validateCachePlan(
@@ -965,7 +1000,7 @@ test "compiled plan cache releases every allocation on compile and decode failur
     try source_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","path-format"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"]},{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["captured"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     const source_root = try source_tmp.dir.realPathFileAlloc(
