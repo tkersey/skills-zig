@@ -1,0 +1,26 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete",
+      "base": "complete",
+      "expect": "valid",
+      "fixture_digest": "sha256:a673edcc0ebb66aad803346ffd096e4f46033ffb5a6a3e6fc3cf1f8416c91f8c"
+    },
+    {
+      "id": "missing-retro",
+      "base": "complete",
+      "expect": "invalid",
+      "fixture_digest": "sha256:2786be8a0e359cc4741bebab22237372ab6d4c76ac6d0afc1981d6edfadcbefd",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/spec_governance_receipt/retro"
+        }
+      ]
+    }
+  ]
+}

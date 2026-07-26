@@ -1,0 +1,27 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "current": "bases/current.json"
+  },
+  "cases": [
+    {
+      "id": "current",
+      "base": "current",
+      "expect": "valid",
+      "fixture_digest": "sha256:522a12d130f33c68d56be3a54f8bb36687e27a86b7d03437ee77174b6893eda2"
+    },
+    {
+      "id": "review-digest",
+      "base": "current",
+      "expect": "invalid",
+      "fixture_digest": "sha256:2e62c9cc112b601baa5a3b5a6f8ea2cc05679cf37a2aed9b957beba31dedeb5d",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/review_contract/contract_digest",
+          "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    }
+  ]
+}

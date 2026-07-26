@@ -1,0 +1,27 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete",
+      "base": "complete",
+      "expect": "valid",
+      "fixture_digest": "sha256:ae012f0bbb9712db930f4c167987f36a1938e140d8ac0d71d596afe940c97055"
+    },
+    {
+      "id": "unknown-condition-atom",
+      "base": "complete",
+      "expect": "invalid",
+      "fixture_digest": "sha256:9e3bf37abf76e0d3f70faac7b1967859020781a12c0f5b56dbfb47a9a037f7c1",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/execution_policy_graph/actions/0/preconditions/all/0",
+          "value": "fact:MISSING"
+        }
+      ]
+    }
+  ]
+}

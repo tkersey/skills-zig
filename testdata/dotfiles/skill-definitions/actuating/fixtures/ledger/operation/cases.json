@@ -1,0 +1,55 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "edit": "bases/edit.json",
+    "inspect": "bases/inspect.json"
+  },
+  "cases": [
+    {
+      "id": "edit",
+      "base": "edit",
+      "expect": "valid",
+      "fixture_digest": "sha256:177d6b1ec9482dfaaa64002925c5706017b55e3b5fce1de431a62b6b45073aa1"
+    },
+    {
+      "id": "inspect",
+      "base": "inspect",
+      "expect": "valid",
+      "fixture_digest": "sha256:0a2edf069c34053bcddfddda45a41ab36346ae534a1ca6601ed3352123c117b8"
+    },
+    {
+      "id": "edit-without-path",
+      "base": "edit",
+      "expect": "invalid",
+      "fixture_digest": "sha256:30f00a6cc254bfc41f2e653c431fbf8fd4582059e225ad2d11fd7b8cbecc7899",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/paths",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "multiple-proof-roles",
+      "base": "edit",
+      "expect": "invalid",
+      "fixture_digest": "sha256:bb9073ea8a12b91bc6e56641de2dd044705d341a316cdf643e5a616e34c54b65",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/effect",
+          "value": "verify"
+        },
+        {
+          "op": "replace",
+          "path": "/proof_obligation_refs",
+          "value": [
+            "proof-1",
+            "proof-2"
+          ]
+        }
+      ]
+    }
+  ]
+}

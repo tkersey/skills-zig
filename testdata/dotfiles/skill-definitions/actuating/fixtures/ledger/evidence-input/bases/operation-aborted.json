@@ -1,0 +1,1 @@
+{"body":{"reason":"subject drift","schema":"operation-aborted/v1","step_id":"step-1"},"construction_ref":"sha256:1111111111111111111111111111111111111111111111111111111111111111","goal_id":"goal-1","kind":"operation_aborted","schema":"actuating-evidence-input/v1","subject_digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"}

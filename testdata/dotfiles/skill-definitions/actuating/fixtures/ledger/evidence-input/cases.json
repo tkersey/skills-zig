@@ -1,0 +1,152 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "effect-recorded": "bases/effect-recorded.json",
+    "operation-aborted": "bases/operation-aborted.json",
+    "operation-observed": "bases/operation-observed.json",
+    "publication-observed": "bases/publication-observed.json",
+    "review-attempt-completed": "bases/review-attempt-completed.json",
+    "review-attempt-started": "bases/review-attempt-started.json",
+    "review-campaign-started": "bases/review-campaign-started.json",
+    "review-request-bound": "bases/review-request-bound.json",
+    "review-transport-failed": "bases/review-transport-failed.json"
+  },
+  "cases": [
+    {
+      "id": "effect-recorded",
+      "base": "effect-recorded",
+      "expect": "valid",
+      "fixture_digest": "sha256:8becb03d23aadbd70b8511b796aebde03a968c3e2c2bef695c26ff8eee926066"
+    },
+    {
+      "id": "operation-aborted",
+      "base": "operation-aborted",
+      "expect": "valid",
+      "fixture_digest": "sha256:719ac72222c2c32fdc702a550224f413ab5d75b09d2b61c4c06a3a48aa401df4"
+    },
+    {
+      "id": "operation-observed",
+      "base": "operation-observed",
+      "expect": "valid",
+      "fixture_digest": "sha256:ecd67d402537e326a91469916b4a8eff87c0ec228596d09c703e4e00ad9a2f37"
+    },
+    {
+      "id": "publication-observed",
+      "base": "publication-observed",
+      "expect": "valid",
+      "fixture_digest": "sha256:835ebc92976c644a481a2f412cb7afb3c7e0d4bf73f1a89e2612765d48ddac7f"
+    },
+    {
+      "id": "review-attempt-completed",
+      "base": "review-attempt-completed",
+      "expect": "valid",
+      "fixture_digest": "sha256:bca57e0c07b0080f8fa1702a86e3f8c0838969bb532c40f65a789868f2db8185"
+    },
+    {
+      "id": "review-attempt-started",
+      "base": "review-attempt-started",
+      "expect": "valid",
+      "fixture_digest": "sha256:f6e3ad1d9dee8f7552532bc35e065272d81de5e3c5aca58d58b4a5a3fedfe493"
+    },
+    {
+      "id": "review-campaign-started",
+      "base": "review-campaign-started",
+      "expect": "valid",
+      "fixture_digest": "sha256:5dd9ae1daab186e4b20a86ff7c8fd387f3296509596697f67d189a00e7075306"
+    },
+    {
+      "id": "review-request-bound",
+      "base": "review-request-bound",
+      "expect": "valid",
+      "fixture_digest": "sha256:a94ecc054654af53d81f734b909be2daf4c5cfde3b0f3468570dd909b5c68323"
+    },
+    {
+      "id": "review-transport-failed",
+      "base": "review-transport-failed",
+      "expect": "valid",
+      "fixture_digest": "sha256:9b28277d225593f53a7355e4d7af2cac5b835c3829f994c94a005ca66f8d54c0"
+    },
+    {
+      "id": "body-schema-mismatch",
+      "base": "operation-aborted",
+      "expect": "invalid",
+      "fixture_digest": "sha256:f8735aa61e6d72a0eaf81f323e406b772fa979d9887a50dd1c1e384c49c412ee",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/body/schema",
+          "value": "operation-observed/v1"
+        }
+      ]
+    },
+    {
+      "id": "duplicate-findings",
+      "base": "review-attempt-completed",
+      "expect": "invalid",
+      "fixture_digest": "sha256:a773ad7f2c789d3a155a1925d7f8b950c954a34c5a3e60788e345144ccf044d3",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/body/verdict",
+          "value": "findings"
+        },
+        {
+          "op": "replace",
+          "path": "/body/finding_refs",
+          "value": [
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/body/receipt_ref",
+          "value": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ]
+    },
+    {
+      "id": "empty-evidence-refs",
+      "base": "operation-observed",
+      "expect": "invalid",
+      "fixture_digest": "sha256:c3c384f970665e92bd834e379dcb2e619fd5c248a7f4134034783be392670020",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/body/discharged_refs",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/body/evidence_refs",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "unknown-kind",
+      "base": "operation-aborted",
+      "expect": "invalid",
+      "fixture_digest": "sha256:a8b6a5693960242f11f269489d4b6d3ccb8686717dbb3c63e7b415e95b520a44",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/kind",
+          "value": "unknown"
+        },
+        {
+          "op": "remove",
+          "path": "/body/schema"
+        },
+        {
+          "op": "remove",
+          "path": "/body/step_id"
+        },
+        {
+          "op": "remove",
+          "path": "/body/reason"
+        }
+      ]
+    }
+  ]
+}

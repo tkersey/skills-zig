@@ -1,0 +1,61 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete-addressed": "bases/complete-addressed.json",
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete-addressed",
+      "base": "complete-addressed",
+      "expect": "valid",
+      "fixture_digest": "sha256:a7f3b58a6d75eba7d9c6f8727db751f6edb16b6492a23e0041ed634275066187"
+    },
+    {
+      "id": "complete",
+      "base": "complete",
+      "expect": "valid",
+      "materialization": {
+        "artifact_id": "sha256:db03dc2b8a57357e2775a3bffbf5205483006c027c824aa6ef2e4c7ffe809e70",
+        "canonical_content_digest": "sha256:12e4803eddaf2be6d65d19904b27b84a90e25aef632db9427330c565c202ce95"
+      },
+      "fixture_digest": "sha256:6aa22d606ae68c28fcafb3a4b5ce5bb8526b91ae33ed7493f45c22123e9a9a6c"
+    },
+    {
+      "id": "identity-mismatch",
+      "base": "complete-addressed",
+      "expect": "invalid",
+      "fixture_digest": "sha256:13816a0e253582b5abc4d12357a20d6c76ab4921a80801d3ce7427df7c6eb2cb",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/receipt_id",
+          "value": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "op": "replace",
+          "path": "/cited_premise_refs",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "unknown-field",
+      "base": "complete",
+      "expect": "invalid",
+      "fixture_digest": "sha256:8337fa2dd8ee445e0408c38e4d5c723ab6ea7bed64361915e99befdc03246047",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/cited_premise_refs",
+          "value": []
+        },
+        {
+          "op": "add",
+          "path": "/approved",
+          "value": true
+        }
+      ]
+    }
+  ]
+}

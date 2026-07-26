@@ -1,0 +1,27 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete",
+      "base": "complete",
+      "expect": "valid",
+      "fixture_digest": "sha256:04f5ab721278e059a716779bc00de8fd41b8471c4cdabaeb26059edba6bfec89"
+    },
+    {
+      "id": "gate-only",
+      "base": "complete",
+      "expect": "invalid",
+      "fixture_digest": "sha256:1988a31e66373d4f6b98c29e6b969700ad2df432bd181af9f1ff136e6f03ad9f",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/plan_source_contract/sgr_v2/spec_governance_receipt/mode",
+          "value": "gate-only"
+        }
+      ]
+    }
+  ]
+}

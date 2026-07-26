@@ -1,0 +1,37 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "minimal": "bases/minimal.json"
+  },
+  "cases": [
+    {
+      "id": "minimal",
+      "base": "minimal",
+      "expect": "valid",
+      "fixture_digest": "sha256:1d4f2c5d718d846d51d1a1c41d4791ef71e724c750120461a210d9abb6983f65"
+    },
+    {
+      "id": "unknown-route",
+      "base": "minimal",
+      "expect": "invalid",
+      "fixture_digest": "sha256:ed4c9154ba4e8ad89413490bbc6b52839634e0618edab48a5c7b7232de37a179",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_decision_contract/triggers/0/cue_literals",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/skill_decision_contract/clauses/0/expected_routes/0",
+          "value": "MISSING-ROUTE"
+        },
+        {
+          "op": "replace",
+          "path": "/skill_decision_contract/clauses/0/rationale",
+          "value": "The missing route must fail closed."
+        }
+      ]
+    }
+  ]
+}

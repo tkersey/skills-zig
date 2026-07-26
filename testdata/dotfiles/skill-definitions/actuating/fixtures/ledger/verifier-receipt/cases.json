@@ -1,0 +1,50 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "passing": "bases/passing.json"
+  },
+  "cases": [
+    {
+      "id": "passing",
+      "base": "passing",
+      "expect": "valid",
+      "fixture_digest": "sha256:bff8c77f79aad04a7d78dd68848fe7639730c8583ea2f00a7c9983dae5602984"
+    },
+    {
+      "id": "empty-argv",
+      "base": "passing",
+      "expect": "invalid",
+      "fixture_digest": "sha256:a652eddf033bbe4f8281cd5e7947c23c47050974dcb33a1bf235727b7f04ce98",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/verifier/argv",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/output_digests",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "non-integer-exit",
+      "base": "passing",
+      "expect": "invalid",
+      "fixture_digest": "sha256:3768daf0a3f87a4ebb7bf931d2b8af2945f8c638d7d08d836bbd8523028d621b",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/exit_status",
+          "value": "pass"
+        },
+        {
+          "op": "replace",
+          "path": "/output_digests",
+          "value": []
+        }
+      ]
+    }
+  ]
+}

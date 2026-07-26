@@ -1,0 +1,32 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "accepted": "bases/accepted.json"
+  },
+  "cases": [
+    {
+      "id": "accepted",
+      "base": "accepted",
+      "expect": "valid",
+      "fixture_digest": "sha256:c15f3a58453b467e77fb230d9cfad785ce60cfa3003d7436cace9764c40f127c"
+    },
+    {
+      "id": "unknown-discrepancy",
+      "base": "accepted",
+      "expect": "invalid",
+      "fixture_digest": "sha256:59549994f0ec4d82b107fa25ad670ab1939118f097a484541a47e11cfaf9484e",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/artifact/payload/classes/0/discrepancy",
+          "value": "preference"
+        },
+        {
+          "op": "replace",
+          "path": "/artifact/payload/classes/0/finding_refs",
+          "value": []
+        }
+      ]
+    }
+  ]
+}
