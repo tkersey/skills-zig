@@ -783,7 +783,7 @@ const Builder = struct {
                     if (imported_rule.input_index != 0 or
                         (imported_rule.other_input_index != null and
                             imported_rule.other_input_index.? != 0) or
-                        !isItemOperator(imported_rule.operator))
+                        !isValidationOperator(imported_rule.operator))
                     {
                         return error.UnsupportedImportedDefinitionRule;
                     }
@@ -3118,7 +3118,7 @@ fn validateCachedRule(
             if (imported_rule.input_index != 0 or
                 (imported_rule.other_input_index != null and
                     imported_rule.other_input_index.? != 0) or
-                !isItemOperator(imported_rule.operator))
+                !isValidationOperator(imported_rule.operator))
             {
                 return error.CacheRuleConfigurationInvalid;
             }
@@ -3600,9 +3600,11 @@ fn applyRule(
             try referencesExist(
                 allocator,
                 plan,
-                loaded,
                 rule,
                 value,
+                root,
+                (loaded[rule.other_input_index.?].parsed_json orelse
+                    return).value,
             )
         else
             false,
@@ -3926,24 +3928,52 @@ fn itemRuleHolds(
             )
         else
             false,
+        .declared_field_values => if (target) |value|
+            try declaredFieldValuesHold(
+                allocator,
+                plan,
+                root,
+                rule,
+                value,
+            )
+        else
+            false,
+        .reference_exists => if (target) |value|
+            try referencesExist(
+                allocator,
+                plan,
+                rule,
+                value,
+                root,
+                root,
+            )
+        else
+            false,
         .implies => implicationHolds(plan, root, rule),
+        .total_partition => try totalPartition(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
+        .total_mapping => try totalMapping(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
+        .path_format => if (target) |value|
+            formattedFieldsHold(plan, rule, value)
+        else
+            false,
         .set_equality,
         .subset,
         .superset,
         .disjoint,
         .field_equal,
         .field_not_equal,
-        => {
-            const left = resolve(
-                root,
-                plan.pointers[rule.pointer_id.?],
-            ) orelse return false;
-            const right = resolve(
-                root,
-                plan.pointers[rule.other_pointer_id.?],
-            ) orelse return false;
-            return compareValues(rule.operator, left, right);
-        },
+        .cross_input_equal,
+        => compareRuleRoots(plan, rule, root, root),
         .exactly_one, .at_least_one => countPresent(plan, root, rule),
         .one_of => if (target) |value|
             oneOfRulesHold(allocator, plan, rule, value)
@@ -3987,6 +4017,15 @@ fn compareRule(
 ) bool {
     const left_root = (loaded[rule.input_index].parsed_json orelse return false).value;
     const right_root = (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
+    return compareRuleRoots(plan, rule, left_root, right_root);
+}
+
+fn compareRuleRoots(
+    plan: *const Plan,
+    rule: CompiledRule,
+    left_root: std.json.Value,
+    right_root: std.json.Value,
+) bool {
     if (rule.path_ids.len == 1) {
         const items = switch (resolve(
             left_root,
@@ -4631,16 +4670,15 @@ const ReferenceCoverageAlias = struct {
 fn referencesExist(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    loaded: []const LoadedInput,
     rule: CompiledRule,
     source_value: std.json.Value,
+    source_root: std.json.Value,
+    target_root: std.json.Value,
 ) !bool {
     var index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty;
     defer index.deinit(allocator);
     var coverage_aliases: std.ArrayList(ReferenceCoverageAlias) = .empty;
     defer coverage_aliases.deinit(allocator);
-    const target_root =
-        (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
     if (rule.reference_targets.len == 0) {
         if (!try indexSingleReferenceTargetSet(
             allocator,
@@ -4683,8 +4721,6 @@ fn referencesExist(
             return false;
         }
     } else {
-        const source_root =
-            (loaded[rule.input_index].parsed_json orelse return false).value;
         for (rule.reference_sources) |source| {
             const items_value = resolve(
                 source_root,
@@ -6159,6 +6195,56 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expect(!valid.authority_granted);
     try std.testing.expect(!valid.storage_mutated);
 
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "wrapper.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record","path":"artifact.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"definition-ref","path":"","definition":"example/record"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
+        ,
+    });
+    var wrapper_closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "wrapper.json",
+        .{},
+    );
+    defer wrapper_closure.deinit(std.testing.allocator);
+    var wrapper_definition = try definition.compile(
+        std.testing.allocator,
+        &wrapper_closure,
+        "wrapper.json",
+    );
+    defer wrapper_definition.deinit(std.testing.allocator);
+    var wrapper_plan = try compile(
+        std.testing.allocator,
+        &wrapper_definition,
+    );
+    defer wrapper_plan.deinit(std.testing.allocator);
+    var wrapper_encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        8 * 1024 * 1024,
+    );
+    defer wrapper_encoder.deinit();
+    try encodeCache(&wrapper_plan, &wrapper_encoder);
+    const wrapper_payload = try wrapper_encoder.toOwnedSlice();
+    defer std.testing.allocator.free(wrapper_payload);
+    var wrapper_decoder =
+        definition_core.cache.Decoder.init(wrapper_payload);
+    var cached_wrapper = try decodeCache(
+        std.testing.allocator,
+        &wrapper_decoder,
+    );
+    defer cached_wrapper.deinit(std.testing.allocator);
+    try wrapper_decoder.finish();
+    try validateCachePlan(&cached_wrapper, &wrapper_definition);
+    var wrapped_valid = try validate(
+        std.testing.allocator,
+        &wrapper_definition,
+        &cached_wrapper,
+        &.{.{ .name = "record", .bytes = valid_bytes }},
+    );
+    defer wrapped_valid.deinit(std.testing.allocator);
+    try std.testing.expect(wrapped_valid.valid);
+
     const invalid_pattern_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -6178,6 +6264,17 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer invalid_pattern.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_pattern.valid);
+    var wrapped_invalid = try validate(
+        std.testing.allocator,
+        &wrapper_definition,
+        &cached_wrapper,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_pattern_bytes,
+        }},
+    );
+    defer wrapped_invalid.deinit(std.testing.allocator);
+    try std.testing.expect(!wrapped_invalid.valid);
 
     const forbidden_field_bytes = try std.mem.replaceOwned(
         u8,
