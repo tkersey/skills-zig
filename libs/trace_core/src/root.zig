@@ -267,6 +267,7 @@ pub const SessionGraphEdge = struct {
 };
 
 pub const TraceOccurrence = struct {
+    source_event_id: [71]u8,
     line_number: usize,
     ordinal: usize,
     turn_index: ?i64 = null,
@@ -275,12 +276,16 @@ pub const TraceOccurrence = struct {
     role: ?[]u8 = null,
     timestamp: ?[]u8 = null,
     payload_json: ?[]u8 = null,
+    raw_json: ?[]u8 = null,
     text: ?[]u8 = null,
     private: bool = false,
+    format: TraceFormat = .unknown,
 
     pub fn init(
         allocator: std.mem.Allocator,
+        path: []const u8,
         line_number: usize,
+        ordinal: usize,
         turn_index: ?i64,
         entry_type: []const u8,
         event_type: ?[]const u8,
@@ -289,8 +294,9 @@ pub const TraceOccurrence = struct {
         private: bool,
     ) !TraceOccurrence {
         return .{
+            .source_event_id = computeSourceEventId(path, line_number, ordinal),
             .line_number = line_number,
-            .ordinal = 0,
+            .ordinal = ordinal,
             .turn_index = turn_index,
             .entry_type = try allocator.dupe(u8, entry_type),
             .event_type = if (event_type) |value| try allocator.dupe(u8, value) else null,
@@ -306,7 +312,12 @@ pub const TraceOccurrence = struct {
         freeOpt(allocator, self.role);
         freeOpt(allocator, self.timestamp);
         freeOpt(allocator, self.payload_json);
+        freeOpt(allocator, self.raw_json);
         freeOpt(allocator, self.text);
+    }
+
+    pub fn sourceEventId(self: *const TraceOccurrence) []const u8 {
+        return &self.source_event_id;
     }
 };
 
@@ -563,7 +574,18 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
         const payload = objectField(root, "payload");
         const timestamp = bestTimestamp(root);
         const occurrence_index = if (options.include_occurrences)
-            try appendOccurrence(allocator, &trace, root, root_type, payload, timestamp, current_turn_index, line_number)
+            try appendOccurrence(
+                allocator,
+                &trace,
+                root,
+                root_type,
+                payload,
+                timestamp,
+                current_turn_index,
+                line_number,
+                line,
+                options.include_raw,
+            )
         else
             null;
         if (stringField(root, "record_type")) |record_type| {
@@ -583,13 +605,13 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 try applyTurnContext(allocator, &trace.turns.items[idx], payload orelse root);
                 try applySessionContextFromTurn(allocator, &trace.session, trace.turns.items[idx]);
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "compacted")) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 trace.turns.items[idx].has_compaction = true;
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "event_msg")) {
@@ -637,14 +659,14 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                     }
                 }
                 if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
                 }
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "response_item")) {
                 if (payload) |p| try applyResponseItem(allocator, &trace, path, &current_turn_index, &synthetic_turns, saw_task_started, p, timestamp, line_number, options);
                 if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
                 }
                 continue;
             }
@@ -687,7 +709,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number, options.max_tools);
             }
             if (current_turn_index) |idx| {
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = @intCast(idx);
+                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
             }
         }
     }
@@ -911,6 +933,8 @@ fn appendOccurrence(
     timestamp: ?[]const u8,
     current_turn_index: ?usize,
     line_number: usize,
+    raw_json: []const u8,
+    include_raw: bool,
 ) !usize {
     const source = payload orelse root;
     const source_type = stringField(source, "type");
@@ -957,8 +981,13 @@ fn appendOccurrence(
 
     var occurrence = try TraceOccurrence.init(
         allocator,
+        trace.session.path,
         line_number,
-        if (current_turn_index) |index| @intCast(index) else null,
+        trace.occurrences.items.len,
+        if (current_turn_index) |index|
+            trace.turns.items[index].turn_index
+        else
+            null,
         entry_type,
         event_type,
         role,
@@ -968,11 +997,51 @@ fn appendOccurrence(
     errdefer occurrence.deinit(allocator);
     freeOpt(allocator, text);
     text = null;
-    occurrence.ordinal = trace.occurrences.items.len;
     occurrence.timestamp = if (timestamp) |value| try allocator.dupe(u8, value) else null;
     occurrence.payload_json = if (!private) try stringifyJsonValue(allocator, if (payload != null) root.get("payload").? else std.json.Value{ .object = root }) else null;
+    occurrence.raw_json = if (include_raw)
+        try allocator.dupe(u8, raw_json)
+    else
+        null;
+    occurrence.format = traceFormat(root, root_type, payload);
     try trace.occurrences.append(allocator, occurrence);
     return trace.occurrences.items.len - 1;
+}
+
+fn computeSourceEventId(path: []const u8, line_number: usize, ordinal: usize) [71]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("trace-source-event/v1\x00");
+    hasher.update(path);
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, @intCast(line_number), .big);
+    hasher.update(&number);
+    std.mem.writeInt(u64, &number, @intCast(ordinal), .big);
+    hasher.update(&number);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var identity: [71]u8 = undefined;
+    @memcpy(identity[0..7], "sha256:");
+    @memcpy(identity[7..], &hex);
+    return identity;
+}
+
+fn traceFormat(
+    root: std.json.ObjectMap,
+    root_type: ?[]const u8,
+    payload: ?std.json.ObjectMap,
+) TraceFormat {
+    if (root_type != null) return .new_044_plus;
+    if (payload != null) return .mid_payload_meta;
+    if ((root.get("id") != null and root.get("timestamp") != null) or
+        (root.get("role") != null and root.get("content") != null) or
+        (root.get("call_id") != null and root.get("arguments") != null) or
+        (root.get("call_id") != null and root.get("output") != null) or
+        root.get("encrypted_content") != null)
+    {
+        return .old_2025_08_root_meta;
+    }
+    return .unknown;
 }
 
 pub fn cutBoundContextAlloc(allocator: std.mem.Allocator, trace: CanonicalSessionTrace, last_fixed_line: usize) !CutBoundContext {
@@ -1736,11 +1805,29 @@ test "bytes-backed trace parsing preserves the exact assistant occurrence line" 
         "/provenance/only.jsonl",
         source,
         nowRealtimeNs(),
-        .{},
+        .{ .include_raw = true },
     );
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4), trace.turns.items[0].final_answer_line.?);
     try std.testing.expectEqualStrings("selected", trace.turns.items[0].final_answer.?);
+    try std.testing.expectEqual(@as(i64, 1), trace.occurrences.items[2].turn_index.?);
+    try std.testing.expectEqualStrings(
+        "sha256:",
+        trace.occurrences.items[2].sourceEventId()[0..7],
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        trace.occurrences.items[2].sourceEventId(),
+        trace.occurrences.items[3].sourceEventId(),
+    ));
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}",
+        trace.occurrences.items[2].raw_json.?,
+    );
+    try std.testing.expectEqual(
+        TraceFormat.new_044_plus,
+        trace.occurrences.items[2].format,
+    );
 }
 
 test "bounded tool retention still observes the retained call completion" {

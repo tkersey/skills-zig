@@ -97,11 +97,30 @@ pub fn observeTrace(
             );
             _ = try runner.feed(row[0..program.source_width]);
         },
+        .source_events => for (trace.occurrences.items) |*occurrence| {
+            try fillSourceEvent(
+                row[0..program.source_width],
+                program.source_field_indices,
+                trace.session,
+                occurrence,
+            );
+            if (try runner.feed(row[0..program.source_width]) == .stop) break;
+        },
         .turns => for (trace.turns.items) |turn| {
             try fillTurn(
                 row[0..program.source_width],
                 program.source_field_indices,
                 turn,
+            );
+            if (try runner.feed(row[0..program.source_width]) == .stop) break;
+        },
+        .messages => for (trace.occurrences.items) |*occurrence| {
+            if (occurrence.role == null or occurrence.text == null) continue;
+            try fillMessage(
+                row[0..program.source_width],
+                program.source_field_indices,
+                trace.session,
+                occurrence,
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
@@ -139,8 +158,6 @@ pub fn observeTrace(
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
-        .source_events,
-        .messages,
         .token_events,
         .structured_documents,
         .structured_values,
@@ -152,14 +169,14 @@ pub fn observeTrace(
 fn supported(relation: physical.Relation) bool {
     return switch (relation) {
         .sessions,
+        .source_events,
         .turns,
+        .messages,
         .tool_invocations,
         .tool_results,
         .tool_lifecycle,
         .session_edges,
         => true,
-        .source_events,
-        .messages,
         .token_events,
         .structured_documents,
         .structured_values,
@@ -174,7 +191,10 @@ fn traceParseOptions(
 ) trace_core.TraceParseOptions {
     return .{
         .ongoing_threshold_secs = options.ongoing_threshold_secs,
-        .include_occurrences = false,
+        .include_raw = relation == .source_events and
+            containsField(demanded_fields, 8),
+        .include_occurrences = relation == .source_events or
+            relation == .messages,
         .include_message_bodies = relation == .turns and
             (containsField(demanded_fields, 9) or
                 containsField(demanded_fields, 10)),
@@ -187,6 +207,33 @@ fn containsField(fields: []const u16, wanted: u16) bool {
 }
 
 fn ignoreLine(_: void, _: []const u8, _: usize) !void {}
+
+fn fillSourceEvent(
+    row: []execution.Value,
+    fields: []const u16,
+    session: trace_core.SessionRecord,
+    occurrence: *const trace_core.TraceOccurrence,
+) !void {
+    for (fields, 0..) |field, index| {
+        row[index] = switch (field) {
+            0 => .{ .string = occurrence.sourceEventId() },
+            1 => optionalString(session.session_id),
+            2 => .{ .string = session.path },
+            3 => try usizeInteger(occurrence.line_number),
+            4 => .{ .string = occurrence.entry_type },
+            5 => optionalString(occurrence.event_type),
+            6 => optionalString(occurrence.timestamp),
+            7 => optionalJson(occurrence.payload_json),
+            8 => optionalJson(occurrence.raw_json),
+            9 => .{ .string = @tagName(occurrence.format) },
+            10 => optionalInteger(occurrence.turn_index),
+            11 => optionalString(occurrence.role),
+            12 => optionalString(occurrence.text),
+            13 => .{ .boolean = occurrence.private },
+            else => return error.InvalidTracePhysicalFieldIndex,
+        };
+    }
+}
 
 fn fillSession(
     row: []execution.Value,
@@ -219,6 +266,28 @@ fn fillSession(
             21 => .{ .boolean = session.is_external_worker },
             22 => .{ .boolean = session.is_inline_worker },
             23 => .{ .integer = session.spawned_worker_count },
+            else => return error.InvalidTracePhysicalFieldIndex,
+        };
+    }
+}
+
+fn fillMessage(
+    row: []execution.Value,
+    fields: []const u16,
+    session: trace_core.SessionRecord,
+    occurrence: *const trace_core.TraceOccurrence,
+) !void {
+    for (fields, 0..) |field, index| {
+        row[index] = switch (field) {
+            0 => .{ .string = occurrence.sourceEventId() },
+            1 => optionalString(session.session_id),
+            2 => optionalInteger(occurrence.turn_index),
+            3 => optionalString(occurrence.role),
+            4 => optionalString(occurrence.text),
+            5 => optionalString(occurrence.timestamp),
+            6 => .{ .string = occurrence.sourceEventId() },
+            7 => .{ .string = session.path },
+            8 => .{ .boolean = occurrence.private },
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -382,6 +451,13 @@ fn optionalBoolean(value: ?bool) execution.Value {
     return if (value) |flag| .{ .boolean = flag } else .null;
 }
 
+fn usizeInteger(value: usize) !execution.Value {
+    return .{
+        .integer = std.math.cast(i64, value) orelse
+            return error.TraceIntegerOverflow,
+    };
+}
+
 test "trace adapter scans demanded session columns in one file pass" {
     const definition_core = @import("definition_core");
     const definition = @import("definition.zig");
@@ -400,7 +476,8 @@ test "trace adapter scans demanded session columns in one file pass" {
         .data =
         \\{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"session-1","model":"gpt-test","cwd":"/repo"}}
         \\{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
-        \\{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
+        \\{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"observed"}}
+        \\{"timestamp":"2026-07-26T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
         \\
         ,
     });
@@ -453,7 +530,7 @@ test "trace adapter scans demanded session columns in one file pass" {
     );
     defer observation.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 3), observation.metrics.lines_seen);
+    try std.testing.expectEqual(@as(usize, 4), observation.metrics.lines_seen);
     try std.testing.expectEqual(@as(usize, 1), observation.result.row_count);
     try std.testing.expectEqualStrings(
         "session-1",
@@ -463,4 +540,63 @@ test "trace adapter scans demanded session columns in one file pass" {
         @as(i64, 1),
         observation.result.rows().row(0)[1].integer,
     );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "events.json",
+        .data =
+        \\{"schema":"seq-observation-definition/v1","id":"example/events","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},"parameters":{},"selectors":["path"],"relations":[{"name":"source_events","fields":["source_event_id","event_type","role","text","raw_json","turn_index"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"source_events","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"event_type","op":"exact","value":"agent_message"}]},{"op":"project","input":"matched","as":"rows","fields":["source_event_id","role","text","raw_json","turn_index"]}],"projections":{"rows":{"relation":"rows","schema":"example-event-rows/v1","fields":["source_event_id","role","text","raw_json","turn_index"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
+        ,
+    });
+    var event_closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "events.json",
+        .{},
+    );
+    defer event_closure.deinit(std.testing.allocator);
+    var event_definition = try definition.compile(
+        std.testing.allocator,
+        &event_closure,
+        "events.json",
+    );
+    defer event_definition.deinit(std.testing.allocator);
+    var event_plan = try plan.compile(
+        std.testing.allocator,
+        &event_definition,
+    );
+    defer event_plan.deinit(std.testing.allocator);
+    var event_bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &event_definition.parameter_declarations,
+        &.{},
+    );
+    defer event_bindings.deinit(std.testing.allocator);
+    var event_program = try execution.compile(
+        std.testing.allocator,
+        &event_definition,
+        &event_plan,
+        &event_bindings,
+        "rows",
+    );
+    defer event_program.deinit(std.testing.allocator);
+
+    var event_output: [5]execution.Value = undefined;
+    var events = try observeFile(
+        std.testing.allocator,
+        &event_program,
+        path,
+        .{ .ongoing_threshold_secs = 0 },
+        &event_output,
+    );
+    defer events.deinit(std.testing.allocator);
+    const event_row = events.result.rows().row(0);
+    try std.testing.expectEqual(@as(usize, 1), events.result.row_count);
+    try std.testing.expectEqualStrings("sha256:", event_row[0].string[0..7]);
+    try std.testing.expectEqualStrings("assistant", event_row[1].string);
+    try std.testing.expectEqualStrings("observed", event_row[2].string);
+    try std.testing.expectEqualStrings(
+        "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"observed\"}}",
+        event_row[3].json,
+    );
+    try std.testing.expectEqual(@as(i64, 1), event_row[4].integer);
 }
