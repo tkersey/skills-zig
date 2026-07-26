@@ -761,6 +761,7 @@ pub fn materializeEvent(
         plan,
         state,
         materialization,
+        request_object,
         body,
         generated_outputs,
         parameters,
@@ -845,6 +846,7 @@ pub fn reconstructInputAlloc(
         plan,
         state,
         materialization,
+        event_object,
         event_object.get(plan.envelope.body_key) orelse
             return error.EventEnvelopeFieldMissing,
     );
@@ -1020,6 +1022,7 @@ fn materializedBodyAlloc(
     plan: *const Plan,
     state: *const ReplayState,
     materialization: *const storage.EventMaterialization,
+    request: std.json.ObjectMap,
     body: std.json.Value,
     generated_outputs: []const GeneratedOutput,
     parameters: ?*const definition_core.parameters.Bindings,
@@ -1031,6 +1034,34 @@ fn materializedBodyAlloc(
         );
     }
     const object = try definition_core.json.object(body);
+    for (materialization.body_fields) |field| {
+        const actual = object.get(field.field);
+        switch (field.source) {
+            .request_input => |input_name| {
+                const body_value = actual orelse
+                    return error.EventBodyFieldMissing;
+                const request_value = request.get(input_name) orelse
+                    return error.EventRequestFieldMissing;
+                if (!try valuesEqualForCustody(
+                    allocator,
+                    body_value,
+                    request_value,
+                )) return error.EventBodyRequestInputMismatch;
+            },
+            .literal_mapping => |mapping| {
+                const body_value = actual orelse
+                    return error.EventBodyFieldMissing;
+                if (!try valueMatchesCanonicalLiteral(
+                    allocator,
+                    body_value,
+                    mapping.request_literal,
+                )) return error.EventLiteralMismatch;
+            },
+            .generated_sha256, .parameter_sha256, .state_value => {
+                if (actual != null) return error.EventBodyFieldCollision;
+            },
+        }
+    }
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(allocator);
     var iterator = object.iterator();
@@ -1038,7 +1069,7 @@ fn materializedBodyAlloc(
         if (findEventBodyField(
             materialization.body_fields,
             entry.key_ptr.*,
-        ) != null) return error.EventBodyFieldCollision;
+        ) != null) continue;
         try keys.append(allocator, entry.key_ptr.*);
     }
     sortStrings(keys.items);
@@ -1051,6 +1082,13 @@ fn materializedBodyAlloc(
     while (key_index < keys.items.len or
         field_index < materialization.body_fields.len)
     {
+        while (field_index < materialization.body_fields.len and
+            materialization.body_fields[field_index].source == .request_input)
+        {
+            field_index += 1;
+        }
+        if (key_index == keys.items.len and
+            field_index == materialization.body_fields.len) break;
         const use_field = field_index < materialization.body_fields.len and
             (key_index == keys.items.len or
                 std.mem.order(
@@ -1158,6 +1196,10 @@ fn writeMaterializedBodyField(
                 value,
             );
         },
+        .literal_mapping => |mapping| {
+            try writer.writeAll(mapping.stored_literal);
+        },
+        .request_input => unreachable,
     }
 }
 
@@ -1166,6 +1208,7 @@ fn reconstructedBodyAlloc(
     plan: *const Plan,
     state: *const ReplayState,
     materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
     body: std.json.Value,
 ) ![]u8 {
     if (materialization.body_fields.len == 0) {
@@ -1176,44 +1219,95 @@ fn reconstructedBodyAlloc(
     }
     const object = try definition_core.json.object(body);
     for (materialization.body_fields) |field| {
-        const actual = object.get(field.field) orelse
-            return error.EventBodyFieldMissing;
-        try validateStoredBodyField(
-            allocator,
-            plan,
-            state,
-            field.source,
-            actual,
-        );
+        switch (field.source) {
+            .request_input => {
+                if (object.get(field.field) != null) {
+                    return error.EventBodyFieldSetInvalid;
+                }
+            },
+            else => {
+                const actual = object.get(field.field) orelse
+                    return error.EventBodyFieldMissing;
+                try validateStoredBodyField(
+                    allocator,
+                    plan,
+                    state,
+                    field.source,
+                    actual,
+                );
+            },
+        }
     }
-    var keys: std.ArrayList([]const u8) = .empty;
-    defer keys.deinit(allocator);
+    const Mapping = struct {
+        key: []const u8,
+        value: union(enum) {
+            json: std.json.Value,
+            literal: []const u8,
+        },
+    };
+    var mappings: std.ArrayList(Mapping) = .empty;
+    defer mappings.deinit(allocator);
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         if (findEventBodyField(
             materialization.body_fields,
             entry.key_ptr.*,
-        ) == null) try keys.append(allocator, entry.key_ptr.*);
+        ) == null) try mappings.append(allocator, .{
+            .key = entry.key_ptr.*,
+            .value = .{ .json = entry.value_ptr.* },
+        });
     }
-    if (keys.items.len + materialization.body_fields.len != object.count()) {
-        return error.EventBodyFieldSetInvalid;
+    for (materialization.body_fields) |field| switch (field.source) {
+        .request_input => |input_name| {
+            try mappings.append(allocator, .{
+                .key = field.field,
+                .value = .{ .json = try eventValueForRequestInput(
+                    materialization,
+                    event,
+                    input_name,
+                ) },
+            });
+        },
+        .literal_mapping => |mapping| {
+            try mappings.append(allocator, .{
+                .key = field.field,
+                .value = .{ .literal = mapping.request_literal },
+            });
+        },
+        .generated_sha256, .parameter_sha256, .state_value => {},
+    };
+    std.mem.sort(Mapping, mappings.items, {}, struct {
+        fn lessThan(_: void, left: Mapping, right: Mapping) bool {
+            return std.mem.lessThan(u8, left.key, right.key);
+        }
+    }.lessThan);
+    if (mappings.items.len > 1) {
+        for (mappings.items[1..], 1..) |mapping, index| {
+            if (std.mem.eql(u8, mappings.items[index - 1].key, mapping.key)) {
+                return error.EventBodyFieldSetInvalid;
+            }
+        }
     }
-    sortStrings(keys.items);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('{');
-    for (keys.items, 0..) |key, index| {
+    for (mappings.items, 0..) |mapping, index| {
         if (index != 0) try output.writer.writeByte(',');
         try definition_core.canonical_json.writeCanonicalString(
             &output.writer,
-            key,
+            mapping.key,
         );
         try output.writer.writeByte(':');
-        try definition_core.canonical_json.writeCanonicalJson(
-            allocator,
-            &output.writer,
-            object.get(key).?,
-        );
+        switch (mapping.value) {
+            .json => |value| {
+                try definition_core.canonical_json.writeCanonicalJson(
+                    allocator,
+                    &output.writer,
+                    value,
+                );
+            },
+            .literal => |literal| try output.writer.writeAll(literal),
+        }
     }
     try output.writer.writeByte('}');
     return output.toOwnedSlice();
@@ -1251,7 +1345,46 @@ fn validateStoredBodyField(
                 expected,
             )) return error.EventStateValueMismatch;
         },
+        .literal_mapping => |mapping| {
+            if (!try valueMatchesCanonicalLiteral(
+                allocator,
+                actual,
+                mapping.stored_literal,
+            )) return error.EventLiteralMismatch;
+        },
+        .request_input => unreachable,
     }
+}
+
+fn valueMatchesCanonicalLiteral(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    literal: []const u8,
+) !bool {
+    const canonical =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            value,
+        );
+    defer allocator.free(canonical);
+    return std.mem.eql(u8, canonical, literal);
+}
+
+fn eventValueForRequestInput(
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+    input_name: []const u8,
+) !std.json.Value {
+    for (materialization.fields) |field| switch (field.source) {
+        .input_field => |candidate| {
+            if (std.mem.eql(u8, candidate, input_name)) {
+                return event.get(field.field) orelse
+                    error.EventEnvelopeFieldMissing;
+            }
+        },
+        else => {},
+    };
+    return error.EventBodyRequestInputMissing;
 }
 
 fn valuesEqualForCustody(
@@ -2060,6 +2193,21 @@ fn validateEventMaterialization(
             try validateStateSource(plan, source.expected_state);
         },
         .state_value => |source| try validateStateSource(plan, source),
+        .request_input => |input_name| {
+            var matches: usize = 0;
+            for (event.fields) |event_field| switch (event_field.source) {
+                .input_field => |candidate| {
+                    matches += @intFromBool(std.mem.eql(
+                        u8,
+                        candidate,
+                        input_name,
+                    ));
+                },
+                else => {},
+            };
+            if (matches != 1) return error.EventBodyRequestInputMissing;
+        },
+        .literal_mapping => {},
     };
 }
 
@@ -2451,7 +2599,11 @@ test "event materialization reconstructs validated request literals" {
         \\        {"field":"schema","literal":"example-event/v1"},
         \\        {"field":"stream_id","input_field":"stream_id"}
         \\      ],
-        \\      "request_literals":[{"field":"schema","literal":"example-request/v1"}]
+        \\      "request_literals":[{"field":"schema","literal":"example-request/v1"}],
+        \\      "body_fields":[
+        \\        {"field":"schema","literal_mapping":{"request":"example-body-request/v1","stored":"example-body-event/v1"}},
+        \\        {"field":"stream_id","request_input":"stream_id"}
+        \\      ]
         \\    }}]},
         \\    "append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{
         \\      "body_input_field":"body",
@@ -2520,7 +2672,7 @@ test "event materialization reconstructs validated request literals" {
     var request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"}}",
+        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-1\"}}",
         .{ .allocate = .alloc_always },
     );
     defer request.deinit();
@@ -2540,6 +2692,13 @@ test "event materialization reconstructs validated request literals" {
             "\"schema\":\"example-event/v1\"",
         ) != null,
     );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            event,
+            "\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-event/v1\"}",
+        ) != null,
+    );
     var parsed_event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -2556,8 +2715,25 @@ test "event materialization reconstructs validated request literals" {
     );
     defer std.testing.allocator.free(reconstructed);
     try std.testing.expectEqualStrings(
-        "{\"body\":{\"id\":\"item-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\",\"stream_id\":\"stream-1\"}",
+        "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\",\"stream_id\":\"stream-1\"}",
         reconstructed,
+    );
+    var tampered_event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-wrong/v1\"},\"body_digest\":\"\",\"event_digest\":\"\",\"kind\":\"created\",\"previous_digest\":null,\"schema\":\"example-event/v1\",\"sequence\":1,\"stream_id\":\"stream-1\"}",
+        .{ .allocate = .alloc_always },
+    );
+    defer tampered_event.deinit();
+    try std.testing.expectError(
+        error.EventLiteralMismatch,
+        reconstructInputAlloc(
+            std.testing.allocator,
+            &plan,
+            &state,
+            materialization,
+            tampered_event.value,
+        ),
     );
     var parameters = try definition_core.parameters.bind(
         std.testing.allocator,
@@ -2615,6 +2791,24 @@ test "event materialization reconstructs validated request literals" {
             &state,
             materialization,
             invalid_request.value,
+            7,
+        ),
+    );
+    var mismatched_body_input = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-2\"}}",
+        .{ .allocate = .alloc_always },
+    );
+    defer mismatched_body_input.deinit();
+    try std.testing.expectError(
+        error.EventBodyRequestInputMismatch,
+        materializeEventAlloc(
+            std.testing.allocator,
+            &plan,
+            &state,
+            materialization,
+            mismatched_body_input.value,
             7,
         ),
     );

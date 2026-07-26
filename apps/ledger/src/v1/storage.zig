@@ -149,16 +149,31 @@ pub const ParameterSha256Source = struct {
     }
 };
 
+pub const LiteralMappingSource = struct {
+    request_literal: []u8,
+    stored_literal: []u8,
+
+    fn deinit(self: *LiteralMappingSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.request_literal);
+        allocator.free(self.stored_literal);
+        self.* = undefined;
+    }
+};
+
 pub const EventBodyFieldSource = union(enum) {
     generated_sha256: []u8,
     parameter_sha256: ParameterSha256Source,
     state_value: StateValueSource,
+    request_input: []u8,
+    literal_mapping: LiteralMappingSource,
 
     fn deinit(self: *EventBodyFieldSource, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .generated_sha256 => |name| allocator.free(name),
             .parameter_sha256 => |*source| source.deinit(allocator),
             .state_value => |*source| source.deinit(allocator),
+            .request_input => |name| allocator.free(name),
+            .literal_mapping => |*source| source.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -407,7 +422,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -480,6 +495,13 @@ pub fn encodeCache(
                         .state_value => |source| {
                             try encodeStateValueSource(source, encoder);
                         },
+                        .request_input => |name| {
+                            try encoder.writeBytes(name);
+                        },
+                        .literal_mapping => |source| {
+                            try encoder.writeBytes(source.request_literal);
+                            try encoder.writeBytes(source.stored_literal);
+                        },
                     }
                 }
                 try encoder.writeCount(event.forbidden_parameters.len);
@@ -495,7 +517,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) {
+    if (try decoder.readU16() != 6) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -943,6 +965,8 @@ fn decodeEventBodyFields(
             .generated_sha256 => .{ .generated_sha256 = try decoder.readBytesAlloc(allocator, 128) },
             .parameter_sha256 => .{ .parameter_sha256 = try decodeParameterSha256Source(allocator, decoder) },
             .state_value => .{ .state_value = try decodeStateValueSource(allocator, decoder) },
+            .request_input => .{ .request_input = try decoder.readBytesAlloc(allocator, 128) },
+            .literal_mapping => .{ .literal_mapping = try decodeLiteralMappingSource(allocator, decoder) },
         };
         errdefer if (source) |*value| value.deinit(allocator);
         const candidate: EventBodyField = .{
@@ -965,6 +989,22 @@ fn decodeEventBodyFields(
         initialized += 1;
     }
     return fields;
+}
+
+fn decodeLiteralMappingSource(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !LiteralMappingSource {
+    const request_literal = try decoder.readBytesAlloc(allocator, 4096);
+    errdefer allocator.free(request_literal);
+    const stored_literal = try decoder.readBytesAlloc(allocator, 4096);
+    errdefer allocator.free(stored_literal);
+    try validateCanonicalScalar(allocator, request_literal);
+    try validateCanonicalScalar(allocator, stored_literal);
+    return .{
+        .request_literal = request_literal,
+        .stored_literal = stored_literal,
+    };
 }
 
 fn decodeParameterSha256Source(
@@ -1556,7 +1596,9 @@ fn compileEventBodyField(
     try definition_core.json.requireExactKeys(object, &.{
         "field",
         "generated_sha256",
+        "literal_mapping",
         "parameter_sha256",
+        "request_input",
         "state_value",
     });
     try definition_core.json.requireFields(object, &.{"field"});
@@ -1567,7 +1609,9 @@ fn compileEventBodyField(
     errdefer allocator.free(field);
     var source_count: usize = 0;
     source_count += @intFromBool(object.get("generated_sha256") != null);
+    source_count += @intFromBool(object.get("literal_mapping") != null);
     source_count += @intFromBool(object.get("parameter_sha256") != null);
+    source_count += @intFromBool(object.get("request_input") != null);
     source_count += @intFromBool(object.get("state_value") != null);
     if (source_count != 1) return error.InvalidEventBodyFieldSource;
     var source: EventBodyFieldSource =
@@ -1617,6 +1661,39 @@ fn compileEventBodyField(
                         "expected_state",
                     ),
                 ),
+            } };
+        } else if (object.get("request_input")) |value|
+            .{ .request_input = try allocator.dupe(
+                u8,
+                try definition_core.json.string(value),
+            ) }
+        else if (object.get("literal_mapping")) |value| blk: {
+            const config = try definition_core.json.object(value);
+            try definition_core.json.requireExactKeys(
+                config,
+                &.{ "request", "stored" },
+            );
+            try definition_core.json.requireFields(
+                config,
+                &.{ "request", "stored" },
+            );
+            const request_literal =
+                try definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    try definition_core.json.field(config, "request"),
+                );
+            errdefer allocator.free(request_literal);
+            const stored_literal =
+                try definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    try definition_core.json.field(config, "stored"),
+                );
+            errdefer allocator.free(stored_literal);
+            try validateCanonicalScalar(allocator, request_literal);
+            try validateCanonicalScalar(allocator, stored_literal);
+            break :blk .{ .literal_mapping = .{
+                .request_literal = request_literal,
+                .stored_literal = stored_literal,
             } };
         } else blk: {
             if (!definition_plan.requires(.reducer)) {
@@ -2071,6 +2148,7 @@ fn validateEventMaterializationAgainstDefinition(
                 return error.UndeclaredArtifactOperator;
             }
         },
+        .request_input, .literal_mapping => {},
     };
     for (event.forbidden_parameters) |name| {
         if (definition_plan.parameter_declarations.find(name) == null) {
@@ -2109,6 +2187,23 @@ fn validateEventBodyField(field: *const EventBodyField) !void {
             try validateStateValueSource(&source.expected_state);
         },
         .state_value => |source| try validateStateValueSource(&source),
+        .request_input => |name| {
+            try definition_core.json.safeIdentifier(name, 128);
+        },
+        .literal_mapping => |source| {
+            if (source.request_literal.len == 0 or
+                source.request_literal.len > 4096 or
+                source.stored_literal.len == 0 or
+                source.stored_literal.len > 4096)
+            {
+                return error.EventLiteralTooLarge;
+            }
+            if (!std.unicode.utf8ValidateSlice(source.request_literal) or
+                !std.unicode.utf8ValidateSlice(source.stored_literal))
+            {
+                return error.EventLiteralNotCanonical;
+            }
+        },
     }
 }
 
