@@ -93,6 +93,7 @@ const CompiledRule = struct {
     scalar_kind: ?JsonKind = null,
     min_count: ?usize = null,
     max_count: ?usize = null,
+    trimmed_min_count: ?usize = null,
     min_number: ?f64 = null,
     max_number: ?f64 = null,
     identifier_style: IdentifierStyle = .portable,
@@ -206,7 +207,6 @@ const Builder = struct {
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
             ),
-            .bounded_string,
             .bounded_array,
             .bounded_object,
             => {
@@ -217,6 +217,34 @@ const Builder = struct {
                 }
                 if (rule.min_count != null and rule.max_count != null and
                     rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+            },
+            .bounded_string => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "min", "max", "trimmed_min" },
+                );
+                rule.min_count = try optionalUnsigned(object, "min");
+                rule.max_count = try optionalUnsigned(object, "max");
+                rule.trimmed_min_count = try optionalUnsigned(
+                    object,
+                    "trimmed_min",
+                );
+                if (rule.min_count == null and rule.max_count == null and
+                    rule.trimmed_min_count == null)
+                {
+                    return error.MissingRuleBound;
+                }
+                if (rule.min_count != null and rule.max_count != null and
+                    rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+                if (rule.trimmed_min_count != null and
+                    rule.max_count != null and
+                    rule.trimmed_min_count.? > rule.max_count.?)
                 {
                     return error.InvalidRuleBounds;
                 }
@@ -571,7 +599,6 @@ const Builder = struct {
                     try definition_core.json.requiredString(object, "type"),
                 );
             },
-            .bounded_string,
             .bounded_array,
             .bounded_object,
             => {
@@ -586,6 +613,34 @@ const Builder = struct {
                 }
                 if (rule.min_count != null and rule.max_count != null and
                     rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+            },
+            .bounded_string => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "min", "max", "trimmed_min" },
+                );
+                rule.min_count = try optionalUnsigned(object, "min");
+                rule.max_count = try optionalUnsigned(object, "max");
+                rule.trimmed_min_count = try optionalUnsigned(
+                    object,
+                    "trimmed_min",
+                );
+                if (rule.min_count == null and rule.max_count == null and
+                    rule.trimmed_min_count == null)
+                {
+                    return error.MissingRuleBound;
+                }
+                if (rule.min_count != null and rule.max_count != null and
+                    rule.min_count.? > rule.max_count.?)
+                {
+                    return error.InvalidRuleBounds;
+                }
+                if (rule.trimmed_min_count != null and
+                    rule.max_count != null and
+                    rule.trimmed_min_count.? > rule.max_count.?)
                 {
                     return error.InvalidRuleBounds;
                 }
@@ -773,7 +828,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(4);
+    try encoder.writeU16(5);
     try encoder.writeCount(plan.inputs.len);
     for (plan.inputs) |input| {
         try encoder.writeBytes(input.name);
@@ -794,7 +849,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 4) {
+    if (try decoder.readU16() != 5) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     const inputs = try decodeCacheInputs(allocator, decoder);
@@ -958,6 +1013,7 @@ fn encodeCompiledRule(
     if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
     try writeOptionalUsize(encoder, rule.min_count);
     try writeOptionalUsize(encoder, rule.max_count);
+    try writeOptionalUsize(encoder, rule.trimmed_min_count);
     try writeOptionalF64(encoder, rule.min_number);
     try writeOptionalF64(encoder, rule.max_number);
     try encoder.writeEnum(rule.identifier_style);
@@ -1036,6 +1092,7 @@ fn decodeCacheRule(
         null;
     const min_count = try readOptionalUsize(decoder);
     const max_count = try readOptionalUsize(decoder);
+    const trimmed_min_count = try readOptionalUsize(decoder);
     const min_number = try readOptionalF64(decoder);
     const max_number = try readOptionalF64(decoder);
     const identifier_style = try decoder.readEnum(IdentifierStyle);
@@ -1065,6 +1122,7 @@ fn decodeCacheRule(
         .scalar_kind = scalar_kind,
         .min_count = min_count,
         .max_count = max_count,
+        .trimmed_min_count = trimmed_min_count,
         .min_number = min_number,
         .max_number = max_number,
         .identifier_style = identifier_style,
@@ -1168,6 +1226,11 @@ fn validateCachedRule(
     {
         return error.InvalidRuleBounds;
     }
+    if (rule.trimmed_min_count != null and rule.max_count != null and
+        rule.trimmed_min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
     if (rule.min_number != null and rule.max_number != null and
         rule.min_number.? > rule.max_number.?)
     {
@@ -1177,10 +1240,14 @@ fn validateCachedRule(
         .scalar_type => if (rule.scalar_kind == null) {
             return error.CacheRuleConfigurationInvalid;
         },
-        .bounded_string,
         .bounded_array,
         .bounded_object,
         => if (rule.min_count == null and rule.max_count == null) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .bounded_string => if (rule.min_count == null and
+            rule.max_count == null and rule.trimmed_min_count == null)
+        {
             return error.CacheRuleConfigurationInvalid;
         },
         .bounded_number => if (rule.min_number == null and
@@ -1261,6 +1328,11 @@ fn validateCachedRule(
     }
     if (rule.operator != .safe_identifier and
         rule.identifier_style != .portable)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .bounded_string and
+        rule.trimmed_min_count != null)
     {
         return error.CacheRuleConfigurationInvalid;
     }
@@ -2128,7 +2200,11 @@ fn boundedString(value: std.json.Value, rule: CompiledRule) bool {
         .string => |text| text,
         else => return false,
     };
-    return withinCount(text.len, rule);
+    if (!withinCount(text.len, rule)) return false;
+    if (rule.trimmed_min_count) |minimum| {
+        if (std.mem.trim(u8, text, " \t\r\n").len < minimum) return false;
+    }
+    return true;
 }
 
 fn boundedNumber(value: std.json.Value, rule: CompiledRule) bool {
@@ -2922,7 +2998,7 @@ test "compiled identifier and repository path policies preserve exact boundaries
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","identity","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","bounded-string","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","identity","label","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"bounded-string","path":"/label","trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -2970,7 +3046,7 @@ test "compiled identifier and repository path policies preserve exact boundaries
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".\",\".github\",\"src/lib\"]}",
+            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".\",\".github\",\"src/lib\"]}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -2982,19 +3058,20 @@ test "compiled identifier and repository path policies preserve exact boundaries
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"paths\":[\"src\"]}",
+            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"label\":\"value\",\"paths\":[\"src\"]}",
         }},
     );
     defer valid_digest.deinit(std.testing.allocator);
     try std.testing.expect(valid_digest.valid);
 
     const invalid_cases = [_][]const u8{
-        "{\"goal_id\":\"Goal-1\",\"identity\":null,\"paths\":[\"src\"]}",
-        "{\"goal_id\":\".goal\",\"identity\":null,\"paths\":[\"src\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".GIT/config\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\".ledger\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"paths\":[\"src/../lib\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":\"not-a-digest\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\"Goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\".goal\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".GIT/config\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".ledger\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src/../lib\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":\"not-a-digest\",\"label\":\"value\",\"paths\":[\"src\"]}",
+        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\" \\t\",\"paths\":[\"src\"]}",
     };
     for (invalid_cases) |bytes| {
         var rejected = try validate(
