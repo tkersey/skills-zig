@@ -149,7 +149,7 @@ pub const Operator = enum {
 
     pub fn version(self: Operator) u16 {
         return switch (self) {
-            .reference_exists => 3,
+            .reference_exists => 5,
             .implies => 2,
             else => 1,
         };

@@ -98,9 +98,48 @@ const CompiledFormatPart = union(enum) {
     literal: []u8,
     parent: u16,
     item: u16,
+    value,
 
     fn deinit(self: *CompiledFormatPart, allocator: std.mem.Allocator) void {
         if (self.* == .literal) allocator.free(self.literal);
+        self.* = undefined;
+    }
+};
+
+const CompiledReferenceTarget = struct {
+    pointer_id: u16,
+    items_pointer_id: ?u16 = null,
+    key_pointer_id: ?u16 = null,
+    coverage_key_pointer_id: ?u16 = null,
+    rules: []CompiledRule,
+    coverage_rules: []CompiledRule,
+    format_parts: []CompiledFormatPart,
+
+    fn deinit(
+        self: *CompiledReferenceTarget,
+        allocator: std.mem.Allocator,
+    ) void {
+        for (self.rules) |*rule| rule.deinit(allocator);
+        allocator.free(self.rules);
+        for (self.coverage_rules) |*rule| rule.deinit(allocator);
+        allocator.free(self.coverage_rules);
+        for (self.format_parts) |*part| part.deinit(allocator);
+        allocator.free(self.format_parts);
+        self.* = undefined;
+    }
+};
+
+const CompiledReferenceSource = struct {
+    pointer_id: u16,
+    reference_pointer_id: u16,
+    format_parts: []CompiledFormatPart,
+
+    fn deinit(
+        self: *CompiledReferenceSource,
+        allocator: std.mem.Allocator,
+    ) void {
+        for (self.format_parts) |*part| part.deinit(allocator);
+        allocator.free(self.format_parts);
         self.* = undefined;
     }
 };
@@ -133,6 +172,8 @@ const CompiledRule = struct {
     coverage_children: []CompiledRule,
     variants: []CompiledVariant,
     format_parts: []CompiledFormatPart,
+    reference_sources: []CompiledReferenceSource,
+    reference_targets: []CompiledReferenceTarget,
 
     fn deinit(self: *CompiledRule, allocator: std.mem.Allocator) void {
         allocator.free(self.path_ids);
@@ -150,6 +191,10 @@ const CompiledRule = struct {
         allocator.free(self.variants);
         for (self.format_parts) |*part| part.deinit(allocator);
         allocator.free(self.format_parts);
+        for (self.reference_sources) |*source| source.deinit(allocator);
+        allocator.free(self.reference_sources);
+        for (self.reference_targets) |*target| target.deinit(allocator);
+        allocator.free(self.reference_targets);
         if (self.imported_plan) |plan| {
             plan.deinit(allocator);
             allocator.destroy(plan);
@@ -245,6 +290,14 @@ const Builder = struct {
             .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+            .reference_sources = try self.allocator.alloc(
+                CompiledReferenceSource,
+                0,
+            ),
+            .reference_targets = try self.allocator.alloc(
+                CompiledReferenceTarget,
+                0,
+            ),
         };
         errdefer rule.deinit(self.allocator);
 
@@ -612,70 +665,106 @@ const Builder = struct {
                         "input",
                         "path",
                         "reference",
+                        "sources",
                         "target_input",
                         "target",
                         "target_items",
                         "target_rules",
                         "coverage_rules",
+                        "targets",
                         "key",
                         "coverage",
                         "self_reference",
                         "ignore_null",
                     },
                 );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "reference", "target", "key" },
-                );
-                if (source.pointer_id == null) {
-                    return error.ReferenceCollectionMissing;
-                }
+                try definition_core.json.requireFields(object, &.{"op"});
                 rule.other_input_index = if (object.get("target_input")) |raw|
                     try self.inputIndex(try definition_core.json.string(raw))
                 else
                     input_index;
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(
-                            object,
-                            "reference",
+                if (object.get("sources")) |raw_sources| {
+                    if (object.get("path") != null or
+                        object.get("reference") != null)
+                    {
+                        return error.ConflictingReferenceSources;
+                    }
+                    rule.reference_sources =
+                        try self.compileReferenceSources(raw_sources);
+                } else {
+                    try definition_core.json.requireFields(
+                        object,
+                        &.{ "path", "reference" },
+                    );
+                    if (source.pointer_id == null) {
+                        return error.ReferenceCollectionMissing;
+                    }
+                    rule.other_pointer_id = try self.internPointer(
+                        try definition_core.json.string(
+                            try definition_core.json.field(
+                                object,
+                                "reference",
+                            ),
                         ),
-                    ),
-                );
-                const target_items = if (object.get("target_items")) |raw|
-                    try self.internPointer(
-                        try definition_core.json.string(raw),
-                    )
-                else
-                    null;
-                rule.path_ids = try self.allocator.alloc(
-                    u16,
-                    if (target_items == null) 2 else 3,
-                );
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "target"),
-                );
-                rule.path_ids[1] = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "key"),
-                    ),
-                );
-                if (target_items) |pointer_id| {
-                    rule.path_ids[2] = pointer_id;
-                }
-                if (object.get("target_rules")) |raw_rules| {
-                    rule.children = try self.compileItemRules(
-                        raw_rules,
-                        rule.other_input_index.?,
-                        0,
                     );
                 }
-                if (object.get("coverage_rules")) |raw_rules| {
-                    rule.coverage_children = try self.compileItemRules(
-                        raw_rules,
-                        rule.other_input_index.?,
-                        0,
+                if (object.get("targets")) |raw_targets| {
+                    if (object.get("target") != null or
+                        object.get("target_items") != null or
+                        object.get("target_rules") != null or
+                        object.get("coverage_rules") != null or
+                        object.get("key") != null)
+                    {
+                        return error.ConflictingReferenceTargets;
+                    }
+                    rule.reference_targets =
+                        try self.compileReferenceTargets(
+                            raw_targets,
+                            rule.other_input_index.?,
+                        );
+                } else {
+                    try definition_core.json.requireFields(
+                        object,
+                        &.{ "target", "key" },
                     );
+                    const target_items = if (object.get("target_items")) |raw|
+                        try self.internPointer(
+                            try definition_core.json.string(raw),
+                        )
+                    else
+                        null;
+                    rule.path_ids = try self.allocator.alloc(
+                        u16,
+                        if (target_items == null) 2 else 3,
+                    );
+                    rule.path_ids[0] = try self.internPointer(
+                        try definition_core.json.requiredString(
+                            object,
+                            "target",
+                        ),
+                    );
+                    rule.path_ids[1] = try self.internPointer(
+                        try definition_core.json.string(
+                            try definition_core.json.field(object, "key"),
+                        ),
+                    );
+                    if (target_items) |pointer_id| {
+                        rule.path_ids[2] = pointer_id;
+                    }
+                    if (object.get("target_rules")) |raw_rules| {
+                        rule.children = try self.compileItemRules(
+                            raw_rules,
+                            rule.other_input_index.?,
+                            0,
+                        );
+                    }
+                    if (object.get("coverage_rules")) |raw_rules| {
+                        rule.coverage_children = try self.compileItemRules(
+                            raw_rules,
+                            rule.other_input_index.?,
+                            0,
+                        );
+                    }
                 }
                 if (object.get("coverage")) |raw_coverage| {
                     const coverage = try definition_core.json.string(
@@ -693,7 +782,9 @@ const Builder = struct {
                     if (!std.mem.eql(u8, policy, "reject")) {
                         return error.UnsupportedSelfReferencePolicy;
                     }
-                    if (rule.other_input_index.? != rule.input_index or
+                    if (rule.reference_sources.len != 0 or
+                        rule.reference_targets.len != 0 or
+                        rule.other_input_index.? != rule.input_index or
                         rule.path_ids[0] != rule.pointer_id.?)
                     {
                         return error.SelfReferenceRequiresOneCollection;
@@ -706,6 +797,163 @@ const Builder = struct {
             else => {},
         }
         try self.rules.append(self.allocator, rule);
+    }
+
+    fn compileReferenceSources(
+        self: *Builder,
+        raw: std.json.Value,
+    ) ![]CompiledReferenceSource {
+        const items = try definition_core.json.array(raw);
+        if (items.items.len == 0 or items.items.len > 64) {
+            return error.ReferenceSourceCountInvalid;
+        }
+        const sources = try self.allocator.alloc(
+            CompiledReferenceSource,
+            items.items.len,
+        );
+        var initialized: usize = 0;
+        errdefer {
+            for (sources[0..initialized]) |*source| {
+                source.deinit(self.allocator);
+            }
+            self.allocator.free(sources);
+        }
+        for (items.items, 0..) |item, index| {
+            const object = try definition_core.json.object(item);
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "path", "reference", "fragments" },
+            );
+            try definition_core.json.requireFields(
+                object,
+                &.{ "path", "reference" },
+            );
+            var source: CompiledReferenceSource = .{
+                .pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "path"),
+                ),
+                .reference_pointer_id = try self.internPointer(
+                    try definition_core.json.string(
+                        try definition_core.json.field(
+                            object,
+                            "reference",
+                        ),
+                    ),
+                ),
+                .format_parts = try self.allocator.alloc(
+                    CompiledFormatPart,
+                    0,
+                ),
+            };
+            errdefer source.deinit(self.allocator);
+            if (object.get("fragments")) |raw_fragments| {
+                source.format_parts = try self.compileFormatParts(
+                    raw_fragments,
+                    true,
+                );
+            }
+            sources[index] = source;
+            initialized += 1;
+        }
+        return sources;
+    }
+
+    fn compileReferenceTargets(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+    ) anyerror![]CompiledReferenceTarget {
+        const items = try definition_core.json.array(raw);
+        if (items.items.len == 0 or items.items.len > 64) {
+            return error.ReferenceTargetCountInvalid;
+        }
+        const targets = try self.allocator.alloc(
+            CompiledReferenceTarget,
+            items.items.len,
+        );
+        var initialized: usize = 0;
+        errdefer {
+            for (targets[0..initialized]) |*target| {
+                target.deinit(self.allocator);
+            }
+            self.allocator.free(targets);
+        }
+        for (items.items, 0..) |item, index| {
+            const object = try definition_core.json.object(item);
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{
+                    "path",
+                    "items",
+                    "key",
+                    "coverage_key",
+                    "fragments",
+                    "rules",
+                    "coverage_rules",
+                },
+            );
+            try definition_core.json.requireFields(object, &.{"path"});
+            const has_key = object.get("key") != null;
+            const has_fragments = object.get("fragments") != null;
+            if (has_key == has_fragments) {
+                return error.ReferenceTargetKeyInvalid;
+            }
+            var target: CompiledReferenceTarget = .{
+                .pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "path"),
+                ),
+                .items_pointer_id = if (object.get("items")) |raw_items|
+                    try self.internPointer(
+                        try definition_core.json.string(raw_items),
+                    )
+                else
+                    null,
+                .key_pointer_id = if (object.get("key")) |raw_key|
+                    try self.internPointer(
+                        try definition_core.json.string(raw_key),
+                    )
+                else
+                    null,
+                .coverage_key_pointer_id = if (object.get(
+                    "coverage_key",
+                )) |raw_key|
+                    try self.internPointer(
+                        try definition_core.json.string(raw_key),
+                    )
+                else
+                    null,
+                .rules = try self.allocator.alloc(CompiledRule, 0),
+                .coverage_rules = try self.allocator.alloc(CompiledRule, 0),
+                .format_parts = try self.allocator.alloc(
+                    CompiledFormatPart,
+                    0,
+                ),
+            };
+            errdefer target.deinit(self.allocator);
+            if (object.get("rules")) |raw_rules| {
+                target.rules = try self.compileItemRules(
+                    raw_rules,
+                    input_index,
+                    0,
+                );
+            }
+            if (object.get("coverage_rules")) |raw_rules| {
+                target.coverage_rules = try self.compileItemRules(
+                    raw_rules,
+                    input_index,
+                    0,
+                );
+            }
+            if (object.get("fragments")) |raw_fragments| {
+                target.format_parts = try self.compileFormatParts(
+                    raw_fragments,
+                    false,
+                );
+            }
+            targets[index] = target;
+            initialized += 1;
+        }
+        return targets;
     }
 
     fn compilePathFormat(
@@ -733,9 +981,18 @@ const Builder = struct {
                 try definition_core.json.field(object, "target"),
             ),
         );
-        const raw_fragments = try definition_core.json.array(
+        rule.format_parts = try self.compileFormatParts(
             try definition_core.json.field(object, "fragments"),
+            false,
         );
+    }
+
+    fn compileFormatParts(
+        self: *Builder,
+        raw: std.json.Value,
+        allow_value: bool,
+    ) anyerror![]CompiledFormatPart {
+        const raw_fragments = try definition_core.json.array(raw);
         if (raw_fragments.items.len == 0 or
             raw_fragments.items.len > 32)
         {
@@ -786,12 +1043,19 @@ const Builder = struct {
                         try definition_core.json.string(raw_item),
                     ),
                 };
+            } else if (fragment.get("value")) |raw_value| {
+                if (!allow_value or
+                    !try definition_core.json.boolean(raw_value))
+                {
+                    return error.PathFormatFragmentInvalid;
+                }
+                parts[index] = .value;
             } else {
                 return error.PathFormatFragmentInvalid;
             }
             initialized += 1;
         }
-        rule.format_parts = parts;
+        return parts;
     }
 
     fn compileItemRules(
@@ -860,6 +1124,14 @@ const Builder = struct {
             .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+            .reference_sources = try self.allocator.alloc(
+                CompiledReferenceSource,
+                0,
+            ),
+            .reference_targets = try self.allocator.alloc(
+                CompiledReferenceTarget,
+                0,
+            ),
         };
         errdefer rule.deinit(self.allocator);
         switch (operator) {
@@ -1271,7 +1543,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(14);
+    try encoder.writeU16(17);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1303,7 +1575,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 14) {
+    if (try decoder.readU16() != 17) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1426,6 +1698,38 @@ fn validateRuleAgainstDefinition(
             return error.CacheValidationPlanMismatch;
         }
         try validateRuleAgainstDefinition(child, definition_plan);
+    }
+    for (rule.coverage_children) |child| {
+        if (child.input_index != rule.other_input_index.? or
+            !isItemOperator(child.operator))
+        {
+            return error.CacheValidationPlanMismatch;
+        }
+        try validateRuleAgainstDefinition(child, definition_plan);
+    }
+    for (rule.reference_targets) |target| {
+        for (target.rules) |target_rule| {
+            if (target_rule.input_index != rule.other_input_index.? or
+                !isItemOperator(target_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+            try validateRuleAgainstDefinition(
+                target_rule,
+                definition_plan,
+            );
+        }
+        for (target.coverage_rules) |coverage_rule| {
+            if (coverage_rule.input_index != rule.other_input_index.? or
+                !isItemOperator(coverage_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+            try validateRuleAgainstDefinition(
+                coverage_rule,
+                definition_plan,
+            );
+        }
     }
     for (rule.variants) |variant| {
         for (variant.rules) |variant_rule| {
@@ -1556,8 +1860,41 @@ fn encodeCompiledRule(
             try encodeCompiledRule(encoder, variant_rule, depth);
         }
     }
-    try encoder.writeCount(rule.format_parts.len);
-    for (rule.format_parts) |part| {
+    try encodeCompiledFormatParts(encoder, rule.format_parts);
+    try encoder.writeCount(rule.reference_sources.len);
+    for (rule.reference_sources) |source| {
+        try encoder.writeU16(source.pointer_id);
+        try encoder.writeU16(source.reference_pointer_id);
+        try encodeCompiledFormatParts(encoder, source.format_parts);
+    }
+    try encoder.writeCount(rule.reference_targets.len);
+    for (rule.reference_targets) |target| {
+        try encoder.writeU16(target.pointer_id);
+        try writeOptionalU16(encoder, target.items_pointer_id);
+        try writeOptionalU16(encoder, target.key_pointer_id);
+        try writeOptionalU16(encoder, target.coverage_key_pointer_id);
+        try encoder.writeCount(target.rules.len);
+        for (target.rules) |target_rule| {
+            try encodeCompiledRule(encoder, target_rule, depth);
+        }
+        try encoder.writeCount(target.coverage_rules.len);
+        for (target.coverage_rules) |coverage_rule| {
+            try encodeCompiledRule(encoder, coverage_rule, depth);
+        }
+        try encodeCompiledFormatParts(encoder, target.format_parts);
+    }
+    try encoder.writeBool(rule.imported_plan != null);
+    if (rule.imported_plan) |imported_plan| {
+        try encodeCachePlan(imported_plan, encoder, depth + 1);
+    }
+}
+
+fn encodeCompiledFormatParts(
+    encoder: *definition_core.cache.Encoder,
+    parts: []const CompiledFormatPart,
+) !void {
+    try encoder.writeCount(parts.len);
+    for (parts) |part| {
         switch (part) {
             .literal => |literal| {
                 try encoder.writeByte(0);
@@ -1571,11 +1908,8 @@ fn encodeCompiledRule(
                 try encoder.writeByte(2);
                 try encoder.writeU16(pointer_id);
             },
+            .value => try encoder.writeByte(3),
         }
-    }
-    try encoder.writeBool(rule.imported_plan != null);
-    if (rule.imported_plan) |imported_plan| {
-        try encodeCachePlan(imported_plan, encoder, depth + 1);
     }
 }
 
@@ -1742,42 +2076,99 @@ fn decodeCacheRule(
         tag_value = null;
         variants_initialized += 1;
     }
-    const format_part_count = try decoder.readCount(32);
-    const format_parts = try allocator.alloc(
-        CompiledFormatPart,
-        format_part_count,
-    );
-    var format_parts_initialized: usize = 0;
+    const format_parts = try decodeCompiledFormatParts(allocator, decoder);
     errdefer {
-        for (format_parts[0..format_parts_initialized]) |*part| {
-            part.deinit(allocator);
-        }
+        for (format_parts) |*part| part.deinit(allocator);
         allocator.free(format_parts);
     }
-    var literal_bytes: usize = 0;
-    for (format_parts) |*part| {
-        part.* = switch (try decoder.readByte()) {
-            0 => literal: {
-                const text = try decoder.readBytesAlloc(allocator, 4096);
-                literal_bytes = std.math.add(
-                    usize,
-                    literal_bytes,
-                    text.len,
-                ) catch {
-                    allocator.free(text);
-                    return error.CachePathFormatLiteralBytesExceeded;
-                };
-                if (text.len == 0 or literal_bytes > 4096) {
-                    allocator.free(text);
-                    return error.CachePathFormatLiteralBytesExceeded;
-                }
-                break :literal .{ .literal = text };
-            },
-            1 => .{ .parent = try decoder.readU16() },
-            2 => .{ .item = try decoder.readU16() },
-            else => return error.CachePathFormatPartInvalid,
+    const reference_source_count = try decoder.readCount(64);
+    const reference_sources = try allocator.alloc(
+        CompiledReferenceSource,
+        reference_source_count,
+    );
+    var reference_sources_initialized: usize = 0;
+    errdefer {
+        for (reference_sources[0..reference_sources_initialized]) |*source| {
+            source.deinit(allocator);
+        }
+        allocator.free(reference_sources);
+    }
+    for (reference_sources) |*source| {
+        source.* = .{
+            .pointer_id = try decoder.readU16(),
+            .reference_pointer_id = try decoder.readU16(),
+            .format_parts = try decodeCompiledFormatParts(
+                allocator,
+                decoder,
+            ),
         };
-        format_parts_initialized += 1;
+        reference_sources_initialized += 1;
+    }
+    const reference_target_count = try decoder.readCount(64);
+    const reference_targets = try allocator.alloc(
+        CompiledReferenceTarget,
+        reference_target_count,
+    );
+    var reference_targets_initialized: usize = 0;
+    errdefer {
+        for (reference_targets[0..reference_targets_initialized]) |*target| {
+            target.deinit(allocator);
+        }
+        allocator.free(reference_targets);
+    }
+    for (reference_targets) |*target| {
+        const target_pointer_id = try decoder.readU16();
+        const items_pointer_id = try readOptionalU16(decoder);
+        const key_pointer_id = try readOptionalU16(decoder);
+        const coverage_key_pointer_id = try readOptionalU16(decoder);
+        const target_rules = try decodeCacheRules(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth + 1,
+            total_rule_count,
+            plan_depth,
+            imported_plan_count,
+        );
+        errdefer {
+            for (target_rules) |*target_rule| {
+                target_rule.deinit(allocator);
+            }
+            allocator.free(target_rules);
+        }
+        const coverage_rules = try decodeCacheRules(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth + 1,
+            total_rule_count,
+            plan_depth,
+            imported_plan_count,
+        );
+        errdefer {
+            for (coverage_rules) |*coverage_rule| {
+                coverage_rule.deinit(allocator);
+            }
+            allocator.free(coverage_rules);
+        }
+        const target_format_parts =
+            try decodeCompiledFormatParts(allocator, decoder);
+        errdefer {
+            for (target_format_parts) |*part| part.deinit(allocator);
+            allocator.free(target_format_parts);
+        }
+        target.* = .{
+            .pointer_id = target_pointer_id,
+            .items_pointer_id = items_pointer_id,
+            .key_pointer_id = key_pointer_id,
+            .coverage_key_pointer_id = coverage_key_pointer_id,
+            .rules = target_rules,
+            .coverage_rules = coverage_rules,
+            .format_parts = target_format_parts,
+        };
+        reference_targets_initialized += 1;
     }
     const imported_plan = if (try decoder.readBool()) blk: {
         const plan = try allocator.create(Plan);
@@ -1822,9 +2213,51 @@ fn decodeCacheRule(
         .coverage_children = coverage_children,
         .variants = variants,
         .format_parts = format_parts,
+        .reference_sources = reference_sources,
+        .reference_targets = reference_targets,
     };
     try validateCachedRule(rule, input_count, pointer_count);
     return rule;
+}
+
+fn decodeCompiledFormatParts(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]CompiledFormatPart {
+    const count = try decoder.readCount(32);
+    const parts = try allocator.alloc(CompiledFormatPart, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (parts[0..initialized]) |*part| part.deinit(allocator);
+        allocator.free(parts);
+    }
+    var literal_bytes: usize = 0;
+    for (parts) |*part| {
+        part.* = switch (try decoder.readByte()) {
+            0 => literal: {
+                const text = try decoder.readBytesAlloc(allocator, 4096);
+                literal_bytes = std.math.add(
+                    usize,
+                    literal_bytes,
+                    text.len,
+                ) catch {
+                    allocator.free(text);
+                    return error.CachePathFormatLiteralBytesExceeded;
+                };
+                if (text.len == 0 or literal_bytes > 4096) {
+                    allocator.free(text);
+                    return error.CachePathFormatLiteralBytesExceeded;
+                }
+                break :literal .{ .literal = text };
+            },
+            1 => .{ .parent = try decoder.readU16() },
+            2 => .{ .item = try decoder.readU16() },
+            3 => .value,
+            else => return error.CachePathFormatPartInvalid,
+        };
+        initialized += 1;
+    }
+    return parts;
 }
 
 fn decodePathIds(
@@ -1908,7 +2341,7 @@ fn validateCachedRule(
     rule: CompiledRule,
     input_count: usize,
     pointer_count: usize,
-) !void {
+) anyerror!void {
     if (rule.input_index >= input_count or
         (rule.pointer_id != null and rule.pointer_id.? >= pointer_count) or
         (rule.other_input_index != null and
@@ -2000,10 +2433,21 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .reference_exists => if (rule.pointer_id == null or
-            rule.other_input_index == null or
-            rule.other_pointer_id == null or
-            (rule.path_ids.len != 2 and rule.path_ids.len != 3))
+        .reference_exists => if (rule.other_input_index == null or
+            (rule.reference_sources.len == 0 and
+                (rule.pointer_id == null or
+                    rule.other_pointer_id == null)) or
+            (rule.reference_sources.len != 0 and
+                (rule.pointer_id != null or
+                    rule.other_pointer_id != null)))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        } else if ((rule.reference_targets.len == 0 and
+            rule.path_ids.len != 2 and rule.path_ids.len != 3) or
+            (rule.reference_targets.len != 0 and
+                (rule.path_ids.len != 0 or
+                    rule.children.len != 0 or
+                    rule.coverage_children.len != 0)))
         {
             return error.CacheRuleConfigurationInvalid;
         } else if (rule.reject_self_reference and rule.path_ids.len != 2) {
@@ -2136,6 +2580,16 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
+    if (rule.operator != .reference_exists and
+        rule.reference_sources.len != 0)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .reference_exists and
+        rule.reference_targets.len != 0)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
     var format_literal_bytes: usize = 0;
     for (rule.format_parts) |part| {
         switch (part) {
@@ -2157,6 +2611,7 @@ fn validateCachedRule(
                     return error.CacheRuleIndexInvalid;
                 }
             },
+            .value => return error.CacheRuleConfigurationInvalid,
         }
     }
     for (rule.children) |child| {
@@ -2166,6 +2621,35 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         }
         try validateCachedRule(child, input_count, pointer_count);
+    }
+    for (rule.coverage_children) |child| {
+        if (child.input_index != rule.other_input_index.? or
+            !isItemOperator(child.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        try validateCachedRule(child, input_count, pointer_count);
+    }
+    for (rule.reference_targets) |target| {
+        try validateCachedReferenceTarget(
+            target,
+            rule.other_input_index.?,
+            rule.total_coverage,
+            input_count,
+            pointer_count,
+        );
+    }
+    for (rule.reference_sources) |source| {
+        if (source.pointer_id >= pointer_count or
+            source.reference_pointer_id >= pointer_count)
+        {
+            return error.CacheRuleIndexInvalid;
+        }
+        try validateCachedFormatParts(
+            source.format_parts,
+            pointer_count,
+            true,
+        );
     }
     for (rule.variants, 0..) |variant, index| {
         if ((rule.other_pointer_id == null and
@@ -2209,6 +2693,85 @@ fn validateCachedRule(
             {
                 return error.CacheRuleConfigurationInvalid;
             }
+        }
+    }
+}
+
+fn validateCachedReferenceTarget(
+    target: CompiledReferenceTarget,
+    input_index: u8,
+    total_coverage: bool,
+    input_count: usize,
+    pointer_count: usize,
+) anyerror!void {
+    if (target.pointer_id >= pointer_count or
+        (target.items_pointer_id != null and
+            target.items_pointer_id.? >= pointer_count) or
+        (target.key_pointer_id != null and
+            target.key_pointer_id.? >= pointer_count) or
+        (target.coverage_key_pointer_id != null and
+            target.coverage_key_pointer_id.? >= pointer_count) or
+        ((target.key_pointer_id == null) ==
+            (target.format_parts.len == 0)) or
+        target.rules.len > 64 or
+        target.coverage_rules.len > 64 or
+        (target.coverage_rules.len != 0 and !total_coverage))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    try validateCachedFormatParts(
+        target.format_parts,
+        pointer_count,
+        false,
+    );
+    for (target.rules) |rule| {
+        if (rule.input_index != input_index or
+            !isItemOperator(rule.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        try validateCachedRule(rule, input_count, pointer_count);
+    }
+    for (target.coverage_rules) |rule| {
+        if (rule.input_index != input_index or
+            !isItemOperator(rule.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        try validateCachedRule(rule, input_count, pointer_count);
+    }
+}
+
+fn validateCachedFormatParts(
+    parts: []const CompiledFormatPart,
+    pointer_count: usize,
+    allow_value: bool,
+) !void {
+    if (parts.len > 32) return error.CacheRuleConfigurationInvalid;
+    var literal_bytes: usize = 0;
+    for (parts) |part| {
+        switch (part) {
+            .literal => |literal| {
+                if (literal.len == 0) {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+                literal_bytes = std.math.add(
+                    usize,
+                    literal_bytes,
+                    literal.len,
+                ) catch return error.CacheRuleConfigurationInvalid;
+                if (literal_bytes > 4096) {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+            },
+            .parent, .item => |pointer_id| {
+                if (pointer_id >= pointer_count) {
+                    return error.CacheRuleIndexInvalid;
+                }
+            },
+            .value => if (!allow_value) {
+                return error.CacheRuleConfigurationInvalid;
+            },
         }
     }
 }
@@ -2763,6 +3326,7 @@ fn formattedFieldsHold(
                         .string => |text| text,
                         else => return false,
                     },
+                    .value => return false,
                 };
                 const end = std.math.add(
                     usize,
@@ -3404,10 +3968,28 @@ fn keyedUnique(
     return true;
 }
 
-const ReferenceTarget = struct {
+const FormattedReferenceKey = struct {
+    parent: std.json.Value,
+    item: std.json.Value,
     value: std.json.Value,
+    parts: []const CompiledFormatPart,
+};
+
+const ReferenceKey = union(enum) {
+    scalar: std.json.Value,
+    formatted: FormattedReferenceKey,
+};
+
+const ReferenceTarget = struct {
+    key: ReferenceKey,
     required: bool,
+    ungrouped_required: bool,
     referenced: bool = false,
+};
+
+const ReferenceCoverageAlias = struct {
+    key_digest: [32]u8,
+    group: std.json.Value,
 };
 
 fn referencesExist(
@@ -3417,13 +3999,193 @@ fn referencesExist(
     rule: CompiledRule,
     source_value: std.json.Value,
 ) !bool {
-    const source_items = switch (source_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (source_items.len > plan.max_records) return false;
+    var index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty;
+    defer index.deinit(allocator);
+    var coverage_aliases: std.ArrayList(ReferenceCoverageAlias) = .empty;
+    defer coverage_aliases.deinit(allocator);
     const target_root =
         (loaded[rule.other_input_index.?].parsed_json orelse return false).value;
+    if (rule.reference_targets.len == 0) {
+        if (!try indexSingleReferenceTargetSet(
+            allocator,
+            plan,
+            rule,
+            target_root,
+            &index,
+            &coverage_aliases,
+        )) return false;
+    } else if (!try indexReferenceTargetUnion(
+        allocator,
+        plan,
+        rule,
+        target_root,
+        &index,
+        &coverage_aliases,
+    )) return false;
+
+    var source_count: usize = 0;
+    var reference_count: usize = 0;
+    if (rule.reference_sources.len == 0) {
+        const source_items = switch (source_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        source_count = source_items.len;
+        if (source_count > plan.max_records or
+            !try markReferencesFromItems(
+                plan,
+                rule,
+                source_items,
+                rule.other_pointer_id.?,
+                &.{},
+                &index,
+                &reference_count,
+            ))
+        {
+            return false;
+        }
+    } else {
+        const source_root =
+            (loaded[rule.input_index].parsed_json orelse return false).value;
+        for (rule.reference_sources) |source| {
+            const items_value = resolve(
+                source_root,
+                plan.pointers[source.pointer_id],
+            ) orelse return false;
+            const items = switch (items_value) {
+                .array => |array| array.items,
+                else => return false,
+            };
+            source_count = std.math.add(
+                usize,
+                source_count,
+                items.len,
+            ) catch return false;
+            if (source_count > plan.max_records or
+                !try markReferencesFromItems(
+                    plan,
+                    rule,
+                    items,
+                    source.reference_pointer_id,
+                    source.format_parts,
+                    &index,
+                    &reference_count,
+                ))
+            {
+                return false;
+            }
+        }
+    }
+    if (rule.total_coverage and
+        !try referenceCoverageComplete(
+            allocator,
+            &index,
+            coverage_aliases.items,
+        ))
+    {
+        return false;
+    }
+    return true;
+}
+
+fn markReferencesFromItems(
+    plan: *const Plan,
+    rule: CompiledRule,
+    source_items: []const std.json.Value,
+    reference_pointer_id: u16,
+    format_parts: []const CompiledFormatPart,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    reference_count: *usize,
+) !bool {
+    for (source_items) |item| {
+        const source_key = if (rule.reject_self_reference)
+            resolve(item, plan.pointers[rule.path_ids[1]]) orelse
+                return false
+        else
+            null;
+        const references = resolve(
+            item,
+            plan.pointers[reference_pointer_id],
+        ) orelse continue;
+        switch (references) {
+            .array => |array| for (array.items) |reference| {
+                if (rule.ignore_null_references and reference == .null) {
+                    continue;
+                }
+                reference_count.* += 1;
+                if (reference_count.* > plan.max_records or
+                    !try markSourceReference(
+                        plan,
+                        index,
+                        item,
+                        reference,
+                        source_key,
+                        format_parts,
+                    ))
+                {
+                    return false;
+                }
+            },
+            else => {
+                if (rule.ignore_null_references and references == .null) {
+                    continue;
+                }
+                reference_count.* += 1;
+                if (reference_count.* > plan.max_records or
+                    !try markSourceReference(
+                        plan,
+                        index,
+                        item,
+                        references,
+                        source_key,
+                        format_parts,
+                    ))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+fn markSourceReference(
+    plan: *const Plan,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    source_item: std.json.Value,
+    reference: std.json.Value,
+    self_key: ?std.json.Value,
+    format_parts: []const CompiledFormatPart,
+) !bool {
+    if (format_parts.len == 0) {
+        return markScalarReference(
+            plan,
+            index,
+            reference,
+            self_key,
+        );
+    }
+    if (self_key != null) return false;
+    return markReferenceKey(
+        plan,
+        index,
+        .{ .formatted = .{
+            .parent = source_item,
+            .item = source_item,
+            .value = reference,
+            .parts = format_parts,
+        } },
+    );
+}
+
+fn indexSingleReferenceTargetSet(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    target_root: std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
+) !bool {
     const target_value = resolve(
         target_root,
         plan.pointers[rule.path_ids[0]],
@@ -3433,9 +4195,6 @@ fn referencesExist(
         else => return false,
     };
     if (target_parents.len > plan.max_records) return false;
-
-    var index: std.AutoHashMapUnmanaged([32]u8, ReferenceTarget) = .empty;
-    defer index.deinit(allocator);
     var target_count: usize = 0;
     for (target_parents) |parent| {
         if (rule.path_ids.len == 3) {
@@ -3459,7 +4218,8 @@ fn referencesExist(
                     plan,
                     rule,
                     item,
-                    &index,
+                    index,
+                    coverage_aliases,
                 )) return false;
             }
         } else {
@@ -3470,65 +4230,130 @@ fn referencesExist(
                     plan,
                     rule,
                     parent,
-                    &index,
+                    index,
+                    coverage_aliases,
                 ))
             {
                 return false;
             }
         }
     }
+    return true;
+}
 
-    var reference_count: usize = 0;
-    for (source_items) |item| {
-        const source_key = if (rule.reject_self_reference)
-            resolve(item, plan.pointers[rule.path_ids[1]]) orelse
-                return false
-        else
-            null;
-        const references = resolve(
-            item,
-            plan.pointers[rule.other_pointer_id.?],
-        ) orelse continue;
-        switch (references) {
-            .array => |array| for (array.items) |reference| {
-                if (rule.ignore_null_references and reference == .null) {
-                    continue;
+fn indexReferenceTargetUnion(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    target_root: std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
+) !bool {
+    var target_count: usize = 0;
+    for (rule.reference_targets) |target| {
+        const parents_value = resolve(
+            target_root,
+            plan.pointers[target.pointer_id],
+        ) orelse return false;
+        const parents = switch (parents_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        for (parents) |parent| {
+            if (target.items_pointer_id) |items_pointer_id| {
+                const items_value = resolve(
+                    parent,
+                    plan.pointers[items_pointer_id],
+                ) orelse return false;
+                const items = switch (items_value) {
+                    .array => |array| array.items,
+                    else => return false,
+                };
+                target_count = std.math.add(
+                    usize,
+                    target_count,
+                    items.len,
+                ) catch return false;
+                if (target_count > plan.max_records) return false;
+                for (items) |item| {
+                    if (!try indexReferenceTargetSpec(
+                        allocator,
+                        plan,
+                        target,
+                        parent,
+                        item,
+                        index,
+                        coverage_aliases,
+                    )) return false;
                 }
-                reference_count += 1;
-                if (reference_count > plan.max_records or
-                    !try markScalarReference(
-                        &index,
-                        reference,
-                        source_key,
+            } else {
+                target_count += 1;
+                if (target_count > plan.max_records or
+                    !try indexReferenceTargetSpec(
+                        allocator,
+                        plan,
+                        target,
+                        parent,
+                        parent,
+                        index,
+                        coverage_aliases,
                     ))
                 {
                     return false;
                 }
-            },
-            else => {
-                if (rule.ignore_null_references and references == .null) {
-                    continue;
-                }
-                reference_count += 1;
-                if (reference_count > plan.max_records or
-                    !try markScalarReference(
-                        &index,
-                        references,
-                        source_key,
-                    ))
-                {
-                    return false;
-                }
-            },
-        }
-    }
-    if (rule.total_coverage) {
-        var iterator = index.valueIterator();
-        while (iterator.next()) |target| {
-            if (target.required and !target.referenced) return false;
+            }
         }
     }
     return true;
+}
+
+fn indexReferenceTargetSpec(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    target: CompiledReferenceTarget,
+    parent: std.json.Value,
+    item: std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
+) !bool {
+    if (target.rules.len != 0 and
+        !try itemRulesHold(allocator, plan, target.rules, item))
+    {
+        return true;
+    }
+    const key: ReferenceKey = if (target.key_pointer_id) |pointer_id|
+        .{ .scalar = resolve(item, plan.pointers[pointer_id]) orelse
+            return false }
+    else
+        .{ .formatted = .{
+            .parent = parent,
+            .item = item,
+            .value = item,
+            .parts = target.format_parts,
+        } };
+    const required = target.coverage_rules.len == 0 or
+        try itemRulesHold(
+            allocator,
+            plan,
+            target.coverage_rules,
+            item,
+        );
+    const coverage_group = if (required)
+        if (target.coverage_key_pointer_id) |pointer_id|
+            resolve(item, plan.pointers[pointer_id]) orelse return false
+        else
+            null
+    else
+        null;
+    return indexReferenceKey(
+        allocator,
+        plan,
+        key,
+        required,
+        coverage_group,
+        index,
+        coverage_aliases,
+    );
 }
 
 fn indexReferenceTarget(
@@ -3537,6 +4362,7 @@ fn indexReferenceTarget(
     rule: CompiledRule,
     item: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
 ) !bool {
     if (rule.children.len != 0 and
         !try itemRulesHold(allocator, plan, rule.children, item))
@@ -3554,25 +4380,95 @@ fn indexReferenceTarget(
             rule.coverage_children,
             item,
         );
-    const digest = scalarKeyDigest(key) orelse return false;
+    return indexReferenceKey(
+        allocator,
+        plan,
+        .{ .scalar = key },
+        required,
+        null,
+        index,
+        coverage_aliases,
+    );
+}
+
+fn indexReferenceKey(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    key: ReferenceKey,
+    required: bool,
+    coverage_group: ?std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
+) !bool {
+    const digest = referenceKeyDigest(plan, key) orelse return false;
     const result = try index.getOrPut(allocator, digest);
     if (result.found_existing) {
-        if (!valuesEqual(result.value_ptr.value, key)) {
+        if (!referenceKeysEqual(plan, result.value_ptr.key, key)) {
             return error.ReferenceKeyDigestCollision;
         }
     } else {
         result.value_ptr.* = .{
-            .value = key,
+            .key = key,
             .required = required,
+            .ungrouped_required = required and coverage_group == null,
         };
     }
     if (required) {
         result.value_ptr.required = true;
+        if (coverage_group) |group| {
+            if (coverage_aliases.items.len >= plan.max_records) return false;
+            try coverage_aliases.append(allocator, .{
+                .key_digest = digest,
+                .group = group,
+            });
+        } else {
+            result.value_ptr.ungrouped_required = true;
+        }
+    }
+    return true;
+}
+
+fn referenceCoverageComplete(
+    allocator: std.mem.Allocator,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    coverage_aliases: []const ReferenceCoverageAlias,
+) !bool {
+    var iterator = index.valueIterator();
+    while (iterator.next()) |target| {
+        if (target.ungrouped_required and !target.referenced) return false;
+    }
+
+    var covered_groups: std.AutoHashMapUnmanaged(
+        [32]u8,
+        std.json.Value,
+    ) = .empty;
+    defer covered_groups.deinit(allocator);
+    for (coverage_aliases) |alias| {
+        const target = index.get(alias.key_digest) orelse
+            return error.ReferenceCoverageTargetMissing;
+        if (!target.referenced) continue;
+        const digest = scalarKeyDigest(alias.group) orelse return false;
+        const result = try covered_groups.getOrPut(allocator, digest);
+        if (result.found_existing) {
+            if (!valuesEqual(result.value_ptr.*, alias.group)) {
+                return error.ReferenceCoverageDigestCollision;
+            }
+        } else {
+            result.value_ptr.* = alias.group;
+        }
+    }
+    for (coverage_aliases) |alias| {
+        const digest = scalarKeyDigest(alias.group) orelse return false;
+        const covered = covered_groups.get(digest) orelse return false;
+        if (!valuesEqual(covered, alias.group)) {
+            return error.ReferenceCoverageDigestCollision;
+        }
     }
     return true;
 }
 
 fn markScalarReference(
+    plan: *const Plan,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     key: std.json.Value,
     self_key: ?std.json.Value,
@@ -3580,13 +4476,186 @@ fn markScalarReference(
     if (self_key) |value| {
         if (valuesEqual(value, key)) return false;
     }
-    const digest = scalarKeyDigest(key) orelse return false;
+    return markReferenceKey(
+        plan,
+        index,
+        .{ .scalar = key },
+    );
+}
+
+fn markReferenceKey(
+    plan: *const Plan,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    key: ReferenceKey,
+) !bool {
+    const digest = referenceKeyDigest(plan, key) orelse return false;
     const indexed = index.getPtr(digest) orelse return false;
-    if (!valuesEqual(indexed.value, key)) {
+    if (!referenceKeysEqual(plan, indexed.key, key)) {
         return error.ReferenceKeyDigestCollision;
     }
     indexed.referenced = true;
     return true;
+}
+
+fn referenceKeyDigest(
+    plan: *const Plan,
+    key: ReferenceKey,
+) ?[32]u8 {
+    return switch (key) {
+        .scalar => |value| scalarKeyDigest(value),
+        .formatted => |formatted| formattedReferenceDigest(
+            plan,
+            formatted,
+        ),
+    };
+}
+
+fn referenceKeysEqual(
+    plan: *const Plan,
+    left: ReferenceKey,
+    right: ReferenceKey,
+) bool {
+    return switch (left) {
+        .scalar => |left_value| switch (right) {
+            .scalar => |right_value| valuesEqual(left_value, right_value),
+            .formatted => |formatted| formattedReferenceMatches(
+                plan,
+                formatted,
+                left_value,
+            ),
+        },
+        .formatted => |left_formatted| switch (right) {
+            .scalar => |right_value| formattedReferenceMatches(
+                plan,
+                left_formatted,
+                right_value,
+            ),
+            .formatted => |right_formatted| blk: {
+                var left_buffer: [4096]u8 = undefined;
+                var right_buffer: [4096]u8 = undefined;
+                const left_text = renderFormattedReference(
+                    plan,
+                    left_formatted,
+                    &left_buffer,
+                ) orelse break :blk false;
+                const right_text = renderFormattedReference(
+                    plan,
+                    right_formatted,
+                    &right_buffer,
+                ) orelse break :blk false;
+                break :blk std.mem.eql(u8, left_text, right_text);
+            },
+        },
+    };
+}
+
+fn formattedReferenceDigest(
+    plan: *const Plan,
+    key: FormattedReferenceKey,
+) ?[32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("string:");
+    var total_bytes: usize = 0;
+    for (key.parts) |part| {
+        const fragment = formattedReferenceFragment(
+            plan,
+            key,
+            part,
+        ) orelse return null;
+        total_bytes = std.math.add(
+            usize,
+            total_bytes,
+            fragment.len,
+        ) catch return null;
+        if (total_bytes > 4096) return null;
+        hasher.update(fragment);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn formattedReferenceMatches(
+    plan: *const Plan,
+    key: FormattedReferenceKey,
+    value: std.json.Value,
+) bool {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return false,
+    };
+    var offset: usize = 0;
+    for (key.parts) |part| {
+        const fragment = formattedReferenceFragment(
+            plan,
+            key,
+            part,
+        ) orelse return false;
+        const end = std.math.add(
+            usize,
+            offset,
+            fragment.len,
+        ) catch return false;
+        if (end > text.len or
+            !std.mem.eql(u8, text[offset..end], fragment))
+        {
+            return false;
+        }
+        offset = end;
+    }
+    return offset == text.len and offset <= 4096;
+}
+
+fn renderFormattedReference(
+    plan: *const Plan,
+    key: FormattedReferenceKey,
+    buffer: *[4096]u8,
+) ?[]const u8 {
+    var offset: usize = 0;
+    for (key.parts) |part| {
+        const fragment = formattedReferenceFragment(
+            plan,
+            key,
+            part,
+        ) orelse return null;
+        const end = std.math.add(
+            usize,
+            offset,
+            fragment.len,
+        ) catch return null;
+        if (end > buffer.len) return null;
+        @memcpy(buffer[offset..end], fragment);
+        offset = end;
+    }
+    return buffer[0..offset];
+}
+
+fn formattedReferenceFragment(
+    plan: *const Plan,
+    key: FormattedReferenceKey,
+    part: CompiledFormatPart,
+) ?[]const u8 {
+    return switch (part) {
+        .literal => |literal| literal,
+        .parent => |pointer_id| switch (resolve(
+            key.parent,
+            plan.pointers[pointer_id],
+        ) orelse return null) {
+            .string => |text| text,
+            else => null,
+        },
+        .item => |pointer_id| switch (resolve(
+            key.item,
+            plan.pointers[pointer_id],
+        ) orelse return null) {
+            .string => |text| text,
+            else => null,
+        },
+        .value => switch (key.value) {
+            .string => |text| text,
+            else => null,
+        },
+    };
 }
 
 fn scalarKeyDigest(value: std.json.Value) ?[32]u8 {
@@ -4067,7 +5136,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","changes","meta","universe","ordering","accepted","rejected","targets","mappings"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","checks","more_checks","guards","changes","meta","universe","ordering","accepted","rejected","targets","mappings"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
@@ -4083,7 +5152,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"path-format","path":"/groups","items":"/members","target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
         \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
         \\    {"op":"all","path":"/items","rules":[
-        \\      {"op":"exact-object","keys":["id","labels","related_ids"]},
+        \\      {"op":"exact-object","keys":["id","kind","labels","related_ids"]},
         \\      {"op":"scalar-type","path":"/id","type":"string"},
         \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
         \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
@@ -4098,6 +5167,17 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
         \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
         \\    {"op":"reference-exists","path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"},
+        \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{"path":"/more_checks","reference":""}],"targets":[
+        \\      {"path":"/items","key":"/id"},
+        \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]}
+        \\    ]},
+        \\    {"op":"reference-exists","sources":[
+        \\      {"path":"/guards","reference":"/ids","fragments":[{"literal":"id:"},{"value":true}]},
+        \\      {"path":"/guards","reference":"/kinds","fragments":[{"literal":"kind:"},{"value":true}]}
+        \\    ],"targets":[
+        \\      {"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],"coverage_key":"/id"},
+        \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],"coverage_key":"/id"}
+        \\    ],"coverage":"all-targets"},
         \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
         \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
         \\  ],
@@ -4151,7 +5231,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"ids\":[],\"kinds\":[\"shared\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -4286,6 +5366,46 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     defer filtered_reference.deinit(std.testing.allocator);
     try std.testing.expect(!filtered_reference.valid);
 
+    const invalid_union_reference_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"checks\":[\"item-1\",\"g:one\"]",
+        "\"checks\":[\"item-1\",\"g:missing\"]",
+    );
+    defer std.testing.allocator.free(invalid_union_reference_bytes);
+    var invalid_union_reference = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_union_reference_bytes,
+        }},
+    );
+    defer invalid_union_reference.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_union_reference.valid);
+
+    const incomplete_alias_coverage_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"guards\":[{\"ids\":[],\"kinds\":[\"shared\"]}]",
+        "\"guards\":[{\"ids\":[\"item-1\"],\"kinds\":[]}]",
+    );
+    defer std.testing.allocator.free(incomplete_alias_coverage_bytes);
+    var incomplete_alias_coverage = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = incomplete_alias_coverage_bytes,
+        }},
+    );
+    defer incomplete_alias_coverage.deinit(std.testing.allocator);
+    try std.testing.expect(!incomplete_alias_coverage.valid);
+
     const missing_implication_target_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
@@ -4332,7 +5452,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);
