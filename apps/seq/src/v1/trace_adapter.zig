@@ -126,19 +126,35 @@ pub fn observeTrace(
         },
         .tool_invocations => for (trace.tools.items) |tool| {
             if (tool.declared_line == null) continue;
+            const occurrence = if (containsField(
+                program.source_field_indices,
+                12,
+            ))
+                occurrenceAtLine(trace, tool.declared_line.?)
+            else
+                null;
             try fillToolInvocation(
                 row[0..program.source_width],
                 program.source_field_indices,
                 tool,
+                occurrence,
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
         .tool_results => for (trace.tools.items) |tool| {
             if (tool.finalized_line == null) continue;
+            const occurrence = if (containsField(
+                program.source_field_indices,
+                10,
+            ))
+                occurrenceAtLine(trace, tool.finalized_line.?)
+            else
+                null;
             try fillToolResult(
                 row[0..program.source_width],
                 program.source_field_indices,
                 tool,
+                occurrence,
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
@@ -158,7 +174,19 @@ pub fn observeTrace(
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
-        .token_events,
+        .token_events => for (trace.token_events.items) |event| {
+            if (event.occurrence_index >= trace.occurrences.items.len) {
+                return error.TokenEventOccurrenceMissing;
+            }
+            try fillTokenEvent(
+                row[0..program.source_width],
+                program.source_field_indices,
+                trace.session,
+                &trace.occurrences.items[event.occurrence_index],
+                event,
+            );
+            if (try runner.feed(row[0..program.source_width]) == .stop) break;
+        },
         .structured_documents,
         .structured_values,
         => return error.UnsupportedTracePhysicalRelation,
@@ -176,8 +204,8 @@ fn supported(relation: physical.Relation) bool {
         .tool_results,
         .tool_lifecycle,
         .session_edges,
-        => true,
         .token_events,
+        => true,
         .structured_documents,
         .structured_values,
         => false,
@@ -194,7 +222,13 @@ fn traceParseOptions(
         .include_raw = relation == .source_events and
             containsField(demanded_fields, 8),
         .include_occurrences = relation == .source_events or
-            relation == .messages,
+            relation == .messages or
+            relation == .token_events or
+            (relation == .tool_invocations and
+                containsField(demanded_fields, 12)) or
+            (relation == .tool_results and
+                containsField(demanded_fields, 10)),
+        .include_token_events = relation == .token_events,
         .include_message_bodies = relation == .turns and
             (containsField(demanded_fields, 9) or
                 containsField(demanded_fields, 10)),
@@ -334,6 +368,7 @@ fn fillToolInvocation(
     row: []execution.Value,
     fields: []const u16,
     tool: trace_core.ToolLifecycleRecord,
+    occurrence: ?*const trace_core.TraceOccurrence,
 ) !void {
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
@@ -349,7 +384,10 @@ fn fillToolInvocation(
             9 => optionalString(tool.input_text),
             10 => optionalString(tool.command_text),
             11 => optionalString(tool.cwd),
-            12 => .null,
+            12 => if (occurrence) |value|
+                .{ .string = value.sourceEventId() }
+            else
+                .null,
             13 => .{ .string = tool.path },
             else => return error.InvalidTracePhysicalFieldIndex,
         };
@@ -360,6 +398,7 @@ fn fillToolResult(
     row: []execution.Value,
     fields: []const u16,
     tool: trace_core.ToolLifecycleRecord,
+    occurrence: ?*const trace_core.TraceOccurrence,
 ) !void {
     for (fields, 0..) |field, index| {
         row[index] = switch (field) {
@@ -373,7 +412,10 @@ fn fillToolResult(
             7 => optionalInteger(tool.duration_ms),
             8 => optionalBoolean(tool.patch_success),
             9 => optionalJson(tool.patch_changes_json),
-            10 => .null,
+            10 => if (occurrence) |value|
+                .{ .string = value.sourceEventId() }
+            else
+                .null,
             11 => .{ .string = tool.path },
             else => return error.InvalidTracePhysicalFieldIndex,
         };
@@ -433,6 +475,54 @@ fn fillSessionEdge(
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
+}
+
+fn fillTokenEvent(
+    row: []execution.Value,
+    fields: []const u16,
+    session: trace_core.SessionRecord,
+    occurrence: *const trace_core.TraceOccurrence,
+    event: trace_core.TokenEventRecord,
+) !void {
+    for (fields, 0..) |field, index| {
+        row[index] = switch (field) {
+            0 => optionalString(session.session_id),
+            1 => .{ .integer = event.turn_index },
+            2 => optionalString(occurrence.timestamp),
+            3 => optionalInteger(event.input_tokens),
+            4 => optionalInteger(event.cached_input_tokens),
+            5 => optionalInteger(event.output_tokens),
+            6 => optionalInteger(event.reasoning_output_tokens),
+            7 => optionalInteger(event.total_tokens),
+            8 => .{ .string = occurrence.sourceEventId() },
+            9 => .{ .string = session.path },
+            else => return error.InvalidTracePhysicalFieldIndex,
+        };
+    }
+}
+
+fn occurrenceAtLine(
+    trace: *const trace_core.CanonicalSessionTrace,
+    line_number: i64,
+) ?*const trace_core.TraceOccurrence {
+    const wanted = std.math.cast(usize, line_number) orelse return null;
+    var low: usize = 0;
+    var high = trace.occurrences.items.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = &trace.occurrences.items[middle];
+        if (candidate.line_number < wanted) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low == trace.occurrences.items.len or
+        trace.occurrences.items[low].line_number != wanted)
+    {
+        return null;
+    }
+    return &trace.occurrences.items[low];
 }
 
 fn optionalString(value: ?[]const u8) execution.Value {

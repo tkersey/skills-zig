@@ -41,6 +41,7 @@ pub const TraceParseOptions = struct {
     ongoing_threshold_secs: i64 = 60,
     include_raw: bool = false,
     include_occurrences: bool = true,
+    include_token_events: bool = false,
     include_message_bodies: bool = true,
     /// Retain the stable top N tools ordered by turn_index descending. This
     /// matches the tool_lifecycle dataset's limit semantics without retaining
@@ -321,6 +322,16 @@ pub const TraceOccurrence = struct {
     }
 };
 
+pub const TokenEventRecord = struct {
+    occurrence_index: usize,
+    turn_index: i64,
+    input_tokens: ?i64 = null,
+    cached_input_tokens: ?i64 = null,
+    output_tokens: ?i64 = null,
+    reasoning_output_tokens: ?i64 = null,
+    total_tokens: ?i64 = null,
+};
+
 pub const MessageTextPart = struct {
     text: []u8,
 
@@ -379,6 +390,7 @@ pub const CanonicalSessionTrace = struct {
     omitted_tool_call_ids: std.StringHashMapUnmanaged(void) = .empty,
     graph_edges: std.ArrayList(SessionGraphEdge) = .empty,
     occurrences: std.ArrayList(TraceOccurrence) = .empty,
+    token_events: std.ArrayList(TokenEventRecord) = .empty,
     warnings: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *CanonicalSessionTrace, allocator: std.mem.Allocator) void {
@@ -394,6 +406,7 @@ pub const CanonicalSessionTrace = struct {
         self.graph_edges.deinit(allocator);
         for (self.occurrences.items) |*occurrence| occurrence.deinit(allocator);
         self.occurrences.deinit(allocator);
+        self.token_events.deinit(allocator);
         for (self.warnings.items) |warning| allocator.free(warning);
         self.warnings.deinit(allocator);
     }
@@ -647,6 +660,17 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                     } else if (std.mem.eql(u8, event_type, "token_count")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
                         applyTokenCount(&trace.turns.items[idx], &trace.session, p);
+                        if (options.include_token_events) {
+                            try trace.token_events.append(
+                                allocator,
+                                tokenEvent(
+                                    occurrence_index orelse
+                                        return error.TokenEventOccurrenceMissing,
+                                    trace.turns.items[idx].turn_index,
+                                    p,
+                                ),
+                            );
+                        }
                     } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
                         const name = stringField(p, "thread_name") orelse stringField(p, "name");
                         if (name) |value| {
@@ -1383,8 +1407,7 @@ fn completeTurn(allocator: std.mem.Allocator, turn: *TurnRecord, status: TurnSta
 }
 
 fn applyTokenCount(turn: *TurnRecord, session: *SessionRecord, payload: std.json.ObjectMap) void {
-    const info = objectField(payload, "info") orelse payload;
-    const total = objectField(info, "total_token_usage") orelse objectField(info, "last_token_usage") orelse return;
+    const total = tokenUsage(payload) orelse return;
     if (intField(total, "input_tokens")) |v| {
         turn.input_tokens = v;
         session.input_tokens = v;
@@ -1405,6 +1428,44 @@ fn applyTokenCount(turn: *TurnRecord, session: *SessionRecord, payload: std.json
         turn.total_tokens = v;
         session.total_tokens = v;
     }
+}
+
+fn tokenEvent(
+    occurrence_index: usize,
+    turn_index: i64,
+    payload: std.json.ObjectMap,
+) TokenEventRecord {
+    const total = tokenUsage(payload);
+    return .{
+        .occurrence_index = occurrence_index,
+        .turn_index = turn_index,
+        .input_tokens = if (total) |value|
+            intField(value, "input_tokens")
+        else
+            null,
+        .cached_input_tokens = if (total) |value|
+            intField(value, "cached_input_tokens")
+        else
+            null,
+        .output_tokens = if (total) |value|
+            intField(value, "output_tokens")
+        else
+            null,
+        .reasoning_output_tokens = if (total) |value|
+            intField(value, "reasoning_output_tokens")
+        else
+            null,
+        .total_tokens = if (total) |value|
+            intField(value, "total_tokens")
+        else
+            null,
+    };
+}
+
+fn tokenUsage(payload: std.json.ObjectMap) ?std.json.ObjectMap {
+    const info = objectField(payload, "info") orelse payload;
+    return objectField(info, "total_token_usage") orelse
+        objectField(info, "last_token_usage");
 }
 
 fn applyResponseItem(
@@ -1783,7 +1844,10 @@ fn testPath(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
 test "parseSessionTrace reconstructs new complete turn" {
     const path = try testPath(std.testing.allocator, "testdata/trace/new_044_plus.jsonl");
     defer std.testing.allocator.free(path);
-    var trace = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    var trace = try parseSessionTrace(std.testing.allocator, path, .{
+        .ongoing_threshold_secs = 0,
+        .include_token_events = true,
+    });
     defer trace.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("new-session", trace.session.session_id.?);
     try std.testing.expectEqual(@as(usize, 1), trace.turns.items.len);
@@ -1792,6 +1856,21 @@ test "parseSessionTrace reconstructs new complete turn" {
     try std.testing.expect(trace.turns.items[0].has_compaction);
     try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
     try std.testing.expectEqual(ToolKind.exec_command, trace.tools.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), trace.token_events.items.len);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        trace.token_events.items[0].turn_index,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 15),
+        trace.token_events.items[0].total_tokens.?,
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:",
+        trace.occurrences
+            .items[trace.token_events.items[0].occurrence_index]
+            .sourceEventId()[0..7],
+    );
 }
 
 test "bytes-backed trace parsing preserves the exact assistant occurrence line" {
