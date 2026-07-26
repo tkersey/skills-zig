@@ -1,0 +1,154 @@
+{
+  "schema": "ledger-artifact-definition/v1",
+  "id": "example/chained-events",
+  "owner": "example",
+  "requires": {
+    "abi": "ledger-artifact-abi/v1",
+    "operators": [
+      "body-digest",
+      "bind-existing",
+      "compare-and-append",
+      "event-digest",
+      "event-envelope",
+      "event-kinds",
+      "exact-object",
+      "idempotency-key",
+      "limit",
+      "previous-digest",
+      "replay",
+      "select",
+      "sequence"
+    ]
+  },
+  "parameters": {
+    "request": {
+      "type": "safe_identifier",
+      "required": false
+    }
+  },
+  "inputs": {
+    "event": {
+      "codec": "json",
+      "max_bytes": 4096
+    }
+  },
+  "canonicalization": {},
+  "shape": {
+    "rules": [
+      {
+        "op": "exact-object",
+        "input": "event",
+        "path": "",
+        "keys": [
+          "body",
+          "body_digest",
+          "event_digest",
+          "kind",
+          "previous_digest",
+          "sequence"
+        ]
+      },
+      {
+        "op": "event-envelope",
+        "input": "event",
+        "keys": [
+          "body",
+          "body_digest",
+          "event_digest",
+          "kind",
+          "previous_digest",
+          "sequence"
+        ],
+        "sequence": "/sequence",
+        "kind": "/kind",
+        "previous_digest": "/previous_digest",
+        "body": "/body",
+        "body_digest": "/body_digest",
+        "event_digest": "/event_digest"
+      }
+    ]
+  },
+  "constraints": [
+    {
+      "op": "sequence",
+      "start": 1
+    },
+    {
+      "op": "previous-digest",
+      "genesis": null
+    },
+    {
+      "op": "body-digest"
+    },
+    {
+      "op": "event-digest"
+    },
+    {
+      "op": "event-kinds",
+      "values": [
+        "created",
+        "updated"
+      ]
+    }
+  ],
+  "identity": {},
+  "storage": {
+    "kind": "event-log",
+    "slots": {
+      "events": {
+        "path": "example/chained-events.jsonl",
+        "kind": "event-log",
+        "codec": "jsonl",
+        "max_bytes": 65536
+      }
+    }
+  },
+  "operations": {
+    "append": {
+      "effects": [
+        {
+          "op": "compare-and-append",
+          "slot": "events",
+          "input": "event",
+          "idempotency_param": "request"
+        }
+      ]
+    },
+    "bind-existing": {
+      "effects": [
+        {
+          "op": "bind-existing",
+          "slot": "events",
+          "input": "event"
+        }
+      ]
+    }
+  },
+  "projections": {
+    "all": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "select",
+          "fields": {
+            "kind": "/kind",
+            "status": "/body/status"
+          }
+        },
+        {
+          "op": "limit",
+          "count": 3
+        }
+      ]
+    }
+  },
+  "diagnostics": {},
+  "bounds": {
+    "max_input_bytes": 4096,
+    "max_store_bytes": 65536,
+    "max_records": 3,
+    "max_output_bytes": 4096,
+    "max_diagnostics": 8,
+    "max_reducer_states": 4
+  }
+}

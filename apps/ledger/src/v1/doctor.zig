@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
+const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const storage = @import("storage.zig");
 
@@ -44,6 +45,7 @@ pub fn execute(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
@@ -79,6 +81,8 @@ pub fn execute(
             definition_plan,
             repo_root,
             slot,
+            event_protocol != null and
+                event_protocol.?.target_slot_index == index,
         ) catch |err| try unhealthySlot(allocator, slot, err);
         initialized += 1;
         if (!slots[index].healthy) healthy = false;
@@ -97,6 +101,7 @@ fn inspectSlot(
     definition_plan: *const definition.Plan,
     repo_root: []const u8,
     slot: storage.ResolvedSlot,
+    protocol_required: bool,
 ) !SlotStatus {
     var snapshot = try custody.readSlot(
         allocator,
@@ -112,6 +117,7 @@ fn inspectSlot(
         slot,
         &snapshot,
         definition_plan.bounds.max_records,
+        protocol_required,
     );
     const name = try allocator.dupe(u8, slot.name);
     errdefer allocator.free(name);

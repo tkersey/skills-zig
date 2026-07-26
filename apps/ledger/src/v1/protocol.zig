@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
+const storage = @import("storage.zig");
 
 const required_operator_mask =
     operatorBit(.event_envelope) |
@@ -59,6 +60,7 @@ pub const Plan = struct {
     genesis: Genesis,
     event_kinds: [][]u8,
     max_records: usize,
+    target_slot_index: u16,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.envelope.deinit(allocator);
@@ -99,6 +101,7 @@ const ProtocolRules = struct {
 pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
 ) !?Plan {
     const present_mask = definition_plan.operator_mask & protocol_operator_mask;
     if (present_mask == 0) return null;
@@ -172,12 +175,17 @@ pub fn compile(
         for (event_kinds) |kind| allocator.free(kind);
         allocator.free(event_kinds);
     }
+    const target_slot_index = try compileTargetSlot(
+        storage_plan,
+        envelope.input_index,
+    );
     return .{
         .envelope = envelope,
         .sequence_start = sequence_start,
         .genesis = genesis,
         .event_kinds = event_kinds,
         .max_records = definition_plan.bounds.max_records,
+        .target_slot_index = target_slot_index,
     };
 }
 
@@ -201,6 +209,7 @@ pub fn encodeCache(
     });
     try encodeStringSet(plan.event_kinds, encoder);
     try encoder.writeUsize(plan.max_records);
+    try encoder.writeU16(plan.target_slot_index);
 }
 
 pub fn decodeCache(
@@ -251,6 +260,7 @@ pub fn decodeCache(
             .genesis = genesis,
             .event_kinds = event_kinds,
             .max_records = try decoder.readUsize(),
+            .target_slot_index = try decoder.readU16(),
         };
     };
     errdefer plan.deinit(allocator);
@@ -261,6 +271,7 @@ pub fn decodeCache(
 pub fn validateCachePlan(
     plan: *const Plan,
     definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
 ) !void {
     try validatePlan(plan);
     if (plan.envelope.input_index >= definition_plan.inputs.len or
@@ -272,6 +283,13 @@ pub fn validateCachePlan(
     {
         return error.CacheProtocolPlanMismatch;
     }
+    const expected_slot = try compileTargetSlot(
+        storage_plan,
+        plan.envelope.input_index,
+    );
+    if (plan.target_slot_index != expected_slot) {
+        return error.CacheProtocolPlanMismatch;
+    }
 }
 
 pub fn apply(
@@ -280,9 +298,6 @@ pub fn apply(
     state: *ReplayState,
     event_bytes: []const u8,
 ) !void {
-    if (state.records >= plan.max_records) {
-        return error.ProtocolRecordBoundsExceeded;
-    }
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -293,7 +308,19 @@ pub fn apply(
         },
     );
     defer parsed.deinit();
-    const object = try definition_core.json.object(parsed.value);
+    return applyValue(allocator, plan, state, parsed.value);
+}
+
+pub fn applyValue(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+) !void {
+    if (state.records >= plan.max_records) {
+        return error.ProtocolRecordBoundsExceeded;
+    }
+    const object = try definition_core.json.object(event);
     try validateEnvelopeKeys(object, plan.envelope.keys);
 
     const sequence_value = object.get(plan.envelope.sequence_key) orelse
@@ -349,7 +376,7 @@ pub fn apply(
     const computed_event_digest =
         try definition_core.canonical_json.fingerprintObjectOmittingAlloc(
             allocator,
-            parsed.value,
+            event,
             plan.envelope.event_digest_key,
         );
     defer allocator.free(computed_event_digest);
@@ -683,6 +710,50 @@ fn validatePlan(plan: *const Plan) !void {
     }
 }
 
+fn compileTargetSlot(
+    storage_plan: *const storage.Plan,
+    input_index: u8,
+) !u16 {
+    var target_slot_index: ?u16 = null;
+    for (storage_plan.operations) |operation| {
+        for (operation.effects) |effect| {
+            if (effect.input_index != input_index) continue;
+            const slot = storage_plan.slots[effect.slot_index];
+            if (slot.kind != .event_log) {
+                return error.ProtocolInputRequiresEventLogSlot;
+            }
+            switch (effect.kind) {
+                .compare_append, .bind_existing => {},
+                .create_new, .compare_replace => {
+                    return error.ProtocolStoreMustBeAppendOnly;
+                },
+            }
+            if (target_slot_index) |prior| {
+                if (prior != effect.slot_index) {
+                    return error.ProtocolInputHasMultipleSlots;
+                }
+            } else {
+                target_slot_index = effect.slot_index;
+            }
+        }
+    }
+    const target = target_slot_index orelse
+        return error.ProtocolInputHasNoStorageEffect;
+    for (storage_plan.operations) |operation| {
+        for (operation.effects) |effect| {
+            if (effect.slot_index == target and
+                effect.input_index != input_index)
+            {
+                return error.ProtocolSlotHasMixedInputs;
+            }
+        }
+    }
+    if (target >= storage_plan.slots.len) {
+        return error.ProtocolTargetSlotInvalid;
+    }
+    return target;
+}
+
 fn validateSortedStringSet(items: []const []u8) !void {
     for (items, 0..) |item, index| {
         try definition_core.json.safeIdentifier(item, 256);
@@ -812,7 +883,7 @@ test "compiled event protocol validates exact chained envelopes" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -828,9 +899,15 @@ test "compiled event protocol validates exact chained envelopes" {
         "protocol.json",
     );
     defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
     var plan = (try compile(
         std.testing.allocator,
         &definition_plan,
+        &storage_plan,
     )).?;
     defer plan.deinit(std.testing.allocator);
     var encoder = definition_core.cache.Encoder.init(
@@ -845,7 +922,7 @@ test "compiled event protocol validates exact chained envelopes" {
     var cached = try decodeCache(std.testing.allocator, &decoder);
     defer cached.deinit(std.testing.allocator);
     try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
+    try validateCachePlan(&cached, &definition_plan, &storage_plan);
     try std.testing.expectEqualStrings(
         plan.envelope.event_digest_key,
         cached.envelope.event_digest_key,
@@ -899,7 +976,7 @@ test "event protocol rejects unknown kinds and broken digest links" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol-errors","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":0},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["accepted"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/errors.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol-errors","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":0},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["accepted"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/errors.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -915,9 +992,15 @@ test "event protocol rejects unknown kinds and broken digest links" {
         "protocol.json",
     );
     defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
     var plan = (try compile(
         std.testing.allocator,
         &definition_plan,
+        &storage_plan,
     )).?;
     defer plan.deinit(std.testing.allocator);
 

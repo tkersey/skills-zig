@@ -4,6 +4,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
+const protocol = @import("protocol.zig");
 const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
@@ -14,9 +15,11 @@ const ArchivedPlan = struct {
     definition_plan: definition.Plan,
     validation_plan: validation.Plan,
     storage_plan: storage.Plan,
+    protocol_plan: ?protocol.Plan,
 
     fn deinit(self: *ArchivedPlan, allocator: std.mem.Allocator) void {
         allocator.free(self.digest);
+        if (self.protocol_plan) |*plan| plan.deinit(allocator);
         self.storage_plan.deinit(allocator);
         self.validation_plan.deinit(allocator);
         self.definition_plan.deinit(allocator);
@@ -66,6 +69,12 @@ const PlanCache = struct {
             &definition_plan,
         );
         errdefer storage_plan.deinit(self.allocator);
+        var protocol_plan = try protocol.compile(
+            self.allocator,
+            &definition_plan,
+            &storage_plan,
+        );
+        errdefer if (protocol_plan) |*plan| plan.deinit(self.allocator);
         const owned_digest = try self.allocator.dupe(u8, digest);
         errdefer self.allocator.free(owned_digest);
         try self.plans.append(self.allocator, .{
@@ -74,6 +83,7 @@ const PlanCache = struct {
             .definition_plan = definition_plan,
             .validation_plan = validation_plan,
             .storage_plan = storage_plan,
+            .protocol_plan = protocol_plan,
         });
         return &self.plans.items[self.plans.items.len - 1];
     }
@@ -82,6 +92,7 @@ const PlanCache = struct {
 pub const Stats = struct {
     records_validated: usize,
     definition_versions: usize,
+    protocol_state: ?protocol.ReplayState,
 };
 
 pub fn validateSlot(
@@ -91,6 +102,7 @@ pub fn validateSlot(
     slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
     current_max_records: usize,
+    protocol_required: bool,
 ) !Stats {
     if (current_max_records == 0 or current_max_records > 10_000_000) {
         return error.InvalidReplayRecordBound;
@@ -101,18 +113,25 @@ pub fn validateSlot(
         .definition_id = definition_id,
     };
     defer cache.deinit();
-    const records_validated = try validateHistory(
+    const history = try validateHistory(
         allocator,
         &cache,
         slot,
         snapshot,
         current_max_records,
+        protocol_required,
     );
     return .{
-        .records_validated = records_validated,
+        .records_validated = history.records_validated,
         .definition_versions = cache.plans.items.len,
+        .protocol_state = history.protocol_state,
     };
 }
+
+const HistoryResult = struct {
+    records_validated: usize,
+    protocol_state: ?protocol.ReplayState,
+};
 
 fn validateHistory(
     allocator: std.mem.Allocator,
@@ -120,7 +139,8 @@ fn validateHistory(
     current_slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
     current_max_records: usize,
-) !usize {
+    protocol_required: bool,
+) !HistoryResult {
     if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
     var epoch_start: usize = 0;
     for (snapshot.binding.rows, 0..) |row, index| {
@@ -128,6 +148,9 @@ fn validateHistory(
         if (row.kind == .admission and
             resolved.effect.kind == .compare_replace)
         {
+            if (protocol_required) {
+                return error.ProtocolHistoryMustBeAppendOnly;
+            }
             if (index == epoch_start) {
                 return error.HistoricalReplaceWithoutState;
             }
@@ -147,6 +170,7 @@ fn validateHistory(
                 snapshot.binding.rows[epoch_start..index],
                 prior_content,
                 null,
+                false,
             );
             epoch_start = index;
         }
@@ -158,6 +182,7 @@ fn validateHistory(
         snapshot.binding.rows[epoch_start..],
         snapshot.content,
         current_max_records,
+        protocol_required,
     );
 }
 
@@ -201,7 +226,8 @@ fn validateEpoch(
     rows: []const custody.BindingRow,
     content: []const u8,
     current_max_records: ?usize,
-) !usize {
+    protocol_required: bool,
+) !HistoryResult {
     if (rows.len == 0) return error.InvalidStoreBinding;
     const digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
@@ -212,13 +238,19 @@ fn validateEpoch(
         return error.HistoricalRevisionMismatch;
     }
     return switch (current_slot.kind) {
-        .document => validateDocumentEpoch(
-            allocator,
-            cache,
-            current_slot,
-            rows,
-            content,
-        ),
+        .document => if (protocol_required)
+            error.ProtocolRequiresEventLogStorage
+        else
+            .{
+                .records_validated = try validateDocumentEpoch(
+                    allocator,
+                    cache,
+                    current_slot,
+                    rows,
+                    content,
+                ),
+                .protocol_state = null,
+            },
         .event_log => validateEventEpoch(
             allocator,
             cache,
@@ -226,6 +258,7 @@ fn validateEpoch(
             rows,
             content,
             current_max_records,
+            protocol_required,
         ),
     };
 }
@@ -275,7 +308,8 @@ fn validateEventEpoch(
     rows: []const custody.BindingRow,
     content: []const u8,
     current_max_records: ?usize,
-) !usize {
+    protocol_required: bool,
+) !HistoryResult {
     var records: std.ArrayList([]const u8) = .empty;
     defer records.deinit(allocator);
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -294,6 +328,7 @@ fn validateEventEpoch(
         }
     }
     var expected_start: usize = 0;
+    var protocol_state: ?protocol.ReplayState = null;
     for (rows, 0..) |row, index| {
         const record_start = row.record_start orelse
             return error.StoreBindingRecordRangeMissing;
@@ -322,6 +357,13 @@ fn validateEventEpoch(
                         record,
                         false,
                     );
+                    try applyHistoricalProtocol(
+                        allocator,
+                        &protocol_state,
+                        protocol_required,
+                        resolved,
+                        record,
+                    );
                 }
             },
             .admission => switch (resolved.effect.kind) {
@@ -335,6 +377,13 @@ fn validateEventEpoch(
                         resolved.effect,
                         content[row.extent_start..row.extent_end],
                         true,
+                    );
+                    try applyHistoricalProtocol(
+                        allocator,
+                        &protocol_state,
+                        protocol_required,
+                        resolved,
+                        content[row.extent_start..row.extent_end],
                     );
                 },
                 .create_new, .compare_replace => {
@@ -352,6 +401,9 @@ fn validateEventEpoch(
                         content,
                         true,
                     );
+                    if (protocol_required) {
+                        return error.ProtocolHistoryMustBeAppendOnly;
+                    }
                 },
                 .bind_existing => return error.HistoricalEffectKindMismatch,
             },
@@ -361,7 +413,35 @@ fn validateEventEpoch(
     if (expected_start != records.items.len) {
         return error.StoreBindingRecordCountMismatch;
     }
-    return records.items.len;
+    if (protocol_required and protocol_state == null) {
+        return error.HistoricalProtocolBindingMismatch;
+    }
+    return .{
+        .records_validated = records.items.len,
+        .protocol_state = protocol_state,
+    };
+}
+
+fn applyHistoricalProtocol(
+    allocator: std.mem.Allocator,
+    state: *?protocol.ReplayState,
+    protocol_required: bool,
+    resolved: ResolvedEffect,
+    record: []const u8,
+) !void {
+    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
+        if (plan.target_slot_index == resolved.effect.slot_index)
+            plan
+        else
+            null
+    else
+        null;
+    if ((historical_plan != null) != protocol_required) {
+        return error.HistoricalProtocolBindingMismatch;
+    }
+    const plan = historical_plan orelse return;
+    if (state.* == null) state.* = protocol.ReplayState.init(plan);
+    try protocol.apply(allocator, plan, &state.*.?, record);
 }
 
 fn validateBoundExtent(

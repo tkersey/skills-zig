@@ -1,0 +1,11 @@
+{
+  "body": {
+    "id": "item-1",
+    "status": "archived"
+  },
+  "body_digest": "sha256:36dc8d763ad3711ea73d0ed2f2c370494a3cbb07711f24c854d3c6a21d479c00",
+  "event_digest": "sha256:2fcdc97b7cfaa95d5f22999aef0a32e69b63616f60cc02ce9e10e3a608097361",
+  "kind": "updated",
+  "previous_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sequence": 3
+}

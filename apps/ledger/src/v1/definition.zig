@@ -847,14 +847,21 @@ fn parseNamedPlans(
         try definition_core.json.safeIdentifier(entry.key_ptr.*, 128);
         const start = compiler.rules.items.len;
         try compiler.compileValue(entry.value_ptr.*, 0);
-        var plan: NamedPlan = .{
-            .name = try allocator.dupe(u8, entry.key_ptr.*),
-            .rule_start = start,
-            .rule_count = compiler.rules.items.len - start,
-            .canonical_config = try definition_core.canonical_json.canonicalJsonAlloc(
-                allocator,
-                entry.value_ptr.*,
-            ),
+        var plan: NamedPlan = plan: {
+            const name = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(name);
+            const canonical_config =
+                try definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    entry.value_ptr.*,
+                );
+            errdefer allocator.free(canonical_config);
+            break :plan .{
+                .name = name,
+                .rule_start = start,
+                .rule_count = compiler.rules.items.len - start,
+                .canonical_config = canonical_config,
+            };
         };
         errdefer plan.deinit(allocator);
         try out.append(allocator, plan);

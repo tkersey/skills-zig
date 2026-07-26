@@ -11,11 +11,20 @@ event_two=apps/ledger/src/v1/fixtures/event-two.json
 event_snapshot_definition=apps/ledger/src/v1/fixtures/event-snapshot-definition.json
 event_snapshot_initial=apps/ledger/src/v1/fixtures/event-snapshot-initial.jsonl
 event_snapshot_replacement=apps/ledger/src/v1/fixtures/event-snapshot-replacement.jsonl
+chained_definition=apps/ledger/src/v1/fixtures/chained-event-definition.json
+chained_one=apps/ledger/src/v1/fixtures/chained-event-one.json
+chained_two=apps/ledger/src/v1/fixtures/chained-event-two.json
+chained_invalid=apps/ledger/src/v1/fixtures/chained-event-invalid.json
+chained_existing=apps/ledger/src/v1/fixtures/chained-event-existing.jsonl
+chained_existing_invalid=apps/ledger/src/v1/fixtures/chained-event-existing-invalid.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 repo_dir=$(mktemp -d "$temp_base/ledger-v1-smoke.XXXXXX")
+protocol_repo=$(mktemp -d "$temp_base/ledger-v1-protocol.XXXXXX")
+protocol_bind_repo=$(mktemp -d "$temp_base/ledger-v1-protocol-bind.XXXXXX")
+protocol_bind_invalid_repo=$(mktemp -d "$temp_base/ledger-v1-protocol-bind-invalid.XXXXXX")
 legacy_repo=$(mktemp -d "$temp_base/ledger-v1-bind.XXXXXX")
 invalid_repo=$(mktemp -d "$temp_base/ledger-v1-bind-invalid.XXXXXX")
-trap 'for dir in "${repo_dir:-}" "${legacy_repo:-}" "${invalid_repo:-}"; do test -n "$dir" && rm -rf -- "$dir"; done' EXIT
+trap 'for dir in "${repo_dir:-}" "${protocol_repo:-}" "${protocol_bind_repo:-}" "${protocol_bind_invalid_repo:-}" "${legacy_repo:-}" "${invalid_repo:-}"; do test -n "$dir" && rm -rf -- "$dir"; done' EXIT
 export LEDGER_CACHE_DIR="$repo_dir/cache"
 
 check_output=$("$binary" definition check \
@@ -145,6 +154,111 @@ grep -Fq '"schema":"ledger-transaction-error/v1"' <<<"$conflict_output"
 grep -Fq '"code":"IdempotencyConflict"' <<<"$conflict_output"
 grep -Fq '"storage_mutated":null' <<<"$conflict_output"
 grep -Fq '"storage_mutation_state":"unknown"' <<<"$conflict_output"
+
+chained_check=$("$binary" definition check \
+  --definition "$chained_definition" \
+  --format json)
+grep -Fq '"valid":true' <<<"$chained_check"
+
+chained_first=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation append \
+  --repo "$protocol_repo" \
+  --input "event=$chained_one" \
+  --param request=chain-one \
+  --format json)
+grep -Fq '"result":"appended"' <<<"$chained_first"
+
+chained_second=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation append \
+  --repo "$protocol_repo" \
+  --input "event=$chained_two" \
+  --param request=chain-two \
+  --format json)
+grep -Fq '"result":"appended"' <<<"$chained_second"
+
+chained_duplicate=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation append \
+  --repo "$protocol_repo" \
+  --input "event=$chained_two" \
+  --param request=chain-two \
+  --format json)
+grep -Fq '"result":"idempotent"' <<<"$chained_duplicate"
+grep -Fq '"storage_mutated":false' <<<"$chained_duplicate"
+
+set +e
+chained_failure=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation append \
+  --repo "$protocol_repo" \
+  --input "event=$chained_invalid" \
+  --param request=chain-invalid \
+  --format json)
+chained_failure_status=$?
+set -e
+test "$chained_failure_status" -eq 2
+grep -Fq '"code":"EventPreviousDigestMismatch"' <<<"$chained_failure"
+
+chained_projection=$("$binary" project \
+  --definition "$chained_definition" \
+  --projection all \
+  --repo "$protocol_repo" \
+  --format json)
+grep -Fq \
+  '"data":[{"kind":"created","status":"open"},{"kind":"updated","status":"closed"}]' \
+  <<<"$chained_projection"
+
+chained_doctor=$("$binary" doctor \
+  --definition "$chained_definition" \
+  --repo "$protocol_repo" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$chained_doctor"
+grep -Fq '"binding_rows":2' <<<"$chained_doctor"
+
+mkdir -p "$protocol_bind_repo/.ledger/example"
+cp \
+  "$chained_existing" \
+  "$protocol_bind_repo/.ledger/example/chained-events.jsonl"
+cp \
+  "$protocol_bind_repo/.ledger/example/chained-events.jsonl" \
+  "$protocol_bind_repo/chained-events.before"
+
+chained_binding=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation bind-existing \
+  --repo "$protocol_bind_repo" \
+  --format json)
+grep -Fq '"result":"bound"' <<<"$chained_binding"
+grep -Fq '"storage_mutated":true' <<<"$chained_binding"
+cmp -s \
+  "$protocol_bind_repo/chained-events.before" \
+  "$protocol_bind_repo/.ledger/example/chained-events.jsonl"
+
+chained_bound_doctor=$("$binary" doctor \
+  --definition "$chained_definition" \
+  --repo "$protocol_bind_repo" \
+  --format json)
+grep -Fq '"healthy":true' <<<"$chained_bound_doctor"
+grep -Fq '"binding_rows":1' <<<"$chained_bound_doctor"
+
+mkdir -p "$protocol_bind_invalid_repo/.ledger/example"
+cp \
+  "$chained_existing_invalid" \
+  "$protocol_bind_invalid_repo/.ledger/example/chained-events.jsonl"
+set +e
+chained_bind_failure=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation bind-existing \
+  --repo "$protocol_bind_invalid_repo" \
+  --format json)
+chained_bind_failure_status=$?
+set -e
+test "$chained_bind_failure_status" -eq 2
+grep -Fq '"code":"EventSequenceMismatch"' <<<"$chained_bind_failure"
+test ! -d "$protocol_bind_invalid_repo/.ledger/.bindings" ||
+  test -z "$(find "$protocol_bind_invalid_repo/.ledger/.bindings" -type f -print -quit)"
 
 printf '%s\n' '{"kind":"one","value":9}' >"$repo_dir/.ledger/example/events.jsonl"
 set +e

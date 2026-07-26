@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
+const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const storage = @import("storage.zig");
 
@@ -681,6 +682,7 @@ pub fn execute(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
     plan: *const Plan,
     projection_name: []const u8,
     repo_root: []const u8,
@@ -709,6 +711,8 @@ pub fn execute(
         slot,
         &snapshot,
         definition_plan.bounds.max_records,
+        event_protocol != null and
+            event_protocol.?.target_slot_index == compiled.slot_index,
     );
     const effective_limit = try resolveLimit(
         compiled.limit,

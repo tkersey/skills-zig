@@ -201,6 +201,7 @@ fn compileFromSource(
             result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
+                &result.storage_plan.?,
             );
             result.projection_plan = try projection.compile(
                 allocator,
@@ -236,6 +237,7 @@ fn compileFromSource(
             result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
+                &result.storage_plan.?,
             );
             if (result.storage_plan.?.findOperation(route.name.?) == null) {
                 return error.UnknownOperation;
@@ -249,6 +251,7 @@ fn compileFromSource(
             result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
+                &result.storage_plan.?,
             );
             result.projection_plan = try projection.compile(
                 allocator,
@@ -267,6 +270,7 @@ fn compileFromSource(
             result.protocol_plan = try protocol.compile(
                 allocator,
                 &result.definition_plan,
+                &result.storage_plan.?,
             );
         },
     }
@@ -749,7 +753,11 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
         try storage.validateCachePlan(plan, &plan_set.definition_plan);
     }
     if (plan_set.protocol_plan) |*plan| {
-        try protocol.validateCachePlan(plan, &plan_set.definition_plan);
+        try protocol.validateCachePlan(
+            plan,
+            &plan_set.definition_plan,
+            &plan_set.storage_plan.?,
+        );
     }
     if (plan_set.projection_plan) |*plan| {
         try projection.validateCachePlan(
@@ -1000,7 +1008,7 @@ test "compiled plan cache releases every allocation on compile and decode failur
     try source_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"]},{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["captured"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"]},{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["captured"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     const source_root = try source_tmp.dir.realPathFileAlloc(

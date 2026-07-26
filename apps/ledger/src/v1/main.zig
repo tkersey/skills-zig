@@ -202,6 +202,7 @@ fn runTransact(
         context.entry_path,
         &context.validation_plan.?,
         &context.storage_plan.?,
+        if (context.protocol_plan) |*plan| plan else null,
         args.operation,
         repo_root,
         documents,
@@ -249,6 +250,7 @@ fn runDoctor(
         allocator,
         &context.definition_plan,
         &context.storage_plan.?,
+        if (context.protocol_plan) |*plan| plan else null,
         repo_root,
         &bindings,
     );
@@ -286,6 +288,7 @@ fn runProject(
         allocator,
         &context.definition_plan,
         &context.storage_plan.?,
+        if (context.protocol_plan) |*plan| plan else null,
         &context.projection_plan.?,
         args.projection,
         repo_root,

@@ -5,6 +5,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
 const materialization = @import("materialization.zig");
+const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
@@ -88,6 +89,7 @@ pub fn transact(
     definition_entry_path: []const u8,
     validation_plan: *const validation.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
     operation_name: []const u8,
     repo_root: []const u8,
     documents: []const validation.InputDocument,
@@ -118,6 +120,7 @@ pub fn transact(
             definition_entry_path,
             validation_plan,
             &resolved_storage,
+            event_protocol,
             operation,
             operation_name,
             repo_root,
@@ -185,6 +188,7 @@ pub fn transact(
         allocator,
         definition_plan,
         &resolved_storage,
+        event_protocol,
         operation,
         operation_name,
         repo_root,
@@ -309,6 +313,7 @@ fn bindExisting(
     definition_entry_path: []const u8,
     validation_plan: *const validation.Plan,
     storage_plan: *const storage.ResolvedPlan,
+    event_protocol: ?*const protocol.Plan,
     operation: *const storage.Operation,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -358,6 +363,7 @@ fn bindExisting(
             definition_plan,
             validation_plan,
             storage_plan,
+            event_protocol,
             effect,
             operation_name,
             repo_root,
@@ -477,6 +483,7 @@ fn prepareExistingBinding(
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
     storage_plan: *const storage.ResolvedPlan,
+    event_protocol: ?*const protocol.Plan,
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -525,6 +532,8 @@ fn prepareExistingBinding(
         validation_plan,
         effect.input_index,
         slot,
+        event_protocol,
+        effect.slot_index,
         slot_content,
     );
     const binding_after = try custody.appendBindingRowAlloc(
@@ -563,6 +572,8 @@ fn validateExistingContent(
     validation_plan: *const validation.Plan,
     input_index: u8,
     slot: storage.ResolvedSlot,
+    event_protocol: ?*const protocol.Plan,
+    slot_index: u16,
     content: []const u8,
 ) !?usize {
     const input = definition_plan.inputs[input_index];
@@ -576,6 +587,14 @@ fn validateExistingContent(
         return null;
     }
     var count: usize = 0;
+    const selected_protocol = if (event_protocol) |plan|
+        if (plan.target_slot_index == slot_index) plan else null
+    else
+        null;
+    var protocol_state = if (selected_protocol) |plan|
+        protocol.ReplayState.init(plan)
+    else
+        null;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
@@ -590,6 +609,14 @@ fn validateExistingContent(
             input.name,
             line,
         );
+        if (selected_protocol) |plan| {
+            try protocol.apply(
+                allocator,
+                plan,
+                &protocol_state.?,
+                line,
+            );
+        }
     }
     if (count == 0) return error.ExistingStoreEmpty;
     return count;
@@ -678,6 +705,7 @@ fn prepareEffects(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.ResolvedPlan,
+    event_protocol: ?*const protocol.Plan,
     operation: *const storage.Operation,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -695,6 +723,7 @@ fn prepareEffects(
             allocator,
             definition_plan,
             storage_plan,
+            event_protocol,
             effect,
             operation_name,
             repo_root,
@@ -710,6 +739,7 @@ fn prepareEffect(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.ResolvedPlan,
+    event_protocol: ?*const protocol.Plan,
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -770,20 +800,6 @@ fn prepareEffect(
         canonical_input,
     );
     defer allocator.free(canonical_input_digest);
-    const slot_content = try slotContentAfter(
-        allocator,
-        slot,
-        effect.kind,
-        slot_before,
-        canonical_input,
-    );
-    const slot_after = slot_content.bytes;
-    errdefer allocator.free(slot_after);
-    const slot_after_digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        slot_after,
-    );
-    errdefer allocator.free(slot_after_digest);
     const idempotency_key = if (effect.idempotency_parameter) |parameter_name|
         parameterText(parameters, parameter_name) orelse
             return error.MissingOperationParameter
@@ -809,16 +825,92 @@ fn prepareEffect(
     errdefer binding_before.deinit(allocator);
     if (slot_before != null and !binding_before.exists) return error.UnboundStore;
     if (slot_before == null and binding_before.exists) return error.OrphanedStoreBinding;
-    if (!binding_before.idempotency_match) {
-        if (slot_after.len > slot.max_bytes) {
+
+    const protocol_required = event_protocol != null and
+        event_protocol.?.target_slot_index == effect.slot_index;
+    var existing_records: ?usize = null;
+    var protocol_state: ?protocol.ReplayState = null;
+    if (slot_before) |content| {
+        const snapshot: custody.SlotSnapshot = .{
+            .path = slot_path,
+            .content = content,
+            .revision = slot_before_digest.?,
+            .binding = binding_before,
+        };
+        const replay_stats = try replay.validateSlot(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            definition_plan.bounds.max_records,
+            protocol_required,
+        );
+        if (slot.kind == .event_log) {
+            existing_records = replay_stats.records_validated;
+        }
+        protocol_state = replay_stats.protocol_state;
+    } else if (slot.kind == .event_log) {
+        existing_records = 0;
+    }
+    if (protocol_required and !binding_before.idempotency_match) {
+        const current_protocol = event_protocol.?;
+        if (protocol_state == null) {
+            protocol_state = protocol.ReplayState.init(current_protocol);
+        }
+        try protocol.applyValue(
+            allocator,
+            current_protocol,
+            &protocol_state.?,
+            execution.inputJson(effect.input_index) orelse
+                return error.ProtocolInputMustBeJson,
+        );
+    }
+
+    const slot_after: SlotAfter = slot_after: {
+        if (binding_before.idempotency_match) {
+            const prior = slot_before orelse return error.InvalidIdempotencyBinding;
+            const prior_digest = slot_before_digest orelse
+                return error.InvalidIdempotencyBinding;
+            const bytes = try allocator.dupe(u8, prior);
+            errdefer allocator.free(bytes);
+            break :slot_after .{
+                .bytes = bytes,
+                .digest = try allocator.dupe(u8, prior_digest),
+                .extent = null,
+            };
+        }
+        const content = try slotContentAfter(
+            allocator,
+            slot,
+            effect.kind,
+            slot_before,
+            existing_records,
+            canonical_input,
+        );
+        errdefer allocator.free(content.bytes);
+        if (content.bytes.len > slot.max_bytes) {
             return error.StorageSlotBoundsExceeded;
         }
-        if (slot_content.extent.record_end) |record_end| {
+        if (content.extent.record_end) |record_end| {
             if (record_end > definition_plan.bounds.max_records) {
                 return error.TransactionRecordBoundsExceeded;
             }
         }
-    }
+        const digest = try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            content.bytes,
+        );
+        errdefer allocator.free(digest);
+        break :slot_after .{
+            .bytes = content.bytes,
+            .digest = digest,
+            .extent = content.extent,
+        };
+    };
+    errdefer allocator.free(slot_after.bytes);
+    errdefer allocator.free(slot_after.digest);
+
     var revision_candidate: ?revision_archive.Candidate = null;
     errdefer if (revision_candidate) |*candidate| candidate.deinit(allocator);
     if (effect.kind == .compare_replace and binding_before.idempotency_match) {
@@ -855,9 +947,9 @@ fn prepareEffect(
             operation_name,
             input_digest,
             canonical_input_digest,
-            slot_content.extent,
+            slot_after.extent.?,
             slot_before_digest,
-            slot_after_digest,
+            slot_after.digest,
             idempotency_key,
         );
     return .{
@@ -867,8 +959,8 @@ fn prepareEffect(
         .binding_path = binding_path,
         .slot_before = slot_before,
         .slot_before_digest = slot_before_digest,
-        .slot_after = slot_after,
-        .slot_after_digest = slot_after_digest,
+        .slot_after = slot_after.bytes,
+        .slot_after_digest = slot_after.digest,
         .binding_before = binding_before,
         .binding_after = binding_after,
         .canonical_input = canonical_input,
@@ -882,11 +974,18 @@ const SlotContent = struct {
     extent: custody.BindingExtent,
 };
 
+const SlotAfter = struct {
+    bytes: []u8,
+    digest: []u8,
+    extent: ?custody.BindingExtent,
+};
+
 fn slotContentAfter(
     allocator: std.mem.Allocator,
     slot: storage.ResolvedSlot,
     kind: storage.EffectKind,
     before: ?[]const u8,
+    existing_records: ?usize,
     canonical_input: []const u8,
 ) !SlotContent {
     if (kind != .compare_append) {
@@ -921,11 +1020,9 @@ fn slotContentAfter(
     if (parsed.value != .object) return error.EventPayloadMustBeObject;
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    var record_start: usize = 0;
+    const record_start = existing_records orelse
+        return error.ExistingEventRecordCountMissing;
     if (before) |bytes| {
-        const jsonl_validation = durable_store.validateJsonlBytes(allocator, bytes);
-        if (!jsonl_validation.ok()) return error.InvalidExistingEventLog;
-        record_start = jsonl_validation.lines;
         try output.writer.writeAll(bytes);
         if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') {
             try output.writer.writeByte('\n');
@@ -1102,6 +1199,76 @@ fn parameterText(
     return null;
 }
 
+const ChainedEvent = struct {
+    bytes: []u8,
+    digest: []u8,
+
+    fn deinit(self: *ChainedEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.digest);
+        self.* = undefined;
+    }
+};
+
+fn chainedEventAlloc(
+    allocator: std.mem.Allocator,
+    sequence: u64,
+    kind: []const u8,
+    previous: ?[]const u8,
+    body: []const u8,
+) !ChainedEvent {
+    const body_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            body,
+        );
+    defer allocator.free(body_digest);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"body\":");
+    try output.writer.writeAll(body);
+    try output.writer.writeAll(",\"body_digest\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &output.writer,
+        body_digest,
+    );
+    try output.writer.writeAll(",\"event_digest\":\"\",\"kind\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &output.writer,
+        kind,
+    );
+    try output.writer.writeAll(",\"previous_digest\":");
+    if (previous) |digest| {
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            digest,
+        );
+    } else {
+        try output.writer.writeAll("null");
+    }
+    try output.writer.print(",\"sequence\":{d}}}", .{sequence});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        output.written(),
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const digest =
+        try definition_core.canonical_json.fingerprintObjectOmittingAlloc(
+            allocator,
+            parsed.value,
+            "event_digest",
+        );
+    errdefer allocator.free(digest);
+    const bytes = try definition_core.canonical_json.finalizeFingerprintAlloc(
+        allocator,
+        output.written(),
+        "event_digest",
+    );
+    return .{ .bytes = bytes, .digest = digest };
+}
+
 test "transaction appends an event and binding in one durable transaction" {
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
@@ -1168,6 +1335,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "protocol.json",
         &validation_plan,
         &storage_plan,
+        null,
         "append",
         repo_root,
         &.{.{ .name = "event", .bytes = "{\"kind\":\"one\",\"value\":1}" }},
@@ -1185,6 +1353,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "protocol.json",
         &validation_plan,
         &storage_plan,
+        null,
         "append",
         repo_root,
         &.{.{ .name = "event", .bytes = "{\"kind\":\"two\",\"value\":2}" }},
@@ -1225,6 +1394,7 @@ test "transaction appends an event and binding in one durable transaction" {
         "protocol.json",
         &validation_plan,
         &storage_plan,
+        null,
         "append",
         repo_root,
         &.{.{ .name = "event", .bytes = "{\"kind\":\"two\",\"value\":2}" }},
@@ -1246,6 +1416,7 @@ test "transaction appends an event and binding in one durable transaction" {
             "protocol.json",
             &validation_plan,
             &storage_plan,
+            null,
             "append",
             repo_root,
             &.{.{ .name = "event", .bytes = "{\"kind\":\"three\",\"value\":3}" }},
@@ -1274,6 +1445,7 @@ test "transaction appends an event and binding in one durable transaction" {
             resolved_storage.slot(0),
             &bounded_snapshot,
             1,
+            false,
         ),
     );
     const binding_path = try custody.bindingPathAlloc(
@@ -1319,10 +1491,179 @@ test "transaction appends an event and binding in one durable transaction" {
             "protocol.json",
             &validation_plan,
             &storage_plan,
+            null,
             "append",
             repo_root,
             &.{.{ .name = "event", .bytes = "{\"kind\":\"three\",\"value\":3}" }},
             &third_parameters,
+        ),
+    );
+}
+
+test "transaction admits and replays a definition-bound event chain" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/chained-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"]},{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/chained-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+
+    var first_event = try chainedEventAlloc(
+        std.testing.allocator,
+        1,
+        "created",
+        null,
+        "{\"id\":\"item-1\",\"status\":\"open\"}",
+    );
+    defer first_event.deinit(std.testing.allocator);
+    var first = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "event", .bytes = first_event.bytes }},
+        &parameters,
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.storage_mutated);
+
+    var second_event = try chainedEventAlloc(
+        std.testing.allocator,
+        2,
+        "updated",
+        first_event.digest,
+        "{\"id\":\"item-1\",\"status\":\"closed\"}",
+    );
+    defer second_event.deinit(std.testing.allocator);
+    var second = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "event", .bytes = second_event.bytes }},
+        &parameters,
+    );
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(second.storage_mutated);
+
+    var broken_event = try chainedEventAlloc(
+        std.testing.allocator,
+        3,
+        "updated",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "{\"id\":\"item-1\",\"status\":\"archived\"}",
+    );
+    defer broken_event.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.EventPreviousDigestMismatch,
+        transact(
+            std.testing.allocator,
+            &definition_plan,
+            &closure,
+            "protocol.json",
+            &validation_plan,
+            &storage_plan,
+            &protocol_plan,
+            "append",
+            repo_root,
+            &.{.{ .name = "event", .bytes = broken_event.bytes }},
+            &parameters,
+        ),
+    );
+
+    var resolved_storage = try storage.resolve(
+        std.testing.allocator,
+        &storage_plan,
+        &parameters,
+    );
+    defer resolved_storage.deinit(std.testing.allocator);
+    var snapshot = try custody.readSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_storage.slot(protocol_plan.target_slot_index),
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    const stats = try replay.validateSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_storage.slot(protocol_plan.target_slot_index),
+        &snapshot,
+        definition_plan.bounds.max_records,
+        true,
+    );
+    try std.testing.expectEqual(@as(usize, 2), stats.records_validated);
+    try std.testing.expectEqual(@as(usize, 2), stats.protocol_state.?.records);
+    try std.testing.expectEqualStrings(
+        second_event.digest,
+        stats.protocol_state.?.previousDigest().?,
+    );
+    try std.testing.expectError(
+        error.HistoricalProtocolBindingMismatch,
+        replay.validateSlot(
+            std.testing.allocator,
+            repo_root,
+            definition_plan.id,
+            resolved_storage.slot(protocol_plan.target_slot_index),
+            &snapshot,
+            definition_plan.bounds.max_records,
+            false,
         ),
     );
 }
@@ -1381,6 +1722,7 @@ test "document replacements replay from immutable prior revisions" {
         "document.json",
         &validation_plan,
         &storage_plan,
+        null,
         "create",
         repo_root,
         &.{.{ .name = "record", .bytes = "{\"value\": 1}" }},
@@ -1394,6 +1736,7 @@ test "document replacements replay from immutable prior revisions" {
         "document.json",
         &validation_plan,
         &storage_plan,
+        null,
         "replace",
         repo_root,
         &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
@@ -1409,6 +1752,7 @@ test "document replacements replay from immutable prior revisions" {
         "document.json",
         &validation_plan,
         &storage_plan,
+        null,
         "replace",
         repo_root,
         &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
@@ -1442,6 +1786,7 @@ test "document replacements replay from immutable prior revisions" {
         resolved_storage.slot(0),
         &snapshot,
         definition_plan.bounds.max_records,
+        false,
     );
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
@@ -1467,6 +1812,7 @@ test "document replacements replay from immutable prior revisions" {
             "document.json",
             &validation_plan,
             &storage_plan,
+            null,
             "replace",
             repo_root,
             &.{.{ .name = "record", .bytes = "{\"value\": 2}" }},
@@ -1482,6 +1828,7 @@ test "document replacements replay from immutable prior revisions" {
             resolved_storage.slot(0),
             &snapshot,
             definition_plan.bounds.max_records,
+            false,
         ),
     );
 }
@@ -1551,6 +1898,7 @@ test "transaction fails closed for an unbound existing store" {
             "protocol.json",
             &validation_plan,
             &storage_plan,
+            null,
             "append",
             repo_root,
             &.{.{ .name = "event", .bytes = "{\"kind\":\"new\"}" }},
