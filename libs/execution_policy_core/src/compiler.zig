@@ -1363,57 +1363,94 @@ fn validateProofBindings(
     const actions = arrayField(root, "actions") orelse &.{};
     for (actions, 0..) |value, action_index| {
         if (value != .object) continue;
-        const proofs = value.object.get("proof_obligations") orelse {
-            try builder.add(.schema_invalid, "$.actions.proof_obligations");
-            continue;
-        };
-        if (proofs != .array) {
-            try builder.add(.schema_invalid, "$.actions.proof_obligations");
-            continue;
-        }
-        for (proofs.array.items, 0..) |proof_value, proof_index| {
-            const path = try std.fmt.allocPrint(
-                allocator,
-                "$.actions[{d}].proof_obligations[{d}]",
-                .{ action_index, proof_index },
-            );
-            if (proof_value != .object) {
-                try builder.add(.schema_invalid, path);
-                continue;
-            }
-            const proof = proof_value.object;
-            const proof_id = stringField(proof, "proof_id") orelse {
-                try builder.add(.schema_invalid, try suffix(allocator, path, ".proof_id"));
-                continue;
-            };
-            atom.validateStableId(proof_id) catch {
-                try builder.add(.atom_invalid, try suffix(allocator, path, ".proof_id"));
-            };
-            if (contains(proof_ids.items, proof_id)) {
-                try builder.add(.id_duplicate, try suffix(allocator, path, ".proof_id"));
-            } else {
-                try proof_ids.append(allocator, proof_id);
-            }
-            inline for ([_][]const u8{
-                "statement",
-                "evidence_kind",
-                "command_or_evidence",
-                "artifact_binding",
-            }) |key| {
-                if (emptyStringField(proof, key)) {
-                    try builder.add(
-                        .schema_invalid,
-                        try std.fmt.allocPrint(
-                            allocator,
-                            "{s}.{s}",
-                            .{ path, key },
-                        ),
-                    );
-                }
-            }
-        }
+        try validateActionProofBindings(
+            builder,
+            value.object,
+            action_index,
+            &proof_ids,
+            allocator,
+        );
         try validateRollbackBinding(builder, actions, value.object, action_index, allocator);
     }
+    try validateTerminalProofBindings(builder, root, proof_ids.items, allocator);
+}
+
+fn validateActionProofBindings(
+    builder: *errors.Builder,
+    action: std.json.ObjectMap,
+    action_index: usize,
+    proof_ids: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+) !void {
+    const proofs = action.get("proof_obligations") orelse {
+        try builder.add(.schema_invalid, "$.actions.proof_obligations");
+        return;
+    };
+    if (proofs != .array) {
+        try builder.add(.schema_invalid, "$.actions.proof_obligations");
+        return;
+    }
+    for (proofs.array.items, 0..) |proof_value, proof_index| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "$.actions[{d}].proof_obligations[{d}]",
+            .{ action_index, proof_index },
+        );
+        try validateProofObligation(
+            builder,
+            proof_value,
+            path,
+            proof_ids,
+            allocator,
+        );
+    }
+}
+
+fn validateProofObligation(
+    builder: *errors.Builder,
+    proof_value: std.json.Value,
+    path: []const u8,
+    proof_ids: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+) !void {
+    if (proof_value != .object) {
+        try builder.add(.schema_invalid, path);
+        return;
+    }
+    const proof = proof_value.object;
+    const proof_id = stringField(proof, "proof_id") orelse {
+        try builder.add(.schema_invalid, try suffix(allocator, path, ".proof_id"));
+        return;
+    };
+    atom.validateStableId(proof_id) catch {
+        try builder.add(.atom_invalid, try suffix(allocator, path, ".proof_id"));
+    };
+    if (contains(proof_ids.items, proof_id)) {
+        try builder.add(.id_duplicate, try suffix(allocator, path, ".proof_id"));
+    } else {
+        try proof_ids.append(allocator, proof_id);
+    }
+    inline for ([_][]const u8{
+        "statement",
+        "evidence_kind",
+        "command_or_evidence",
+        "artifact_binding",
+    }) |key| {
+        if (emptyStringField(proof, key)) {
+            try builder.add(
+                .schema_invalid,
+                try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, key }),
+            );
+        }
+    }
+}
+
+fn validateTerminalProofBindings(
+    builder: *errors.Builder,
+    root: std.json.ObjectMap,
+    proof_ids: []const []const u8,
+    allocator: std.mem.Allocator,
+) !void {
     const terminals = objectField(root, "terminal_states") orelse return;
     var terminal_iterator = terminals.iterator();
     while (terminal_iterator.next()) |entry| {
@@ -1429,7 +1466,7 @@ fn validateProofBindings(
         try validateStringRefs(
             builder,
             stringValues(terminal, "proof_refs"),
-            proof_ids.items,
+            proof_ids,
             path,
         );
     }
@@ -2187,64 +2224,97 @@ fn validateRiskShields(
             try builder.add(.schema_invalid, "$.safety_shield.rules");
             continue;
         }
-        const row = value.object;
-        const responses = [_][]const u8{ "block", "rollback", "return_to_spec" };
-        if (!oneOf(stringField(row, "response"), &responses)) {
+        try validateShieldRule(
+            builder,
+            value.object,
+            index,
+            action_ids,
+            actions,
+            allocator,
+        );
+    }
+    try validateRiskCoverage(builder, actions, rules);
+}
+
+fn validateShieldRule(
+    builder: *errors.Builder,
+    rule: std.json.ObjectMap,
+    index: usize,
+    action_ids: []const []const u8,
+    actions: []const std.json.Value,
+    allocator: std.mem.Allocator,
+) !void {
+    const responses = [_][]const u8{ "block", "rollback", "return_to_spec" };
+    if (!oneOf(stringField(rule, "response"), &responses)) {
+        try builder.add(
+            .schema_invalid,
+            try std.fmt.allocPrint(
+                allocator,
+                "$.safety_shield.rules[{d}].response",
+                .{index},
+            ),
+        );
+    }
+    try requireStringArray(
+        builder,
+        rule,
+        "forbids_action_ids",
+        "$.safety_shield.rules.forbids_action_ids",
+    );
+    try requireStringArray(
+        builder,
+        rule,
+        "forbids_action_kinds",
+        "$.safety_shield.rules.forbids_action_kinds",
+    );
+    for (stringValues(rule, "forbids_action_ids")) |ref_value| {
+        const ref = valueString(ref_value) orelse continue;
+        if (!contains(action_ids, ref)) {
             try builder.add(
-                .schema_invalid,
-                try std.fmt.allocPrint(
-                    allocator,
-                    "$.safety_shield.rules[{d}].response",
-                    .{index},
-                ),
+                .reference_unknown,
+                "$.safety_shield.rules.forbids_action_ids",
             );
         }
-        try requireStringArray(
-            builder,
-            row,
-            "forbids_action_ids",
-            "$.safety_shield.rules.forbids_action_ids",
-        );
-        try requireStringArray(
-            builder,
-            row,
-            "forbids_action_kinds",
-            "$.safety_shield.rules.forbids_action_kinds",
-        );
-        for (stringValues(row, "forbids_action_ids")) |ref_value| {
-            const ref = valueString(ref_value) orelse continue;
-            if (!contains(action_ids, ref)) {
-                try builder.add(
-                    .reference_unknown,
-                    "$.safety_shield.rules.forbids_action_ids",
-                );
-            }
-        }
-        for (stringValues(row, "forbids_action_kinds")) |kind_value| {
-            if (!oneOf(valueString(kind_value), &action_kinds)) {
-                try builder.add(
-                    .schema_invalid,
-                    "$.safety_shield.rules.forbids_action_kinds",
-                );
-            }
-        }
-        if (stringEquals(row, "response", "rollback")) {
-            for (actions) |action_value| {
-                if (action_value != .object) continue;
-                const action = action_value.object;
-                if (!shieldTargetsAction(row, action)) continue;
-                const rollback = objectField(action, "rollback");
-                if (rollback == null or
-                    nullableStringField(rollback.?, "action_id") == null)
-                {
-                    try builder.add(
-                        .schema_invalid,
-                        "$.safety_shield.rules.response",
-                    );
-                }
-            }
+    }
+    for (stringValues(rule, "forbids_action_kinds")) |kind_value| {
+        if (!oneOf(valueString(kind_value), &action_kinds)) {
+            try builder.add(
+                .schema_invalid,
+                "$.safety_shield.rules.forbids_action_kinds",
+            );
         }
     }
+    if (stringEquals(rule, "response", "rollback")) {
+        try validateRollbackShieldTargets(builder, rule, actions);
+    }
+}
+
+fn validateRollbackShieldTargets(
+    builder: *errors.Builder,
+    rule: std.json.ObjectMap,
+    actions: []const std.json.Value,
+) !void {
+    for (actions) |action_value| {
+        if (action_value != .object) continue;
+        const action = action_value.object;
+        if (!shieldTargetsAction(rule, action)) continue;
+        const rollback = objectField(action, "rollback");
+        if (rollback == null or
+            nullableStringField(rollback.?, "action_id") == null)
+        {
+            try builder.add(
+                .schema_invalid,
+                "$.safety_shield.rules.response",
+            );
+        }
+    }
+}
+
+fn validateRiskCoverage(
+    builder: *errors.Builder,
+    actions: []const std.json.Value,
+    rules: []const std.json.Value,
+) !void {
     for (actions) |value| {
         if (value != .object) continue;
         const action = value.object;
