@@ -9,12 +9,26 @@ const Identity = union(enum) {
         exclude_key: ?[]u8,
         claimed_key: ?[]u8,
     },
+    composite: struct {
+        prefix: ?[]u8,
+        separator: []u8,
+        fields: []definition_core.json_pointer.Pointer,
+        claimed: ?definition_core.json_pointer.Pointer,
+        max_bytes: usize,
+    },
 
     fn deinit(self: *Identity, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .content_address => |*config| {
                 if (config.exclude_key) |key| allocator.free(key);
                 if (config.claimed_key) |key| allocator.free(key);
+            },
+            .composite => |*config| {
+                if (config.prefix) |prefix| allocator.free(prefix);
+                allocator.free(config.separator);
+                for (config.fields) |*field| field.deinit(allocator);
+                allocator.free(config.fields);
+                if (config.claimed) |*claimed| claimed.deinit(allocator);
             },
             .none => {},
         }
@@ -134,6 +148,31 @@ pub fn compile(
                 }
                 identity = .{ .content_address = config };
             },
+            .composite_identity => {
+                if (identity != .none) {
+                    return error.MultipleIdentityDerivations;
+                }
+                var parsed = try parseRule(
+                    allocator,
+                    rule.canonical_config,
+                );
+                defer parsed.deinit();
+                const object = parsed.value.object;
+                const candidate = try ruleInputIndex(
+                    definition_plan,
+                    object,
+                );
+                if (input_index != null and input_index.? != candidate) {
+                    return error.IdentityInputMismatch;
+                }
+                input_index = candidate;
+                identity = .{
+                    .composite = try compileCompositeIdentity(
+                        allocator,
+                        object,
+                    ),
+                };
+            },
             else => {},
         }
     }
@@ -154,7 +193,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeByte(plan.input_index);
     try encoder.writeEnum(plan.codec);
     try encoder.writeBool(plan.normalize_line_endings);
@@ -166,6 +205,18 @@ pub fn encodeCache(
             try encoder.writeOptionalBytes(config.exclude_key);
             try encoder.writeOptionalBytes(config.claimed_key);
         },
+        .composite => |config| {
+            try encoder.writeByte(2);
+            try encoder.writeOptionalBytes(config.prefix);
+            try encoder.writeBytes(config.separator);
+            try encoder.writeCount(config.fields.len);
+            for (config.fields) |field| try encoder.writeBytes(field.raw);
+            try encoder.writeOptionalBytes(if (config.claimed) |claimed|
+                claimed.raw
+            else
+                null);
+            try encoder.writeUsize(config.max_bytes);
+        },
     }
 }
 
@@ -173,7 +224,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerMaterializationCacheVersionMismatch;
     }
     const input_index = try decoder.readByte();
@@ -189,6 +240,10 @@ pub fn decodeCache(
             ),
             .claimed_key = null,
         } },
+        2 => .{ .composite = try decodeCompositeIdentity(
+            allocator,
+            decoder,
+        ) },
         else => return error.CacheIdentityKindInvalid,
     };
     errdefer identity.deinit(allocator);
@@ -204,6 +259,8 @@ pub fn decodeCache(
         if (identity.content_address.claimed_key) |key| {
             if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidUtf8;
         }
+    } else if (identity == .composite) {
+        try validateCompositeIdentityConfig(identity.composite);
     }
     if (codec != .text and
         (normalize_line_endings or trailing_newline != .preserve))
@@ -227,6 +284,15 @@ pub fn validateCachePlan(
         plan.codec != definition_plan.inputs[plan.input_index].codec)
     {
         return error.CacheMaterializationPlanMismatch;
+    }
+    switch (plan.identity) {
+        .none => {},
+        .content_address => if (!definition_plan.requires(.content_address)) {
+            return error.CacheMaterializationPlanMismatch;
+        },
+        .composite => if (!definition_plan.requires(.composite_identity)) {
+            return error.CacheMaterializationPlanMismatch;
+        },
     }
 }
 
@@ -286,6 +352,61 @@ pub fn materialize(
                         canonical_digest = null;
                         allocator.free(artifact_id.?);
                         artifact_id = null;
+                    }
+                }
+            },
+            .composite => |config| {
+                const root = execution.inputJson(
+                    materialization_plan.input_index,
+                ) orelse return error.MaterializationInputInvalid;
+                artifact_id = deriveCompositeIdentityAlloc(
+                    allocator,
+                    root,
+                    config,
+                ) catch |err| switch (err) {
+                    error.CompositeIdentityFieldMissing,
+                    error.CompositeIdentityFieldInvalid,
+                    error.CompositeIdentityBytesExceeded,
+                    => identity: {
+                        try execution.addDiagnostic(
+                            "composite-identity",
+                            "",
+                            "composite identity cannot be derived from the declared scalar fields",
+                        );
+                        discardMaterialized(
+                            allocator,
+                            &canonical_content,
+                            &canonical_digest,
+                            &artifact_id,
+                        );
+                        break :identity null;
+                    },
+                    else => return err,
+                };
+                if (artifact_id) |derived| {
+                    if (config.claimed) |claimed_pointer| {
+                        const claimed = definition_core.json_pointer.lookup(
+                            root,
+                            claimed_pointer,
+                        );
+                        const matches = if (claimed) |value|
+                            value == .string and
+                                std.mem.eql(u8, value.string, derived)
+                        else
+                            false;
+                        if (!matches) {
+                            try execution.addDiagnostic(
+                                "composite-identity",
+                                claimed_pointer.raw,
+                                "claimed artifact identity does not match the derived composite identity",
+                            );
+                            discardMaterialized(
+                                allocator,
+                                &canonical_content,
+                                &canonical_digest,
+                                &artifact_id,
+                            );
+                        }
                     }
                 }
             },
@@ -447,6 +568,305 @@ fn ruleInputIndex(
     return error.AmbiguousMaterializationInput;
 }
 
+fn compileCompositeIdentity(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !@FieldType(Identity, "composite") {
+    try definition_core.json.requireExactKeys(object, &.{
+        "op",
+        "input",
+        "prefix",
+        "fields",
+        "separator",
+        "field",
+        "max_bytes",
+    });
+    try definition_core.json.requireFields(object, &.{ "op", "fields" });
+
+    var prefix: ?[]u8 = null;
+    errdefer if (prefix) |text| allocator.free(text);
+    if (try definition_core.json.optionalString(object, "prefix")) |text| {
+        try validateIdentityStaticText(text, 128, true);
+        prefix = try allocator.dupe(u8, text);
+    }
+
+    const separator_text = if (object.get("separator")) |raw|
+        try definition_core.json.string(raw)
+    else
+        "-";
+    try validateIdentityStaticText(separator_text, 16, true);
+    const separator = try allocator.dupe(u8, separator_text);
+    errdefer allocator.free(separator);
+
+    const raw_fields = try definition_core.json.array(
+        try definition_core.json.field(object, "fields"),
+    );
+    if (raw_fields.items.len == 0 or raw_fields.items.len > 16) {
+        return error.CompositeIdentityFieldCountInvalid;
+    }
+    var fields: std.ArrayList(definition_core.json_pointer.Pointer) = .empty;
+    errdefer {
+        for (fields.items) |*field| field.deinit(allocator);
+        fields.deinit(allocator);
+    }
+    for (raw_fields.items) |raw| {
+        const pointer_text = try definition_core.json.string(raw);
+        if (pointer_text.len == 0 or pointer_text.len > 1024 or
+            !std.unicode.utf8ValidateSlice(pointer_text))
+        {
+            return error.InvalidJsonPointer;
+        }
+        for (fields.items) |existing| {
+            if (std.mem.eql(u8, existing.raw, pointer_text)) {
+                return error.DuplicateCompositeIdentityField;
+            }
+        }
+        const pointer = try definition_core.json_pointer.compile(
+            allocator,
+            pointer_text,
+        );
+        errdefer {
+            var mutable = pointer;
+            mutable.deinit(allocator);
+        }
+        try fields.append(allocator, pointer);
+    }
+
+    var claimed: ?definition_core.json_pointer.Pointer = null;
+    errdefer if (claimed) |*pointer| pointer.deinit(allocator);
+    if (try definition_core.json.optionalString(object, "field")) |pointer_text| {
+        if (pointer_text.len == 0 or pointer_text.len > 1024) {
+            return error.InvalidJsonPointer;
+        }
+        for (fields.items) |field| {
+            if (std.mem.eql(u8, field.raw, pointer_text)) {
+                return error.CompositeIdentityCycle;
+            }
+        }
+        claimed = try definition_core.json_pointer.compile(
+            allocator,
+            pointer_text,
+        );
+    }
+
+    const max_bytes = if (object.get("max_bytes")) |raw|
+        try definition_core.json.unsigned(raw)
+    else
+        256;
+    if (max_bytes == 0 or max_bytes > 4096) {
+        return error.CompositeIdentityBytesInvalid;
+    }
+
+    return .{
+        .prefix = prefix,
+        .separator = separator,
+        .fields = try fields.toOwnedSlice(allocator),
+        .claimed = claimed,
+        .max_bytes = max_bytes,
+    };
+}
+
+fn decodeCompositeIdentity(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !@FieldType(Identity, "composite") {
+    const prefix = try decoder.readOptionalBytesAlloc(allocator, 128);
+    errdefer if (prefix) |text| allocator.free(text);
+    const separator = try decoder.readBytesAlloc(allocator, 16);
+    errdefer allocator.free(separator);
+
+    const field_count = try decoder.readCount(16);
+    if (field_count == 0) return error.CacheCompositeIdentityInvalid;
+    const fields = try allocator.alloc(
+        definition_core.json_pointer.Pointer,
+        field_count,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields) |*field| {
+        const raw = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw);
+        field.* = try definition_core.json_pointer.compile(allocator, raw);
+        initialized += 1;
+    }
+
+    var claimed: ?definition_core.json_pointer.Pointer = null;
+    errdefer if (claimed) |*pointer| pointer.deinit(allocator);
+    if (try decoder.readOptionalBytesAlloc(allocator, 1024)) |raw| {
+        defer allocator.free(raw);
+        claimed = try definition_core.json_pointer.compile(allocator, raw);
+    }
+    const max_bytes = try decoder.readUsize();
+
+    const config: @FieldType(Identity, "composite") = .{
+        .prefix = prefix,
+        .separator = separator,
+        .fields = fields,
+        .claimed = claimed,
+        .max_bytes = max_bytes,
+    };
+    try validateCompositeIdentityConfig(config);
+    return config;
+}
+
+fn validateCompositeIdentityConfig(
+    config: @FieldType(Identity, "composite"),
+) !void {
+    if (config.prefix) |prefix| {
+        try validateIdentityStaticText(prefix, 128, true);
+    }
+    try validateIdentityStaticText(config.separator, 16, true);
+    if (config.fields.len == 0 or config.fields.len > 16 or
+        config.max_bytes == 0 or config.max_bytes > 4096)
+    {
+        return error.CacheCompositeIdentityInvalid;
+    }
+    for (config.fields, 0..) |field, index| {
+        if (field.raw.len == 0 or field.raw.len > 1024) {
+            return error.CacheCompositeIdentityInvalid;
+        }
+        for (config.fields[0..index]) |previous| {
+            if (std.mem.eql(u8, field.raw, previous.raw)) {
+                return error.CacheCompositeIdentityInvalid;
+            }
+        }
+    }
+    if (config.claimed) |claimed| {
+        if (claimed.raw.len == 0 or claimed.raw.len > 1024) {
+            return error.CacheCompositeIdentityInvalid;
+        }
+        for (config.fields) |field| {
+            if (std.mem.eql(u8, claimed.raw, field.raw)) {
+                return error.CacheCompositeIdentityInvalid;
+            }
+        }
+    }
+}
+
+fn validateIdentityStaticText(
+    text: []const u8,
+    maximum: usize,
+    require_non_empty: bool,
+) !void {
+    if ((require_non_empty and text.len == 0) or text.len > maximum or
+        !std.unicode.utf8ValidateSlice(text))
+    {
+        return error.CompositeIdentityTextInvalid;
+    }
+    for (text) |byte| {
+        if (byte < 0x20 or byte == 0x7f) {
+            return error.CompositeIdentityTextInvalid;
+        }
+    }
+}
+
+fn deriveCompositeIdentityAlloc(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    config: @FieldType(Identity, "composite"),
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var component_count: usize = 0;
+    if (config.prefix) |prefix| {
+        try appendIdentityComponent(&output, prefix, config.max_bytes);
+        component_count += 1;
+    }
+    for (config.fields) |pointer| {
+        if (component_count > 0) {
+            try appendIdentityComponent(
+                &output,
+                config.separator,
+                config.max_bytes,
+            );
+        }
+        const value = definition_core.json_pointer.lookup(
+            root,
+            pointer,
+        ) orelse return error.CompositeIdentityFieldMissing;
+        switch (value) {
+            .string => |text| {
+                if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) {
+                    return error.CompositeIdentityFieldInvalid;
+                }
+                for (text) |byte| {
+                    if (byte < 0x20 or byte == 0x7f) {
+                        return error.CompositeIdentityFieldInvalid;
+                    }
+                }
+                try appendIdentityField(
+                    &output,
+                    text,
+                    config.separator,
+                    config.max_bytes,
+                );
+            },
+            .integer => |number| {
+                var buffer: [64]u8 = undefined;
+                const text = try std.fmt.bufPrint(&buffer, "{d}", .{number});
+                try appendIdentityField(
+                    &output,
+                    text,
+                    config.separator,
+                    config.max_bytes,
+                );
+            },
+            .bool => |flag| try appendIdentityField(
+                &output,
+                if (flag) "true" else "false",
+                config.separator,
+                config.max_bytes,
+            ),
+            else => return error.CompositeIdentityFieldInvalid,
+        }
+        component_count += 1;
+    }
+    return output.toOwnedSlice();
+}
+
+fn appendIdentityField(
+    output: *std.Io.Writer.Allocating,
+    text: []const u8,
+    separator: []const u8,
+    max_bytes: usize,
+) !void {
+    if (std.mem.indexOf(u8, text, separator) != null) {
+        return error.CompositeIdentityFieldInvalid;
+    }
+    try appendIdentityComponent(output, text, max_bytes);
+}
+
+fn appendIdentityComponent(
+    output: *std.Io.Writer.Allocating,
+    text: []const u8,
+    max_bytes: usize,
+) !void {
+    const next = std.math.add(
+        usize,
+        output.written().len,
+        text.len,
+    ) catch return error.CompositeIdentityBytesExceeded;
+    if (next > max_bytes) return error.CompositeIdentityBytesExceeded;
+    try output.writer.writeAll(text);
+}
+
+fn discardMaterialized(
+    allocator: std.mem.Allocator,
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) void {
+    if (canonical_content.*) |value| allocator.free(value);
+    canonical_content.* = null;
+    if (canonical_digest.*) |value| allocator.free(value);
+    canonical_digest.* = null;
+    if (artifact_id.*) |value| allocator.free(value);
+    artifact_id.* = null;
+}
+
 fn rootKeyFromPointer(
     allocator: std.mem.Allocator,
     pointer: []const u8,
@@ -473,6 +893,30 @@ fn rootKeyFromPointer(
         });
     }
     return output.toOwnedSlice();
+}
+
+fn compileForAllocationFailure(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+) !void {
+    var plan = compile(allocator, definition_plan) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+}
+
+fn decodeForAllocationFailure(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var plan = decodeCache(allocator, &decoder) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer plan.deinit(allocator);
+    try decoder.finish();
 }
 
 test "materialization reuses validation parse and derives content address" {
@@ -579,4 +1023,137 @@ test "claimed content address mismatch fails structural materialization" {
     try std.testing.expect(!result.validation_result.valid);
     try std.testing.expect(result.canonical_content == null);
     try std.testing.expect(result.artifact_id == null);
+}
+
+test "compiled composite identity derives bounded scalar identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/composite","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","composite-identity","exact-object"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["kind","record_id","sequence"]}]},"constraints":[],"identity":{"op":"composite-identity","input":"record","prefix":"REC","fields":["/kind","/sequence"],"separator":"-","field":"/record_id","max_bytes":128},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&definition_plan},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
+
+    var valid = try materialize(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"sequence\":7,\"record_id\":\"REC-alpha-7\",\"kind\":\"alpha\"}",
+        }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.validation_result.valid);
+    try std.testing.expectEqualStrings("REC-alpha-7", valid.artifact_id.?);
+
+    var mismatch = try materialize(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"record_id\":\"wrong\",\"kind\":\"alpha\",\"sequence\":7}",
+        }},
+    );
+    defer mismatch.deinit(std.testing.allocator);
+    try std.testing.expect(!mismatch.validation_result.valid);
+    try std.testing.expect(mismatch.canonical_content == null);
+    try std.testing.expect(mismatch.canonical_content_digest == null);
+    try std.testing.expect(mismatch.artifact_id == null);
+}
+
+test "composite identity rejects non-scalar and oversized components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/composite-bounds","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","composite-identity"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{},"constraints":[],"identity":{"op":"composite-identity","input":"record","fields":["/value"],"max_bytes":3},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    for ([_][]const u8{
+        "{\"value\":{\"nested\":true}}",
+        "{\"value\":\"a-b\"}",
+        "{\"value\":\"four\"}",
+    }) |bytes| {
+        var result = try materialize(
+            std.testing.allocator,
+            &definition_plan,
+            &validation_plan,
+            &plan,
+            &.{.{ .name = "record", .bytes = bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.validation_result.valid);
+        try std.testing.expect(result.artifact_id == null);
+    }
 }

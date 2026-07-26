@@ -184,6 +184,7 @@ pub const Operator = enum {
             .canonical_text,
             .sha256,
             .content_address,
+            .composite_identity,
             .path_format,
             .immutable_document,
             .append_only_log,

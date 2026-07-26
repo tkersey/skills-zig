@@ -34,10 +34,11 @@ grep -Fq '"id":"exact-object","version":1' <<<"$capabilities"
 grep -Fq '"id":"implies","version":1' <<<"$capabilities"
 grep -Fq '"id":"total-partition","version":1' <<<"$capabilities"
 grep -Fq '"id":"total-mapping","version":1' <<<"$capabilities"
+grep -Fq '"id":"composite-identity","version":1' <<<"$capabilities"
 grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
 grep -Fq '"id":"compare-and-append","version":1' <<<"$capabilities"
 if grep -Eq \
-  '"id":"(regex|tagged-union|composite-identity|relevance|text-render)"' \
+  '"id":"(regex|tagged-union|relevance|text-render)"' \
   <<<"$capabilities"
 then
   exit 1
