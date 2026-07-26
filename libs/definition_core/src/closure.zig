@@ -22,6 +22,8 @@ pub const Limits = struct {
 pub const ClosureFile = struct {
     path: []u8,
     canonical_json: []u8,
+    source_digest: [32]u8 = [_]u8{0} ** 32,
+    source_bytes: usize = 0,
 
     fn deinit(self: *ClosureFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -143,12 +145,16 @@ const Builder = struct {
         };
         var canonical_owned = true;
         errdefer if (canonical_owned) self.allocator.free(canonical);
+        var source_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &source_digest, .{});
 
         try self.states.put(self.allocator, relative_path, .visiting);
         errdefer _ = self.states.remove(relative_path);
         try self.files.append(self.allocator, .{
             .path = relative_path,
             .canonical_json = canonical,
+            .source_digest = source_digest,
+            .source_bytes = raw.len,
         });
         path_owned = false;
         canonical_owned = false;
@@ -282,6 +288,16 @@ pub fn fromCanonicalFiles(
         files[index] = .{
             .path = try allocator.dupe(u8, source.path),
             .canonical_json = canonical,
+            .source_digest = blk: {
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(
+                    source.canonical_json,
+                    &digest,
+                    .{},
+                );
+                break :blk digest;
+            },
+            .source_bytes = source.canonical_json.len,
         };
         initialized += 1;
     }
@@ -306,6 +322,83 @@ pub fn fromCanonicalFiles(
         .digest = digestFiles(files),
         .total_definition_bytes = total_definition_bytes,
     };
+}
+
+pub fn verifySourceManifest(
+    allocator: std.mem.Allocator,
+    admitted_root: []const u8,
+    files: []const ClosureFile,
+    limits: Limits,
+) !usize {
+    try limits.validate();
+    if (!std.fs.path.isAbsolute(admitted_root)) {
+        return error.DefinitionRootNotAbsolute;
+    }
+    if (files.len == 0 or files.len > limits.max_files) {
+        return error.TooManyDefinitionFiles;
+    }
+    try rejectAbsoluteSymlinkComponents(admitted_root);
+    var root = try std.Io.Dir.openDirAbsolute(defaultIo(), admitted_root, .{
+        .follow_symlinks = false,
+    });
+    defer root.close(defaultIo());
+
+    var total_bytes: usize = 0;
+    var prior_path: ?[]const u8 = null;
+    for (files) |file| {
+        const normalized = try normalizeRelativeAlloc(
+            allocator,
+            "",
+            file.path,
+        );
+        defer allocator.free(normalized);
+        if (!std.mem.eql(u8, normalized, file.path)) {
+            return error.InvalidDefinitionPath;
+        }
+        if (prior_path) |prior| {
+            if (std.mem.order(u8, prior, file.path) != .lt) {
+                return error.DefinitionManifestNotSorted;
+            }
+        }
+        prior_path = file.path;
+        if (file.source_bytes > limits.max_file_bytes) {
+            return error.DefinitionFileTooLarge;
+        }
+        total_bytes = std.math.add(
+            usize,
+            total_bytes,
+            file.source_bytes,
+        ) catch return error.DefinitionClosureTooLarge;
+        if (total_bytes > limits.max_total_bytes) {
+            return error.DefinitionClosureTooLarge;
+        }
+
+        try rejectSymlinkComponents(&root, file.path);
+        const stat = try root.statFile(defaultIo(), file.path, .{
+            .follow_symlinks = false,
+        });
+        if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
+        if (stat.kind != .file) return error.DefinitionNotRegularFile;
+        if (stat.size != file.source_bytes) {
+            return error.DefinitionSourceSizeMismatch;
+        }
+        const raw = try root.readFileAlloc(
+            defaultIo(),
+            file.path,
+            allocator,
+            .limited(limits.max_file_bytes),
+        );
+        defer allocator.free(raw);
+        if (!std.unicode.utf8ValidateSlice(raw)) {
+            return error.InvalidDefinitionUtf8;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &file.source_digest)) {
+            return error.DefinitionSourceDigestMismatch;
+        }
+    }
+    return total_bytes;
 }
 
 const CanonicalClosureValidator = struct {
@@ -553,6 +646,55 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     var repeated = try loadFromDir(std.testing.allocator, &tmp.dir, "./root.json", .{});
     defer repeated.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(closure.digestSlice(), repeated.digestSlice());
+}
+
+test "source manifest verifies unchanged files without reparsing definitions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "root.json",
+        .data = "{\"schema\":\"example/v1\",\"imports\":[\"child.json\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "child.json",
+        .data = "{\"schema\":\"example-child/v1\",\"value\":1}",
+    });
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    var closure = try load(
+        std.testing.allocator,
+        root,
+        "root.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        closure.total_definition_bytes,
+        try verifySourceManifest(
+            std.testing.allocator,
+            root,
+            closure.files,
+            .{},
+        ),
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "child.json",
+        .data = "{\"schema\": \"example-child/v1\", \"value\": 1}",
+    });
+    try std.testing.expectError(
+        error.DefinitionSourceSizeMismatch,
+        verifySourceManifest(
+            std.testing.allocator,
+            root,
+            closure.files,
+            .{},
+        ),
+    );
 }
 
 test "closure rejects cycles, root escapes, duplicate fields, and bounds" {
