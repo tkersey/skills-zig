@@ -580,7 +580,7 @@ fn collectImports(
     }
 }
 
-fn normalizeRelativeAlloc(
+pub fn normalizeRelativeAlloc(
     allocator: std.mem.Allocator,
     base_dir: []const u8,
     raw_path: []const u8,

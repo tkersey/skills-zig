@@ -21,6 +21,7 @@ pub const Operator = enum {
     regex,
     tagged_union,
     one_of,
+    definition_ref,
     unique,
     sorted,
     set_equality,
@@ -94,6 +95,7 @@ pub const Operator = enum {
             .safe_relative_path => "safe-relative-path",
             .tagged_union => "tagged-union",
             .one_of => "one-of",
+            .definition_ref => "definition-ref",
             .set_equality => "set-equality",
             .total_partition => "total-partition",
             .exactly_one => "exactly-one",
@@ -165,6 +167,7 @@ pub const Operator = enum {
             .safe_identifier,
             .safe_relative_path,
             .one_of,
+            .definition_ref,
             .unique,
             .sorted,
             .set_equality,
@@ -262,6 +265,7 @@ pub const Input = struct {
 pub const Rule = struct {
     operator: Operator,
     pointer_id: ?u16,
+    import_index: ?u16 = null,
     canonical_config: []u8,
 
     fn deinit(self: *Rule, allocator: std.mem.Allocator) void {
@@ -300,6 +304,7 @@ pub const Plan = struct {
     parameter_declarations: definition_core.parameters.Declarations,
     inputs: []Input,
     storage_kind: StorageKind,
+    imports: []Plan,
     pointers: [][]u8,
     rules: []Rule,
     operations: []NamedPlan,
@@ -315,6 +320,8 @@ pub const Plan = struct {
         self.parameter_declarations.deinit(allocator);
         for (self.inputs) |*input| input.deinit(allocator);
         allocator.free(self.inputs);
+        for (self.imports) |*imported| imported.deinit(allocator);
+        allocator.free(self.imports);
         for (self.pointers) |pointer| allocator.free(pointer);
         allocator.free(self.pointers);
         for (self.rules) |*rule| rule.deinit(allocator);
@@ -337,6 +344,7 @@ pub const Plan = struct {
 const Compiler = struct {
     allocator: std.mem.Allocator,
     operator_mask: u128,
+    imports: []const Plan,
     pointers: std.ArrayList([]u8) = .empty,
     rules: std.ArrayList(Rule) = .empty,
 
@@ -364,6 +372,13 @@ const Compiler = struct {
                         try self.internPointer(try definition_core.json.string(raw_path))
                     else
                         null;
+                    const import_index = if (operator == .definition_ref)
+                        try self.importIndex(try definition_core.json.requiredString(
+                            object,
+                            "definition",
+                        ))
+                    else
+                        null;
                     const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
                         self.allocator,
                         value,
@@ -372,6 +387,7 @@ const Compiler = struct {
                     try self.rules.append(self.allocator, .{
                         .operator = operator,
                         .pointer_id = pointer_id,
+                        .import_index = import_index,
                         .canonical_config = canonical,
                     });
                     return;
@@ -400,6 +416,13 @@ const Compiler = struct {
         );
         return @intCast(self.pointers.items.len - 1);
     }
+
+    fn importIndex(self: Compiler, id: []const u8) !u16 {
+        for (self.imports, 0..) |imported, index| {
+            if (std.mem.eql(u8, imported.id, id)) return @intCast(index);
+        }
+        return error.UnknownImportedDefinition;
+    }
 };
 
 pub fn compile(
@@ -407,6 +430,30 @@ pub fn compile(
     closure: *const definition_core.Closure,
     entry_path: []const u8,
 ) !Plan {
+    var compiled_count: usize = 0;
+    return compileAtDepth(
+        allocator,
+        closure,
+        entry_path,
+        0,
+        &compiled_count,
+    );
+}
+
+fn compileAtDepth(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    entry_path: []const u8,
+    depth: usize,
+    compiled_count: *usize,
+) anyerror!Plan {
+    if (depth > 32) return error.ImportDepthExceeded;
+    compiled_count.* = std.math.add(
+        usize,
+        compiled_count.*,
+        1,
+    ) catch return error.TooManyImportedDefinitions;
+    if (compiled_count.* > 128) return error.TooManyImportedDefinitions;
     const entry = closure.find(entry_path) orelse return error.EntryDefinitionMissing;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -486,10 +533,20 @@ pub fn compile(
     const bounds = try parseBounds(try definition_core.json.object(
         try definition_core.json.field(root, "bounds"),
     ));
+    const imports = try parseImportedPlans(
+        allocator,
+        closure,
+        entry_path,
+        root.get("imports"),
+        depth,
+        compiled_count,
+    );
+    errdefer deinitPlans(allocator, imports);
 
     var compiler = Compiler{
         .allocator = allocator,
         .operator_mask = operator_mask,
+        .imports = imports,
     };
     errdefer compiler.deinit();
     try compiler.compileValue(try definition_core.json.field(root, "canonicalization"), 0);
@@ -544,6 +601,7 @@ pub fn compile(
         .parameter_declarations = parameter_declarations,
         .inputs = inputs,
         .storage_kind = storage_kind,
+        .imports = imports,
         .pointers = pointers,
         .rules = rules,
         .operations = operations,
@@ -556,7 +614,16 @@ pub fn compile(
 }
 
 pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
+    try encodeCachePlan(plan, encoder, 0);
+}
+
+fn encodeCachePlan(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+    depth: usize,
+) !void {
+    if (depth > 32) return error.ImportDepthExceeded;
     try encoder.writeBytes(plan.id);
     try encoder.writeBytes(plan.owner);
     try encoder.writeFixed(&plan.closure_digest);
@@ -573,6 +640,10 @@ pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !
         try encoder.writeUsize(input.max_bytes);
     }
     try encoder.writeEnum(plan.storage_kind);
+    try encoder.writeCount(plan.imports.len);
+    for (plan.imports) |*imported| {
+        try encodeCachePlan(imported, encoder, depth + 1);
+    }
     try encoder.writeCount(plan.pointers.len);
     for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
     try encoder.writeCount(plan.rules.len);
@@ -580,6 +651,8 @@ pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !
         try encoder.writeEnum(rule.operator);
         try encoder.writeBool(rule.pointer_id != null);
         if (rule.pointer_id) |pointer_id| try encoder.writeU16(pointer_id);
+        try encoder.writeBool(rule.import_index != null);
+        if (rule.import_index) |import_index| try encoder.writeU16(import_index);
         try encoder.writeBytes(rule.canonical_config);
     }
     try encodeNamedPlans(plan.operations, encoder);
@@ -599,7 +672,24 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readU16() != 2) return error.LedgerPlanCacheVersionMismatch;
+    var decoded_count: usize = 0;
+    return decodeCachePlan(allocator, decoder, 0, &decoded_count);
+}
+
+fn decodeCachePlan(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    depth: usize,
+    decoded_count: *usize,
+) !Plan {
+    if (depth > 32) return error.CacheImportDepthExceeded;
+    decoded_count.* = std.math.add(
+        usize,
+        decoded_count.*,
+        1,
+    ) catch return error.CacheImportCountExceeded;
+    if (decoded_count.* > 128) return error.CacheImportCountExceeded;
     const id = try decoder.readBytesAlloc(allocator, 256);
     errdefer allocator.free(id);
     try definition_core.json.safeIdentifier(id, 256);
@@ -628,12 +718,32 @@ pub fn decodeCache(
     const inputs = try decodeInputs(allocator, decoder);
     errdefer deinitInputs(allocator, inputs);
     const storage_kind = try decoder.readEnum(StorageKind);
+    const import_count = try decoder.readCount(128);
+    const imports = try allocator.alloc(Plan, import_count);
+    var imports_initialized: usize = 0;
+    errdefer {
+        for (imports[0..imports_initialized]) |*imported| {
+            imported.deinit(allocator);
+        }
+        allocator.free(imports);
+    }
+    for (imports) |*imported| {
+        imported.* = try decodeCachePlan(
+            allocator,
+            decoder,
+            depth + 1,
+            decoded_count,
+        );
+        imports_initialized += 1;
+    }
+    try validateImportedPlans(imports);
     const pointers = try decodePointers(allocator, decoder);
     errdefer deinitPointers(allocator, pointers);
     const rules = try decodeRules(
         allocator,
         decoder,
         operator_mask,
+        imports.len,
         pointers.len,
     );
     errdefer deinitRules(allocator, rules);
@@ -673,6 +783,7 @@ pub fn decodeCache(
         .parameter_declarations = parameter_declarations,
         .inputs = inputs,
         .storage_kind = storage_kind,
+        .imports = imports,
         .pointers = pointers,
         .rules = rules,
         .operations = operations,
@@ -759,6 +870,7 @@ fn decodeRules(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
     operator_mask: u128,
+    import_count: usize,
     pointer_count: usize,
 ) ![]Rule {
     const count = try decoder.readCount(65_535);
@@ -780,6 +892,16 @@ fn decodeRules(
         if (pointer_id != null and pointer_id.? >= pointer_count) {
             return error.CachePointerIndexInvalid;
         }
+        const import_index = if (try decoder.readBool())
+            try decoder.readU16()
+        else
+            null;
+        if (import_index != null and import_index.? >= import_count) {
+            return error.CacheImportIndexInvalid;
+        }
+        if ((operator == .definition_ref) != (import_index != null)) {
+            return error.CacheImportIndexInvalid;
+        }
         const canonical_config = try decoder.readBytesAlloc(
             allocator,
             4 * 1024 * 1024,
@@ -788,6 +910,7 @@ fn decodeRules(
         rule.* = .{
             .operator = operator,
             .pointer_id = pointer_id,
+            .import_index = import_index,
             .canonical_config = canonical_config,
         };
         initialized += 1;
@@ -862,6 +985,88 @@ fn parseRequires(object: std.json.ObjectMap) !u128 {
         mask |= bit;
     }
     return mask;
+}
+
+fn parseImportedPlans(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    entry_path: []const u8,
+    raw: ?std.json.Value,
+    depth: usize,
+    compiled_count: *usize,
+) anyerror![]Plan {
+    const value = raw orelse return allocator.alloc(Plan, 0);
+    const items = try definition_core.json.array(value);
+    if (items.items.len > 128) return error.TooManyImportedDefinitions;
+    const imports = try allocator.alloc(Plan, items.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (imports[0..initialized]) |*imported| imported.deinit(allocator);
+        allocator.free(imports);
+    }
+    const base_dir = std.fs.path.dirname(entry_path) orelse "";
+    for (items.items, 0..) |item, index| {
+        var declared_id: ?[]const u8 = null;
+        const raw_path = switch (item) {
+            .string => |path| path,
+            .object => |object| blk: {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "id", "path" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "id", "path" },
+                );
+                declared_id = try definition_core.json.requiredString(
+                    object,
+                    "id",
+                );
+                try definition_core.json.safeIdentifier(declared_id.?, 256);
+                break :blk try definition_core.json.requiredString(
+                    object,
+                    "path",
+                );
+            },
+            else => return error.InvalidImports,
+        };
+        const normalized = try definition_core.closure.normalizeRelativeAlloc(
+            allocator,
+            base_dir,
+            raw_path,
+        );
+        defer allocator.free(normalized);
+        imports[index] = try compileAtDepth(
+            allocator,
+            closure,
+            normalized,
+            depth + 1,
+            compiled_count,
+        );
+        initialized += 1;
+        if (declared_id) |expected| {
+            if (!std.mem.eql(u8, expected, imports[index].id)) {
+                return error.ImportedDefinitionIdMismatch;
+            }
+        }
+    }
+    std.mem.sort(Plan, imports, {}, struct {
+        fn lessThan(_: void, left: Plan, right: Plan) bool {
+            return std.mem.lessThan(u8, left.id, right.id);
+        }
+    }.lessThan);
+    try validateImportedPlans(imports);
+    return imports;
+}
+
+fn validateImportedPlans(imports: []const Plan) !void {
+    for (imports, 0..) |imported, index| {
+        if (index != 0 and
+            std.mem.order(u8, imports[index - 1].id, imported.id) != .lt)
+        {
+            return error.DuplicateImportedDefinition;
+        }
+    }
 }
 
 fn parseInputs(
@@ -1075,6 +1280,11 @@ fn operatorBit(operator: Operator) u128 {
 fn deinitInputs(allocator: std.mem.Allocator, inputs: []Input) void {
     for (inputs) |*input| input.deinit(allocator);
     allocator.free(inputs);
+}
+
+fn deinitPlans(allocator: std.mem.Allocator, plans: []Plan) void {
+    for (plans) |*plan| plan.deinit(allocator);
+    allocator.free(plans);
 }
 
 fn deinitPointers(allocator: std.mem.Allocator, pointers: [][]u8) void {

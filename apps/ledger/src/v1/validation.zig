@@ -85,6 +85,8 @@ const CompiledRule = struct {
     operator: definition.Operator,
     input_index: u8,
     pointer_id: ?u16,
+    import_index: ?u16 = null,
+    imported_plan: ?*Plan = null,
     other_input_index: ?u8 = null,
     other_pointer_id: ?u16 = null,
     path_ids: []u16,
@@ -109,6 +111,10 @@ const CompiledRule = struct {
         allocator.free(self.values);
         for (self.children) |*child| child.deinit(allocator);
         allocator.free(self.children);
+        if (self.imported_plan) |plan| {
+            plan.deinit(allocator);
+            allocator.destroy(plan);
+        }
         self.* = undefined;
     }
 };
@@ -448,6 +454,64 @@ const Builder = struct {
                     0,
                 );
             },
+            .definition_ref => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "definition" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path", "definition" },
+                );
+                const import_index = source.import_index orelse
+                    return error.ImportedDefinitionIndexMissing;
+                if (import_index >= self.definition_plan.imports.len) {
+                    return error.ImportedDefinitionIndexInvalid;
+                }
+                const imported_definition =
+                    &self.definition_plan.imports[import_index];
+                if (!std.mem.eql(
+                    u8,
+                    imported_definition.id,
+                    try definition_core.json.requiredString(
+                        object,
+                        "definition",
+                    ),
+                )) return error.ImportedDefinitionIdMismatch;
+                if (imported_definition.storage_kind != .pure or
+                    imported_definition.inputs.len != 1 or
+                    imported_definition.inputs[0].codec != .json or
+                    !imported_definition.inputs[0].required)
+                {
+                    return error.ImportedDefinitionNotReusable;
+                }
+                const imported_plan = try self.allocator.create(Plan);
+                var imported_plan_initialized = false;
+                var imported_plan_owned = true;
+                errdefer if (imported_plan_owned) {
+                    if (imported_plan_initialized) {
+                        imported_plan.deinit(self.allocator);
+                    }
+                    self.allocator.destroy(imported_plan);
+                };
+                imported_plan.* = try compile(
+                    self.allocator,
+                    imported_definition,
+                );
+                imported_plan_initialized = true;
+                for (imported_plan.rules) |imported_rule| {
+                    if (imported_rule.input_index != 0 or
+                        (imported_rule.other_input_index != null and
+                            imported_rule.other_input_index.? != 0) or
+                        !isItemOperator(imported_rule.operator))
+                    {
+                        return error.UnsupportedImportedDefinitionRule;
+                    }
+                }
+                rule.import_index = import_index;
+                rule.imported_plan = imported_plan;
+                imported_plan_owned = false;
+            },
             .keyed_unique => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -553,7 +617,9 @@ const Builder = struct {
         if (!self.definition_plan.requires(operator)) {
             return error.UndeclaredArtifactOperator;
         }
-        if (!isItemOperator(operator)) return error.UnsupportedItemOperator;
+        if (!isItemOperator(operator) or operator == .definition_ref) {
+            return error.UnsupportedItemOperator;
+        }
         if (object.contains("input")) return error.ItemRuleInputForbidden;
         const pointer_id = if (object.get("path")) |raw|
             try self.internPointer(try definition_core.json.string(raw))
@@ -795,7 +861,7 @@ const Builder = struct {
 pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
-) !Plan {
+) anyerror!Plan {
     var builder = Builder{
         .allocator = allocator,
         .definition_plan = definition_plan,
@@ -828,7 +894,16 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
+    try encodeCachePlan(plan, encoder, 0);
+}
+
+fn encodeCachePlan(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+    depth: usize,
+) anyerror!void {
+    if (depth > 32) return error.ImportDepthExceeded;
     try encoder.writeCount(plan.inputs.len);
     for (plan.inputs) |input| {
         try encoder.writeBytes(input.name);
@@ -839,7 +914,9 @@ pub fn encodeCache(
     try encoder.writeCount(plan.pointers.len);
     for (plan.pointers) |pointer| try encoder.writeBytes(pointer.raw);
     try encoder.writeCount(plan.rules.len);
-    for (plan.rules) |rule| try encodeCompiledRule(encoder, rule);
+    for (plan.rules) |rule| {
+        try encodeCompiledRule(encoder, rule, depth);
+    }
     try encoder.writeUsize(plan.max_input_bytes);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_diagnostics);
@@ -849,9 +926,31 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) {
+    if (try decoder.readU16() != 6) {
         return error.LedgerValidationCacheVersionMismatch;
     }
+    var imported_plan_count: usize = 0;
+    return decodeCachePlan(
+        allocator,
+        decoder,
+        0,
+        &imported_plan_count,
+    );
+}
+
+fn decodeCachePlan(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    depth: usize,
+    imported_plan_count: *usize,
+) anyerror!Plan {
+    if (depth > 32) return error.CacheImportDepthExceeded;
+    imported_plan_count.* = std.math.add(
+        usize,
+        imported_plan_count.*,
+        1,
+    ) catch return error.CacheImportCountExceeded;
+    if (imported_plan_count.* > 128) return error.CacheImportCountExceeded;
     const inputs = try decodeCacheInputs(allocator, decoder);
     errdefer {
         for (inputs) |*input| input.deinit(allocator);
@@ -870,6 +969,8 @@ pub fn decodeCache(
         pointers.len,
         0,
         &total_rule_count,
+        depth,
+        imported_plan_count,
     );
     errdefer {
         for (rules) |*rule| rule.deinit(allocator);
@@ -897,7 +998,7 @@ pub fn decodeCache(
 pub fn validateCachePlan(
     plan: *const Plan,
     definition_plan: *const definition.Plan,
-) !void {
+) anyerror!void {
     if (plan.inputs.len != definition_plan.inputs.len or
         plan.max_input_bytes != definition_plan.bounds.max_input_bytes or
         plan.max_records != definition_plan.bounds.max_records or
@@ -924,6 +1025,21 @@ fn validateRuleAgainstDefinition(
     definition_plan: *const definition.Plan,
 ) !void {
     if (!definition_plan.requires(rule.operator)) {
+        return error.CacheValidationPlanMismatch;
+    }
+    if (rule.operator == .definition_ref) {
+        const import_index = rule.import_index orelse
+            return error.CacheValidationPlanMismatch;
+        if (import_index >= definition_plan.imports.len or
+            rule.imported_plan == null)
+        {
+            return error.CacheValidationPlanMismatch;
+        }
+        try validateCachePlan(
+            rule.imported_plan.?,
+            &definition_plan.imports[import_index],
+        );
+    } else if (rule.import_index != null or rule.imported_plan != null) {
         return error.CacheValidationPlanMismatch;
     }
     for (rule.children) |child| {
@@ -997,10 +1113,12 @@ fn decodeCachePointers(
 fn encodeCompiledRule(
     encoder: *definition_core.cache.Encoder,
     rule: CompiledRule,
-) !void {
+    depth: usize,
+) anyerror!void {
     try encoder.writeEnum(rule.operator);
     try encoder.writeByte(rule.input_index);
     try writeOptionalU16(encoder, rule.pointer_id);
+    try writeOptionalU16(encoder, rule.import_index);
     try writeOptionalByte(encoder, rule.other_input_index);
     try writeOptionalU16(encoder, rule.other_pointer_id);
     try encoder.writeCount(rule.path_ids.len);
@@ -1020,7 +1138,13 @@ fn encodeCompiledRule(
     try encoder.writeBool(rule.allow_root);
     try encoder.writeBool(rule.case_insensitive);
     try encoder.writeCount(rule.children.len);
-    for (rule.children) |child| try encodeCompiledRule(encoder, child);
+    for (rule.children) |child| {
+        try encodeCompiledRule(encoder, child, depth);
+    }
+    try encoder.writeBool(rule.imported_plan != null);
+    if (rule.imported_plan) |imported_plan| {
+        try encodeCachePlan(imported_plan, encoder, depth + 1);
+    }
 }
 
 fn decodeCacheRules(
@@ -1030,7 +1154,9 @@ fn decodeCacheRules(
     pointer_count: usize,
     depth: usize,
     total_rule_count: *usize,
-) ![]CompiledRule {
+    plan_depth: usize,
+    imported_plan_count: *usize,
+) anyerror![]CompiledRule {
     const count = try decoder.readCount(65_535);
     if (depth > 16 and count != 0) {
         return error.CacheItemRuleDepthExceeded;
@@ -1055,6 +1181,8 @@ fn decodeCacheRules(
             pointer_count,
             depth,
             total_rule_count,
+            plan_depth,
+            imported_plan_count,
         );
         initialized += 1;
     }
@@ -1068,10 +1196,13 @@ fn decodeCacheRule(
     pointer_count: usize,
     depth: usize,
     total_rule_count: *usize,
+    plan_depth: usize,
+    imported_plan_count: *usize,
 ) anyerror!CompiledRule {
     const operator = try decoder.readEnum(definition.Operator);
     const input_index = try decoder.readByte();
     const pointer_id = try readOptionalU16(decoder);
+    const import_index = try readOptionalU16(decoder);
     const other_input_index = try readOptionalByte(decoder);
     const other_pointer_id = try readOptionalU16(decoder);
     const path_ids = try decodePathIds(allocator, decoder);
@@ -1105,15 +1236,34 @@ fn decodeCacheRule(
         pointer_count,
         depth + 1,
         total_rule_count,
+        plan_depth,
+        imported_plan_count,
     );
     errdefer {
         for (children) |*child| child.deinit(allocator);
         allocator.free(children);
     }
+    const imported_plan = if (try decoder.readBool()) blk: {
+        const plan = try allocator.create(Plan);
+        errdefer allocator.destroy(plan);
+        plan.* = try decodeCachePlan(
+            allocator,
+            decoder,
+            plan_depth + 1,
+            imported_plan_count,
+        );
+        break :blk plan;
+    } else null;
+    errdefer if (imported_plan) |plan| {
+        plan.deinit(allocator);
+        allocator.destroy(plan);
+    };
     const rule: CompiledRule = .{
         .operator = operator,
         .input_index = input_index,
         .pointer_id = pointer_id,
+        .import_index = import_index,
+        .imported_plan = imported_plan,
         .other_input_index = other_input_index,
         .other_pointer_id = other_pointer_id,
         .path_ids = path_ids,
@@ -1324,7 +1474,21 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
+        .definition_ref => if (rule.pointer_id == null or
+            rule.import_index == null or
+            rule.imported_plan == null or
+            rule.imported_plan.?.inputs.len != 1 or
+            rule.imported_plan.?.inputs[0].codec != .json or
+            !rule.imported_plan.?.inputs[0].required)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         else => {},
+    }
+    if (rule.operator != .definition_ref and
+        (rule.import_index != null or rule.imported_plan != null))
+    {
+        return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .safe_identifier and
         rule.identifier_style != .portable)
@@ -1362,6 +1526,17 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         }
         try validateCachedRule(child, input_count, pointer_count);
+    }
+    if (rule.imported_plan) |imported_plan| {
+        for (imported_plan.rules) |imported_rule| {
+            if (imported_rule.input_index != 0 or
+                (imported_rule.other_input_index != null and
+                    imported_rule.other_input_index.? != 0) or
+                !isItemOperator(imported_rule.operator))
+            {
+                return error.CacheRuleConfigurationInvalid;
+            }
+        }
     }
 }
 
@@ -1752,6 +1927,14 @@ fn applyRule(
             try oneOfRulesHold(allocator, plan, rule, value)
         else
             false,
+        .definition_ref => if (target) |value|
+            try importedPlanHolds(
+                allocator,
+                rule.imported_plan.?,
+                value,
+            )
+        else
+            false,
         .all_rules, .any_rules, .no_rules => if (target) |value|
             try collectionRuleHolds(
                 allocator,
@@ -1907,12 +2090,27 @@ fn itemRuleHolds(
             oneOfRulesHold(allocator, plan, rule, value)
         else
             false,
+        .definition_ref => if (target) |value|
+            importedPlanHolds(allocator, rule.imported_plan.?, value)
+        else
+            false,
         .all_rules, .any_rules, .no_rules => if (target) |value|
             collectionRuleHolds(allocator, plan, rule, value)
         else
             false,
         else => unreachable,
     };
+}
+
+fn importedPlanHolds(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+) anyerror!bool {
+    for (plan.rules) |rule| {
+        if (!try itemRuleHolds(allocator, plan, rule, root)) return false;
+    }
+    return true;
 }
 
 fn compareRule(
@@ -2753,6 +2951,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .safe_identifier,
         .safe_relative_path,
         .one_of,
+        .definition_ref,
         .unique,
         .sorted,
         .set_equality,
@@ -2793,6 +2992,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .safe_identifier,
         .safe_relative_path,
         .one_of,
+        .definition_ref,
         .unique,
         .sorted,
         .set_equality,
@@ -3129,4 +3329,111 @@ test "validation reports missing and malformed inputs without granting authority
     try std.testing.expect(!malformed.valid);
     try std.testing.expect(!malformed.authority_granted);
     try std.testing.expect(!malformed.storage_mutated);
+}
+
+test "definition references compile imported validators and survive cache round trips" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "receipt.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","enum","scalar-type"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packet.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/packet","owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["receipt"]},{"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "packet.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "packet.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), definition_plan.imports.len);
+    try std.testing.expectEqualStrings(
+        "example/receipt",
+        definition_plan.imports[0].id,
+    );
+
+    var definition_encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        8 * 1024 * 1024,
+    );
+    defer definition_encoder.deinit();
+    try definition.encodeCache(&definition_plan, &definition_encoder);
+    const definition_payload = try definition_encoder.toOwnedSlice();
+    defer std.testing.allocator.free(definition_payload);
+    var definition_decoder =
+        definition_core.cache.Decoder.init(definition_payload);
+    var cached_definition = try definition.decodeCache(
+        std.testing.allocator,
+        &definition_decoder,
+    );
+    defer cached_definition.deinit(std.testing.allocator);
+    try definition_decoder.finish();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        cached_definition.imports.len,
+    );
+
+    var plan = try compile(std.testing.allocator, &cached_definition);
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        8 * 1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &cached_definition);
+
+    var valid = try validate(
+        std.testing.allocator,
+        &cached_definition,
+        &cached,
+        &.{.{
+            .name = "packet",
+            .bytes = "{\"receipt\":{\"count\":2,\"status\":\"complete\"}}",
+        }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    var invalid = try validate(
+        std.testing.allocator,
+        &cached_definition,
+        &cached,
+        &.{.{
+            .name = "packet",
+            .bytes = "{\"receipt\":{\"count\":\"two\",\"status\":\"complete\"}}",
+        }},
+    );
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid.valid);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&cached_definition},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
 }
