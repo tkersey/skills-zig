@@ -4,9 +4,8 @@
   "requires": {
     "abi": "seq-observation-abi/v1",
     "operators": [
-      "sort",
+      "top-k",
       "distinct",
-      "limit",
       "project"
     ]
   },
@@ -40,7 +39,7 @@
   ],
   "pipeline": [
     {
-      "op": "sort",
+      "op": "top-k",
       "input": "facts",
       "as": "ranked",
       "by": [
@@ -49,7 +48,8 @@
           "direction": "desc",
           "nulls": "last"
         }
-      ]
+      ],
+      "limit": 5
     },
     {
       "op": "distinct",
@@ -60,14 +60,8 @@
       ]
     },
     {
-      "op": "limit",
-      "input": "unique",
-      "as": "bounded",
-      "limit": 3
-    },
-    {
       "op": "project",
-      "input": "bounded",
+      "input": "unique",
       "as": "rows",
       "fields": [
         "id",

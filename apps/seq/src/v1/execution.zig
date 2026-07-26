@@ -79,6 +79,10 @@ const RuntimeOperation = union(enum) {
         state_index: u16,
     },
     sort: FieldRange,
+    top_k: struct {
+        keys: FieldRange,
+        count: usize,
+    },
     distinct: FieldRange,
 };
 
@@ -265,6 +269,36 @@ pub fn compile(
                     .sort = .{
                         .start = @intCast(start),
                         .len = @intCast(sort_keys.items.len - start),
+                    },
+                });
+            },
+            .top_k => |top_k| {
+                if (first_blocking_operation == null) {
+                    first_blocking_operation = @intCast(operations.items.len);
+                }
+                const start = sort_keys.items.len;
+                for (top_k.keys) |key| {
+                    if (key.field_index >= field_count) {
+                        return error.ObservationFieldIndexInvalid;
+                    }
+                    try sort_keys.append(allocator, .{
+                        .field_index = field_map[key.field_index],
+                        .direction = key.direction,
+                        .nulls = key.nulls,
+                    });
+                }
+                try operations.append(allocator, .{
+                    .top_k = .{
+                        .keys = .{
+                            .start = @intCast(start),
+                            .len = @intCast(sort_keys.items.len - start),
+                        },
+                        .count = try resolveLimit(
+                            definition_plan,
+                            bindings,
+                            top_k.limit,
+                            native_plan.max_rows,
+                        ),
                     },
                 });
             },
@@ -476,6 +510,10 @@ pub const Runner = struct {
                     ),
                     .limit => |limit| @min(active_count, limit.count),
                     .sort => |range| self.sortRows(active_count, range),
+                    .top_k => |top_k| @min(
+                        self.sortRows(active_count, top_k.keys),
+                        top_k.count,
+                    ),
                     .distinct => |range| self.distinctRows(
                         active_count,
                         range,
@@ -533,7 +571,7 @@ pub const Runner = struct {
                     stop_after_row = stop_after_row or
                         self.limit_states[limit.state_index] == limit.count;
                 },
-                .sort, .distinct => {
+                .sort, .top_k, .distinct => {
                     return error.ObservationBlockingOperatorInStreamingPrefix;
                 },
             }
@@ -1343,5 +1381,71 @@ test "compiled sort and distinct preserve stable bounded semantics" {
         std.testing.allocator,
         executeBlockingForAllocationFailure,
         .{ &program, &source },
+    );
+}
+
+test "compiled top-k binds its count once before execution" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data =
+        \\{"schema":"seq-observation-definition/v1","id":"example/top","requires":{"abi":"seq-observation-abi/v1","operators":["top-k","project"]},"parameters":{"k":{"type":"integer","required":true}},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"score","type":"integer","nullable":false}],"max_rows":4,"max_bytes":4096}],"pipeline":[{"op":"top-k","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc"}],"limit":"k"},{"op":"project","input":"ranked","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-top/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":4,"max_output_bytes":4096,"max_fold_states":2}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "observation.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var native_plan = try plan.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer native_plan.deinit(std.testing.allocator);
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "k", .raw_value = "2" }},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    var program = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &native_plan,
+        &bindings,
+        "rows",
+    );
+    defer program.deinit(std.testing.allocator);
+
+    const source = [_]Value{
+        .{ .string = "a" }, .{ .integer = 2 },
+        .{ .string = "b" }, .{ .integer = 4 },
+        .{ .string = "c" }, .{ .integer = 4 },
+        .{ .string = "d" }, .{ .integer = 1 },
+    };
+    var output: [4]Value = undefined;
+    const result = try executeAlloc(
+        std.testing.allocator,
+        &program,
+        .{ .values = &source, .width = 2 },
+        &output,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqualStrings(
+        "b",
+        result.rows().row(0)[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "c",
+        result.rows().row(1)[0].string,
     );
 }

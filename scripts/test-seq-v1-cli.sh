@@ -83,6 +83,7 @@ grep -Fq '"id":"scan","version":1' <<<"$capabilities"
 grep -Fq '"id":"filter","version":1' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"
+grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
 if grep -Eq '"id":"(join|aggregate|ordered-fold|reachability)"' \
   <<<"$capabilities"

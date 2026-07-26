@@ -10,6 +10,7 @@ pub fn supports(operator: definition.Operator) bool {
         .project,
         .limit,
         .sort,
+        .top_k,
         .distinct,
         .named_relation,
         .result_projection,
@@ -206,6 +207,16 @@ pub const Distinct = struct {
     }
 };
 
+pub const TopK = struct {
+    keys: []SortKey,
+    limit: Limit,
+
+    fn deinit(self: *TopK, allocator: std.mem.Allocator) void {
+        allocator.free(self.keys);
+        self.* = undefined;
+    }
+};
+
 pub const Operation = union(enum) {
     scan: Scan,
     filter: Filter,
@@ -213,6 +224,7 @@ pub const Operation = union(enum) {
     alias,
     limit: Limit,
     sort: Sort,
+    top_k: TopK,
     distinct: Distinct,
 
     fn deinit(self: *Operation, allocator: std.mem.Allocator) void {
@@ -221,6 +233,7 @@ pub const Operation = union(enum) {
             .filter => |*value| value.deinit(allocator),
             .project => |*value| value.deinit(allocator),
             .sort => |*value| value.deinit(allocator),
+            .top_k => |*value| value.deinit(allocator),
             .distinct => |*value| value.deinit(allocator),
             .alias, .limit => {},
         }
@@ -464,6 +477,27 @@ fn compileStage(
                 &schema,
                 object,
             ) };
+        },
+        .top_k => {
+            source_ref = try resolveSource(
+                definition_plan,
+                prior_stages,
+                source.input_names[0],
+            );
+            schema = try cloneSourceSchema(
+                allocator,
+                definition_plan,
+                prior_stages,
+                source_ref.?,
+            );
+            errdefer schema.deinit(allocator);
+            var sort = try compileSort(allocator, &schema, object);
+            errdefer sort.deinit(allocator);
+            operation = .{ .top_k = .{
+                .keys = sort.keys,
+                .limit = try compileLimit(definition_plan, object),
+            } };
+            sort = undefined;
         },
         .distinct => {
             source_ref = try resolveSource(
@@ -965,7 +999,7 @@ pub fn encodeCache(
     native_plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeCount(native_plan.stages.len);
     for (native_plan.stages) |stage| {
         try encoder.writeBytes(stage.name);
@@ -996,7 +1030,7 @@ pub fn decodeCache(
     decoder: *definition_core.cache.Decoder,
     definition_plan: *const definition.Plan,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.SeqNativePlanCacheVersionMismatch;
     }
     const stage_count = try decoder.readCount(256);
@@ -1250,6 +1284,22 @@ pub fn validateCachePlan(
                     }
                 }
             },
+            .top_k => {
+                const top_k = switch (stage.operation) {
+                    .top_k => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateSameSchema(&stage.schema, source_schema.?);
+                try validateSortKeys(
+                    top_k.keys,
+                    source_schema.?,
+                );
+                try validateLimit(
+                    top_k.limit,
+                    definition_plan,
+                    native_plan.max_rows,
+                );
+            },
             .distinct => {
                 const distinct = switch (stage.operation) {
                     .distinct => |value| value,
@@ -1312,6 +1362,46 @@ pub fn validateCachePlan(
                 return error.CacheObservationProjectionMismatch;
             }
         }
+    }
+}
+
+fn validateSortKeys(
+    keys: []const SortKey,
+    source_schema: SourceSchema,
+) !void {
+    if (keys.len == 0 or keys.len > 64) {
+        return error.InvalidObservationSortKeyCount;
+    }
+    for (keys, 0..) |key, key_index| {
+        if (key.field_index >= source_schema.columnCount()) {
+            return error.CacheObservationSortFieldInvalid;
+        }
+        for (keys[0..key_index]) |prior| {
+            if (prior.field_index == key.field_index) {
+                return error.DuplicateObservationSortField;
+            }
+        }
+    }
+}
+
+fn validateLimit(
+    limit: Limit,
+    definition_plan: *const definition.Plan,
+    max_rows: usize,
+) !void {
+    switch (limit) {
+        .fixed => |count| if (count == 0 or count > max_rows) {
+            return error.InvalidObservationLimit;
+        },
+        .parameter => |parameter| {
+            if (parameter >=
+                definition_plan.parameter_declarations.items.len or
+                definition_plan.parameter_declarations
+                    .items[parameter].kind != .integer)
+            {
+                return error.ObservationLimitParameterMustBeInteger;
+            }
+        },
     }
 }
 
@@ -1516,12 +1606,39 @@ fn encodeOperation(
                 try encoder.writeEnum(key.nulls);
             }
         },
+        .top_k => |top_k| {
+            try encodeSortKeys(top_k.keys, encoder);
+            try encodeLimit(top_k.limit, encoder);
+        },
         .distinct => |distinct| {
             try encoder.writeCount(distinct.field_indices.len);
             for (distinct.field_indices) |field_index| {
                 try encoder.writeU16(field_index);
             }
         },
+    }
+}
+
+fn encodeSortKeys(
+    keys: []const SortKey,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(keys.len);
+    for (keys) |key| {
+        try encoder.writeU16(key.field_index);
+        try encoder.writeEnum(key.direction);
+        try encoder.writeEnum(key.nulls);
+    }
+}
+
+fn encodeLimit(
+    limit: Limit,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeEnum(std.meta.activeTag(limit));
+    switch (limit) {
+        .fixed => |count| try encoder.writeUsize(count),
+        .parameter => |index| try encoder.writeU16(index),
     }
 }
 
@@ -1542,6 +1659,11 @@ fn decodeOperation(
         .alias => .alias,
         .limit => .{ .limit = try decodeLimit(decoder) },
         .sort => .{ .sort = try decodeSort(
+            allocator,
+            decoder,
+            schema,
+        ) },
+        .top_k => .{ .top_k = try decodeTopK(
             allocator,
             decoder,
             schema,
@@ -1702,6 +1824,19 @@ fn decodeSort(
         }
     }
     return .{ .keys = keys };
+}
+
+fn decodeTopK(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !TopK {
+    var sort = try decodeSort(allocator, decoder, schema);
+    errdefer sort.deinit(allocator);
+    return .{
+        .keys = sort.keys,
+        .limit = try decodeLimit(decoder),
+    };
 }
 
 fn decodeDistinct(
@@ -1894,7 +2029,7 @@ test "sort and distinct plans cache compiled field indices" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
         .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/order","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"first"},{"field":"id"}]},{"op":"distinct","input":"ranked","as":"rows","keys":["group"]}],"projections":{"rows":{"relation":"rows","schema":"example-order/v1","fields":["id","group","score"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
+        \\{"schema":"seq-observation-definition/v1","id":"example/order","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct","top-k"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"first"},{"field":"id"}]},{"op":"distinct","input":"ranked","as":"unique","keys":["group"]},{"op":"top-k","input":"unique","as":"rows","by":[{"field":"id"}],"limit":2}],"projections":{"rows":{"relation":"rows","schema":"example-order/v1","fields":["id","group","score"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -1920,6 +2055,8 @@ test "sort and distinct plans cache compiled field indices" {
     try std.testing.expectEqual(SortDirection.descending, native_plan.stages[0].operation.sort.keys[0].direction);
     try std.testing.expectEqual(NullOrder.first, native_plan.stages[0].operation.sort.keys[0].nulls);
     try std.testing.expectEqual(@as(u16, 1), native_plan.stages[1].operation.distinct.field_indices[0]);
+    try std.testing.expectEqual(@as(u16, 0), native_plan.stages[2].operation.top_k.keys[0].field_index);
+    try std.testing.expectEqual(@as(usize, 2), native_plan.stages[2].operation.top_k.limit.fixed);
 
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
@@ -1945,5 +2082,9 @@ test "sort and distinct plans cache compiled field indices" {
         u16,
         native_plan.stages[1].operation.distinct.field_indices,
         cached.stages[1].operation.distinct.field_indices,
+    );
+    try std.testing.expectEqual(
+        native_plan.stages[2].operation.top_k.keys[0],
+        cached.stages[2].operation.top_k.keys[0],
     );
 }
