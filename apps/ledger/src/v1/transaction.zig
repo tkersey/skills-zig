@@ -11,6 +11,8 @@ const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
+threadlocal var runtime_io: ?std.Io = null;
+
 pub const EffectReceipt = struct {
     slot: []u8,
     logical_ref: []u8,
@@ -79,6 +81,7 @@ const PreparedEffect = struct {
 };
 
 pub fn installRuntimeIo(io: std.Io) void {
+    runtime_io = io;
     durable_store.installRuntimeIo(io);
 }
 
@@ -530,7 +533,7 @@ fn prepareExistingBinding(
         allocator,
         definition_plan,
         validation_plan,
-        effect.input_index,
+        effect,
         slot,
         event_protocol,
         effect.slot_index,
@@ -570,12 +573,13 @@ fn validateExistingContent(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
-    input_index: u8,
+    effect: storage.Effect,
     slot: storage.ResolvedSlot,
     event_protocol: ?*const protocol.Plan,
     slot_index: u16,
     content: []const u8,
 ) !?usize {
+    const input_index = effect.input_index;
     const input = definition_plan.inputs[input_index];
     if (slot.kind == .document) {
         try validateExistingDocument(
@@ -610,6 +614,7 @@ fn validateExistingContent(
                 validation_plan,
                 input.name,
                 input_index,
+                effect.event,
                 plan,
                 &protocol_state.?,
                 line,
@@ -647,10 +652,54 @@ fn validateExistingEvent(
     validation_plan: *const validation.Plan,
     input_name: []const u8,
     input_index: u8,
+    event_materialization: ?storage.EventMaterialization,
     event_protocol: *const protocol.Plan,
     protocol_state: *protocol.ReplayState,
     bytes: []const u8,
 ) !void {
+    if (event_materialization) |materialized| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            bytes,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        );
+        defer parsed.deinit();
+        const canonical =
+            try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                parsed.value,
+            );
+        defer allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, bytes)) {
+            return error.ExistingStoreValidationFailed;
+        }
+        const reconstructed = try protocol.reconstructInputAlloc(
+            allocator,
+            event_protocol,
+            protocol_state,
+            &materialized,
+            parsed.value,
+        );
+        defer allocator.free(reconstructed);
+        var execution = try validation.execute(
+            allocator,
+            validation_plan,
+            &.{.{ .name = input_name, .bytes = reconstructed }},
+        );
+        defer execution.deinit();
+        if (!execution.isValid()) return error.ExistingStoreValidationFailed;
+        try protocol.applyValue(
+            allocator,
+            event_protocol,
+            protocol_state,
+            parsed.value,
+        );
+        return;
+    }
     var execution = try validation.execute(
         allocator,
         validation_plan,
@@ -820,18 +869,13 @@ fn prepareEffect(
         }
     }
 
-    const canonical_input = try materialization.canonicalizeInputAlloc(
+    const canonical_request = try materialization.canonicalizeInputAlloc(
         allocator,
         execution,
         effect.input_index,
         definition_plan.inputs[effect.input_index].codec,
     );
-    errdefer allocator.free(canonical_input);
-    const canonical_input_digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        canonical_input,
-    );
-    defer allocator.free(canonical_input_digest);
+    defer allocator.free(canonical_request);
     const idempotency_key = if (effect.idempotency_parameter) |parameter_name|
         parameterText(parameters, parameter_name) orelse
             return error.MissingOperationParameter
@@ -887,19 +931,69 @@ fn prepareEffect(
         existing_records = 0;
     }
     defer if (protocol_state) |*state| state.deinit(allocator);
-    if (protocol_required and !binding_before.idempotency_match) {
+    var canonical_input_storage: ?[]u8 = null;
+    errdefer if (canonical_input_storage) |bytes| allocator.free(bytes);
+    if (binding_before.idempotency_match and effect.event != null) {
+        const content = slot_before orelse return error.InvalidIdempotencyBinding;
+        const match_index = binding_before.idempotency_match_index orelse
+            return error.InvalidIdempotencyBinding;
+        const row = binding_before.rows[match_index];
+        if (row.extent_start >= row.extent_end or
+            row.extent_end > content.len)
+        {
+            return error.InvalidIdempotencyBinding;
+        }
+        canonical_input_storage = try allocator.dupe(
+            u8,
+            content[row.extent_start..row.extent_end],
+        );
+    } else if (protocol_required and effect.event != null) {
         const current_protocol = event_protocol.?;
         if (protocol_state == null) {
             protocol_state = protocol.ReplayState.init(current_protocol);
         }
-        try protocol.applyValue(
+        canonical_input_storage = try protocol.materializeEventAlloc(
             allocator,
             current_protocol,
             &protocol_state.?,
+            &effect.event.?,
             execution.inputJson(effect.input_index) orelse
                 return error.ProtocolInputMustBeJson,
+            currentUnixSeconds(),
         );
+        try protocol.apply(
+            allocator,
+            current_protocol,
+            &protocol_state.?,
+            canonical_input_storage.?,
+        );
+    } else {
+        if (effect.event != null) {
+            return error.EventMaterializationRequiresProtocol;
+        }
+        canonical_input_storage = try allocator.dupe(u8, canonical_request);
+        if (protocol_required and !binding_before.idempotency_match) {
+            const current_protocol = event_protocol.?;
+            if (protocol_state == null) {
+                protocol_state = protocol.ReplayState.init(current_protocol);
+            }
+            try protocol.applyValue(
+                allocator,
+                current_protocol,
+                &protocol_state.?,
+                execution.inputJson(effect.input_index) orelse
+                    return error.ProtocolInputMustBeJson,
+            );
+        }
     }
+    const canonical_input = canonical_input_storage orelse
+        return error.CanonicalInputMissing;
+    const canonical_input_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            canonical_input,
+        );
+    defer allocator.free(canonical_input_digest);
 
     const slot_after: SlotAfter = slot_after: {
         if (binding_before.idempotency_match) {
@@ -1233,6 +1327,14 @@ fn parameterText(
     return null;
 }
 
+fn currentUnixSeconds() i64 {
+    const io = runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divFloor(
+        std.Io.Clock.real.now(io).nanoseconds,
+        std.time.ns_per_s,
+    ));
+}
+
 const ChainedEvent = struct {
     bytes: []u8,
     digest: []u8,
@@ -1532,6 +1634,222 @@ test "transaction appends an event and binding in one durable transaction" {
             &third_parameters,
         ),
     );
+}
+
+test "transaction materializes passive event requests before chained append" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","idempotency-key","previous-digest","replay","sequence"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"request":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"request"}]},"shape":{"rules":[{"op":"exact-object","input":"request","path":"","keys":["body","construction_ref","goal_id","kind","subject_digest"]},{"op":"event-envelope","input":"request","keys":["body","body_digest","construction_ref","event_digest","event_id","goal_id","kind","previous_digest","recorded_at","schema","sequence","subject_digest"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/materialized-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","idempotency_param":"request","event":{"body_input_field":"body","fields":[{"field":"construction_ref","input_field":"construction_ref"},{"field":"event_id","sequence_text_prefix":"e-"},{"field":"goal_id","input_field":"goal_id"},{"field":"kind","input_field":"kind"},{"field":"recorded_at","unix_seconds":true},{"field":"schema","literal":"example-event/v1"},{"field":"subject_digest","input_field":"subject_digest"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var storage_encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer storage_encoder.deinit();
+    try storage.encodeCache(&storage_plan, &storage_encoder);
+    const storage_payload = try storage_encoder.toOwnedSlice();
+    defer std.testing.allocator.free(storage_payload);
+    var storage_decoder = definition_core.cache.Decoder.init(storage_payload);
+    var cached_storage = try storage.decodeCache(
+        std.testing.allocator,
+        &storage_decoder,
+    );
+    defer cached_storage.deinit(std.testing.allocator);
+    try storage_decoder.finish();
+    try storage.validateCachePlan(&cached_storage, &definition_plan);
+    var cached_protocol = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &cached_storage,
+    )).?;
+    defer cached_protocol.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var first_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "request", .raw_value = "first" }},
+    );
+    defer first_parameters.deinit(std.testing.allocator);
+    var second_parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "request", .raw_value = "second" }},
+    );
+    defer second_parameters.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    const first_request =
+        "{\"body\":{\"id\":\"item-1\"},\"construction_ref\":null,\"goal_id\":\"goal-1\",\"kind\":\"created\",\"subject_digest\":null}";
+    var first = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "request", .bytes = first_request }},
+        &first_parameters,
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.storage_mutated);
+    const first_event = first.returned_content orelse
+        return error.TestExpectedEqual;
+    var first_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        first_event,
+        .{},
+    );
+    defer first_parsed.deinit();
+    const first_object = try definition_core.json.object(first_parsed.value);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try definition_core.json.integer(
+            try definition_core.json.field(first_object, "sequence"),
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "e-1",
+        try definition_core.json.requiredString(first_object, "event_id"),
+    );
+    try std.testing.expectEqualStrings(
+        "example-event/v1",
+        try definition_core.json.requiredString(first_object, "schema"),
+    );
+    try std.testing.expectEqualStrings(
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        try definition_core.json.requiredString(
+            first_object,
+            "previous_digest",
+        ),
+    );
+    const first_digest = try definition_core.json.requiredString(
+        first_object,
+        "event_digest",
+    );
+    const second_request =
+        "{\"body\":{\"id\":\"item-1\"},\"construction_ref\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"goal_id\":\"goal-1\",\"kind\":\"updated\",\"subject_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"}";
+    var second = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "request", .bytes = second_request }},
+        &second_parameters,
+    );
+    defer second.deinit(std.testing.allocator);
+    const second_event = second.returned_content orelse
+        return error.TestExpectedEqual;
+    var second_parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        second_event,
+        .{},
+    );
+    defer second_parsed.deinit();
+    const second_object = try definition_core.json.object(second_parsed.value);
+    try std.testing.expectEqual(
+        @as(i64, 2),
+        try definition_core.json.integer(
+            try definition_core.json.field(second_object, "sequence"),
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        first_digest,
+        try definition_core.json.requiredString(
+            second_object,
+            "previous_digest",
+        ),
+    );
+    var duplicate = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        &protocol_plan,
+        "append",
+        repo_root,
+        &.{.{ .name = "request", .bytes = second_request }},
+        &second_parameters,
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expectEqualStrings(
+        second_event,
+        duplicate.returned_content.?,
+    );
+    var resolved_storage = try storage.resolve(
+        std.testing.allocator,
+        &storage_plan,
+        &first_parameters,
+    );
+    defer resolved_storage.deinit(std.testing.allocator);
+    var snapshot = try custody.readSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_storage.slot(0),
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    var replay_stats = try replay.validateSlot(
+        std.testing.allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_storage.slot(0),
+        &snapshot,
+        3,
+        true,
+    );
+    defer replay_stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), replay_stats.records_validated);
 }
 
 test "transaction admits and replays a definition-bound event chain" {

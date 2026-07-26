@@ -76,16 +76,58 @@ pub const EffectKind = enum {
     }
 };
 
+pub const EventFieldSource = union(enum) {
+    input_field: []u8,
+    literal: []u8,
+    sequence_text_prefix: []u8,
+    unix_seconds,
+
+    fn deinit(self: *EventFieldSource, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .input_field => |value| allocator.free(value),
+            .literal => |value| allocator.free(value),
+            .sequence_text_prefix => |value| allocator.free(value),
+            .unix_seconds => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const EventField = struct {
+    field: []u8,
+    source: EventFieldSource,
+
+    fn deinit(self: *EventField, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        self.source.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const EventMaterialization = struct {
+    body_input_field: []u8,
+    fields: []EventField,
+
+    fn deinit(self: *EventMaterialization, allocator: std.mem.Allocator) void {
+        allocator.free(self.body_input_field);
+        for (self.fields) |*field| field.deinit(allocator);
+        allocator.free(self.fields);
+        self.* = undefined;
+    }
+};
+
 pub const Effect = struct {
     kind: EffectKind,
     slot_index: u16,
     input_index: u8,
     expected_revision_parameter: ?[]u8,
     idempotency_parameter: ?[]u8,
+    event: ?EventMaterialization,
 
     fn deinit(self: *Effect, allocator: std.mem.Allocator) void {
         if (self.expected_revision_parameter) |name| allocator.free(name);
         if (self.idempotency_parameter) |name| allocator.free(name);
+        if (self.event) |*event| event.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -282,7 +324,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -310,6 +352,23 @@ pub fn encodeCache(
                 effect.expected_revision_parameter,
             );
             try encoder.writeOptionalBytes(effect.idempotency_parameter);
+            try encoder.writeBool(effect.event != null);
+            if (effect.event) |event| {
+                try encoder.writeBytes(event.body_input_field);
+                try encoder.writeCount(event.fields.len);
+                for (event.fields) |field| {
+                    try encoder.writeBytes(field.field);
+                    try encoder.writeEnum(std.meta.activeTag(field.source));
+                    switch (field.source) {
+                        .input_field => |value| try encoder.writeBytes(value),
+                        .literal => |value| try encoder.writeBytes(value),
+                        .sequence_text_prefix => |value| {
+                            try encoder.writeBytes(value);
+                        },
+                        .unix_seconds => {},
+                    }
+                }
+            }
         }
     }
 }
@@ -318,7 +377,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -421,6 +480,14 @@ pub fn validateCachePlan(
                 {
                     return error.CacheStoragePlanMismatch;
                 }
+            }
+            if (effect.event) |*event| {
+                if (effect.kind != .compare_append and
+                    effect.kind != .bind_existing)
+                {
+                    return error.CacheStoragePlanMismatch;
+                }
+                try validateCachedEventMaterialization(event);
             }
         }
     }
@@ -564,11 +631,21 @@ fn decodeCacheOperations(
             if (idempotency_parameter) |value| {
                 try definition_core.json.safeIdentifier(value, 128);
             }
+            var event = if (try decoder.readBool())
+                try decodeEventMaterialization(allocator, decoder)
+            else
+                null;
+            errdefer if (event) |*value| value.deinit(allocator);
             if (kind == .bind_existing and
                 (expected_revision_parameter != null or
                     idempotency_parameter != null))
             {
                 return error.BindingEffectHasAdmissionParameter;
+            }
+            if (event != null and kind != .compare_append and
+                kind != .bind_existing)
+            {
+                return error.EventMaterializationRequiresAppend;
             }
             effect.* = .{
                 .kind = kind,
@@ -576,7 +653,9 @@ fn decodeCacheOperations(
                 .input_index = input_index,
                 .expected_revision_parameter = expected_revision_parameter,
                 .idempotency_parameter = idempotency_parameter,
+                .event = event,
             };
+            event = null;
             effect_initialized += 1;
         }
         try validateCachedOperation(effects, atomic);
@@ -588,6 +667,64 @@ fn decodeCacheOperations(
         initialized += 1;
     }
     return operations;
+}
+
+fn decodeEventMaterialization(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventMaterialization {
+    const body_input_field = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(body_input_field);
+    try definition_core.json.safeIdentifier(body_input_field, 128);
+    const field_count = try decoder.readCount(64);
+    if (field_count == 0) return error.InvalidEventMaterializationFields;
+    const fields = try allocator.alloc(EventField, field_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields, 0..) |*field, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, fields[index - 1].field, name) != .lt)
+        {
+            return error.EventMaterializationFieldsNotSorted;
+        }
+        const source_tag = try decoder.readEnum(
+            std.meta.Tag(EventFieldSource),
+        );
+        var source: ?EventFieldSource = switch (source_tag) {
+            .input_field => .{ .input_field = try decoder.readBytesAlloc(allocator, 128) },
+            .literal => .{ .literal = try decoder.readBytesAlloc(allocator, 4096) },
+            .sequence_text_prefix => .{ .sequence_text_prefix = try decoder.readBytesAlloc(allocator, 128) },
+            .unix_seconds => .unix_seconds,
+        };
+        errdefer if (source) |*value| value.deinit(allocator);
+        switch (source.?) {
+            .input_field => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            },
+            .literal => |value| try validateCanonicalScalar(allocator, value),
+            .sequence_text_prefix => |value| {
+                if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
+                    return error.InvalidEventSequencePrefix;
+                }
+            },
+            .unix_seconds => {},
+        }
+        field.* = .{ .field = name, .source = source.? };
+        source = null;
+        initialized += 1;
+    }
+    const result: EventMaterialization = .{
+        .body_input_field = body_input_field,
+        .fields = fields,
+    };
+    try validateEventMaterialization(allocator, &result);
+    return result;
 }
 
 fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
@@ -798,6 +935,7 @@ fn compileEffect(
         "input",
         "expected_revision_param",
         "idempotency_param",
+        "event",
     });
     try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
     const operator = try definition.Operator.parse(
@@ -848,13 +986,258 @@ fn compileEffect(
     {
         return error.BindingEffectHasAdmissionParameter;
     }
+    var event = if (object.get("event")) |raw_event|
+        try compileEventMaterialization(allocator, raw_event)
+    else
+        null;
+    errdefer if (event) |*value| value.deinit(allocator);
+    if (event != null and kind != .compare_append and kind != .bind_existing) {
+        return error.EventMaterializationRequiresAppend;
+    }
     return .{
         .kind = kind,
         .slot_index = @intCast(slot_index),
         .input_index = @intCast(input_index),
         .expected_revision_parameter = expected_revision_parameter,
         .idempotency_parameter = idempotency_parameter,
+        .event = event,
     };
+}
+
+fn compileEventMaterialization(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !EventMaterialization {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "body_input_field", "fields" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "body_input_field", "fields" },
+    );
+    const body_input_field = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(
+            object,
+            "body_input_field",
+        ),
+    );
+    errdefer allocator.free(body_input_field);
+    try definition_core.json.safeIdentifier(body_input_field, 128);
+    const raw_fields = try definition_core.json.array(
+        try definition_core.json.field(object, "fields"),
+    );
+    if (raw_fields.items.len == 0 or raw_fields.items.len > 64) {
+        return error.InvalidEventMaterializationFields;
+    }
+    const fields = try allocator.alloc(EventField, raw_fields.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (raw_fields.items, 0..) |raw_field, index| {
+        fields[index] = try compileEventField(allocator, raw_field);
+        initialized += 1;
+    }
+    std.mem.sort(EventField, fields, {}, struct {
+        fn lessThan(_: void, left: EventField, right: EventField) bool {
+            return std.mem.lessThan(u8, left.field, right.field);
+        }
+    }.lessThan);
+    const result: EventMaterialization = .{
+        .body_input_field = body_input_field,
+        .fields = fields,
+    };
+    try validateEventMaterialization(allocator, &result);
+    return result;
+}
+
+fn compileEventField(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !EventField {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(object, &.{
+        "field",
+        "input_field",
+        "literal",
+        "sequence_text_prefix",
+        "unix_seconds",
+    });
+    try definition_core.json.requireFields(object, &.{"field"});
+    const field = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "field"),
+    );
+    errdefer allocator.free(field);
+    try definition_core.json.safeIdentifier(field, 128);
+    var source_count: usize = 0;
+    source_count += @intFromBool(object.get("input_field") != null);
+    source_count += @intFromBool(object.get("literal") != null);
+    source_count += @intFromBool(object.get("sequence_text_prefix") != null);
+    source_count += @intFromBool(object.get("unix_seconds") != null);
+    if (source_count != 1) return error.InvalidEventFieldSource;
+    var source: EventFieldSource = if (object.get("input_field")) |value|
+        .{ .input_field = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) }
+    else if (object.get("literal")) |value|
+        .{ .literal = try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            value,
+        ) }
+    else if (object.get("sequence_text_prefix")) |value|
+        .{ .sequence_text_prefix = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) }
+    else if (try definition_core.json.boolean(
+        object.get("unix_seconds").?,
+    ))
+        .unix_seconds
+    else
+        return error.InvalidEventUnixSecondsSource;
+    errdefer source.deinit(allocator);
+    switch (source) {
+        .input_field => |value| {
+            try definition_core.json.safeIdentifier(value, 128);
+        },
+        .literal => |value| try validateCanonicalScalar(allocator, value),
+        .sequence_text_prefix => |value| {
+            if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
+                return error.InvalidEventSequencePrefix;
+            }
+        },
+        .unix_seconds => {},
+    }
+    return .{ .field = field, .source = source };
+}
+
+fn validateCanonicalScalar(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .null, .bool, .integer, .float, .string => {},
+        .array, .object, .number_string => {
+            return error.EventLiteralMustBeScalar;
+        },
+    }
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        parsed.value,
+    );
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, bytes)) {
+        return error.EventLiteralNotCanonical;
+    }
+}
+
+fn validateEventMaterialization(
+    allocator: std.mem.Allocator,
+    event: *const EventMaterialization,
+) !void {
+    try definition_core.json.safeIdentifier(event.body_input_field, 128);
+    if (event.fields.len == 0 or event.fields.len > 64) {
+        return error.InvalidEventMaterializationFields;
+    }
+    for (event.fields, 0..) |field, index| {
+        try definition_core.json.safeIdentifier(field.field, 128);
+        if (std.mem.eql(u8, field.field, event.body_input_field)) {
+            return error.EventInputFieldCollision;
+        }
+        if (index != 0 and
+            std.mem.order(u8, event.fields[index - 1].field, field.field) != .lt)
+        {
+            return error.EventMaterializationFieldsNotSorted;
+        }
+        switch (field.source) {
+            .input_field => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+                if (std.mem.eql(u8, value, event.body_input_field)) {
+                    return error.EventInputFieldCollision;
+                }
+                for (event.fields[0..index]) |prior| switch (prior.source) {
+                    .input_field => |prior_value| {
+                        if (std.mem.eql(u8, prior_value, value)) {
+                            return error.DuplicateEventInputField;
+                        }
+                    },
+                    else => {},
+                };
+            },
+            .literal => |value| try validateCanonicalScalar(allocator, value),
+            .sequence_text_prefix => |value| {
+                if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
+                    return error.InvalidEventSequencePrefix;
+                }
+            },
+            .unix_seconds => {},
+        }
+    }
+}
+
+fn validateCachedEventMaterialization(
+    event: *const EventMaterialization,
+) !void {
+    try definition_core.json.safeIdentifier(event.body_input_field, 128);
+    if (event.fields.len == 0 or event.fields.len > 64) {
+        return error.CacheStoragePlanMismatch;
+    }
+    for (event.fields, 0..) |field, index| {
+        try definition_core.json.safeIdentifier(field.field, 128);
+        if (std.mem.eql(u8, field.field, event.body_input_field) or
+            (index != 0 and
+                std.mem.order(
+                    u8,
+                    event.fields[index - 1].field,
+                    field.field,
+                ) != .lt))
+        {
+            return error.CacheStoragePlanMismatch;
+        }
+        switch (field.source) {
+            .input_field => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+                if (std.mem.eql(u8, value, event.body_input_field)) {
+                    return error.CacheStoragePlanMismatch;
+                }
+                for (event.fields[0..index]) |prior| switch (prior.source) {
+                    .input_field => |prior_value| {
+                        if (std.mem.eql(u8, prior_value, value)) {
+                            return error.CacheStoragePlanMismatch;
+                        }
+                    },
+                    else => {},
+                };
+            },
+            .literal => |value| {
+                if (value.len == 0 or value.len > 4096) {
+                    return error.CacheStoragePlanMismatch;
+                }
+            },
+            .sequence_text_prefix => |value| {
+                if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
+                    return error.CacheStoragePlanMismatch;
+                }
+            },
+            .unix_seconds => {},
+        }
+    }
 }
 
 fn optionalParameterName(

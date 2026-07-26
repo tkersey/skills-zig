@@ -480,6 +480,64 @@ fn validateEventInput(
 ) !void {
     const input =
         resolved.archived.definition_plan.inputs[resolved.effect.input_index];
+    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
+        if (plan.target_slot_index == resolved.effect.slot_index)
+            plan
+        else
+            null
+    else
+        null;
+    if ((historical_plan != null) != protocol_required) {
+        return error.HistoricalProtocolBindingMismatch;
+    }
+    if (resolved.effect.event) |*event_materialization| {
+        const plan = historical_plan orelse
+            return error.HistoricalProtocolBindingMismatch;
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            bytes,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        );
+        defer parsed.deinit();
+        const canonical_event =
+            try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                parsed.value,
+            );
+        defer allocator.free(canonical_event);
+        if (!std.mem.eql(u8, canonical_event, bytes)) {
+            return error.HistoricalArtifactNotCanonical;
+        }
+        if (protocol_state.* == null) {
+            protocol_state.* = protocol.ReplayState.init(plan);
+        }
+        const reconstructed = try protocol.reconstructInputAlloc(
+            allocator,
+            plan,
+            &protocol_state.*.?,
+            event_materialization,
+            parsed.value,
+        );
+        defer allocator.free(reconstructed);
+        var execution = try validation.execute(
+            allocator,
+            &resolved.archived.validation_plan,
+            &.{.{ .name = input.name, .bytes = reconstructed }},
+        );
+        defer execution.deinit();
+        if (!execution.isValid()) return error.HistoricalArtifactInvalid;
+        try protocol.applyValue(
+            allocator,
+            plan,
+            &protocol_state.*.?,
+            parsed.value,
+        );
+        return;
+    }
     var execution = try validation.execute(
         allocator,
         &resolved.archived.validation_plan,
@@ -498,16 +556,6 @@ fn validateEventInput(
         if (!std.mem.eql(u8, canonical, bytes)) {
             return error.HistoricalArtifactNotCanonical;
         }
-    }
-    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
-        if (plan.target_slot_index == resolved.effect.slot_index)
-            plan
-        else
-            null
-    else
-        null;
-    if ((historical_plan != null) != protocol_required) {
-        return error.HistoricalProtocolBindingMismatch;
     }
     const plan = historical_plan orelse return;
     const event = execution.inputJson(resolved.effect.input_index) orelse

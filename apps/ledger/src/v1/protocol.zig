@@ -203,7 +203,7 @@ pub fn compile(
     } else if (rules.transition_table != null or rules.reducer != null) {
         return error.UndeclaredReducerRule;
     }
-    return .{
+    const result: Plan = .{
         .envelope = envelope,
         .sequence_start = sequence_start,
         .genesis = genesis,
@@ -212,6 +212,8 @@ pub fn compile(
         .target_slot_index = target_slot_index,
         .reducer_plan = reducer_plan,
     };
+    try validateStorageMaterializations(&result, storage_plan);
+    return result;
 }
 
 pub fn encodeCache(
@@ -342,6 +344,7 @@ pub fn validateCachePlan(
     if (plan.target_slot_index != expected_slot) {
         return error.CacheProtocolPlanMismatch;
     }
+    try validateStorageMaterializations(plan, storage_plan);
 }
 
 pub fn apply(
@@ -453,6 +456,248 @@ pub fn applyValue(
     state.has_previous_digest = true;
     state.next_sequence += 1;
     state.records += 1;
+}
+
+pub fn materializeEventAlloc(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    request: std.json.Value,
+    unix_seconds: i64,
+) ![]u8 {
+    if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
+    try validateEventMaterialization(plan, materialization);
+    const request_object = try definition_core.json.object(request);
+    try validateRequestKeys(request_object, materialization);
+    const body = request_object.get(
+        materialization.body_input_field,
+    ) orelse return error.EventBodyInputMissing;
+    const body_digest =
+        try definition_core.canonical_json.digestValueAlloc(
+            allocator,
+            body,
+        );
+    defer allocator.free(body_digest);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeByte('{');
+    for (plan.envelope.keys, 0..) |key, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            key,
+        );
+        try output.writer.writeByte(':');
+        if (std.mem.eql(u8, key, plan.envelope.sequence_key)) {
+            try output.writer.print("{d}", .{state.next_sequence});
+        } else if (std.mem.eql(u8, key, plan.envelope.previous_digest_key)) {
+            try writePreviousDigest(&output.writer, plan, state);
+        } else if (std.mem.eql(u8, key, plan.envelope.body_key)) {
+            try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                &output.writer,
+                body,
+            );
+        } else if (std.mem.eql(u8, key, plan.envelope.body_digest_key)) {
+            try definition_core.canonical_json.writeCanonicalString(
+                &output.writer,
+                body_digest,
+            );
+        } else if (std.mem.eql(u8, key, plan.envelope.event_digest_key)) {
+            try output.writer.writeAll("\"\"");
+        } else {
+            const field = findEventField(
+                materialization.fields,
+                key,
+            ) orelse return error.EventMaterializationFieldCoverageMismatch;
+            try writeMaterializedField(
+                allocator,
+                &output.writer,
+                field.source,
+                request_object,
+                state.next_sequence,
+                unix_seconds,
+            );
+        }
+    }
+    try output.writer.writeByte('}');
+    return definition_core.canonical_json.finalizeFingerprintAlloc(
+        allocator,
+        output.written(),
+        plan.envelope.event_digest_key,
+    );
+}
+
+pub fn reconstructInputAlloc(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.Value,
+) ![]u8 {
+    try validateEventMaterialization(plan, materialization);
+    const event_object = try definition_core.json.object(event);
+    try validateEnvelopeKeys(event_object, plan.envelope.keys);
+    const Mapping = struct {
+        key: []const u8,
+        value: std.json.Value,
+    };
+    var mappings: [65]Mapping = undefined;
+    var count: usize = 0;
+    mappings[count] = .{
+        .key = materialization.body_input_field,
+        .value = event_object.get(plan.envelope.body_key) orelse
+            return error.EventEnvelopeFieldMissing,
+    };
+    count += 1;
+    for (materialization.fields) |field| {
+        const value = event_object.get(field.field) orelse
+            return error.EventEnvelopeFieldMissing;
+        switch (field.source) {
+            .input_field => |input_field| {
+                mappings[count] = .{ .key = input_field, .value = value };
+                count += 1;
+            },
+            .literal => |literal| {
+                const canonical =
+                    try definition_core.canonical_json.canonicalJsonAlloc(
+                        allocator,
+                        value,
+                    );
+                defer allocator.free(canonical);
+                if (!std.mem.eql(u8, canonical, literal)) {
+                    return error.EventLiteralMismatch;
+                }
+            },
+            .sequence_text_prefix => |prefix| {
+                const actual = try definition_core.json.string(value);
+                const expected = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}{d}",
+                    .{ prefix, state.next_sequence },
+                );
+                defer allocator.free(expected);
+                if (!std.mem.eql(u8, actual, expected)) {
+                    return error.EventSequenceTextMismatch;
+                }
+            },
+            .unix_seconds => switch (value) {
+                .integer => |timestamp| {
+                    if (timestamp < 0) return error.InvalidEventUnixTimestamp;
+                },
+                else => return error.InvalidEventUnixTimestamp,
+            },
+        }
+    }
+    std.mem.sort(Mapping, mappings[0..count], {}, struct {
+        fn lessThan(_: void, left: Mapping, right: Mapping) bool {
+            return std.mem.lessThan(u8, left.key, right.key);
+        }
+    }.lessThan);
+    for (mappings[1..count], 1..) |mapping, index| {
+        if (std.mem.eql(u8, mappings[index - 1].key, mapping.key)) {
+            return error.DuplicateEventInputField;
+        }
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    for (mappings[0..count], 0..) |mapping, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            mapping.key,
+        );
+        try output.writer.writeByte(':');
+        try definition_core.canonical_json.writeCanonicalJson(
+            allocator,
+            &output.writer,
+            mapping.value,
+        );
+    }
+    try output.writer.writeByte('}');
+    return output.toOwnedSlice();
+}
+
+fn validateRequestKeys(
+    request: std.json.ObjectMap,
+    materialization: *const storage.EventMaterialization,
+) !void {
+    var expected: usize = 1;
+    for (materialization.fields) |field| switch (field.source) {
+        .input_field => expected += 1,
+        else => {},
+    };
+    if (request.count() != expected) return error.EventRequestKeysMismatch;
+    if (!request.contains(materialization.body_input_field)) {
+        return error.EventBodyInputMissing;
+    }
+    for (materialization.fields) |field| switch (field.source) {
+        .input_field => |input_field| {
+            if (!request.contains(input_field)) {
+                return error.EventRequestFieldMissing;
+            }
+        },
+        else => {},
+    };
+}
+
+fn writePreviousDigest(
+    writer: *std.Io.Writer,
+    plan: *const Plan,
+    state: *const ReplayState,
+) !void {
+    if (state.previousDigest()) |digest| {
+        return definition_core.canonical_json.writeCanonicalString(
+            writer,
+            digest,
+        );
+    }
+    switch (plan.genesis) {
+        .null => try writer.writeAll("null"),
+        .digest => |digest| {
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                digest,
+            );
+        },
+    }
+}
+
+fn writeMaterializedField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    source: storage.EventFieldSource,
+    request: std.json.ObjectMap,
+    sequence: u64,
+    unix_seconds: i64,
+) !void {
+    switch (source) {
+        .input_field => |input_field| {
+            const value = request.get(input_field) orelse
+                return error.EventRequestFieldMissing;
+            try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                writer,
+                value,
+            );
+        },
+        .literal => |literal| try writer.writeAll(literal),
+        .sequence_text_prefix => |prefix| {
+            const value = try std.fmt.allocPrint(
+                allocator,
+                "{s}{d}",
+                .{ prefix, sequence },
+            );
+            defer allocator.free(value);
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                value,
+            );
+        },
+        .unix_seconds => try writer.print("{d}", .{unix_seconds}),
+    }
 }
 
 fn setRule(slot: *?definition.Rule, rule: definition.Rule) !void {
@@ -813,6 +1058,81 @@ fn compileTargetSlot(
         return error.ProtocolTargetSlotInvalid;
     }
     return target;
+}
+
+fn validateStorageMaterializations(
+    plan: *const Plan,
+    storage_plan: *const storage.Plan,
+) !void {
+    var materialized_effects: usize = 0;
+    var plain_effects: usize = 0;
+    for (storage_plan.operations) |operation| {
+        for (operation.effects) |effect| {
+            if (effect.slot_index != plan.target_slot_index) continue;
+            if (effect.event) |event| {
+                materialized_effects += 1;
+                try validateEventMaterialization(plan, &event);
+            } else {
+                plain_effects += 1;
+            }
+        }
+    }
+    if (materialized_effects != 0 and plain_effects != 0) {
+        return error.MixedEventMaterializationModes;
+    }
+}
+
+fn validateEventMaterialization(
+    plan: *const Plan,
+    event: *const storage.EventMaterialization,
+) !void {
+    const automatic = [_][]const u8{
+        plan.envelope.sequence_key,
+        plan.envelope.previous_digest_key,
+        plan.envelope.body_key,
+        plan.envelope.body_digest_key,
+        plan.envelope.event_digest_key,
+    };
+    if (event.fields.len + automatic.len != plan.envelope.keys.len) {
+        return error.EventMaterializationFieldCoverageMismatch;
+    }
+    for (automatic) |name| {
+        if (findEventField(event.fields, name) != null) {
+            return error.EventMaterializationOverridesAutomaticField;
+        }
+    }
+    for (plan.envelope.keys) |name| {
+        var is_automatic = false;
+        for (automatic) |automatic_name| {
+            if (std.mem.eql(u8, name, automatic_name)) {
+                is_automatic = true;
+                break;
+            }
+        }
+        if (!is_automatic and findEventField(event.fields, name) == null) {
+            return error.EventMaterializationFieldCoverageMismatch;
+        }
+    }
+    if (findEventField(event.fields, plan.envelope.kind_key) == null) {
+        return error.EventMaterializationKindMissing;
+    }
+}
+
+fn findEventField(
+    fields: []const storage.EventField,
+    name: []const u8,
+) ?*const storage.EventField {
+    var low: usize = 0;
+    var high = fields.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, fields[mid].field, name)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &fields[mid],
+        }
+    }
+    return null;
 }
 
 fn validateSortedStringSet(items: []const []u8) !void {
