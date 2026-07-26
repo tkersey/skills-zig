@@ -8,7 +8,7 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 4;
+const payload_version: u16 = 5;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -212,6 +212,10 @@ fn compileFromSource(
         },
         .validation => {
             result.validation_plan = try validation.compile(
+                allocator,
+                &result.definition_plan,
+            );
+            result.materialization_plan = try materialization.compile(
                 allocator,
                 &result.definition_plan,
             );
@@ -724,7 +728,8 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
         route.kind == .validation or
         route.kind == .materialization or
         route.kind == .transact;
-    const required_materialization = route.kind == .materialization;
+    const required_materialization = route.kind == .validation or
+        route.kind == .materialization;
     const required_storage = route.kind == .definition_check or
         route.kind == .transact or
         route.kind == .project or

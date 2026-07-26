@@ -427,10 +427,11 @@ fn runValidate(
     defer deinitDocuments(allocator, owned_documents);
     const documents = try documentViews(allocator, owned_documents);
     defer allocator.free(documents);
-    var result = try ledger.validation.validate(
+    var result = try ledger.materialization.validateArtifact(
         allocator,
         &context.definition_plan,
         &context.validation_plan.?,
+        &context.materialization_plan.?,
         documents,
     );
     defer result.deinit(allocator);

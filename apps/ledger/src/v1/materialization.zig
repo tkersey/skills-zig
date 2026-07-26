@@ -481,6 +481,158 @@ pub fn materialize(
     };
 }
 
+pub fn validateArtifact(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    validation_plan: *const validation.Plan,
+    materialization_plan: *const Plan,
+    documents: []const validation.InputDocument,
+) !validation.Result {
+    var execution = try validation.execute(allocator, validation_plan, documents);
+    defer execution.deinit();
+    if (execution.isValid()) {
+        try validateClaimedIdentity(
+            allocator,
+            &execution,
+            materialization_plan,
+        );
+    }
+    return execution.takeResult(allocator, definition_plan);
+}
+
+fn validateClaimedIdentity(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+) !void {
+    switch (plan.identity) {
+        .none => {},
+        .content_address => |config| {
+            const claimed_pointer = config.claimed orelse return;
+            const root = execution.inputJsonPtr(plan.input_index) orelse {
+                try execution.addDiagnostic(
+                    "content-address",
+                    claimed_pointer.raw,
+                    "content identity requires a JSON input",
+                );
+                return;
+            };
+            if (config.basis_null) |basis_pointer| {
+                const field = definition_core.json_pointer.lookupPtr(
+                    root,
+                    basis_pointer,
+                ) orelse {
+                    try execution.addDiagnostic(
+                        "content-address",
+                        basis_pointer.raw,
+                        "declared identity field is missing",
+                    );
+                    return;
+                };
+                const supplied = field.*;
+                if (supplied == .null) return;
+                if (supplied != .string) {
+                    try execution.addDiagnostic(
+                        "content-address",
+                        claimed_pointer.raw,
+                        "draft identity must be null or the matching content address",
+                    );
+                    return;
+                }
+                field.* = .null;
+                defer field.* = supplied;
+                const derived =
+                    try definition_core.canonical_json.digestValueAlloc(
+                        allocator,
+                        root.*,
+                    );
+                defer allocator.free(derived);
+                if (!std.mem.eql(u8, supplied.string, derived)) {
+                    try execution.addDiagnostic(
+                        "content-address",
+                        claimed_pointer.raw,
+                        "claimed artifact identity does not match canonical content",
+                    );
+                }
+                return;
+            }
+
+            const root_value = root.*;
+            const derived = if (config.exclude_key) |exclude_key|
+                try definition_core.canonical_json.fingerprintObjectOmittingAlloc(
+                    allocator,
+                    root_value,
+                    exclude_key,
+                )
+            else derived: {
+                const canonical = try canonicalize(allocator, execution, plan);
+                defer allocator.free(canonical);
+                break :derived try definition_core.canonical_json.digestBytesAlloc(
+                    allocator,
+                    canonical,
+                );
+            };
+            defer allocator.free(derived);
+            const claimed = definition_core.json_pointer.lookup(
+                root_value,
+                claimed_pointer,
+            );
+            if (claimed == null or claimed.? != .string or
+                !std.mem.eql(u8, claimed.?.string, derived))
+            {
+                try execution.addDiagnostic(
+                    "content-address",
+                    claimed_pointer.raw,
+                    "claimed artifact identity does not match canonical content",
+                );
+            }
+        },
+        .composite => |config| {
+            const claimed_pointer = config.claimed orelse return;
+            const root = execution.inputJson(plan.input_index) orelse {
+                try execution.addDiagnostic(
+                    "composite-identity",
+                    claimed_pointer.raw,
+                    "composite identity requires a JSON input",
+                );
+                return;
+            };
+            const derived = deriveCompositeIdentityAlloc(
+                allocator,
+                root,
+                config,
+            ) catch |err| switch (err) {
+                error.CompositeIdentityFieldMissing,
+                error.CompositeIdentityFieldInvalid,
+                error.CompositeIdentityBytesExceeded,
+                => {
+                    try execution.addDiagnostic(
+                        "composite-identity",
+                        "",
+                        "composite identity cannot be derived from the declared scalar fields",
+                    );
+                    return;
+                },
+                else => return err,
+            };
+            defer allocator.free(derived);
+            const claimed = definition_core.json_pointer.lookup(
+                root,
+                claimed_pointer,
+            );
+            if (claimed == null or claimed.? != .string or
+                !std.mem.eql(u8, claimed.?.string, derived))
+            {
+                try execution.addDiagnostic(
+                    "composite-identity",
+                    claimed_pointer.raw,
+                    "claimed artifact identity does not match the derived composite identity",
+                );
+            }
+        },
+    }
+}
+
 fn materializeDraftContentAddress(
     allocator: std.mem.Allocator,
     execution: *validation.Execution,
@@ -1299,6 +1451,20 @@ test "nested draft content address materializes and verifies canonical identity"
     try std.testing.expect(!rejected.validation_result.valid);
     try std.testing.expect(rejected.canonical_content == null);
     try std.testing.expect(rejected.artifact_id == null);
+
+    var rejected_validation = try validateArtifact(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{ .name = "contract", .bytes = wrong }},
+    );
+    defer rejected_validation.deinit(std.testing.allocator);
+    try std.testing.expect(!rejected_validation.valid);
+    try std.testing.expectEqualStrings(
+        "content-address",
+        rejected_validation.diagnostics.items.items[0].code,
+    );
 }
 
 test "compiled composite identity derives bounded scalar identity" {
