@@ -142,6 +142,285 @@ pub fn compile(
     };
 }
 
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeEnum(plan.storage_kind);
+    try encoder.writeCount(plan.slots.len);
+    for (plan.slots) |slot| {
+        try encoder.writeBytes(slot.name);
+        try encoder.writeBytes(slot.relative_path);
+        try encoder.writeEnum(slot.kind);
+        try encoder.writeEnum(slot.codec);
+        try encoder.writeUsize(slot.max_bytes);
+    }
+    try encoder.writeCount(plan.operations.len);
+    for (plan.operations) |operation| {
+        try encoder.writeBytes(operation.name);
+        try encoder.writeBool(operation.atomic);
+        try encoder.writeCount(operation.effects.len);
+        for (operation.effects) |effect| {
+            try encoder.writeEnum(effect.kind);
+            try encoder.writeU16(effect.slot_index);
+            try encoder.writeByte(effect.input_index);
+            try encoder.writeOptionalBytes(
+                effect.expected_revision_parameter,
+            );
+            try encoder.writeOptionalBytes(effect.idempotency_parameter);
+        }
+    }
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.LedgerStorageCacheVersionMismatch;
+    }
+    const storage_kind = try decoder.readEnum(definition.StorageKind);
+    const slots = try decodeCacheSlots(allocator, decoder);
+    errdefer deinitSlots(allocator, slots);
+    const operations = try decodeCacheOperations(
+        allocator,
+        decoder,
+        slots,
+    );
+    errdefer {
+        for (operations) |*operation| operation.deinit(allocator);
+        allocator.free(operations);
+    }
+    if (storage_kind == .pure) {
+        if (slots.len != 0 or operations.len != 0) {
+            return error.CachePureStorageHasEffects;
+        }
+    } else if (slots.len == 0) {
+        return error.InvalidStorageSlotCount;
+    }
+    return .{
+        .storage_kind = storage_kind,
+        .slots = slots,
+        .operations = operations,
+    };
+}
+
+pub fn validateCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (plan.storage_kind != definition_plan.storage_kind) {
+        return error.CacheStoragePlanMismatch;
+    }
+    for (plan.slots) |slot| {
+        if (slot.max_bytes > definition_plan.bounds.max_store_bytes) {
+            return error.CacheStoragePlanMismatch;
+        }
+    }
+    for (plan.operations) |operation| {
+        for (operation.effects) |effect| {
+            if (effect.input_index >= definition_plan.inputs.len) {
+                return error.CacheStoragePlanMismatch;
+            }
+            const slot = plan.slots[effect.slot_index];
+            const input = definition_plan.inputs[effect.input_index];
+            const required_operator: definition.Operator = switch (effect.kind) {
+                .create_new => .create_new,
+                .compare_append => .compare_append,
+                .compare_replace => .compare_replace,
+                .bind_existing => .bind_existing,
+            };
+            if (!definition_plan.requires(required_operator)) {
+                return error.CacheStoragePlanMismatch;
+            }
+            if ((effect.kind == .compare_append or
+                (effect.kind == .bind_existing and
+                    slot.kind == .event_log)) and
+                input.codec != .json)
+            {
+                return error.CacheStoragePlanMismatch;
+            }
+            if (effect.kind != .compare_append and
+                !(effect.kind == .bind_existing and
+                    slot.kind == .event_log) and
+                input.codec != slot.codec)
+            {
+                return error.CacheStoragePlanMismatch;
+            }
+            if (effect.expected_revision_parameter) |name| {
+                const declaration =
+                    definition_plan.parameter_declarations.find(name) orelse
+                    return error.CacheStoragePlanMismatch;
+                if (declaration.kind != .digest) {
+                    return error.CacheStoragePlanMismatch;
+                }
+            }
+            if (effect.idempotency_parameter) |name| {
+                const declaration =
+                    definition_plan.parameter_declarations.find(name) orelse
+                    return error.CacheStoragePlanMismatch;
+                if (!definition_plan.requires(.idempotency_key) or
+                    declaration.kind != .safe_identifier)
+                {
+                    return error.CacheStoragePlanMismatch;
+                }
+            }
+        }
+    }
+}
+
+fn decodeCacheSlots(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Slot {
+    const count = try decoder.readCount(64);
+    const slots = try allocator.alloc(Slot, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (slots[0..initialized]) |*slot| slot.deinit(allocator);
+        allocator.free(slots);
+    }
+    for (slots, 0..) |*slot, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, slots[index - 1].name, name) != .lt)
+        {
+            return error.CacheStorageSlotsNotSorted;
+        }
+        const relative_path = try decoder.readBytesAlloc(
+            allocator,
+            4096,
+        );
+        errdefer allocator.free(relative_path);
+        try validateLogicalSlotPath(relative_path);
+        const kind = try decoder.readEnum(SlotKind);
+        const codec = try decoder.readEnum(definition.Codec);
+        if (kind == .event_log and codec != .jsonl) {
+            return error.EventLogSlotRequiresJsonl;
+        }
+        if (kind == .document and codec == .jsonl) {
+            return error.JsonlSlotRequiresEventLog;
+        }
+        const max_bytes = try decoder.readUsize();
+        if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
+            return error.StorageSlotBoundsExceeded;
+        }
+        for (slots[0..index]) |prior| {
+            if (std.ascii.eqlIgnoreCase(
+                prior.relative_path,
+                relative_path,
+            )) return error.StoragePathCaseAmbiguity;
+        }
+        slot.* = .{
+            .name = name,
+            .relative_path = relative_path,
+            .kind = kind,
+            .codec = codec,
+            .max_bytes = max_bytes,
+        };
+        initialized += 1;
+    }
+    return slots;
+}
+
+fn decodeCacheOperations(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    slots: []const Slot,
+) ![]Operation {
+    const count = try decoder.readCount(128);
+    const operations = try allocator.alloc(Operation, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (operations[0..initialized]) |*operation| {
+            operation.deinit(allocator);
+        }
+        allocator.free(operations);
+    }
+    for (operations, 0..) |*operation, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, operations[index - 1].name, name) != .lt)
+        {
+            return error.CacheStorageOperationsNotSorted;
+        }
+        const atomic = try decoder.readBool();
+        const effect_count = try decoder.readCount(64);
+        if (effect_count == 0) return error.InvalidOperationEffectCount;
+        const effects = try allocator.alloc(Effect, effect_count);
+        var effect_initialized: usize = 0;
+        errdefer {
+            for (effects[0..effect_initialized]) |*effect| {
+                effect.deinit(allocator);
+            }
+            allocator.free(effects);
+        }
+        for (effects) |*effect| {
+            const kind = try decoder.readEnum(EffectKind);
+            const slot_index = try decoder.readU16();
+            if (slot_index >= slots.len) return error.CacheStorageIndexInvalid;
+            const input_index = try decoder.readByte();
+            const expected_revision_parameter =
+                try decoder.readOptionalBytesAlloc(allocator, 128);
+            errdefer if (expected_revision_parameter) |value| {
+                allocator.free(value);
+            };
+            if (expected_revision_parameter) |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            }
+            const idempotency_parameter =
+                try decoder.readOptionalBytesAlloc(allocator, 128);
+            errdefer if (idempotency_parameter) |value| allocator.free(value);
+            if (idempotency_parameter) |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            }
+            if (kind == .bind_existing and
+                (expected_revision_parameter != null or
+                    idempotency_parameter != null))
+            {
+                return error.BindingEffectHasAdmissionParameter;
+            }
+            effect.* = .{
+                .kind = kind,
+                .slot_index = slot_index,
+                .input_index = input_index,
+                .expected_revision_parameter = expected_revision_parameter,
+                .idempotency_parameter = idempotency_parameter,
+            };
+            effect_initialized += 1;
+        }
+        try validateCachedOperation(effects, atomic);
+        operation.* = .{
+            .name = name,
+            .atomic = atomic,
+            .effects = effects,
+        };
+        initialized += 1;
+    }
+    return operations;
+}
+
+fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
+    if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
+    var binding_effects: usize = 0;
+    for (effects, 0..) |left, index| {
+        if (left.kind == .bind_existing) binding_effects += 1;
+        for (effects[index + 1 ..]) |right| {
+            if (left.slot_index == right.slot_index) {
+                return error.DuplicateOperationSlot;
+            }
+        }
+    }
+    if (binding_effects != 0 and binding_effects != effects.len) {
+        return error.BindingOperationCannotMixEffects;
+    }
+}
+
 fn compileSlots(
     allocator: std.mem.Allocator,
     storage_kind: definition.StorageKind,
@@ -468,6 +747,25 @@ test "storage compiler binds generic slots and atomic effects" {
     try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
     try std.testing.expect(plan.operations[0].atomic);
     try std.testing.expectEqual(@as(usize, 2), plan.operations[0].effects.len);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(plan.storage_kind, cached.storage_kind);
+    try std.testing.expectEqual(plan.slots.len, cached.slots.len);
+    try std.testing.expectEqual(plan.operations.len, cached.operations.len);
+    try std.testing.expectEqual(
+        plan.operations[0].effects.len,
+        cached.operations[0].effects.len,
+    );
 }
 
 test "storage compiler rejects reserved paths and implicit multi effects" {

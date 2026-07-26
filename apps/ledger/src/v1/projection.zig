@@ -166,6 +166,284 @@ pub fn compile(
     };
 }
 
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeCount(plan.projections.len);
+    for (plan.projections) |projection| {
+        try encoder.writeBytes(projection.name);
+        try encoder.writeU16(projection.slot_index);
+        try encoder.writeCount(projection.predicates.len);
+        for (projection.predicates) |predicate| {
+            try encoder.writeBytes(predicate.pointer.raw);
+            switch (predicate.operand) {
+                .constant => |value| {
+                    try encoder.writeByte(0);
+                    try encodeCacheScalar(encoder, value);
+                },
+                .parameter => |name| {
+                    try encoder.writeByte(1);
+                    try encoder.writeBytes(name);
+                },
+            }
+        }
+        try encoder.writeCount(projection.fields.len);
+        for (projection.fields) |field| {
+            try encoder.writeBytes(field.name);
+            try encoder.writeBytes(field.pointer.raw);
+        }
+        try encoder.writeBool(projection.latest != null);
+        if (projection.latest) |pointer| try encoder.writeBytes(pointer.raw);
+        if (projection.limit) |limit| {
+            switch (limit) {
+                .fixed => |count| {
+                    try encoder.writeByte(1);
+                    try encoder.writeUsize(count);
+                },
+                .parameter => |name| {
+                    try encoder.writeByte(2);
+                    try encoder.writeBytes(name);
+                },
+            }
+        } else {
+            try encoder.writeByte(0);
+        }
+    }
+    try encoder.writeUsize(plan.max_records);
+    try encoder.writeUsize(plan.max_output_bytes);
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.LedgerProjectionCacheVersionMismatch;
+    }
+    const count = try decoder.readCount(128);
+    const projections = try allocator.alloc(Projection, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (projections[0..initialized]) |*projection| {
+            projection.deinit(allocator);
+        }
+        allocator.free(projections);
+    }
+    for (projections, 0..) |*projection, index| {
+        projection.* = try decodeCacheProjection(allocator, decoder);
+        initialized += 1;
+        if (index != 0 and std.mem.order(
+            u8,
+            projections[index - 1].name,
+            projection.name,
+        ) != .lt) return error.CacheProjectionsNotSorted;
+    }
+    const max_records = try decoder.readUsize();
+    const max_output_bytes = try decoder.readUsize();
+    if (max_records == 0 or max_records > 10_000_000 or
+        max_output_bytes == 0 or max_output_bytes > 256 * 1024 * 1024)
+    {
+        return error.CacheProjectionBoundsInvalid;
+    }
+    for (projections) |projection| {
+        if (projection.limit) |limit| switch (limit) {
+            .fixed => |fixed| if (fixed == 0 or fixed > max_records) {
+                return error.InvalidProjectionLimit;
+            },
+            .parameter => {},
+        };
+    }
+    return .{
+        .projections = projections,
+        .max_records = max_records,
+        .max_output_bytes = max_output_bytes,
+    };
+}
+
+pub fn validateCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+) !void {
+    if (plan.max_records != definition_plan.bounds.max_records or
+        plan.max_output_bytes != definition_plan.bounds.max_output_bytes)
+    {
+        return error.CacheProjectionPlanMismatch;
+    }
+    for (plan.projections) |projection| {
+        if (projection.slot_index >= storage_plan.slots.len) {
+            return error.CacheProjectionPlanMismatch;
+        }
+        for (projection.predicates) |predicate| {
+            if (predicate.operand == .parameter and
+                definition_plan.parameter_declarations.find(
+                    predicate.operand.parameter,
+                ) == null)
+            {
+                return error.CacheProjectionPlanMismatch;
+            }
+        }
+        if (projection.limit) |limit| switch (limit) {
+            .fixed => {},
+            .parameter => |name| {
+                const declaration =
+                    definition_plan.parameter_declarations.find(name) orelse
+                    return error.CacheProjectionPlanMismatch;
+                if (declaration.kind != .integer) {
+                    return error.CacheProjectionPlanMismatch;
+                }
+            },
+        };
+    }
+}
+
+fn decodeCacheProjection(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Projection {
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    const slot_index = try decoder.readU16();
+    const predicate_count = try decoder.readCount(64);
+    const predicates = try allocator.alloc(Predicate, predicate_count);
+    var predicate_initialized: usize = 0;
+    errdefer {
+        for (predicates[0..predicate_initialized]) |*predicate| {
+            predicate.deinit(allocator);
+        }
+        allocator.free(predicates);
+    }
+    for (predicates) |*predicate| {
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        var pointer = try definition_core.json_pointer.compile(
+            allocator,
+            raw_pointer,
+        );
+        errdefer pointer.deinit(allocator);
+        var operand: Operand = switch (try decoder.readByte()) {
+            0 => .{ .constant = try decodeCacheScalar(allocator, decoder) },
+            1 => .{ .parameter = try decoder.readBytesAlloc(
+                allocator,
+                128,
+            ) },
+            else => return error.CacheProjectionOperandInvalid,
+        };
+        errdefer operand.deinit(allocator);
+        if (operand == .parameter) {
+            try definition_core.json.safeIdentifier(operand.parameter, 128);
+        }
+        predicate.* = .{
+            .pointer = pointer,
+            .operand = operand,
+        };
+        predicate_initialized += 1;
+    }
+    const field_count = try decoder.readCount(256);
+    const fields = try allocator.alloc(Field, field_count);
+    var field_initialized: usize = 0;
+    errdefer {
+        for (fields[0..field_initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields, 0..) |*field, index| {
+        const field_name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(field_name);
+        try definition_core.json.safeIdentifier(field_name, 128);
+        if (index != 0 and
+            std.mem.order(u8, fields[index - 1].name, field_name) != .lt)
+        {
+            return error.CacheProjectionFieldsNotSorted;
+        }
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        var pointer = try definition_core.json_pointer.compile(
+            allocator,
+            raw_pointer,
+        );
+        errdefer pointer.deinit(allocator);
+        field.* = .{ .name = field_name, .pointer = pointer };
+        field_initialized += 1;
+    }
+    var latest: ?definition_core.json_pointer.Pointer = null;
+    errdefer if (latest) |*pointer| pointer.deinit(allocator);
+    if (try decoder.readBool()) {
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        latest = try definition_core.json_pointer.compile(
+            allocator,
+            raw_pointer,
+        );
+    }
+    var limit: ?Limit = switch (try decoder.readByte()) {
+        0 => null,
+        1 => .{ .fixed = try decoder.readUsize() },
+        2 => .{ .parameter = try decoder.readBytesAlloc(allocator, 128) },
+        else => return error.CacheProjectionLimitInvalid,
+    };
+    errdefer if (limit) |*value| value.deinit(allocator);
+    if (limit != null and limit.? == .parameter) {
+        try definition_core.json.safeIdentifier(limit.?.parameter, 128);
+    }
+    return .{
+        .name = name,
+        .slot_index = slot_index,
+        .predicates = predicates,
+        .fields = fields,
+        .latest = latest,
+        .limit = limit,
+    };
+}
+
+fn encodeCacheScalar(
+    encoder: *definition_core.cache.Encoder,
+    value: Scalar,
+) !void {
+    switch (value) {
+        .string => |text| {
+            try encoder.writeByte(0);
+            try encoder.writeBytes(text);
+        },
+        .integer => |number| {
+            try encoder.writeByte(1);
+            try encoder.writeI64(number);
+        },
+        .float => |number| {
+            try encoder.writeByte(2);
+            try encoder.writeF64(number);
+        },
+        .boolean => |flag| {
+            try encoder.writeByte(3);
+            try encoder.writeBool(flag);
+        },
+        .null => try encoder.writeByte(4),
+    }
+}
+
+fn decodeCacheScalar(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Scalar {
+    return switch (try decoder.readByte()) {
+        0 => .{ .string = try decoder.readBytesAlloc(
+            allocator,
+            4 * 1024 * 1024,
+        ) },
+        1 => .{ .integer = try decoder.readI64() },
+        2 => blk: {
+            const number = try decoder.readF64();
+            if (!std.math.isFinite(number)) return error.CacheNumberInvalid;
+            break :blk .{ .float = number };
+        },
+        3 => .{ .boolean = try decoder.readBool() },
+        4 => .null,
+        else => error.CacheProjectionScalarInvalid,
+    };
+}
+
 fn compileProjection(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -732,4 +1010,64 @@ fn resolveLimit(
     };
     if (value == 0 or value > max_records) return error.InvalidProjectionLimit;
     return value;
+}
+
+test "projection plan round trips through the bounded cache codec" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/projection","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["filter","latest","limit","select"]},"parameters":{"kind":{"type":"string","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"recent":{"slot":"events","pipeline":[{"op":"filter","path":"/kind","param":"kind"},{"op":"select","fields":{"kind":"/kind","value":"/value"}},{"op":"limit","count":10}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    );
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(plan.projections.len, cached.projections.len);
+    try std.testing.expectEqualStrings(
+        plan.projections[0].name,
+        cached.projections[0].name,
+    );
+    try std.testing.expectEqual(
+        plan.projections[0].predicates.len,
+        cached.projections[0].predicates.len,
+    );
+    try std.testing.expectEqual(
+        plan.projections[0].fields.len,
+        cached.projections[0].fields.len,
+    );
 }

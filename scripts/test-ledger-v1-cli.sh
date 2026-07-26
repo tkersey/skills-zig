@@ -13,12 +13,39 @@ repo_dir=$(mktemp -d "$temp_base/ledger-v1-smoke.XXXXXX")
 legacy_repo=$(mktemp -d "$temp_base/ledger-v1-bind.XXXXXX")
 invalid_repo=$(mktemp -d "$temp_base/ledger-v1-bind-invalid.XXXXXX")
 trap 'for dir in "${repo_dir:-}" "${legacy_repo:-}" "${invalid_repo:-}"; do test -n "$dir" && rm -rf -- "$dir"; done' EXIT
+export LEDGER_CACHE_DIR="$repo_dir/cache"
 
 check_output=$("$binary" definition check \
   --definition "$definition" \
   --format json)
 grep -Fq '"schema":"ledger-definition-check-result/v1"' <<<"$check_output"
 grep -Fq '"valid":true' <<<"$check_output"
+grep -Fq '"cache_hit":false' <<<"$check_output"
+
+warm_check_output=$("$binary" definition check \
+  --definition "$definition" \
+  --format json)
+grep -Fq '"valid":true' <<<"$warm_check_output"
+grep -Fq '"cache_hit":true' <<<"$warm_check_output"
+
+plan_file=$(find \
+  "$LEDGER_CACHE_DIR/definitions/plans" \
+  -type f \
+  -print \
+  -quit)
+test -n "$plan_file"
+printf '%s\n' 'corrupt-cache-entry' >"$plan_file"
+rebuilt_check_output=$("$binary" definition check \
+  --definition "$definition" \
+  --format json)
+grep -Fq '"valid":true' <<<"$rebuilt_check_output"
+grep -Fq '"cache_hit":false' <<<"$rebuilt_check_output"
+
+recovered_check_output=$("$binary" definition check \
+  --definition "$definition" \
+  --format json)
+grep -Fq '"valid":true' <<<"$recovered_check_output"
+grep -Fq '"cache_hit":true' <<<"$recovered_check_output"
 
 validation_output=$("$binary" validate \
   --definition "$definition" \

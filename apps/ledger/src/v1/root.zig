@@ -1,4 +1,5 @@
 pub const definition = @import("definition.zig");
+pub const compiled_plan = @import("compiled_plan.zig");
 pub const validation = @import("validation.zig");
 pub const materialization = @import("materialization.zig");
 pub const storage = @import("storage.zig");
@@ -12,6 +13,7 @@ pub const envelope = @import("envelope.zig");
 
 test {
     _ = definition;
+    _ = compiled_plan;
     _ = validation;
     _ = materialization;
     _ = storage;

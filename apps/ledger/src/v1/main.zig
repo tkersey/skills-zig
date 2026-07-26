@@ -90,18 +90,7 @@ const DoctorArgs = struct {
     }
 };
 
-const DefinitionContext = struct {
-    closure: definition_core.Closure,
-    entry_path: []u8,
-    plan: ledger.definition.Plan,
-
-    fn deinit(self: *DefinitionContext, allocator: std.mem.Allocator) void {
-        self.plan.deinit(allocator);
-        allocator.free(self.entry_path);
-        self.closure.deinit(allocator);
-        self.* = undefined;
-    }
-};
+const DefinitionContext = ledger.compiled_plan.PlanSet;
 
 const OwnedDocument = struct {
     name: []u8,
@@ -179,21 +168,21 @@ fn runTransact(
 ) !u8 {
     var args = try parseTransactionArgs(allocator, argv);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.common.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.common.definition_path,
+        .{ .kind = .transact, .name = args.operation },
+    );
     defer context.deinit(allocator);
     var bindings = try bindParameters(
         allocator,
-        &context.plan.parameter_declarations,
+        &context.definition_plan.parameter_declarations,
         args.common.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    var validation_plan = try ledger.validation.compile(allocator, &context.plan);
-    defer validation_plan.deinit(allocator);
-    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
-    defer storage_plan.deinit(allocator);
     const owned_documents = try readDocuments(
         allocator,
-        &validation_plan,
+        &context.validation_plan.?,
         args.common.input_specs,
     );
     defer deinitDocuments(allocator, owned_documents);
@@ -208,11 +197,11 @@ fn runTransact(
     defer allocator.free(repo_root);
     var result = ledger.transaction.transact(
         allocator,
-        &context.plan,
+        &context.definition_plan,
         &context.closure,
         context.entry_path,
-        &validation_plan,
-        &storage_plan,
+        &context.validation_plan.?,
+        &context.storage_plan.?,
         args.operation,
         repo_root,
         documents,
@@ -222,7 +211,12 @@ fn runTransact(
         return 2;
     };
     defer result.deinit(allocator);
-    try emitTransaction(allocator, args.common.format, &result);
+    try emitTransaction(
+        allocator,
+        args.common.format,
+        &result,
+        context.stats,
+    );
     return if (result.validation_result.valid) 0 else 2;
 }
 
@@ -232,16 +226,18 @@ fn runDoctor(
 ) !u8 {
     var args = try parseDoctorArgs(allocator, argv);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .doctor },
+    );
     defer context.deinit(allocator);
     var bindings = try bindParameters(
         allocator,
-        &context.plan.parameter_declarations,
+        &context.definition_plan.parameter_declarations,
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
-    defer storage_plan.deinit(allocator);
     try durable_store.rejectSymlinkComponents(args.repo_path);
     const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
         defaultIo(),
@@ -251,12 +247,12 @@ fn runDoctor(
     defer allocator.free(repo_root);
     var result = try ledger.doctor.execute(
         allocator,
-        &context.plan,
-        &storage_plan,
+        &context.definition_plan,
+        &context.storage_plan.?,
         repo_root,
     );
     defer result.deinit(allocator);
-    try emitDoctor(allocator, args.format, &result);
+    try emitDoctor(allocator, args.format, &result, context.stats);
     return if (result.healthy) 0 else 2;
 }
 
@@ -266,22 +262,18 @@ fn runProject(
 ) !u8 {
     var args = try parseProjectionArgs(allocator, argv);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .project, .name = args.projection },
+    );
     defer context.deinit(allocator);
     var bindings = try bindParameters(
         allocator,
-        &context.plan.parameter_declarations,
+        &context.definition_plan.parameter_declarations,
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
-    defer storage_plan.deinit(allocator);
-    var projection_plan = try ledger.projection.compile(
-        allocator,
-        &context.plan,
-        &storage_plan,
-    );
-    defer projection_plan.deinit(allocator);
     try durable_store.rejectSymlinkComponents(args.repo_path);
     const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
         defaultIo(),
@@ -291,9 +283,9 @@ fn runProject(
     defer allocator.free(repo_root);
     var result = try ledger.projection.execute(
         allocator,
-        &context.plan,
-        &storage_plan,
-        &projection_plan,
+        &context.definition_plan,
+        &context.storage_plan.?,
+        &context.projection_plan.?,
         args.projection,
         repo_root,
         &bindings,
@@ -304,6 +296,7 @@ fn runProject(
         args.format,
         args.payload_only,
         &result,
+        context.stats,
     );
     return 0;
 }
@@ -314,21 +307,12 @@ fn runDefinitionCheck(
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .definition_check },
+    );
     defer context.deinit(allocator);
-    var validation_plan = try ledger.validation.compile(allocator, &context.plan);
-    defer validation_plan.deinit(allocator);
-    var storage_plan = try ledger.storage.compile(
-        allocator,
-        &context.plan,
-    );
-    defer storage_plan.deinit(allocator);
-    var projection_plan = try ledger.projection.compile(
-        allocator,
-        &context.plan,
-        &storage_plan,
-    );
-    defer projection_plan.deinit(allocator);
     switch (args.format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
@@ -338,17 +322,24 @@ fn runDefinitionCheck(
             );
             try definition_core.canonical_json.writeCanonicalString(
                 &output.writer,
-                context.plan.id,
+                context.definition_plan.id,
             );
             try output.writer.writeAll(",\"digest\":");
             try definition_core.canonical_json.writeCanonicalString(
                 &output.writer,
-                context.plan.closure_digest[0..],
+                context.definition_plan.closure_digest[0..],
             );
             try output.writer.writeAll(",\"abi\":\"");
             try output.writer.writeAll(ledger.definition.abi);
             try output.writer.writeAll(
-                "\"},\"valid\":true,\"errors\":[],\"passive\":true,\"authority_granted\":false}\n",
+                "\"},\"valid\":true,\"errors\":[],\"compile_stats\":",
+            );
+            try ledger.envelope.writeCompileStatsJson(
+                &output.writer,
+                context.stats,
+            );
+            try output.writer.writeAll(
+                ",\"passive\":true,\"authority_granted\":false}\n",
             );
             try writeStdout(output.written());
         },
@@ -356,7 +347,10 @@ fn runDefinitionCheck(
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
             try stdout_writer.interface.print(
                 "structurally valid definition {s}@{s}\n",
-                .{ context.plan.id, context.plan.closure_digest[0..] },
+                .{
+                    context.definition_plan.id,
+                    context.definition_plan.closure_digest[0..],
+                },
             );
         },
     }
@@ -369,7 +363,11 @@ fn runDefinitionDescribe(
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .definition },
+    );
     defer context.deinit(allocator);
     switch (args.format) {
         .json => {
@@ -377,7 +375,8 @@ fn runDefinitionDescribe(
             defer output.deinit();
             try ledger.envelope.writeDefinitionDescriptionJson(
                 &output.writer,
-                &context.plan,
+                &context.definition_plan,
+                context.stats,
             );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
@@ -387,9 +386,9 @@ fn runDefinitionDescribe(
             try stdout_writer.interface.print(
                 "{s}\nowner: {s}\ndigest: {s}\nabi: {s}\n",
                 .{
-                    context.plan.id,
-                    context.plan.owner,
-                    context.plan.closure_digest[0..],
+                    context.definition_plan.id,
+                    context.definition_plan.owner,
+                    context.definition_plan.closure_digest[0..],
                     ledger.definition.abi,
                 },
             );
@@ -404,19 +403,21 @@ fn runValidate(
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .validation },
+    );
     defer context.deinit(allocator);
     var bindings = try bindParameters(
         allocator,
-        &context.plan.parameter_declarations,
+        &context.definition_plan.parameter_declarations,
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    var validation_plan = try ledger.validation.compile(allocator, &context.plan);
-    defer validation_plan.deinit(allocator);
     const owned_documents = try readDocuments(
         allocator,
-        &validation_plan,
+        &context.validation_plan.?,
         args.input_specs,
     );
     defer deinitDocuments(allocator, owned_documents);
@@ -424,12 +425,12 @@ fn runValidate(
     defer allocator.free(documents);
     var result = try ledger.validation.validate(
         allocator,
-        &context.plan,
-        &validation_plan,
+        &context.definition_plan,
+        &context.validation_plan.?,
         documents,
     );
     defer result.deinit(allocator);
-    try emitValidation(allocator, args.format, &result);
+    try emitValidation(allocator, args.format, &result, context.stats);
     return if (result.valid) 0 else 2;
 }
 
@@ -439,24 +440,21 @@ fn runMaterialize(
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
-    var context = try loadDefinition(allocator, args.definition_path);
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .kind = .materialization },
+    );
     defer context.deinit(allocator);
     var bindings = try bindParameters(
         allocator,
-        &context.plan.parameter_declarations,
+        &context.definition_plan.parameter_declarations,
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
-    var validation_plan = try ledger.validation.compile(allocator, &context.plan);
-    defer validation_plan.deinit(allocator);
-    var materialization_plan = try ledger.materialization.compile(
-        allocator,
-        &context.plan,
-    );
-    defer materialization_plan.deinit(allocator);
     const owned_documents = try readDocuments(
         allocator,
-        &validation_plan,
+        &context.validation_plan.?,
         args.input_specs,
     );
     defer deinitDocuments(allocator, owned_documents);
@@ -464,13 +462,18 @@ fn runMaterialize(
     defer allocator.free(documents);
     var result = try ledger.materialization.materialize(
         allocator,
-        &context.plan,
-        &validation_plan,
-        &materialization_plan,
+        &context.definition_plan,
+        &context.validation_plan.?,
+        &context.materialization_plan.?,
         documents,
     );
     defer result.deinit(allocator);
-    try emitMaterialization(allocator, args.format, &result);
+    try emitMaterialization(
+        allocator,
+        args.format,
+        &result,
+        context.stats,
+    );
     return if (result.validation_result.valid) 0 else 2;
 }
 
@@ -722,6 +725,7 @@ fn parseDoctorArgs(
 fn loadDefinition(
     allocator: std.mem.Allocator,
     path: []const u8,
+    route: ledger.compiled_plan.Route,
 ) !DefinitionContext {
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), ".", allocator);
     defer allocator.free(cwd);
@@ -736,21 +740,45 @@ fn loadDefinition(
         relativeWithin(absolute, cwd)
     else
         std.fs.path.basename(absolute);
-    var closure = try definition_core.closure.load(
+    const cache_dir = try ledgerCacheDirAlloc(allocator, cwd);
+    defer if (cache_dir) |owned| allocator.free(owned);
+    return ledger.compiled_plan.load(
         allocator,
         root,
         entry,
-        .{},
+        route,
+        Version,
+        .{ .cache_dir = cache_dir },
     );
-    errdefer closure.deinit(allocator);
-    const entry_path = try allocator.dupe(u8, entry);
-    errdefer allocator.free(entry_path);
-    const plan = try ledger.definition.compile(allocator, &closure, entry);
-    return .{
-        .closure = closure,
-        .entry_path = entry_path,
-        .plan = plan,
-    };
+}
+
+fn ledgerCacheDirAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+) !?[]u8 {
+    var base: []const u8 = undefined;
+    var suffix: []const u8 = undefined;
+    if (environmentValue("LEDGER_CACHE_DIR")) |value| {
+        base = value;
+        suffix = "definitions";
+    } else if (environmentValue("XDG_CACHE_HOME")) |value| {
+        base = value;
+        suffix = "ledger/definitions";
+    } else if (environmentValue("HOME")) |value| {
+        base = value;
+        suffix = ".cache/ledger/definitions";
+    } else {
+        return null;
+    }
+    const joined = try std.fs.path.join(allocator, &.{ base, suffix });
+    defer allocator.free(joined);
+    return try std.fs.path.resolve(allocator, &.{ cwd, joined });
+}
+
+fn environmentValue(comptime key: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(key) orelse return null;
+    const bytes = std.mem.span(value);
+    return if (bytes.len == 0) null else bytes;
 }
 
 fn readDocuments(
@@ -844,12 +872,17 @@ fn emitValidation(
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.validation.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try ledger.envelope.writeValidationJson(&output.writer, result);
+            try ledger.envelope.writeValidationJson(
+                &output.writer,
+                result,
+                compile_stats,
+            );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
         },
@@ -871,12 +904,17 @@ fn emitMaterialization(
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.materialization.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try ledger.envelope.writeMaterializationJson(&output.writer, result);
+            try ledger.envelope.writeMaterializationJson(
+                &output.writer,
+                result,
+                compile_stats,
+            );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
         },
@@ -901,12 +939,17 @@ fn emitTransaction(
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.transaction.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try ledger.envelope.writeTransactionJson(&output.writer, result);
+            try ledger.envelope.writeTransactionJson(
+                &output.writer,
+                result,
+                compile_stats,
+            );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
         },
@@ -939,6 +982,7 @@ fn emitProjection(
     format: Format,
     payload_only: bool,
     result: *const ledger.projection.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     if (payload_only) {
         try writeStdout(result.payload);
@@ -949,7 +993,11 @@ fn emitProjection(
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try ledger.envelope.writeProjectionJson(&output.writer, result);
+            try ledger.envelope.writeProjectionJson(
+                &output.writer,
+                result,
+                compile_stats,
+            );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
         },
@@ -964,12 +1012,17 @@ fn emitDoctor(
     allocator: std.mem.Allocator,
     format: Format,
     result: *const ledger.doctor.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try ledger.envelope.writeDoctorJson(&output.writer, result);
+            try ledger.envelope.writeDoctorJson(
+                &output.writer,
+                result,
+                compile_stats,
+            );
             try output.writer.writeByte('\n');
             try writeStdout(output.written());
         },

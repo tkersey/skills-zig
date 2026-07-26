@@ -309,6 +309,438 @@ pub fn compile(
     };
 }
 
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeCount(plan.inputs.len);
+    for (plan.inputs) |input| {
+        try encoder.writeBytes(input.name);
+        try encoder.writeEnum(input.codec);
+        try encoder.writeBool(input.required);
+        try encoder.writeUsize(input.max_bytes);
+    }
+    try encoder.writeCount(plan.pointers.len);
+    for (plan.pointers) |pointer| try encoder.writeBytes(pointer.raw);
+    try encoder.writeCount(plan.rules.len);
+    for (plan.rules) |rule| {
+        try encoder.writeEnum(rule.operator);
+        try encoder.writeByte(rule.input_index);
+        try writeOptionalU16(encoder, rule.pointer_id);
+        try writeOptionalByte(encoder, rule.other_input_index);
+        try writeOptionalU16(encoder, rule.other_pointer_id);
+        try encoder.writeCount(rule.path_ids.len);
+        for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
+        try encoder.writeCount(rule.keys.len);
+        for (rule.keys) |key| try encoder.writeBytes(key);
+        try encoder.writeCount(rule.values.len);
+        for (rule.values) |value| try encodeEnumScalar(encoder, value);
+        try encoder.writeBool(rule.scalar_kind != null);
+        if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
+        try writeOptionalUsize(encoder, rule.min_count);
+        try writeOptionalUsize(encoder, rule.max_count);
+        try writeOptionalF64(encoder, rule.min_number);
+        try writeOptionalF64(encoder, rule.max_number);
+    }
+    try encoder.writeUsize(plan.max_input_bytes);
+    try encoder.writeUsize(plan.max_records);
+    try encoder.writeUsize(plan.max_diagnostics);
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.LedgerValidationCacheVersionMismatch;
+    }
+    const inputs = try decodeCacheInputs(allocator, decoder);
+    errdefer {
+        for (inputs) |*input| input.deinit(allocator);
+        allocator.free(inputs);
+    }
+    const pointers = try decodeCachePointers(allocator, decoder);
+    errdefer {
+        for (pointers) |*pointer| pointer.deinit(allocator);
+        allocator.free(pointers);
+    }
+    const rules = try decodeCacheRules(
+        allocator,
+        decoder,
+        inputs.len,
+        pointers.len,
+    );
+    errdefer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    const max_input_bytes = try decoder.readUsize();
+    const max_records = try decoder.readUsize();
+    const max_diagnostics = try decoder.readUsize();
+    if (max_input_bytes == 0 or max_input_bytes > 256 * 1024 * 1024 or
+        max_records == 0 or max_records > 10_000_000 or
+        max_diagnostics == 0 or max_diagnostics > 1024)
+    {
+        return error.CacheValidationBoundsInvalid;
+    }
+    return .{
+        .inputs = inputs,
+        .pointers = pointers,
+        .rules = rules,
+        .max_input_bytes = max_input_bytes,
+        .max_records = max_records,
+        .max_diagnostics = max_diagnostics,
+    };
+}
+
+pub fn validateCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (plan.inputs.len != definition_plan.inputs.len or
+        plan.max_input_bytes != definition_plan.bounds.max_input_bytes or
+        plan.max_records != definition_plan.bounds.max_records or
+        plan.max_diagnostics != definition_plan.bounds.max_diagnostics)
+    {
+        return error.CacheValidationPlanMismatch;
+    }
+    for (plan.inputs, definition_plan.inputs) |cached, declared| {
+        if (!std.mem.eql(u8, cached.name, declared.name) or
+            cached.codec != declared.codec or
+            cached.required != declared.required or
+            cached.max_bytes != declared.max_bytes)
+        {
+            return error.CacheValidationPlanMismatch;
+        }
+    }
+    for (plan.rules) |rule| {
+        if (!definition_plan.requires(rule.operator)) {
+            return error.CacheValidationPlanMismatch;
+        }
+    }
+}
+
+fn decodeCacheInputs(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]definition.Input {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidInputCount;
+    const inputs = try allocator.alloc(definition.Input, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (inputs[0..initialized]) |*input| input.deinit(allocator);
+        allocator.free(inputs);
+    }
+    for (inputs, 0..) |*input, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, inputs[index - 1].name, name) != .lt)
+        {
+            return error.CacheInputsNotSorted;
+        }
+        const codec = try decoder.readEnum(definition.Codec);
+        const required = try decoder.readBool();
+        const max_bytes = try decoder.readUsize();
+        if (max_bytes == 0 or max_bytes > 256 * 1024 * 1024) {
+            return error.InputBoundsExceeded;
+        }
+        input.* = .{
+            .name = name,
+            .codec = codec,
+            .required = required,
+            .max_bytes = max_bytes,
+        };
+        initialized += 1;
+    }
+    return inputs;
+}
+
+fn decodeCachePointers(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Pointer {
+    const count = try decoder.readCount(65_535);
+    const pointers = try allocator.alloc(Pointer, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (pointers[0..initialized]) |*pointer| pointer.deinit(allocator);
+        allocator.free(pointers);
+    }
+    for (pointers) |*pointer| {
+        const raw = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw);
+        pointer.* = try definition_core.json_pointer.compile(allocator, raw);
+        initialized += 1;
+    }
+    return pointers;
+}
+
+fn decodeCacheRules(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    input_count: usize,
+    pointer_count: usize,
+) ![]CompiledRule {
+    const count = try decoder.readCount(65_535);
+    const rules = try allocator.alloc(CompiledRule, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (rules[0..initialized]) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    for (rules) |*destination| {
+        var rule: CompiledRule = .{
+            .operator = try decoder.readEnum(definition.Operator),
+            .input_index = try decoder.readByte(),
+            .pointer_id = try readOptionalU16(decoder),
+            .other_input_index = try readOptionalByte(decoder),
+            .other_pointer_id = try readOptionalU16(decoder),
+            .path_ids = try decodePathIds(allocator, decoder),
+            .keys = try decodeKeys(allocator, decoder),
+            .values = try decodeEnumScalars(allocator, decoder),
+            .scalar_kind = if (try decoder.readBool())
+                try decoder.readEnum(JsonKind)
+            else
+                null,
+            .min_count = try readOptionalUsize(decoder),
+            .max_count = try readOptionalUsize(decoder),
+            .min_number = try readOptionalF64(decoder),
+            .max_number = try readOptionalF64(decoder),
+        };
+        errdefer rule.deinit(allocator);
+        try validateCachedRule(rule, input_count, pointer_count);
+        destination.* = rule;
+        initialized += 1;
+    }
+    return rules;
+}
+
+fn decodePathIds(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]u16 {
+    const count = try decoder.readCount(1024);
+    const values = try allocator.alloc(u16, count);
+    errdefer allocator.free(values);
+    for (values) |*value| value.* = try decoder.readU16();
+    return values;
+}
+
+fn decodeKeys(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![][]u8 {
+    const count = try decoder.readCount(65_536);
+    const keys = try allocator.alloc([]u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| allocator.free(key);
+        allocator.free(keys);
+    }
+    for (keys, 0..) |*key, index| {
+        key.* = try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024);
+        errdefer allocator.free(key.*);
+        if (!std.unicode.utf8ValidateSlice(key.*)) return error.InvalidUtf8;
+        if (index != 0 and
+            std.mem.order(u8, keys[index - 1], key.*) != .lt)
+        {
+            return error.CacheRuleKeysNotSorted;
+        }
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn decodeEnumScalars(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]EnumScalar {
+    const count = try decoder.readCount(65_536);
+    const values = try allocator.alloc(EnumScalar, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |*value| value.deinit(allocator);
+        allocator.free(values);
+    }
+    for (values) |*value| {
+        value.* = switch (try decoder.readByte()) {
+            0 => .{ .string = try decoder.readBytesAlloc(
+                allocator,
+                4 * 1024 * 1024,
+            ) },
+            1 => .{ .integer = try decoder.readI64() },
+            2 => blk: {
+                const number = try decoder.readF64();
+                if (!std.math.isFinite(number)) {
+                    return error.CacheNumberInvalid;
+                }
+                break :blk .{ .float = number };
+            },
+            3 => .{ .boolean = try decoder.readBool() },
+            4 => .null,
+            else => return error.CacheEnumScalarInvalid,
+        };
+        initialized += 1;
+    }
+    return values;
+}
+
+fn validateCachedRule(
+    rule: CompiledRule,
+    input_count: usize,
+    pointer_count: usize,
+) !void {
+    if (rule.input_index >= input_count or
+        (rule.pointer_id != null and rule.pointer_id.? >= pointer_count) or
+        (rule.other_input_index != null and
+            rule.other_input_index.? >= input_count) or
+        (rule.other_pointer_id != null and
+            rule.other_pointer_id.? >= pointer_count))
+    {
+        return error.CacheRuleIndexInvalid;
+    }
+    for (rule.path_ids) |path_id| {
+        if (path_id >= pointer_count) return error.CacheRuleIndexInvalid;
+    }
+    if (rule.min_count != null and rule.max_count != null and
+        rule.min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+    if (rule.min_number != null and rule.max_number != null and
+        rule.min_number.? > rule.max_number.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+    switch (rule.operator) {
+        .scalar_type => if (rule.scalar_kind == null) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .bounded_string,
+        .bounded_array,
+        .bounded_object,
+        => if (rule.min_count == null and rule.max_count == null) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .bounded_number => if (rule.min_number == null and
+            rule.max_number == null)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .enum_value => if (rule.values.len == 0) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .set_equality,
+        .subset,
+        .superset,
+        .disjoint,
+        .field_equal,
+        .field_not_equal,
+        .cross_input_equal,
+        => if (rule.other_input_index == null or
+            rule.pointer_id == null or
+            rule.other_pointer_id == null)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .exactly_one, .at_least_one => if (rule.path_ids.len == 0) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        else => {},
+    }
+}
+
+fn encodeEnumScalar(
+    encoder: *definition_core.cache.Encoder,
+    value: EnumScalar,
+) !void {
+    switch (value) {
+        .string => |text| {
+            try encoder.writeByte(0);
+            try encoder.writeBytes(text);
+        },
+        .integer => |number| {
+            try encoder.writeByte(1);
+            try encoder.writeI64(number);
+        },
+        .float => |number| {
+            try encoder.writeByte(2);
+            try encoder.writeF64(number);
+        },
+        .boolean => |flag| {
+            try encoder.writeByte(3);
+            try encoder.writeBool(flag);
+        },
+        .null => try encoder.writeByte(4),
+    }
+}
+
+fn writeOptionalByte(
+    encoder: *definition_core.cache.Encoder,
+    value: ?u8,
+) !void {
+    try encoder.writeBool(value != null);
+    if (value) |number| try encoder.writeByte(number);
+}
+
+fn readOptionalByte(
+    decoder: *definition_core.cache.Decoder,
+) !?u8 {
+    if (!try decoder.readBool()) return null;
+    return @as(?u8, try decoder.readByte());
+}
+
+fn writeOptionalU16(
+    encoder: *definition_core.cache.Encoder,
+    value: ?u16,
+) !void {
+    try encoder.writeBool(value != null);
+    if (value) |number| try encoder.writeU16(number);
+}
+
+fn readOptionalU16(
+    decoder: *definition_core.cache.Decoder,
+) !?u16 {
+    if (!try decoder.readBool()) return null;
+    return @as(?u16, try decoder.readU16());
+}
+
+fn writeOptionalUsize(
+    encoder: *definition_core.cache.Encoder,
+    value: ?usize,
+) !void {
+    try encoder.writeBool(value != null);
+    if (value) |number| try encoder.writeUsize(number);
+}
+
+fn readOptionalUsize(
+    decoder: *definition_core.cache.Decoder,
+) !?usize {
+    if (!try decoder.readBool()) return null;
+    return @as(?usize, try decoder.readUsize());
+}
+
+fn writeOptionalF64(
+    encoder: *definition_core.cache.Encoder,
+    value: ?f64,
+) !void {
+    try encoder.writeBool(value != null);
+    if (value) |number| try encoder.writeF64(number);
+}
+
+fn readOptionalF64(
+    decoder: *definition_core.cache.Decoder,
+) !?f64 {
+    if (!try decoder.readBool()) return null;
+    const value = try decoder.readF64();
+    if (!std.math.isFinite(value)) return error.CacheNumberInvalid;
+    return @as(?f64, value);
+}
+
 const LoadedInput = struct {
     bytes: ?[]const u8 = null,
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
@@ -1019,11 +1451,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     defer definition_plan.deinit(std.testing.allocator);
     var plan = try compile(std.testing.allocator, &definition_plan);
     defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        8 * 1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(plan.inputs.len, cached.inputs.len);
+    try std.testing.expectEqual(plan.pointers.len, cached.pointers.len);
+    try std.testing.expectEqual(plan.rules.len, cached.rules.len);
 
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
-        &plan,
+        &cached,
         &.{.{
             .name = "record",
             .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\"}",

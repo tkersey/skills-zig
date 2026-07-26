@@ -143,6 +143,12 @@ pub const Encoder = struct {
         try self.writeFixed(&bytes);
     }
 
+    pub fn writeU128(self: *Encoder, value: u128) !void {
+        var bytes: [16]u8 = undefined;
+        std.mem.writeInt(u128, &bytes, value, .big);
+        try self.writeFixed(&bytes);
+    }
+
     pub fn writeI64(self: *Encoder, value: i64) !void {
         try self.writeU64(@bitCast(value));
     }
@@ -234,6 +240,12 @@ pub const Decoder = struct {
         const bytes = try self.readFixed(8);
         const fixed: *const [8]u8 = @ptrCast(bytes.ptr);
         return std.mem.readInt(u64, fixed, .big);
+    }
+
+    pub fn readU128(self: *Decoder) !u128 {
+        const bytes = try self.readFixed(16);
+        const fixed: *const [16]u8 = @ptrCast(bytes.ptr);
+        return std.mem.readInt(u128, fixed, .big);
     }
 
     pub fn readI64(self: *Decoder) !i64 {

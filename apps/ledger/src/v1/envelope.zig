@@ -10,6 +10,7 @@ const doctor = @import("doctor.zig");
 pub fn writeValidationJson(
     writer: *std.Io.Writer,
     result: *const validation.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-validation-result/v1\",\"definition\":{\"id\":",
@@ -45,14 +46,17 @@ pub fn writeValidationJson(
         try definition_core.canonical_json.writeCanonicalString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
+    try writer.writeAll("],\"claims\":[],\"compile_stats\":");
+    try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
-        "],\"claims\":[],\"authority_granted\":false,\"storage_mutated\":false}",
+        ",\"authority_granted\":false,\"storage_mutated\":false}",
     );
 }
 
 pub fn writeDefinitionDescriptionJson(
     writer: *std.Io.Writer,
     plan: *const definition.Plan,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-definition-description/v1\",\"definition\":{\"id\":",
@@ -113,7 +117,7 @@ pub fn writeDefinitionDescriptionJson(
         try definition_core.canonical_json.writeCanonicalString(writer, projection.name);
     }
     try writer.print(
-        "],\"bounds\":{{\"max_input_bytes\":{d},\"max_store_bytes\":{d},\"max_records\":{d},\"max_output_bytes\":{d},\"max_diagnostics\":{d},\"max_reducer_states\":{d}}},\"passive\":true,\"authority_granted\":false}}",
+        "],\"bounds\":{{\"max_input_bytes\":{d},\"max_store_bytes\":{d},\"max_records\":{d},\"max_output_bytes\":{d},\"max_diagnostics\":{d},\"max_reducer_states\":{d}}},\"compile_stats\":",
         .{
             plan.bounds.max_input_bytes,
             plan.bounds.max_store_bytes,
@@ -123,11 +127,16 @@ pub fn writeDefinitionDescriptionJson(
             plan.bounds.max_reducer_states,
         },
     );
+    try writeCompileStatsJson(writer, compile_stats);
+    try writer.writeAll(
+        ",\"passive\":true,\"authority_granted\":false}",
+    );
 }
 
 pub fn writeMaterializationJson(
     writer: *std.Io.Writer,
     result: *const materialization.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-materialization-result/v1\",\"definition\":{\"id\":",
@@ -162,8 +171,10 @@ pub fn writeMaterializationJson(
         try definition_core.canonical_json.writeCanonicalString(writer, diagnostic.message);
         try writer.writeByte('}');
     }
+    try writer.writeAll("],\"claims\":[],\"compile_stats\":");
+    try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
-        "],\"claims\":[],\"authority_granted\":false,\"storage_mutated\":false}",
+        ",\"authority_granted\":false,\"storage_mutated\":false}",
     );
 }
 
@@ -178,6 +189,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 pub fn writeTransactionJson(
     writer: *std.Io.Writer,
     result: *const transaction.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-transaction-result/v1\",\"definition\":{\"id\":",
@@ -222,8 +234,10 @@ pub fn writeTransactionJson(
     try writeOptionalString(writer, result.returned_content);
     try writer.writeAll(",\"valid\":");
     try writer.writeAll(if (result.validation_result.valid) "true" else "false");
+    try writer.writeAll(",\"structural_claims\":[],\"compile_stats\":");
+    try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
-        ",\"structural_claims\":[],\"semantic_authority_granted\":false,\"storage_mutated\":",
+        ",\"semantic_authority_granted\":false,\"storage_mutated\":",
     );
     try writer.writeAll(if (result.storage_mutated) "true" else "false");
     try writer.writeByte('}');
@@ -248,6 +262,7 @@ pub fn writeTransactionErrorJson(
 pub fn writeProjectionJson(
     writer: *std.Io.Writer,
     result: *const projection_runtime.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-projection-result/v1\",\"definition\":{\"id\":",
@@ -281,13 +296,15 @@ pub fn writeProjectionJson(
     try writer.writeAll(",\"data\":");
     try writer.writeAll(result.payload);
     try writer.print(
-        ",\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"limitations\":[",
+        ",\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"compile_stats\":",
         .{
             result.stats.records_scanned,
             result.stats.records_matched,
             result.stats.records_emitted,
         },
     );
+    try writeCompileStatsJson(writer, compile_stats);
+    try writer.writeAll(",\"limitations\":[");
     for (result.limitations, 0..) |limitation, index| {
         if (index != 0) try writer.writeByte(',');
         try definition_core.canonical_json.writeCanonicalString(
@@ -303,6 +320,7 @@ pub fn writeProjectionJson(
 pub fn writeDoctorJson(
     writer: *std.Io.Writer,
     result: *const doctor.Result,
+    compile_stats: definition_core.result.CompileStats,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-doctor-result/v1\",\"definition\":{\"id\":",
@@ -349,8 +367,25 @@ pub fn writeDoctorJson(
         try writeOptionalString(writer, slot.error_code);
         try writer.writeByte('}');
     }
+    try writer.writeAll("],\"compile_stats\":");
+    try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
-        "],\"authority_granted\":false,\"storage_mutated\":false}",
+        ",\"authority_granted\":false,\"storage_mutated\":false}",
+    );
+}
+
+pub fn writeCompileStatsJson(
+    writer: *std.Io.Writer,
+    stats: definition_core.result.CompileStats,
+) !void {
+    try writer.print(
+        "{{\"cache_hit\":{s},\"compile_ns\":{d},\"closure_files\":{d},\"closure_bytes\":{d}}}",
+        .{
+            if (stats.cache_hit) "true" else "false",
+            stats.compile_ns,
+            stats.closure_files,
+            stats.closure_bytes,
+        },
     );
 }
 
@@ -382,7 +417,12 @@ test "validation envelope preserves definition identity and denies authority" {
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeValidationJson(&output.writer, &result);
+    try writeValidationJson(&output.writer, &result, .{
+        .cache_hit = true,
+        .compile_ns = 17,
+        .closure_files = 2,
+        .closure_bytes = 256,
+    });
     const bytes = output.written();
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"valid\":false") != null);
     try std.testing.expect(
@@ -390,6 +430,9 @@ test "validation envelope preserves definition identity and denies authority" {
     );
     try std.testing.expect(
         std.mem.indexOf(u8, bytes, "\"storage_mutated\":false") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, bytes, "\"cache_hit\":true") != null,
     );
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -442,7 +485,7 @@ test "materialization envelope distinguishes canonical bytes from authority" {
     defer result.deinit(std.testing.allocator);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try writeMaterializationJson(&output.writer, &result);
+    try writeMaterializationJson(&output.writer, &result, .{});
     try std.testing.expect(
         std.mem.indexOf(u8, output.written(), "\"storage_mutated\":false") != null,
     );

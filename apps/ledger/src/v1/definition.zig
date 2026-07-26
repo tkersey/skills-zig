@@ -461,9 +461,13 @@ pub fn compile(
     errdefer deinitPointers(allocator, pointers);
     const rules = try compiler.rules.toOwnedSlice(allocator);
     errdefer deinitRules(allocator, rules);
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    const owned_owner = try allocator.dupe(u8, owner);
+    errdefer allocator.free(owned_owner);
     return .{
-        .id = try allocator.dupe(u8, id),
-        .owner = try allocator.dupe(u8, owner),
+        .id = owned_id,
+        .owner = owned_owner,
         .closure_digest = closure.digest,
         .operator_mask = operator_mask,
         .parameter_declarations = parameter_declarations,
@@ -478,6 +482,288 @@ pub fn compile(
         .identity_json = identity_json,
         .storage_json = storage_json,
     };
+}
+
+pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !void {
+    try encoder.writeU16(1);
+    try encoder.writeBytes(plan.id);
+    try encoder.writeBytes(plan.owner);
+    try encoder.writeFixed(&plan.closure_digest);
+    try encoder.writeU128(plan.operator_mask);
+    try definition_core.parameters.encodeCache(
+        &plan.parameter_declarations,
+        encoder,
+    );
+    try encoder.writeCount(plan.inputs.len);
+    for (plan.inputs) |input| {
+        try encoder.writeBytes(input.name);
+        try encoder.writeEnum(input.codec);
+        try encoder.writeBool(input.required);
+        try encoder.writeUsize(input.max_bytes);
+    }
+    try encoder.writeEnum(plan.storage_kind);
+    try encoder.writeCount(plan.pointers.len);
+    for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
+    try encoder.writeCount(plan.rules.len);
+    for (plan.rules) |rule| {
+        try encoder.writeEnum(rule.operator);
+        try encoder.writeBool(rule.pointer_id != null);
+        if (rule.pointer_id) |pointer_id| try encoder.writeU16(pointer_id);
+        try encoder.writeBytes(rule.canonical_config);
+    }
+    try encodeNamedPlans(plan.operations, encoder);
+    try encodeNamedPlans(plan.projections, encoder);
+    try encoder.writeUsize(plan.bounds.max_input_bytes);
+    try encoder.writeUsize(plan.bounds.max_store_bytes);
+    try encoder.writeUsize(plan.bounds.max_records);
+    try encoder.writeUsize(plan.bounds.max_output_bytes);
+    try encoder.writeUsize(plan.bounds.max_diagnostics);
+    try encoder.writeUsize(plan.bounds.max_reducer_states);
+    try encoder.writeBytes(plan.canonicalization_json);
+    try encoder.writeBytes(plan.identity_json);
+    try encoder.writeBytes(plan.storage_json);
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) return error.LedgerPlanCacheVersionMismatch;
+    const id = try decoder.readBytesAlloc(allocator, 256);
+    errdefer allocator.free(id);
+    try definition_core.json.safeIdentifier(id, 256);
+    const owner = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(owner);
+    try definition_core.json.safeIdentifier(owner, 128);
+    var closure_digest: [71]u8 = undefined;
+    @memcpy(&closure_digest, try decoder.readFixed(closure_digest.len));
+    try definition_core.json.digest(&closure_digest);
+    const operator_mask = try decoder.readU128();
+    var known_operator_mask: u128 = 0;
+    inline for (@typeInfo(Operator).@"enum".fields) |field| {
+        known_operator_mask |= operatorBit(@enumFromInt(field.value));
+    }
+    if ((operator_mask & ~known_operator_mask) != 0) {
+        return error.CacheArtifactOperatorInvalid;
+    }
+    var parameter_declarations = try definition_core.parameters.decodeCache(
+        allocator,
+        decoder,
+    );
+    errdefer parameter_declarations.deinit(allocator);
+    const inputs = try decodeInputs(allocator, decoder);
+    errdefer deinitInputs(allocator, inputs);
+    const storage_kind = try decoder.readEnum(StorageKind);
+    const pointers = try decodePointers(allocator, decoder);
+    errdefer deinitPointers(allocator, pointers);
+    const rules = try decodeRules(
+        allocator,
+        decoder,
+        operator_mask,
+        pointers.len,
+    );
+    errdefer deinitRules(allocator, rules);
+    const operations = try decodeNamedPlans(allocator, decoder, rules.len);
+    errdefer deinitNamedPlans(allocator, operations);
+    const projections = try decodeNamedPlans(allocator, decoder, rules.len);
+    errdefer deinitNamedPlans(allocator, projections);
+    const bounds: Bounds = .{
+        .max_input_bytes = try decoder.readUsize(),
+        .max_store_bytes = try decoder.readUsize(),
+        .max_records = try decoder.readUsize(),
+        .max_output_bytes = try decoder.readUsize(),
+        .max_diagnostics = try decoder.readUsize(),
+        .max_reducer_states = try decoder.readUsize(),
+    };
+    try validateBounds(bounds);
+    const canonicalization_json = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(canonicalization_json);
+    const identity_json = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(identity_json);
+    const storage_json = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(storage_json);
+    return .{
+        .id = id,
+        .owner = owner,
+        .closure_digest = closure_digest,
+        .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
+        .inputs = inputs,
+        .storage_kind = storage_kind,
+        .pointers = pointers,
+        .rules = rules,
+        .operations = operations,
+        .projections = projections,
+        .bounds = bounds,
+        .canonicalization_json = canonicalization_json,
+        .identity_json = identity_json,
+        .storage_json = storage_json,
+    };
+}
+
+fn encodeNamedPlans(
+    plans: []const NamedPlan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(plans.len);
+    for (plans) |plan| {
+        try encoder.writeBytes(plan.name);
+        try encoder.writeUsize(plan.rule_start);
+        try encoder.writeUsize(plan.rule_count);
+        try encoder.writeBytes(plan.canonical_config);
+    }
+}
+
+fn decodeInputs(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Input {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidInputCount;
+    const inputs = try allocator.alloc(Input, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (inputs[0..initialized]) |*input| input.deinit(allocator);
+        allocator.free(inputs);
+    }
+    for (inputs, 0..) |*input, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, inputs[index - 1].name, name) != .lt)
+        {
+            return error.CacheInputsNotSorted;
+        }
+        const codec = try decoder.readEnum(Codec);
+        const required = try decoder.readBool();
+        const max_bytes = try decoder.readUsize();
+        if (max_bytes == 0 or max_bytes > 256 * 1024 * 1024) {
+            return error.InputBoundsExceeded;
+        }
+        input.* = .{
+            .name = name,
+            .codec = codec,
+            .required = required,
+            .max_bytes = max_bytes,
+        };
+        initialized += 1;
+    }
+    return inputs;
+}
+
+fn decodePointers(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![][]u8 {
+    const count = try decoder.readCount(65_535);
+    const pointers = try allocator.alloc([]u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (pointers[0..initialized]) |pointer| allocator.free(pointer);
+        allocator.free(pointers);
+    }
+    for (pointers) |*pointer| {
+        pointer.* = try decoder.readBytesAlloc(allocator, 1024);
+        errdefer allocator.free(pointer.*);
+        try validateJsonPointer(pointer.*);
+        initialized += 1;
+    }
+    return pointers;
+}
+
+fn decodeRules(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    operator_mask: u128,
+    pointer_count: usize,
+) ![]Rule {
+    const count = try decoder.readCount(65_535);
+    const rules = try allocator.alloc(Rule, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (rules[0..initialized]) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    for (rules) |*rule| {
+        const operator = try decoder.readEnum(Operator);
+        if ((operator_mask & operatorBit(operator)) == 0) {
+            return error.UndeclaredArtifactOperator;
+        }
+        const pointer_id = if (try decoder.readBool())
+            try decoder.readU16()
+        else
+            null;
+        if (pointer_id != null and pointer_id.? >= pointer_count) {
+            return error.CachePointerIndexInvalid;
+        }
+        const canonical_config = try decoder.readBytesAlloc(
+            allocator,
+            4 * 1024 * 1024,
+        );
+        errdefer allocator.free(canonical_config);
+        rule.* = .{
+            .operator = operator,
+            .pointer_id = pointer_id,
+            .canonical_config = canonical_config,
+        };
+        initialized += 1;
+    }
+    return rules;
+}
+
+fn decodeNamedPlans(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    rule_count: usize,
+) ![]NamedPlan {
+    const count = try decoder.readCount(128);
+    const plans = try allocator.alloc(NamedPlan, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (plans[0..initialized]) |*plan| plan.deinit(allocator);
+        allocator.free(plans);
+    }
+    for (plans, 0..) |*plan, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, plans[index - 1].name, name) != .lt)
+        {
+            return error.CacheNamedPlansNotSorted;
+        }
+        const rule_start = try decoder.readUsize();
+        const plan_rule_count = try decoder.readUsize();
+        const rule_end = std.math.add(
+            usize,
+            rule_start,
+            plan_rule_count,
+        ) catch return error.CacheRuleRangeInvalid;
+        if (rule_end > rule_count) return error.CacheRuleRangeInvalid;
+        const canonical_config = try decoder.readBytesAlloc(
+            allocator,
+            4 * 1024 * 1024,
+        );
+        errdefer allocator.free(canonical_config);
+        plan.* = .{
+            .name = name,
+            .rule_start = rule_start,
+            .rule_count = plan_rule_count,
+            .canonical_config = canonical_config,
+        };
+        initialized += 1;
+    }
+    return plans;
 }
 
 fn parseRequires(object: std.json.ObjectMap) !u128 {
@@ -525,7 +811,7 @@ fn parseInputs(
         if (max_bytes == 0 or max_bytes > 256 * 1024 * 1024) {
             return error.InputBoundsExceeded;
         }
-        try out.append(allocator, .{
+        var input: Input = .{
             .name = try allocator.dupe(u8, entry.key_ptr.*),
             .codec = try Codec.parse(try definition_core.json.requiredString(declaration, "codec")),
             .required = if (declaration.get("required")) |raw|
@@ -533,7 +819,9 @@ fn parseInputs(
             else
                 true,
             .max_bytes = max_bytes,
-        });
+        };
+        errdefer input.deinit(allocator);
+        try out.append(allocator, input);
     }
     std.mem.sort(Input, out.items, {}, struct {
         fn lessThan(_: void, left: Input, right: Input) bool {
@@ -559,17 +847,17 @@ fn parseNamedPlans(
         try definition_core.json.safeIdentifier(entry.key_ptr.*, 128);
         const start = compiler.rules.items.len;
         try compiler.compileValue(entry.value_ptr.*, 0);
-        const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
-            allocator,
-            entry.value_ptr.*,
-        );
-        errdefer allocator.free(canonical);
-        try out.append(allocator, .{
+        var plan: NamedPlan = .{
             .name = try allocator.dupe(u8, entry.key_ptr.*),
             .rule_start = start,
             .rule_count = compiler.rules.items.len - start,
-            .canonical_config = canonical,
-        });
+            .canonical_config = try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                entry.value_ptr.*,
+            ),
+        };
+        errdefer plan.deinit(allocator);
+        try out.append(allocator, plan);
     }
     std.mem.sort(NamedPlan, out.items, {}, struct {
         fn lessThan(_: void, left: NamedPlan, right: NamedPlan) bool {
@@ -616,6 +904,11 @@ fn parseBounds(object: std.json.ObjectMap) !Bounds {
             try definition_core.json.field(object, "max_reducer_states"),
         ),
     };
+    try validateBounds(bounds);
+    return bounds;
+}
+
+fn validateBounds(bounds: Bounds) !void {
     if (bounds.max_input_bytes == 0 or bounds.max_input_bytes > 256 * 1024 * 1024 or
         bounds.max_store_bytes == 0 or bounds.max_store_bytes > 4 * 1024 * 1024 * 1024 or
         bounds.max_records == 0 or bounds.max_records > 10_000_000 or
@@ -625,7 +918,6 @@ fn parseBounds(object: std.json.ObjectMap) !Bounds {
     {
         return error.ArtifactBoundsExceeded;
     }
-    return bounds;
 }
 
 fn rejectExecutableKeys(object: std.json.ObjectMap) !void {
@@ -755,6 +1047,30 @@ test "artifact definition compiles structural rules and effect plans" {
     try std.testing.expectEqual(@as(usize, 2), plan.pointers.len);
     try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        8 * 1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqualStrings(plan.id, cached.id);
+    try std.testing.expectEqualStrings(plan.owner, cached.owner);
+    try std.testing.expectEqualSlices(
+        u8,
+        &plan.closure_digest,
+        &cached.closure_digest,
+    );
+    try std.testing.expectEqual(plan.operator_mask, cached.operator_mask);
+    try std.testing.expectEqual(plan.rules.len, cached.rules.len);
+    try std.testing.expectEqual(plan.operations.len, cached.operations.len);
+    try std.testing.expectEqual(plan.projections.len, cached.projections.len);
 }
 
 test "artifact definition rejects executable hooks and undeclared operators" {

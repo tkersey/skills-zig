@@ -150,6 +150,86 @@ pub fn compile(
     };
 }
 
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeByte(plan.input_index);
+    try encoder.writeEnum(plan.codec);
+    try encoder.writeBool(plan.normalize_line_endings);
+    try encoder.writeEnum(plan.trailing_newline);
+    switch (plan.identity) {
+        .none => try encoder.writeByte(0),
+        .content_address => |config| {
+            try encoder.writeByte(1);
+            try encoder.writeOptionalBytes(config.exclude_key);
+            try encoder.writeOptionalBytes(config.claimed_key);
+        },
+    }
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.LedgerMaterializationCacheVersionMismatch;
+    }
+    const input_index = try decoder.readByte();
+    const codec = try decoder.readEnum(definition.Codec);
+    const normalize_line_endings = try decoder.readBool();
+    const trailing_newline = try decoder.readEnum(TrailingNewline);
+    var identity: Identity = switch (try decoder.readByte()) {
+        0 => .none,
+        1 => .{ .content_address = .{
+            .exclude_key = try decoder.readOptionalBytesAlloc(
+                allocator,
+                4 * 1024 * 1024,
+            ),
+            .claimed_key = null,
+        } },
+        else => return error.CacheIdentityKindInvalid,
+    };
+    errdefer identity.deinit(allocator);
+    if (identity == .content_address) {
+        identity.content_address.claimed_key =
+            try decoder.readOptionalBytesAlloc(
+                allocator,
+                4 * 1024 * 1024,
+            );
+        if (identity.content_address.exclude_key) |key| {
+            if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidUtf8;
+        }
+        if (identity.content_address.claimed_key) |key| {
+            if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidUtf8;
+        }
+    }
+    if (codec != .text and
+        (normalize_line_endings or trailing_newline != .preserve))
+    {
+        return error.CacheCanonicalizationModeInvalid;
+    }
+    return .{
+        .input_index = input_index,
+        .codec = codec,
+        .normalize_line_endings = normalize_line_endings,
+        .trailing_newline = trailing_newline,
+        .identity = identity,
+    };
+}
+
+pub fn validateCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (plan.input_index >= definition_plan.inputs.len or
+        plan.codec != definition_plan.inputs[plan.input_index].codec)
+    {
+        return error.CacheMaterializationPlanMismatch;
+    }
+}
+
 pub fn materialize(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -424,11 +504,23 @@ test "materialization reuses validation parse and derives content address" {
     defer validation_plan.deinit(std.testing.allocator);
     var plan = try compile(std.testing.allocator, &definition_plan);
     defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
     var result = try materialize(
         std.testing.allocator,
         &definition_plan,
         &validation_plan,
-        &plan,
+        &cached,
         &.{.{
             .name = "record",
             .bytes = "{\"value\":1,\"record_id\":\"pending\"}",

@@ -1,4 +1,5 @@
 const std = @import("std");
+const cache = @import("cache.zig");
 const canonical_json = @import("canonical_json.zig");
 const json = @import("json.zig");
 const scalar = @import("scalar.zig");
@@ -169,6 +170,100 @@ pub fn bind(
     };
 }
 
+pub fn encodeCache(
+    declarations: *const Declarations,
+    encoder: *cache.Encoder,
+) !void {
+    try encoder.writeCount(declarations.items.len);
+    for (declarations.items) |declaration| {
+        try encoder.writeBytes(declaration.name);
+        try encoder.writeEnum(declaration.kind);
+        try encoder.writeBool(declaration.required);
+        try encoder.writeBool(declaration.default_value != null);
+        if (declaration.default_value) |value| {
+            if (value.kind() != declaration.kind) {
+                return error.CacheParameterKindMismatch;
+            }
+            try encodeScalar(value, encoder);
+        }
+    }
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *cache.Decoder,
+) !Declarations {
+    const count = try decoder.readCount(65_535);
+    const items = try allocator.alloc(Declaration, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    for (items, 0..) |*item, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, items[index - 1].name, name) != .lt)
+        {
+            return error.CacheParametersNotSorted;
+        }
+        const kind = try decoder.readEnum(scalar.Kind);
+        const required = try decoder.readBool();
+        const has_default = try decoder.readBool();
+        if (required and has_default) return error.RequiredParameterHasDefault;
+        const default_value = if (has_default)
+            try decodeScalar(allocator, decoder, kind)
+        else
+            null;
+        errdefer if (default_value) |*value| value.deinit(allocator);
+        item.* = .{
+            .name = name,
+            .kind = kind,
+            .required = required,
+            .default_value = default_value,
+        };
+        initialized += 1;
+    }
+    return .{
+        .items = items,
+        .shape_digest = digestDeclarations(items),
+    };
+}
+
+fn encodeScalar(value: scalar.Value, encoder: *cache.Encoder) !void {
+    switch (value) {
+        .string,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .relative_path,
+        => |text| try encoder.writeBytes(text),
+        .integer => |number| try encoder.writeI64(number),
+        .boolean => |flag| try encoder.writeBool(flag),
+    }
+}
+
+fn decodeScalar(
+    allocator: std.mem.Allocator,
+    decoder: *cache.Decoder,
+    kind: scalar.Kind,
+) !scalar.Value {
+    return switch (kind) {
+        .integer => .{ .integer = try decoder.readI64() },
+        .boolean => .{ .boolean = try decoder.readBool() },
+        else => blk: {
+            const text = try decoder.readBytesAlloc(
+                allocator,
+                4 * 1024 * 1024,
+            );
+            defer allocator.free(text);
+            break :blk try scalar.parseAlloc(allocator, kind, text);
+        },
+    };
+}
+
 fn cloneValue(allocator: std.mem.Allocator, value: scalar.Value) !scalar.Value {
     return switch (value) {
         .string => |text| .{ .string = try allocator.dupe(u8, text) },
@@ -257,5 +352,37 @@ test "parameter declarations and values compile to stable typed digests" {
         bind(std.testing.allocator, &declarations, &.{
             .{ .name = "unknown", .raw_value = "x" },
         }),
+    );
+}
+
+test "parameter declarations round trip through bounded cache plans" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"limit":{"type":"integer","required":false,"default":10},"name":{"type":"safe_identifier","required":true}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    var declarations = try compile(std.testing.allocator, parsed.value);
+    defer declarations.deinit(std.testing.allocator);
+    var encoder = cache.Encoder.init(std.testing.allocator, 4096);
+    defer encoder.deinit();
+    try encodeCache(&declarations, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = cache.Decoder.init(payload);
+    var decoded = try decodeCache(std.testing.allocator, &decoder);
+    defer decoded.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(declarations.items.len, decoded.items.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &declarations.shape_digest,
+        &decoded.shape_digest,
+    );
+    try std.testing.expectEqualStrings(
+        declarations.items[1].name,
+        decoded.items[1].name,
     );
 }

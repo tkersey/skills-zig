@@ -327,7 +327,7 @@ pub fn fromCanonicalFiles(
 pub fn verifySourceManifest(
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
-    files: []const ClosureFile,
+    files: anytype,
     limits: Limits,
 ) !usize {
     try limits.validate();
@@ -399,6 +399,81 @@ pub fn verifySourceManifest(
         }
     }
     return total_bytes;
+}
+
+pub fn validateCached(
+    allocator: std.mem.Allocator,
+    cached: *const Closure,
+    entry_path: []const u8,
+    limits: Limits,
+) !void {
+    try limits.validate();
+    if (cached.files.len == 0 or cached.files.len > limits.max_files) {
+        return error.TooManyDefinitionFiles;
+    }
+    const normalized_entry = try normalizeRelativeAlloc(
+        allocator,
+        "",
+        entry_path,
+    );
+    defer allocator.free(normalized_entry);
+    if (!std.mem.eql(u8, normalized_entry, entry_path)) {
+        return error.InvalidDefinitionPath;
+    }
+
+    var total_source_bytes: usize = 0;
+    var total_canonical_bytes: usize = 0;
+    for (cached.files, 0..) |file, index| {
+        const normalized = try normalizeRelativeAlloc(
+            allocator,
+            "",
+            file.path,
+        );
+        defer allocator.free(normalized);
+        if (!std.mem.eql(u8, normalized, file.path)) {
+            return error.InvalidDefinitionPath;
+        }
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                cached.files[index - 1].path,
+                file.path,
+            ) != .lt)
+        {
+            return error.DefinitionManifestNotSorted;
+        }
+        if (file.source_bytes > limits.max_file_bytes or
+            file.canonical_json.len > limits.max_file_bytes)
+        {
+            return error.DefinitionFileTooLarge;
+        }
+        if (!std.unicode.utf8ValidateSlice(file.canonical_json)) {
+            return error.InvalidDefinitionUtf8;
+        }
+        total_source_bytes = std.math.add(
+            usize,
+            total_source_bytes,
+            file.source_bytes,
+        ) catch return error.DefinitionClosureTooLarge;
+        total_canonical_bytes = std.math.add(
+            usize,
+            total_canonical_bytes,
+            file.canonical_json.len,
+        ) catch return error.DefinitionClosureTooLarge;
+        if (total_source_bytes > limits.max_total_bytes or
+            total_canonical_bytes > limits.max_total_bytes)
+        {
+            return error.DefinitionClosureTooLarge;
+        }
+    }
+    if (cached.find(entry_path) == null) return error.EntryDefinitionMissing;
+    if (cached.total_definition_bytes != total_source_bytes) {
+        return error.DefinitionSourceSizeMismatch;
+    }
+    const digest = digestFiles(cached.files);
+    if (!std.mem.eql(u8, &digest, &cached.digest)) {
+        return error.DefinitionClosureDigestMismatch;
+    }
 }
 
 const CanonicalClosureValidator = struct {
