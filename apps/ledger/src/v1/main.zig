@@ -1,6 +1,7 @@
 const std = @import("std");
 const app_meta = @import("app_meta");
 const definition_core = @import("definition_core");
+const durable_store = @import("durable_store");
 const ledger = @import("ledger_v1_core");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
@@ -52,6 +53,17 @@ const CommonArgs = struct {
     }
 };
 
+const TransactionArgs = struct {
+    common: CommonArgs,
+    operation: []const u8,
+    repo_path: []const u8,
+
+    fn deinit(self: *TransactionArgs, allocator: std.mem.Allocator) void {
+        self.common.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const DefinitionContext = struct {
     closure: definition_core.Closure,
     plan: ledger.definition.Plan,
@@ -77,6 +89,7 @@ const OwnedDocument = struct {
 pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     defer runtime_io = null;
+    ledger.transaction.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const code = runWithArgv(init.gpa, argv) catch |err| blk: {
         emitCommandError(err) catch |write_err| {
@@ -120,13 +133,66 @@ pub fn runWithArgv(
     if (std.mem.eql(u8, argv[1], "materialize")) {
         return runMaterialize(allocator, argv[2..]);
     }
-    if (std.mem.eql(u8, argv[1], "transact") or
-        std.mem.eql(u8, argv[1], "project") or
+    if (std.mem.eql(u8, argv[1], "transact")) {
+        return runTransact(allocator, argv[2..]);
+    }
+    if (std.mem.eql(u8, argv[1], "project") or
         std.mem.eql(u8, argv[1], "doctor"))
     {
         return error.CommandKernelNotImplemented;
     }
     return error.UnknownCommand;
+}
+
+fn runTransact(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    var args = try parseTransactionArgs(allocator, argv);
+    defer args.deinit(allocator);
+    var context = try loadDefinition(allocator, args.common.definition_path);
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.plan.parameter_declarations,
+        args.common.parameter_specs,
+    );
+    defer bindings.deinit(allocator);
+    var validation_plan = try ledger.validation.compile(allocator, &context.plan);
+    defer validation_plan.deinit(allocator);
+    var storage_plan = try ledger.storage.compile(allocator, &context.plan);
+    defer storage_plan.deinit(allocator);
+    const owned_documents = try readDocuments(
+        allocator,
+        &validation_plan,
+        args.common.input_specs,
+    );
+    defer deinitDocuments(allocator, owned_documents);
+    const documents = try documentViews(allocator, owned_documents);
+    defer allocator.free(documents);
+    try durable_store.rejectSymlinkComponents(args.repo_path);
+    const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        args.repo_path,
+        allocator,
+    );
+    defer allocator.free(repo_root);
+    var result = ledger.transaction.transact(
+        allocator,
+        &context.plan,
+        &validation_plan,
+        &storage_plan,
+        args.operation,
+        repo_root,
+        documents,
+        &bindings,
+    ) catch |err| {
+        try emitTransactionError(err);
+        return 2;
+    };
+    defer result.deinit(allocator);
+    try emitTransaction(allocator, args.common.format, &result);
+    return if (result.validation_result.valid) 0 else 2;
 }
 
 fn runDefinitionCheck(
@@ -139,11 +205,11 @@ fn runDefinitionCheck(
     defer context.deinit(allocator);
     var validation_plan = try ledger.validation.compile(allocator, &context.plan);
     defer validation_plan.deinit(allocator);
-    var materialization_plan = try ledger.materialization.compile(
+    var storage_plan = try ledger.storage.compile(
         allocator,
         &context.plan,
     );
-    defer materialization_plan.deinit(allocator);
+    defer storage_plan.deinit(allocator);
     switch (args.format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
@@ -345,6 +411,80 @@ fn parseCommonArgs(
     };
 }
 
+fn parseTransactionArgs(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !TransactionArgs {
+    var definition_path: ?[]const u8 = null;
+    var operation: ?[]const u8 = null;
+    var repo_path: ?[]const u8 = null;
+    var format: Format = .json;
+    var inputs: std.ArrayList([]const u8) = .empty;
+    errdefer inputs.deinit(allocator);
+    var parameters: std.ArrayList([]const u8) = .empty;
+    errdefer parameters.deinit(allocator);
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const token = argv[index];
+        if (std.mem.eql(u8, token, "--definition")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (definition_path != null) return error.DuplicateDefinitionOption;
+            definition_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--operation")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (operation != null) return error.DuplicateOperationOption;
+            operation = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--repo")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (repo_path != null) return error.DuplicateRepositoryOption;
+            repo_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--format")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            format = try Format.parse(argv[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--input")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            try inputs.append(allocator, argv[index]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--param")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            try parameters.append(allocator, argv[index]);
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    const resolved_definition = definition_path orelse return error.MissingDefinition;
+    const resolved_operation = operation orelse return error.MissingOperation;
+    const resolved_repo = repo_path orelse return error.MissingRepository;
+    const input_specs = try inputs.toOwnedSlice(allocator);
+    errdefer allocator.free(input_specs);
+    const parameter_specs = try parameters.toOwnedSlice(allocator);
+    return .{
+        .common = .{
+            .definition_path = resolved_definition,
+            .format = format,
+            .input_specs = input_specs,
+            .parameter_specs = parameter_specs,
+        },
+        .operation = resolved_operation,
+        .repo_path = resolved_repo,
+    };
+}
+
 fn loadDefinition(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -515,6 +655,43 @@ fn emitMaterialization(
             }
         },
     }
+}
+
+fn emitTransaction(
+    allocator: std.mem.Allocator,
+    format: Format,
+    result: *const ledger.transaction.Result,
+) !void {
+    switch (format) {
+        .json => {
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            defer output.deinit();
+            try ledger.envelope.writeTransactionJson(&output.writer, result);
+            try output.writer.writeByte('\n');
+            try writeStdout(output.written());
+        },
+        .text => {
+            var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+            try stdout_writer.interface.print(
+                "{s} {s}@{s}; storage_mutated={s}\n",
+                .{
+                    result.operation,
+                    result.validation_result.definition_id,
+                    result.validation_result.definition_digest[0..],
+                    if (result.storage_mutated) "true" else "false",
+                },
+            );
+        },
+    }
+}
+
+fn emitTransactionError(err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try ledger.envelope.writeTransactionErrorJson(
+        &stdout_writer.interface,
+        err,
+    );
+    try stdout_writer.interface.writeByte('\n');
 }
 
 fn emitCapabilities(argv: []const []const u8) !u8 {

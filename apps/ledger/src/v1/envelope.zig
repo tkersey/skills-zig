@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
 const materialization = @import("materialization.zig");
+const transaction = @import("transaction.zig");
 
 pub fn writeValidationJson(
     writer: *std.Io.Writer,
@@ -172,6 +173,76 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     }
 }
 
+pub fn writeTransactionJson(
+    writer: *std.Io.Writer,
+    result: *const transaction.Result,
+) !void {
+    try writer.writeAll(
+        "{\"schema\":\"ledger-transaction-result/v1\",\"definition\":{\"id\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.validation_result.definition_id,
+    );
+    try writer.writeAll(",\"digest\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        result.validation_result.definition_digest[0..],
+    );
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(definition.abi);
+    try writer.writeAll("\"},\"operation\":");
+    try definition_core.canonical_json.writeCanonicalString(writer, result.operation);
+    try writer.writeAll(",\"transaction_id\":");
+    try writeOptionalString(writer, result.transaction_id);
+    try writer.writeAll(",\"effects\":[");
+    for (result.effects, 0..) |effect, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"slot\":");
+        try definition_core.canonical_json.writeCanonicalString(writer, effect.slot);
+        try writer.writeAll(",\"logical_ref\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            effect.logical_ref,
+        );
+        try writer.writeAll(",\"revision_before\":");
+        try writeOptionalString(writer, effect.revision_before);
+        try writer.writeAll(",\"revision_after\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            effect.revision_after,
+        );
+        try writer.writeAll(",\"result\":");
+        try definition_core.canonical_json.writeCanonicalString(writer, effect.result);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],\"returned_content\":");
+    try writeOptionalString(writer, result.returned_content);
+    try writer.writeAll(",\"valid\":");
+    try writer.writeAll(if (result.validation_result.valid) "true" else "false");
+    try writer.writeAll(
+        ",\"structural_claims\":[],\"semantic_authority_granted\":false,\"storage_mutated\":",
+    );
+    try writer.writeAll(if (result.storage_mutated) "true" else "false");
+    try writer.writeByte('}');
+}
+
+pub fn writeTransactionErrorJson(
+    writer: *std.Io.Writer,
+    err: anyerror,
+) !void {
+    try writer.writeAll(
+        "{\"schema\":\"ledger-transaction-error/v1\",\"code\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        @errorName(err),
+    );
+    try writer.writeAll(
+        ",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
+    );
+}
+
 test "validation envelope preserves definition identity and denies authority" {
     var diagnostics = definition_core.diagnostics.Collector.init(
         std.testing.allocator,
@@ -216,6 +287,19 @@ test "validation envelope preserves definition identity and denies authority" {
         .{ .duplicate_field_behavior = .@"error" },
     );
     defer parsed.deinit();
+}
+
+test "transaction errors do not claim a known mutation state" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeTransactionErrorJson(
+        &output.writer,
+        error.TransactionRecoveryRequired,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"ledger-transaction-error/v1\",\"code\":\"TransactionRecoveryRequired\",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
+        output.written(),
+    );
 }
 
 test "materialization envelope distinguishes canonical bytes from authority" {

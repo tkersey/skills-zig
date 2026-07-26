@@ -153,7 +153,7 @@ pub const Codec = enum {
     jsonl,
     text,
 
-    fn parse(text: []const u8) !Codec {
+    pub fn parse(text: []const u8) !Codec {
         inline for (@typeInfo(Codec).@"enum".fields) |field| {
             if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
         }

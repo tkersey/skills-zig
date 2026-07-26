@@ -359,6 +359,14 @@ pub const Execution = struct {
         return parsed.value;
     }
 
+    pub fn inputDigest(self: *const Execution, name: []const u8) ?[]const u8 {
+        const digests = self.input_digests orelse return null;
+        for (digests) |digest| {
+            if (std.mem.eql(u8, digest.name, name)) return digest.digest;
+        }
+        return null;
+    }
+
     pub fn addDiagnostic(
         self: *Execution,
         code: []const u8,

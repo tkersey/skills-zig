@@ -143,6 +143,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "durable_store", .module = durable_store },
         },
     });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
@@ -172,6 +173,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "ledger_v1_core", .module = ledger_v1_core },
         },
     });

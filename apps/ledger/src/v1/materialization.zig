@@ -225,21 +225,39 @@ fn canonicalize(
     execution: *const validation.Execution,
     plan: *const Plan,
 ) ![]u8 {
-    const bytes = execution.inputBytes(plan.input_index) orelse
-        return error.MaterializationInputMissing;
     return switch (plan.codec) {
-        .json => definition_core.canonical_json.canonicalJsonAlloc(
+        .json, .jsonl => canonicalizeInputAlloc(
             allocator,
-            execution.inputJson(plan.input_index) orelse
-                return error.MaterializationInputInvalid,
+            execution,
+            plan.input_index,
+            plan.codec,
         ),
-        .jsonl => canonicalizeJsonl(allocator, bytes),
         .text => canonicalizeText(
             allocator,
-            bytes,
+            execution.inputBytes(plan.input_index) orelse
+                return error.MaterializationInputMissing,
             plan.normalize_line_endings,
             plan.trailing_newline,
         ),
+    };
+}
+
+pub fn canonicalizeInputAlloc(
+    allocator: std.mem.Allocator,
+    execution: *const validation.Execution,
+    input_index: usize,
+    codec: definition.Codec,
+) ![]u8 {
+    const bytes = execution.inputBytes(input_index) orelse
+        return error.MaterializationInputMissing;
+    return switch (codec) {
+        .json => definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            execution.inputJson(input_index) orelse
+                return error.MaterializationInputInvalid,
+        ),
+        .jsonl => canonicalizeJsonl(allocator, bytes),
+        .text => allocator.dupe(u8, bytes),
     };
 }
 
