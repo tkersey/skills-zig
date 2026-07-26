@@ -88,7 +88,7 @@ pub fn validateSlot(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
 ) !Stats {
     var cache = PlanCache{
@@ -112,7 +112,7 @@ pub fn validateSlot(
 fn validateHistory(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
     snapshot: *const custody.SlotSnapshot,
 ) !usize {
     if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
@@ -161,7 +161,7 @@ const ResolvedEffect = struct {
 
 fn resolveEffect(
     cache: *PlanCache,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
     row: custody.BindingRow,
 ) !ResolvedEffect {
     const archived = try cache.get(row.definition_digest);
@@ -189,7 +189,7 @@ fn resolveEffect(
 fn validateEpoch(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
 ) !usize {
@@ -223,7 +223,7 @@ fn validateEpoch(
 fn validateDocumentEpoch(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
 ) !usize {
@@ -261,7 +261,7 @@ fn validateDocumentEpoch(
 fn validateEventEpoch(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
 ) !usize {
@@ -393,7 +393,7 @@ fn validateInput(
 fn findEffectForSlot(
     storage_plan: *const storage.Plan,
     operation: *const storage.Operation,
-    current_slot: storage.Slot,
+    current_slot: storage.ResolvedSlot,
 ) ?storage.Effect {
     for (operation.effects) |effect| {
         const historical_slot = storage_plan.slots[effect.slot_index];
@@ -401,9 +401,8 @@ fn findEffectForSlot(
             u8,
             historical_slot.name,
             current_slot.name,
-        ) and std.mem.eql(
-            u8,
-            historical_slot.relative_path,
+        ) and storage.pathTemplateMatches(
+            historical_slot,
             current_slot.relative_path,
         )) return effect;
     }

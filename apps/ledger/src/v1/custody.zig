@@ -106,7 +106,7 @@ pub fn readSlot(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     definition_id: []const u8,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
 ) !SlotSnapshot {
     if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
     const path = try std.fs.path.join(
@@ -444,7 +444,7 @@ pub fn appendBindingRowAlloc(
     allocator: std.mem.Allocator,
     before: []const u8,
     definition_plan: *const definition.Plan,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
     operation: []const u8,
     input_digest: []const u8,
     canonical_input_digest: []const u8,

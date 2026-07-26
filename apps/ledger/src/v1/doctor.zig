@@ -1,4 +1,5 @@
 const std = @import("std");
+const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
@@ -44,6 +45,7 @@ pub fn execute(
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
     repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
 ) !Result {
     if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
     const transactions_dir = try std.fs.path.join(
@@ -55,14 +57,23 @@ pub fn execute(
         allocator,
         transactions_dir,
     );
-    const slots = try allocator.alloc(SlotStatus, storage_plan.slots.len);
+    var resolved_storage = try storage.resolve(
+        allocator,
+        storage_plan,
+        parameters,
+    );
+    defer resolved_storage.deinit(allocator);
+    const slots = try allocator.alloc(
+        SlotStatus,
+        resolved_storage.slotSlice().len,
+    );
     var initialized: usize = 0;
     errdefer {
         for (slots[0..initialized]) |*slot| slot.deinit(allocator);
         allocator.free(slots);
     }
     var healthy = pending_transactions == 0;
-    for (storage_plan.slots, 0..) |slot, index| {
+    for (resolved_storage.slotSlice(), 0..) |slot, index| {
         slots[index] = inspectSlot(
             allocator,
             definition_plan.id,
@@ -85,7 +96,7 @@ fn inspectSlot(
     allocator: std.mem.Allocator,
     definition_id: []const u8,
     repo_root: []const u8,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
 ) !SlotStatus {
     var snapshot = try custody.readSlot(
         allocator,
@@ -118,7 +129,7 @@ fn inspectSlot(
 
 fn unhealthySlot(
     allocator: std.mem.Allocator,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
     err: anyerror,
 ) !SlotStatus {
     const name = try allocator.dupe(u8, slot.name);

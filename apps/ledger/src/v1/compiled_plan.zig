@@ -965,7 +965,7 @@ test "compiled plan cache releases every allocation on compile and decode failur
     try source_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object"]},"parameters":{"limit":{"type":"integer","required":false,"default":10}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","path-format"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     const source_root = try source_tmp.dir.realPathFileAlloc(

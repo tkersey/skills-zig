@@ -9,6 +9,7 @@
       "create-new",
       "idempotency-key",
       "limit",
+      "path-format",
       "select"
     ]
   },
@@ -16,6 +17,10 @@
     "request": {
       "type": "safe_identifier",
       "required": false
+    },
+    "stream": {
+      "type": "safe_identifier",
+      "required": true
     }
   },
   "inputs": {
@@ -32,7 +37,7 @@
     "kind": "event-log",
     "slots": {
       "events": {
-        "path": "example/snapshots.jsonl",
+        "path": "example/{stream}/snapshots.jsonl",
         "kind": "event-log",
         "codec": "jsonl",
         "max_bytes": 4096

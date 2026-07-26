@@ -225,8 +225,10 @@ snapshot_create=$("$binary" transact \
   --operation create \
   --repo "$repo_dir" \
   --input "snapshot=$event_snapshot_initial" \
+  --param stream=snapshot-one \
   --format json)
 grep -Fq '"result":"created"' <<<"$snapshot_create"
+test -f "$repo_dir/.ledger/example/snapshot-one/snapshots.jsonl"
 
 snapshot_replace=$("$binary" transact \
   --definition "$event_snapshot_definition" \
@@ -234,6 +236,7 @@ snapshot_replace=$("$binary" transact \
   --repo "$repo_dir" \
   --input "snapshot=$event_snapshot_replacement" \
   --param request=snapshot-replace \
+  --param stream=snapshot-one \
   --format json)
 grep -Fq '"result":"replaced"' <<<"$snapshot_replace"
 compgen -G "$repo_dir/.ledger/.revisions/*.bin" >/dev/null
@@ -244,6 +247,7 @@ snapshot_duplicate=$("$binary" transact \
   --repo "$repo_dir" \
   --input "snapshot=$event_snapshot_replacement" \
   --param request=snapshot-replace \
+  --param stream=snapshot-one \
   --format json)
 grep -Fq '"result":"idempotent"' <<<"$snapshot_duplicate"
 grep -Fq '"storage_mutated":false' <<<"$snapshot_duplicate"
@@ -252,6 +256,7 @@ snapshot_projection=$("$binary" project \
   --definition "$event_snapshot_definition" \
   --projection all \
   --repo "$repo_dir" \
+  --param stream=snapshot-one \
   --format json)
 grep -Fq '"data":[{"kind":"three","value":3}]' \
   <<<"$snapshot_projection"
@@ -259,6 +264,7 @@ grep -Fq '"data":[{"kind":"three","value":3}]' \
 snapshot_doctor=$("$binary" doctor \
   --definition "$event_snapshot_definition" \
   --repo "$repo_dir" \
+  --param stream=snapshot-one \
   --format json)
 grep -Fq '"healthy":true' <<<"$snapshot_doctor"
 grep -Fq '"binding_rows":2' <<<"$snapshot_doctor"

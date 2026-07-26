@@ -250,6 +250,7 @@ fn runDoctor(
         &context.definition_plan,
         &context.storage_plan.?,
         repo_root,
+        &bindings,
     );
     defer result.deinit(allocator);
     try emitDoctor(allocator, args.format, &result, context.stats);

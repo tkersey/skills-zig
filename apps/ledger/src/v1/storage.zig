@@ -13,9 +13,25 @@ pub const SlotKind = enum {
     }
 };
 
+const PathSegmentKind = enum {
+    literal,
+    parameter,
+};
+
+const PathSegment = struct {
+    kind: PathSegmentKind,
+    text: []u8,
+
+    fn deinit(self: *PathSegment, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
 pub const Slot = struct {
     name: []u8,
     relative_path: []u8,
+    path_segments: []PathSegment,
     kind: SlotKind,
     codec: definition.Codec,
     max_bytes: usize,
@@ -23,6 +39,22 @@ pub const Slot = struct {
     fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.relative_path);
+        for (self.path_segments) |*segment| segment.deinit(allocator);
+        allocator.free(self.path_segments);
+        self.* = undefined;
+    }
+};
+
+pub const ResolvedSlot = struct {
+    name: []const u8,
+    relative_path: []const u8,
+    owned_path: ?[]u8,
+    kind: SlotKind,
+    codec: definition.Codec,
+    max_bytes: usize,
+
+    fn deinit(self: *ResolvedSlot, allocator: std.mem.Allocator) void {
+        if (self.owned_path) |path| allocator.free(path);
         self.* = undefined;
     }
 };
@@ -113,6 +145,45 @@ pub const Plan = struct {
     }
 };
 
+pub const ResolvedPlan = struct {
+    storage_kind: definition.StorageKind,
+    slot_buffer: [64]ResolvedSlot,
+    slot_count: usize,
+    operations: []const Operation,
+
+    pub fn deinit(self: *ResolvedPlan, allocator: std.mem.Allocator) void {
+        for (self.slot_buffer[0..self.slot_count]) |*item| {
+            item.deinit(allocator);
+        }
+        self.* = undefined;
+    }
+
+    pub fn slot(self: *const ResolvedPlan, index: usize) ResolvedSlot {
+        return self.slot_buffer[index];
+    }
+
+    pub fn slotSlice(self: *const ResolvedPlan) []const ResolvedSlot {
+        return self.slot_buffer[0..self.slot_count];
+    }
+
+    pub fn findOperation(
+        self: *const ResolvedPlan,
+        name: []const u8,
+    ) ?*const Operation {
+        var low: usize = 0;
+        var high = self.operations.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, self.operations[mid].name, name)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => return &self.operations[mid],
+            }
+        }
+        return null;
+    }
+};
+
 pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -130,7 +201,7 @@ pub fn compile(
     const storage_object = try definition_core.json.object(parsed.value);
     const slots = try compileSlots(
         allocator,
-        definition_plan.storage_kind,
+        definition_plan,
         storage_object,
     );
     errdefer deinitSlots(allocator, slots);
@@ -142,16 +213,86 @@ pub fn compile(
     };
 }
 
+pub fn resolve(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    parameters: *const definition_core.parameters.Bindings,
+) !ResolvedPlan {
+    var resolved: ResolvedPlan = .{
+        .storage_kind = plan.storage_kind,
+        .slot_buffer = undefined,
+        .slot_count = 0,
+        .operations = plan.operations,
+    };
+    errdefer resolved.deinit(allocator);
+    for (plan.slots, 0..) |slot, index| {
+        const owned_path = if (pathIsParameterized(slot.path_segments))
+            try resolvePathAlloc(
+                allocator,
+                slot.path_segments,
+                parameters,
+            )
+        else
+            null;
+        errdefer if (owned_path) |path| allocator.free(path);
+        resolved.slot_buffer[index] = .{
+            .name = slot.name,
+            .relative_path = owned_path orelse slot.relative_path,
+            .owned_path = owned_path,
+            .kind = slot.kind,
+            .codec = slot.codec,
+            .max_bytes = slot.max_bytes,
+        };
+        resolved.slot_count += 1;
+    }
+    const slots = resolved.slotSlice();
+    for (slots, 0..) |left, index| {
+        for (slots[index + 1 ..]) |right| {
+            if (std.ascii.eqlIgnoreCase(
+                left.relative_path,
+                right.relative_path,
+            )) return error.StoragePathCaseAmbiguity;
+        }
+    }
+    return resolved;
+}
+
+pub fn pathTemplateMatches(slot: Slot, actual_path: []const u8) bool {
+    validateLogicalSlotPath(actual_path) catch return false;
+    var components = std.mem.splitScalar(u8, actual_path, '/');
+    for (slot.path_segments) |segment| {
+        const component = components.next() orelse return false;
+        switch (segment.kind) {
+            .literal => if (!std.mem.eql(u8, segment.text, component)) {
+                return false;
+            },
+            .parameter => {
+                definition_core.json.safeIdentifier(component, 128) catch
+                    return false;
+                if (std.mem.indexOfScalar(u8, component, '/') != null) {
+                    return false;
+                }
+            },
+        }
+    }
+    return components.next() == null;
+}
+
 pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
         try encoder.writeBytes(slot.name);
         try encoder.writeBytes(slot.relative_path);
+        try encoder.writeCount(slot.path_segments.len);
+        for (slot.path_segments) |segment| {
+            try encoder.writeEnum(segment.kind);
+            try encoder.writeBytes(segment.text);
+        }
         try encoder.writeEnum(slot.kind);
         try encoder.writeEnum(slot.codec);
         try encoder.writeUsize(slot.max_bytes);
@@ -177,7 +318,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -217,6 +358,21 @@ pub fn validateCachePlan(
         if (slot.max_bytes > definition_plan.bounds.max_store_bytes) {
             return error.CacheStoragePlanMismatch;
         }
+        for (slot.path_segments) |segment| switch (segment.kind) {
+            .literal => {},
+            .parameter => {
+                if (!definition_plan.requires(.path_format)) {
+                    return error.CacheStoragePlanMismatch;
+                }
+                const declaration =
+                    definition_plan.parameter_declarations.find(
+                        segment.text,
+                    ) orelse return error.CacheStoragePlanMismatch;
+                if (declaration.kind != .safe_identifier) {
+                    return error.CacheStoragePlanMismatch;
+                }
+            },
+        };
     }
     for (plan.operations) |operation| {
         for (operation.effects) |effect| {
@@ -295,7 +451,35 @@ fn decodeCacheSlots(
             4096,
         );
         errdefer allocator.free(relative_path);
-        try validateLogicalSlotPath(relative_path);
+        const segment_count = try decoder.readCount(128);
+        if (segment_count == 0) return error.InvalidStoragePathTemplate;
+        const path_segments = try allocator.alloc(
+            PathSegment,
+            segment_count,
+        );
+        var segment_initialized: usize = 0;
+        errdefer {
+            for (path_segments[0..segment_initialized]) |*segment| {
+                segment.deinit(allocator);
+            }
+            allocator.free(path_segments);
+        }
+        for (path_segments) |*segment| {
+            const kind = try decoder.readEnum(PathSegmentKind);
+            const text = try decoder.readBytesAlloc(
+                allocator,
+                if (kind == .parameter) 128 else 4096,
+            );
+            errdefer allocator.free(text);
+            try validatePathSegment(kind, text);
+            segment.* = .{ .kind = kind, .text = text };
+            segment_initialized += 1;
+        }
+        try validateEncodedPathTemplate(
+            allocator,
+            relative_path,
+            path_segments,
+        );
         const kind = try decoder.readEnum(SlotKind);
         const codec = try decoder.readEnum(definition.Codec);
         if (kind == .event_log and codec != .jsonl) {
@@ -317,6 +501,7 @@ fn decodeCacheSlots(
         slot.* = .{
             .name = name,
             .relative_path = relative_path,
+            .path_segments = path_segments,
             .kind = kind,
             .codec = codec,
             .max_bytes = max_bytes,
@@ -423,10 +608,10 @@ fn validateCachedOperation(effects: []const Effect, atomic: bool) !void {
 
 fn compileSlots(
     allocator: std.mem.Allocator,
-    storage_kind: definition.StorageKind,
+    definition_plan: *const definition.Plan,
     object: std.json.ObjectMap,
 ) ![]Slot {
-    if (storage_kind == .pure) {
+    if (definition_plan.storage_kind == .pure) {
         try definition_core.json.requireExactKeys(object, &.{"kind"});
         return allocator.alloc(Slot, 0);
     }
@@ -458,8 +643,16 @@ fn compileSlots(
             "codec",
             "max_bytes",
         });
-        const relative_path = try definition_core.json.requiredString(slot, "path");
-        try validateLogicalSlotPath(relative_path);
+        const relative_path = try definition_core.json.requiredString(
+            slot,
+            "path",
+        );
+        const path_segments = try compilePathSegments(
+            allocator,
+            definition_plan,
+            relative_path,
+        );
+        errdefer deinitPathSegments(allocator, path_segments);
         const codec = try definition.Codec.parse(
             try definition_core.json.requiredString(slot, "codec"),
         );
@@ -488,6 +681,7 @@ fn compileSlots(
         try slots.append(allocator, .{
             .name = owned_name,
             .relative_path = owned_path,
+            .path_segments = path_segments,
             .kind = kind,
             .codec = codec,
             .max_bytes = max_bytes,
@@ -689,6 +883,190 @@ fn optionalParameterName(
     return try allocator.dupe(u8, name);
 }
 
+fn compilePathSegments(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    path: []const u8,
+) ![]PathSegment {
+    if (path.len == 0 or path.len > 4096 or
+        std.fs.path.isAbsolute(path) or
+        std.mem.indexOfScalar(u8, path, 0) != null or
+        std.mem.indexOfScalar(u8, path, '\\') != null or
+        path[path.len - 1] == '/')
+    {
+        return error.InvalidStoragePathTemplate;
+    }
+    var segments: std.ArrayList(PathSegment) = .empty;
+    errdefer {
+        for (segments.items) |*segment| segment.deinit(allocator);
+        segments.deinit(allocator);
+    }
+    var dynamic = false;
+    var iterator = std.mem.splitScalar(u8, path, '/');
+    while (iterator.next()) |component| {
+        if (segments.items.len >= 128) {
+            return error.StoragePathSegmentBoundsExceeded;
+        }
+        if (component.len == 0) return error.InvalidStoragePathTemplate;
+        const kind: PathSegmentKind = if (component.len >= 3 and
+            component[0] == '{' and
+            component[component.len - 1] == '}')
+        blk: {
+            const name = component[1 .. component.len - 1];
+            try definition_core.json.safeIdentifier(name, 128);
+            if (std.mem.indexOfScalar(u8, name, '/') != null) {
+                return error.InvalidStoragePathParameter;
+            }
+            const declaration =
+                definition_plan.parameter_declarations.find(name) orelse
+                return error.UnknownStoragePathParameter;
+            if (declaration.kind != .safe_identifier) {
+                return error.StoragePathParameterMustBeSafeIdentifier;
+            }
+            dynamic = true;
+            break :blk .parameter;
+        } else blk: {
+            if (std.mem.indexOfScalar(u8, component, '{') != null or
+                std.mem.indexOfScalar(u8, component, '}') != null)
+            {
+                return error.InvalidStoragePathTemplate;
+            }
+            try validateLiteralPathSegment(component);
+            break :blk .literal;
+        };
+        const text = switch (kind) {
+            .literal => component,
+            .parameter => component[1 .. component.len - 1],
+        };
+        const owned_text = try allocator.dupe(u8, text);
+        errdefer allocator.free(owned_text);
+        try segments.append(allocator, .{
+            .kind = kind,
+            .text = owned_text,
+        });
+    }
+    if (dynamic and !definition_plan.requires(.path_format)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    if (!dynamic) try validateLogicalSlotPath(path);
+    const owned = try segments.toOwnedSlice(allocator);
+    errdefer deinitPathSegments(allocator, owned);
+    try validateEncodedPathTemplate(allocator, path, owned);
+    return owned;
+}
+
+fn validateEncodedPathTemplate(
+    allocator: std.mem.Allocator,
+    expected: []const u8,
+    segments: []const PathSegment,
+) !void {
+    if (segments.len == 0 or expected.len == 0 or expected.len > 4096 or
+        std.fs.path.isAbsolute(expected) or
+        std.mem.indexOfScalar(u8, expected, 0) != null or
+        std.mem.indexOfScalar(u8, expected, '\\') != null)
+    {
+        return error.InvalidStoragePathTemplate;
+    }
+    if (segments[0].kind == .literal) {
+        const first = segments[0].text;
+        if (first[0] == '.' or
+            std.ascii.eqlIgnoreCase(first, "transactions") or
+            std.ascii.eqlIgnoreCase(first, "bindings"))
+        {
+            return error.ReservedStoragePath;
+        }
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    for (segments, 0..) |segment, index| {
+        if (index != 0) try output.writer.writeByte('/');
+        switch (segment.kind) {
+            .literal => try output.writer.writeAll(segment.text),
+            .parameter => try output.writer.print(
+                "{{{s}}}",
+                .{segment.text},
+            ),
+        }
+    }
+    if (!std.mem.eql(u8, expected, output.written())) {
+        return error.InvalidStoragePathTemplate;
+    }
+}
+
+fn validatePathSegment(kind: PathSegmentKind, text: []const u8) !void {
+    switch (kind) {
+        .literal => try validateLiteralPathSegment(text),
+        .parameter => {
+            try definition_core.json.safeIdentifier(text, 128);
+            if (std.mem.indexOfScalar(u8, text, '/') != null) {
+                return error.InvalidStoragePathParameter;
+            }
+        },
+    }
+}
+
+fn validateLiteralPathSegment(component: []const u8) !void {
+    if (component.len == 0 or
+        std.mem.eql(u8, component, ".") or
+        std.mem.eql(u8, component, ".."))
+    {
+        return error.InvalidStoragePathTemplate;
+    }
+    for (component) |byte| if (byte < 0x20 or byte == 0x7f) {
+        return error.InvalidStoragePathTemplate;
+    };
+}
+
+fn pathIsParameterized(segments: []const PathSegment) bool {
+    for (segments) |segment| {
+        if (segment.kind == .parameter) return true;
+    }
+    return false;
+}
+
+fn resolvePathAlloc(
+    allocator: std.mem.Allocator,
+    segments: []const PathSegment,
+    parameters: *const definition_core.parameters.Bindings,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (segments, 0..) |segment, index| {
+        if (index != 0) try output.writer.writeByte('/');
+        switch (segment.kind) {
+            .literal => try output.writer.writeAll(segment.text),
+            .parameter => {
+                const value = pathParameter(parameters, segment.text) orelse
+                    return error.MissingStoragePathParameter;
+                if (std.mem.indexOfScalar(u8, value, '/') != null) {
+                    return error.InvalidStoragePathParameter;
+                }
+                try validateLiteralPathSegment(value);
+                try output.writer.writeAll(value);
+            },
+        }
+    }
+    if (output.written().len > 4096) {
+        return error.StoragePathBoundsExceeded;
+    }
+    try validateLogicalSlotPath(output.written());
+    return output.toOwnedSlice();
+}
+
+fn pathParameter(
+    parameters: *const definition_core.parameters.Bindings,
+    name: []const u8,
+) ?[]const u8 {
+    for (parameters.items) |binding| {
+        if (!std.mem.eql(u8, binding.name, name)) continue;
+        return switch (binding.value) {
+            .safe_identifier => |value| value,
+            else => null,
+        };
+    }
+    return null;
+}
+
 fn validateLogicalSlotPath(path: []const u8) !void {
     try definition_core.json.repositoryRelativePath(path, false);
     const first_end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
@@ -698,6 +1076,14 @@ fn validateLogicalSlotPath(path: []const u8) !void {
     {
         return error.ReservedStoragePath;
     }
+}
+
+fn deinitPathSegments(
+    allocator: std.mem.Allocator,
+    segments: []PathSegment,
+) void {
+    for (segments) |*segment| segment.deinit(allocator);
+    allocator.free(segments);
 }
 
 fn findSlot(slots: []const Slot, name: []const u8) ?usize {
@@ -717,6 +1103,18 @@ fn findInput(inputs: []const definition.Input, name: []const u8) ?usize {
 fn deinitSlots(allocator: std.mem.Allocator, slots: []Slot) void {
     for (slots) |*slot| slot.deinit(allocator);
     allocator.free(slots);
+}
+
+fn resolveForAllocationFailure(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    var resolved = resolve(allocator, plan, parameters) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer resolved.deinit(allocator);
 }
 
 test "storage compiler binds generic slots and atomic effects" {
@@ -766,18 +1164,148 @@ test "storage compiler binds generic slots and atomic effects" {
         plan.operations[0].effects.len,
         cached.operations[0].effects.len,
     );
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var resolved = try resolve(
+        failing.allocator(),
+        &plan,
+        &parameters,
+    );
+    defer resolved.deinit(failing.allocator());
+}
+
+test "storage path parameters compile once and resolve as safe components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "parameterized.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/parameterized","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["path-format"]},"parameters":{"stream":{"type":"safe_identifier","required":true}},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"{stream}/events.jsonl","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "parameterized.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "parameterized.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "tenant-1" }},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var resolved = try resolve(
+        std.testing.allocator,
+        &plan,
+        &parameters,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "tenant-1/events.jsonl",
+        resolved.slot(0).relative_path,
+    );
+    try std.testing.expect(pathTemplateMatches(
+        plan.slots[0],
+        resolved.slot(0).relative_path,
+    ));
+    try std.testing.expect(!pathTemplateMatches(
+        plan.slots[0],
+        "tenant-1/other.jsonl",
+    ));
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    var cached_resolved = try resolve(
+        std.testing.allocator,
+        &cached,
+        &parameters,
+    );
+    defer cached_resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        resolved.slot(0).relative_path,
+        cached_resolved.slot(0).relative_path,
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resolveForAllocationFailure,
+        .{ &plan, &parameters },
+    );
+
+    var nested = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "nested/value" }},
+    );
+    defer nested.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.InvalidStoragePathParameter,
+        resolve(std.testing.allocator, &plan, &nested),
+    );
+    var reserved = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = ".definitions" }},
+    );
+    defer reserved.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.ReservedStoragePath,
+        resolve(std.testing.allocator, &plan, &reserved),
+    );
 }
 
 test "storage compiler rejects reserved paths and implicit multi effects" {
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "reserved.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/reserved","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":".definitions/events.jsonl","codec":"jsonl","max_bytes":1024}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
-        "{\"kind\":\"event-log\",\"slots\":{\"events\":{\"path\":\".definitions/events.jsonl\",\"codec\":\"jsonl\",\"max_bytes\":1024}}}",
+        &tmp.dir,
+        "reserved.json",
         .{},
     );
-    defer parsed.deinit();
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "reserved.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.ReservedStoragePath,
-        compileSlots(std.testing.allocator, .event_log, parsed.value.object),
+        compile(std.testing.allocator, &definition_plan),
     );
 }

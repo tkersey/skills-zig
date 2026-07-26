@@ -99,7 +99,13 @@ pub fn transact(
         definition_plan.closure_digest[0..],
         definition_closure.digestSlice(),
     )) return error.DefinitionClosureDigestMismatch;
-    const operation = storage_plan.findOperation(operation_name) orelse
+    var resolved_storage = try storage.resolve(
+        allocator,
+        storage_plan,
+        parameters,
+    );
+    defer resolved_storage.deinit(allocator);
+    const operation = resolved_storage.findOperation(operation_name) orelse
         return error.UnknownOperation;
     if (isBindingOperation(operation)) {
         if (documents.len != 0) {
@@ -111,7 +117,7 @@ pub fn transact(
             definition_closure,
             definition_entry_path,
             validation_plan,
-            storage_plan,
+            &resolved_storage,
             operation,
             operation_name,
             repo_root,
@@ -178,7 +184,7 @@ pub fn transact(
     const prepared = try prepareEffects(
         allocator,
         definition_plan,
-        storage_plan,
+        &resolved_storage,
         operation,
         operation_name,
         repo_root,
@@ -204,7 +210,7 @@ pub fn transact(
     if (duplicate_count == 0) {
         const mutations = try buildMutations(
             allocator,
-            storage_plan,
+            &resolved_storage,
             prepared,
             &archive,
         );
@@ -236,7 +242,7 @@ pub fn transact(
 
     const receipts = try buildReceipts(
         allocator,
-        storage_plan,
+        &resolved_storage,
         prepared,
         duplicate_count != 0,
     );
@@ -302,7 +308,7 @@ fn bindExisting(
     definition_closure: *const definition_core.Closure,
     definition_entry_path: []const u8,
     validation_plan: *const validation.Plan,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     operation: *const storage.Operation,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -365,7 +371,7 @@ fn bindExisting(
     );
     defer allocator.free(mutations);
     for (prepared, 0..) |item, index| {
-        const slot = storage_plan.slots[item.slot_index];
+        const slot = storage_plan.slot(item.slot_index);
         mutations[index * 2] = .{
             .path = item.slot_path,
             .text = "",
@@ -424,7 +430,7 @@ fn bindExisting(
         allocator.free(receipts);
     }
     for (prepared, 0..) |item, index| {
-        const slot = storage_plan.slots[item.slot_index];
+        const slot = storage_plan.slot(item.slot_index);
         {
             const owned_slot = try allocator.dupe(u8, slot.name);
             errdefer allocator.free(owned_slot);
@@ -470,7 +476,7 @@ fn prepareExistingBinding(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -478,7 +484,7 @@ fn prepareExistingBinding(
     if (effect.kind != .bind_existing) {
         return error.BindingOperationCannotMixEffects;
     }
-    const slot = storage_plan.slots[effect.slot_index];
+    const slot = storage_plan.slot(effect.slot_index);
     const slot_path = try std.fs.path.join(
         allocator,
         &.{ repo_root, ".ledger", slot.relative_path },
@@ -556,7 +562,7 @@ fn validateExistingContent(
     definition_plan: *const definition.Plan,
     validation_plan: *const validation.Plan,
     input_index: u8,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
     content: []const u8,
 ) !?usize {
     const input = definition_plan.inputs[input_index];
@@ -607,7 +613,7 @@ fn validateExistingDocument(
 fn bindingValidationResult(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     prepared: []const PreparedBinding,
 ) !validation.Result {
     const input_digests = try allocator.alloc(
@@ -623,7 +629,7 @@ fn bindingValidationResult(
         allocator.free(input_digests);
     }
     for (prepared, 0..) |item, index| {
-        const slot = storage_plan.slots[item.slot_index];
+        const slot = storage_plan.slot(item.slot_index);
         {
             const name = try allocator.dupe(u8, slot.name);
             errdefer allocator.free(name);
@@ -671,7 +677,7 @@ fn bindingValidationResult(
 fn prepareEffects(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     operation: *const storage.Operation,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -703,14 +709,14 @@ fn prepareEffects(
 fn prepareEffect(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
     execution: *const validation.Execution,
     parameters: *const definition_core.parameters.Bindings,
 ) !PreparedEffect {
-    const slot = storage_plan.slots[effect.slot_index];
+    const slot = storage_plan.slot(effect.slot_index);
     const slot_path = try std.fs.path.join(
         allocator,
         &.{ repo_root, ".ledger", slot.relative_path },
@@ -869,7 +875,7 @@ const SlotContent = struct {
 
 fn slotContentAfter(
     allocator: std.mem.Allocator,
-    slot: storage.Slot,
+    slot: storage.ResolvedSlot,
     kind: storage.EffectKind,
     before: ?[]const u8,
     canonical_input: []const u8,
@@ -934,7 +940,7 @@ fn slotContentAfter(
 
 fn buildMutations(
     allocator: std.mem.Allocator,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     prepared: []const PreparedEffect,
     archive: *const definition_archive.Candidate,
 ) ![]durable_store.TransactionMutation {
@@ -945,7 +951,7 @@ fn buildMutations(
         prepared.len * 2 + revision_count + archive_count,
     );
     for (prepared, 0..) |effect, index| {
-        const slot = storage_plan.slots[effect.slot_index];
+        const slot = storage_plan.slot(effect.slot_index);
         mutations[index * 2] = .{
             .path = effect.slot_path,
             .text = effect.slot_after,
@@ -973,7 +979,7 @@ fn buildMutations(
         if (revision.exists or revisionAppearedEarlier(prepared, index)) {
             continue;
         }
-        const slot = storage_plan.slots[effect.slot_index];
+        const slot = storage_plan.slot(effect.slot_index);
         mutations[mutation_index] = .{
             .path = revision.path,
             .text = effect.slot_before.?,
@@ -1027,7 +1033,7 @@ fn revisionAppearedEarlier(
 
 fn buildReceipts(
     allocator: std.mem.Allocator,
-    storage_plan: *const storage.Plan,
+    storage_plan: *const storage.ResolvedPlan,
     prepared: []const PreparedEffect,
     idempotent: bool,
 ) ![]EffectReceipt {
@@ -1038,7 +1044,7 @@ fn buildReceipts(
         allocator.free(receipts);
     }
     for (prepared, 0..) |effect, index| {
-        const slot = storage_plan.slots[effect.slot_index];
+        const slot = storage_plan.slot(effect.slot_index);
         receipts[index] = .{
             .slot = try allocator.dupe(u8, slot.name),
             .logical_ref = try allocator.dupe(u8, slot.relative_path),
@@ -1336,11 +1342,17 @@ test "document replacements replay from immutable prior revisions" {
         duplicate.effects[0].result,
     );
 
+    var resolved_storage = try storage.resolve(
+        std.testing.allocator,
+        &storage_plan,
+        &parameters,
+    );
+    defer resolved_storage.deinit(std.testing.allocator);
     var snapshot = try custody.readSlot(
         std.testing.allocator,
         repo_root,
         definition_plan.id,
-        storage_plan.slots[0],
+        resolved_storage.slot(0),
     );
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), snapshot.binding.rows.len);
@@ -1348,7 +1360,7 @@ test "document replacements replay from immutable prior revisions" {
         std.testing.allocator,
         repo_root,
         definition_plan.id,
-        storage_plan.slots[0],
+        resolved_storage.slot(0),
         &snapshot,
     );
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
@@ -1387,7 +1399,7 @@ test "document replacements replay from immutable prior revisions" {
             std.testing.allocator,
             repo_root,
             definition_plan.id,
-            storage_plan.slots[0],
+            resolved_storage.slot(0),
             &snapshot,
         ),
     );

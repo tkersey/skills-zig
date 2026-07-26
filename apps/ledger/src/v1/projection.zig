@@ -688,7 +688,13 @@ pub fn execute(
 ) !Result {
     const compiled = plan.find(projection_name) orelse
         return error.UnknownProjection;
-    const slot = storage_plan.slots[compiled.slot_index];
+    var resolved_storage = try storage.resolve(
+        allocator,
+        storage_plan,
+        parameters,
+    );
+    defer resolved_storage.deinit(allocator);
+    const slot = resolved_storage.slot(compiled.slot_index);
     var snapshot = try custody.readSlot(
         allocator,
         repo_root,
