@@ -657,10 +657,14 @@ const Builder = struct {
                     try definition_core.json.requiredString(object, "right_input"),
                 );
                 rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "left"),
+                    try definition_core.json.string(
+                        try definition_core.json.field(object, "left"),
+                    ),
                 );
                 rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "right"),
+                    try definition_core.json.string(
+                        try definition_core.json.field(object, "right"),
+                    ),
                 );
             },
             .implies => {
@@ -8481,7 +8485,10 @@ test "embedded validation compares borrowed event and retained state values" {
     var rules = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\[{"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"}]
+        \\[
+        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"},
+        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"","right_input":"state","right":""}
+        \\]
     ,
         .{},
     );

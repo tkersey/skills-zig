@@ -226,7 +226,7 @@ pub fn compile(
                 allocator,
                 definition_plan,
                 reducer_rule,
-                definition_plan.inputs[envelope.input_index].max_bytes,
+                definition_plan.bounds.max_input_bytes,
             );
             try state_reducer.validateEventKinds(
                 &state_reducer_plan.?,
@@ -421,7 +421,7 @@ pub fn validateCachePlan(
         try state_reducer.validatePlan(
             compiled,
             definition_plan,
-            definition_plan.inputs[plan.envelope.input_index].max_bytes,
+            definition_plan.bounds.max_input_bytes,
         );
         try state_reducer.validateEventKinds(compiled, plan.event_kinds);
     }
@@ -1460,10 +1460,15 @@ fn compileTargetSlot(
         return error.ProtocolInputHasNoStorageEffect;
     for (storage_plan.operations) |operation| {
         for (operation.effects) |effect| {
-            if (effect.slot_index == target and
-                effect.input_index != input_index)
-            {
-                return error.ProtocolSlotHasMixedInputs;
+            if (effect.slot_index != target) continue;
+            switch (effect.kind) {
+                .compare_append, .bind_existing => {},
+                .create_new, .compare_replace => {
+                    return error.ProtocolStoreMustBeAppendOnly;
+                },
+            }
+            if (effect.input_index != input_index and effect.event == null) {
+                return error.ProtocolSlotHasUnmaterializedMixedInputs;
             }
         }
     }
@@ -1877,9 +1882,14 @@ test "event materialization reconstructs validated request literals" {
         \\  "owner":"example",
         \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},
         \\  "parameters":{"stream":{"type":"safe_identifier","required":true}},
-        \\  "inputs":{"request":{"codec":"json","max_bytes":4096}},
+        \\  "inputs":{
+        \\    "alternate":{"codec":"json","max_bytes":4096},
+        \\    "request":{"codec":"json","max_bytes":4096}
+        \\  },
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
+        \\    {"op":"exact-object","input":"alternate","path":"","keys":["body","kind","schema","stream_id"]},
+        \\    {"op":"enum","input":"alternate","path":"/schema","values":["example-alternate/v1"]},
         \\    {"op":"exact-object","input":"request","path":"","keys":["body","kind","schema","stream_id"]},
         \\    {"op":"enum","input":"request","path":"/schema","values":["example-request/v1"]},
         \\    {"op":"event-envelope","input":"request","keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}
@@ -1893,15 +1903,26 @@ test "event materialization reconstructs validated request literals" {
         \\  ],
         \\  "identity":{},
         \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
-        \\  "operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{
-        \\    "body_input_field":"body",
-        \\    "fields":[
-        \\      {"field":"kind","input_field":"kind"},
-        \\      {"field":"schema","literal":"example-event/v1"},
-        \\      {"field":"stream_id","input_field":"stream_id"}
-        \\    ],
-        \\    "request_literals":[{"field":"schema","literal":"example-request/v1"}]
-        \\  }}]}},
+        \\  "operations":{
+        \\    "append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{
+        \\      "body_input_field":"body",
+        \\      "fields":[
+        \\        {"field":"kind","input_field":"kind"},
+        \\        {"field":"schema","literal":"example-event/v1"},
+        \\        {"field":"stream_id","input_field":"stream_id"}
+        \\      ],
+        \\      "request_literals":[{"field":"schema","literal":"example-request/v1"}]
+        \\    }}]},
+        \\    "append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{
+        \\      "body_input_field":"body",
+        \\      "fields":[
+        \\        {"field":"kind","input_field":"kind"},
+        \\        {"field":"schema","literal":"example-event/v1"},
+        \\        {"field":"stream_id","input_field":"stream_id"}
+        \\      ],
+        \\      "request_literals":[{"field":"schema","literal":"example-alternate/v1"}]
+        \\    }}]}
+        \\  },
         \\  "projections":{},
         \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}
         \\}

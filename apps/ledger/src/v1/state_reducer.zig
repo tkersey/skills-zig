@@ -685,7 +685,9 @@ fn compileActions(
                 .source = source,
                 .pointer = try definition_core.json_pointer.compile(
                     allocator,
-                    try definition_core.json.requiredString(object, "path"),
+                    try definition_core.json.string(
+                        try definition_core.json.field(object, "path"),
+                    ),
                 ),
             } };
         } else if (std.mem.eql(u8, operator, "clear")) {
