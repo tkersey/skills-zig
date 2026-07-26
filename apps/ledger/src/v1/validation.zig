@@ -233,6 +233,23 @@ const Builder = struct {
                 true,
                 &rule,
             ),
+            .optional_field => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path" },
+                );
+                if (object.get("rules")) |raw_rules| {
+                    rule.children = try self.compileItemRules(
+                        raw_rules,
+                        input_index,
+                        0,
+                    );
+                }
+            },
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
             ),
@@ -674,8 +691,24 @@ const Builder = struct {
                 false,
                 &rule,
             ),
+            .optional_field => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "rules" },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "op", "path" },
+                );
+                if (object.get("rules")) |raw_rules| {
+                    rule.children = try self.compileItemRules(
+                        raw_rules,
+                        input_index,
+                        depth + 1,
+                    );
+                }
+            },
             .required_field,
-            .optional_field,
             .digest,
             .timestamp,
             .unique,
@@ -1054,7 +1087,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(8);
+    try encoder.writeU16(9);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1086,7 +1119,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 8) {
+    if (try decoder.readU16() != 9) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1637,6 +1670,11 @@ fn validateCachedRule(
         return error.InvalidRuleBounds;
     }
     switch (rule.operator) {
+        .optional_field => if (rule.pointer_id == null or
+            rule.children.len > 64)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .scalar_type => if (rule.scalar_kind == null) {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -1778,7 +1816,8 @@ fn validateCachedRule(
             }
         }
     }
-    if (rule.operator != .one_of and
+    if (rule.operator != .optional_field and
+        rule.operator != .one_of and
         rule.operator != .all_rules and
         rule.operator != .any_rules and
         rule.operator != .no_rules and
@@ -2180,7 +2219,16 @@ fn applyRule(
     const path = if (rule.pointer_id) |pointer_id| plan.pointers[pointer_id].raw else "";
     const valid = switch (rule.operator) {
         .required_field => target != null,
-        .optional_field => true,
+        .optional_field => if (target) |value|
+            rule.children.len == 0 or
+                try itemRulesHold(
+                    allocator,
+                    plan,
+                    rule.children,
+                    value,
+                )
+        else
+            true,
         .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
@@ -2387,7 +2435,16 @@ fn itemRuleHolds(
         root;
     return switch (rule.operator) {
         .required_field => target != null,
-        .optional_field => true,
+        .optional_field => if (target) |value|
+            rule.children.len == 0 or
+                try itemRulesHold(
+                    allocator,
+                    plan,
+                    rule.children,
+                    value,
+                )
+        else
+            true,
         .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
@@ -3485,7 +3542,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping","all","any","none"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","optional-field","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping","all","any","none"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
@@ -3497,6 +3554,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"sorted","path":"/tags"},
         \\    {"op":"keyed-unique","path":"/items","key":"/id"},
         \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"},
+        \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
         \\    {"op":"all","path":"/items","rules":[
         \\      {"op":"exact-object","keys":["id","labels"]},
         \\      {"op":"scalar-type","path":"/id","type":"string"},
@@ -3577,6 +3635,46 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expect(valid.valid);
     try std.testing.expect(!valid.authority_granted);
     try std.testing.expect(!valid.storage_mutated);
+
+    const present_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"meta\":{}",
+        "\"meta\":{\"closure\":\"confirmed\"}",
+    );
+    defer std.testing.allocator.free(present_bytes);
+    var valid_present = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = present_bytes,
+        }},
+    );
+    defer valid_present.deinit(std.testing.allocator);
+    try std.testing.expect(valid_present.valid);
+
+    const invalid_optional_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"meta\":{}",
+        "\"meta\":{\"closure\":\"wrong\"}",
+    );
+    defer std.testing.allocator.free(invalid_optional_bytes);
+    var invalid_optional = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_optional_bytes,
+        }},
+    );
+    defer invalid_optional.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_optional.valid);
 
     var invalid = try validate(
         std.testing.allocator,
