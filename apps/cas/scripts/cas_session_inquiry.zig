@@ -3205,11 +3205,6 @@ fn extractLastFiaJsonObjectAlloc(allocator: std.mem.Allocator, text: []const u8)
     return selected;
 }
 
-fn extractBalancedJsonObjectAlloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
-    const start = std.mem.indexOfScalar(u8, text, '{') orelse return null;
-    return extractBalancedJsonObjectFromAlloc(allocator, text, start);
-}
-
 fn extractBalancedJsonObjectFromAlloc(allocator: std.mem.Allocator, text: []const u8, start: usize) !?[]u8 {
     var depth: usize = 0;
     var in_string = false;
@@ -3269,12 +3264,6 @@ fn stringListAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: [
         };
     }
     return out;
-}
-
-fn readThread(client: *cas_client.Client, allocator: std.mem.Allocator, thread_id: []const u8) ![]u8 {
-    const params = try stringifyAnyAlloc(allocator, .{ .threadId = thread_id, .includeTurns = true });
-    defer allocator.free(params);
-    return client.requestJson("thread/read", params);
 }
 
 fn threadIdFromResponse(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -3585,32 +3574,6 @@ fn appendSourceDigestMismatchEvent(
     try appendLine(events_path, event);
 }
 
-fn canonicalTurnsJsonAlloc(allocator: std.mem.Allocator, turns: []const std.json.Value) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    try out.append(allocator, '[');
-    for (turns, 0..) |turn_value, index| {
-        if (index > 0) try out.append(allocator, ',');
-        const turn = switch (turn_value) {
-            .object => |obj| obj,
-            else => return error.SourceStale,
-        };
-        try out.appendSlice(allocator, "{\"index\":");
-        const index_text = try std.fmt.allocPrint(allocator, "{d}", .{index});
-        defer allocator.free(index_text);
-        try out.appendSlice(allocator, index_text);
-        try out.appendSlice(allocator, ",\"status\":");
-        try appendCanonicalJson(allocator, &out, turn.get("status") orelse .null);
-        try out.appendSlice(allocator, ",\"error\":");
-        try appendCanonicalJson(allocator, &out, turn.get("error") orelse .null);
-        try out.appendSlice(allocator, ",\"items\":");
-        try appendCanonicalJson(allocator, &out, turn.get("items") orelse return error.SourceStale);
-        try out.append(allocator, '}');
-    }
-    try out.append(allocator, ']');
-    return out.toOwnedSlice(allocator);
-}
-
 fn appendCanonicalJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: std.json.Value) !void {
     switch (value) {
         .object => |obj| {
@@ -3746,90 +3709,6 @@ fn inquiryWorkspaceCwdAlloc(allocator: std.mem.Allocator, options: Options, rip:
     const workspace = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, "workspace");
     try ensureDir(workspace);
     return workspace;
-}
-
-fn persistPlannedInquiry(
-    allocator: std.mem.Allocator,
-    options: Options,
-    dcp: Dcp,
-    rip: Rip,
-    receipt_dir: []const u8,
-    preflight: PreflightResult,
-    detached: bool,
-) !RunOutput {
-    try ensureDir(receipt_dir);
-    const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_dir});
-    defer allocator.free(lanes_dir);
-    try ensureDir(lanes_dir);
-    try persistInputCopies(allocator, options, rip.inquiry_id);
-    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir});
-    const created_event = try stringifyAnyAlloc(allocator, .{
-        .event = "detached_created",
-        .state = @tagName(InquiryState.created),
-        .schema_fingerprint = preflight.schema_fingerprint,
-        .codex_version = preflight.codex_version,
-    });
-    defer allocator.free(created_event);
-    try appendLine(events_path, created_event);
-    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
-    const summary = .{
-        .session_inquiry_summary = .{
-            .summary_version = "SIS-v1",
-            .inquiry_id = rip.inquiry_id,
-            .state = @tagName(InquiryState.created),
-            .valid_firs = 0,
-            .invalid_firs = 0,
-            .schema_fingerprint = preflight.schema_fingerprint,
-            .failure_code = "",
-            .failure_hint = "",
-        },
-    };
-    try writeJsonFile(allocator, summary_path, summary);
-    const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
-    try ensureParentDir(state_path);
-    const state = .{
-        .session_inquiry_record = .{
-            .record_version = "SIR-v1",
-            .inquiry_id = rip.inquiry_id,
-            .state = @tagName(InquiryState.created),
-            .capsule_id = dcp.packet_id,
-            .plan_id = rip.inquiry_id,
-            .source_thread_id = dcp.source_thread_id orelse "",
-            .source_thread_id_present = dcp.source_thread_id != null,
-            .source_rollout_path = dcp.source_rollout_path orelse "",
-            .source_artifact_reconstructability = dcp.reconstructability,
-            .lineage_mode = lineageMode(dcp).asString(),
-            .managed_transport = .{
-                .selected_transport = "websocket",
-                .detached = detached,
-            },
-            .lane_states = [_][]const u8{},
-            .budgets = .{
-                .max_forks = rip.max_forks,
-                .max_turns_per_fork = rip.max_turns_per_fork,
-                .max_total_tokens = rip.max_total_tokens,
-                .timeout_ms = rip.timeout_ms,
-            },
-            .tokens_used = 0,
-            .started_at = nowMillis(),
-            .updated_at = nowMillis(),
-            .terminal_at = null,
-            .failure_code = "",
-            .failure_hint = "",
-            .summary_ref = summary_path,
-        },
-    };
-    try writeJsonFile(allocator, state_path, state);
-    return .{
-        .inquiry_id = rip.inquiry_id,
-        .state = @tagName(InquiryState.created),
-        .receipt_dir = receipt_dir,
-        .state_ref = state_path,
-        .events_ref = events_path,
-        .summary_ref = summary_path,
-        .failure_code = "",
-        .failure_hint = "",
-    };
 }
 
 fn rootObject(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
@@ -4209,18 +4088,6 @@ fn readFirReceiptValid(allocator: std.mem.Allocator, path: []const u8) !bool {
     const receipt = core_json.objectField(root, "fork_inquiry_receipt") orelse root;
     const gate = core_json.objectField(receipt, "gate") orelse return false;
     return boolField(gate, "receipt_valid") orelse false;
-}
-
-fn stateFromSirRecord(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |obj| obj,
-        else => return null,
-    };
-    const record = core_json.objectField(root, "session_inquiry_record") orelse root;
-    const state = core_json.stringField(record, "state") orelse return null;
-    return try allocator.dupe(u8, state);
 }
 
 fn writeJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {

@@ -40,6 +40,13 @@
     "size_depth_limits",
     "malformed_json",
     "unknown_extension_policy",
+    "architectonic_epg_compilation",
+    "raw_policy_execution_barrier",
+    "self_certification_rejection",
+    "malformed_lowering_shape",
+    "wrapped_claim_rejection",
+    "source_binding_and_horizon",
+    "declared_stale_source",
     "cross_app_fixture_parity"
   ],
   "implemented_by": {
@@ -52,7 +59,8 @@
       "valid_linear_policy.json",
       "valid_linear_state.json",
       "valid_linear_decision.json",
-      "valid_linear_receipt.json"
+      "valid_linear_receipt.json",
+      "../../src/fixtures/valid_architectonic_epg.json"
     ]
   }
 }

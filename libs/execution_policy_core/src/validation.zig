@@ -7,9 +7,24 @@ const schema = @import("schema.zig");
 pub fn validatePolicy(allocator: std.mem.Allocator, policy: *const schema.Policy) !errors.ValidationReport {
     var validator = Validator.init(allocator);
     defer validator.deinit();
-    try validator.validate(policy);
+    try validator.validate(policy, .source);
     return validator.finish();
 }
+
+pub fn validateCompiledRuntimePolicy(
+    allocator: std.mem.Allocator,
+    policy: *const schema.Policy,
+) !errors.ValidationReport {
+    var validator = Validator.init(allocator);
+    defer validator.deinit();
+    try validator.validate(policy, .compiled_runtime);
+    return validator.finish();
+}
+
+const ValidationMode = enum {
+    source,
+    compiled_runtime,
+};
 
 const Validator = struct {
     allocator: std.mem.Allocator,
@@ -62,7 +77,7 @@ const Validator = struct {
         return self.builder.finish();
     }
 
-    fn validate(self: *Validator, policy: *const schema.Policy) !void {
+    fn validate(self: *Validator, policy: *const schema.Policy, mode: ValidationMode) !void {
         if (policy.root() != .object) {
             try self.add(.schema_invalid, "$");
             return;
@@ -86,8 +101,12 @@ const Validator = struct {
         try self.validateActionCycles(root);
         try self.validateActionReachability();
         try self.validateRollbackReachability();
-        try self.validateOutcomeClosure(root);
-        try self.validateReadiness(root);
+        if (mode == .source) {
+            try self.validateOutcomeClosure(root);
+            try self.validateReadiness(root);
+        } else {
+            try self.validateCompiledOutcomeClosure(root);
+        }
     }
 
     fn gatherCustomAuthority(self: *Validator, root: std.json.ObjectMap) !void {
@@ -262,6 +281,33 @@ const Validator = struct {
                     for (rollback.array.items) |item| if (item == .string) try self.rollback_referenced_ids.append(self.allocator, item.string);
                 }
                 try self.requireStringArray(rollback, "$.actions", index, ".rollback_actions");
+            }
+            if (obj.get("rollback_trigger_atoms")) |triggers| {
+                try self.requireStringArray(
+                    triggers,
+                    "$.actions",
+                    index,
+                    ".rollback_trigger_atoms",
+                );
+                if (obj.get("rollback_actions") == null) {
+                    try self.addIndex(
+                        .schema_invalid,
+                        "$.actions",
+                        index,
+                        ".rollback_trigger_atoms",
+                    );
+                }
+                if (triggers == .array) {
+                    for (triggers.array.items) |item| {
+                        if (item != .string) continue;
+                        try self.validateDeclaredAtom(
+                            item.string,
+                            "$.actions",
+                            index,
+                            ".rollback_trigger_atoms",
+                        );
+                    }
+                }
             }
             if (obj.get("results")) |results| try self.validateActionResults(results, index);
         }
@@ -479,6 +525,96 @@ const Validator = struct {
                         try self.addIndex2(.outcome_dangling, "$.actions", index, ".results", atom_index, "");
                         self.saw_graph_error = true;
                     }
+                }
+            }
+        }
+    }
+
+    fn validateCompiledOutcomeClosure(
+        self: *Validator,
+        root: std.json.ObjectMap,
+    ) !void {
+        const actions = root.get("actions") orelse return;
+        if (actions != .array) return;
+        for (actions.array.items, 0..) |row, index| {
+            if (row != .object) continue;
+            const expected = arrayField(
+                row.object,
+                "expected_observation_refs",
+            ) orelse &.{};
+            const failure = arrayField(
+                row.object,
+                "failure_observation_refs",
+            ) orelse &.{};
+            if (expected.len == 0 and failure.len == 0) {
+                try self.validateActionOutcomeClosure(row.object, index);
+                continue;
+            }
+            try self.validateObservationClosure(
+                root,
+                expected,
+                index,
+                ".expected_observation_refs",
+            );
+            try self.validateObservationClosure(
+                root,
+                failure,
+                index,
+                ".failure_observation_refs",
+            );
+        }
+    }
+
+    fn validateActionOutcomeClosure(
+        self: *Validator,
+        action: std.json.ObjectMap,
+        action_index: usize,
+    ) !void {
+        const results = action.get("results") orelse return;
+        if (results != .object) return;
+        var result_iterator = results.object.iterator();
+        while (result_iterator.next()) |entry| {
+            if (entry.value_ptr.* != .array) continue;
+            for (entry.value_ptr.array.items, 0..) |item, atom_index| {
+                if (item != .string or self.atomIsClosed(item.string)) continue;
+                try self.addIndex2(
+                    .outcome_dangling,
+                    "$.actions",
+                    action_index,
+                    ".results",
+                    atom_index,
+                    "",
+                );
+            }
+        }
+    }
+
+    fn validateObservationClosure(
+        self: *Validator,
+        root: std.json.ObjectMap,
+        refs: []const std.json.Value,
+        action_index: usize,
+        path_suffix: []const u8,
+    ) !void {
+        for (refs) |ref_value| {
+            if (ref_value != .string) continue;
+            const observation = observationObject(root, ref_value.string) orelse
+                continue;
+            for (arrayField(observation, "outcomes") orelse &.{}) |outcome| {
+                if (outcome != .string) continue;
+                const outcome_atom = try std.fmt.allocPrint(
+                    self.allocator,
+                    "obs:{s}={s}",
+                    .{ ref_value.string, outcome.string },
+                );
+                defer self.allocator.free(outcome_atom);
+                if (!self.atomIsClosed(outcome_atom)) {
+                    try self.addIndex(
+                        .outcome_dangling,
+                        "$.actions",
+                        action_index,
+                        path_suffix,
+                    );
                 }
             }
         }
@@ -733,6 +869,31 @@ fn actionObject(root: std.json.ObjectMap, id: []const u8) ?std.json.ObjectMap {
         if (std.mem.eql(u8, row_id, id)) return row.object;
     }
     return null;
+}
+
+fn observationObject(
+    root: std.json.ObjectMap,
+    id: []const u8,
+) ?std.json.ObjectMap {
+    const observations = root.get("observations") orelse return null;
+    if (observations != .array) return null;
+    for (observations.array.items) |row| {
+        if (row != .object) continue;
+        const row_id = stringField(row.object, "id") orelse continue;
+        if (std.mem.eql(u8, row_id, id)) return row.object;
+    }
+    return null;
+}
+
+fn arrayField(
+    object: std.json.ObjectMap,
+    key: []const u8,
+) ?[]const std.json.Value {
+    const value = object.get(key) orelse return null;
+    return switch (value) {
+        .array => |array| array.items,
+        else => null,
+    };
 }
 
 fn contains(items: []const []const u8, needle: []const u8) bool {

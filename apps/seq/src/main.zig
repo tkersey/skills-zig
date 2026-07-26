@@ -37,6 +37,7 @@ fn shouldSuppressCliError(err: anyerror) bool {
         error.NoDecisionCandidate,
         error.DecisionAmbiguous,
         error.InvalidPacket,
+        error.ExecutionPolicyRejected,
         => true,
         else => false,
     };

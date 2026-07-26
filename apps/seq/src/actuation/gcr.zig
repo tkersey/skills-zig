@@ -443,15 +443,6 @@ fn isTokenChar(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == ':' or byte == '.';
 }
 
-fn toolContains(tool: canonical_trace.ToolLifecycleRecord, needle: []const u8) bool {
-    if (tool.tool_name) |text| if (contains(text, needle)) return true;
-    if (tool.command_text) |text| if (contains(text, needle)) return true;
-    if (tool.input_text) |text| if (contains(text, needle)) return true;
-    if (tool.output_text) |text| if (contains(text, needle)) return true;
-    if (tool.arguments_json) |text| if (contains(text, needle)) return true;
-    return false;
-}
-
 fn commandFieldsContain(tool: canonical_trace.ToolLifecycleRecord, needle: []const u8) bool {
     if (tool.command_text) |text| if (contains(text, needle)) return true;
     if (tool.input_text) |text| if (contains(text, needle)) return true;
