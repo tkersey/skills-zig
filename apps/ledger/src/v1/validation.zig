@@ -1335,6 +1335,18 @@ pub const Execution = struct {
         return parsed.value;
     }
 
+    pub fn inputJsonPtr(
+        self: *Execution,
+        input_index: usize,
+    ) ?*std.json.Value {
+        if (input_index >= self.loaded.len) return null;
+        const parsed = if (self.loaded[input_index].parsed_json) |*value|
+            value
+        else
+            return null;
+        return &parsed.value;
+    }
+
     pub fn inputDigest(self: *const Execution, name: []const u8) ?[]const u8 {
         const digests = self.input_digests orelse return null;
         for (digests) |digest| {

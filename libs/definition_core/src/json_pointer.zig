@@ -81,6 +81,34 @@ pub fn lookup(root: std.json.Value, pointer: Pointer) ?std.json.Value {
     return current;
 }
 
+pub fn lookupPtr(
+    root: *std.json.Value,
+    pointer: Pointer,
+) ?*std.json.Value {
+    var current = root;
+    for (pointer.segments) |segment| {
+        current = switch (current.*) {
+            .object => |*object| object.getPtr(segment) orelse return null,
+            .array => |*array| blk: {
+                if (segment.len == 0 or
+                    (segment.len > 1 and segment[0] == '0'))
+                {
+                    return null;
+                }
+                const index = std.fmt.parseInt(
+                    usize,
+                    segment,
+                    10,
+                ) catch return null;
+                if (index >= array.items.len) return null;
+                break :blk &array.items[index];
+            },
+            else => return null,
+        };
+    }
+    return current;
+}
+
 test "compiled JSON pointers look up escaped object and array segments" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -97,6 +125,13 @@ test "compiled JSON pointers look up escaped object and array segments" {
     const value = lookup(parsed.value, pointer) orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("value", value.string);
+    const mutable = lookupPtr(&parsed.value, pointer) orelse
+        return error.TestExpectedEqual;
+    mutable.* = .{ .string = "changed" };
+    try std.testing.expectEqualStrings(
+        "changed",
+        lookup(parsed.value, pointer).?.string,
+    );
     try std.testing.expectError(
         error.InvalidJsonPointer,
         compile(std.testing.allocator, "/bad~2escape"),

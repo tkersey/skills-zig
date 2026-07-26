@@ -7,7 +7,8 @@ const Identity = union(enum) {
     none,
     content_address: struct {
         exclude_key: ?[]u8,
-        claimed_key: ?[]u8,
+        claimed: ?definition_core.json_pointer.Pointer,
+        basis_null: ?definition_core.json_pointer.Pointer,
     },
     composite: struct {
         prefix: ?[]u8,
@@ -21,7 +22,8 @@ const Identity = union(enum) {
         switch (self.*) {
             .content_address => |*config| {
                 if (config.exclude_key) |key| allocator.free(key);
-                if (config.claimed_key) |key| allocator.free(key);
+                if (config.claimed) |*field| field.deinit(allocator);
+                if (config.basis_null) |*field| field.deinit(allocator);
             },
             .composite => |*config| {
                 if (config.prefix) |prefix| allocator.free(prefix);
@@ -121,6 +123,13 @@ pub fn compile(
                 var parsed = try parseRule(allocator, rule.canonical_config);
                 defer parsed.deinit();
                 const object = parsed.value.object;
+                try definition_core.json.requireExactKeys(object, &.{
+                    "op",
+                    "input",
+                    "exclude",
+                    "field",
+                    "basis_null",
+                });
                 const candidate = try ruleInputIndex(definition_plan, object);
                 if (input_index != null and input_index.? != candidate) {
                     return error.IdentityInputMismatch;
@@ -128,11 +137,13 @@ pub fn compile(
                 input_index = candidate;
                 var config: @FieldType(Identity, "content_address") = .{
                     .exclude_key = null,
-                    .claimed_key = null,
+                    .claimed = null,
+                    .basis_null = null,
                 };
                 errdefer {
                     if (config.exclude_key) |key| allocator.free(key);
-                    if (config.claimed_key) |key| allocator.free(key);
+                    if (config.claimed) |*field| field.deinit(allocator);
+                    if (config.basis_null) |*field| field.deinit(allocator);
                 }
                 if (object.get("exclude")) |raw| {
                     config.exclude_key = try rootKeyFromPointer(
@@ -141,10 +152,22 @@ pub fn compile(
                     );
                 }
                 if (object.get("field")) |raw| {
-                    config.claimed_key = try rootKeyFromPointer(
+                    config.claimed = try definition_core.json_pointer.compile(
                         allocator,
                         try definition_core.json.string(raw),
                     );
+                }
+                if (object.get("basis_null")) |raw| {
+                    config.basis_null = try definition_core.json_pointer.compile(
+                        allocator,
+                        try definition_core.json.string(raw),
+                    );
+                }
+                try validateContentAddressConfig(config);
+                if (config.basis_null != null and
+                    definition_plan.inputs[candidate].codec != .json)
+                {
+                    return error.ContentAddressBasisRequiresJson;
                 }
                 identity = .{ .content_address = config };
             },
@@ -193,7 +216,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeByte(plan.input_index);
     try encoder.writeEnum(plan.codec);
     try encoder.writeBool(plan.normalize_line_endings);
@@ -203,7 +226,14 @@ pub fn encodeCache(
         .content_address => |config| {
             try encoder.writeByte(1);
             try encoder.writeOptionalBytes(config.exclude_key);
-            try encoder.writeOptionalBytes(config.claimed_key);
+            try encoder.writeOptionalBytes(if (config.claimed) |field|
+                field.raw
+            else
+                null);
+            try encoder.writeOptionalBytes(if (config.basis_null) |field|
+                field.raw
+            else
+                null);
         },
         .composite => |config| {
             try encoder.writeByte(2);
@@ -224,7 +254,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerMaterializationCacheVersionMismatch;
     }
     const input_index = try decoder.readByte();
@@ -238,7 +268,8 @@ pub fn decodeCache(
                 allocator,
                 4 * 1024 * 1024,
             ),
-            .claimed_key = null,
+            .claimed = null,
+            .basis_null = null,
         } },
         2 => .{ .composite = try decodeCompositeIdentity(
             allocator,
@@ -248,17 +279,20 @@ pub fn decodeCache(
     };
     errdefer identity.deinit(allocator);
     if (identity == .content_address) {
-        identity.content_address.claimed_key =
-            try decoder.readOptionalBytesAlloc(
+        identity.content_address.claimed =
+            try decodeOptionalPointer(
                 allocator,
-                4 * 1024 * 1024,
+                decoder,
+            );
+        identity.content_address.basis_null =
+            try decodeOptionalPointer(
+                allocator,
+                decoder,
             );
         if (identity.content_address.exclude_key) |key| {
             if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidUtf8;
         }
-        if (identity.content_address.claimed_key) |key| {
-            if (!std.unicode.utf8ValidateSlice(key)) return error.InvalidUtf8;
-        }
+        try validateContentAddressConfig(identity.content_address);
     } else if (identity == .composite) {
         try validateCompositeIdentityConfig(identity.composite);
     }
@@ -287,8 +321,13 @@ pub fn validateCachePlan(
     }
     switch (plan.identity) {
         .none => {},
-        .content_address => if (!definition_plan.requires(.content_address)) {
-            return error.CacheMaterializationPlanMismatch;
+        .content_address => |config| {
+            if (!definition_plan.requires(.content_address) or
+                (config.basis_null != null and plan.codec != .json))
+            {
+                return error.CacheMaterializationPlanMismatch;
+            }
+            try validateContentAddressConfig(config);
         },
         .composite => if (!definition_plan.requires(.composite_identity)) {
             return error.CacheMaterializationPlanMismatch;
@@ -313,7 +352,21 @@ pub fn materialize(
     var artifact_id: ?[]u8 = null;
     errdefer if (artifact_id) |value| allocator.free(value);
 
-    if (execution.isValid()) {
+    if (execution.isValid()) materialized: {
+        if (materialization_plan.identity == .content_address and
+            materialization_plan.identity.content_address.basis_null != null)
+        {
+            try materializeDraftContentAddress(
+                allocator,
+                &execution,
+                materialization_plan,
+                materialization_plan.identity.content_address,
+                &canonical_content,
+                &canonical_digest,
+                &artifact_id,
+            );
+            break :materialized;
+        }
         canonical_content = try canonicalize(
             allocator,
             &execution,
@@ -334,24 +387,31 @@ pub fn materialize(
                     )
                 else
                     try allocator.dupe(u8, canonical_digest.?);
-                if (config.claimed_key) |claimed_key| {
-                    const root = execution.inputJson(materialization_plan.input_index).?;
-                    const claimed = switch (root.object.get(claimed_key) orelse .null) {
-                        .string => |text| text,
-                        else => "",
-                    };
-                    if (!std.mem.eql(u8, claimed, artifact_id.?)) {
+                if (config.claimed) |claimed_pointer| {
+                    const root = execution.inputJson(
+                        materialization_plan.input_index,
+                    ) orelse return error.MaterializationInputInvalid;
+                    const claimed = definition_core.json_pointer.lookup(
+                        root,
+                        claimed_pointer,
+                    );
+                    const matches = if (claimed) |value|
+                        value == .string and
+                            std.mem.eql(u8, value.string, artifact_id.?)
+                    else
+                        false;
+                    if (!matches) {
                         try execution.addDiagnostic(
                             "content-address",
-                            claimed_key,
+                            claimed_pointer.raw,
                             "claimed artifact identity does not match canonical content",
                         );
-                        allocator.free(canonical_content.?);
-                        canonical_content = null;
-                        allocator.free(canonical_digest.?);
-                        canonical_digest = null;
-                        allocator.free(artifact_id.?);
-                        artifact_id = null;
+                        discardMaterialized(
+                            allocator,
+                            &canonical_content,
+                            &canonical_digest,
+                            &artifact_id,
+                        );
                     }
                 }
             },
@@ -419,6 +479,66 @@ pub fn materialize(
         .canonical_content_digest = canonical_digest,
         .artifact_id = artifact_id,
     };
+}
+
+fn materializeDraftContentAddress(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "content_address"),
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    const basis_pointer = config.basis_null orelse
+        return error.ContentAddressBasisMissing;
+    const claimed_pointer = config.claimed orelse
+        return error.ContentAddressBasisRequiresField;
+    const root = execution.inputJsonPtr(plan.input_index) orelse
+        return error.MaterializationInputInvalid;
+    const field = definition_core.json_pointer.lookupPtr(
+        root,
+        basis_pointer,
+    ) orelse {
+        try execution.addDiagnostic(
+            "content-address",
+            basis_pointer.raw,
+            "declared identity field is missing",
+        );
+        return;
+    };
+    const supplied = field.*;
+    if (supplied != .null and supplied != .string) {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "draft identity must be null or the matching content address",
+        );
+        return;
+    }
+    field.* = .null;
+    artifact_id.* = try definition_core.canonical_json.digestValueAlloc(
+        allocator,
+        root.*,
+    );
+    if (supplied == .string and
+        !std.mem.eql(u8, supplied.string, artifact_id.*.?))
+    {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "claimed artifact identity does not match canonical content",
+        );
+        allocator.free(artifact_id.*.?);
+        artifact_id.* = null;
+        return;
+    }
+    field.* = .{ .string = artifact_id.*.? };
+    canonical_content.* = try canonicalize(allocator, execution, plan);
+    canonical_digest.* = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        canonical_content.*.?,
+    );
 }
 
 fn canonicalize(
@@ -566,6 +686,38 @@ fn ruleInputIndex(
     }
     if (definition_plan.inputs.len == 1) return 0;
     return error.AmbiguousMaterializationInput;
+}
+
+fn decodeOptionalPointer(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !?definition_core.json_pointer.Pointer {
+    const raw = try decoder.readOptionalBytesAlloc(allocator, 1024) orelse
+        return null;
+    defer allocator.free(raw);
+    return try definition_core.json_pointer.compile(allocator, raw);
+}
+
+fn validateContentAddressConfig(
+    config: @FieldType(Identity, "content_address"),
+) !void {
+    if (config.exclude_key != null and config.basis_null != null) {
+        return error.ContentAddressBasisConflict;
+    }
+    if (config.basis_null) |basis| {
+        const claimed = config.claimed orelse
+            return error.ContentAddressBasisRequiresField;
+        if (basis.raw.len == 0 or basis.raw.len > 1024 or
+            !std.mem.eql(u8, basis.raw, claimed.raw))
+        {
+            return error.ContentAddressBasisFieldMismatch;
+        }
+    }
+    if (config.claimed) |claimed| {
+        if (claimed.raw.len == 0 or claimed.raw.len > 1024) {
+            return error.InvalidJsonPointer;
+        }
+    }
 }
 
 fn compileCompositeIdentity(
@@ -1023,6 +1175,130 @@ test "claimed content address mismatch fails structural materialization" {
     try std.testing.expect(!result.validation_result.valid);
     try std.testing.expect(result.canonical_content == null);
     try std.testing.expect(result.artifact_id == null);
+}
+
+test "nested draft content address materializes and verifies canonical identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/nested-draft","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","content-address","exact-object"]},"inputs":{"contract":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"contract"}]},"shape":{"rules":[{"op":"exact-object","input":"contract","path":"","keys":["artifact"]},{"op":"exact-object","input":"contract","path":"/artifact","keys":["artifact_id","value"]}]},"constraints":[],"identity":{"op":"content-address","input":"contract","basis_null":"/artifact/artifact_id","field":"/artifact/artifact_id"},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&definition_plan},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{payload},
+    );
+
+    const draft = "{\"artifact\":{\"value\":1,\"artifact_id\":null}}";
+    const basis = "{\"artifact\":{\"artifact_id\":null,\"value\":1}}";
+    const expected_id = try definition_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        basis,
+    );
+    defer std.testing.allocator.free(expected_id);
+    var result = try materialize(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{ .name = "contract", .bytes = draft }},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.validation_result.valid);
+    try std.testing.expectEqualStrings(expected_id, result.artifact_id.?);
+    const expected_canonical = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"artifact\":{{\"artifact_id\":\"{s}\",\"value\":1}}}}",
+        .{expected_id},
+    );
+    defer std.testing.allocator.free(expected_canonical);
+    try std.testing.expectEqualStrings(
+        expected_canonical,
+        result.canonical_content.?,
+    );
+
+    var repeated = try materialize(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{
+            .name = "contract",
+            .bytes = result.canonical_content.?,
+        }},
+    );
+    defer repeated.deinit(std.testing.allocator);
+    try std.testing.expect(repeated.validation_result.valid);
+    try std.testing.expectEqualStrings(
+        result.canonical_content.?,
+        repeated.canonical_content.?,
+    );
+    try std.testing.expectEqualStrings(
+        result.artifact_id.?,
+        repeated.artifact_id.?,
+    );
+
+    const wrong = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        result.canonical_content.?,
+        expected_id,
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    );
+    defer std.testing.allocator.free(wrong);
+    var rejected = try materialize(
+        std.testing.allocator,
+        &definition_plan,
+        &validation_plan,
+        &cached,
+        &.{.{ .name = "contract", .bytes = wrong }},
+    );
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expect(!rejected.validation_result.valid);
+    try std.testing.expect(rejected.canonical_content == null);
+    try std.testing.expect(rejected.artifact_id == null);
 }
 
 test "compiled composite identity derives bounded scalar identity" {
