@@ -413,6 +413,7 @@ fn parseInputs(
     allocator: std.mem.Allocator,
     items: std.json.Array,
 ) ![]ExternalInput {
+    if (items.items.len > 64) return error.InvalidExternalInputCount;
     var out: std.ArrayList(ExternalInput) = .empty;
     errdefer {
         for (out.items) |*item| item.deinit(allocator);
@@ -523,9 +524,9 @@ fn parseSteps(
     for (items.items) |item| {
         const object = try definition_core.json.object(item);
         try definition_core.json.requireExactKeys(object, &.{
-            "op", "input", "inputs", "as", "name", "relation", "fields", "where",
-            "on", "keys", "metrics", "by", "limit", "depth", "max_nodes", "state",
-            "order_by", "transitions", "emit", "window", "classifications",
+            "op",       "input",       "inputs",  "as",     "name",            "relation", "fields",    "where",
+            "on",       "keys",        "metrics", "by",     "limit",           "depth",    "max_nodes", "state",
+            "order_by", "transitions", "emit",    "window", "classifications",
         });
         const operator = try Operator.parse(try definition_core.json.requiredString(object, "op"));
         if ((operator_mask & operatorBit(operator)) == 0) {
@@ -778,6 +779,11 @@ fn parseBounds(object: std.json.ObjectMap) !Bounds {
         else
             64,
     };
+    try validateBounds(bounds);
+    return bounds;
+}
+
+fn validateBounds(bounds: Bounds) !void {
     if (bounds.max_rows == 0 or bounds.max_rows > 10_000_000 or
         bounds.max_output_bytes == 0 or bounds.max_output_bytes > 256 * 1024 * 1024 or
         bounds.max_fold_states == 0 or bounds.max_fold_states > 65_536 or
@@ -788,7 +794,459 @@ fn parseBounds(object: std.json.ObjectMap) !Bounds {
     {
         return error.ObservationBoundsExceeded;
     }
-    return bounds;
+}
+
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeBytes(plan.id);
+    try encoder.writeFixed(&plan.closure_digest);
+    try encoder.writeU32(plan.operator_mask);
+    try definition_core.parameters.encodeCache(
+        &plan.parameter_declarations,
+        encoder,
+    );
+    try encoder.writeByte(plan.selector_mask);
+    try encoder.writeCount(plan.relations.len);
+    for (plan.relations) |relation| {
+        try encoder.writeEnum(relation.relation);
+        try encoder.writeCount(relation.fields.len);
+        for (relation.fields) |field| try encoder.writeU16(field);
+    }
+    try encoder.writeCount(plan.inputs.len);
+    for (plan.inputs) |input| {
+        try encoder.writeBytes(input.name);
+        try encoder.writeBytes(input.schema_id);
+        try encoder.writeOptionalBytes(input.digest);
+        try encoder.writeCount(input.fields.len);
+        for (input.fields) |field| {
+            try encoder.writeBytes(field.name);
+            try encoder.writeEnum(field.kind);
+            try encoder.writeBool(field.nullable);
+        }
+        try encoder.writeUsize(input.max_rows);
+        try encoder.writeUsize(input.max_bytes);
+    }
+    try encoder.writeCount(plan.steps.len);
+    for (plan.steps) |step| {
+        try encoder.writeEnum(step.operator);
+        try encoder.writeOptionalBytes(step.output_name);
+        try encoder.writeCount(step.input_names.len);
+        for (step.input_names) |name| try encoder.writeBytes(name);
+        try encoder.writeBytes(step.canonical_config);
+    }
+    try encoder.writeCount(plan.projections.len);
+    for (plan.projections) |projection| {
+        try encoder.writeBytes(projection.name);
+        try encoder.writeBytes(projection.relation);
+        try encoder.writeBytes(projection.schema_id);
+        try encoder.writeCount(projection.fields.len);
+        for (projection.fields) |field| try encoder.writeBytes(field);
+        try encoder.writeByte(projection.renderer_mask);
+    }
+    try encoder.writeUsize(plan.bounds.max_rows);
+    try encoder.writeUsize(plan.bounds.max_output_bytes);
+    try encoder.writeUsize(plan.bounds.max_fold_states);
+    try encoder.writeUsize(plan.bounds.max_input_bytes);
+    try encoder.writeUsize(plan.bounds.max_graph_depth);
+    try encoder.writeUsize(plan.bounds.max_graph_nodes);
+    try encoder.writeUsize(plan.bounds.max_diagnostics);
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.SeqDefinitionPlanCacheVersionMismatch;
+    }
+    const id = try decoder.readBytesAlloc(allocator, 256);
+    errdefer allocator.free(id);
+    try definition_core.json.safeIdentifier(id, 256);
+    var closure_digest: [71]u8 = undefined;
+    @memcpy(
+        &closure_digest,
+        try decoder.readFixed(closure_digest.len),
+    );
+    try definition_core.json.digest(&closure_digest);
+    const operator_mask = try decoder.readU32();
+    var known_operator_mask: u32 = 0;
+    inline for (@typeInfo(Operator).@"enum".fields) |field| {
+        known_operator_mask |= operatorBit(@enumFromInt(field.value));
+    }
+    if ((operator_mask & ~known_operator_mask) != 0) {
+        return error.CacheObservationOperatorInvalid;
+    }
+    var parameter_declarations = try definition_core.parameters.decodeCache(
+        allocator,
+        decoder,
+    );
+    errdefer parameter_declarations.deinit(allocator);
+    const selector_mask = try decoder.readByte();
+    var known_selector_mask: u8 = 0;
+    inline for (@typeInfo(Selector).@"enum".fields) |field| {
+        known_selector_mask |= @as(u8, 1) << @intCast(field.value);
+    }
+    if ((selector_mask & ~known_selector_mask) != 0) {
+        return error.CacheObservationSelectorInvalid;
+    }
+    const relations = try decodeCacheRelations(allocator, decoder);
+    errdefer deinitRelations(allocator, relations);
+    const inputs = try decodeCacheInputs(allocator, decoder);
+    errdefer deinitInputs(allocator, inputs);
+    const steps = try decodeCacheSteps(
+        allocator,
+        decoder,
+        operator_mask,
+        relations,
+        inputs,
+    );
+    errdefer deinitSteps(allocator, steps);
+    const projections = try decodeCacheProjections(
+        allocator,
+        decoder,
+        steps,
+    );
+    errdefer deinitProjections(allocator, projections);
+    const bounds: Bounds = .{
+        .max_rows = try decoder.readUsize(),
+        .max_output_bytes = try decoder.readUsize(),
+        .max_fold_states = try decoder.readUsize(),
+        .max_input_bytes = try decoder.readUsize(),
+        .max_graph_depth = try decoder.readUsize(),
+        .max_graph_nodes = try decoder.readUsize(),
+        .max_diagnostics = try decoder.readUsize(),
+    };
+    try validateBounds(bounds);
+    return .{
+        .id = id,
+        .closure_digest = closure_digest,
+        .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
+        .selector_mask = selector_mask,
+        .relations = relations,
+        .inputs = inputs,
+        .steps = steps,
+        .projections = projections,
+        .bounds = bounds,
+    };
+}
+
+fn decodeCacheRelations(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]RelationRequirement {
+    const count = try decoder.readCount(
+        @typeInfo(physical.Relation).@"enum".fields.len,
+    );
+    const relations = try allocator.alloc(RelationRequirement, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (relations[0..initialized]) |*relation| {
+            relation.deinit(allocator);
+        }
+        allocator.free(relations);
+    }
+    for (relations, 0..) |*relation, index| {
+        const relation_kind = try decoder.readEnum(physical.Relation);
+        if (index != 0 and
+            @intFromEnum(relations[index - 1].relation) >=
+                @intFromEnum(relation_kind))
+        {
+            return error.CachePhysicalRelationsNotSorted;
+        }
+        const field_count = try decoder.readCount(
+            relation_kind.fields().len,
+        );
+        if (field_count == 0) return error.EmptyPhysicalFieldSet;
+        const fields = try allocator.alloc(u16, field_count);
+        errdefer allocator.free(fields);
+        for (fields, 0..) |*field, field_index| {
+            field.* = try decoder.readU16();
+            if (field.* >= relation_kind.fields().len) {
+                return error.CachePhysicalFieldInvalid;
+            }
+            if (field_index != 0 and fields[field_index - 1] >= field.*) {
+                return error.CachePhysicalFieldsNotSorted;
+            }
+        }
+        relation.* = .{
+            .relation = relation_kind,
+            .fields = fields,
+        };
+        initialized += 1;
+    }
+    return relations;
+}
+
+fn decodeCacheInputs(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]ExternalInput {
+    const count = try decoder.readCount(64);
+    const inputs = try allocator.alloc(ExternalInput, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (inputs[0..initialized]) |*input| input.deinit(allocator);
+        allocator.free(inputs);
+    }
+    for (inputs, 0..) |*input, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, inputs[index - 1].name, name) != .lt)
+        {
+            return error.CacheExternalInputsNotSorted;
+        }
+        const schema_id = try decoder.readBytesAlloc(allocator, 256);
+        errdefer allocator.free(schema_id);
+        try definition_core.json.safeIdentifier(schema_id, 256);
+        const digest = try decoder.readOptionalBytesAlloc(allocator, 71);
+        errdefer if (digest) |value| allocator.free(value);
+        if (digest) |value| try definition_core.json.digest(value);
+        const fields = try decodeCacheExternalFields(allocator, decoder);
+        errdefer deinitExternalFields(allocator, fields);
+        const max_rows = try decoder.readUsize();
+        const max_bytes = try decoder.readUsize();
+        if (max_rows == 0 or max_rows > 1_000_000 or
+            max_bytes == 0 or max_bytes > 256 * 1024 * 1024)
+        {
+            return error.ExternalInputBoundsExceeded;
+        }
+        input.* = .{
+            .name = name,
+            .schema_id = schema_id,
+            .digest = digest,
+            .fields = fields,
+            .max_rows = max_rows,
+            .max_bytes = max_bytes,
+        };
+        initialized += 1;
+    }
+    return inputs;
+}
+
+fn decodeCacheExternalFields(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]ExternalField {
+    const count = try decoder.readCount(256);
+    if (count == 0) return error.InvalidExternalFieldCount;
+    const fields = try allocator.alloc(ExternalField, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields, 0..) |*field, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        for (fields[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, name)) {
+                return error.DuplicateExternalField;
+            }
+        }
+        field.* = .{
+            .name = name,
+            .kind = try decoder.readEnum(ExternalScalarKind),
+            .nullable = try decoder.readBool(),
+        };
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn decodeCacheSteps(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    operator_mask: u32,
+    relations: []const RelationRequirement,
+    inputs: []const ExternalInput,
+) ![]Step {
+    const count = try decoder.readCount(256);
+    if (count == 0) return error.InvalidPipelineLength;
+    const steps = try allocator.alloc(Step, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (steps[0..initialized]) |*step| step.deinit(allocator);
+        allocator.free(steps);
+    }
+    for (steps) |*step| {
+        const operator = try decoder.readEnum(Operator);
+        if ((operator_mask & operatorBit(operator)) == 0 or
+            isExpressionOperator(operator))
+        {
+            return error.CacheObservationOperatorInvalid;
+        }
+        const output_name = try decoder.readOptionalBytesAlloc(
+            allocator,
+            128,
+        );
+        errdefer if (output_name) |value| allocator.free(value);
+        const output = output_name orelse
+            return error.PipelineStageOutputMissing;
+        try definition_core.json.safeIdentifier(output, 128);
+        if (relationNameExists(steps[0..initialized], inputs, relations, output)) {
+            return error.DuplicatePipelineRelation;
+        }
+        const input_count = try decoder.readCount(16);
+        const expected_input_count: usize = switch (operator) {
+            .scan => 0,
+            .join, .union_relations, .temporal_correlate => if (input_count >= 2)
+                input_count
+            else
+                return error.InvalidPipelineInputCount,
+            else => 1,
+        };
+        if (input_count != expected_input_count) {
+            return error.InvalidPipelineInputCount;
+        }
+        const input_names = try allocator.alloc([]u8, input_count);
+        var input_initialized: usize = 0;
+        errdefer {
+            for (input_names[0..input_initialized]) |name| {
+                allocator.free(name);
+            }
+            allocator.free(input_names);
+        }
+        for (input_names) |*name| {
+            name.* = try decoder.readBytesAlloc(allocator, 128);
+            errdefer allocator.free(name.*);
+            try definition_core.json.safeIdentifier(name.*, 128);
+            if (!relationNameExists(
+                steps[0..initialized],
+                inputs,
+                relations,
+                name.*,
+            )) return error.UnknownPipelineInput;
+            input_initialized += 1;
+        }
+        const canonical_config = try decoder.readBytesAlloc(
+            allocator,
+            4 * 1024 * 1024,
+        );
+        errdefer allocator.free(canonical_config);
+        if (canonical_config.len == 0 or
+            !std.unicode.utf8ValidateSlice(canonical_config))
+        {
+            return error.CacheCanonicalConfigInvalid;
+        }
+        step.* = .{
+            .operator = operator,
+            .output_name = output_name,
+            .input_names = input_names,
+            .canonical_config = canonical_config,
+        };
+        initialized += 1;
+    }
+    return steps;
+}
+
+fn decodeCacheProjections(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    steps: []const Step,
+) ![]Projection {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidProjectionCount;
+    const projections = try allocator.alloc(Projection, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (projections[0..initialized]) |*projection| {
+            projection.deinit(allocator);
+        }
+        allocator.free(projections);
+    }
+    for (projections, 0..) |*projection, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        if (index != 0 and
+            std.mem.order(u8, projections[index - 1].name, name) != .lt)
+        {
+            return error.CacheProjectionsNotSorted;
+        }
+        const relation = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(relation);
+        var relation_found = false;
+        for (steps) |step| if (step.output_name) |output| {
+            if (std.mem.eql(u8, output, relation)) {
+                relation_found = true;
+                break;
+            }
+        };
+        if (!relation_found) return error.UnknownProjectionRelation;
+        const schema_id = try decoder.readBytesAlloc(allocator, 256);
+        errdefer allocator.free(schema_id);
+        try definition_core.json.safeIdentifier(schema_id, 256);
+        const fields = try decodeCacheStrings(
+            allocator,
+            decoder,
+            1,
+            256,
+        );
+        errdefer deinitStrings(allocator, fields);
+        const renderer_mask = try decoder.readByte();
+        const known_renderers = (@as(u8, 1) <<
+            @typeInfo(Renderer).@"enum".fields.len) - 1;
+        if (renderer_mask == 0 or
+            (renderer_mask & ~known_renderers) != 0)
+        {
+            return error.CacheRendererMaskInvalid;
+        }
+        projection.* = .{
+            .name = name,
+            .relation = relation,
+            .schema_id = schema_id,
+            .fields = fields,
+            .renderer_mask = renderer_mask,
+        };
+        initialized += 1;
+    }
+    return projections;
+}
+
+fn decodeCacheStrings(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    min_count: usize,
+    max_count: usize,
+) ![][]u8 {
+    const count = try decoder.readCount(max_count);
+    if (count < min_count) return error.InvalidStringArrayLength;
+    const values = try allocator.alloc([]u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| allocator.free(value);
+        allocator.free(values);
+    }
+    for (values, 0..) |*value, index| {
+        value.* = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(value.*);
+        try definition_core.json.safeIdentifier(value.*, 128);
+        for (values[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, value.*)) return error.DuplicateString;
+        }
+        initialized += 1;
+    }
+    return values;
+}
+
+fn isExpressionOperator(operator: Operator) bool {
+    return switch (operator) {
+        .literal_match,
+        .regex_match,
+        .multi_literal_match,
+        .json_pointer,
+        .structured_type,
+        .evidence_classify,
+        => true,
+        else => false,
+    };
 }
 
 fn parseOwnedStringArray(
@@ -852,6 +1310,16 @@ fn deinitProjections(allocator: std.mem.Allocator, items: []Projection) void {
     allocator.free(items);
 }
 
+fn decodeCacheForAllocationFailure(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var plan = try decodeCache(allocator, &decoder);
+    defer plan.deinit(allocator);
+    try decoder.finish();
+}
+
 test "observation definition compiles passive structure into an immutable plan" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -891,6 +1359,39 @@ test "observation definition compiles passive structure into an immutable plan" 
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
     const authority_boundary: definition_core.result.AuthorityBoundary = .{};
     try std.testing.expect(!authority_boundary.authority_granted);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqualStrings(plan.id, cached.id);
+    try std.testing.expectEqualSlices(
+        u8,
+        &plan.closure_digest,
+        &cached.closure_digest,
+    );
+    try std.testing.expectEqual(plan.steps.len, cached.steps.len);
+    try std.testing.expectEqual(
+        plan.relations[0].fields.len,
+        cached.relations[0].fields.len,
+    );
+    try std.testing.expectEqualStrings(
+        plan.projections[0].schema_id,
+        cached.projections[0].schema_id,
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeCacheForAllocationFailure,
+        .{payload},
+    );
 }
 
 test "observation definition rejects undeclared operators and domain relations" {
