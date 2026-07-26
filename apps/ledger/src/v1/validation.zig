@@ -136,6 +136,7 @@ const CompiledRegexPattern = struct {
 const Sha256Mode = enum {
     canonical_json_null,
     framed_items,
+    framed_fields,
 };
 
 const CompiledReferenceTarget = struct {
@@ -2043,6 +2044,8 @@ const Builder = struct {
             .canonical_json_null
         else if (std.mem.eql(u8, mode, "framed-items"))
             .framed_items
+        else if (std.mem.eql(u8, mode, "framed-fields"))
+            .framed_fields
         else
             return error.UnsupportedSha256Mode;
         rule.other_pointer_id = try self.internPointer(
@@ -2102,6 +2105,31 @@ const Builder = struct {
                     try definition_core.json.field(object, "fragments"),
                     false,
                 );
+            },
+            .framed_fields => {
+                try definition_core.json.requireFields(
+                    object,
+                    &.{ "prefix", "fragments" },
+                );
+                if (object.get("null") != null or object.get("items") != null) {
+                    return error.ConflictingSha256ModeFields;
+                }
+                const prefix = try definition_core.json.requiredString(
+                    object,
+                    "prefix",
+                );
+                if (prefix.len > 4096) {
+                    return error.Sha256PrefixBytesExceeded;
+                }
+                rule.sha256_prefix = try self.allocator.dupe(u8, prefix);
+                rule.format_parts = try self.compileFormatParts(
+                    try definition_core.json.field(object, "fragments"),
+                    false,
+                );
+                for (rule.format_parts) |part| switch (part) {
+                    .literal, .parent => {},
+                    .item, .value => return error.InvalidSha256FieldFragment,
+                };
             },
         }
     }
@@ -3409,26 +3437,43 @@ fn validateCachedRule(
             rule.max_count.? == 0 or
             rule.max_count.? > max_sha256_subject_bytes or
             rule.other_pointer_id == null or
-            rule.path_ids.len != 1 or
             rule.sha256_mode == null)
         {
             return error.CacheRuleConfigurationInvalid;
         } else switch (rule.sha256_mode.?) {
             .canonical_json_null => {
-                if (rule.sha256_prefix != null or
+                if (rule.path_ids.len != 1 or
+                    rule.sha256_prefix != null or
                     rule.format_parts.len != 0)
                 {
                     return error.CacheRuleConfigurationInvalid;
                 }
             },
             .framed_items => {
-                if (rule.sha256_prefix == null or
+                if (rule.path_ids.len != 1 or
+                    rule.sha256_prefix == null or
                     rule.sha256_prefix.?.len > 4096 or
                     rule.format_parts.len == 0 or
                     rule.format_parts.len > 32)
                 {
                     return error.CacheRuleConfigurationInvalid;
                 }
+            },
+            .framed_fields => {
+                if (rule.path_ids.len != 0 or
+                    rule.sha256_prefix == null or
+                    rule.sha256_prefix.?.len > 4096 or
+                    rule.format_parts.len == 0 or
+                    rule.format_parts.len > 32)
+                {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+                for (rule.format_parts) |part| switch (part) {
+                    .literal, .parent => {},
+                    .item, .value => {
+                        return error.CacheRuleConfigurationInvalid;
+                    },
+                };
             },
         },
         .bounded_number => if (rule.min_number == null and
@@ -5181,11 +5226,7 @@ fn sha256Holds(
     rule: CompiledRule,
     value: std.json.Value,
 ) !bool {
-    if (plan.pointers[rule.other_pointer_id.?].raw.len == 0 or
-        plan.pointers[rule.path_ids[0]].raw.len == 0)
-    {
-        return false;
-    }
+    if (plan.pointers[rule.other_pointer_id.?].raw.len == 0) return false;
     const expected_value = resolve(
         value,
         plan.pointers[rule.other_pointer_id.?],
@@ -5199,6 +5240,7 @@ fn sha256Holds(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     switch (rule.sha256_mode.?) {
         .canonical_json_null => {
+            if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
             var mutable = value;
             const null_field = definition_core.json_pointer.lookupPtr(
                 &mutable,
@@ -5220,6 +5262,7 @@ fn sha256Holds(
             hasher.update(canonical);
         },
         .framed_items => {
+            if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
             const prefix = rule.sha256_prefix.?;
             var total_bytes = prefix.len;
             if (total_bytes > rule.max_count.?) return false;
@@ -5253,6 +5296,32 @@ fn sha256Holds(
                     if (total_bytes > rule.max_count.?) return false;
                     hasher.update(fragment);
                 }
+            }
+        },
+        .framed_fields => {
+            const prefix = rule.sha256_prefix.?;
+            var total_bytes = prefix.len;
+            if (total_bytes > rule.max_count.?) return false;
+            hasher.update(prefix);
+            const key: FormattedReferenceKey = .{
+                .parent = value,
+                .item = value,
+                .value = value,
+                .parts = rule.format_parts,
+            };
+            for (rule.format_parts) |part| {
+                const fragment = formattedReferenceFragment(
+                    plan,
+                    key,
+                    part,
+                ) orelse return false;
+                total_bytes = std.math.add(
+                    usize,
+                    total_bytes,
+                    fragment.len,
+                ) catch return false;
+                if (total_bytes > rule.max_count.?) return false;
+                hasher.update(fragment);
             }
         },
     }
@@ -8199,7 +8268,7 @@ test "compiled namespace uniqueness and nested reference coverage survive cache"
     }
 }
 
-test "compiled sha256 validates canonical subdocuments and framed item streams" {
+test "compiled sha256 validates canonical documents and framed streams" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -8207,7 +8276,8 @@ test "compiled sha256 validates canonical subdocuments and framed item streams" 
         .data =
         \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
         \\{"op":"sha256","path":"/review","mode":"canonical-json-null","field":"/contract_digest","null":"/contract_digest","max_bytes":4096},
-        \\{"op":"object-values","path":"/manifests","rules":[{"op":"sha256","mode":"framed-items","field":"/contract_digest","items":"/resources","prefix":"lens-contract/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/digest"},{"literal":"\u0000"}],"max_bytes":4096}]}
+        \\{"op":"object-values","path":"/manifests","rules":[{"op":"sha256","mode":"framed-items","field":"/contract_digest","items":"/resources","prefix":"lens-contract/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/digest"},{"literal":"\u0000"}],"max_bytes":4096}]},
+        \\{"op":"sha256","path":"/campaign","mode":"framed-fields","field":"/campaign_id","prefix":"campaign/v1\u0000","fragments":[{"parent":"/goal_id"},{"literal":"\u0000"},{"parent":"/construction_ref"},{"literal":"\u0000"},{"parent":"/subject_digest"},{"literal":"\u0000"},{"parent":"/review_contract_digest"}],"max_bytes":4096}
         \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
@@ -8252,10 +8322,34 @@ test "compiled sha256 validates canonical subdocuments and framed item streams" 
         .{framed_hex},
     );
     defer std.testing.allocator.free(framed_digest);
+    var field_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    field_hasher.update("campaign/v1\x00");
+    field_hasher.update("goal-1");
+    field_hasher.update("\x00");
+    field_hasher.update("construction-1");
+    field_hasher.update("\x00");
+    field_hasher.update("subject-1");
+    field_hasher.update("\x00");
+    field_hasher.update(resource_digest);
+    var field_raw: [32]u8 = undefined;
+    field_hasher.final(&field_raw);
+    const field_hex = std.fmt.bytesToHex(field_raw, .lower);
+    const field_digest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "sha256:{s}",
+        .{field_hex},
+    );
+    defer std.testing.allocator.free(field_digest);
     const valid_bytes = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}}}}",
-        .{ framed_digest, resource_digest, review_digest },
+        "{{\"campaign\":{{\"campaign_id\":\"{s}\",\"construction_ref\":\"construction-1\",\"goal_id\":\"goal-1\",\"review_contract_digest\":\"{s}\",\"subject_digest\":\"subject-1\"}},\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}}}}",
+        .{
+            field_digest,
+            resource_digest,
+            framed_digest,
+            resource_digest,
+            review_digest,
+        },
     );
     defer std.testing.allocator.free(valid_bytes);
 
@@ -8317,6 +8411,22 @@ test "compiled sha256 validates canonical subdocuments and framed item streams" 
     );
     defer invalid_manifest.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_manifest.valid);
+    const invalid_campaign_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        field_digest,
+        wrong_digest,
+    );
+    defer std.testing.allocator.free(invalid_campaign_bytes);
+    var invalid_campaign = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = invalid_campaign_bytes }},
+    );
+    defer invalid_campaign.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_campaign.valid);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         validateForAllocationFailure,
