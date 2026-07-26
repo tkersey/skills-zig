@@ -2,17 +2,21 @@ const std = @import("std");
 const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
+const structured = @import("structured.zig");
 
 pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
+    structured_limits: structured.Limits = .{},
 };
 
 pub const Observation = struct {
     trace: trace_core.CanonicalSessionTrace,
+    structured_index: structured.Index = .{},
     result: execution.Result,
     metrics: trace_core.StreamMetrics,
 
     pub fn deinit(self: *Observation, allocator: std.mem.Allocator) void {
+        self.structured_index.deinit(allocator);
         self.trace.deinit(allocator);
         self.* = undefined;
     }
@@ -68,10 +72,29 @@ pub fn observeFile(
             &metrics,
         );
     errdefer trace.deinit(allocator);
+    var structured_index = structured.Index{};
+    errdefer structured_index.deinit(allocator);
+    const observation_result = switch (relation) {
+        .structured_documents, .structured_values => structured_result: {
+            structured_index = try structured.build(
+                allocator,
+                &trace,
+                relation == .structured_values,
+                options.structured_limits,
+            );
+            break :structured_result try structured.observe(
+                program,
+                &structured_index,
+                output,
+            );
+        },
+        else => try observeTrace(program, &trace, output),
+    };
 
     return .{
         .trace = trace,
-        .result = try observeTrace(program, &trace, output),
+        .structured_index = structured_index,
+        .result = observation_result,
         .metrics = metrics,
     };
 }
@@ -205,10 +228,9 @@ fn supported(relation: physical.Relation) bool {
         .tool_lifecycle,
         .session_edges,
         .token_events,
-        => true,
         .structured_documents,
         .structured_values,
-        => false,
+        => true,
     };
 }
 
@@ -227,7 +249,9 @@ fn traceParseOptions(
             (relation == .tool_invocations and
                 containsField(demanded_fields, 12)) or
             (relation == .tool_results and
-                containsField(demanded_fields, 10)),
+                containsField(demanded_fields, 10)) or
+            relation == .structured_documents or
+            relation == .structured_values,
         .include_token_events = relation == .token_events,
         .include_message_bodies = relation == .turns and
             (containsField(demanded_fields, 9) or

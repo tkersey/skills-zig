@@ -5,6 +5,7 @@ pub const external_input = @import("external_input.zig");
 pub const plan = @import("plan.zig");
 pub const physical = @import("physical.zig");
 pub const result = @import("result.zig");
+pub const structured = @import("structured.zig");
 pub const trace_adapter = @import("trace_adapter.zig");
 
 test {
@@ -15,5 +16,6 @@ test {
     _ = plan;
     _ = physical;
     _ = result;
+    _ = structured;
     _ = trace_adapter;
 }
