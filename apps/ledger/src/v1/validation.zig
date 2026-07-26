@@ -3038,7 +3038,7 @@ fn referencesExist(
         const references = resolve(
             item,
             plan.pointers[rule.other_pointer_id.?],
-        ) orelse return false;
+        ) orelse continue;
         switch (references) {
             .array => |array| for (array.items) |reference| {
                 reference_count += 1;
@@ -3550,7 +3550,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links","meta","universe","accepted","rejected","targets","mappings"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","links","optional_links","meta","universe","accepted","rejected","targets","mappings"]},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
@@ -3558,6 +3558,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"sorted","path":"/tags"},
         \\    {"op":"keyed-unique","path":"/items","key":"/id"},
         \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"},
+        \\    {"op":"reference-exists","path":"/optional_links","reference":"/item_refs","target":"/items","key":"/id"},
         \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
         \\    {"op":"all","path":"/items","rules":[
         \\      {"op":"exact-object","keys":["id","labels"]},
@@ -3626,7 +3627,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"]},{\"id\":\"item-2\",\"labels\":[\"b\"]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[\"a\"]},{\"id\":\"item-2\",\"labels\":[\"b\"]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"meta\":{},\"universe\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
