@@ -604,17 +604,21 @@ fn validateExistingContent(
         if (count > definition_plan.bounds.max_records) {
             return error.ExistingStoreRecordBoundsExceeded;
         }
-        try validateExistingDocument(
-            allocator,
-            validation_plan,
-            input.name,
-            line,
-        );
         if (selected_protocol) |plan| {
-            try protocol.apply(
+            try validateExistingEvent(
                 allocator,
+                validation_plan,
+                input.name,
+                input_index,
                 plan,
                 &protocol_state.?,
+                line,
+            );
+        } else {
+            try validateExistingDocument(
+                allocator,
+                validation_plan,
+                input.name,
                 line,
             );
         }
@@ -636,6 +640,32 @@ fn validateExistingDocument(
     );
     defer execution.deinit();
     if (!execution.isValid()) return error.ExistingStoreValidationFailed;
+}
+
+fn validateExistingEvent(
+    allocator: std.mem.Allocator,
+    validation_plan: *const validation.Plan,
+    input_name: []const u8,
+    input_index: u8,
+    event_protocol: *const protocol.Plan,
+    protocol_state: *protocol.ReplayState,
+    bytes: []const u8,
+) !void {
+    var execution = try validation.execute(
+        allocator,
+        validation_plan,
+        &.{.{ .name = input_name, .bytes = bytes }},
+    );
+    defer execution.deinit();
+    if (!execution.isValid()) return error.ExistingStoreValidationFailed;
+    const event = execution.inputJson(input_index) orelse
+        return error.ExistingProtocolInputMustBeJson;
+    try protocol.applyValue(
+        allocator,
+        event_protocol,
+        protocol_state,
+        event,
+    );
 }
 
 fn bindingValidationResult(

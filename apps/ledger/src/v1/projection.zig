@@ -64,6 +64,17 @@ const Limit = union(enum) {
     }
 };
 
+const Fold = struct {
+    key_field: []u8,
+    state_field: []u8,
+
+    fn deinit(self: *Fold, allocator: std.mem.Allocator) void {
+        allocator.free(self.key_field);
+        allocator.free(self.state_field);
+        self.* = undefined;
+    }
+};
+
 pub const Projection = struct {
     name: []u8,
     slot_index: u16,
@@ -71,6 +82,7 @@ pub const Projection = struct {
     fields: []Field,
     latest: ?definition_core.json_pointer.Pointer,
     limit: ?Limit,
+    fold: ?Fold,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -80,6 +92,7 @@ pub const Projection = struct {
         allocator.free(self.fields);
         if (self.latest) |*pointer| pointer.deinit(allocator);
         if (self.limit) |*limit| limit.deinit(allocator);
+        if (self.fold) |*fold| fold.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -144,6 +157,7 @@ pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
 ) !Plan {
     var projections: std.ArrayList(Projection) = .empty;
     errdefer {
@@ -155,6 +169,7 @@ pub fn compile(
             allocator,
             definition_plan,
             storage_plan,
+            event_protocol,
             source,
         );
         errdefer compiled.deinit(allocator);
@@ -171,7 +186,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
@@ -211,6 +226,11 @@ pub fn encodeCache(
         } else {
             try encoder.writeByte(0);
         }
+        try encoder.writeBool(projection.fold != null);
+        if (projection.fold) |fold| {
+            try encoder.writeBytes(fold.key_field);
+            try encoder.writeBytes(fold.state_field);
+        }
     }
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
@@ -220,7 +240,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const count = try decoder.readCount(128);
@@ -267,6 +287,7 @@ pub fn validateCachePlan(
     plan: *const Plan,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
 ) !void {
     if (plan.max_records != definition_plan.bounds.max_records or
         plan.max_output_bytes != definition_plan.bounds.max_output_bytes)
@@ -276,6 +297,21 @@ pub fn validateCachePlan(
     for (plan.projections) |projection| {
         if (projection.slot_index >= storage_plan.slots.len) {
             return error.CacheProjectionPlanMismatch;
+        }
+        if (projection.fold) |fold| {
+            if (projection.predicates.len != 0 or
+                projection.fields.len != 0 or
+                projection.latest != null or
+                !definition_plan.requires(.fold) or
+                event_protocol == null or
+                event_protocol.?.reducer_plan == null or
+                event_protocol.?.target_slot_index != projection.slot_index or
+                std.mem.eql(u8, fold.key_field, fold.state_field))
+            {
+                return error.CacheProjectionPlanMismatch;
+            }
+            try definition_core.json.safeIdentifier(fold.key_field, 128);
+            try definition_core.json.safeIdentifier(fold.state_field, 128);
         }
         for (projection.predicates) |predicate| {
             if (predicate.operand == .parameter and
@@ -389,6 +425,23 @@ fn decodeCacheProjection(
     if (limit != null and limit.? == .parameter) {
         try definition_core.json.safeIdentifier(limit.?.parameter, 128);
     }
+    var fold: ?Fold = null;
+    errdefer if (fold) |*compiled| compiled.deinit(allocator);
+    if (try decoder.readBool()) {
+        const key_field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(key_field);
+        try definition_core.json.safeIdentifier(key_field, 128);
+        const state_field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(state_field);
+        try definition_core.json.safeIdentifier(state_field, 128);
+        if (std.mem.eql(u8, key_field, state_field)) {
+            return error.CacheProjectionFieldsConflict;
+        }
+        fold = .{
+            .key_field = key_field,
+            .state_field = state_field,
+        };
+    }
     return .{
         .name = name,
         .slot_index = slot_index,
@@ -396,6 +449,7 @@ fn decodeCacheProjection(
         .fields = fields,
         .latest = latest,
         .limit = limit,
+        .fold = fold,
     };
 }
 
@@ -449,6 +503,7 @@ fn compileProjection(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
     source: definition.NamedPlan,
 ) !Projection {
     var parsed = try std.json.parseFromSlice(
@@ -487,6 +542,8 @@ fn compileProjection(
     errdefer if (latest) |*pointer| pointer.deinit(allocator);
     var limit: ?Limit = null;
     errdefer if (limit) |*value| value.deinit(allocator);
+    var fold: ?Fold = null;
+    errdefer if (fold) |*compiled| compiled.deinit(allocator);
     var selection_seen = false;
     for (steps.items) |step_value| {
         const step = try definition_core.json.object(step_value);
@@ -498,7 +555,9 @@ fn compileProjection(
         }
         switch (operator) {
             .filter, .id_lookup => {
-                if (selection_seen or latest != null or limit != null) {
+                if (selection_seen or latest != null or limit != null or
+                    fold != null)
+                {
                     return error.InvalidProjectionOperatorOrder;
                 }
                 var predicate = try compilePredicate(
@@ -511,7 +570,9 @@ fn compileProjection(
                 try predicates.append(allocator, predicate);
             },
             .latest => {
-                if (selection_seen or latest != null or limit != null) {
+                if (selection_seen or latest != null or limit != null or
+                    fold != null)
+                {
                     return error.InvalidProjectionOperatorOrder;
                 }
                 try definition_core.json.requireExactKeys(
@@ -524,7 +585,7 @@ fn compileProjection(
                 );
             },
             .select => {
-                if (selection_seen or limit != null) {
+                if (selection_seen or limit != null or fold != null) {
                     return error.InvalidProjectionOperatorOrder;
                 }
                 fields = try compileFields(
@@ -535,6 +596,49 @@ fn compileProjection(
                     step,
                 );
                 selection_seen = true;
+            },
+            .fold => {
+                if (selection_seen or predicates.items.len != 0 or
+                    latest != null or limit != null or fold != null)
+                {
+                    return error.InvalidProjectionOperatorOrder;
+                }
+                if (event_protocol == null or
+                    event_protocol.?.reducer_plan == null or
+                    event_protocol.?.target_slot_index != slot_index)
+                {
+                    return error.FoldRequiresReducerSlot;
+                }
+                try definition_core.json.requireExactKeys(
+                    step,
+                    &.{ "op", "key_field", "state_field" },
+                );
+                try definition_core.json.requireFields(
+                    step,
+                    &.{ "op", "key_field", "state_field" },
+                );
+                const key_field = try definition_core.json.requiredString(
+                    step,
+                    "key_field",
+                );
+                const state_field = try definition_core.json.requiredString(
+                    step,
+                    "state_field",
+                );
+                try definition_core.json.safeIdentifier(key_field, 128);
+                try definition_core.json.safeIdentifier(state_field, 128);
+                if (std.mem.eql(u8, key_field, state_field)) {
+                    return error.ProjectionFieldsConflict;
+                }
+                fold = fold: {
+                    const owned_key = try allocator.dupe(u8, key_field);
+                    errdefer allocator.free(owned_key);
+                    const owned_state = try allocator.dupe(u8, state_field);
+                    break :fold .{
+                        .key_field = owned_key,
+                        .state_field = owned_state,
+                    };
+                };
             },
             .limit => {
                 if (limit != null) return error.DuplicateProjectionLimit;
@@ -553,6 +657,7 @@ fn compileProjection(
         .fields = fields,
         .latest = latest,
         .limit = limit,
+        .fold = fold,
     };
 }
 
@@ -727,27 +832,44 @@ pub fn execute(
         .records_matched = 0,
         .records_emitted = 0,
     };
-    switch (slot.codec) {
-        .json => try executeDocument(
+    if (compiled.fold) |fold| {
+        const state = if (replay_stats.protocol_state) |*protocol_state|
+            &protocol_state.reducer_state
+        else
+            return error.FoldReplayStateMissing;
+        stats.records_scanned = replay_stats.records_validated;
+        stats.records_matched = state.count();
+        stats.records_emitted = try state.writeCanonicalRows(
             allocator,
-            compiled,
-            snapshot.content,
-            parameters,
+            &output,
+            fold.key_field,
+            fold.state_field,
             effective_limit,
-            &output.writer,
-            &stats,
-        ),
-        .jsonl => try executeJsonl(
-            allocator,
-            compiled,
-            snapshot.content,
-            parameters,
-            effective_limit,
-            plan.max_records,
-            &output.writer,
-            &stats,
-        ),
-        .text => return error.TextProjectionNotCompiled,
+            plan.max_output_bytes,
+        );
+    } else {
+        switch (slot.codec) {
+            .json => try executeDocument(
+                allocator,
+                compiled,
+                snapshot.content,
+                parameters,
+                effective_limit,
+                &output.writer,
+                &stats,
+            ),
+            .jsonl => try executeJsonl(
+                allocator,
+                compiled,
+                snapshot.content,
+                parameters,
+                effective_limit,
+                plan.max_records,
+                &output.writer,
+                &stats,
+            ),
+            .text => return error.TextProjectionNotCompiled,
+        }
     }
     if (output.written().len > plan.max_output_bytes) {
         return error.ProjectionOutputBoundsExceeded;
@@ -1055,6 +1177,7 @@ test "projection plan round trips through the bounded cache codec" {
         std.testing.allocator,
         &definition_plan,
         &storage_plan,
+        null,
     );
     defer plan.deinit(std.testing.allocator);
     var encoder = definition_core.cache.Encoder.init(

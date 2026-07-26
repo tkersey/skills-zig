@@ -362,19 +362,13 @@ fn validateEventEpoch(
                     return error.HistoricalEffectKindMismatch;
                 }
                 for (records.items[record_start..record_end]) |record| {
-                    try validateInput(
-                        allocator,
-                        resolved.archived,
-                        resolved.effect,
-                        record,
-                        false,
-                    );
-                    try applyHistoricalProtocol(
+                    try validateEventInput(
                         allocator,
                         &protocol_state,
                         protocol_required,
                         resolved,
                         record,
+                        false,
                     );
                 }
             },
@@ -383,19 +377,13 @@ fn validateEventEpoch(
                     if (record_end != record_start + 1) {
                         return error.StoreBindingRecordCountMismatch;
                     }
-                    try validateInput(
-                        allocator,
-                        resolved.archived,
-                        resolved.effect,
-                        content[row.extent_start..row.extent_end],
-                        true,
-                    );
-                    try applyHistoricalProtocol(
+                    try validateEventInput(
                         allocator,
                         &protocol_state,
                         protocol_required,
                         resolved,
                         content[row.extent_start..row.extent_end],
+                        true,
                     );
                 },
                 .create_new, .compare_replace => {
@@ -432,28 +420,6 @@ fn validateEventEpoch(
         .records_validated = records.items.len,
         .protocol_state = protocol_state,
     };
-}
-
-fn applyHistoricalProtocol(
-    allocator: std.mem.Allocator,
-    state: *?protocol.ReplayState,
-    protocol_required: bool,
-    resolved: ResolvedEffect,
-    record: []const u8,
-) !void {
-    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
-        if (plan.target_slot_index == resolved.effect.slot_index)
-            plan
-        else
-            null
-    else
-        null;
-    if ((historical_plan != null) != protocol_required) {
-        return error.HistoricalProtocolBindingMismatch;
-    }
-    const plan = historical_plan orelse return;
-    if (state.* == null) state.* = protocol.ReplayState.init(plan);
-    try protocol.apply(allocator, plan, &state.*.?, record);
 }
 
 fn validateBoundExtent(
@@ -502,6 +468,54 @@ fn validateInput(
     if (!std.mem.eql(u8, canonical, bytes)) {
         return error.HistoricalArtifactNotCanonical;
     }
+}
+
+fn validateEventInput(
+    allocator: std.mem.Allocator,
+    protocol_state: *?protocol.ReplayState,
+    protocol_required: bool,
+    resolved: ResolvedEffect,
+    bytes: []const u8,
+    require_canonical: bool,
+) !void {
+    const input =
+        resolved.archived.definition_plan.inputs[resolved.effect.input_index];
+    var execution = try validation.execute(
+        allocator,
+        &resolved.archived.validation_plan,
+        &.{.{ .name = input.name, .bytes = bytes }},
+    );
+    defer execution.deinit();
+    if (!execution.isValid()) return error.HistoricalArtifactInvalid;
+    if (require_canonical) {
+        const canonical = try materialization.canonicalizeInputAlloc(
+            allocator,
+            &execution,
+            resolved.effect.input_index,
+            input.codec,
+        );
+        defer allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, bytes)) {
+            return error.HistoricalArtifactNotCanonical;
+        }
+    }
+    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
+        if (plan.target_slot_index == resolved.effect.slot_index)
+            plan
+        else
+            null
+    else
+        null;
+    if ((historical_plan != null) != protocol_required) {
+        return error.HistoricalProtocolBindingMismatch;
+    }
+    const plan = historical_plan orelse return;
+    const event = execution.inputJson(resolved.effect.input_index) orelse
+        return error.HistoricalProtocolInputMustBeJson;
+    if (protocol_state.* == null) {
+        protocol_state.* = protocol.ReplayState.init(plan);
+    }
+    try protocol.applyValue(allocator, plan, &protocol_state.*.?, event);
 }
 
 fn findEffectForSlot(

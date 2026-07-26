@@ -81,6 +81,54 @@ pub const State = struct {
     pub fn count(self: *const State) usize {
         return self.entries.count();
     }
+
+    pub fn writeCanonicalRows(
+        self: *State,
+        allocator: std.mem.Allocator,
+        output: *std.Io.Writer.Allocating,
+        key_field: []const u8,
+        state_field: []const u8,
+        limit: usize,
+        max_output_bytes: usize,
+    ) !usize {
+        try definition_core.json.safeIdentifier(key_field, 128);
+        try definition_core.json.safeIdentifier(state_field, 128);
+        if (std.mem.eql(u8, key_field, state_field)) {
+            return error.ReducerProjectionFieldsConflict;
+        }
+        const values = try allocator.alloc(*const Entry, self.entries.count());
+        defer allocator.free(values);
+        var iterator = self.entries.valueIterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            values[index] = entry;
+        }
+        std.mem.sort(*const Entry, values, {}, entryLessThan);
+        const emitted = @min(limit, values.len);
+        try output.writer.writeByte('[');
+        for (values[0..emitted], 0..) |entry, row_index| {
+            if (row_index != 0) try output.writer.writeByte(',');
+            try output.writer.writeByte('{');
+            if (std.mem.order(u8, key_field, state_field) == .lt) {
+                try writeField(&output.writer, key_field, entry.key());
+                try output.writer.writeByte(',');
+                try writeField(&output.writer, state_field, entry.state());
+            } else {
+                try writeField(&output.writer, state_field, entry.state());
+                try output.writer.writeByte(',');
+                try writeField(&output.writer, key_field, entry.key());
+            }
+            try output.writer.writeByte('}');
+            if (output.written().len > max_output_bytes) {
+                return error.ReducerProjectionOutputBoundsExceeded;
+            }
+        }
+        try output.writer.writeByte(']');
+        if (output.written().len > max_output_bytes) {
+            return error.ReducerProjectionOutputBoundsExceeded;
+        }
+        return emitted;
+    }
 };
 
 pub fn compile(
@@ -284,7 +332,7 @@ pub fn apply(
             return error.ReducerToAssertionMismatch;
         }
     }
-    if (prior == null and state.entries.count() == plan.max_entries) {
+    if (prior == null and state.entries.count() >= plan.max_entries) {
         return error.ReducerStateBoundsExceeded;
     }
     const result = try state.entries.getOrPut(allocator, key_digest);
@@ -654,6 +702,20 @@ fn stringLessThan(_: void, left: []u8, right: []u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
 
+fn entryLessThan(_: void, left: *const Entry, right: *const Entry) bool {
+    return std.mem.lessThan(u8, left.key(), right.key());
+}
+
+fn writeField(
+    writer: *std.Io.Writer,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    try definition_core.canonical_json.writeCanonicalString(writer, name);
+    try writer.writeByte(':');
+    try definition_core.canonical_json.writeCanonicalString(writer, value);
+}
+
 test "compiled reducer admits deterministic keyed transitions" {
     const table_rule: definition.Rule = .{
         .operator = .transition_table,
@@ -673,7 +735,7 @@ test "compiled reducer admits deterministic keyed transitions" {
         std.testing.allocator,
         table_rule,
         reducer_rule,
-        1,
+        2,
     );
     defer plan.deinit(std.testing.allocator);
     var state: State = .{};
@@ -724,8 +786,49 @@ test "compiled reducer admits deterministic keyed transitions" {
         .{},
     );
     defer second_key.deinit();
+    try apply(std.testing.allocator, &plan, &state, second_key.value);
+    var projection: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer projection.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try state.writeCanonicalRows(
+            std.testing.allocator,
+            &projection,
+            "id",
+            "status",
+            2,
+            4096,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "[{\"id\":\"item-1\",\"status\":\"closed\"},{\"id\":\"item-2\",\"status\":\"open\"}]",
+        projection.written(),
+    );
+    var third_key = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"event\":\"create\",\"from\":null,\"id\":\"item-3\",\"to\":\"open\"}",
+        .{},
+    );
+    defer third_key.deinit();
+    var constrained_plan = try compile(
+        std.testing.allocator,
+        table_rule,
+        reducer_rule,
+        1,
+    );
+    defer constrained_plan.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.ReducerStateBoundsExceeded,
-        apply(std.testing.allocator, &plan, &state, second_key.value),
+        apply(
+            std.testing.allocator,
+            &constrained_plan,
+            &state,
+            third_key.value,
+        ),
+    );
+    try std.testing.expectError(
+        error.ReducerStateBoundsExceeded,
+        apply(std.testing.allocator, &plan, &state, third_key.value),
     );
 }

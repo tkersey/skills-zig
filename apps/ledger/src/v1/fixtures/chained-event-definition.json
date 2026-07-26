@@ -12,6 +12,7 @@
       "event-envelope",
       "event-kinds",
       "exact-object",
+      "fold",
       "idempotency-key",
       "limit",
       "previous-digest",
@@ -161,6 +162,20 @@
             "kind": "/kind",
             "status": "/body/status"
           }
+        },
+        {
+          "op": "limit",
+          "count": 3
+        }
+      ]
+    },
+    "current": {
+      "slot": "events",
+      "pipeline": [
+        {
+          "op": "fold",
+          "key_field": "id",
+          "state_field": "status"
         },
         {
           "op": "limit",

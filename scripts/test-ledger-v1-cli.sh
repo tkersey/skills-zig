@@ -161,6 +161,12 @@ chained_check=$("$binary" definition check \
   --format json)
 grep -Fq '"valid":true' <<<"$chained_check"
 
+chained_warm_check=$("$binary" definition check \
+  --definition "$chained_definition" \
+  --format json)
+grep -Fq '"valid":true' <<<"$chained_warm_check"
+grep -Fq '"cache_hit":true' <<<"$chained_warm_check"
+
 chained_first=$("$binary" transact \
   --definition "$chained_definition" \
   --operation append \
@@ -223,6 +229,24 @@ chained_projection=$("$binary" project \
 grep -Fq \
   '"data":[{"kind":"created","status":"open"},{"kind":"updated","status":"closed"}]' \
   <<<"$chained_projection"
+
+chained_current=$("$binary" project \
+  --definition "$chained_definition" \
+  --projection current \
+  --repo "$protocol_repo" \
+  --format json)
+grep -Fq '"data":[{"id":"item-1","status":"closed"}]' <<<"$chained_current"
+grep -Fq \
+  '"stats":{"records_scanned":2,"records_matched":1,"records_emitted":1}' \
+  <<<"$chained_current"
+
+chained_current_warm=$("$binary" project \
+  --definition "$chained_definition" \
+  --projection current \
+  --repo "$protocol_repo" \
+  --format json)
+grep -Fq '"data":[{"id":"item-1","status":"closed"}]' <<<"$chained_current_warm"
+grep -Fq '"cache_hit":true' <<<"$chained_current_warm"
 
 chained_doctor=$("$binary" doctor \
   --definition "$chained_definition" \
