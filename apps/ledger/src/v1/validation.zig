@@ -106,12 +106,37 @@ const CompiledFormatPart = union(enum) {
     }
 };
 
+const RegexQuantifier = enum {
+    one,
+    zero_or_one,
+    zero_or_more,
+    one_or_more,
+};
+
+const CompiledRegexAtom = struct {
+    bytes: [4]u64,
+    quantifier: RegexQuantifier,
+};
+
+const CompiledRegexPattern = struct {
+    atoms: []CompiledRegexAtom,
+
+    fn deinit(
+        self: *CompiledRegexPattern,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.atoms);
+        self.* = undefined;
+    }
+};
+
 const CompiledReferenceTarget = struct {
     pointer_id: u16,
     items_pointer_id: ?u16 = null,
     key_pointer_id: ?u16 = null,
     coverage_key_pointer_id: ?u16 = null,
     rules: []CompiledRule,
+    match_rules: []CompiledRule,
     coverage_rules: []CompiledRule,
     format_parts: []CompiledFormatPart,
 
@@ -121,6 +146,8 @@ const CompiledReferenceTarget = struct {
     ) void {
         for (self.rules) |*rule| rule.deinit(allocator);
         allocator.free(self.rules);
+        for (self.match_rules) |*rule| rule.deinit(allocator);
+        allocator.free(self.match_rules);
         for (self.coverage_rules) |*rule| rule.deinit(allocator);
         allocator.free(self.coverage_rules);
         for (self.format_parts) |*part| part.deinit(allocator);
@@ -132,12 +159,15 @@ const CompiledReferenceTarget = struct {
 const CompiledReferenceSource = struct {
     pointer_id: u16,
     reference_pointer_id: u16,
+    rules: []CompiledRule,
     format_parts: []CompiledFormatPart,
 
     fn deinit(
         self: *CompiledReferenceSource,
         allocator: std.mem.Allocator,
     ) void {
+        for (self.rules) |*rule| rule.deinit(allocator);
+        allocator.free(self.rules);
         for (self.format_parts) |*part| part.deinit(allocator);
         allocator.free(self.format_parts);
         self.* = undefined;
@@ -165,6 +195,7 @@ const CompiledRule = struct {
     identifier_style: IdentifierStyle = .portable,
     allow_root: bool = true,
     case_insensitive: bool = false,
+    allow_additional: bool = false,
     total_coverage: bool = false,
     reject_self_reference: bool = false,
     ignore_null_references: bool = false,
@@ -172,6 +203,7 @@ const CompiledRule = struct {
     coverage_children: []CompiledRule,
     variants: []CompiledVariant,
     format_parts: []CompiledFormatPart,
+    regex_patterns: []CompiledRegexPattern,
     reference_sources: []CompiledReferenceSource,
     reference_targets: []CompiledReferenceTarget,
 
@@ -191,6 +223,8 @@ const CompiledRule = struct {
         allocator.free(self.variants);
         for (self.format_parts) |*part| part.deinit(allocator);
         allocator.free(self.format_parts);
+        for (self.regex_patterns) |*pattern| pattern.deinit(allocator);
+        allocator.free(self.regex_patterns);
         for (self.reference_sources) |*source| source.deinit(allocator);
         allocator.free(self.reference_sources);
         for (self.reference_targets) |*target| target.deinit(allocator);
@@ -290,6 +324,10 @@ const Builder = struct {
             .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+            .regex_patterns = try self.allocator.alloc(
+                CompiledRegexPattern,
+                0,
+            ),
             .reference_sources = try self.allocator.alloc(
                 CompiledReferenceSource,
                 0,
@@ -370,6 +408,21 @@ const Builder = struct {
                     return error.InvalidRuleBounds;
                 }
             },
+            .regex => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "input", "path", "patterns", "max" },
+                );
+                rule.max_count = try optionalUnsigned(object, "max") orelse
+                    return error.MissingRegexBound;
+                if (rule.max_count.? == 0 or rule.max_count.? > 4096) {
+                    return error.InvalidRegexBound;
+                }
+                rule.regex_patterns = try compileRegexPatterns(
+                    self.allocator,
+                    try definition_core.json.field(object, "patterns"),
+                );
+            },
             .safe_identifier => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -437,6 +490,77 @@ const Builder = struct {
                     }
                     rule.path_ids = try self.allocator.alloc(u16, 1);
                     rule.path_ids[0] = scope;
+                }
+            },
+            .declared_field_values => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{
+                        "op",
+                        "input",
+                        "path",
+                        "object",
+                        "declarations",
+                        "declaration_paths",
+                        "type",
+                        "min",
+                        "max",
+                    },
+                );
+                try definition_core.json.requireFields(
+                    object,
+                    &.{
+                        "op",
+                        "path",
+                        "object",
+                        "declarations",
+                        "declaration_paths",
+                        "type",
+                    },
+                );
+                if (source.pointer_id == null) {
+                    return error.DeclaredFieldCollectionMissing;
+                }
+                rule.other_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(object, "object"),
+                );
+                const declaration_pointer_id = try self.internPointer(
+                    try definition_core.json.requiredString(
+                        object,
+                        "declarations",
+                    ),
+                );
+                const declaration_paths = try self.parsePaths(
+                    try definition_core.json.field(
+                        object,
+                        "declaration_paths",
+                    ),
+                );
+                defer self.allocator.free(declaration_paths);
+                rule.path_ids = try self.allocator.alloc(
+                    u16,
+                    declaration_paths.len + 1,
+                );
+                rule.path_ids[0] = declaration_pointer_id;
+                @memcpy(rule.path_ids[1..], declaration_paths);
+                rule.scalar_kind = try JsonKind.parse(
+                    try definition_core.json.requiredString(object, "type"),
+                );
+                if (rule.scalar_kind.? != .integer and
+                    rule.scalar_kind.? != .number)
+                {
+                    return error.DeclaredFieldValueTypeUnsupported;
+                }
+                rule.min_number = try optionalNumber(object, "min");
+                rule.max_number = try optionalNumber(object, "max");
+                if (rule.min_number == null and rule.max_number == null) {
+                    return error.MissingRuleBound;
+                }
+                if (rule.min_number != null and
+                    rule.max_number != null and
+                    rule.min_number.? > rule.max_number.?)
+                {
+                    return error.InvalidRuleBounds;
                 }
             },
             .cross_input_equal => {
@@ -690,7 +814,10 @@ const Builder = struct {
                         return error.ConflictingReferenceSources;
                     }
                     rule.reference_sources =
-                        try self.compileReferenceSources(raw_sources);
+                        try self.compileReferenceSources(
+                            raw_sources,
+                            input_index,
+                        );
                 } else {
                     try definition_core.json.requireFields(
                         object,
@@ -802,7 +929,8 @@ const Builder = struct {
     fn compileReferenceSources(
         self: *Builder,
         raw: std.json.Value,
-    ) ![]CompiledReferenceSource {
+        input_index: u8,
+    ) anyerror![]CompiledReferenceSource {
         const items = try definition_core.json.array(raw);
         if (items.items.len == 0 or items.items.len > 64) {
             return error.ReferenceSourceCountInvalid;
@@ -822,7 +950,7 @@ const Builder = struct {
             const object = try definition_core.json.object(item);
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "path", "reference", "fragments" },
+                &.{ "path", "reference", "fragments", "rules" },
             );
             try definition_core.json.requireFields(
                 object,
@@ -840,12 +968,20 @@ const Builder = struct {
                         ),
                     ),
                 ),
+                .rules = try self.allocator.alloc(CompiledRule, 0),
                 .format_parts = try self.allocator.alloc(
                     CompiledFormatPart,
                     0,
                 ),
             };
             errdefer source.deinit(self.allocator);
+            if (object.get("rules")) |raw_rules| {
+                source.rules = try self.compileItemRules(
+                    raw_rules,
+                    input_index,
+                    0,
+                );
+            }
             if (object.get("fragments")) |raw_fragments| {
                 source.format_parts = try self.compileFormatParts(
                     raw_fragments,
@@ -889,6 +1025,7 @@ const Builder = struct {
                     "coverage_key",
                     "fragments",
                     "rules",
+                    "match_rules",
                     "coverage_rules",
                 },
             );
@@ -923,6 +1060,7 @@ const Builder = struct {
                 else
                     null,
                 .rules = try self.allocator.alloc(CompiledRule, 0),
+                .match_rules = try self.allocator.alloc(CompiledRule, 0),
                 .coverage_rules = try self.allocator.alloc(CompiledRule, 0),
                 .format_parts = try self.allocator.alloc(
                     CompiledFormatPart,
@@ -932,6 +1070,13 @@ const Builder = struct {
             errdefer target.deinit(self.allocator);
             if (object.get("rules")) |raw_rules| {
                 target.rules = try self.compileItemRules(
+                    raw_rules,
+                    input_index,
+                    0,
+                );
+            }
+            if (object.get("match_rules")) |raw_rules| {
+                target.match_rules = try self.compileItemRules(
                     raw_rules,
                     input_index,
                     0,
@@ -1124,6 +1269,10 @@ const Builder = struct {
             .coverage_children = try self.allocator.alloc(CompiledRule, 0),
             .variants = try self.allocator.alloc(CompiledVariant, 0),
             .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+            .regex_patterns = try self.allocator.alloc(
+                CompiledRegexPattern,
+                0,
+            ),
             .reference_sources = try self.allocator.alloc(
                 CompiledReferenceSource,
                 0,
@@ -1221,6 +1370,21 @@ const Builder = struct {
                 {
                     return error.InvalidRuleBounds;
                 }
+            },
+            .regex => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path", "patterns", "max" },
+                );
+                rule.max_count = try optionalUnsigned(object, "max") orelse
+                    return error.MissingRegexBound;
+                if (rule.max_count.? == 0 or rule.max_count.? > 4096) {
+                    return error.InvalidRegexBound;
+                }
+                rule.regex_patterns = try compileRegexPatterns(
+                    self.allocator,
+                    try definition_core.json.field(object, "patterns"),
+                );
             },
             .safe_identifier => {
                 try definition_core.json.requireExactKeys(
@@ -1543,7 +1707,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(17);
+    try encoder.writeU16(22);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -1575,7 +1739,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 17) {
+    if (try decoder.readU16() != 22) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -1719,6 +1883,17 @@ fn validateRuleAgainstDefinition(
                 definition_plan,
             );
         }
+        for (target.match_rules) |match_rule| {
+            if (match_rule.input_index != rule.other_input_index.? or
+                !isItemOperator(match_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+            try validateRuleAgainstDefinition(
+                match_rule,
+                definition_plan,
+            );
+        }
         for (target.coverage_rules) |coverage_rule| {
             if (coverage_rule.input_index != rule.other_input_index.? or
                 !isItemOperator(coverage_rule.operator))
@@ -1727,6 +1902,19 @@ fn validateRuleAgainstDefinition(
             }
             try validateRuleAgainstDefinition(
                 coverage_rule,
+                definition_plan,
+            );
+        }
+    }
+    for (rule.reference_sources) |source| {
+        for (source.rules) |source_rule| {
+            if (source_rule.input_index != rule.input_index or
+                !isItemOperator(source_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+            try validateRuleAgainstDefinition(
+                source_rule,
                 definition_plan,
             );
         }
@@ -1833,6 +2021,7 @@ fn encodeCompiledRule(
     try encoder.writeEnum(rule.identifier_style);
     try encoder.writeBool(rule.allow_root);
     try encoder.writeBool(rule.case_insensitive);
+    try encoder.writeBool(rule.allow_additional);
     try encoder.writeBool(rule.total_coverage);
     try encoder.writeBool(rule.reject_self_reference);
     try encoder.writeBool(rule.ignore_null_references);
@@ -1861,10 +2050,22 @@ fn encodeCompiledRule(
         }
     }
     try encodeCompiledFormatParts(encoder, rule.format_parts);
+    try encoder.writeCount(rule.regex_patterns.len);
+    for (rule.regex_patterns) |pattern| {
+        try encoder.writeCount(pattern.atoms.len);
+        for (pattern.atoms) |atom| {
+            for (atom.bytes) |word| try encoder.writeU64(word);
+            try encoder.writeEnum(atom.quantifier);
+        }
+    }
     try encoder.writeCount(rule.reference_sources.len);
     for (rule.reference_sources) |source| {
         try encoder.writeU16(source.pointer_id);
         try encoder.writeU16(source.reference_pointer_id);
+        try encoder.writeCount(source.rules.len);
+        for (source.rules) |source_rule| {
+            try encodeCompiledRule(encoder, source_rule, depth);
+        }
         try encodeCompiledFormatParts(encoder, source.format_parts);
     }
     try encoder.writeCount(rule.reference_targets.len);
@@ -1876,6 +2077,10 @@ fn encodeCompiledRule(
         try encoder.writeCount(target.rules.len);
         for (target.rules) |target_rule| {
             try encodeCompiledRule(encoder, target_rule, depth);
+        }
+        try encoder.writeCount(target.match_rules.len);
+        for (target.match_rules) |match_rule| {
+            try encodeCompiledRule(encoder, match_rule, depth);
         }
         try encoder.writeCount(target.coverage_rules.len);
         for (target.coverage_rules) |coverage_rule| {
@@ -2000,6 +2205,7 @@ fn decodeCacheRule(
     const identifier_style = try decoder.readEnum(IdentifierStyle);
     const allow_root = try decoder.readBool();
     const case_insensitive = try decoder.readBool();
+    const allow_additional = try decoder.readBool();
     const total_coverage = try decoder.readBool();
     const reject_self_reference = try decoder.readBool();
     const ignore_null_references = try decoder.readBool();
@@ -2081,6 +2287,14 @@ fn decodeCacheRule(
         for (format_parts) |*part| part.deinit(allocator);
         allocator.free(format_parts);
     }
+    const regex_patterns = try decodeCompiledRegexPatterns(
+        allocator,
+        decoder,
+    );
+    errdefer {
+        for (regex_patterns) |*pattern| pattern.deinit(allocator);
+        allocator.free(regex_patterns);
+    }
     const reference_source_count = try decoder.readCount(64);
     const reference_sources = try allocator.alloc(
         CompiledReferenceSource,
@@ -2094,9 +2308,28 @@ fn decodeCacheRule(
         allocator.free(reference_sources);
     }
     for (reference_sources) |*source| {
+        const source_pointer_id = try decoder.readU16();
+        const reference_pointer_id = try decoder.readU16();
+        const source_rules = try decodeCacheRules(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth + 1,
+            total_rule_count,
+            plan_depth,
+            imported_plan_count,
+        );
+        errdefer {
+            for (source_rules) |*source_rule| {
+                source_rule.deinit(allocator);
+            }
+            allocator.free(source_rules);
+        }
         source.* = .{
-            .pointer_id = try decoder.readU16(),
-            .reference_pointer_id = try decoder.readU16(),
+            .pointer_id = source_pointer_id,
+            .reference_pointer_id = reference_pointer_id,
+            .rules = source_rules,
             .format_parts = try decodeCompiledFormatParts(
                 allocator,
                 decoder,
@@ -2137,6 +2370,22 @@ fn decodeCacheRule(
             }
             allocator.free(target_rules);
         }
+        const match_rules = try decodeCacheRules(
+            allocator,
+            decoder,
+            input_count,
+            pointer_count,
+            depth + 1,
+            total_rule_count,
+            plan_depth,
+            imported_plan_count,
+        );
+        errdefer {
+            for (match_rules) |*match_rule| {
+                match_rule.deinit(allocator);
+            }
+            allocator.free(match_rules);
+        }
         const coverage_rules = try decodeCacheRules(
             allocator,
             decoder,
@@ -2165,6 +2414,7 @@ fn decodeCacheRule(
             .key_pointer_id = key_pointer_id,
             .coverage_key_pointer_id = coverage_key_pointer_id,
             .rules = target_rules,
+            .match_rules = match_rules,
             .coverage_rules = coverage_rules,
             .format_parts = target_format_parts,
         };
@@ -2206,6 +2456,7 @@ fn decodeCacheRule(
         .identifier_style = identifier_style,
         .allow_root = allow_root,
         .case_insensitive = case_insensitive,
+        .allow_additional = allow_additional,
         .total_coverage = total_coverage,
         .reject_self_reference = reject_self_reference,
         .ignore_null_references = ignore_null_references,
@@ -2213,6 +2464,7 @@ fn decodeCacheRule(
         .coverage_children = coverage_children,
         .variants = variants,
         .format_parts = format_parts,
+        .regex_patterns = regex_patterns,
         .reference_sources = reference_sources,
         .reference_targets = reference_targets,
     };
@@ -2258,6 +2510,45 @@ fn decodeCompiledFormatParts(
         initialized += 1;
     }
     return parts;
+}
+
+fn decodeCompiledRegexPatterns(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]CompiledRegexPattern {
+    const count = try decoder.readCount(32);
+    if (count == 0) return allocator.alloc(CompiledRegexPattern, 0);
+    const patterns = try allocator.alloc(CompiledRegexPattern, count);
+    var initialized: usize = 0;
+    var total_atoms: usize = 0;
+    errdefer {
+        for (patterns[0..initialized]) |*pattern| {
+            pattern.deinit(allocator);
+        }
+        allocator.free(patterns);
+    }
+    for (patterns) |*pattern| {
+        const atom_count = try decoder.readCount(255);
+        if (atom_count == 0) return error.CacheRegexPatternInvalid;
+        total_atoms = std.math.add(
+            usize,
+            total_atoms,
+            atom_count,
+        ) catch return error.CacheRegexPatternInvalid;
+        if (total_atoms > 256) return error.CacheRegexPatternInvalid;
+        const atoms = try allocator.alloc(CompiledRegexAtom, atom_count);
+        errdefer allocator.free(atoms);
+        for (atoms) |*atom| {
+            for (&atom.bytes) |*word| word.* = try decoder.readU64();
+            atom.quantifier = try decoder.readEnum(RegexQuantifier);
+            if (regexByteSetEmpty(atom.bytes)) {
+                return error.CacheRegexPatternInvalid;
+            }
+        }
+        pattern.* = .{ .atoms = atoms };
+        initialized += 1;
+    }
+    return patterns;
 }
 
 fn decodePathIds(
@@ -2388,6 +2679,34 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
+        .regex => if (rule.max_count == null or
+            rule.max_count.? == 0 or
+            rule.max_count.? > 4096 or
+            rule.regex_patterns.len == 0 or
+            rule.regex_patterns.len > 32)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        } else {
+            var total_atoms: usize = 0;
+            for (rule.regex_patterns) |pattern| {
+                if (pattern.atoms.len == 0 or pattern.atoms.len > 255) {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+                total_atoms = std.math.add(
+                    usize,
+                    total_atoms,
+                    pattern.atoms.len,
+                ) catch return error.CacheRuleConfigurationInvalid;
+                if (total_atoms > 256) {
+                    return error.CacheRuleConfigurationInvalid;
+                }
+                for (pattern.atoms) |atom| {
+                    if (regexByteSetEmpty(atom.bytes)) {
+                        return error.CacheRuleConfigurationInvalid;
+                    }
+                }
+            }
+        },
         .bounded_number => if (rule.min_number == null and
             rule.max_number == null)
         {
@@ -2430,6 +2749,16 @@ fn validateCachedRule(
         },
         .keyed_unique => if (rule.pointer_id == null or
             rule.other_pointer_id == null)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .declared_field_values => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or
+            rule.path_ids.len < 2 or
+            rule.scalar_kind == null or
+            (rule.scalar_kind.? != .integer and
+                rule.scalar_kind.? != .number) or
+            (rule.min_number == null and rule.max_number == null))
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -2542,6 +2871,9 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
+    if (rule.operator != .exact_object and rule.allow_additional) {
+        return error.CacheRuleConfigurationInvalid;
+    }
     if (rule.operator != .exact_object and rule.optional_keys.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
@@ -2568,6 +2900,9 @@ fn validateCachedRule(
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .path_format and rule.format_parts.len != 0) {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.operator != .regex and rule.regex_patterns.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .reference_exists and
@@ -2650,6 +2985,18 @@ fn validateCachedRule(
             pointer_count,
             true,
         );
+        for (source.rules) |source_rule| {
+            if (source_rule.input_index != rule.input_index or
+                !isItemOperator(source_rule.operator))
+            {
+                return error.CacheRuleConfigurationInvalid;
+            }
+            try validateCachedRule(
+                source_rule,
+                input_count,
+                pointer_count,
+            );
+        }
     }
     for (rule.variants, 0..) |variant, index| {
         if ((rule.other_pointer_id == null and
@@ -2714,6 +3061,7 @@ fn validateCachedReferenceTarget(
         ((target.key_pointer_id == null) ==
             (target.format_parts.len == 0)) or
         target.rules.len > 64 or
+        target.match_rules.len > 64 or
         target.coverage_rules.len > 64 or
         (target.coverage_rules.len != 0 and !total_coverage))
     {
@@ -2725,6 +3073,14 @@ fn validateCachedReferenceTarget(
         false,
     );
     for (target.rules) |rule| {
+        if (rule.input_index != input_index or
+            !isItemOperator(rule.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        try validateCachedRule(rule, input_count, pointer_count);
+    }
+    for (target.match_rules) |rule| {
         if (rule.input_index != input_index or
             !isItemOperator(rule.operator))
         {
@@ -3126,6 +3482,7 @@ fn applyRule(
         .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
+        .regex => if (target) |value| regexHolds(value, rule) else false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
         .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
         .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
@@ -3142,6 +3499,16 @@ fn applyRule(
                 value,
                 plan.pointers[rule.other_pointer_id.?],
                 plan.max_records,
+            )
+        else
+            false,
+        .declared_field_values => if (target) |value|
+            try declaredFieldValuesHold(
+                allocator,
+                plan,
+                root,
+                rule,
+                value,
             )
         else
             false,
@@ -3419,6 +3786,7 @@ fn itemRuleHolds(
         .exact_object => if (target) |value| exactObject(value, rule) else false,
         .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
+        .regex => if (target) |value| regexHolds(value, rule) else false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
         .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
         .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
@@ -3762,11 +4130,13 @@ fn exactObject(value: std.json.Value, rule: CompiledRule) bool {
         else => return false,
     };
     if (object.count() < rule.keys.len or
-        object.count() > rule.keys.len + rule.optional_keys.len)
+        (!rule.allow_additional and
+            object.count() > rule.keys.len + rule.optional_keys.len))
     {
         return false;
     }
     for (rule.keys) |key| if (!object.contains(key)) return false;
+    if (rule.allow_additional) return true;
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         if (!containsString(rule.keys, entry.key_ptr.*) and
@@ -3802,10 +4172,150 @@ fn boundedString(value: std.json.Value, rule: CompiledRule) bool {
     return true;
 }
 
+fn regexHolds(value: std.json.Value, rule: CompiledRule) bool {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return false,
+    };
+    if (text.len > rule.max_count.?) return false;
+    for (rule.regex_patterns) |pattern| {
+        if (compiledRegexMatches(text, pattern)) return true;
+    }
+    return false;
+}
+
+fn compiledRegexMatches(
+    text: []const u8,
+    pattern: CompiledRegexPattern,
+) bool {
+    var active: [4]u64 = @splat(0);
+    regexStateSet(&active, 0);
+    regexEpsilonClosure(pattern, &active);
+    for (text) |byte| {
+        var next: [4]u64 = @splat(0);
+        for (pattern.atoms, 0..) |atom, index| {
+            if (!regexStateContains(active, index) or
+                !regexByteSetContains(atom.bytes, byte))
+            {
+                continue;
+            }
+            switch (atom.quantifier) {
+                .one, .zero_or_one => regexStateSet(&next, index + 1),
+                .zero_or_more, .one_or_more => {
+                    regexStateSet(&next, index);
+                    regexStateSet(&next, index + 1);
+                },
+            }
+        }
+        active = next;
+        regexEpsilonClosure(pattern, &active);
+    }
+    regexEpsilonClosure(pattern, &active);
+    return regexStateContains(active, pattern.atoms.len);
+}
+
+fn regexEpsilonClosure(
+    pattern: CompiledRegexPattern,
+    states: *[4]u64,
+) void {
+    for (pattern.atoms, 0..) |atom, index| {
+        if (!regexStateContains(states.*, index)) continue;
+        switch (atom.quantifier) {
+            .zero_or_one, .zero_or_more => {
+                regexStateSet(states, index + 1);
+            },
+            .one, .one_or_more => {},
+        }
+    }
+}
+
+fn regexStateSet(states: *[4]u64, state: usize) void {
+    const word = state / 64;
+    const bit: u6 = @intCast(state % 64);
+    states[word] |= @as(u64, 1) << bit;
+}
+
+fn regexStateContains(states: [4]u64, state: usize) bool {
+    const word = state / 64;
+    const bit: u6 = @intCast(state % 64);
+    return states[word] & (@as(u64, 1) << bit) != 0;
+}
+
 fn boundedNumber(value: std.json.Value, rule: CompiledRule) bool {
     const number = jsonNumber(value) orelse return false;
     if (rule.min_number) |minimum| if (number < minimum) return false;
     if (rule.max_number) |maximum| if (number > maximum) return false;
+    return true;
+}
+
+fn declaredFieldValuesHold(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+    target_value: std.json.Value,
+) !bool {
+    const targets = switch (target_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    const declarations_value = resolve(
+        root,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    const declarations = switch (declarations_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (targets.len > plan.max_records or
+        declarations.len > plan.max_records)
+    {
+        return false;
+    }
+
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(allocator);
+    for (declarations) |declaration| {
+        var name: ?[]const u8 = null;
+        for (rule.path_ids[1..]) |pointer_id| {
+            const candidate = resolve(
+                declaration,
+                plan.pointers[pointer_id],
+            ) orelse continue;
+            const text = switch (candidate) {
+                .string => |value| value,
+                else => return false,
+            };
+            if (text.len == 0 or name != null) return false;
+            name = text;
+        }
+        const declaration_name = name orelse return false;
+        const entry = try names.getOrPut(allocator, declaration_name);
+        if (entry.found_existing) return false;
+    }
+
+    for (targets) |target| {
+        const fields_value = resolve(
+            target,
+            plan.pointers[rule.other_pointer_id.?],
+        ) orelse return false;
+        const fields = switch (fields_value) {
+            .object => |object| object,
+            else => return false,
+        };
+        var matched: usize = 0;
+        var iterator = fields.iterator();
+        while (iterator.next()) |entry| {
+            if (!names.contains(entry.key_ptr.*)) continue;
+            if (!valueHasKind(entry.value_ptr.*, rule.scalar_kind.?) or
+                !boundedNumber(entry.value_ptr.*, rule))
+            {
+                return false;
+            }
+            matched += 1;
+        }
+        if (matched != names.count()) return false;
+    }
     return true;
 }
 
@@ -3984,6 +4494,7 @@ const ReferenceTarget = struct {
     key: ReferenceKey,
     required: bool,
     ungrouped_required: bool,
+    match_allowed: bool,
     referenced: bool = false,
 };
 
@@ -4033,10 +4544,12 @@ fn referencesExist(
         source_count = source_items.len;
         if (source_count > plan.max_records or
             !try markReferencesFromItems(
+                allocator,
                 plan,
                 rule,
                 source_items,
                 rule.other_pointer_id.?,
+                &.{},
                 &.{},
                 &index,
                 &reference_count,
@@ -4063,10 +4576,12 @@ fn referencesExist(
             ) catch return false;
             if (source_count > plan.max_records or
                 !try markReferencesFromItems(
+                    allocator,
                     plan,
                     rule,
                     items,
                     source.reference_pointer_id,
+                    source.rules,
                     source.format_parts,
                     &index,
                     &reference_count,
@@ -4089,15 +4604,22 @@ fn referencesExist(
 }
 
 fn markReferencesFromItems(
+    allocator: std.mem.Allocator,
     plan: *const Plan,
     rule: CompiledRule,
     source_items: []const std.json.Value,
     reference_pointer_id: u16,
+    source_rules: []const CompiledRule,
     format_parts: []const CompiledFormatPart,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     reference_count: *usize,
 ) !bool {
     for (source_items) |item| {
+        if (source_rules.len != 0 and
+            !try itemRulesHold(allocator, plan, source_rules, item))
+        {
+            continue;
+        }
         const source_key = if (rule.reject_self_reference)
             resolve(item, plan.pointers[rule.path_ids[1]]) orelse
                 return false
@@ -4345,12 +4867,20 @@ fn indexReferenceTargetSpec(
             null
     else
         null;
+    const match_allowed = target.match_rules.len == 0 or
+        try itemRulesHold(
+            allocator,
+            plan,
+            target.match_rules,
+            item,
+        );
     return indexReferenceKey(
         allocator,
         plan,
         key,
         required,
         coverage_group,
+        match_allowed,
         index,
         coverage_aliases,
     );
@@ -4386,6 +4916,7 @@ fn indexReferenceTarget(
         .{ .scalar = key },
         required,
         null,
+        true,
         index,
         coverage_aliases,
     );
@@ -4397,6 +4928,7 @@ fn indexReferenceKey(
     key: ReferenceKey,
     required: bool,
     coverage_group: ?std.json.Value,
+    match_allowed: bool,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
 ) !bool {
@@ -4406,11 +4938,14 @@ fn indexReferenceKey(
         if (!referenceKeysEqual(plan, result.value_ptr.key, key)) {
             return error.ReferenceKeyDigestCollision;
         }
+        result.value_ptr.match_allowed =
+            result.value_ptr.match_allowed and match_allowed;
     } else {
         result.value_ptr.* = .{
             .key = key,
             .required = required,
             .ungrouped_required = required and coverage_group == null,
+            .match_allowed = match_allowed,
         };
     }
     if (required) {
@@ -4493,6 +5028,7 @@ fn markReferenceKey(
     if (!referenceKeysEqual(plan, indexed.key, key)) {
         return error.ReferenceKeyDigestCollision;
     }
+    if (!indexed.match_allowed) return false;
     indexed.referenced = true;
     return true;
 }
@@ -4838,6 +5374,196 @@ fn compileRelativePathRule(
     }
 }
 
+fn compileRegexPatterns(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) ![]CompiledRegexPattern {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 32) {
+        return error.RegexPatternCountInvalid;
+    }
+    const patterns = try allocator.alloc(
+        CompiledRegexPattern,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    var total_atoms: usize = 0;
+    errdefer {
+        for (patterns[0..initialized]) |*pattern| {
+            pattern.deinit(allocator);
+        }
+        allocator.free(patterns);
+    }
+    for (values.items, 0..) |value, index| {
+        patterns[index] = try compileRegexPattern(
+            allocator,
+            try definition_core.json.string(value),
+        );
+        initialized += 1;
+        total_atoms = std.math.add(
+            usize,
+            total_atoms,
+            patterns[index].atoms.len,
+        ) catch return error.RegexStateBoundExceeded;
+        if (total_atoms > 256) return error.RegexStateBoundExceeded;
+    }
+    return patterns;
+}
+
+fn compileRegexPattern(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+) !CompiledRegexPattern {
+    if (pattern.len < 3 or pattern.len > 1024 or
+        pattern[0] != '^' or
+        pattern[pattern.len - 1] != '$' or
+        regexByteEscaped(pattern, pattern.len - 1))
+    {
+        return error.RegexMustBeAnchored;
+    }
+    const expression = pattern[1 .. pattern.len - 1];
+    var atoms: std.ArrayList(CompiledRegexAtom) = .empty;
+    defer atoms.deinit(allocator);
+    var index: usize = 0;
+    while (index < expression.len) {
+        var bytes: [4]u64 = @splat(0);
+        switch (expression[index]) {
+            '\\' => {
+                index += 1;
+                if (index >= expression.len) {
+                    return error.RegexEscapeInvalid;
+                }
+                regexByteSet(&bytes, expression[index]);
+                index += 1;
+            },
+            '[' => {
+                bytes = try compileRegexClass(expression, &index);
+            },
+            '.' => {
+                bytes = @splat(std.math.maxInt(u64));
+                regexByteClear(&bytes, '\n');
+                regexByteClear(&bytes, '\r');
+                index += 1;
+            },
+            '*', '+', '?', '{', '}', '(', ')', '|', '^', '$', ']' => {
+                return error.RegexConstructUnsupported;
+            },
+            else => |byte| {
+                regexByteSet(&bytes, byte);
+                index += 1;
+            },
+        }
+        var quantifier: RegexQuantifier = .one;
+        if (index < expression.len) {
+            quantifier = switch (expression[index]) {
+                '?' => .zero_or_one,
+                '*' => .zero_or_more,
+                '+' => .one_or_more,
+                else => .one,
+            };
+            if (quantifier != .one) index += 1;
+        }
+        if (atoms.items.len >= 255) {
+            return error.RegexStateBoundExceeded;
+        }
+        try atoms.append(allocator, .{
+            .bytes = bytes,
+            .quantifier = quantifier,
+        });
+    }
+    if (atoms.items.len == 0) return error.RegexPatternEmpty;
+    return .{ .atoms = try atoms.toOwnedSlice(allocator) };
+}
+
+fn compileRegexClass(
+    expression: []const u8,
+    index: *usize,
+) ![4]u64 {
+    var bytes: [4]u64 = @splat(0);
+    index.* += 1;
+    const negated = index.* < expression.len and
+        expression[index.*] == '^';
+    if (negated) index.* += 1;
+    var item_count: usize = 0;
+    while (index.* < expression.len and expression[index.*] != ']') {
+        const start = try readRegexClassByte(expression, index);
+        if (index.* + 1 < expression.len and
+            expression[index.*] == '-' and
+            expression[index.* + 1] != ']')
+        {
+            index.* += 1;
+            const end = try readRegexClassByte(expression, index);
+            if (start > end) return error.RegexClassRangeInvalid;
+            var byte: u16 = start;
+            while (byte <= end) : (byte += 1) {
+                regexByteSet(&bytes, @intCast(byte));
+            }
+        } else {
+            regexByteSet(&bytes, start);
+        }
+        item_count += 1;
+    }
+    if (index.* >= expression.len or expression[index.*] != ']') {
+        return error.RegexClassUnclosed;
+    }
+    index.* += 1;
+    if (item_count == 0) return error.RegexClassEmpty;
+    if (negated) {
+        for (&bytes) |*word| word.* = ~word.*;
+    }
+    return bytes;
+}
+
+fn readRegexClassByte(
+    expression: []const u8,
+    index: *usize,
+) !u8 {
+    if (index.* >= expression.len or expression[index.*] == ']') {
+        return error.RegexClassInvalid;
+    }
+    if (expression[index.*] == '\\') {
+        index.* += 1;
+        if (index.* >= expression.len) return error.RegexEscapeInvalid;
+    }
+    const byte = expression[index.*];
+    index.* += 1;
+    return byte;
+}
+
+fn regexByteEscaped(text: []const u8, index: usize) bool {
+    if (index == 0) return false;
+    var slash_count: usize = 0;
+    var cursor = index;
+    while (cursor > 0 and text[cursor - 1] == '\\') {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    return slash_count % 2 == 1;
+}
+
+fn regexByteSet(bytes: *[4]u64, byte: u8) void {
+    const word: usize = @intCast(byte / 64);
+    const bit: u6 = @intCast(byte % 64);
+    bytes[word] |= @as(u64, 1) << bit;
+}
+
+fn regexByteClear(bytes: *[4]u64, byte: u8) void {
+    const word: usize = @intCast(byte / 64);
+    const bit: u6 = @intCast(byte % 64);
+    bytes[word] &= ~(@as(u64, 1) << bit);
+}
+
+fn regexByteSetContains(bytes: [4]u64, byte: u8) bool {
+    const word: usize = @intCast(byte / 64);
+    const bit: u6 = @intCast(byte % 64);
+    return bytes[word] & (@as(u64, 1) << bit) != 0;
+}
+
+fn regexByteSetEmpty(bytes: [4]u64) bool {
+    for (bytes) |word| if (word != 0) return false;
+    return true;
+}
+
 fn compileExactObjectRule(
     allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
@@ -4854,14 +5580,24 @@ fn compileExactObjectRule(
                 "keys",
                 "required_keys",
                 "optional_keys",
+                "allow_additional",
             },
         );
     } else {
         try definition_core.json.requireExactKeys(
             object,
-            &.{ "op", "path", "keys", "required_keys", "optional_keys" },
+            &.{
+                "op",
+                "path",
+                "keys",
+                "required_keys",
+                "optional_keys",
+                "allow_additional",
+            },
         );
     }
+    rule.allow_additional =
+        try optionalBoolean(object, "allow_additional") orelse false;
     if (object.get("keys")) |raw| {
         if (object.contains("required_keys") or
             object.contains("optional_keys"))
@@ -5011,6 +5747,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .optional_field,
         .scalar_type,
         .bounded_string,
+        .regex,
         .bounded_number,
         .bounded_array,
         .bounded_object,
@@ -5037,6 +5774,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .field_not_equal,
         .cross_input_equal,
         .keyed_unique,
+        .declared_field_values,
         .reference_exists,
         .implies,
         .total_partition,
@@ -5054,6 +5792,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .optional_field,
         .scalar_type,
         .bounded_string,
+        .regex,
         .bounded_number,
         .bounded_array,
         .bounded_object,
@@ -5132,13 +5871,14 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/record",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","optional-field","scalar-type","enum","safe-identifier","unique","sorted","field-equal","keyed-unique","reference-exists","disjoint","implies","total-partition","total-mapping","path-format","all","any","none"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","optional-field","scalar-type","enum","safe-identifier","regex","unique","sorted","field-equal","keyed-unique","reference-exists","declared-field-values","disjoint","implies","total-partition","total-mapping","path-format","all","any","none"]},
         \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","checks","more_checks","guards","changes","meta","universe","ordering","accepted","rejected","targets","mappings"]},
+        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","checks","more_checks","guards","changes","meta","universe","ordering","accepted","rejected","targets","mappings","declarations","scored"],"allow_additional":true},
         \\    {"op":"scalar-type","path":"/record_id","type":"string"},
         \\    {"op":"safe-identifier","path":"/record_id","max":64},
+        \\    {"op":"regex","path":"/record_id","patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64},
         \\    {"op":"enum","path":"/status","values":["open","closed"]},
         \\    {"op":"unique","path":"/tags"},
         \\    {"op":"sorted","path":"/tags"},
@@ -5152,7 +5892,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\    {"op":"path-format","path":"/groups","items":"/members","target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
         \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
         \\    {"op":"all","path":"/items","rules":[
-        \\      {"op":"exact-object","keys":["id","kind","labels","related_ids"]},
+        \\      {"op":"exact-object","keys":["id","kind","state","labels","related_ids"]},
         \\      {"op":"scalar-type","path":"/id","type":"string"},
         \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
         \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
@@ -5172,12 +5912,13 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]}
         \\    ]},
         \\    {"op":"reference-exists","sources":[
-        \\      {"path":"/guards","reference":"/ids","fragments":[{"literal":"id:"},{"value":true}]},
-        \\      {"path":"/guards","reference":"/kinds","fragments":[{"literal":"kind:"},{"value":true}]}
+        \\      {"path":"/guards","reference":"/ids","rules":[{"op":"enum","path":"/mode","values":["active"]}],"fragments":[{"literal":"id:"},{"value":true}]},
+        \\      {"path":"/guards","reference":"/kinds","rules":[{"op":"enum","path":"/mode","values":["active"]}],"fragments":[{"literal":"kind:"},{"value":true}]}
         \\    ],"targets":[
         \\      {"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],"coverage_key":"/id"},
-        \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],"coverage_key":"/id"}
+        \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],"coverage_key":"/id","match_rules":[{"op":"enum","path":"/state","values":["ready"]}]}
         \\    ],"coverage":"all-targets"},
+        \\    {"op":"declared-field-values","path":"/scored","object":"/values","declarations":"/declarations","declaration_paths":["/increase","/decrease"],"type":"integer","min":0,"max":100},
         \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
         \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
         \\  ],
@@ -5231,7 +5972,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
 
     const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"ids\":[],\"kinds\":[\"shared\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}]}";
+        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10,\"undeclared\":999}}],\"extension\":\"preserved\"}";
     var valid = try validate(
         std.testing.allocator,
         &definition_plan,
@@ -5245,6 +5986,86 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expect(valid.valid);
     try std.testing.expect(!valid.authority_granted);
     try std.testing.expect(!valid.storage_mutated);
+
+    const invalid_pattern_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"record_id\":\"record-1\"",
+        "\"record_id\":\"other-1\"",
+    );
+    defer std.testing.allocator.free(invalid_pattern_bytes);
+    var invalid_pattern = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = invalid_pattern_bytes,
+        }},
+    );
+    defer invalid_pattern.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_pattern.valid);
+
+    const missing_declared_field_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"speed\":90,\"cost\":10",
+        "\"speed\":90",
+    );
+    defer std.testing.allocator.free(missing_declared_field_bytes);
+    var missing_declared_field = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = missing_declared_field_bytes,
+        }},
+    );
+    defer missing_declared_field.deinit(std.testing.allocator);
+    try std.testing.expect(!missing_declared_field.valid);
+
+    const duplicate_declaration_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "{\"increase\":\"speed\"},{\"decrease\":\"cost\"}",
+        "{\"increase\":\"speed\"},{\"decrease\":\"speed\"}",
+    );
+    defer std.testing.allocator.free(duplicate_declaration_bytes);
+    var duplicate_declaration = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = duplicate_declaration_bytes,
+        }},
+    );
+    defer duplicate_declaration.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate_declaration.valid);
+
+    const out_of_bounds_declared_field_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"speed\":90,\"cost\":10",
+        "\"speed\":101,\"cost\":10",
+    );
+    defer std.testing.allocator.free(out_of_bounds_declared_field_bytes);
+    var out_of_bounds_declared_field = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = out_of_bounds_declared_field_bytes,
+        }},
+    );
+    defer out_of_bounds_declared_field.deinit(std.testing.allocator);
+    try std.testing.expect(!out_of_bounds_declared_field.valid);
 
     const present_bytes = try std.mem.replaceOwned(
         u8,
@@ -5390,8 +6211,8 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         u8,
         std.testing.allocator,
         valid_bytes,
-        "\"guards\":[{\"ids\":[],\"kinds\":[\"shared\"]}]",
-        "\"guards\":[{\"ids\":[\"item-1\"],\"kinds\":[]}]",
+        "\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}]",
+        "\"guards\":[{\"mode\":\"active\",\"ids\":[\"item-1\"],\"kinds\":[]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"shared\"]}]",
     );
     defer std.testing.allocator.free(incomplete_alias_coverage_bytes);
     var incomplete_alias_coverage = try validate(
@@ -5405,6 +6226,26 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     );
     defer incomplete_alias_coverage.deinit(std.testing.allocator);
     try std.testing.expect(!incomplete_alias_coverage.valid);
+
+    const disallowed_match_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        "\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\"",
+        "\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"blocked\"",
+    );
+    defer std.testing.allocator.free(disallowed_match_bytes);
+    var disallowed_match = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = disallowed_match_bytes,
+        }},
+    );
+    defer disallowed_match.deinit(std.testing.allocator);
+    try std.testing.expect(!disallowed_match.valid);
 
     const missing_implication_target_bytes = try std.mem.replaceOwned(
         u8,
@@ -5452,7 +6293,7 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
         &plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"extra\":true}",
+            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10}}],\"extra\":true}",
         }},
     );
     defer invalid.deinit(std.testing.allocator);

@@ -30,9 +30,11 @@ export LEDGER_CACHE_DIR="$repo_dir/cache"
 
 capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"ledger-capabilities/v1"' <<<"$capabilities"
-grep -Fq '"id":"exact-object","version":1' <<<"$capabilities"
+grep -Fq '"id":"exact-object","version":2' <<<"$capabilities"
 grep -Fq '"id":"implies","version":2' <<<"$capabilities"
-grep -Fq '"id":"reference-exists","version":5' <<<"$capabilities"
+grep -Fq '"id":"regex","version":1' <<<"$capabilities"
+grep -Fq '"id":"reference-exists","version":7' <<<"$capabilities"
+grep -Fq '"id":"declared-field-values","version":1' <<<"$capabilities"
 grep -Fq '"id":"total-partition","version":1' <<<"$capabilities"
 grep -Fq '"id":"total-mapping","version":1' <<<"$capabilities"
 grep -Fq '"id":"all","version":1' <<<"$capabilities"
@@ -43,7 +45,7 @@ grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
 grep -Fq '"id":"compare-and-append","version":1' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
 if grep -Eq \
-  '"id":"(regex|relevance|text-render)"' \
+  '"id":"(relevance|text-render)"' \
   <<<"$capabilities"
 then
   exit 1

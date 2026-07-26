@@ -79,6 +79,7 @@ pub const Operator = enum {
     fold,
     @"export",
     text_render,
+    declared_field_values,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -135,6 +136,7 @@ pub const Operator = enum {
             .atomic_transaction => "atomic-transaction",
             .id_lookup => "id-lookup",
             .text_render => "text-render",
+            .declared_field_values => "declared-field-values",
             else => @tagName(self),
         };
     }
@@ -149,7 +151,8 @@ pub const Operator = enum {
 
     pub fn version(self: Operator) u16 {
         return switch (self) {
-            .reference_exists => 5,
+            .exact_object => 2,
+            .reference_exists => 7,
             .implies => 2,
             else => 1,
         };
@@ -162,6 +165,7 @@ pub const Operator = enum {
             .optional_field,
             .scalar_type,
             .bounded_string,
+            .regex,
             .bounded_number,
             .bounded_array,
             .bounded_object,
@@ -192,6 +196,7 @@ pub const Operator = enum {
             .cross_input_equal,
             .implies,
             .total_mapping,
+            .declared_field_values,
             .canonical_json,
             .canonical_text,
             .sha256,
@@ -1436,7 +1441,7 @@ test "artifact definition rejects named but unimplemented operators" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["regex"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["keyed-join"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
