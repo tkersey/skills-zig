@@ -93,6 +93,17 @@ pub const Stats = struct {
     records_validated: usize,
     definition_versions: usize,
     protocol_state: ?protocol.ReplayState,
+
+    pub fn deinit(self: *Stats, allocator: std.mem.Allocator) void {
+        if (self.protocol_state) |*state| state.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn takeProtocolState(self: *Stats) ?protocol.ReplayState {
+        const result = self.protocol_state;
+        self.protocol_state = null;
+        return result;
+    }
 };
 
 pub fn validateSlot(
@@ -329,6 +340,7 @@ fn validateEventEpoch(
     }
     var expected_start: usize = 0;
     var protocol_state: ?protocol.ReplayState = null;
+    errdefer if (protocol_state) |*state| state.deinit(allocator);
     for (rows, 0..) |row, index| {
         const record_start = row.record_start orelse
             return error.StoreBindingRecordRangeMissing;

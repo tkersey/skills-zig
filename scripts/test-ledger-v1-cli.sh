@@ -15,6 +15,7 @@ chained_definition=apps/ledger/src/v1/fixtures/chained-event-definition.json
 chained_one=apps/ledger/src/v1/fixtures/chained-event-one.json
 chained_two=apps/ledger/src/v1/fixtures/chained-event-two.json
 chained_invalid=apps/ledger/src/v1/fixtures/chained-event-invalid.json
+chained_illegal=apps/ledger/src/v1/fixtures/chained-event-illegal.json
 chained_existing=apps/ledger/src/v1/fixtures/chained-event-existing.jsonl
 chained_existing_invalid=apps/ledger/src/v1/fixtures/chained-event-existing-invalid.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
@@ -200,6 +201,19 @@ chained_failure_status=$?
 set -e
 test "$chained_failure_status" -eq 2
 grep -Fq '"code":"EventPreviousDigestMismatch"' <<<"$chained_failure"
+
+set +e
+chained_illegal_failure=$("$binary" transact \
+  --definition "$chained_definition" \
+  --operation append \
+  --repo "$protocol_repo" \
+  --input "event=$chained_illegal" \
+  --param request=chain-illegal \
+  --format json)
+chained_illegal_failure_status=$?
+set -e
+test "$chained_illegal_failure_status" -eq 2
+grep -Fq '"code":"IllegalReducerTransition"' <<<"$chained_illegal_failure"
 
 chained_projection=$("$binary" project \
   --definition "$chained_definition" \

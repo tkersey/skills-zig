@@ -595,6 +595,7 @@ fn validateExistingContent(
         protocol.ReplayState.init(plan)
     else
         null;
+    defer if (protocol_state) |*state| state.deinit(allocator);
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
@@ -837,7 +838,7 @@ fn prepareEffect(
             .revision = slot_before_digest.?,
             .binding = binding_before,
         };
-        const replay_stats = try replay.validateSlot(
+        var replay_stats = try replay.validateSlot(
             allocator,
             repo_root,
             definition_plan.id,
@@ -846,13 +847,15 @@ fn prepareEffect(
             definition_plan.bounds.max_records,
             protocol_required,
         );
+        defer replay_stats.deinit(allocator);
         if (slot.kind == .event_log) {
             existing_records = replay_stats.records_validated;
         }
-        protocol_state = replay_stats.protocol_state;
+        protocol_state = replay_stats.takeProtocolState();
     } else if (slot.kind == .event_log) {
         existing_records = 0;
     }
+    defer if (protocol_state) |*state| state.deinit(allocator);
     if (protocol_required and !binding_before.idempotency_match) {
         const current_protocol = event_protocol.?;
         if (protocol_state == null) {
@@ -1639,7 +1642,7 @@ test "transaction admits and replays a definition-bound event chain" {
         resolved_storage.slot(protocol_plan.target_slot_index),
     );
     defer snapshot.deinit(std.testing.allocator);
-    const stats = try replay.validateSlot(
+    var stats = try replay.validateSlot(
         std.testing.allocator,
         repo_root,
         definition_plan.id,
@@ -1648,6 +1651,7 @@ test "transaction admits and replays a definition-bound event chain" {
         definition_plan.bounds.max_records,
         true,
     );
+    defer stats.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 2), stats.protocol_state.?.records);
     try std.testing.expectEqualStrings(
@@ -1779,7 +1783,7 @@ test "document replacements replay from immutable prior revisions" {
     );
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), snapshot.binding.rows.len);
-    const stats = try replay.validateSlot(
+    var stats = try replay.validateSlot(
         std.testing.allocator,
         repo_root,
         definition_plan.id,
@@ -1788,6 +1792,7 @@ test "document replacements replay from immutable prior revisions" {
         definition_plan.bounds.max_records,
         false,
     );
+    defer stats.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
     try std.testing.expectEqual(@as(usize, 1), stats.definition_versions);
     try std.testing.expectEqualStrings("{\"value\":2}", snapshot.content);

@@ -704,7 +704,7 @@ pub fn execute(
         slot,
     );
     defer snapshot.deinit(allocator);
-    _ = try replay.validateSlot(
+    var replay_stats = try replay.validateSlot(
         allocator,
         repo_root,
         definition_plan.id,
@@ -714,6 +714,7 @@ pub fn execute(
         event_protocol != null and
             event_protocol.?.target_slot_index == compiled.slot_index,
     );
+    defer replay_stats.deinit(allocator);
     const effective_limit = try resolveLimit(
         compiled.limit,
         parameters,

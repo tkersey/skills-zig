@@ -110,7 +110,7 @@ fn inspectSlot(
         slot,
     );
     defer snapshot.deinit(allocator);
-    _ = try replay.validateSlot(
+    var replay_stats = try replay.validateSlot(
         allocator,
         repo_root,
         definition_plan.id,
@@ -119,6 +119,7 @@ fn inspectSlot(
         definition_plan.bounds.max_records,
         protocol_required,
     );
+    defer replay_stats.deinit(allocator);
     const name = try allocator.dupe(u8, slot.name);
     errdefer allocator.free(name);
     const logical_ref = try allocator.dupe(u8, slot.relative_path);

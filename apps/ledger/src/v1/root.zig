@@ -10,6 +10,7 @@ pub const transaction = @import("transaction.zig");
 pub const projection = @import("projection.zig");
 pub const replay = @import("replay.zig");
 pub const protocol = @import("protocol.zig");
+pub const reducer = @import("reducer.zig");
 pub const doctor = @import("doctor.zig");
 pub const envelope = @import("envelope.zig");
 
@@ -26,6 +27,7 @@ test {
     _ = projection;
     _ = replay;
     _ = protocol;
+    _ = reducer;
     _ = doctor;
     _ = envelope;
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
+const reducer = @import("reducer.zig");
 const storage = @import("storage.zig");
 
 const required_operator_mask =
@@ -61,12 +62,14 @@ pub const Plan = struct {
     event_kinds: [][]u8,
     max_records: usize,
     target_slot_index: u16,
+    reducer_plan: ?reducer.Plan,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         self.envelope.deinit(allocator);
         self.genesis.deinit(allocator);
         for (self.event_kinds) |kind| allocator.free(kind);
         allocator.free(self.event_kinds);
+        if (self.reducer_plan) |*plan| plan.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -76,9 +79,15 @@ pub const ReplayState = struct {
     previous_digest: [71]u8 = undefined,
     has_previous_digest: bool = false,
     records: usize = 0,
+    reducer_state: reducer.State = .{},
 
     pub fn init(plan: *const Plan) ReplayState {
         return .{ .next_sequence = plan.sequence_start };
+    }
+
+    pub fn deinit(self: *ReplayState, allocator: std.mem.Allocator) void {
+        self.reducer_state.deinit(allocator);
+        self.* = undefined;
     }
 
     pub fn previousDigest(self: *const ReplayState) ?[]const u8 {
@@ -96,6 +105,8 @@ const ProtocolRules = struct {
     body_digest: ?definition.Rule = null,
     event_digest: ?definition.Rule = null,
     event_kinds: ?definition.Rule = null,
+    transition_table: ?definition.Rule = null,
+    reducer: ?definition.Rule = null,
 };
 
 pub fn compile(
@@ -118,10 +129,6 @@ pub fn compile(
     {
         return error.IncompleteReducerOperators;
     }
-    if (definition_plan.requires(.transition_table)) {
-        return error.UnsupportedReducerProtocol;
-    }
-
     var rules: ProtocolRules = .{};
     for (definition_plan.rules) |rule| switch (rule.operator) {
         .event_envelope => try setRule(&rules.envelope, rule),
@@ -130,6 +137,8 @@ pub fn compile(
         .body_digest => try setRule(&rules.body_digest, rule),
         .event_digest => try setRule(&rules.event_digest, rule),
         .event_kinds => try setRule(&rules.event_kinds, rule),
+        .transition_table => try setRule(&rules.transition_table, rule),
+        .reducer => try setRule(&rules.reducer, rule),
         else => {},
     };
     if (rules.envelope == null or
@@ -179,6 +188,21 @@ pub fn compile(
         storage_plan,
         envelope.input_index,
     );
+    var reducer_plan: ?reducer.Plan = null;
+    errdefer if (reducer_plan) |*plan| plan.deinit(allocator);
+    if (definition_plan.requires(.transition_table)) {
+        if (rules.transition_table == null or rules.reducer == null) {
+            return error.IncompleteReducerRules;
+        }
+        reducer_plan = try reducer.compile(
+            allocator,
+            rules.transition_table.?,
+            rules.reducer.?,
+            definition_plan.bounds.max_reducer_states,
+        );
+    } else if (rules.transition_table != null or rules.reducer != null) {
+        return error.UndeclaredReducerRule;
+    }
     return .{
         .envelope = envelope,
         .sequence_start = sequence_start,
@@ -186,6 +210,7 @@ pub fn compile(
         .event_kinds = event_kinds,
         .max_records = definition_plan.bounds.max_records,
         .target_slot_index = target_slot_index,
+        .reducer_plan = reducer_plan,
     };
 }
 
@@ -193,7 +218,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
     try encoder.writeBytes(plan.envelope.sequence_key);
@@ -210,13 +235,17 @@ pub fn encodeCache(
     try encodeStringSet(plan.event_kinds, encoder);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeU16(plan.target_slot_index);
+    try encoder.writeBool(plan.reducer_plan != null);
+    if (plan.reducer_plan) |*compiled| {
+        try reducer.encodeCache(compiled, encoder);
+    }
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
@@ -244,6 +273,13 @@ pub fn decodeCache(
         errdefer genesis.deinit(allocator);
         const event_kinds = try decodeStringSet(allocator, decoder, 256);
         errdefer deinitStringSet(allocator, event_kinds);
+        var reducer_plan: ?reducer.Plan = null;
+        errdefer if (reducer_plan) |*compiled| compiled.deinit(allocator);
+        const max_records = try decoder.readUsize();
+        const target_slot_index = try decoder.readU16();
+        if (try decoder.readBool()) {
+            reducer_plan = try reducer.decodeCache(allocator, decoder);
+        }
         break :plan .{
             .envelope = .{
                 .input_index = std.math.cast(u8, input_index) orelse
@@ -259,8 +295,9 @@ pub fn decodeCache(
             .sequence_start = sequence_start,
             .genesis = genesis,
             .event_kinds = event_kinds,
-            .max_records = try decoder.readUsize(),
-            .target_slot_index = try decoder.readU16(),
+            .max_records = max_records,
+            .target_slot_index = target_slot_index,
+            .reducer_plan = reducer_plan,
         };
     };
     errdefer plan.deinit(allocator);
@@ -273,15 +310,30 @@ pub fn validateCachePlan(
     definition_plan: *const definition.Plan,
     storage_plan: *const storage.Plan,
 ) !void {
+    const reducer_required = definition_plan.requires(.transition_table) and
+        definition_plan.requires(.reducer);
+    if (definition_plan.requires(.transition_table) !=
+        definition_plan.requires(.reducer))
+    {
+        return error.CacheProtocolPlanMismatch;
+    }
     try validatePlan(plan);
     if (plan.envelope.input_index >= definition_plan.inputs.len or
         definition_plan.inputs[plan.envelope.input_index].codec != .json or
         plan.max_records != definition_plan.bounds.max_records or
         definition_plan.storage_kind != .event_log or
         (definition_plan.operator_mask & required_operator_mask) !=
-            required_operator_mask)
+            required_operator_mask or
+        (plan.reducer_plan != null) != reducer_required)
     {
         return error.CacheProtocolPlanMismatch;
+    }
+    if (plan.reducer_plan) |*compiled| {
+        if (compiled.max_entries !=
+            definition_plan.bounds.max_reducer_states)
+        {
+            return error.CacheProtocolPlanMismatch;
+        }
     }
     const expected_slot = try compileTargetSlot(
         storage_plan,
@@ -388,6 +440,14 @@ pub fn applyValue(
 
     if (state.next_sequence == std.math.maxInt(u64)) {
         return error.EventSequenceOverflow;
+    }
+    if (plan.reducer_plan) |*compiled| {
+        try reducer.apply(
+            allocator,
+            compiled,
+            &state.reducer_state,
+            event,
+        );
     }
     @memcpy(&state.previous_digest, claimed_event_digest);
     state.has_previous_digest = true;
@@ -708,6 +768,7 @@ fn validatePlan(plan: *const Plan) !void {
         .null => {},
         .digest => |digest| try definition_core.json.digest(digest),
     }
+    if (plan.reducer_plan) |*compiled| try reducer.validatePlan(compiled);
 }
 
 fn compileTargetSlot(
@@ -932,6 +993,7 @@ test "compiled event protocol validates exact chained envelopes" {
         cached.event_kinds[1],
     );
     var state = ReplayState.init(&plan);
+    defer state.deinit(std.testing.allocator);
     const first = try eventAlloc(
         std.testing.allocator,
         1,
@@ -1005,6 +1067,7 @@ test "event protocol rejects unknown kinds and broken digest links" {
     defer plan.deinit(std.testing.allocator);
 
     var unknown_state = ReplayState.init(&plan);
+    defer unknown_state.deinit(std.testing.allocator);
     const unknown = try eventAlloc(
         std.testing.allocator,
         0,
@@ -1019,6 +1082,7 @@ test "event protocol rejects unknown kinds and broken digest links" {
     );
 
     var linked_state = ReplayState.init(&plan);
+    defer linked_state.deinit(std.testing.allocator);
     const first = try eventAlloc(
         std.testing.allocator,
         0,

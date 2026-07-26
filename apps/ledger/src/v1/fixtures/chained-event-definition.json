@@ -15,9 +15,11 @@
       "idempotency-key",
       "limit",
       "previous-digest",
+      "reducer",
       "replay",
       "select",
-      "sequence"
+      "sequence",
+      "transition-table"
     ]
   },
   "parameters": {
@@ -89,6 +91,31 @@
         "created",
         "updated"
       ]
+    },
+    {
+      "op": "transition-table",
+      "states": [
+        "closed",
+        "open"
+      ],
+      "transitions": [
+        {
+          "from": null,
+          "on": "created",
+          "to": "open"
+        },
+        {
+          "from": "open",
+          "on": "updated",
+          "to": "closed"
+        }
+      ]
+    },
+    {
+      "op": "reducer",
+      "key": "/body/id",
+      "on": "/kind",
+      "to": "/body/status"
     }
   ],
   "identity": {},
