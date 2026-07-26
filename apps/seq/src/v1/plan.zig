@@ -743,9 +743,7 @@ fn validatePredicateTypes(
             .null => return if (column.nullable and
                 !operator.requiresString() and
                 !case_insensitive)
-                {}
-            else
-                error.FilterPredicateTypeMismatch,
+            {} else error.FilterPredicateTypeMismatch,
         },
         .parameter => |index| parameterColumnKind(
             definition_plan.parameter_declarations.items[index].kind,
@@ -789,12 +787,682 @@ fn parameterColumnKind(kind: definition_core.scalar.Kind) ColumnKind {
     };
 }
 
+pub fn encodeCache(
+    native_plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(1);
+    try encoder.writeCount(native_plan.stages.len);
+    for (native_plan.stages) |stage| {
+        try encoder.writeBytes(stage.name);
+        try encoder.writeBool(stage.source != null);
+        if (stage.source) |source| {
+            try encoder.writeEnum(std.meta.activeTag(source));
+            switch (source) {
+                .stage => |index| try encoder.writeU16(index),
+                .external => |index| try encoder.writeU16(index),
+            }
+        }
+        try encodeSchema(&stage.schema, encoder);
+        try encodeOperation(&stage.operation, encoder);
+    }
+    try encoder.writeCount(native_plan.projections.len);
+    for (native_plan.projections) |projection| {
+        try encoder.writeU16(projection.definition_index);
+        try encoder.writeU16(projection.stage_index);
+        try encoder.writeCount(projection.field_indices.len);
+        for (projection.field_indices) |field| try encoder.writeU16(field);
+    }
+    try encoder.writeUsize(native_plan.max_rows);
+    try encoder.writeUsize(native_plan.max_output_bytes);
+}
+
+pub fn decodeCache(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    definition_plan: *const definition.Plan,
+) !Plan {
+    if (try decoder.readU16() != 1) {
+        return error.SeqNativePlanCacheVersionMismatch;
+    }
+    const stage_count = try decoder.readCount(256);
+    if (stage_count == 0) return error.InvalidPipelineLength;
+    const stages = try allocator.alloc(Stage, stage_count);
+    var initialized: usize = 0;
+    var stages_transferred = false;
+    errdefer if (!stages_transferred) {
+        for (stages[0..initialized]) |*stage| stage.deinit(allocator);
+        allocator.free(stages);
+    };
+    for (stages, 0..) |*stage, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        for (stages[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, name)) {
+                return error.DuplicatePipelineRelation;
+            }
+        }
+        const source = if (try decoder.readBool())
+            try decodeSource(decoder, index)
+        else
+            null;
+        var schema = try decodeSchema(allocator, decoder);
+        errdefer schema.deinit(allocator);
+        var operation = try decodeOperation(
+            allocator,
+            decoder,
+            &schema,
+        );
+        errdefer operation.deinit(allocator);
+        stage.* = .{
+            .name = name,
+            .source = source,
+            .operation = operation,
+            .schema = schema,
+        };
+        initialized += 1;
+    }
+    const projection_count = try decoder.readCount(64);
+    if (projection_count == 0) return error.InvalidProjectionCount;
+    const projections = try allocator.alloc(Projection, projection_count);
+    var projections_initialized: usize = 0;
+    var projections_transferred = false;
+    errdefer if (!projections_transferred) {
+        for (projections[0..projections_initialized]) |*projection| {
+            projection.deinit(allocator);
+        }
+        allocator.free(projections);
+    };
+    for (projections) |*projection| {
+        const definition_index = try decoder.readU16();
+        const stage_index = try decoder.readU16();
+        if (stage_index >= stages.len) {
+            return error.CacheProjectionStageInvalid;
+        }
+        const field_count = try decoder.readCount(256);
+        if (field_count == 0) return error.InvalidProjectionFieldCount;
+        const fields = try allocator.alloc(u16, field_count);
+        errdefer allocator.free(fields);
+        for (fields, 0..) |*field, field_index| {
+            field.* = try decoder.readU16();
+            if (field.* >= stages[stage_index].schema.columns.len) {
+                return error.CacheProjectionFieldInvalid;
+            }
+            for (fields[0..field_index]) |prior| {
+                if (prior == field.*) {
+                    return error.DuplicateProjectionField;
+                }
+            }
+        }
+        projection.* = .{
+            .definition_index = definition_index,
+            .stage_index = stage_index,
+            .field_indices = fields,
+        };
+        projections_initialized += 1;
+    }
+    var result: Plan = .{
+        .stages = stages,
+        .projections = projections,
+        .max_rows = try decoder.readUsize(),
+        .max_output_bytes = try decoder.readUsize(),
+    };
+    stages_transferred = true;
+    projections_transferred = true;
+    errdefer result.deinit(allocator);
+    try validateCachePlan(&result, definition_plan);
+    return result;
+}
+
+pub fn validateCachePlan(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (native_plan.stages.len != definition_plan.steps.len or
+        native_plan.projections.len != definition_plan.projections.len or
+        native_plan.max_rows != definition_plan.bounds.max_rows or
+        native_plan.max_output_bytes != definition_plan.bounds.max_output_bytes)
+    {
+        return error.CacheObservationPlanShapeMismatch;
+    }
+    for (
+        native_plan.stages,
+        definition_plan.steps,
+        0..,
+    ) |stage, step, index| {
+        if (!std.mem.eql(
+            u8,
+            stage.name,
+            step.output_name orelse
+                return error.PipelineStageOutputMissing,
+        )) return error.CacheObservationStageNameMismatch;
+        const expected_source = if (step.operator == .scan)
+            null
+        else
+            try expectedSource(
+                native_plan.stages[0..index],
+                definition_plan.inputs,
+                step.input_names[0],
+            );
+        if (!sourcesEqual(stage.source, expected_source)) {
+            return error.CacheObservationSourceMismatch;
+        }
+        const source_schema = if (expected_source) |source|
+            sourceSchema(
+                native_plan.stages[0..index],
+                definition_plan.inputs,
+                source,
+            )
+        else
+            null;
+        switch (step.operator) {
+            .scan => {
+                const scan = switch (stage.operation) {
+                    .scan => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                const requirement = findRelation(
+                    definition_plan.relations,
+                    scan.relation,
+                ) orelse return error.UndeclaredPhysicalRelation;
+                if (!std.mem.eql(
+                    u16,
+                    scan.field_indices,
+                    requirement.fields,
+                )) return error.CachePhysicalFieldsMismatch;
+                try validatePhysicalSchema(
+                    &stage.schema,
+                    scan.relation,
+                    scan.field_indices,
+                );
+            },
+            .filter => {
+                const filter = switch (stage.operation) {
+                    .filter => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateSameSchema(&stage.schema, source_schema.?);
+                for (filter.predicates) |predicate| {
+                    if (predicate.field_index >=
+                        source_schema.?.columnCount())
+                    {
+                        return error.CachePredicateFieldInvalid;
+                    }
+                    if (predicate.operand == .parameter and
+                        predicate.operand.parameter >=
+                            definition_plan.parameter_declarations.items.len)
+                    {
+                        return error.ObservationParameterIndexInvalid;
+                    }
+                    try validatePredicateTypes(
+                        definition_plan,
+                        source_schema.?.column(predicate.field_index),
+                        predicate.operator,
+                        predicate.operand,
+                        predicate.case_insensitive,
+                    );
+                }
+            },
+            .project => {
+                const project = switch (stage.operation) {
+                    .project => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                if (project.input_field_indices.len !=
+                    stage.schema.columns.len)
+                {
+                    return error.CacheProjectionSchemaMismatch;
+                }
+                for (
+                    project.input_field_indices,
+                    stage.schema.columns,
+                ) |field_index, column| {
+                    if (field_index >= source_schema.?.columnCount()) {
+                        return error.CacheProjectionFieldInvalid;
+                    }
+                    try validateColumn(
+                        column,
+                        source_schema.?.column(field_index),
+                    );
+                }
+            },
+            .named_relation, .result_projection => {
+                if (stage.operation != .alias) {
+                    return error.CacheObservationOperationMismatch;
+                }
+                try validateSameSchema(&stage.schema, source_schema.?);
+            },
+            .limit => {
+                const limit = switch (stage.operation) {
+                    .limit => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateSameSchema(&stage.schema, source_schema.?);
+                switch (limit) {
+                    .fixed => |count| if (count == 0 or
+                        count > native_plan.max_rows)
+                    {
+                        return error.InvalidObservationLimit;
+                    },
+                    .parameter => |parameter| {
+                        if (parameter >=
+                            definition_plan.parameter_declarations.items.len or
+                            definition_plan.parameter_declarations
+                                .items[parameter].kind != .integer)
+                        {
+                            return error.ObservationLimitParameterMustBeInteger;
+                        }
+                    },
+                }
+            },
+            else => return error.ObservationOperatorPlanNotCompiled,
+        }
+    }
+    for (
+        native_plan.projections,
+        definition_plan.projections,
+        0..,
+    ) |projection, source, index| {
+        if (projection.definition_index != index or
+            projection.stage_index >= native_plan.stages.len or
+            projection.field_indices.len != source.fields.len or
+            !std.mem.eql(
+                u8,
+                native_plan.stages[projection.stage_index].name,
+                source.relation,
+            ))
+        {
+            return error.CacheObservationProjectionMismatch;
+        }
+        const schema =
+            &native_plan.stages[projection.stage_index].schema;
+        for (
+            projection.field_indices,
+            source.fields,
+        ) |field_index, field_name| {
+            if (field_index >= schema.columns.len or
+                !std.mem.eql(
+                    u8,
+                    schema.columns[field_index].name,
+                    field_name,
+                ))
+            {
+                return error.CacheObservationProjectionMismatch;
+            }
+        }
+    }
+}
+
+const SourceSchema = union(enum) {
+    native: *const Schema,
+    external: *const definition.ExternalInput,
+
+    fn columnCount(self: SourceSchema) usize {
+        return switch (self) {
+            .native => |schema| schema.columns.len,
+            .external => |input| input.fields.len,
+        };
+    }
+
+    fn column(self: SourceSchema, index: usize) Column {
+        return switch (self) {
+            .native => |schema| schema.columns[index],
+            .external => |input| .{
+                .name = input.fields[index].name,
+                .kind = externalKind(input.fields[index].kind),
+                .nullable = input.fields[index].nullable,
+            },
+        };
+    }
+};
+
+fn sourceSchema(
+    stages: []const Stage,
+    inputs: []const definition.ExternalInput,
+    source: SourceRef,
+) SourceSchema {
+    return switch (source) {
+        .stage => |index| .{ .native = &stages[index].schema },
+        .external => |index| .{ .external = &inputs[index] },
+    };
+}
+
+fn expectedSource(
+    stages: []const Stage,
+    inputs: []const definition.ExternalInput,
+    name: []const u8,
+) !SourceRef {
+    if (findStageIndex(stages, name)) |index| {
+        return .{ .stage = index };
+    }
+    for (inputs, 0..) |input, index| {
+        if (std.mem.eql(u8, input.name, name)) {
+            return .{ .external = @intCast(index) };
+        }
+    }
+    return error.UnknownPipelineInput;
+}
+
+fn sourcesEqual(left: ?SourceRef, right: ?SourceRef) bool {
+    if ((left == null) != (right == null)) return false;
+    if (left == null) return true;
+    return switch (left.?) {
+        .stage => |index| right.? == .stage and
+            right.?.stage == index,
+        .external => |index| right.? == .external and
+            right.?.external == index,
+    };
+}
+
+fn validatePhysicalSchema(
+    schema: *const Schema,
+    relation: physical.Relation,
+    field_indices: []const u16,
+) !void {
+    if (schema.columns.len != field_indices.len) {
+        return error.CachePhysicalSchemaMismatch;
+    }
+    const fields = relation.fields();
+    for (schema.columns, field_indices) |column, field_index| {
+        if (field_index >= fields.len) {
+            return error.PhysicalFieldIndexInvalid;
+        }
+        try validateColumn(column, .{
+            .name = @constCast(fields[field_index].name),
+            .kind = physicalKind(fields[field_index].kind),
+            .nullable = fields[field_index].nullable,
+        });
+    }
+}
+
+fn validateSameSchema(
+    schema: *const Schema,
+    expected: SourceSchema,
+) !void {
+    if (schema.columns.len != expected.columnCount()) {
+        return error.CacheObservationSchemaMismatch;
+    }
+    for (schema.columns, 0..) |column, index| {
+        try validateColumn(column, expected.column(index));
+    }
+}
+
+fn validateColumn(actual: Column, expected: Column) !void {
+    if (!std.mem.eql(u8, actual.name, expected.name) or
+        actual.kind != expected.kind or
+        actual.nullable != expected.nullable)
+    {
+        return error.CacheObservationSchemaMismatch;
+    }
+}
+
+fn encodeSchema(
+    schema: *const Schema,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(schema.columns.len);
+    for (schema.columns) |column| {
+        try encoder.writeBytes(column.name);
+        try encoder.writeEnum(column.kind);
+        try encoder.writeBool(column.nullable);
+    }
+}
+
+fn decodeSchema(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Schema {
+    const count = try decoder.readCount(256);
+    if (count == 0) return error.InvalidObservationSourceWidth;
+    const columns = try allocator.alloc(Column, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |*column| column.deinit(allocator);
+        allocator.free(columns);
+    }
+    for (columns, 0..) |*column, index| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        try definition_core.json.safeIdentifier(name, 128);
+        for (columns[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, name)) {
+                return error.DuplicateObservationColumn;
+            }
+        }
+        column.* = .{
+            .name = name,
+            .kind = try decoder.readEnum(ColumnKind),
+            .nullable = try decoder.readBool(),
+        };
+        initialized += 1;
+    }
+    return .{ .columns = columns };
+}
+
+fn encodeOperation(
+    operation: *const Operation,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeEnum(std.meta.activeTag(operation.*));
+    switch (operation.*) {
+        .scan => |scan| {
+            try encoder.writeEnum(scan.relation);
+            try encoder.writeCount(scan.field_indices.len);
+            for (scan.field_indices) |field| try encoder.writeU16(field);
+        },
+        .filter => |filter| {
+            try encoder.writeCount(filter.predicates.len);
+            for (filter.predicates) |predicate| {
+                try encoder.writeU16(predicate.field_index);
+                try encoder.writeEnum(predicate.operator);
+                try encoder.writeEnum(std.meta.activeTag(predicate.operand));
+                switch (predicate.operand) {
+                    .parameter => |index| try encoder.writeU16(index),
+                    .constant => |constant| {
+                        try encoder.writeEnum(std.meta.activeTag(constant));
+                        switch (constant) {
+                            .string => |text| try encoder.writeBytes(text),
+                            .integer => |number| try encoder.writeI64(number),
+                            .float => |number| try encoder.writeF64(number),
+                            .boolean => |flag| try encoder.writeBool(flag),
+                            .null => {},
+                        }
+                    },
+                }
+                try encoder.writeBool(predicate.case_insensitive);
+            }
+        },
+        .project => |project| {
+            try encoder.writeCount(project.input_field_indices.len);
+            for (project.input_field_indices) |field| {
+                try encoder.writeU16(field);
+            }
+        },
+        .alias => {},
+        .limit => |limit| {
+            try encoder.writeEnum(std.meta.activeTag(limit));
+            switch (limit) {
+                .fixed => |count| try encoder.writeUsize(count),
+                .parameter => |index| try encoder.writeU16(index),
+            }
+        },
+    }
+}
+
+fn decodeOperation(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !Operation {
+    const tag = try decoder.readEnum(std.meta.Tag(Operation));
+    return switch (tag) {
+        .scan => .{ .scan = try decodeScan(allocator, decoder) },
+        .filter => .{ .filter = try decodeFilter(
+            allocator,
+            decoder,
+            schema,
+        ) },
+        .project => .{ .project = try decodeProject(allocator, decoder) },
+        .alias => .alias,
+        .limit => .{ .limit = try decodeLimit(decoder) },
+    };
+}
+
+fn decodeScan(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Scan {
+    const relation = try decoder.readEnum(physical.Relation);
+    const count = try decoder.readCount(relation.fields().len);
+    if (count == 0) return error.EmptyPhysicalFieldSet;
+    const fields = try allocator.alloc(u16, count);
+    errdefer allocator.free(fields);
+    for (fields, 0..) |*field, index| {
+        field.* = try decoder.readU16();
+        if (field.* >= relation.fields().len) {
+            return error.PhysicalFieldIndexInvalid;
+        }
+        if (index != 0 and fields[index - 1] >= field.*) {
+            return error.CachePhysicalFieldsNotSorted;
+        }
+    }
+    return .{ .relation = relation, .field_indices = fields };
+}
+
+fn decodeFilter(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !Filter {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidFilterPredicateCount;
+    const predicates = try allocator.alloc(Predicate, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |*predicate| {
+            predicate.deinit(allocator);
+        }
+        allocator.free(predicates);
+    }
+    for (predicates) |*predicate| {
+        const field_index = try decoder.readU16();
+        if (field_index >= schema.columns.len) {
+            return error.CachePredicateFieldInvalid;
+        }
+        const operator = try decoder.readEnum(PredicateOperator);
+        var operand = try decodeOperand(allocator, decoder);
+        errdefer operand.deinit(allocator);
+        predicate.* = .{
+            .field_index = field_index,
+            .operator = operator,
+            .operand = operand,
+            .case_insensitive = try decoder.readBool(),
+        };
+        initialized += 1;
+    }
+    return .{ .predicates = predicates };
+}
+
+fn decodeOperand(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Operand {
+    return switch (try decoder.readEnum(std.meta.Tag(Operand))) {
+        .parameter => .{ .parameter = try decoder.readU16() },
+        .constant => .{ .constant = switch (try decoder.readEnum(
+            std.meta.Tag(Constant),
+        )) {
+            .string => .{ .string = try decodeStringConstant(
+                allocator,
+                decoder,
+            ) },
+            .integer => .{ .integer = try decoder.readI64() },
+            .float => float: {
+                const value = try decoder.readF64();
+                if (!std.math.isFinite(value)) {
+                    return error.InvalidFilterConstant;
+                }
+                break :float .{ .float = value };
+            },
+            .boolean => .{ .boolean = try decoder.readBool() },
+            .null => .null,
+        } },
+    };
+}
+
+fn decodeStringConstant(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]u8 {
+    const value = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(value);
+    if (!std.unicode.utf8ValidateSlice(value)) {
+        return error.InvalidFilterConstant;
+    }
+    return value;
+}
+
+fn decodeProject(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Project {
+    const count = try decoder.readCount(256);
+    if (count == 0) return error.InvalidProjectionFieldCount;
+    const fields = try allocator.alloc(u16, count);
+    errdefer allocator.free(fields);
+    for (fields, 0..) |*field, index| {
+        field.* = try decoder.readU16();
+        for (fields[0..index]) |prior| {
+            if (prior == field.*) return error.DuplicateProjectionField;
+        }
+    }
+    return .{ .input_field_indices = fields };
+}
+
+fn decodeLimit(
+    decoder: *definition_core.cache.Decoder,
+) !Limit {
+    return switch (try decoder.readEnum(std.meta.Tag(Limit))) {
+        .fixed => .{ .fixed = try decoder.readUsize() },
+        .parameter => .{ .parameter = try decoder.readU16() },
+    };
+}
+
+fn decodeSource(
+    decoder: *definition_core.cache.Decoder,
+    stage_index: usize,
+) !SourceRef {
+    return switch (try decoder.readEnum(std.meta.Tag(SourceRef))) {
+        .stage => stage: {
+            const index = try decoder.readU16();
+            if (index >= stage_index) return error.CacheStageSourceInvalid;
+            break :stage .{ .stage = index };
+        },
+        .external => .{ .external = try decoder.readU16() },
+    };
+}
+
 fn compileForAllocationFailure(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
 ) !void {
     var compiled = try compile(allocator, definition_plan);
     defer compiled.deinit(allocator);
+}
+
+fn decodeCacheForAllocationFailure(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    definition_plan: *const definition.Plan,
+) !void {
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(allocator, &decoder, definition_plan);
+    defer cached.deinit(allocator);
+    try decoder.finish();
 }
 
 test "observation steps compile field names and parameters to native indices" {
@@ -839,6 +1507,50 @@ test "observation steps compile field names and parameters to native indices" {
         std.testing.allocator,
         compileForAllocationFailure,
         .{&definition_plan},
+    );
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(
+        std.testing.allocator,
+        &decoder,
+        &definition_plan,
+    );
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(plan.stages.len, cached.stages.len);
+    try std.testing.expectEqualSlices(
+        u16,
+        plan.stages[0].operation.scan.field_indices,
+        cached.stages[0].operation.scan.field_indices,
+    );
+    try std.testing.expectEqual(
+        plan.stages[1].operation.filter.predicates[0].field_index,
+        cached.stages[1].operation.filter.predicates[0].field_index,
+    );
+    const mismatched = try std.testing.allocator.dupe(u8, payload);
+    defer std.testing.allocator.free(mismatched);
+    mismatched[mismatched.len - 1] ^= 1;
+    var mismatch_decoder = definition_core.cache.Decoder.init(mismatched);
+    try std.testing.expectError(
+        error.CacheObservationPlanShapeMismatch,
+        decodeCache(
+            std.testing.allocator,
+            &mismatch_decoder,
+            &definition_plan,
+        ),
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeCacheForAllocationFailure,
+        .{ payload, &definition_plan },
     );
 }
 
