@@ -4,6 +4,7 @@ pub const execution = @import("execution.zig");
 pub const external_input = @import("external_input.zig");
 pub const plan = @import("plan.zig");
 pub const physical = @import("physical.zig");
+pub const result = @import("result.zig");
 
 test {
     _ = compiled_plan;
@@ -12,4 +13,5 @@ test {
     _ = external_input;
     _ = plan;
     _ = physical;
+    _ = result;
 }
