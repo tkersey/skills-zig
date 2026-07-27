@@ -989,8 +989,9 @@ fn emitProjection(
     compile_stats: definition_core.result.CompileStats,
 ) !void {
     if (payload_only) {
-        try writeStdout(result.payload);
-        try writeStdout("\n");
+        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        try stdout_writer.interface.writeAll(result.payload);
+        try stdout_writer.interface.writeByte('\n');
         return;
     }
     switch (format) {
@@ -1006,8 +1007,10 @@ fn emitProjection(
             try writeStdout(output.written());
         },
         .text => {
-            try writeStdout(result.payload);
-            try writeStdout("\n");
+            var stdout_writer =
+                std.Io.File.stdout().writer(defaultIo(), &.{});
+            try stdout_writer.interface.writeAll(result.payload);
+            try stdout_writer.interface.writeByte('\n');
         },
     }
 }

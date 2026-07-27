@@ -166,7 +166,7 @@ pub const Operator = enum {
             .exact_object => 2,
             .optional_field => 2,
             .reference_exists => 8,
-            .implies => 3,
+            .implies => 4,
             .sorted => 2,
             .exactly_one, .at_least_one => 2,
             .keyed_unique => 2,
@@ -176,6 +176,7 @@ pub const Operator = enum {
             .compare_append, .bind_existing => 2,
             .event_envelope => 4,
             .cross_input_equal => 2,
+            .fold => 2,
             else => 1,
         };
     }

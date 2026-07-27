@@ -5,6 +5,8 @@ const reducer = @import("reducer.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 
+const max_event_kinds: usize = 256;
+
 const required_operator_mask =
     operatorBit(.event_envelope) |
     operatorBit(.sequence) |
@@ -101,6 +103,8 @@ pub const ReplayState = struct {
     next_sequence: u64,
     previous_digest: [71]u8 = undefined,
     has_previous_digest: bool = false,
+    kind_counts: [max_event_kinds]usize =
+        [_]usize{0} ** max_event_kinds,
     records: usize = 0,
     reducer_state: reducer.State = .{},
     state_reducer_state: state_reducer.State = .{},
@@ -120,6 +124,26 @@ pub const ReplayState = struct {
             self.previous_digest[0..]
         else
             null;
+    }
+
+    pub fn headDigest(
+        self: *const ReplayState,
+        plan: *const Plan,
+    ) ?[]const u8 {
+        if (self.previousDigest()) |digest| return digest;
+        return switch (plan.genesis) {
+            .null => null,
+            .digest => |digest| digest,
+        };
+    }
+
+    pub fn eventKindCount(
+        self: *const ReplayState,
+        plan: *const Plan,
+        index: usize,
+    ) ?usize {
+        if (index >= plan.event_kinds.len) return null;
+        return self.kind_counts[index];
     }
 };
 
@@ -592,9 +616,10 @@ fn applyValueWithParameters(
         object.get(plan.envelope.kind_key) orelse
             return error.EventEnvelopeFieldMissing,
     );
-    if (!containsSorted(plan.event_kinds, kind)) {
-        return error.UnknownEventKind;
-    }
+    const kind_index = findSortedIndex(
+        plan.event_kinds,
+        kind,
+    ) orelse return error.UnknownEventKind;
 
     const claimed_previous = object.get(
         plan.envelope.previous_digest_key,
@@ -659,6 +684,7 @@ fn applyValueWithParameters(
     }
     @memcpy(&state.previous_digest, claimed_event_digest);
     state.has_previous_digest = true;
+    state.kind_counts[kind_index] += 1;
     state.next_sequence += 1;
     state.records += 1;
 }
@@ -2293,6 +2319,13 @@ fn validatePreviousDigest(
 }
 
 fn containsSorted(items: []const []u8, needle: []const u8) bool {
+    return findSortedIndex(items, needle) != null;
+}
+
+fn findSortedIndex(
+    items: []const []u8,
+    needle: []const u8,
+) ?usize {
     var low: usize = 0;
     var high = items.len;
     while (low < high) {
@@ -2300,10 +2333,10 @@ fn containsSorted(items: []const []u8, needle: []const u8) bool {
         switch (std.mem.order(u8, items[mid], needle)) {
             .lt => low = mid + 1,
             .gt => high = mid,
-            .eq => return true,
+            .eq => return mid,
         }
     }
-    return false;
+    return null;
 }
 
 fn findInput(

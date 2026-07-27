@@ -246,18 +246,39 @@ pub const State = struct {
         plan: *const Plan,
         name: []const u8,
     ) ?std.json.Value {
-        if (findRegister(plan.registers, name) == null) return null;
-        const index = findNamedRegister(self.registers.items, name) orelse
-            return null;
-        return if (self.registers.items[index].value) |owned|
-            owned.parsed.value
-        else
-            null;
+        const index = registerIndex(plan, name) orelse return null;
+        return getByIndex(self, plan, index);
     }
 };
 
 pub fn hasRegister(plan: *const Plan, name: []const u8) bool {
     return findRegister(plan.registers, name) != null;
+}
+
+pub fn registerIndex(plan: *const Plan, name: []const u8) ?u16 {
+    const index = findRegister(plan.registers, name) orelse return null;
+    return std.math.cast(u16, index);
+}
+
+pub fn registerCount(plan: *const Plan) usize {
+    return plan.registers.len;
+}
+
+pub fn getByIndex(
+    state: *const State,
+    plan: *const Plan,
+    index: u16,
+) ?std.json.Value {
+    const plan_index: usize = index;
+    if (plan_index >= plan.registers.len or
+        plan_index >= state.register_map.len)
+    {
+        return null;
+    }
+    return if (registerStateConst(state, plan_index).value) |owned|
+        owned.parsed.value
+    else
+        null;
 }
 
 pub fn isRetainedRule(

@@ -4,6 +4,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
+const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 
 const Scalar = union(enum) {
@@ -64,13 +65,77 @@ const Limit = union(enum) {
     }
 };
 
-const Fold = struct {
+const KeyedFold = struct {
     key_field: []u8,
     state_field: []u8,
 
-    fn deinit(self: *Fold, allocator: std.mem.Allocator) void {
+    fn deinit(self: *KeyedFold, allocator: std.mem.Allocator) void {
         allocator.free(self.key_field);
         allocator.free(self.state_field);
+        self.* = undefined;
+    }
+};
+
+const RetainedMeta = enum {
+    record_count,
+    head_digest,
+    event_kind_counts,
+};
+
+const RetainedRegister = struct {
+    index: u16,
+    pointer: definition_core.json_pointer.Pointer,
+    count: bool,
+
+    fn deinit(
+        self: *RetainedRegister,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.pointer.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const RetainedSource = union(enum) {
+    register: RetainedRegister,
+    meta: RetainedMeta,
+
+    fn deinit(self: *RetainedSource, allocator: std.mem.Allocator) void {
+        if (self.* == .register) self.register.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const RetainedField = struct {
+    name: []u8,
+    source: RetainedSource,
+
+    fn deinit(self: *RetainedField, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.source.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const RetainedFold = struct {
+    fields: []RetainedField,
+
+    fn deinit(self: *RetainedFold, allocator: std.mem.Allocator) void {
+        for (self.fields) |*field| field.deinit(allocator);
+        allocator.free(self.fields);
+        self.* = undefined;
+    }
+};
+
+const Fold = union(enum) {
+    keyed: KeyedFold,
+    retained: RetainedFold,
+
+    fn deinit(self: *Fold, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .keyed => |*fold| fold.deinit(allocator),
+            .retained => |*fold| fold.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
@@ -186,7 +251,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
@@ -228,8 +293,34 @@ pub fn encodeCache(
         }
         try encoder.writeBool(projection.fold != null);
         if (projection.fold) |fold| {
-            try encoder.writeBytes(fold.key_field);
-            try encoder.writeBytes(fold.state_field);
+            switch (fold) {
+                .keyed => |keyed| {
+                    try encoder.writeByte(0);
+                    try encoder.writeBytes(keyed.key_field);
+                    try encoder.writeBytes(keyed.state_field);
+                },
+                .retained => |retained| {
+                    try encoder.writeByte(1);
+                    try encoder.writeCount(retained.fields.len);
+                    for (retained.fields) |field| {
+                        try encoder.writeBytes(field.name);
+                        switch (field.source) {
+                            .register => |register| {
+                                try encoder.writeByte(0);
+                                try encoder.writeU16(register.index);
+                                try encoder.writeBytes(
+                                    register.pointer.raw,
+                                );
+                                try encoder.writeBool(register.count);
+                            },
+                            .meta => |meta| {
+                                try encoder.writeByte(1);
+                                try encoder.writeEnum(meta);
+                            },
+                        }
+                    }
+                },
+            }
         }
     }
     try encoder.writeUsize(plan.max_records);
@@ -240,7 +331,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const count = try decoder.readCount(128);
@@ -304,14 +395,69 @@ pub fn validateCachePlan(
                 projection.latest != null or
                 !definition_plan.requires(.fold) or
                 event_protocol == null or
-                event_protocol.?.reducer_plan == null or
-                event_protocol.?.target_slot_index != projection.slot_index or
-                std.mem.eql(u8, fold.key_field, fold.state_field))
+                event_protocol.?.target_slot_index != projection.slot_index)
             {
                 return error.CacheProjectionPlanMismatch;
             }
-            try definition_core.json.safeIdentifier(fold.key_field, 128);
-            try definition_core.json.safeIdentifier(fold.state_field, 128);
+            switch (fold) {
+                .keyed => |keyed| {
+                    if (event_protocol.?.reducer_plan == null or
+                        std.mem.eql(
+                            u8,
+                            keyed.key_field,
+                            keyed.state_field,
+                        ))
+                    {
+                        return error.CacheProjectionPlanMismatch;
+                    }
+                    try definition_core.json.safeIdentifier(
+                        keyed.key_field,
+                        128,
+                    );
+                    try definition_core.json.safeIdentifier(
+                        keyed.state_field,
+                        128,
+                    );
+                },
+                .retained => |retained| {
+                    const retained_plan =
+                        if (event_protocol.?.state_reducer_plan) |*value|
+                            value
+                        else
+                            return error.CacheProjectionPlanMismatch;
+                    if (projection.limit != null or
+                        retained.fields.len == 0 or
+                        retained.fields.len > 256)
+                    {
+                        return error.CacheProjectionPlanMismatch;
+                    }
+                    for (retained.fields, 0..) |field, index| {
+                        try definition_core.json.safeIdentifier(
+                            field.name,
+                            128,
+                        );
+                        if (index != 0 and std.mem.order(
+                            u8,
+                            retained.fields[index - 1].name,
+                            field.name,
+                        ) != .lt) {
+                            return error.CacheProjectionFieldsNotSorted;
+                        }
+                        switch (field.source) {
+                            .register => |register| {
+                                if (register.index >=
+                                    state_reducer.registerCount(
+                                        retained_plan,
+                                    ))
+                                {
+                                    return error.CacheProjectionPlanMismatch;
+                                }
+                            },
+                            .meta => {},
+                        }
+                    }
+                },
+            }
         }
         for (projection.predicates) |predicate| {
             if (predicate.operand == .parameter and
@@ -428,18 +574,97 @@ fn decodeCacheProjection(
     var fold: ?Fold = null;
     errdefer if (fold) |*compiled| compiled.deinit(allocator);
     if (try decoder.readBool()) {
-        const key_field = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(key_field);
-        try definition_core.json.safeIdentifier(key_field, 128);
-        const state_field = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(state_field);
-        try definition_core.json.safeIdentifier(state_field, 128);
-        if (std.mem.eql(u8, key_field, state_field)) {
-            return error.CacheProjectionFieldsConflict;
-        }
-        fold = .{
-            .key_field = key_field,
-            .state_field = state_field,
+        fold = switch (try decoder.readByte()) {
+            0 => keyed: {
+                const key_field =
+                    try decoder.readBytesAlloc(allocator, 128);
+                errdefer allocator.free(key_field);
+                try definition_core.json.safeIdentifier(key_field, 128);
+                const state_field =
+                    try decoder.readBytesAlloc(allocator, 128);
+                errdefer allocator.free(state_field);
+                try definition_core.json.safeIdentifier(
+                    state_field,
+                    128,
+                );
+                if (std.mem.eql(u8, key_field, state_field)) {
+                    return error.CacheProjectionFieldsConflict;
+                }
+                break :keyed .{ .keyed = .{
+                    .key_field = key_field,
+                    .state_field = state_field,
+                } };
+            },
+            1 => retained: {
+                const retained_count = try decoder.readCount(256);
+                if (retained_count == 0) {
+                    return error.CacheProjectionFieldsInvalid;
+                }
+                const retained_fields = try allocator.alloc(
+                    RetainedField,
+                    retained_count,
+                );
+                var retained_initialized: usize = 0;
+                errdefer {
+                    for (retained_fields[0..retained_initialized]) |*field| {
+                        field.deinit(allocator);
+                    }
+                    allocator.free(retained_fields);
+                }
+                for (retained_fields, 0..) |*field, index| {
+                    const field_name =
+                        try decoder.readBytesAlloc(allocator, 128);
+                    errdefer allocator.free(field_name);
+                    try definition_core.json.safeIdentifier(
+                        field_name,
+                        128,
+                    );
+                    if (index != 0 and std.mem.order(
+                        u8,
+                        retained_fields[index - 1].name,
+                        field_name,
+                    ) != .lt) {
+                        return error.CacheProjectionFieldsNotSorted;
+                    }
+                    var source: RetainedSource = switch (try decoder.readByte()) {
+                        0 => register: {
+                            const register_index =
+                                try decoder.readU16();
+                            const raw_pointer =
+                                try decoder.readBytesAlloc(
+                                    allocator,
+                                    1024,
+                                );
+                            defer allocator.free(raw_pointer);
+                            var pointer =
+                                try definition_core.json_pointer.compile(
+                                    allocator,
+                                    raw_pointer,
+                                );
+                            errdefer pointer.deinit(allocator);
+                            break :register .{ .register = .{
+                                .index = register_index,
+                                .pointer = pointer,
+                                .count = try decoder.readBool(),
+                            } };
+                        },
+                        1 => .{ .meta = try decoder.readEnum(
+                            RetainedMeta,
+                        ) },
+                        else => return error.CacheProjectionSourceInvalid,
+                    };
+                    errdefer source.deinit(allocator);
+                    field.* = .{
+                        .name = field_name,
+                        .source = source,
+                    };
+                    retained_initialized += 1;
+                }
+                break :retained .{ .retained = .{
+                    .fields = retained_fields,
+                } };
+            },
+            else => return error.CacheProjectionFoldInvalid,
         };
     }
     return .{
@@ -604,41 +829,74 @@ fn compileProjection(
                     return error.InvalidProjectionOperatorOrder;
                 }
                 if (event_protocol == null or
-                    event_protocol.?.reducer_plan == null or
                     event_protocol.?.target_slot_index != slot_index)
                 {
                     return error.FoldRequiresReducerSlot;
                 }
-                try definition_core.json.requireExactKeys(
-                    step,
-                    &.{ "op", "key_field", "state_field" },
-                );
-                try definition_core.json.requireFields(
-                    step,
-                    &.{ "op", "key_field", "state_field" },
-                );
-                const key_field = try definition_core.json.requiredString(
-                    step,
-                    "key_field",
-                );
-                const state_field = try definition_core.json.requiredString(
-                    step,
-                    "state_field",
-                );
-                try definition_core.json.safeIdentifier(key_field, 128);
-                try definition_core.json.safeIdentifier(state_field, 128);
-                if (std.mem.eql(u8, key_field, state_field)) {
-                    return error.ProjectionFieldsConflict;
-                }
-                fold = fold: {
-                    const owned_key = try allocator.dupe(u8, key_field);
-                    errdefer allocator.free(owned_key);
-                    const owned_state = try allocator.dupe(u8, state_field);
-                    break :fold .{
-                        .key_field = owned_key,
-                        .state_field = owned_state,
+                if (step.get("fields")) |fields_value| {
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "fields" },
+                    );
+                    const retained_plan =
+                        if (event_protocol.?.state_reducer_plan) |*value|
+                            value
+                        else
+                            return error.FoldRequiresRetainedReducer;
+                    fold = .{ .retained = .{
+                        .fields = try compileRetainedFields(
+                            allocator,
+                            retained_plan,
+                            try definition_core.json.object(
+                                fields_value,
+                            ),
+                        ),
+                    } };
+                } else {
+                    if (event_protocol.?.reducer_plan == null) {
+                        return error.FoldRequiresKeyedReducer;
+                    }
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "key_field", "state_field" },
+                    );
+                    try definition_core.json.requireFields(
+                        step,
+                        &.{ "op", "key_field", "state_field" },
+                    );
+                    const key_field =
+                        try definition_core.json.requiredString(
+                            step,
+                            "key_field",
+                        );
+                    const state_field =
+                        try definition_core.json.requiredString(
+                            step,
+                            "state_field",
+                        );
+                    try definition_core.json.safeIdentifier(
+                        key_field,
+                        128,
+                    );
+                    try definition_core.json.safeIdentifier(
+                        state_field,
+                        128,
+                    );
+                    if (std.mem.eql(u8, key_field, state_field)) {
+                        return error.ProjectionFieldsConflict;
+                    }
+                    fold = fold: {
+                        const owned_key =
+                            try allocator.dupe(u8, key_field);
+                        errdefer allocator.free(owned_key);
+                        const owned_state =
+                            try allocator.dupe(u8, state_field);
+                        break :fold .{ .keyed = .{
+                            .key_field = owned_key,
+                            .state_field = owned_state,
+                        } };
                     };
-                };
+                }
             },
             .limit => {
                 if (limit != null) return error.DuplicateProjectionLimit;
@@ -649,6 +907,9 @@ fn compileProjection(
             },
             else => return error.UnsupportedProjectionOperator,
         }
+    }
+    if (fold != null and fold.? == .retained and limit != null) {
+        return error.RetainedFoldRejectsLimit;
     }
     return .{
         .name = try allocator.dupe(u8, source.name),
@@ -753,6 +1014,107 @@ fn compileFields(
     return fields.toOwnedSlice(allocator);
 }
 
+fn compileRetainedFields(
+    allocator: std.mem.Allocator,
+    retained_plan: *const state_reducer.Plan,
+    object: std.json.ObjectMap,
+) ![]RetainedField {
+    if (object.count() == 0 or object.count() > 256) {
+        return error.InvalidProjectionFields;
+    }
+    var fields: std.ArrayList(RetainedField) = .empty;
+    errdefer {
+        for (fields.items) |*field| field.deinit(allocator);
+        fields.deinit(allocator);
+    }
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        try definition_core.json.safeIdentifier(entry.key_ptr.*, 128);
+        const name = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(name);
+        const source_object = try definition_core.json.object(
+            entry.value_ptr.*,
+        );
+        var source: RetainedSource = if (source_object.get("register") != null) register: {
+            try definition_core.json.requireExactKeys(
+                source_object,
+                &.{ "register", "path", "count" },
+            );
+            try definition_core.json.requireFields(
+                source_object,
+                &.{"register"},
+            );
+            const register_name =
+                try definition_core.json.requiredString(
+                    source_object,
+                    "register",
+                );
+            const register_index =
+                state_reducer.registerIndex(
+                    retained_plan,
+                    register_name,
+                ) orelse return error.UnknownProjectionRegister;
+            const raw_path = if (source_object.get("path")) |raw|
+                try definition_core.json.string(raw)
+            else
+                "";
+            var pointer = try definition_core.json_pointer.compile(
+                allocator,
+                raw_path,
+            );
+            errdefer pointer.deinit(allocator);
+            const count = if (source_object.get("count")) |raw|
+                try definition_core.json.boolean(raw)
+            else
+                false;
+            break :register .{ .register = .{
+                .index = register_index,
+                .pointer = pointer,
+                .count = count,
+            } };
+        } else meta: {
+            try definition_core.json.requireExactKeys(
+                source_object,
+                &.{"meta"},
+            );
+            try definition_core.json.requireFields(
+                source_object,
+                &.{"meta"},
+            );
+            break :meta .{ .meta = try parseRetainedMeta(
+                try definition_core.json.requiredString(
+                    source_object,
+                    "meta",
+                ),
+            ) };
+        };
+        errdefer source.deinit(allocator);
+        try fields.append(allocator, .{
+            .name = name,
+            .source = source,
+        });
+    }
+    std.mem.sort(RetainedField, fields.items, {}, struct {
+        fn lessThan(
+            _: void,
+            left: RetainedField,
+            right: RetainedField,
+        ) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
+    return fields.toOwnedSlice(allocator);
+}
+
+fn parseRetainedMeta(raw: []const u8) !RetainedMeta {
+    if (std.mem.eql(u8, raw, "record-count")) return .record_count;
+    if (std.mem.eql(u8, raw, "head-digest")) return .head_digest;
+    if (std.mem.eql(u8, raw, "event-kind-counts")) {
+        return .event_kind_counts;
+    }
+    return error.UnknownProjectionMetadata;
+}
+
 fn compileLimit(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -834,20 +1196,46 @@ pub fn execute(
         .records_emitted = 0,
     };
     if (compiled.fold) |fold| {
-        const state = if (replay_stats.protocol_state) |*protocol_state|
-            &protocol_state.reducer_state
-        else
-            return error.FoldReplayStateMissing;
+        const replay_state =
+            if (replay_stats.protocol_state) |*protocol_state|
+                protocol_state
+            else
+                return error.FoldReplayStateMissing;
+        const event_plan = event_protocol orelse
+            return error.FoldReplayPlanMissing;
         stats.records_scanned = replay_stats.records_validated;
-        stats.records_matched = state.count();
-        stats.records_emitted = try state.writeCanonicalRows(
-            allocator,
-            &output,
-            fold.key_field,
-            fold.state_field,
-            effective_limit,
-            plan.max_output_bytes,
-        );
+        switch (fold) {
+            .keyed => |keyed| {
+                stats.records_matched =
+                    replay_state.reducer_state.count();
+                stats.records_emitted =
+                    try replay_state.reducer_state.writeCanonicalRows(
+                        allocator,
+                        &output,
+                        keyed.key_field,
+                        keyed.state_field,
+                        effective_limit,
+                        plan.max_output_bytes,
+                    );
+            },
+            .retained => |retained| {
+                const retained_plan =
+                    if (event_plan.state_reducer_plan) |*value|
+                        value
+                    else
+                        return error.FoldRetainedPlanMissing;
+                try writeRetainedProjection(
+                    allocator,
+                    &output.writer,
+                    event_plan,
+                    retained_plan,
+                    replay_state,
+                    retained.fields,
+                );
+                stats.records_matched = 1;
+                stats.records_emitted = 1;
+            },
+        }
     } else {
         switch (slot.codec) {
             .json => try executeDocument(
@@ -896,6 +1284,95 @@ pub fn execute(
         .payload = payload,
         .stats = stats,
         .limitations = limitations,
+    };
+}
+
+fn writeRetainedProjection(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    event_plan: *const protocol.Plan,
+    retained_plan: *const state_reducer.Plan,
+    replay_state: *const protocol.ReplayState,
+    fields: []const RetainedField,
+) !void {
+    try writer.writeByte('{');
+    for (fields, 0..) |field, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            field.name,
+        );
+        try writer.writeByte(':');
+        switch (field.source) {
+            .register => |register| {
+                const root = state_reducer.getByIndex(
+                    &replay_state.state_reducer_state,
+                    retained_plan,
+                    register.index,
+                );
+                const selected = if (root) |value|
+                    definition_core.json_pointer.lookup(
+                        value,
+                        register.pointer,
+                    )
+                else
+                    null;
+                if (register.count) {
+                    const count = if (selected) |value|
+                        try retainedValueCount(value)
+                    else
+                        0;
+                    try writer.print("{d}", .{count});
+                } else if (selected) |value| {
+                    try definition_core.canonical_json.writeCanonicalJson(
+                        allocator,
+                        writer,
+                        value,
+                    );
+                } else {
+                    try writer.writeAll("null");
+                }
+            },
+            .meta => |meta| switch (meta) {
+                .record_count => try writer.print(
+                    "{d}",
+                    .{replay_state.records},
+                ),
+                .head_digest => {
+                    if (replay_state.headDigest(event_plan)) |digest| {
+                        try definition_core.canonical_json
+                            .writeCanonicalString(writer, digest);
+                    } else {
+                        try writer.writeAll("null");
+                    }
+                },
+                .event_kind_counts => {
+                    try writer.writeByte('{');
+                    for (event_plan.event_kinds, 0..) |kind, kind_index| {
+                        if (kind_index != 0) try writer.writeByte(',');
+                        try definition_core.canonical_json
+                            .writeCanonicalString(writer, kind);
+                        try writer.writeByte(':');
+                        try writer.print("{d}", .{
+                            replay_state.eventKindCount(
+                                event_plan,
+                                kind_index,
+                            ) orelse return error.EventKindCountMissing,
+                        });
+                    }
+                    try writer.writeByte('}');
+                },
+            },
+        }
+    }
+    try writer.writeByte('}');
+}
+
+fn retainedValueCount(value: std.json.Value) !usize {
+    return switch (value) {
+        .array => |items| items.items.len,
+        .object => |items| items.count(),
+        else => error.ProjectionCountRequiresCollection,
     };
 }
 

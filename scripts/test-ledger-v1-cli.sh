@@ -32,7 +32,7 @@ capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"ledger-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"id":"exact-object","version":2' <<<"$capabilities"
 grep -Fq '"id":"optional-field","version":2' <<<"$capabilities"
-grep -Fq '"id":"implies","version":3' <<<"$capabilities"
+grep -Fq '"id":"implies","version":4' <<<"$capabilities"
 grep -Fq '"id":"regex","version":2' <<<"$capabilities"
 grep -Fq '"id":"sha256","version":3' <<<"$capabilities"
 grep -Fq '"id":"sorted","version":2' <<<"$capabilities"
@@ -57,6 +57,7 @@ grep -Fq '"id":"event-envelope","version":4' <<<"$capabilities"
 grep -Fq '"id":"cross-input-equal","version":2' <<<"$capabilities"
 grep -Fq '"id":"compare-and-append","version":2' <<<"$capabilities"
 grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
+grep -Fq '"id":"fold","version":2' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
 if grep -Eq \
   '"id":"(relevance|text-render)"' \
