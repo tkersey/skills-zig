@@ -159,6 +159,58 @@ transact_success() {
     "$result" >/dev/null
 }
 
+check_structural_facts() {
+  local case_tmp=$1
+  local repo_root=$2
+  local result="$case_tmp/structural-facts.json"
+  local payload="$case_tmp/structural-facts-payload.json"
+  local expected_head
+
+  "$ledger_bin" project \
+    --definition "$protocol_definition" \
+    --projection structural-facts \
+    --repo "$repo_root" \
+    --param goal=goal-1 \
+    --format json >"$result"
+  expected_head=$(
+    tail -n 1 "$repo_root/.ledger/actuation/goal-1/evidence.jsonl" |
+      jq -r '.event_digest'
+  )
+  jq -e \
+    --arg head "$expected_head" \
+    --slurpfile context "$case_tmp/context.json" \
+    '
+      .schema == "ledger-projection-result/v1" and
+      .definition.id == "actuating/evidence-protocol" and
+      .projection == "structural-facts" and
+      .data.construction_ref ==
+        $context[0].construction_artifact_id and
+      .data.counterexample_class_count == 1 and
+      .data.event_count == 3 and
+      .data.event_kinds.construction_contract_registered == 1 and
+      .data.event_kinds.counterexample_set_registered == 1 and
+      .data.event_kinds.goal_contract_registered == 1 and
+      ([.data.event_kinds[]] | add) == 3 and
+      .data.goal_contract_ref == $context[0].goal_artifact_id and
+      .data.goal_id == "goal-1" and
+      .data.head_digest == $head and
+      .data.pending_operation == null and
+      .data.subject_digest == $context[0].subject_digest and
+      .authority_granted == false and
+      .storage_mutated == false
+    ' \
+    "$result" >/dev/null
+
+  "$ledger_bin" project \
+    --definition "$protocol_definition" \
+    --projection structural-facts \
+    --repo "$repo_root" \
+    --param goal=goal-1 \
+    --payload-only \
+    --format json >"$payload"
+  jq -S -c '.data' "$result" | cmp -s - "$payload"
+}
+
 setup_review() {
   local case_tmp=$1
   local repo_root=$2
@@ -399,6 +451,7 @@ while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error 
     review_status=rejected
   fi
   setup_review "$case_tmp" "$repo_root" "$review_status"
+  check_structural_facts "$case_tmp" "$repo_root"
   prepare_candidate "$case_id" "$candidate_kind" "$case_tmp"
   actual_digest="sha256:$(shasum -a 256 "$case_tmp/candidate.json" | awk '{print $1}')"
   if [[ "$actual_digest" != "$expected_digest" ]]; then
