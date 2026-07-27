@@ -209,6 +209,34 @@ fn tryLoadCache(
         runtime_version,
         source_adapter_version,
     );
+    const cached_locator = try loadLocator(
+        allocator,
+        cache_dir,
+        locator_key,
+        admitted_root,
+        closure_limits,
+    );
+    var locator = cached_locator orelse return null;
+    defer locator.deinit(allocator);
+    return @as(?PlanSet, try loadCachedPlan(
+        allocator,
+        cache_dir,
+        entry_path,
+        request,
+        runtime_version,
+        source_adapter_version,
+        &locator,
+        closure_limits,
+    ));
+}
+
+fn loadLocator(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    locator_key: [32]u8,
+    admitted_root: []const u8,
+    closure_limits: definition_core.closure.Limits,
+) !?Locator {
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -231,14 +259,26 @@ fn tryLoadCache(
         locator_limits,
     );
     var locator = try decodeLocator(allocator, locator_payload);
-    defer locator.deinit(allocator);
+    errdefer locator.deinit(allocator);
     _ = try definition_core.closure.verifySourceManifest(
         allocator,
         admitted_root,
         locator.files,
         closure_limits,
     );
+    return locator;
+}
 
+fn loadCachedPlan(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    entry_path: []const u8,
+    request: Request,
+    runtime_version: []const u8,
+    source_adapter_version: []const u8,
+    locator: *const Locator,
+    closure_limits: definition_core.closure.Limits,
+) !PlanSet {
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -306,6 +346,34 @@ fn writeCache(
     try durable_store.ensureDirectoryPathNoSymlinks(plans_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(locators_dir);
 
+    const plan_key = try writePlanEntry(
+        allocator,
+        cache_dir,
+        runtime_version,
+        source_adapter_version,
+        request,
+        plan_set,
+    );
+    try writeLocatorEntry(
+        allocator,
+        cache_dir,
+        admitted_root,
+        runtime_version,
+        source_adapter_version,
+        request,
+        plan_set,
+        plan_key,
+    );
+}
+
+fn writePlanEntry(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    runtime_version: []const u8,
+    source_adapter_version: []const u8,
+    request: Request,
+    plan_set: *const PlanSet,
+) ![32]u8 {
     const plan_key = planKey(
         runtime_version,
         source_adapter_version,
@@ -335,7 +403,19 @@ fn writeCache(
     );
     defer allocator.free(plan_path);
     try durable_store.writeTextAtomic(allocator, plan_path, plan_entry);
+    return plan_key;
+}
 
+fn writeLocatorEntry(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    admitted_root: []const u8,
+    runtime_version: []const u8,
+    source_adapter_version: []const u8,
+    request: Request,
+    plan_set: *const PlanSet,
+    plan_key: [32]u8,
+) !void {
     const locator_key = locatorKey(
         admitted_root,
         plan_set.entry_path,
@@ -732,32 +812,42 @@ fn decodePlanSetForAllocationFailure(
     defer plan_set.deinit(allocator);
 }
 
-test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
-    var source_tmp = std.testing.tmpDir(.{});
-    defer source_tmp.cleanup();
-    const observation_source =
-        \\{"schema":"seq-observation-definition/v1","id":"example/cache","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},"parameters":{"needle":{"type":"string","required":true}},"selectors":["path"],"relations":[{"name":"messages","fields":["session_id","text"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"messages","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"text","op":"contains","param":"needle"}]},{"op":"project","input":"matched","as":"rows","fields":["session_id","text"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["session_id","text"],"renderers":["json"]}},"bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":8}}
-    ;
-    try source_tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data = observation_source,
-    });
-    const source_root = try source_tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(source_root);
-    var cache_tmp = std.testing.tmpDir(.{});
-    defer cache_tmp.cleanup();
-    const cache_root = try cache_tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(cache_root);
-    const request: Request = .{ .projection_names = &.{"rows"} };
+const cached_observation_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/cache",
+    \\  "requires": {
+    \\    "abi": "seq-observation-abi/v1",
+    \\    "operators": ["scan", "filter", "project"]
+    \\  },
+    \\  "parameters": {"needle": {"type": "string", "required": true}},
+    \\  "selectors": ["path"],
+    \\  "relations": [{"name": "messages", "fields": ["session_id", "text"]}],
+    \\  "inputs": [],
+    \\  "pipeline": [
+    \\    {"op": "scan", "relation": "messages", "as": "source"},
+    \\    {"op": "filter", "input": "source", "as": "matched",
+    \\     "where": [{"field": "text", "op": "contains", "param": "needle"}]},
+    \\    {"op": "project", "input": "matched", "as": "rows",
+    \\     "fields": ["session_id", "text"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-rows/v1",
+    \\             "fields": ["session_id", "text"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 100,
+    \\    "max_output_bytes": 4096,
+    \\    "max_fold_states": 8
+    \\  }
+    \\}
+;
 
+fn cacheHitKey(
+    source_root: []const u8,
+    cache_root: []const u8,
+    request: Request,
+) ![32]u8 {
     var cold = try load(
         std.testing.allocator,
         source_root,
@@ -798,13 +888,20 @@ test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
         cold.definition_plan.id,
         warm.definition_plan.id,
     );
-
-    const key = planKey(
+    return planKey(
         "1.0.0",
         "trace-source/v1",
         request,
         &warm.definition_plan,
     );
+}
+
+fn repairCache(
+    source_root: []const u8,
+    cache_root: []const u8,
+    request: Request,
+    key: [32]u8,
+) !void {
     const corrupt_path = try cachePathAlloc(
         std.testing.allocator,
         cache_root,
@@ -838,10 +935,18 @@ test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
     );
     defer repaired_hit.deinit(std.testing.allocator);
     try std.testing.expect(repaired_hit.stats.cache_hit);
+}
 
-    try source_tmp.dir.writeFile(std.testing.io, .{
+fn invalidateCache(
+    source_dir: *std.Io.Dir,
+    source_root: []const u8,
+    cache_dir: *std.Io.Dir,
+    cache_root: []const u8,
+    request: Request,
+) !void {
+    try source_dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data = "\n" ++ observation_source,
+        .data = "\n" ++ cached_observation_definition,
     });
     var source_miss = try load(
         std.testing.allocator,
@@ -867,11 +972,11 @@ test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
     defer adapter_miss.deinit(std.testing.allocator);
     try std.testing.expect(!adapter_miss.stats.cache_hit);
 
-    try cache_tmp.dir.writeFile(std.testing.io, .{
+    try cache_dir.writeFile(std.testing.io, .{
         .sub_path = "not-a-directory",
         .data = "cache writes must remain optional",
     });
-    const blocked_cache = try cache_tmp.dir.realPathFileAlloc(
+    const blocked_cache = try cache_dir.realPathFileAlloc(
         std.testing.io,
         "not-a-directory",
         std.testing.allocator,
@@ -888,6 +993,39 @@ test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
     );
     defer write_failure.deinit(std.testing.allocator);
     try std.testing.expect(write_failure.stats.cache_write_failed);
+}
+
+test "compiled plan cache restores typed plans and rebuilds corrupt entries" {
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    try source_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data = cached_observation_definition,
+    });
+    const source_root = try source_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(source_root);
+    var cache_tmp = std.testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    const cache_root = try cache_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(cache_root);
+    const request: Request = .{ .projection_names = &.{"rows"} };
+    const key = try cacheHitKey(source_root, cache_root, request);
+    try repairCache(source_root, cache_root, request, key);
+    try invalidateCache(
+        &source_tmp.dir,
+        source_root,
+        &cache_tmp.dir,
+        cache_root,
+        request,
+    );
 }
 
 test "projection cache selection is canonical and explicit" {

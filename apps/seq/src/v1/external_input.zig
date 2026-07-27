@@ -77,7 +77,28 @@ pub fn parseBytes(
         }
     }
 
-    var parsed = std.json.parseFromSlice(
+    var parsed = try parseExternalJson(allocator, bytes);
+    errdefer parsed.deinit();
+    const rows = try validateExternalEnvelope(parsed.value, input);
+    var converted = try convertRowsAlloc(allocator, rows, input.fields);
+    errdefer converted.deinit(allocator);
+    return .{
+        .input_index = found.index,
+        .parsed = parsed,
+        .values = converted.values,
+        .canonical_json_values = converted.canonical_json_values,
+        .row_count = rows.items.len,
+        .width = input.fields.len,
+        .input_bytes = bytes.len,
+        .raw_digest = raw_digest,
+    };
+}
+
+fn parseExternalJson(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(
         std.json.Value,
         allocator,
         bytes,
@@ -90,8 +111,13 @@ pub fn parseBytes(
         error.DuplicateField => return error.DuplicateExternalInputField,
         else => return error.InvalidExternalInputJson,
     };
-    errdefer parsed.deinit();
-    const envelope = try definition_core.json.object(parsed.value);
+}
+
+fn validateExternalEnvelope(
+    value: std.json.Value,
+    input: definition.ExternalInput,
+) !std.json.Array {
+    const envelope = try definition_core.json.object(value);
     try definition_core.json.requireExactKeys(
         envelope,
         &.{ "schema", "rows" },
@@ -111,10 +137,30 @@ pub fn parseBytes(
     if (rows.items.len > input.max_rows) {
         return error.ExternalInputRowBoundExceeded;
     }
+    return rows;
+}
+
+const ConvertedRows = struct {
+    values: []execution.Value,
+    canonical_json_values: [][]u8,
+
+    fn deinit(self: *ConvertedRows, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+        for (self.canonical_json_values) |value| allocator.free(value);
+        allocator.free(self.canonical_json_values);
+        self.* = undefined;
+    }
+};
+
+fn convertRowsAlloc(
+    allocator: std.mem.Allocator,
+    rows: std.json.Array,
+    fields: []const definition.ExternalField,
+) !ConvertedRows {
     const cell_count = std.math.mul(
         usize,
         rows.items.len,
-        input.fields.len,
+        fields.len,
     ) catch return error.ExternalInputCellBoundExceeded;
     if (cell_count > max_external_cells) {
         return error.ExternalInputCellBoundExceeded;
@@ -129,9 +175,9 @@ pub fn parseBytes(
 
     for (rows.items, 0..) |row_value, row_index| {
         const row = try definition_core.json.object(row_value);
-        try validateRowKeys(row, input.fields);
-        const start = row_index * input.fields.len;
-        for (input.fields, 0..) |field, field_index| {
+        try validateRowKeys(row, fields);
+        const start = row_index * fields.len;
+        for (fields, 0..) |field, field_index| {
             const value = row.get(field.name) orelse
                 return error.ExternalInputFieldMissing;
             values[start + field_index] = try convertValue(
@@ -149,14 +195,8 @@ pub fn parseBytes(
         allocator.free(owned_json_values);
     }
     return .{
-        .input_index = found.index,
-        .parsed = parsed,
         .values = values,
         .canonical_json_values = owned_json_values,
-        .row_count = rows.items.len,
-        .width = input.fields.len,
-        .input_bytes = bytes.len,
-        .raw_digest = raw_digest,
     };
 }
 
@@ -288,36 +328,130 @@ fn parseForAllocationFailure(
     defer relation.deinit(allocator);
 }
 
+const external_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/external-input",
+    \\  "requires": {"abi": "seq-observation-abi/v1", "operators": ["project"]},
+    \\  "parameters": {},
+    \\  "selectors": [],
+    \\  "relations": [],
+    \\  "inputs": [{
+    \\    "name": "facts",
+    \\    "schema": "example-facts/v1",
+    \\    "fields": [
+    \\      {"name": "id", "type": "string", "nullable": false},
+    \\      {"name": "count", "type": "integer", "nullable": false},
+    \\      {"name": "score", "type": "float", "nullable": false},
+    \\      {"name": "active", "type": "boolean", "nullable": false},
+    \\      {"name": "detail", "type": "json", "nullable": true}
+    \\    ],
+    \\    "max_rows": 10,
+    \\    "max_bytes": 4096
+    \\  }],
+    \\  "pipeline": [
+    \\    {"op": "project", "input": "facts", "as": "rows",
+    \\     "fields": ["id", "count", "score", "active", "detail"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-rows/v1",
+    \\             "fields": ["id", "count", "score", "active", "detail"],
+    \\             "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 10,
+    \\    "max_output_bytes": 4096,
+    \\    "max_fold_states": 2,
+    \\    "max_input_bytes": 4096
+    \\  }
+    \\}
+;
+
+const external_error_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/external-errors",
+    \\  "requires": {"abi": "seq-observation-abi/v1", "operators": ["project"]},
+    \\  "parameters": {},
+    \\  "selectors": [],
+    \\  "relations": [],
+    \\  "inputs": [{
+    \\    "name": "facts",
+    \\    "schema": "example-facts/v1",
+    \\    "fields": [{"name": "id", "type": "string", "nullable": false}],
+    \\    "max_rows": 1,
+    \\    "max_bytes": 1024
+    \\  }],
+    \\  "pipeline": [
+    \\    {"op": "project", "input": "facts", "as": "rows", "fields": ["id"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-rows/v1",
+    \\             "fields": ["id"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 1,
+    \\    "max_output_bytes": 1024,
+    \\    "max_fold_states": 1,
+    \\    "max_input_bytes": 1024
+    \\  }
+    \\}
+;
+
+const external_input_document =
+    \\{
+    \\  "schema": "example-facts/v1",
+    \\  "rows": [
+    \\    {"id": "a", "count": 2, "score": 1.5, "active": true,
+    \\     "detail": {"z": 1, "a": 2}},
+    \\    {"id": "b", "count": 3, "score": 2, "active": false, "detail": null}
+    \\  ]
+    \\}
+;
+
+const TestDefinition = struct {
+    closure: definition_core.closure.Closure,
+    plan: definition.Plan,
+
+    fn init(dir: *std.Io.Dir, source: []const u8) !TestDefinition {
+        try dir.writeFile(std.testing.io, .{
+            .sub_path = "observation.json",
+            .data = source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            dir,
+            "observation.json",
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        return .{
+            .closure = closure,
+            .plan = try definition.compile(
+                std.testing.allocator,
+                &closure,
+                "observation.json",
+            ),
+        };
+    }
+
+    fn deinit(self: *TestDefinition) void {
+        self.plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
 test "external immutable relations validate schema fields and canonical json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/external-input","requires":{"abi":"seq-observation-abi/v1","operators":["project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"count","type":"integer","nullable":false},{"name":"score","type":"float","nullable":false},{"name":"active","type":"boolean","nullable":false},{"name":"detail","type":"json","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"project","input":"facts","as":"rows","fields":["id","count","score","active","detail"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id","count","score","active","detail"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2,"max_input_bytes":4096}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    const input =
-        \\{"schema":"example-facts/v1","rows":[{"id":"a","count":2,"score":1.5,"active":true,"detail":{"z":1,"a":2}},{"id":"b","count":3,"score":2,"active":false,"detail":null}]}
-    ;
+    var fixture = try TestDefinition.init(&tmp.dir, external_definition);
+    defer fixture.deinit();
     var relation = try parseBytes(
         std.testing.allocator,
-        &definition_plan,
+        &fixture.plan,
         "facts",
-        input,
+        external_input_document,
     );
     defer relation.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), relation.row_count);
@@ -335,18 +469,18 @@ test "external immutable relations validate schema fields and canonical json" {
     try std.testing.expect(relation.rows().row(1)[4] == .null);
     var native_plan = try observation_plan.compile(
         std.testing.allocator,
-        &definition_plan,
+        &fixture.plan,
     );
     defer native_plan.deinit(std.testing.allocator);
     var bindings = try definition_core.parameters.bind(
         std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        &fixture.plan.parameter_declarations,
         &.{},
     );
     defer bindings.deinit(std.testing.allocator);
     var program = try execution.compile(
         std.testing.allocator,
-        &definition_plan,
+        &fixture.plan,
         &native_plan,
         &bindings,
         "rows",
@@ -367,37 +501,20 @@ test "external immutable relations validate schema fields and canonical json" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         parseForAllocationFailure,
-        .{ &definition_plan, input },
+        .{ &fixture.plan, external_input_document },
     );
 }
 
 test "external immutable relations fail closed on shape type and digest drift" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/external-errors","requires":{"abi":"seq-observation-abi/v1","operators":["project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false}],"max_rows":1,"max_bytes":1024}],"pipeline":[{"op":"project","input":"facts","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":1,"max_output_bytes":1024,"max_fold_states":1,"max_input_bytes":1024}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
+    var fixture = try TestDefinition.init(&tmp.dir, external_error_definition);
+    defer fixture.deinit();
     try std.testing.expectError(
         error.ExternalInputSchemaMismatch,
         parseBytes(
             std.testing.allocator,
-            &definition_plan,
+            &fixture.plan,
             "facts",
             \\{"schema":"wrong/v1","rows":[{"id":"a"}]}
             ,
@@ -407,7 +524,7 @@ test "external immutable relations fail closed on shape type and digest drift" {
         error.ExternalInputFieldSetMismatch,
         parseBytes(
             std.testing.allocator,
-            &definition_plan,
+            &fixture.plan,
             "facts",
             \\{"schema":"example-facts/v1","rows":[{"id":"a","extra":1}]}
             ,
@@ -417,7 +534,7 @@ test "external immutable relations fail closed on shape type and digest drift" {
         error.ExternalInputFieldTypeMismatch,
         parseBytes(
             std.testing.allocator,
-            &definition_plan,
+            &fixture.plan,
             "facts",
             \\{"schema":"example-facts/v1","rows":[{"id":1}]}
             ,
@@ -427,14 +544,14 @@ test "external immutable relations fail closed on shape type and digest drift" {
         error.ExternalInputRowBoundExceeded,
         parseBytes(
             std.testing.allocator,
-            &definition_plan,
+            &fixture.plan,
             "facts",
             \\{"schema":"example-facts/v1","rows":[{"id":"a"},{"id":"b"}]}
             ,
         ),
     );
 
-    definition_plan.inputs[0].digest = try std.testing.allocator.dupe(
+    fixture.plan.inputs[0].digest = try std.testing.allocator.dupe(
         u8,
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     );
@@ -442,7 +559,7 @@ test "external immutable relations fail closed on shape type and digest drift" {
         error.ExternalInputDigestMismatch,
         parseBytes(
             std.testing.allocator,
-            &definition_plan,
+            &fixture.plan,
             "facts",
             \\{"schema":"example-facts/v1","rows":[{"id":"a"}]}
             ,

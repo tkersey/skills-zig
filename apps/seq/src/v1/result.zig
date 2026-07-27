@@ -39,6 +39,17 @@ pub fn renderJsonAlloc(
     );
     errdefer output.deinit();
 
+    try writeIdentityAndCorpus(&output, envelope);
+    try writeRows(&output, envelope, projection);
+    try writeStats(&output, envelope);
+    try writeLimitations(&output, envelope.limitations);
+    return output.toOwnedSlice();
+}
+
+fn writeIdentityAndCorpus(
+    output: *BoundedJson,
+    envelope: Envelope,
+) !void {
     try output.raw("{\"schema\":");
     try output.string(schema);
     try output.raw(",\"definition\":{\"id\":");
@@ -61,6 +72,13 @@ pub fn renderJsonAlloc(
     try output.string(envelope.parameters_digest);
     try output.raw(",\"projection\":");
     try output.string(envelope.projection_name);
+}
+
+fn writeRows(
+    output: *BoundedJson,
+    envelope: Envelope,
+    projection: *const definition.Projection,
+) !void {
     try output.raw(",\"data\":{\"schema\":");
     try output.string(projection.schema_id);
     try output.raw(",\"rows\":[");
@@ -77,6 +95,12 @@ pub fn renderJsonAlloc(
         }
         try output.raw("}");
     }
+}
+
+fn writeStats(
+    output: *BoundedJson,
+    envelope: Envelope,
+) !void {
     try output.raw("]},\"stats\":{\"cache_hit\":");
     try output.boolean(envelope.compile_stats.cache_hit);
     try output.raw(",\"cache_write_failed\":");
@@ -103,13 +127,18 @@ pub fn renderJsonAlloc(
     try output.usizeValue(envelope.execution_stats.output_rows);
     try output.raw(",\"output_bytes\":");
     try output.usizeValue(envelope.execution_stats.output_bytes);
+}
+
+fn writeLimitations(
+    output: *BoundedJson,
+    limitations: []const []const u8,
+) !void {
     try output.raw("},\"limitations\":[");
-    for (envelope.limitations, 0..) |limitation, index| {
+    for (limitations, 0..) |limitation, index| {
         if (index != 0) try output.raw(",");
         try output.string(limitation);
     }
     try output.raw("],\"authority_granted\":false}");
-    return output.toOwnedSlice();
 }
 
 fn validateEnvelope(envelope: Envelope) !void {
@@ -305,31 +334,141 @@ fn renderForAllocationFailure(
     defer allocator.free(rendered);
 }
 
+const zero_digest =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+const result_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/result",
+    \\  "requires": {"abi": "seq-observation-abi/v1", "operators": ["project"]},
+    \\  "parameters": {},
+    \\  "selectors": [],
+    \\  "relations": [],
+    \\  "inputs": [{
+    \\    "name": "facts",
+    \\    "schema": "example-facts/v1",
+    \\    "fields": [
+    \\      {"name": "id", "type": "string", "nullable": false},
+    \\      {"name": "score", "type": "float", "nullable": false},
+    \\      {"name": "detail", "type": "json", "nullable": true}
+    \\    ],
+    \\    "max_rows": 10,
+    \\    "max_bytes": 4096
+    \\  }],
+    \\  "pipeline": [
+    \\    {"op": "project", "input": "facts", "as": "rows",
+    \\     "fields": ["id", "score", "detail"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-rows/v1",
+    \\             "fields": ["id", "score", "detail"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 10,
+    \\    "max_output_bytes": 8192,
+    \\    "max_fold_states": 2,
+    \\    "max_input_bytes": 4096
+    \\  }
+    \\}
+;
+
+const bounded_result_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/result-bound",
+    \\  "requires": {"abi": "seq-observation-abi/v1", "operators": ["project"]},
+    \\  "parameters": {},
+    \\  "selectors": [],
+    \\  "relations": [],
+    \\  "inputs": [{
+    \\    "name": "facts",
+    \\    "schema": "example-facts/v1",
+    \\    "fields": [{"name": "id", "type": "string", "nullable": false}],
+    \\    "max_rows": 1,
+    \\    "max_bytes": 1024
+    \\  }],
+    \\  "pipeline": [
+    \\    {"op": "project", "input": "facts", "as": "rows", "fields": ["id"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-rows/v1",
+    \\             "fields": ["id"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 1,
+    \\    "max_output_bytes": 64,
+    \\    "max_fold_states": 1,
+    \\    "max_input_bytes": 1024
+    \\  }
+    \\}
+;
+
+const TestDefinition = struct {
+    closure: definition_core.closure.Closure,
+    plan: definition.Plan,
+
+    fn init(dir: *std.Io.Dir, source: []const u8) !TestDefinition {
+        try dir.writeFile(std.testing.io, .{
+            .sub_path = "observation.json",
+            .data = source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            dir,
+            "observation.json",
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        return .{
+            .closure = closure,
+            .plan = try definition.compile(
+                std.testing.allocator,
+                &closure,
+                "observation.json",
+            ),
+        };
+    }
+
+    fn deinit(self: *TestDefinition) void {
+        self.plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
+fn testEnvelope(
+    plan: *const definition.Plan,
+    parameters_digest: []const u8,
+    values: []const execution.Value,
+    compile_stats: definition_core.result.CompileStats,
+) Envelope {
+    return .{
+        .definition_plan = plan,
+        .projection_name = "rows",
+        .parameters_digest = parameters_digest,
+        .corpus = .{
+            .adapter = "immutable-relation/v1",
+            .digest = zero_digest,
+            .files = 1,
+            .sessions = 0,
+            .contaminated = false,
+        },
+        .rows = .{ .values = values, .width = 3 },
+        .compile_stats = compile_stats,
+        .execution_stats = .{ .rows_scanned = 1, .output_rows = 1 },
+        .limitations = &.{"external facts are caller supplied"},
+    };
+}
+
 test "observation result preserves identities provenance limits and no authority" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/result","requires":{"abi":"seq-observation-abi/v1","operators":["project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"score","type":"float","nullable":false},{"name":"detail","type":"json","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"project","input":"facts","as":"rows","fields":["id","score","detail"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id","score","detail"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":8192,"max_fold_states":2,"max_input_bytes":4096}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
+    var fixture = try TestDefinition.init(&tmp.dir, result_definition);
+    defer fixture.deinit();
     var bindings = try definition_core.parameters.bind(
         std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        &fixture.plan.parameter_declarations,
         &.{},
     );
     defer bindings.deinit(std.testing.allocator);
@@ -338,29 +477,17 @@ test "observation result preserves identities provenance limits and no authority
         .{ .float = 1.5 },
         .{ .json = "{\"a\":1}" },
     };
-    const rendered = try renderJsonAlloc(std.testing.allocator, .{
-        .definition_plan = &definition_plan,
-        .projection_name = "rows",
-        .parameters_digest = &bindings.values_digest,
-        .corpus = .{
-            .adapter = "immutable-relation/v1",
-            .digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            .files = 1,
-            .sessions = 0,
-            .contaminated = false,
-        },
-        .rows = .{ .values = &values, .width = 3 },
-        .compile_stats = .{
+    const envelope = testEnvelope(
+        &fixture.plan,
+        &bindings.values_digest,
+        &values,
+        .{
             .cache_hit = true,
             .closure_files = 1,
             .closure_bytes = 1024,
         },
-        .execution_stats = .{
-            .rows_scanned = 1,
-            .output_rows = 1,
-        },
-        .limitations = &.{"external facts are caller supplied"},
-    });
+    );
+    const rendered = try renderJsonAlloc(std.testing.allocator, envelope);
     defer std.testing.allocator.free(rendered);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -381,69 +508,27 @@ test "observation result preserves identities provenance limits and no authority
             .object.get("id").?.string,
     );
     try std.testing.expectEqualStrings(
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        zero_digest,
         root.get("corpus").?.object.get("digest").?.string,
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         renderForAllocationFailure,
-        .{Envelope{
-            .definition_plan = &definition_plan,
-            .projection_name = "rows",
-            .parameters_digest = &bindings.values_digest,
-            .corpus = .{
-                .adapter = "immutable-relation/v1",
-                .digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                .files = 1,
-                .sessions = 0,
-                .contaminated = false,
-            },
-            .rows = .{ .values = &values, .width = 3 },
-            .compile_stats = .{},
-            .execution_stats = .{ .output_rows = 1 },
-        }},
+        .{testEnvelope(&fixture.plan, &bindings.values_digest, &values, .{})},
     );
 }
 
 test "observation result fails before emitting beyond the declared byte bound" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/result-bound","requires":{"abi":"seq-observation-abi/v1","operators":["project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false}],"max_rows":1,"max_bytes":1024}],"pipeline":[{"op":"project","input":"facts","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":1,"max_output_bytes":64,"max_fold_states":1,"max_input_bytes":1024}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
+    var fixture = try TestDefinition.init(&tmp.dir, bounded_result_definition);
+    defer fixture.deinit();
     const values = [_]execution.Value{.{ .string = "bounded" }};
+    var envelope = testEnvelope(&fixture.plan, zero_digest, &values, .{});
+    envelope.rows.width = 1;
+    envelope.limitations = &.{};
     try std.testing.expectError(
         error.ObservationOutputBytesExceeded,
-        renderJsonAlloc(std.testing.allocator, .{
-            .definition_plan = &definition_plan,
-            .projection_name = "rows",
-            .parameters_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            .corpus = .{
-                .adapter = "immutable-relation/v1",
-                .digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                .files = 1,
-                .sessions = 0,
-                .contaminated = false,
-            },
-            .rows = .{ .values = &values, .width = 1 },
-            .compile_stats = .{},
-            .execution_stats = .{ .output_rows = 1 },
-        }),
+        renderJsonAlloc(std.testing.allocator, envelope),
     );
 }
