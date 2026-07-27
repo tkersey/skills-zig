@@ -444,6 +444,12 @@ const Builder = struct {
                     &.{ "op", "path" },
                 );
             },
+            .forbidden_object_keys => try compileForbiddenObjectKeysRule(
+                self.allocator,
+                object,
+                true,
+                &rule,
+            ),
             .optional_field => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1756,6 +1762,12 @@ const Builder = struct {
             => try definition_core.json.requireExactKeys(
                 object,
                 &.{ "op", "path" },
+            ),
+            .forbidden_object_keys => try compileForbiddenObjectKeysRule(
+                self.allocator,
+                object,
+                false,
+                &rule,
             ),
             .sorted => {
                 try definition_core.json.requireExactKeys(
@@ -3622,6 +3634,18 @@ fn validateCachedRule(
                 ) catch return error.CacheRuleConfigurationInvalid;
             }
         },
+        .forbidden_object_keys => if (rule.pointer_id == null or
+            rule.keys.len == 0 or
+            rule.keys.len > 64 or
+            rule.min_count == null or
+            rule.min_count.? == 0 or
+            rule.min_count.? > 128 or
+            rule.max_count == null or
+            rule.max_count.? == 0 or
+            rule.max_count.? > 1_000_000)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .sorted => if (rule.pointer_id == null or
             rule.path_ids.len != 0)
         {
@@ -3800,6 +3824,7 @@ fn validateCachedRule(
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .safe_relative_path and
+        rule.operator != .forbidden_object_keys and
         (!rule.allow_root or rule.case_insensitive))
     {
         return error.CacheRuleConfigurationInvalid;
@@ -3817,6 +3842,7 @@ fn validateCachedRule(
     }
     if (rule.operator != .exact_object and
         rule.operator != .safe_relative_path and
+        rule.operator != .forbidden_object_keys and
         rule.keys.len != 0)
     {
         return error.CacheRuleConfigurationInvalid;
@@ -4550,6 +4576,10 @@ fn applyRule(
         .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
         .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
         .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
+        .forbidden_object_keys => if (target) |value|
+            forbiddenObjectKeysHold(value, rule)
+        else
+            false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value|
             arraySorted(value, if (rule.other_pointer_id) |pointer_id|
@@ -4759,6 +4789,55 @@ fn objectValuesHold(
     return true;
 }
 
+fn forbiddenObjectKeysHold(
+    value: std.json.Value,
+    rule: CompiledRule,
+) bool {
+    var visited: usize = 0;
+    return forbiddenObjectKeysVisit(value, rule, 0, &visited);
+}
+
+fn forbiddenObjectKeysVisit(
+    value: std.json.Value,
+    rule: CompiledRule,
+    depth: usize,
+    visited: *usize,
+) bool {
+    if (depth > rule.min_count.?) return false;
+    visited.* = std.math.add(usize, visited.*, 1) catch return false;
+    if (visited.* > rule.max_count.?) return false;
+    switch (value) {
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                for (rule.keys) |forbidden| {
+                    const matches = if (rule.case_insensitive)
+                        std.ascii.eqlIgnoreCase(entry.key_ptr.*, forbidden)
+                    else
+                        std.mem.eql(u8, entry.key_ptr.*, forbidden);
+                    if (matches) return false;
+                }
+                if (!forbiddenObjectKeysVisit(
+                    entry.value_ptr.*,
+                    rule,
+                    depth + 1,
+                    visited,
+                )) return false;
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            if (!forbiddenObjectKeysVisit(
+                item,
+                rule,
+                depth + 1,
+                visited,
+            )) return false;
+        },
+        else => {},
+    }
+    return true;
+}
+
 fn oneOfRulesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -4936,6 +5015,10 @@ fn itemRuleHolds(
         .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
         .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
         .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
+        .forbidden_object_keys => if (target) |value|
+            forbiddenObjectKeysHold(value, rule)
+        else
+            false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value|
             arraySorted(value, if (rule.other_pointer_id) |pointer_id|
@@ -7288,6 +7371,66 @@ fn compileRelativePathRule(
     }
 }
 
+fn compileForbiddenObjectKeysRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    allow_input: bool,
+    rule: *CompiledRule,
+) !void {
+    if (allow_input) {
+        try definition_core.json.requireExactKeys(object, &.{
+            "op",
+            "input",
+            "path",
+            "keys",
+            "case_insensitive",
+            "max_depth",
+            "max_nodes",
+        });
+    } else {
+        try definition_core.json.requireExactKeys(object, &.{
+            "op",
+            "path",
+            "keys",
+            "case_insensitive",
+            "max_depth",
+            "max_nodes",
+        });
+    }
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "path", "keys", "max_depth", "max_nodes" },
+    );
+    rule.keys = try parseStringSet(
+        allocator,
+        try definition_core.json.field(object, "keys"),
+    );
+    if (rule.keys.len == 0 or rule.keys.len > 64) {
+        return error.InvalidForbiddenObjectKeyCount;
+    }
+    for (rule.keys, 0..) |key, index| {
+        if (key.len == 0 or key.len > 256) {
+            return error.InvalidForbiddenObjectKey;
+        }
+        for (rule.keys[0..index]) |prior| {
+            if (std.ascii.eqlIgnoreCase(prior, key)) {
+                return error.DuplicateForbiddenObjectKey;
+            }
+        }
+    }
+    rule.case_insensitive =
+        try optionalBoolean(object, "case_insensitive") orelse false;
+    rule.min_count = try optionalUnsigned(object, "max_depth") orelse
+        return error.MissingForbiddenObjectKeyBound;
+    rule.max_count = try optionalUnsigned(object, "max_nodes") orelse
+        return error.MissingForbiddenObjectKeyBound;
+    if (rule.min_count.? == 0 or rule.min_count.? > 128 or
+        rule.max_count.? == 0 or rule.max_count.? > 1_000_000)
+    {
+        return error.InvalidForbiddenObjectKeyBound;
+    }
+}
+
 fn compileRegexPatterns(
     allocator: std.mem.Allocator,
     raw: std.json.Value,
@@ -7555,8 +7698,12 @@ fn parseStringSet(
             return std.mem.lessThan(u8, left, right);
         }
     }.lessThan);
-    for (out[1..], 1..) |value, index| {
-        if (std.mem.eql(u8, out[index - 1], value)) return error.DuplicateRuleValue;
+    if (out.len > 1) {
+        for (out[1..], 1..) |value, index| {
+            if (std.mem.eql(u8, out[index - 1], value)) {
+                return error.DuplicateRuleValue;
+            }
+        }
     }
     return out;
 }
@@ -7691,6 +7838,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .any_rules,
         .no_rules,
         .object_values,
+        .forbidden_object_keys,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -7750,6 +7898,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .any_rules,
         .no_rules,
         .object_values,
+        .forbidden_object_keys,
         => true,
         else => false,
     };
@@ -9169,6 +9318,107 @@ test "definition references execute imported cross-record constraints" {
     );
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(!duplicate.valid);
+}
+
+test "forbidden object keys reject bounded nested sensitive fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/no-sensitive-keys","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","forbidden-object-keys"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["payload"]},{"op":"forbidden-object-keys","path":"","keys":["api_key","password","secret"],"case_insensitive":true,"max_depth":4,"max_nodes":16}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        256 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"payload\":{\"items\":[{\"token\":\"public\"}]}}",
+        }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+
+    var sensitive = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"payload\":{\"items\":[{\"SeCrEt\":\"value\"}]}}",
+        }},
+    );
+    defer sensitive.deinit(std.testing.allocator);
+    try std.testing.expect(!sensitive.valid);
+
+    var too_deep = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"payload\":{\"a\":{\"b\":{\"c\":{\"d\":\"value\"}}}}}",
+        }},
+    );
+    defer too_deep.deinit(std.testing.allocator);
+    try std.testing.expect(!too_deep.valid);
+
+    var too_many = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"payload\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}",
+        }},
+    );
+    defer too_many.deinit(std.testing.allocator);
+    try std.testing.expect(!too_many.valid);
+}
+
+test "optional-only exact objects compile an empty required-key set" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[]",
+        .{},
+    );
+    defer parsed.deinit();
+    const keys = try parseStringSet(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(keys);
+    try std.testing.expectEqual(@as(usize, 0), keys.len);
 }
 
 test "embedded validation compares borrowed event and retained state values" {

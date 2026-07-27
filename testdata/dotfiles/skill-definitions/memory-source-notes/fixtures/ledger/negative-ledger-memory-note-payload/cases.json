@@ -1,0 +1,66 @@
+{
+  "schema": "ledger-definition-conformance-cases/v2",
+  "oracle": {
+    "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
+    "ledger_version": "0.13.3"
+  },
+  "bases": {
+    "frozen-export": "bases/frozen-export.json"
+  },
+  "cases": [
+    {
+      "id": "frozen-export",
+      "base": "frozen-export",
+      "expect": "valid"
+    },
+    {
+      "id": "active-without-applicability",
+      "base": "frozen-export",
+      "expect": "invalid",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/payload/applicability_conditions",
+          "value": []
+        }
+      ]
+    },
+    {
+      "id": "projection-fingerprint-shape",
+      "base": "frozen-export",
+      "expect": "invalid",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/payload/projection_fingerprint",
+          "value": "not-a-fingerprint"
+        }
+      ]
+    },
+    {
+      "id": "reopened-with-assert-operation",
+      "base": "frozen-export",
+      "expect": "invalid",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/payload/status",
+          "value": "reopened"
+        }
+      ]
+    },
+    {
+      "id": "repo-mismatch",
+      "base": "frozen-export",
+      "expect": "invalid",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/payload/repository_id",
+          "value": "other/repo"
+        }
+      ]
+    }
+  ],
+  "reconstructed_cases_digest": "sha256:1d13649130e81abd9140259a630e53f3c09f863c0189b7f2fe0a1ad375bbf67a"
+}
