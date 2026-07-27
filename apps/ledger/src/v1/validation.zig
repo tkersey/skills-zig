@@ -2261,10 +2261,10 @@ const Builder = struct {
                 rule.path_ids[0] = try self.internPointer(
                     try definition_core.json.requiredString(object, "items"),
                 );
-                const prefix = try definition_core.json.requiredString(
+                const prefix = (try definition_core.json.optionalString(
                     object,
                     "prefix",
-                );
+                )) orelse return error.MissingField;
                 if (prefix.len > 4096) {
                     return error.Sha256PrefixBytesExceeded;
                 }
@@ -2282,10 +2282,10 @@ const Builder = struct {
                 if (object.get("null") != null or object.get("items") != null) {
                     return error.ConflictingSha256ModeFields;
                 }
-                const prefix = try definition_core.json.requiredString(
+                const prefix = (try definition_core.json.optionalString(
                     object,
                     "prefix",
-                );
+                )) orelse return error.MissingField;
                 if (prefix.len > 4096) {
                     return error.Sha256PrefixBytesExceeded;
                 }
@@ -8997,7 +8997,8 @@ test "compiled sha256 validates canonical documents and framed streams" {
         \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
         \\{"op":"sha256","path":"/review","mode":"canonical-json-null","field":"/contract_digest","null":"/contract_digest","max_bytes":4096},
         \\{"op":"object-values","path":"/manifests","rules":[{"op":"sha256","mode":"framed-items","field":"/contract_digest","items":"/resources","prefix":"lens-contract/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/digest"},{"literal":"\u0000"}],"max_bytes":4096}]},
-        \\{"op":"sha256","path":"/campaign","mode":"framed-fields","field":"/campaign_id","prefix":"campaign/v1\u0000","fragments":[{"parent":"/goal_id"},{"literal":"\u0000"},{"parent":"/construction_ref"},{"literal":"\u0000"},{"parent":"/subject_digest"},{"literal":"\u0000"},{"parent":"/review_contract_digest"}],"max_bytes":4096}
+        \\{"op":"sha256","path":"/campaign","mode":"framed-fields","field":"/campaign_id","prefix":"campaign/v1\u0000","fragments":[{"parent":"/goal_id"},{"literal":"\u0000"},{"parent":"/construction_ref"},{"literal":"\u0000"},{"parent":"/subject_digest"},{"literal":"\u0000"},{"parent":"/review_contract_digest"}],"max_bytes":4096},
+        \\{"op":"sha256","path":"/writer","mode":"framed-fields","field":"/fingerprint","prefix":"","fragments":[{"parent":"/extension"},{"literal":"\n"},{"parent":"/kind"},{"literal":"\n"},{"parent":"/raw"}],"max_bytes":4096}
         \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
@@ -9060,15 +9061,27 @@ test "compiled sha256 validates canonical documents and framed streams" {
         .{field_hex},
     );
     defer std.testing.allocator.free(field_digest);
+    var writer_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    writer_hasher.update("synesthesia\nmapping-endorsement\n{}\n");
+    var writer_raw: [32]u8 = undefined;
+    writer_hasher.final(&writer_raw);
+    const writer_hex = std.fmt.bytesToHex(writer_raw, .lower);
+    const writer_digest = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "sha256:{s}",
+        .{writer_hex},
+    );
+    defer std.testing.allocator.free(writer_digest);
     const valid_bytes = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"campaign\":{{\"campaign_id\":\"{s}\",\"construction_ref\":\"construction-1\",\"goal_id\":\"goal-1\",\"review_contract_digest\":\"{s}\",\"subject_digest\":\"subject-1\"}},\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}}}}",
+        "{{\"campaign\":{{\"campaign_id\":\"{s}\",\"construction_ref\":\"construction-1\",\"goal_id\":\"goal-1\",\"review_contract_digest\":\"{s}\",\"subject_digest\":\"subject-1\"}},\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}},\"writer\":{{\"extension\":\"synesthesia\",\"fingerprint\":\"{s}\",\"kind\":\"mapping-endorsement\",\"raw\":\"{{}}\\n\"}}}}",
         .{
             field_digest,
             resource_digest,
             framed_digest,
             resource_digest,
             review_digest,
+            writer_digest,
         },
     );
     defer std.testing.allocator.free(valid_bytes);
@@ -9147,6 +9160,22 @@ test "compiled sha256 validates canonical documents and framed streams" {
     );
     defer invalid_campaign.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_campaign.valid);
+    const invalid_writer_bytes = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        valid_bytes,
+        writer_digest,
+        wrong_digest,
+    );
+    defer std.testing.allocator.free(invalid_writer_bytes);
+    var invalid_writer = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "record", .bytes = invalid_writer_bytes }},
+    );
+    defer invalid_writer.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_writer.valid);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         validateForAllocationFailure,
