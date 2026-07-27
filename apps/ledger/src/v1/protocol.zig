@@ -1044,6 +1044,7 @@ pub fn materializeEvent(
             try writeMaterializedField(
                 allocator,
                 &output.writer,
+                materialization,
                 field.source,
                 request_object,
                 state.next_sequence,
@@ -1130,6 +1131,7 @@ pub fn materializePlainEvent(
             try writeMaterializedField(
                 allocator,
                 &output.writer,
+                materialization,
                 field.source,
                 request_object,
                 0,
@@ -1228,10 +1230,14 @@ pub fn canonicalPlainStoredEventAlloc(
             defer allocator.free(body);
             try output.writer.writeAll(body);
         } else {
-            try definition_core.canonical_json.writeCanonicalJson(
+            var path = EventJsonPath{};
+            try path.push(key);
+            try writeEventJsonValue(
                 allocator,
                 &output.writer,
+                materialization,
                 value,
+                &path,
             );
         }
     }
@@ -1676,6 +1682,12 @@ fn deriveEventValueAlloc(
             unix_seconds,
             format,
         ),
+        .sha1 => |config| deriveEventSha1Alloc(
+            allocator,
+            request,
+            prior,
+            config,
+        ),
         .sha256 => |config| deriveEventSha256Alloc(
             allocator,
             request,
@@ -1689,6 +1701,42 @@ fn deriveEventValueAlloc(
             config,
         ),
     };
+}
+
+fn deriveEventSha1Alloc(
+    allocator: std.mem.Allocator,
+    request: std.json.Value,
+    prior: []const GeneratedOutput,
+    config: storage.EventDigestDerivation,
+) ![]u8 {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    var total_bytes: usize = 0;
+    for (config.fragments) |fragment| {
+        const bytes = try eventDerivationFragmentAlloc(
+            allocator,
+            request,
+            prior,
+            fragment,
+        );
+        defer allocator.free(bytes);
+        total_bytes = std.math.add(
+            usize,
+            total_bytes,
+            bytes.len,
+        ) catch return error.EventDerivationBytesExceeded;
+        if (total_bytes > config.max_bytes) {
+            return error.EventDerivationBytesExceeded;
+        }
+        hasher.update(bytes);
+    }
+    var raw: [20]u8 = undefined;
+    hasher.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const encoded = switch (config.encoding) {
+        .hex => try allocator.dupe(u8, &hex),
+        .digest => try std.fmt.allocPrint(allocator, "sha1:{s}", .{hex}),
+    };
+    return truncateEventDigestAlloc(allocator, encoded, config.prefix_bytes);
 }
 
 fn deriveEventSha256Alloc(
@@ -1720,10 +1768,25 @@ fn deriveEventSha256Alloc(
     var raw: [32]u8 = undefined;
     hasher.final(&raw);
     const hex = std.fmt.bytesToHex(raw, .lower);
-    return switch (config.encoding) {
-        .hex => allocator.dupe(u8, &hex),
-        .digest => std.fmt.allocPrint(allocator, "sha256:{s}", .{hex}),
+    const encoded = switch (config.encoding) {
+        .hex => try allocator.dupe(u8, &hex),
+        .digest => try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex}),
     };
+    return truncateEventDigestAlloc(allocator, encoded, config.prefix_bytes);
+}
+
+fn truncateEventDigestAlloc(
+    allocator: std.mem.Allocator,
+    encoded: []u8,
+    prefix_bytes: ?u16,
+) ![]u8 {
+    const count = prefix_bytes orelse return encoded;
+    const count_usize: usize = count;
+    errdefer allocator.free(encoded);
+    if (count_usize > encoded.len) return error.EventDerivedPrefixInvalid;
+    const prefix = try allocator.dupe(u8, encoded[0..count_usize]);
+    allocator.free(encoded);
+    return prefix;
 }
 
 fn deriveEventConcatAlloc(
@@ -1763,15 +1826,22 @@ fn eventDerivationFragmentAlloc(
 ) ![]u8 {
     return switch (fragment) {
         .literal => |value| allocator.dupe(u8, value),
-        .input_text => |pointer| blk: {
+        .input_text => |source| blk: {
             const value = definition_core.json_pointer.lookup(
                 request,
-                pointer,
+                source.pointer,
             ) orelse return error.EventDerivationInputMissing;
-            break :blk try allocator.dupe(
-                u8,
-                try definition_core.json.string(value),
-            );
+            const text = try definition_core.json.string(value);
+            break :blk switch (source.transform) {
+                .none => try allocator.dupe(u8, text),
+                .ascii_lower => lower: {
+                    const lowered = try allocator.alloc(u8, text.len);
+                    for (text, 0..) |byte, index| {
+                        lowered[index] = std.ascii.toLower(byte);
+                    }
+                    break :lower lowered;
+                },
+            };
         },
         .input_json => |pointer| blk: {
             const value = definition_core.json_pointer.lookup(
@@ -1958,6 +2028,204 @@ fn deinitGeneratedOutputs(
     allocator.free(outputs);
 }
 
+const EventJsonPath = struct {
+    segments: [32][]const u8 = undefined,
+    len: usize = 0,
+
+    fn push(self: *EventJsonPath, segment: []const u8) !void {
+        if (self.len == self.segments.len) {
+            return error.EventObjectOrderDepthExceeded;
+        }
+        self.segments[self.len] = segment;
+        self.len += 1;
+    }
+
+    fn pop(self: *EventJsonPath) void {
+        std.debug.assert(self.len != 0);
+        self.len -= 1;
+    }
+
+    fn slice(self: *const EventJsonPath) []const []const u8 {
+        return self.segments[0..self.len];
+    }
+};
+
+fn writeEventJsonValue(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    value: std.json.Value,
+    path: *EventJsonPath,
+) !void {
+    switch (value) {
+        .null => try writer.writeAll("null"),
+        .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
+        .integer => |number| try writer.print("{d}", .{number}),
+        .float => |number| {
+            try definition_core.canonical_json.writeCanonicalFloat(
+                writer,
+                number,
+            );
+        },
+        .number_string => return error.NumberOutOfRange,
+        .string => |text| try writeEventJsonString(
+            writer,
+            text,
+            materialization.escape_non_ascii,
+        ),
+        .array => |items| {
+            try writer.writeByte('[');
+            for (items.items, 0..) |item, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeEventJsonValue(
+                    allocator,
+                    writer,
+                    materialization,
+                    item,
+                    path,
+                );
+            }
+            try writer.writeByte(']');
+        },
+        .object => |object| {
+            const declared = findEventObjectOrder(
+                materialization.object_orders,
+                path.slice(),
+            );
+            var keys: std.ArrayList([]const u8) = .empty;
+            defer keys.deinit(allocator);
+            if (declared) |order| {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    if (!containsDeclaredName(
+                        order.fields,
+                        entry.key_ptr.*,
+                    )) return error.EventObjectFieldCoverageMismatch;
+                }
+                for (order.fields) |field| {
+                    if (object.get(field) != null) {
+                        try keys.append(allocator, field);
+                    }
+                }
+            } else {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    try keys.append(allocator, entry.key_ptr.*);
+                }
+                sortStrings(keys.items);
+            }
+            try writer.writeByte('{');
+            for (keys.items, 0..) |key, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeEventJsonString(
+                    writer,
+                    key,
+                    materialization.escape_non_ascii,
+                );
+                try writer.writeByte(':');
+                try path.push(key);
+                try writeEventJsonValue(
+                    allocator,
+                    writer,
+                    materialization,
+                    object.get(key).?,
+                    path,
+                );
+                path.pop();
+            }
+            try writer.writeByte('}');
+        },
+    }
+}
+
+fn findEventObjectOrder(
+    orders: []const storage.EventObjectOrder,
+    path: []const []const u8,
+) ?*const storage.EventObjectOrder {
+    for (orders) |*order| {
+        if (order.pointer.segments.len != path.len) continue;
+        var matches = true;
+        for (path, 0..) |segment, index| {
+            if (!std.mem.eql(
+                u8,
+                segment,
+                order.pointer.segments[index],
+            )) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return order;
+    }
+    return null;
+}
+
+fn writeEventJsonString(
+    writer: *std.Io.Writer,
+    text: []const u8,
+    escape_non_ascii: bool,
+) !void {
+    if (!escape_non_ascii) {
+        return definition_core.canonical_json.writeCanonicalString(
+            writer,
+            text,
+        );
+    }
+    try writer.writeByte('"');
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
+        if (byte < 0x80) {
+            switch (byte) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\x08' => try writer.writeAll("\\b"),
+                '\x0c' => try writer.writeAll("\\f"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                else => if (byte < 0x20)
+                    try writer.print("\\u00{X:0>2}", .{byte})
+                else
+                    try writer.writeByte(byte),
+            }
+            index += 1;
+            continue;
+        }
+        const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try writer.print("\\u00{X:0>2}", .{byte});
+            index += 1;
+            continue;
+        };
+        if (index + sequence_len > text.len) {
+            try writer.print("\\u00{X:0>2}", .{byte});
+            index += 1;
+            continue;
+        }
+        const codepoint = std.unicode.utf8Decode(
+            text[index .. index + sequence_len],
+        ) catch {
+            try writer.print("\\u00{X:0>2}", .{byte});
+            index += 1;
+            continue;
+        };
+        index += sequence_len;
+        if (codepoint <= 0xFFFF) {
+            try writer.print("\\u{X:0>4}", .{codepoint});
+            continue;
+        }
+        const scalar = codepoint - 0x1_0000;
+        const high: u32 = 0xD800 + @as(u32, @intCast(scalar >> 10));
+        const low: u32 = 0xDC00 +
+            @as(u32, @intCast(scalar & 0x3FF));
+        try writer.print(
+            "\\u{X:0>4}\\u{X:0>4}",
+            .{ high, low },
+        );
+    }
+    try writer.writeByte('"');
+}
+
 fn materializedBodyAlloc(
     allocator: std.mem.Allocator,
     plan: ?*const Plan,
@@ -1969,7 +2237,10 @@ fn materializedBodyAlloc(
     parameters: ?*const definition_core.parameters.Bindings,
     declared_order: ?[]const []u8,
 ) ![]u8 {
-    if (materialization.body_fields.len == 0 and declared_order == null) {
+    if (materialization.body_fields.len == 0 and declared_order == null and
+        materialization.object_orders.len == 0 and
+        !materialization.escape_non_ascii)
+    {
         return definition_core.canonical_json.canonicalJsonAlloc(
             allocator,
             body,
@@ -2065,6 +2336,7 @@ fn materializedBodyAlloc(
             try writeMaterializedBodyField(
                 allocator,
                 &output.writer,
+                materialization,
                 plan,
                 state,
                 field.source,
@@ -2079,10 +2351,14 @@ fn materializedBodyAlloc(
                 key,
             );
             try output.writer.writeByte(':');
-            try definition_core.canonical_json.writeCanonicalJson(
+            var path = EventJsonPath{};
+            try path.push(key);
+            try writeEventJsonValue(
                 allocator,
                 &output.writer,
+                materialization,
                 object.get(key).?,
+                &path,
             );
             key_index += 1;
         }
@@ -2127,6 +2403,7 @@ fn materializedBodyInDeclaredOrderAlloc(
             try writeMaterializedBodyField(
                 allocator,
                 &output.writer,
+                materialization,
                 plan,
                 state,
                 field.source,
@@ -2141,10 +2418,14 @@ fn materializedBodyInDeclaredOrderAlloc(
                 key,
             );
             try output.writer.writeByte(':');
-            try definition_core.canonical_json.writeCanonicalJson(
+            var path = EventJsonPath{};
+            try path.push(key);
+            try writeEventJsonValue(
                 allocator,
                 &output.writer,
+                materialization,
                 value,
+                &path,
             );
             written += 1;
         }
@@ -2178,10 +2459,14 @@ fn canonicalPlainStoredBodyAlloc(
             key,
         );
         try output.writer.writeByte(':');
-        try definition_core.canonical_json.writeCanonicalJson(
+        var path = EventJsonPath{};
+        try path.push(key);
+        try writeEventJsonValue(
             allocator,
             &output.writer,
+            materialization,
             value,
+            &path,
         );
         written += 1;
     }
@@ -2202,6 +2487,7 @@ fn containsDeclaredName(
 fn writeMaterializedBodyField(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
     plan: ?*const Plan,
     state: ?*const ReplayState,
     source: storage.EventBodyFieldSource,
@@ -2220,9 +2506,10 @@ fn writeMaterializedBodyField(
                     generated.value,
                 );
             defer allocator.free(digest);
-            try definition_core.canonical_json.writeCanonicalString(
+            try writeEventJsonString(
                 writer,
                 digest,
+                materialization.escape_non_ascii,
             );
         },
         .parameter_sha256 => |config| {
@@ -2252,9 +2539,10 @@ fn writeMaterializedBodyField(
             {
                 return error.EventCapabilityMismatch;
             }
-            try definition_core.canonical_json.writeCanonicalString(
+            try writeEventJsonString(
                 writer,
                 digest,
+                materialization.escape_non_ascii,
             );
         },
         .state_value => |config| {
@@ -2267,10 +2555,13 @@ fn writeMaterializedBodyField(
                 protocol_state,
                 config,
             );
-            try definition_core.canonical_json.writeCanonicalJson(
+            var path = EventJsonPath{};
+            try writeEventJsonValue(
                 allocator,
                 writer,
+                materialization,
                 value,
+                &path,
             );
         },
         .literal_mapping => |mapping| {
@@ -2281,9 +2572,10 @@ fn writeMaterializedBodyField(
                 generated_outputs,
                 name,
             ) orelse return error.EventDerivedOutputMissing;
-            try definition_core.canonical_json.writeCanonicalString(
+            try writeEventJsonString(
                 writer,
                 generated.value,
+                materialization.escape_non_ascii,
             );
         },
         .request_input => unreachable,
@@ -2697,6 +2989,7 @@ fn writePreviousDigest(
 fn writeMaterializedField(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
     source: storage.EventFieldSource,
     request: std.json.ObjectMap,
     sequence: u64,
@@ -2707,10 +3000,13 @@ fn writeMaterializedField(
         .input_field => |input_field| {
             const value = request.get(input_field) orelse
                 return error.EventRequestFieldMissing;
-            try definition_core.canonical_json.writeCanonicalJson(
+            var path = EventJsonPath{};
+            try writeEventJsonValue(
                 allocator,
                 writer,
+                materialization,
                 value,
+                &path,
             );
         },
         .literal => |literal| try writer.writeAll(literal),
@@ -2721,9 +3017,10 @@ fn writeMaterializedField(
                 .{ prefix, sequence },
             );
             defer allocator.free(value);
-            try definition_core.canonical_json.writeCanonicalString(
+            try writeEventJsonString(
                 writer,
                 value,
+                materialization.escape_non_ascii,
             );
         },
         .unix_seconds => try writer.print("{d}", .{unix_seconds}),
@@ -2732,9 +3029,10 @@ fn writeMaterializedField(
                 generated_outputs,
                 name,
             ) orelse return error.EventDerivedOutputMissing;
-            try definition_core.canonical_json.writeCanonicalString(
+            try writeEventJsonString(
                 writer,
                 generated.value,
+                materialization.escape_non_ascii,
             );
         },
     }

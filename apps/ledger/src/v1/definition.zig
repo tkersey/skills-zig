@@ -89,6 +89,7 @@ pub const Operator = enum {
     member_of,
     not_member_of,
     forbidden_object_keys,
+    sha1,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -178,13 +179,16 @@ pub const Operator = enum {
             .keyed_unique => 2,
             .regex => 2,
             .sha256 => 4,
+            .event_materialization => 3,
+            .idempotency_key => 2,
             .reducer => 5,
             .append_only_log => 3,
             .compare_append, .bind_existing => 2,
             .event_envelope => 4,
             .cross_input_equal => 2,
             .fold => 3,
-            .id_lookup, .latest, .@"export", .relevance => 2,
+            .id_lookup, .latest, .relevance => 2,
+            .@"export" => 3,
             .sort => 1,
             else => 1,
         };
@@ -242,6 +246,7 @@ pub const Operator = enum {
             .canonical_json,
             .canonical_text,
             .sha256,
+            .sha1,
             .content_address,
             .composite_identity,
             .path_format,
@@ -669,7 +674,7 @@ fn compileAtDepth(
 }
 
 pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -727,7 +732,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readU16() != 4) return error.LedgerPlanCacheVersionMismatch;
     var decoded_count: usize = 0;
     return decodeCachePlan(allocator, decoder, 0, &decoded_count);
 }

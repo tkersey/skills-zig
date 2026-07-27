@@ -422,6 +422,12 @@ if [[ -f codex/skills/negative-ledger/definitions/ledger/negative-evidence-proto
     "$script_dir/check-negative-ledger-protocol.sh"
 fi
 
+if [[ -f codex/skills/learnings/definitions/ledger/learnings-protocol.json ]]; then
+  DOTFILES_ROOT="$dotfiles_root" \
+    LEDGER_BIN="$ledger_bin" \
+    "$script_dir/check-learnings-protocol.sh"
+fi
+
 printf \
   'definition conformance passed: manifests=%d seq=%d ledger=%d fixtures=%d materializations=%d transactions=%d contracts=%d\n' \
   "$manifest_count" \

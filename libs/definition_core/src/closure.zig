@@ -33,12 +33,12 @@ pub fn admittedLocation(
     {
         return error.DefinitionRootNotAbsolute;
     }
-    const root = if (pathWithin(absolute_path, current_root))
-        current_root
-    else
-        canonicalPackageRoot(absolute_path) orelse
+    const root = canonicalPackageRoot(absolute_path) orelse
+        if (pathWithin(absolute_path, current_root))
+            current_root
+        else
             std.fs.path.dirname(absolute_path) orelse
-            return error.InvalidDefinitionPath;
+                return error.InvalidDefinitionPath;
     return .{
         .root = root,
         .entry = relativeWithin(absolute_path, root),
@@ -50,7 +50,13 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
     while (true) {
         if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
             const package = std.fs.path.dirname(cursor) orelse return null;
-            return std.fs.path.dirname(package);
+            const collection = std.fs.path.dirname(package) orelse return null;
+            if (std.mem.eql(
+                u8,
+                collection,
+                std.fs.path.dirname(collection) orelse return null,
+            )) return null;
+            return collection;
         }
         const parent = std.fs.path.dirname(cursor) orelse return null;
         if (std.mem.eql(u8, parent, cursor)) return null;
@@ -751,15 +757,33 @@ test "canonical definition packages admit cross-package imports" {
         "first/definitions/ledger/record.json",
         external.entry,
     );
-    const local = try admittedLocation(
-        "/workspace/target/definitions/ledger/local.json",
+    const containing_cwd = try admittedLocation(
+        "/opt/config/packages/first/definitions/ledger/record.json",
+        "/opt/config",
+    );
+    try std.testing.expectEqualStrings(external.root, containing_cwd.root);
+    try std.testing.expectEqualStrings(external.entry, containing_cwd.entry);
+    const local_package = try admittedLocation(
+        "/workspace/packages/target/definitions/ledger/local.json",
         "/workspace/target",
     );
-    try std.testing.expectEqualStrings("/workspace/target", local.root);
     try std.testing.expectEqualStrings(
-        "definitions/ledger/local.json",
-        local.entry,
+        "/workspace/packages",
+        local_package.root,
     );
+    try std.testing.expectEqualStrings(
+        "target/definitions/ledger/local.json",
+        local_package.entry,
+    );
+    const root_safe = try admittedLocation(
+        "/tmp/definitions/standalone.json",
+        "/workspace/target",
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/definitions",
+        root_safe.root,
+    );
+    try std.testing.expectEqualStrings("standalone.json", root_safe.entry);
     const standalone = try admittedLocation(
         "/tmp/standalone.json",
         "/workspace/target",

@@ -2,6 +2,7 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
+const projection_value = @import("projection_value.zig");
 const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const state_reducer = @import("state_reducer.zig");
@@ -207,6 +208,8 @@ pub const Projection = struct {
     fields: []Field,
     preserve_field_order: bool,
     raw: bool,
+    value_path: ?definition_core.json_pointer.Pointer,
+    constructed_value: ?projection_value.Value,
     single: bool,
     require_match: bool,
     sort_keys: []SortKey,
@@ -221,6 +224,8 @@ pub const Projection = struct {
         allocator.free(self.predicates);
         for (self.fields) |*field| field.deinit(allocator);
         allocator.free(self.fields);
+        if (self.value_path) |*pointer| pointer.deinit(allocator);
+        if (self.constructed_value) |*value| value.deinit(allocator);
         for (self.sort_keys) |*key| key.deinit(allocator);
         allocator.free(self.sort_keys);
         if (self.relevance) |*relevance| relevance.deinit(allocator);
@@ -320,7 +325,9 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(7);
+    try encoder.writeU16(8);
+    try encoder.writeUsize(plan.max_records);
+    try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
@@ -341,6 +348,14 @@ pub fn encodeCache(
         }
         try encoder.writeBool(projection.preserve_field_order);
         try encoder.writeBool(projection.raw);
+        try encoder.writeBool(projection.value_path != null);
+        if (projection.value_path) |pointer| {
+            try encoder.writeBytes(pointer.raw);
+        }
+        try encoder.writeBool(projection.constructed_value != null);
+        if (projection.constructed_value) |value| {
+            try projection_value.encodeCache(value, encoder);
+        }
         try encoder.writeBool(projection.single);
         try encoder.writeBool(projection.require_match);
         try encoder.writeCount(projection.sort_keys.len);
@@ -423,16 +438,21 @@ pub fn encodeCache(
             }
         }
     }
-    try encoder.writeUsize(plan.max_records);
-    try encoder.writeUsize(plan.max_output_bytes);
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 7) {
+    if (try decoder.readU16() != 8) {
         return error.LedgerProjectionCacheVersionMismatch;
+    }
+    const max_records = try decoder.readUsize();
+    const max_output_bytes = try decoder.readUsize();
+    if (max_records == 0 or max_records > 10_000_000 or
+        max_output_bytes == 0 or max_output_bytes > 256 * 1024 * 1024)
+    {
+        return error.CacheProjectionBoundsInvalid;
     }
     const count = try decoder.readCount(128);
     const projections = try allocator.alloc(Projection, count);
@@ -444,20 +464,17 @@ pub fn decodeCache(
         allocator.free(projections);
     }
     for (projections, 0..) |*projection, index| {
-        projection.* = try decodeCacheProjection(allocator, decoder);
+        projection.* = try decodeCacheProjection(
+            allocator,
+            decoder,
+            max_output_bytes,
+        );
         initialized += 1;
         if (index != 0 and std.mem.order(
             u8,
             projections[index - 1].name,
             projection.name,
         ) != .lt) return error.CacheProjectionsNotSorted;
-    }
-    const max_records = try decoder.readUsize();
-    const max_output_bytes = try decoder.readUsize();
-    if (max_records == 0 or max_records > 10_000_000 or
-        max_output_bytes == 0 or max_output_bytes > 256 * 1024 * 1024)
-    {
-        return error.CacheProjectionBoundsInvalid;
     }
     for (projections) |projection| {
         if (projection.limit) |limit| switch (limit) {
@@ -492,6 +509,8 @@ pub fn validateCachePlan(
         if (projection.fold) |fold| {
             if (projection.predicates.len != 0 or
                 projection.fields.len != 0 or
+                projection.value_path != null or
+                projection.constructed_value != null or
                 projection.latest != null or
                 !definition_plan.requires(.fold) or
                 event_protocol == null or
@@ -611,7 +630,9 @@ pub fn validateCachePlan(
                 relevance.paths.len > 64 or
                 relevance.score_field != null and
                     projection.fields.len == 0 or
-                projection.raw)
+                projection.raw or
+                projection.value_path != null or
+                projection.constructed_value != null)
             {
                 return error.CacheProjectionPlanMismatch;
             }
@@ -630,7 +651,17 @@ pub fn validateCachePlan(
                 return error.CacheProjectionPlanMismatch;
             }
         }
-        if (projection.raw and projection.fields.len != 0) {
+        if ((projection.raw and
+            (projection.fields.len != 0 or
+                projection.value_path != null or
+                projection.constructed_value != null)) or
+            (projection.value_path != null and
+                (projection.fields.len != 0 or
+                    projection.constructed_value != null)) or
+            (projection.constructed_value != null and
+                projection.fields.len != 0) or
+            (projection.preserve_field_order and projection.fields.len == 0))
+        {
             return error.CacheProjectionPlanMismatch;
         }
         for (projection.fields, 0..) |field, index| {
@@ -655,6 +686,7 @@ pub fn validateCachePlan(
 fn decodeCacheProjection(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
+    max_output_bytes: usize,
 ) !Projection {
     const name = try decoder.readBytesAlloc(allocator, 128);
     errdefer allocator.free(name);
@@ -697,6 +729,25 @@ fn decodeCacheProjection(
     }
     const preserve_field_order = try decoder.readBool();
     const raw = try decoder.readBool();
+    var value_path: ?definition_core.json_pointer.Pointer = null;
+    errdefer if (value_path) |*pointer| pointer.deinit(allocator);
+    if (try decoder.readBool()) {
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        value_path = try definition_core.json_pointer.compile(
+            allocator,
+            raw_pointer,
+        );
+    }
+    var constructed_value: ?projection_value.Value = null;
+    errdefer if (constructed_value) |*value| value.deinit(allocator);
+    if (try decoder.readBool()) {
+        constructed_value = try projection_value.decodeCache(
+            allocator,
+            decoder,
+            max_output_bytes,
+        );
+    }
     const single = try decoder.readBool();
     const require_match = try decoder.readBool();
     const sort_key_count = try decoder.readCount(8);
@@ -941,6 +992,8 @@ fn decodeCacheProjection(
         .fields = fields,
         .preserve_field_order = preserve_field_order,
         .raw = raw,
+        .value_path = value_path,
+        .constructed_value = constructed_value,
         .single = single,
         .require_match = require_match,
         .sort_keys = sort_keys,
@@ -1052,6 +1105,10 @@ fn compileProjection(
     var selection_seen = false;
     var preserve_field_order = false;
     var raw_export = false;
+    var value_path: ?definition_core.json_pointer.Pointer = null;
+    errdefer if (value_path) |*pointer| pointer.deinit(allocator);
+    var constructed_value: ?projection_value.Value = null;
+    errdefer if (constructed_value) |*value| value.deinit(allocator);
     var single = false;
     var require_match = false;
     for (steps.items) |step_value| {
@@ -1277,6 +1334,25 @@ fn compileProjection(
                         step,
                     );
                     preserve_field_order = true;
+                } else if (step.get("path")) |path_value| {
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "path" },
+                    );
+                    value_path = try definition_core.json_pointer.compile(
+                        allocator,
+                        try definition_core.json.string(path_value),
+                    );
+                } else if (step.get("value")) |value| {
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "value" },
+                    );
+                    constructed_value = try projection_value.compile(
+                        allocator,
+                        value,
+                        definition_plan.bounds.max_output_bytes,
+                    );
                 } else {
                     try definition_core.json.requireExactKeys(
                         step,
@@ -1296,7 +1372,9 @@ fn compileProjection(
         return error.RetainedFoldRejectsLimit;
     }
     if (relevance != null) {
-        if (sort_keys.len == 0 or raw_export) {
+        if (sort_keys.len == 0 or raw_export or value_path != null or
+            constructed_value != null)
+        {
             return error.RelevanceRequiresSortedStructuredProjection;
         }
         if (relevance.?.score_field) |score_field| {
@@ -1322,6 +1400,8 @@ fn compileProjection(
         .fields = fields,
         .preserve_field_order = preserve_field_order,
         .raw = raw_export,
+        .value_path = value_path,
+        .constructed_value = constructed_value,
         .single = single,
         .require_match = require_match,
         .sort_keys = sort_keys,
@@ -2325,6 +2405,23 @@ fn writeProjectedValue(
     projection: *const Projection,
     value: std.json.Value,
 ) !void {
+    if (projection.constructed_value) |constructed| {
+        try projection_value.write(
+            allocator,
+            writer,
+            constructed,
+            value,
+        );
+        return;
+    }
+    if (projection.value_path) |pointer| {
+        const selected = definition_core.json_pointer.lookup(
+            value,
+            pointer,
+        ) orelse return error.ProjectionFieldMissing;
+        try std.json.Stringify.value(selected, .{}, writer);
+        return;
+    }
     if (projection.fields.len == 0) {
         try definition_core.canonical_json.writeCanonicalJson(
             allocator,
@@ -2646,7 +2743,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["export","id-lookup","latest","limit","relevance","sort"]},"parameters":{"id":{"type":"string","required":false},"query":{"type":"string","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"latest":{"slot":"events","pipeline":[{"op":"latest","path":"/record/id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"ordered":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"query":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"literal"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"raw":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","raw":true}]},"recall":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"tokens","score_field":"score"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"recent":{"slot":"events","pipeline":[{"op":"sort","keys":[{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":2}]},"required":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id","required":true},{"op":"export","raw":true}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["export","id-lookup","latest","limit","relevance","sort"]},"parameters":{"id":{"type":"string","required":false},"query":{"type":"string","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"latest":{"slot":"events","pipeline":[{"op":"latest","path":"/record/id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"nested":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","path":"/record"}]},"ordered":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"query":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"literal"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"raw":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","raw":true}]},"recall":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"tokens","score_field":"score"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"recent":{"slot":"events","pipeline":[{"op":"sort","keys":[{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":2}]},"required":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id","required":true},{"op":"export","raw":true}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -2697,6 +2794,13 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try std.testing.expect(raw.single);
     try std.testing.expect(raw.raw);
     try std.testing.expectEqual(@as(usize, 0), raw.fields.len);
+    const nested = cached.find("nested").?;
+    try std.testing.expect(nested.single);
+    try std.testing.expect(nested.value_path != null);
+    try std.testing.expectEqualStrings(
+        "/record",
+        nested.value_path.?.raw,
+    );
 
     var bindings = try definition_core.parameters.bind(
         std.testing.allocator,
@@ -2753,6 +2857,29 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try std.testing.expectEqualStrings(
         "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}}",
         raw_output.written(),
+    );
+
+    var nested_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer nested_output.deinit();
+    var nested_stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeJsonl(
+        std.testing.allocator,
+        nested,
+        rows,
+        &bindings,
+        100,
+        100,
+        &nested_output.writer,
+        &nested_stats,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}",
+        nested_output.written(),
     );
 
     const recent = cached.find("recent").?;

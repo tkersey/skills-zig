@@ -3137,7 +3137,7 @@ test "transaction fails closed for an unbound existing store" {
     );
 }
 
-test "plain event idempotency derives a content key with an explicit bypass" {
+test "plain event idempotency derives a transformed truncated digest with an explicit bypass" {
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
     try definition_tmp.dir.writeFile(std.testing.io, .{
@@ -3147,13 +3147,14 @@ test "plain event idempotency derives a content key with an explicit bypass" {
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/content-idempotency",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["bind-existing","canonical-json","compare-and-append","event-materialization","exact-object","idempotency-key","sha256"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["bind-existing","canonical-json","compare-and-append","event-materialization","exact-object","idempotency-key","sha1"]},
         \\  "parameters":{"allow_duplicate":{"type":"boolean","required":false,"default":false}},
         \\  "inputs":{"submission":{"codec":"json","max_bytes":4096}},
         \\  "canonicalization":{"steps":[{"op":"canonical-json","input":"submission"}]},
         \\  "shape":{"rules":[
         \\    {"op":"exact-object","input":"submission","path":"","keys":["record"]},
-        \\    {"op":"exact-object","input":"submission","path":"/record","keys":["summary"]}
+        \\    {"op":"exact-object","input":"submission","path":"/record","keys":["context","status","summary"]},
+        \\    {"op":"exact-object","input":"submission","path":"/record/context","keys":["branch","paths","repo"]}
         \\  ]},
         \\  "constraints":[],
         \\  "identity":{},
@@ -3164,9 +3165,11 @@ test "plain event idempotency derives a content key with an explicit bypass" {
         \\    "mode":"plain",
         \\    "body_input_field":"record",
         \\    "field_order":["event","record"],
-        \\    "body_order":["summary","fingerprint"],
+        \\    "body_order":["status","summary","context","fingerprint"],
+        \\    "object_orders":[{"path":"/context","fields":["repo","branch","paths"]}],
+        \\    "escape_non_ascii":true,
         \\    "fields":[{"field":"event","literal":"capture"}],
-        \\    "derive":[{"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[{"canonical_input":"/record"}],"max_bytes":4096}],
+        \\    "derive":[{"name":"fingerprint","op":"sha1","encoding":"hex","prefix_bytes":16,"fragments":[{"input_text":"/record/status"},{"literal":"|"},{"input_text":"/record/summary","transform":"ascii-lower"}],"max_bytes":4096}],
         \\    "idempotency":{"derived":"fingerprint","bypass_param":"allow_duplicate"},
         \\    "body_fields":[{"field":"fingerprint","derived":"fingerprint"}]
         \\  }}]}
@@ -3240,7 +3243,8 @@ test "plain event idempotency derives a content key with an explicit bypass" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-    const request = "{\"record\":{\"summary\":\"same\"}}";
+    const request =
+        "{\"record\":{\"status\":\"do_more\",\"summary\":\"MiXeD CaSe\",\"context\":{\"branch\":\"main\",\"paths\":[],\"repo\":\"café\"}}}";
     var first = try transact(
         std.testing.allocator,
         &definition_plan,
@@ -3260,6 +3264,14 @@ test "plain event idempotency derives a content key with an explicit bypass" {
     try std.testing.expectEqualStrings(
         "fingerprint",
         first.generated_outputs[0].name,
+    );
+    try std.testing.expectEqualStrings(
+        "eea046b1709337f1",
+        first.generated_outputs[0].value,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"event\":\"capture\",\"record\":{\"status\":\"do_more\",\"summary\":\"MiXeD CaSe\",\"context\":{\"repo\":\"caf\\u00E9\",\"branch\":\"main\",\"paths\":[]},\"fingerprint\":\"eea046b1709337f1\"}}",
+        first.returned_content.?,
     );
     var duplicate = try transact(
         std.testing.allocator,
