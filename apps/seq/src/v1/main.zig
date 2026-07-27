@@ -34,7 +34,8 @@ const Help =
     \\  capabilities
     \\  version
     \\
-    \\Definitions are passive JSON. Seq reports observations and limitations; it never grants authority.
+    \\Definitions are passive JSON. Seq reports observations and limitations
+    \\without granting authority.
     \\
 ;
 
@@ -166,84 +167,119 @@ fn runExplain(
 
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     if (args.format == .text) {
-        try stdout_writer.interface.print(
-            "{s}@{s}\nprojection: {s}\nsource: {s}\nfields: {d}\nmax_rows: {d}\n",
-            .{
-                context.definition_plan.id,
-                context.definition_plan.closure_digest[0..],
-                args.projection,
-                switch (program.source) {
-                    .physical => |relation| @tagName(relation),
-                    .external => |index| context.definition_plan.inputs[index].name,
-                },
-                program.source_field_indices.len,
-                program.max_rows,
-            },
+        try writeExplanationText(
+            &stdout_writer.interface,
+            &context,
+            &args,
+            &program,
         );
         return 0;
     }
-    try stdout_writer.interface.writeAll(
+    try writeExplanationJson(
+        &stdout_writer.interface,
+        &context,
+        &args,
+        &program,
+    );
+    return 0;
+}
+
+fn writeExplanationText(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+) !void {
+    try writer.print(
+        "{s}@{s}\nprojection: {s}\nsource: {s}\nfields: {d}\nmax_rows: {d}\n",
+        .{
+            context.definition_plan.id,
+            context.definition_plan.closure_digest[0..],
+            args.projection,
+            explanationSourceName(context, program),
+            program.source_field_indices.len,
+            program.max_rows,
+        },
+    );
+}
+
+fn explanationSourceName(
+    context: *const seq.compiled_plan.PlanSet,
+    program: *const seq.execution.Program,
+) []const u8 {
+    return switch (program.source) {
+        .physical => |relation| @tagName(relation),
+        .external => |index| context.definition_plan.inputs[index].name,
+    };
+}
+
+fn writeExplanationJson(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+) !void {
+    try writer.writeAll(
         "{\"schema\":\"seq-observation-plan/v1\",\"definition\":{\"id\":",
     );
-    try writeString(&stdout_writer.interface, context.definition_plan.id);
-    try stdout_writer.interface.writeAll(",\"digest\":");
+    try writeString(writer, context.definition_plan.id);
+    try writer.writeAll(",\"digest\":");
     try writeString(
-        &stdout_writer.interface,
+        writer,
         &context.definition_plan.closure_digest,
     );
-    try stdout_writer.interface.writeAll(",\"abi\":\"");
-    try stdout_writer.interface.writeAll(seq.definition.abi);
-    try stdout_writer.interface.writeAll("\"},\"projection\":");
-    try writeString(&stdout_writer.interface, args.projection);
-    try stdout_writer.interface.writeAll(",\"source\":{\"kind\":");
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(seq.definition.abi);
+    try writer.writeAll("\"},\"projection\":");
+    try writeString(writer, args.projection);
+    try writer.writeAll(",\"source\":{\"kind\":");
     switch (program.source) {
         .physical => |relation| {
-            try stdout_writer.interface.writeAll("\"physical\",\"relation\":");
-            try writeString(&stdout_writer.interface, @tagName(relation));
+            try writer.writeAll("\"physical\",\"relation\":");
+            try writeString(writer, @tagName(relation));
         },
         .external => |index| {
-            try stdout_writer.interface.writeAll("\"external\",\"input\":");
-            try writeString(
-                &stdout_writer.interface,
-                context.definition_plan.inputs[index].name,
-            );
+            try writer.writeAll("\"external\",\"input\":");
+            try writeString(writer, context.definition_plan.inputs[index].name);
         },
     }
-    try stdout_writer.interface.writeAll("},\"required_fields\":[");
-    switch (program.source) {
-        .physical => |relation| {
-            for (program.source_field_indices, 0..) |field_index, index| {
-                if (index != 0) try stdout_writer.interface.writeByte(',');
-                try writeString(
-                    &stdout_writer.interface,
-                    relation.fields()[field_index].name,
-                );
-            }
-        },
-        .external => |input_index| {
-            const fields = context.definition_plan.inputs[input_index].fields;
-            for (program.source_field_indices, 0..) |field_index, index| {
-                if (index != 0) try stdout_writer.interface.writeByte(',');
-                try writeString(
-                    &stdout_writer.interface,
-                    fields[field_index].name,
-                );
-            }
-        },
-    }
-    try stdout_writer.interface.print(
-        "],\"source_width\":{d},\"output_width\":{d},\"max_rows\":{d},\"compile_stats\":",
+    try writer.writeAll("},\"required_fields\":[");
+    try writeExplanationFields(writer, context, program);
+    try writer.print(
+        "],\"source_width\":{d},\"output_width\":{d}," ++
+            "\"max_rows\":{d},\"compile_stats\":",
         .{
             program.source_width,
             program.output_field_indices.len,
             program.max_rows,
         },
     );
-    try writeCompileStats(&stdout_writer.interface, context.stats);
-    try stdout_writer.interface.writeAll(
+    try writeCompileStats(writer, context.stats);
+    try writer.writeAll(
         ",\"corpus_read\":false,\"authority_granted\":false}\n",
     );
-    return 0;
+}
+
+fn writeExplanationFields(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+    program: *const seq.execution.Program,
+) !void {
+    switch (program.source) {
+        .physical => |relation| {
+            for (program.source_field_indices, 0..) |field_index, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeString(writer, relation.fields()[field_index].name);
+            }
+        },
+        .external => |input_index| {
+            const fields = context.definition_plan.inputs[input_index].fields;
+            for (program.source_field_indices, 0..) |field_index, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeString(writer, fields[field_index].name);
+            }
+        },
+    }
 }
 
 fn runDefinitionCheck(
@@ -314,60 +350,72 @@ fn runDefinitionDescribe(
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
-            try output.writer.writeAll(
-                "{\"schema\":\"seq-definition-description/v1\",\"definition\":{\"id\":",
-            );
-            try writeString(&output.writer, context.definition_plan.id);
-            try output.writer.writeAll(",\"digest\":");
-            try writeString(
-                &output.writer,
-                &context.definition_plan.closure_digest,
-            );
-            try output.writer.writeAll(",\"abi\":\"");
-            try output.writer.writeAll(seq.definition.abi);
-            try output.writer.writeAll("\"},\"operators\":[");
-            var first = true;
-            for (std.enums.values(seq.definition.Operator)) |operator| {
-                if (!context.definition_plan.requires(operator)) continue;
-                if (!first) try output.writer.writeByte(',');
-                first = false;
-                try writeString(&output.writer, operator.id());
-            }
-            try output.writer.writeAll("],\"selectors\":[");
-            first = true;
-            for (std.enums.values(seq.definition.Selector)) |selector| {
-                if (!selectorAllowed(&context.definition_plan, selector)) {
-                    continue;
-                }
-                if (!first) try output.writer.writeByte(',');
-                first = false;
-                try writeString(&output.writer, selector.id());
-            }
-            try output.writer.writeAll("],\"projections\":[");
-            for (context.definition_plan.projections, 0..) |projection, index| {
-                if (index != 0) try output.writer.writeByte(',');
-                try writeString(&output.writer, projection.name);
-            }
-            try output.writer.writeAll("],\"compile_stats\":");
-            try writeCompileStats(&output.writer, context.stats);
-            try output.writer.writeAll(
-                ",\"passive\":true,\"authority_granted\":false}\n",
-            );
+            try writeDefinitionDescriptionJson(&output.writer, &context);
             try writeStdout(output.written());
         },
         .text => {
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
-            try stdout_writer.interface.print(
-                "{s}\ndigest: {s}\nabi: {s}\n",
-                .{
-                    context.definition_plan.id,
-                    context.definition_plan.closure_digest[0..],
-                    seq.definition.abi,
-                },
+            try writeDefinitionDescriptionText(
+                &stdout_writer.interface,
+                &context,
             );
         },
     }
     return 0;
+}
+
+fn writeDefinitionDescriptionJson(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+) !void {
+    try writer.writeAll(
+        "{\"schema\":\"seq-definition-description/v1\",\"definition\":{\"id\":",
+    );
+    try writeString(writer, context.definition_plan.id);
+    try writer.writeAll(",\"digest\":");
+    try writeString(writer, &context.definition_plan.closure_digest);
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(seq.definition.abi);
+    try writer.writeAll("\"},\"operators\":[");
+    var first = true;
+    for (std.enums.values(seq.definition.Operator)) |operator| {
+        if (!context.definition_plan.requires(operator)) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writeString(writer, operator.id());
+    }
+    try writer.writeAll("],\"selectors\":[");
+    first = true;
+    for (std.enums.values(seq.definition.Selector)) |selector| {
+        if (!selectorAllowed(&context.definition_plan, selector)) continue;
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writeString(writer, selector.id());
+    }
+    try writer.writeAll("],\"projections\":[");
+    for (context.definition_plan.projections, 0..) |projection, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeString(writer, projection.name);
+    }
+    try writer.writeAll("],\"compile_stats\":");
+    try writeCompileStats(writer, context.stats);
+    try writer.writeAll(
+        ",\"passive\":true,\"authority_granted\":false}\n",
+    );
+}
+
+fn writeDefinitionDescriptionText(
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+) !void {
+    try writer.print(
+        "{s}\ndigest: {s}\nabi: {s}\n",
+        .{
+            context.definition_plan.id,
+            context.definition_plan.closure_digest[0..],
+            seq.definition.abi,
+        },
+    );
 }
 
 fn runObserve(
@@ -410,6 +458,22 @@ fn runObserve(
         args.projection,
     );
     defer program.deinit(allocator);
+    return emitObservation(
+        allocator,
+        &args,
+        &context,
+        &bindings,
+        &program,
+    );
+}
+
+fn emitObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+    program: *const seq.execution.Program,
+) !u8 {
     const output_width = program.output_field_indices.len;
     const output_cells = std.math.mul(
         usize,
@@ -421,133 +485,24 @@ fn runObserve(
     }
     const output = try allocator.alloc(seq.execution.Value, output_cells);
     defer allocator.free(output);
-
     const execution_start = monotonicNanoseconds();
-    var rows: seq.execution.Rows = undefined;
-    var corpus_adapter: []const u8 = undefined;
-    var corpus_digest: []const u8 = undefined;
-    var corpus_digest_storage: [71]u8 = undefined;
-    var corpus_files: usize = 0;
-    var corpus_sessions: usize = 0;
-    var files_opened: usize = 0;
-    var bytes_read: usize = 0;
-    var rows_materialized: usize = 0;
-    var corpus_runner: ?seq.execution.Runner = null;
-    defer if (corpus_runner) |*runner| runner.deinit();
-    var external_relation: ?seq.external_input.Relation = null;
-    defer if (external_relation) |*relation| relation.deinit(allocator);
-
-    const result = switch (program.source) {
-        .physical => |relation| physical_result: {
-            if (args.input_specs.len != 0) {
-                return error.ExternalInputNotAcceptedForPhysicalObservation;
-            }
-            try validateSelectedSelectors(
-                &context.definition_plan,
-                args.selectors,
-            );
-            var paths = try seq.native.resolveTargetPaths(
-                allocator,
-                defaultIo(),
-                args.selectors,
-                false,
-            );
-            defer seq.native.freePaths(allocator, &paths);
-            corpus_runner = try seq.execution.Runner.initOwnedAlloc(
-                allocator,
-                &program,
-                output,
-            );
-            var digest_set = CorpusSetHasher{};
-            for (paths.items) |path| {
-                var parsed = try seq.trace_adapter.parseFile(
-                    allocator,
-                    &program,
-                    path,
-                    .{},
-                );
-                defer parsed.deinit(allocator);
-                files_opened += 1;
-                bytes_read = std.math.add(
-                    usize,
-                    bytes_read,
-                    parsed.metrics.bytes_read,
-                ) catch return error.ObservationMetricOverflow;
-                if (!seq.native.sessionPasses(
-                    parsed.trace.session,
-                    args.selectors,
-                )) continue;
-                corpus_files += 1;
-                corpus_sessions += 1;
-                digest_set.add(path, &parsed.corpus_digest);
-                const feed = switch (relation) {
-                    .structured_documents,
-                    .structured_values,
-                    => structured_feed: {
-                        var index = try seq.structured.build(
-                            allocator,
-                            &parsed.trace,
-                            relation == .structured_values,
-                            .{},
-                        );
-                        defer index.deinit(allocator);
-                        break :structured_feed try seq.structured.feed(
-                            &corpus_runner.?,
-                            &program,
-                            &index,
-                        );
-                    },
-                    else => try seq.trace_adapter.feedTrace(
-                        &corpus_runner.?,
-                        &program,
-                        &parsed.trace,
-                    ),
-                };
-                if (feed == .stop) break;
-            }
-            corpus_digest_storage = digest_set.digest();
-            corpus_adapter = "codex-rollout-jsonl/v1";
-            corpus_digest = &corpus_digest_storage;
-            break :physical_result try corpus_runner.?.finish();
-        },
-        .external => |input_index| external_result: {
-            if (hasPhysicalSelector(args.selectors)) {
-                return error.SelectorNotAcceptedForExternalInput;
-            }
-            if (input_index >= context.definition_plan.inputs.len) {
-                return error.ObservationExternalInputIndexInvalid;
-            }
-            external_relation = try loadExternalInput(
-                allocator,
-                &context.definition_plan,
-                context.definition_plan.inputs[input_index].name,
-                args.input_specs,
-            );
-            const relation = &external_relation.?;
-            corpus_adapter = "immutable-relation-json/v1";
-            corpus_digest = &relation.raw_digest;
-            files_opened = 1;
-            bytes_read = relation.input_bytes;
-            corpus_files = 1;
-            break :external_result try seq.external_input.execute(
-                allocator,
-                &program,
-                relation,
-                output,
-            );
-        },
-    };
-    rows_materialized = result.materialized_row_count;
-    rows = result.rows();
+    var execution = try executeObservation(
+        allocator,
+        args,
+        context,
+        program,
+        output,
+    );
+    defer execution.deinit(allocator);
     const execution_ns = elapsedNanoseconds(execution_start);
     var execution_stats = definition_core.result.ExecutionStats{
         .execution_ns = execution_ns,
         .physical_passes = 1,
-        .files_opened = files_opened,
-        .bytes_read = bytes_read,
-        .rows_scanned = result.source_row_count,
-        .rows_materialized = rows_materialized,
-        .output_rows = result.row_count,
+        .files_opened = execution.files_opened,
+        .bytes_read = execution.bytes_read,
+        .rows_scanned = execution.result.source_row_count,
+        .rows_materialized = execution.result.materialized_row_count,
+        .output_rows = execution.result.row_count,
     };
     const rendered = try renderObservationAlloc(
         allocator,
@@ -556,13 +511,13 @@ fn runObserve(
             .projection_name = args.projection,
             .parameters_digest = &bindings.values_digest,
             .corpus = .{
-                .adapter = corpus_adapter,
-                .digest = corpus_digest,
-                .files = corpus_files,
-                .sessions = corpus_sessions,
+                .adapter = execution.corpus_adapter,
+                .digest = &execution.corpus_digest,
+                .files = execution.corpus_files,
+                .sessions = execution.corpus_sessions,
                 .contaminated = false,
             },
-            .rows = rows,
+            .rows = execution.result.rows(),
             .compile_stats = context.stats,
             .execution_stats = execution_stats,
         },
@@ -573,6 +528,198 @@ fn runObserve(
     try stdout_writer.interface.writeAll(rendered);
     try stdout_writer.interface.writeByte('\n');
     return 0;
+}
+
+const ObservationExecution = struct {
+    result: seq.execution.Result,
+    runner: ?seq.execution.Runner = null,
+    external_relation: ?seq.external_input.Relation = null,
+    corpus_adapter: []const u8,
+    corpus_digest: [71]u8,
+    corpus_files: usize,
+    corpus_sessions: usize,
+    files_opened: usize,
+    bytes_read: usize,
+
+    fn deinit(self: *ObservationExecution, allocator: std.mem.Allocator) void {
+        if (self.runner) |*runner| runner.deinit();
+        if (self.external_relation) |*relation| relation.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn executeObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    program: *const seq.execution.Program,
+    output: []seq.execution.Value,
+) !ObservationExecution {
+    return switch (program.source) {
+        .physical => |relation| executePhysicalObservation(
+            allocator,
+            args,
+            context,
+            program,
+            relation,
+            output,
+        ),
+        .external => |input_index| executeExternalObservation(
+            allocator,
+            args,
+            context,
+            program,
+            input_index,
+            output,
+        ),
+    };
+}
+
+fn executePhysicalObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    program: *const seq.execution.Program,
+    relation: seq.physical.Relation,
+    output: []seq.execution.Value,
+) !ObservationExecution {
+    if (args.input_specs.len != 0) {
+        return error.ExternalInputNotAcceptedForPhysicalObservation;
+    }
+    try validateSelectedSelectors(&context.definition_plan, args.selectors);
+    var paths = try seq.native.resolveTargetPaths(
+        allocator,
+        defaultIo(),
+        args.selectors,
+        false,
+    );
+    defer seq.native.freePaths(allocator, &paths);
+    var runner = try seq.execution.Runner.initOwnedAlloc(
+        allocator,
+        program,
+        output,
+    );
+    errdefer runner.deinit();
+    var metrics = PhysicalMetrics{};
+    var digest_set = CorpusSetHasher{};
+    for (paths.items) |path| {
+        const feed = try feedPhysicalFile(
+            allocator,
+            args,
+            program,
+            relation,
+            path,
+            &runner,
+            &digest_set,
+            &metrics,
+        );
+        if (feed == .stop) break;
+    }
+    return .{
+        .result = try runner.finish(),
+        .runner = runner,
+        .corpus_adapter = "codex-rollout-jsonl/v1",
+        .corpus_digest = digest_set.digest(),
+        .corpus_files = metrics.files,
+        .corpus_sessions = metrics.sessions,
+        .files_opened = metrics.opened,
+        .bytes_read = metrics.bytes_read,
+    };
+}
+
+const PhysicalMetrics = struct {
+    files: usize = 0,
+    sessions: usize = 0,
+    opened: usize = 0,
+    bytes_read: usize = 0,
+};
+
+fn feedPhysicalFile(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    relation: seq.physical.Relation,
+    path: []const u8,
+    runner: *seq.execution.Runner,
+    digest_set: *CorpusSetHasher,
+    metrics: *PhysicalMetrics,
+) !seq.execution.Feed {
+    var parsed = try seq.trace_adapter.parseFile(
+        allocator,
+        program,
+        path,
+        .{},
+    );
+    defer parsed.deinit(allocator);
+    metrics.opened += 1;
+    metrics.bytes_read = std.math.add(
+        usize,
+        metrics.bytes_read,
+        parsed.metrics.bytes_read,
+    ) catch return error.ObservationMetricOverflow;
+    if (!seq.native.sessionPasses(parsed.trace.session, args.selectors)) {
+        return .continue_scanning;
+    }
+    metrics.files += 1;
+    metrics.sessions += 1;
+    digest_set.add(path, &parsed.corpus_digest);
+    return switch (relation) {
+        .structured_documents, .structured_values => result: {
+            var index = try seq.structured.build(
+                allocator,
+                &parsed.trace,
+                relation == .structured_values,
+                .{},
+            );
+            defer index.deinit(allocator);
+            break :result try seq.structured.feed(runner, program, &index);
+        },
+        else => try seq.trace_adapter.feedTrace(
+            runner,
+            program,
+            &parsed.trace,
+        ),
+    };
+}
+
+fn executeExternalObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    program: *const seq.execution.Program,
+    input_index: u16,
+    output: []seq.execution.Value,
+) !ObservationExecution {
+    if (hasPhysicalSelector(args.selectors)) {
+        return error.PhysicalSelectorNotAcceptedForExternalObservation;
+    }
+    if (input_index >= context.definition_plan.inputs.len) {
+        return error.ExternalInputProgramMismatch;
+    }
+    const input_name = context.definition_plan.inputs[input_index].name;
+    var relation = try loadExternalInput(
+        allocator,
+        &context.definition_plan,
+        input_name,
+        args.input_specs,
+    );
+    errdefer relation.deinit(allocator);
+    const result = try seq.external_input.execute(
+        allocator,
+        program,
+        &relation,
+        output,
+    );
+    return .{
+        .result = result,
+        .external_relation = relation,
+        .corpus_adapter = "immutable-relation-json/v1",
+        .corpus_digest = relation.raw_digest,
+        .corpus_files = 1,
+        .corpus_sessions = 0,
+        .files_opened = 1,
+        .bytes_read = relation.input_bytes,
+    };
 }
 
 fn renderObservationAlloc(
@@ -621,123 +768,163 @@ fn parseDefinitionArgs(argv: []const []const u8) !DefinitionArgs {
     };
 }
 
+const ObserveOption = enum {
+    definition,
+    projection,
+    path,
+    root,
+    session_id,
+    repo,
+    since,
+    until,
+    last,
+    input,
+    parameter,
+    format,
+
+    fn parse(token: []const u8) !ObserveOption {
+        if (std.mem.eql(u8, token, "--definition")) return .definition;
+        if (std.mem.eql(u8, token, "--projection")) return .projection;
+        if (std.mem.eql(u8, token, "--path")) return .path;
+        if (std.mem.eql(u8, token, "--root")) return .root;
+        if (std.mem.eql(u8, token, "--session-id")) return .session_id;
+        if (std.mem.eql(u8, token, "--repo")) return .repo;
+        if (std.mem.eql(u8, token, "--since")) return .since;
+        if (std.mem.eql(u8, token, "--until")) return .until;
+        if (std.mem.eql(u8, token, "--last")) return .last;
+        if (std.mem.eql(u8, token, "--input")) return .input;
+        if (std.mem.eql(u8, token, "--param")) return .parameter;
+        if (std.mem.eql(u8, token, "--format")) return .format;
+        return error.UnknownOption;
+    }
+};
+
+const ObserveParseState = struct {
+    definition_path: ?[]const u8 = null,
+    projection: ?[]const u8 = null,
+    selectors: seq.native.Options = .{},
+    format: Format = .json,
+    inputs: std.ArrayList([]const u8) = .empty,
+    parameters: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *ObserveParseState, allocator: std.mem.Allocator) void {
+        self.inputs.deinit(allocator);
+        self.parameters.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn apply(
+        self: *ObserveParseState,
+        allocator: std.mem.Allocator,
+        option: ObserveOption,
+        value: []const u8,
+    ) !void {
+        switch (option) {
+            .definition => try setOnce(
+                &self.definition_path,
+                value,
+                error.DuplicateDefinitionOption,
+            ),
+            .projection => try setOnce(
+                &self.projection,
+                value,
+                error.DuplicateProjectionOption,
+            ),
+            .path => try setOnce(
+                &self.selectors.path,
+                value,
+                error.DuplicatePathOption,
+            ),
+            .root => try setOnce(
+                &self.selectors.root,
+                value,
+                error.DuplicateRootOption,
+            ),
+            .session_id => try setOnce(
+                &self.selectors.session_id,
+                value,
+                error.DuplicateSessionIdOption,
+            ),
+            .repo => try setOnce(
+                &self.selectors.repo,
+                value,
+                error.DuplicateRepoOption,
+            ),
+            .since => try setOnce(
+                &self.selectors.since,
+                value,
+                error.DuplicateSinceOption,
+            ),
+            .until => try setOnce(
+                &self.selectors.until,
+                value,
+                error.DuplicateUntilOption,
+            ),
+            .last => try setOnce(
+                &self.selectors.last,
+                value,
+                error.DuplicateLastOption,
+            ),
+            .input => try self.inputs.append(allocator, value),
+            .parameter => try self.parameters.append(allocator, value),
+            .format => self.format = try Format.parse(value),
+        }
+    }
+
+    fn finish(
+        self: *ObserveParseState,
+        allocator: std.mem.Allocator,
+    ) !ObserveArgs {
+        const definition_path = self.definition_path orelse
+            return error.MissingDefinition;
+        const projection = self.projection orelse
+            return error.MissingProjection;
+        if (self.selectors.path != null and
+            (self.selectors.root != null or
+                self.selectors.session_id != null))
+        {
+            return error.ConflictingSessionSelectors;
+        }
+        try seq.native.resolveTemporalBounds(&self.selectors);
+        const input_specs = try self.inputs.toOwnedSlice(allocator);
+        errdefer allocator.free(input_specs);
+        const parameter_specs =
+            try self.parameters.toOwnedSlice(allocator);
+        return .{
+            .definition_path = definition_path,
+            .projection = projection,
+            .selectors = self.selectors,
+            .input_specs = input_specs,
+            .parameter_specs = parameter_specs,
+            .format = self.format,
+        };
+    }
+};
+
+fn setOnce(
+    slot: *?[]const u8,
+    value: []const u8,
+    duplicate_error: anyerror,
+) !void {
+    if (slot.* != null) return duplicate_error;
+    slot.* = value;
+}
+
 fn parseObserveArgs(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
 ) !ObserveArgs {
-    var definition_path: ?[]const u8 = null;
-    var projection: ?[]const u8 = null;
-    var selectors = seq.native.Options{};
-    var format: Format = .json;
-    var inputs: std.ArrayList([]const u8) = .empty;
-    errdefer inputs.deinit(allocator);
-    var parameters: std.ArrayList([]const u8) = .empty;
-    errdefer parameters.deinit(allocator);
+    var state = ObserveParseState{};
+    defer state.deinit(allocator);
     var index: usize = 0;
-    while (index < argv.len) : (index += 1) {
-        const token = argv[index];
-        if (std.mem.eql(u8, token, "--definition")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (definition_path != null) return error.DuplicateDefinitionOption;
-            definition_path = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--projection")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (projection != null) return error.DuplicateProjectionOption;
-            projection = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--path")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.path != null) return error.DuplicatePathOption;
-            selectors.path = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--root")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.root != null) return error.DuplicateRootOption;
-            selectors.root = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--session-id")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.session_id != null) {
-                return error.DuplicateSessionIdOption;
-            }
-            selectors.session_id = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--repo")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.repo != null) return error.DuplicateRepoOption;
-            selectors.repo = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--since")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.since != null) return error.DuplicateSinceOption;
-            selectors.since = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--until")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.until != null) return error.DuplicateUntilOption;
-            selectors.until = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--last")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            if (selectors.last != null) return error.DuplicateLastOption;
-            selectors.last = argv[index];
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--input")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            try inputs.append(allocator, argv[index]);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--param")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            try parameters.append(allocator, argv[index]);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--format")) {
-            index += 1;
-            if (index >= argv.len) return error.MissingOptionValue;
-            format = try Format.parse(argv[index]);
-            continue;
-        }
-        return error.UnknownOption;
+    while (index < argv.len) {
+        const option = try ObserveOption.parse(argv[index]);
+        index += 1;
+        if (index >= argv.len) return error.MissingOptionValue;
+        try state.apply(allocator, option, argv[index]);
+        index += 1;
     }
-    const input_specs = try inputs.toOwnedSlice(allocator);
-    errdefer allocator.free(input_specs);
-    if (selectors.path != null and
-        (selectors.root != null or selectors.session_id != null))
-    {
-        return error.ConflictingSessionSelectors;
-    }
-    try seq.native.resolveTemporalBounds(&selectors);
-    return .{
-        .definition_path = definition_path orelse
-            return error.MissingDefinition,
-        .projection = projection orelse return error.MissingProjection,
-        .selectors = selectors,
-        .input_specs = input_specs,
-        .parameter_specs = try parameters.toOwnedSlice(allocator),
-        .format = format,
-    };
+    return state.finish(allocator);
 }
 
 fn hasPhysicalSelector(options: seq.native.Options) bool {
@@ -982,7 +1169,10 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         return 0;
     }
     try stdout_writer.interface.print(
-        "{{\"schema\":\"seq-capabilities/v1\",\"version\":\"{s}\",\"observation_abis\":[\"{s}\"],\"source_adapters\":[\"codex-rollout-jsonl/v1\",\"immutable-relation-json/v1\"],\"operators\":[",
+        "{{\"schema\":\"seq-capabilities/v1\",\"version\":\"{s}\"," ++
+            "\"observation_abis\":[\"{s}\"],\"source_adapters\":" ++
+            "[\"codex-rollout-jsonl/v1\"," ++
+            "\"immutable-relation-json/v1\"],\"operators\":[",
         .{ Version, seq.definition.abi },
     );
     var first = true;
@@ -998,7 +1188,9 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         );
     }
     try stdout_writer.interface.print(
-        "],\"renderers\":[\"json\"],\"cache_format\":{d},\"limits\":{{\"max_output_cells\":{d}}},\"result_schemas\":[\"seq-observation-result/v1\"]}}\n",
+        "],\"renderers\":[\"json\"],\"cache_format\":{d}," ++
+            "\"limits\":{{\"max_output_cells\":{d}}}," ++
+            "\"result_schemas\":[\"seq-observation-result/v1\"]}}\n",
         .{ definition_core.cache.format_version, max_output_cells },
     );
     return 0;
@@ -1009,7 +1201,9 @@ fn writeCompileStats(
     stats: definition_core.result.CompileStats,
 ) !void {
     try writer.print(
-        "{{\"cache_hit\":{},\"cache_write_failed\":{},\"compile_ns\":{d},\"closure_files\":{d},\"closure_bytes\":{d}}}",
+        "{{\"cache_hit\":{},\"cache_write_failed\":{}," ++
+            "\"compile_ns\":{d},\"closure_files\":{d}," ++
+            "\"closure_bytes\":{d}}}",
         .{
             stats.cache_hit,
             stats.cache_write_failed,
