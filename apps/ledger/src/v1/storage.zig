@@ -657,8 +657,16 @@ pub fn encodeCache(
 ) !void {
     try encoder.writeU16(12);
     try encoder.writeEnum(plan.storage_kind);
-    try encoder.writeCount(plan.slots.len);
-    for (plan.slots) |slot| {
+    try encodeCacheSlots(plan.slots, encoder);
+    try encodeCacheOperations(plan.operations, encoder);
+}
+
+fn encodeCacheSlots(
+    slots: []const Slot,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(slots.len);
+    for (slots) |slot| {
         try encoder.writeBytes(slot.name);
         try encoder.writeBytes(slot.relative_path);
         try encoder.writeCount(slot.path_segments.len);
@@ -670,101 +678,119 @@ pub fn encodeCache(
         try encoder.writeEnum(slot.codec);
         try encoder.writeUsize(slot.max_bytes);
     }
-    try encoder.writeCount(plan.operations.len);
-    for (plan.operations) |operation| {
+}
+
+fn encodeCacheOperations(
+    operations: []const Operation,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(operations.len);
+    for (operations) |operation| {
         try encoder.writeBytes(operation.name);
         try encoder.writeBool(operation.atomic);
         try encoder.writeCount(operation.effects.len);
         for (operation.effects) |effect| {
-            try encoder.writeEnum(effect.kind);
-            try encoder.writeU16(effect.slot_index);
-            try encoder.writeByte(effect.input_index);
-            try encoder.writeOptionalBytes(
-                effect.expected_revision_parameter,
-            );
-            try encoder.writeOptionalBytes(effect.idempotency_parameter);
-            try encoder.writeBool(effect.event != null);
-            if (effect.event) |event| {
-                try encoder.writeEnum(event.mode);
-                try encoder.writeBytes(event.body_input_field);
-                try encodeNames(event.field_order, encoder);
-                try encodeNames(event.body_order, encoder);
-                try encoder.writeCount(event.object_orders.len);
-                for (event.object_orders) |order| {
-                    try encoder.writeBytes(order.pointer.raw);
-                    try encodeNames(order.fields, encoder);
-                }
-                try encoder.writeBool(event.escape_non_ascii);
-                try encoder.writeCount(event.fields.len);
-                for (event.fields) |field| {
-                    try encoder.writeBytes(field.field);
-                    try encoder.writeEnum(std.meta.activeTag(field.source));
-                    switch (field.source) {
-                        .input_field => |value| try encoder.writeBytes(value),
-                        .literal => |value| try encoder.writeBytes(value),
-                        .sequence_text_prefix => |value| {
-                            try encoder.writeBytes(value);
-                        },
-                        .unix_seconds => {},
-                        .derived => |value| try encoder.writeBytes(value),
-                    }
-                }
-                try encoder.writeCount(event.request_literals.len);
-                for (event.request_literals) |literal| {
-                    try encoder.writeBytes(literal.field);
-                    try encoder.writeBytes(literal.literal);
-                }
-                try encoder.writeCount(event.generate.len);
-                for (event.generate) |item| {
-                    try encoder.writeBytes(item.name);
-                    try encoder.writeBytes(item.prefix);
-                    try encoder.writeByte(item.byte_count);
-                }
-                try encodeEventDerivations(event.derive, encoder);
-                try encoder.writeBool(event.idempotency != null);
-                if (event.idempotency) |idempotency| {
-                    try encoder.writeBytes(idempotency.derived);
-                    try encoder.writeOptionalBytes(
-                        idempotency.bypass_parameter,
-                    );
-                }
-                try encoder.writeCount(event.body_fields.len);
-                for (event.body_fields) |field| {
-                    try encoder.writeBytes(field.field);
-                    try encoder.writeEnum(std.meta.activeTag(field.source));
-                    switch (field.source) {
-                        .generated_sha256 => |name| {
-                            try encoder.writeBytes(name);
-                        },
-                        .parameter_sha256 => |source| {
-                            try encoder.writeBytes(source.parameter);
-                            try encodeStateValueSource(
-                                source.expected_state,
-                                encoder,
-                            );
-                        },
-                        .state_value => |source| {
-                            try encodeStateValueSource(source, encoder);
-                        },
-                        .request_input => |name| {
-                            try encoder.writeBytes(name);
-                        },
-                        .literal_mapping => |source| {
-                            try encoder.writeBytes(source.request_literal);
-                            try encoder.writeBytes(source.stored_literal);
-                        },
-                        .derived => |name| try encoder.writeBytes(name),
-                    }
-                }
-                try encoder.writeCount(event.forbidden_parameters.len);
-                for (event.forbidden_parameters) |name| {
-                    try encoder.writeBytes(name);
-                }
-            }
-            try encoder.writeBool(effect.document != null);
-            if (effect.document) |document_plan| {
-                try document.encodeCache(&document_plan, encoder);
-            }
+            try encodeCacheEffect(effect, encoder);
+        }
+    }
+}
+
+fn encodeCacheEffect(
+    effect: Effect,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeEnum(effect.kind);
+    try encoder.writeU16(effect.slot_index);
+    try encoder.writeByte(effect.input_index);
+    try encoder.writeOptionalBytes(effect.expected_revision_parameter);
+    try encoder.writeOptionalBytes(effect.idempotency_parameter);
+    try encoder.writeBool(effect.event != null);
+    if (effect.event) |event| {
+        try encodeEventMaterialization(event, encoder);
+    }
+    try encoder.writeBool(effect.document != null);
+    if (effect.document) |document_plan| {
+        try document.encodeCache(&document_plan, encoder);
+    }
+}
+
+fn encodeEventMaterialization(
+    event: EventMaterialization,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeEnum(event.mode);
+    try encoder.writeBytes(event.body_input_field);
+    try encodeNames(event.field_order, encoder);
+    try encodeNames(event.body_order, encoder);
+    try encoder.writeCount(event.object_orders.len);
+    for (event.object_orders) |order| {
+        try encoder.writeBytes(order.pointer.raw);
+        try encodeNames(order.fields, encoder);
+    }
+    try encoder.writeBool(event.escape_non_ascii);
+    try encodeEventFields(event.fields, encoder);
+    try encoder.writeCount(event.request_literals.len);
+    for (event.request_literals) |literal| {
+        try encoder.writeBytes(literal.field);
+        try encoder.writeBytes(literal.literal);
+    }
+    try encoder.writeCount(event.generate.len);
+    for (event.generate) |item| {
+        try encoder.writeBytes(item.name);
+        try encoder.writeBytes(item.prefix);
+        try encoder.writeByte(item.byte_count);
+    }
+    try encodeEventDerivations(event.derive, encoder);
+    try encoder.writeBool(event.idempotency != null);
+    if (event.idempotency) |idempotency| {
+        try encoder.writeBytes(idempotency.derived);
+        try encoder.writeOptionalBytes(idempotency.bypass_parameter);
+    }
+    try encodeEventBodyFields(event.body_fields, encoder);
+    try encodeNames(event.forbidden_parameters, encoder);
+}
+
+fn encodeEventFields(
+    fields: []const EventField,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(fields.len);
+    for (fields) |field| {
+        try encoder.writeBytes(field.field);
+        try encoder.writeEnum(std.meta.activeTag(field.source));
+        switch (field.source) {
+            .input_field => |value| try encoder.writeBytes(value),
+            .literal => |value| try encoder.writeBytes(value),
+            .sequence_text_prefix => |value| try encoder.writeBytes(value),
+            .unix_seconds => {},
+            .derived => |value| try encoder.writeBytes(value),
+        }
+    }
+}
+
+fn encodeEventBodyFields(
+    fields: []const EventBodyField,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(fields.len);
+    for (fields) |field| {
+        try encoder.writeBytes(field.field);
+        try encoder.writeEnum(std.meta.activeTag(field.source));
+        switch (field.source) {
+            .generated_sha256 => |name| try encoder.writeBytes(name),
+            .parameter_sha256 => |source| {
+                try encoder.writeBytes(source.parameter);
+                try encodeStateValueSource(source.expected_state, encoder);
+            },
+            .state_value => |source| {
+                try encodeStateValueSource(source, encoder);
+            },
+            .request_input => |name| try encoder.writeBytes(name),
+            .literal_mapping => |source| {
+                try encoder.writeBytes(source.request_literal);
+                try encoder.writeBytes(source.stored_literal);
+            },
+            .derived => |name| try encoder.writeBytes(name),
         }
     }
 }
@@ -825,7 +851,23 @@ pub fn validateCachePlan(
     if (plan.storage_kind != definition_plan.storage_kind) {
         return error.CacheStoragePlanMismatch;
     }
-    for (plan.slots) |slot| {
+    try validateCacheSlots(plan.slots, definition_plan);
+    for (plan.operations) |operation| {
+        for (operation.effects) |effect| {
+            try validateCacheEffect(
+                plan.slots,
+                effect,
+                definition_plan,
+            );
+        }
+    }
+}
+
+fn validateCacheSlots(
+    slots: []const Slot,
+    definition_plan: *const definition.Plan,
+) !void {
+    for (slots) |slot| {
         if (slot.max_bytes > definition_plan.bounds.max_store_bytes) {
             return error.CacheStoragePlanMismatch;
         }
@@ -845,100 +887,134 @@ pub fn validateCachePlan(
             },
         };
     }
-    for (plan.operations) |operation| {
-        for (operation.effects) |effect| {
-            if (effect.input_index >= definition_plan.inputs.len) {
-                return error.CacheStoragePlanMismatch;
-            }
-            const slot = plan.slots[effect.slot_index];
-            const input = definition_plan.inputs[effect.input_index];
-            const required_operator: definition.Operator = switch (effect.kind) {
-                .create_new => .create_new,
-                .compare_append => .compare_append,
-                .compare_replace => .compare_replace,
-                .bind_existing => .bind_existing,
-            };
-            if (!definition_plan.requires(required_operator)) {
-                return error.CacheStoragePlanMismatch;
-            }
-            if ((effect.kind == .compare_append or
-                (effect.kind == .bind_existing and
-                    slot.kind == .event_log)) and
-                input.codec != .json)
-            {
-                return error.CacheStoragePlanMismatch;
-            }
-            if (effect.kind != .compare_append and
-                !(effect.kind == .bind_existing and
-                    slot.kind == .event_log) and
-                effect.document == null and input.codec != slot.codec)
-            {
-                return error.CacheStoragePlanMismatch;
-            }
-            if (effect.expected_revision_parameter) |name| {
-                const declaration =
-                    definition_plan.parameter_declarations.find(name) orelse
-                    return error.CacheStoragePlanMismatch;
-                if (declaration.kind != .digest) {
-                    return error.CacheStoragePlanMismatch;
-                }
-            }
-            if (effect.idempotency_parameter) |name| {
-                const declaration =
-                    definition_plan.parameter_declarations.find(name) orelse
-                    return error.CacheStoragePlanMismatch;
-                if (!definition_plan.requires(.idempotency_key) or
-                    declaration.kind != .safe_identifier)
-                {
-                    return error.CacheStoragePlanMismatch;
-                }
-            }
-            if (effect.event) |*event| {
-                if (effect.kind != .compare_append and
-                    effect.kind != .bind_existing)
-                {
-                    return error.CacheStoragePlanMismatch;
-                }
-                try validateCachedEventMaterialization(event);
-                validateEventMaterializationAgainstDefinition(
-                    event,
-                    definition_plan,
-                ) catch return error.CacheStoragePlanMismatch;
-                if (effect.idempotency_parameter != null and
-                    event.idempotency != null)
-                {
-                    return error.CacheStoragePlanMismatch;
-                }
-            }
-            if (effect.document) |*document_plan| {
-                if (slot.kind != .document or slot.codec != .text or
-                    (effect.kind != .create_new and
-                        effect.kind != .compare_replace) or
-                    effect.event != null)
-                {
-                    return error.CacheStoragePlanMismatch;
-                }
-                switch (document_plan.mode) {
-                    .template => if (effect.kind != .create_new) {
-                        return error.CacheStoragePlanMismatch;
-                    },
-                    .edit => if (effect.kind != .compare_replace) {
-                        return error.CacheStoragePlanMismatch;
-                    },
-                }
-                try document.validateCachePlan(
-                    document_plan,
-                    definition_plan,
-                );
-                if (document_plan.identity) |identity| {
-                    if (!slotPathUsesParameter(
-                        slot,
-                        document.pathOutputName(identity),
-                    )) {
-                        return error.CacheStoragePlanMismatch;
-                    }
-                }
-            }
+}
+
+fn validateCacheEffect(
+    slots: []const Slot,
+    effect: Effect,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (effect.input_index >= definition_plan.inputs.len) {
+        return error.CacheStoragePlanMismatch;
+    }
+    const slot = slots[effect.slot_index];
+    const input = definition_plan.inputs[effect.input_index];
+    const required_operator: definition.Operator = switch (effect.kind) {
+        .create_new => .create_new,
+        .compare_append => .compare_append,
+        .compare_replace => .compare_replace,
+        .bind_existing => .bind_existing,
+    };
+    if (!definition_plan.requires(required_operator)) {
+        return error.CacheStoragePlanMismatch;
+    }
+    try validateCacheEffectCodec(effect, slot, input);
+    try validateCacheEffectParameters(effect, definition_plan);
+    if (effect.event) |*event| {
+        try validateCacheEvent(effect, event, definition_plan);
+    }
+    if (effect.document) |*document_plan| {
+        try validateCacheDocument(
+            effect,
+            slot,
+            document_plan,
+            definition_plan,
+        );
+    }
+}
+
+fn validateCacheEffectCodec(
+    effect: Effect,
+    slot: Slot,
+    input: definition.Input,
+) !void {
+    const event_log_append = effect.kind == .compare_append or
+        (effect.kind == .bind_existing and slot.kind == .event_log);
+    if (event_log_append and input.codec != .json) {
+        return error.CacheStoragePlanMismatch;
+    }
+    if (!event_log_append and
+        effect.document == null and
+        input.codec != slot.codec)
+    {
+        return error.CacheStoragePlanMismatch;
+    }
+}
+
+fn validateCacheEffectParameters(
+    effect: Effect,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (effect.expected_revision_parameter) |name| {
+        const declaration =
+            definition_plan.parameter_declarations.find(name) orelse
+            return error.CacheStoragePlanMismatch;
+        if (declaration.kind != .digest) {
+            return error.CacheStoragePlanMismatch;
+        }
+    }
+    if (effect.idempotency_parameter) |name| {
+        const declaration =
+            definition_plan.parameter_declarations.find(name) orelse
+            return error.CacheStoragePlanMismatch;
+        if (!definition_plan.requires(.idempotency_key) or
+            declaration.kind != .safe_identifier)
+        {
+            return error.CacheStoragePlanMismatch;
+        }
+    }
+}
+
+fn validateCacheEvent(
+    effect: Effect,
+    event: *const EventMaterialization,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (effect.kind != .compare_append and
+        effect.kind != .bind_existing)
+    {
+        return error.CacheStoragePlanMismatch;
+    }
+    try validateCachedEventMaterialization(event);
+    validateEventMaterializationAgainstDefinition(
+        event,
+        definition_plan,
+    ) catch return error.CacheStoragePlanMismatch;
+    if (effect.idempotency_parameter != null and
+        event.idempotency != null)
+    {
+        return error.CacheStoragePlanMismatch;
+    }
+}
+
+fn validateCacheDocument(
+    effect: Effect,
+    slot: Slot,
+    document_plan: *const document.Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (slot.kind != .document or slot.codec != .text or
+        (effect.kind != .create_new and
+            effect.kind != .compare_replace) or
+        effect.event != null)
+    {
+        return error.CacheStoragePlanMismatch;
+    }
+    switch (document_plan.mode) {
+        .template => if (effect.kind != .create_new) {
+            return error.CacheStoragePlanMismatch;
+        },
+        .edit => if (effect.kind != .compare_replace) {
+            return error.CacheStoragePlanMismatch;
+        },
+    }
+    try document.validateCachePlan(document_plan, definition_plan);
+    if (document_plan.identity) |identity| {
+        if (!slotPathUsesParameter(
+            slot,
+            document.pathOutputName(identity),
+        )) {
+            return error.CacheStoragePlanMismatch;
         }
     }
 }
@@ -955,77 +1031,108 @@ fn decodeCacheSlots(
         allocator.free(slots);
     }
     for (slots, 0..) |*slot, index| {
-        const name = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(name);
-        try definition_core.json.safeIdentifier(name, 128);
+        var decoded = try decodeCacheSlot(
+            allocator,
+            decoder,
+            slots[0..index],
+        );
+        errdefer decoded.deinit(allocator);
         if (index != 0 and
-            std.mem.order(u8, slots[index - 1].name, name) != .lt)
+            std.mem.order(
+                u8,
+                slots[index - 1].name,
+                decoded.name,
+            ) != .lt)
         {
             return error.CacheStorageSlotsNotSorted;
         }
-        const relative_path = try decoder.readBytesAlloc(
-            allocator,
-            4096,
-        );
-        errdefer allocator.free(relative_path);
-        const segment_count = try decoder.readCount(128);
-        if (segment_count == 0) return error.InvalidStoragePathTemplate;
-        const path_segments = try allocator.alloc(
-            PathSegment,
-            segment_count,
-        );
-        var segment_initialized: usize = 0;
-        errdefer {
-            for (path_segments[0..segment_initialized]) |*segment| {
-                segment.deinit(allocator);
-            }
-            allocator.free(path_segments);
-        }
-        for (path_segments) |*segment| {
-            const kind = try decoder.readEnum(PathSegmentKind);
-            const text = try decoder.readBytesAlloc(
-                allocator,
-                if (kind == .parameter) 128 else 4096,
-            );
-            errdefer allocator.free(text);
-            try validatePathSegment(kind, text);
-            segment.* = .{ .kind = kind, .text = text };
-            segment_initialized += 1;
-        }
-        try validateEncodedPathTemplate(
-            allocator,
-            relative_path,
-            path_segments,
-        );
-        const kind = try decoder.readEnum(SlotKind);
-        const codec = try decoder.readEnum(definition.Codec);
-        if (kind == .event_log and codec != .jsonl) {
-            return error.EventLogSlotRequiresJsonl;
-        }
-        if (kind == .document and codec == .jsonl) {
-            return error.JsonlSlotRequiresEventLog;
-        }
-        const max_bytes = try decoder.readUsize();
-        if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
-            return error.StorageSlotBoundsExceeded;
-        }
-        for (slots[0..index]) |prior| {
-            if (std.ascii.eqlIgnoreCase(
-                prior.relative_path,
-                relative_path,
-            )) return error.StoragePathCaseAmbiguity;
-        }
-        slot.* = .{
-            .name = name,
-            .relative_path = relative_path,
-            .path_segments = path_segments,
-            .kind = kind,
-            .codec = codec,
-            .max_bytes = max_bytes,
-        };
+        slot.* = decoded;
         initialized += 1;
     }
     return slots;
+}
+
+fn decodeCacheSlot(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    prior_slots: []const Slot,
+) !Slot {
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    const relative_path = try decoder.readBytesAlloc(allocator, 4096);
+    errdefer allocator.free(relative_path);
+    const path_segments = try decodeCachePathSegments(allocator, decoder);
+    errdefer {
+        for (path_segments) |*segment| segment.deinit(allocator);
+        allocator.free(path_segments);
+    }
+    try validateEncodedPathTemplate(
+        allocator,
+        relative_path,
+        path_segments,
+    );
+    const kind = try decoder.readEnum(SlotKind);
+    const codec = try decoder.readEnum(definition.Codec);
+    try validateDecodedSlotCodec(kind, codec);
+    const max_bytes = try decoder.readUsize();
+    if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
+        return error.StorageSlotBoundsExceeded;
+    }
+    for (prior_slots) |prior| {
+        if (std.ascii.eqlIgnoreCase(
+            prior.relative_path,
+            relative_path,
+        )) return error.StoragePathCaseAmbiguity;
+    }
+    return .{
+        .name = name,
+        .relative_path = relative_path,
+        .path_segments = path_segments,
+        .kind = kind,
+        .codec = codec,
+        .max_bytes = max_bytes,
+    };
+}
+
+fn decodeCachePathSegments(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]PathSegment {
+    const count = try decoder.readCount(128);
+    if (count == 0) return error.InvalidStoragePathTemplate;
+    const segments = try allocator.alloc(PathSegment, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (segments[0..initialized]) |*segment| {
+            segment.deinit(allocator);
+        }
+        allocator.free(segments);
+    }
+    for (segments) |*segment| {
+        const kind = try decoder.readEnum(PathSegmentKind);
+        const text = try decoder.readBytesAlloc(
+            allocator,
+            if (kind == .parameter) 128 else 4096,
+        );
+        errdefer allocator.free(text);
+        try validatePathSegment(kind, text);
+        segment.* = .{ .kind = kind, .text = text };
+        initialized += 1;
+    }
+    return segments;
+}
+
+fn validateDecodedSlotCodec(
+    kind: SlotKind,
+    codec: definition.Codec,
+) !void {
+    if (kind == .event_log and codec != .jsonl) {
+        return error.EventLogSlotRequiresJsonl;
+    }
+    if (kind == .document and codec == .jsonl) {
+        return error.JsonlSlotRequiresEventLog;
+    }
 }
 
 fn decodeCacheOperations(
@@ -1043,110 +1150,162 @@ fn decodeCacheOperations(
         allocator.free(operations);
     }
     for (operations, 0..) |*operation, index| {
-        const name = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(name);
-        try definition_core.json.safeIdentifier(name, 128);
+        var decoded = try decodeCacheOperation(
+            allocator,
+            decoder,
+            slots,
+        );
+        errdefer decoded.deinit(allocator);
         if (index != 0 and
-            std.mem.order(u8, operations[index - 1].name, name) != .lt)
+            std.mem.order(
+                u8,
+                operations[index - 1].name,
+                decoded.name,
+            ) != .lt)
         {
             return error.CacheStorageOperationsNotSorted;
         }
-        const atomic = try decoder.readBool();
-        const effect_count = try decoder.readCount(64);
-        if (effect_count == 0) return error.InvalidOperationEffectCount;
-        const effects = try allocator.alloc(Effect, effect_count);
-        var effect_initialized: usize = 0;
-        errdefer {
-            for (effects[0..effect_initialized]) |*effect| {
-                effect.deinit(allocator);
-            }
-            allocator.free(effects);
-        }
-        for (effects) |*effect| {
-            const kind = try decoder.readEnum(EffectKind);
-            const slot_index = try decoder.readU16();
-            if (slot_index >= slots.len) return error.CacheStorageIndexInvalid;
-            const input_index = try decoder.readByte();
-            const expected_revision_parameter =
-                try decoder.readOptionalBytesAlloc(allocator, 128);
-            errdefer if (expected_revision_parameter) |value| {
-                allocator.free(value);
-            };
-            if (expected_revision_parameter) |value| {
-                try definition_core.json.safeIdentifier(value, 128);
-            }
-            const idempotency_parameter =
-                try decoder.readOptionalBytesAlloc(allocator, 128);
-            errdefer if (idempotency_parameter) |value| allocator.free(value);
-            if (idempotency_parameter) |value| {
-                try definition_core.json.safeIdentifier(value, 128);
-            }
-            var event = if (try decoder.readBool())
-                try decodeEventMaterialization(allocator, decoder)
-            else
-                null;
-            errdefer if (event) |*value| value.deinit(allocator);
-            var document_plan = if (try decoder.readBool())
-                try document.decodeCache(allocator, decoder)
-            else
-                null;
-            errdefer if (document_plan) |*value| value.deinit(allocator);
-            if (kind == .bind_existing and
-                (expected_revision_parameter != null or
-                    idempotency_parameter != null))
-            {
-                return error.BindingEffectHasAdmissionParameter;
-            }
-            if (event != null and kind != .compare_append and
-                kind != .bind_existing)
-            {
-                return error.EventMaterializationRequiresAppend;
-            }
-            if (idempotency_parameter != null and
-                event != null and event.?.idempotency != null)
-            {
-                return error.DuplicateIdempotencySource;
-            }
-            if (document_plan != null and event != null) {
-                return error.DuplicateEffectMaterialization;
-            }
-            if (document_plan) |value| {
-                if (slots[slot_index].kind != .document or
-                    slots[slot_index].codec != .text)
-                {
-                    return error.DocumentMaterializationRequiresTextSlot;
-                }
-                switch (value.mode) {
-                    .template => if (kind != .create_new) {
-                        return error.TemplateMaterializationRequiresCreate;
-                    },
-                    .edit => if (kind != .compare_replace) {
-                        return error.EditMaterializationRequiresReplace;
-                    },
-                }
-            }
-            effect.* = .{
-                .kind = kind,
-                .slot_index = slot_index,
-                .input_index = input_index,
-                .expected_revision_parameter = expected_revision_parameter,
-                .idempotency_parameter = idempotency_parameter,
-                .event = event,
-                .document = document_plan,
-            };
-            event = null;
-            document_plan = null;
-            effect_initialized += 1;
-        }
-        try validateCachedOperation(effects, atomic);
-        operation.* = .{
-            .name = name,
-            .atomic = atomic,
-            .effects = effects,
-        };
+        operation.* = decoded;
         initialized += 1;
     }
     return operations;
+}
+
+fn decodeCacheOperation(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    slots: []const Slot,
+) !Operation {
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    const atomic = try decoder.readBool();
+    const effects = try decodeCacheEffects(allocator, decoder, slots);
+    errdefer {
+        for (effects) |*effect| effect.deinit(allocator);
+        allocator.free(effects);
+    }
+    try validateCachedOperation(effects, atomic);
+    return .{
+        .name = name,
+        .atomic = atomic,
+        .effects = effects,
+    };
+}
+
+fn decodeCacheEffects(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    slots: []const Slot,
+) ![]Effect {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidOperationEffectCount;
+    const effects = try allocator.alloc(Effect, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (effects[0..initialized]) |*effect| effect.deinit(allocator);
+        allocator.free(effects);
+    }
+    for (effects) |*effect| {
+        effect.* = try decodeCacheEffect(allocator, decoder, slots);
+        initialized += 1;
+    }
+    return effects;
+}
+
+fn decodeCacheEffect(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    slots: []const Slot,
+) !Effect {
+    const kind = try decoder.readEnum(EffectKind);
+    const slot_index = try decoder.readU16();
+    if (slot_index >= slots.len) return error.CacheStorageIndexInvalid;
+    const input_index = try decoder.readByte();
+    const expected_revision_parameter =
+        try decoder.readOptionalBytesAlloc(allocator, 128);
+    errdefer if (expected_revision_parameter) |value| allocator.free(value);
+    if (expected_revision_parameter) |value| {
+        try definition_core.json.safeIdentifier(value, 128);
+    }
+    const idempotency_parameter =
+        try decoder.readOptionalBytesAlloc(allocator, 128);
+    errdefer if (idempotency_parameter) |value| allocator.free(value);
+    if (idempotency_parameter) |value| {
+        try definition_core.json.safeIdentifier(value, 128);
+    }
+    var event = if (try decoder.readBool())
+        try decodeEventMaterialization(allocator, decoder)
+    else
+        null;
+    errdefer if (event) |*value| value.deinit(allocator);
+    var document_plan = if (try decoder.readBool())
+        try document.decodeCache(allocator, decoder)
+    else
+        null;
+    errdefer if (document_plan) |*value| value.deinit(allocator);
+    try validateDecodedEffect(
+        kind,
+        slots[slot_index],
+        expected_revision_parameter,
+        idempotency_parameter,
+        event,
+        document_plan,
+    );
+    const result: Effect = .{
+        .kind = kind,
+        .slot_index = slot_index,
+        .input_index = input_index,
+        .expected_revision_parameter = expected_revision_parameter,
+        .idempotency_parameter = idempotency_parameter,
+        .event = event,
+        .document = document_plan,
+    };
+    event = null;
+    document_plan = null;
+    return result;
+}
+
+fn validateDecodedEffect(
+    kind: EffectKind,
+    slot: Slot,
+    expected_revision_parameter: ?[]const u8,
+    idempotency_parameter: ?[]const u8,
+    event: ?EventMaterialization,
+    document_plan: ?document.Plan,
+) !void {
+    if (kind == .bind_existing and
+        (expected_revision_parameter != null or
+            idempotency_parameter != null))
+    {
+        return error.BindingEffectHasAdmissionParameter;
+    }
+    if (event != null and kind != .compare_append and
+        kind != .bind_existing)
+    {
+        return error.EventMaterializationRequiresAppend;
+    }
+    if (idempotency_parameter != null and
+        event != null and event.?.idempotency != null)
+    {
+        return error.DuplicateIdempotencySource;
+    }
+    if (document_plan != null and event != null) {
+        return error.DuplicateEffectMaterialization;
+    }
+    if (document_plan) |value| {
+        if (slot.kind != .document or slot.codec != .text) {
+            return error.DocumentMaterializationRequiresTextSlot;
+        }
+        switch (value.mode) {
+            .template => if (kind != .create_new) {
+                return error.TemplateMaterializationRequiresCreate;
+            },
+            .edit => if (kind != .compare_replace) {
+                return error.EditMaterializationRequiresReplace;
+            },
+        }
+    }
 }
 
 fn decodeEventMaterialization(
@@ -1172,95 +1331,13 @@ fn decodeEventMaterialization(
     const object_orders = try decodeEventObjectOrders(allocator, decoder);
     errdefer deinitEventObjectOrders(allocator, object_orders);
     const escape_non_ascii = try decoder.readBool();
-    const field_count = try decoder.readCount(64);
-    if (field_count == 0) return error.InvalidEventMaterializationFields;
-    const fields = try allocator.alloc(EventField, field_count);
-    var initialized: usize = 0;
+    const fields = try decodeEventFields(allocator, decoder);
     errdefer {
-        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        for (fields) |*field| field.deinit(allocator);
         allocator.free(fields);
     }
-    for (fields, 0..) |*field, index| {
-        const name = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(name);
-        try definition_core.json.safeIdentifier(name, 128);
-        if (index != 0 and
-            std.mem.order(u8, fields[index - 1].field, name) != .lt)
-        {
-            return error.EventMaterializationFieldsNotSorted;
-        }
-        const source_tag = try decoder.readEnum(
-            std.meta.Tag(EventFieldSource),
-        );
-        var source: ?EventFieldSource = switch (source_tag) {
-            .input_field => .{ .input_field = try decoder.readBytesAlloc(allocator, 128) },
-            .literal => .{ .literal = try decoder.readBytesAlloc(allocator, 4096) },
-            .sequence_text_prefix => .{ .sequence_text_prefix = try decoder.readBytesAlloc(allocator, 128) },
-            .unix_seconds => .unix_seconds,
-            .derived => .{ .derived = try decoder.readBytesAlloc(allocator, 128) },
-        };
-        errdefer if (source) |*value| value.deinit(allocator);
-        switch (source.?) {
-            .input_field => |value| {
-                try definition_core.json.safeIdentifier(value, 128);
-            },
-            .literal => |value| try validateCanonicalScalar(allocator, value),
-            .sequence_text_prefix => |value| {
-                if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
-                    return error.InvalidEventSequencePrefix;
-                }
-            },
-            .unix_seconds => {},
-            .derived => |value| {
-                try definition_core.json.safeIdentifier(value, 128);
-            },
-        }
-        field.* = .{ .field = name, .source = source.? };
-        source = null;
-        initialized += 1;
-    }
-    const request_literals = try decodeRequestLiterals(
-        allocator,
-        decoder,
-    );
-    errdefer deinitRequestLiterals(allocator, request_literals);
-    const generate = try decodeSecureTokenGenerations(
-        allocator,
-        decoder,
-    );
-    errdefer deinitSecureTokenGenerations(allocator, generate);
-    const derive = try decodeEventDerivations(
-        allocator,
-        decoder,
-        generate,
-    );
-    errdefer deinitEventDerivations(allocator, derive);
-    var idempotency = if (try decoder.readBool()) EventIdempotency{
-        .derived = try decoder.readBytesAlloc(allocator, 128),
-        .bypass_parameter = null,
-    } else null;
-    errdefer if (idempotency) |*item| item.deinit(allocator);
-    if (idempotency) |*item| {
-        try definition_core.json.safeIdentifier(item.derived, 128);
-        item.bypass_parameter = try decoder.readOptionalBytesAlloc(
-            allocator,
-            128,
-        );
-        if (item.bypass_parameter) |name| {
-            try definition_core.json.safeIdentifier(name, 128);
-        }
-    }
-    const body_fields = try decodeEventBodyFields(
-        allocator,
-        decoder,
-    );
-    errdefer deinitEventBodyFields(allocator, body_fields);
-    const forbidden_parameters = try decodeSortedNames(
-        allocator,
-        decoder,
-        64,
-    );
-    errdefer deinitNames(allocator, forbidden_parameters);
+    var extensions = try decodeEventExtensions(allocator, decoder);
+    errdefer extensions.deinit(allocator);
     const result: EventMaterialization = .{
         .mode = mode,
         .body_input_field = body_input_field,
@@ -1269,6 +1346,147 @@ fn decodeEventMaterialization(
         .object_orders = object_orders,
         .escape_non_ascii = escape_non_ascii,
         .fields = fields,
+        .request_literals = extensions.request_literals,
+        .generate = extensions.generate,
+        .derive = extensions.derive,
+        .idempotency = extensions.idempotency,
+        .body_fields = extensions.body_fields,
+        .forbidden_parameters = extensions.forbidden_parameters,
+    };
+    try validateEventMaterialization(allocator, &result);
+    return result;
+}
+
+fn decodeEventFields(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]EventField {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidEventMaterializationFields;
+    const fields = try allocator.alloc(EventField, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (fields, 0..) |*field, index| {
+        var decoded = try decodeEventField(allocator, decoder);
+        errdefer decoded.deinit(allocator);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                fields[index - 1].field,
+                decoded.field,
+            ) != .lt)
+        {
+            return error.EventMaterializationFieldsNotSorted;
+        }
+        field.* = decoded;
+        initialized += 1;
+    }
+    return fields;
+}
+
+fn decodeEventField(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventField {
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    const source_tag = try decoder.readEnum(
+        std.meta.Tag(EventFieldSource),
+    );
+    var source: ?EventFieldSource = try decodeEventFieldSource(
+        allocator,
+        decoder,
+        source_tag,
+    );
+    errdefer if (source) |*value| value.deinit(allocator);
+    try validateDecodedEventFieldSource(allocator, source.?);
+    const result: EventField = .{ .field = name, .source = source.? };
+    source = null;
+    return result;
+}
+
+fn decodeEventFieldSource(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    tag: std.meta.Tag(EventFieldSource),
+) !EventFieldSource {
+    if (tag == .unix_seconds) return .unix_seconds;
+    const max_bytes: usize = if (tag == .literal) 4096 else 128;
+    const value = try decoder.readBytesAlloc(allocator, max_bytes);
+    return switch (tag) {
+        .input_field => .{ .input_field = value },
+        .literal => .{ .literal = value },
+        .sequence_text_prefix => .{ .sequence_text_prefix = value },
+        .derived => .{ .derived = value },
+        .unix_seconds => unreachable,
+    };
+}
+
+fn validateDecodedEventFieldSource(
+    allocator: std.mem.Allocator,
+    source: EventFieldSource,
+) !void {
+    switch (source) {
+        .input_field, .derived => |value| {
+            try definition_core.json.safeIdentifier(value, 128);
+        },
+        .literal => |value| try validateCanonicalScalar(allocator, value),
+        .sequence_text_prefix => |value| {
+            if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
+                return error.InvalidEventSequencePrefix;
+            }
+        },
+        .unix_seconds => {},
+    }
+}
+
+const EventExtensions = struct {
+    request_literals: []RequestLiteral,
+    generate: []SecureTokenGeneration,
+    derive: []EventDerivation,
+    idempotency: ?EventIdempotency,
+    body_fields: []EventBodyField,
+    forbidden_parameters: [][]u8,
+
+    fn deinit(
+        self: *EventExtensions,
+        allocator: std.mem.Allocator,
+    ) void {
+        deinitRequestLiterals(allocator, self.request_literals);
+        deinitSecureTokenGenerations(allocator, self.generate);
+        deinitEventDerivations(allocator, self.derive);
+        if (self.idempotency) |*item| item.deinit(allocator);
+        deinitEventBodyFields(allocator, self.body_fields);
+        deinitNames(allocator, self.forbidden_parameters);
+        self.* = undefined;
+    }
+};
+
+fn decodeEventExtensions(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventExtensions {
+    const request_literals = try decodeRequestLiterals(allocator, decoder);
+    errdefer deinitRequestLiterals(allocator, request_literals);
+    const generate = try decodeSecureTokenGenerations(allocator, decoder);
+    errdefer deinitSecureTokenGenerations(allocator, generate);
+    const derive = try decodeEventDerivations(allocator, decoder, generate);
+    errdefer deinitEventDerivations(allocator, derive);
+    var idempotency = try decodeEventIdempotency(allocator, decoder);
+    errdefer if (idempotency) |*item| item.deinit(allocator);
+    const body_fields = try decodeEventBodyFields(allocator, decoder);
+    errdefer deinitEventBodyFields(allocator, body_fields);
+    const forbidden_parameters = try decodeSortedNames(
+        allocator,
+        decoder,
+        64,
+    );
+    errdefer deinitNames(allocator, forbidden_parameters);
+    return .{
         .request_literals = request_literals,
         .generate = generate,
         .derive = derive,
@@ -1276,8 +1494,26 @@ fn decodeEventMaterialization(
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
-    try validateEventMaterialization(allocator, &result);
-    idempotency = null;
+}
+
+fn decodeEventIdempotency(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !?EventIdempotency {
+    if (!try decoder.readBool()) return null;
+    var result: EventIdempotency = .{
+        .derived = try decoder.readBytesAlloc(allocator, 128),
+        .bypass_parameter = null,
+    };
+    errdefer result.deinit(allocator);
+    try definition_core.json.safeIdentifier(result.derived, 128);
+    result.bypass_parameter = try decoder.readOptionalBytesAlloc(
+        allocator,
+        128,
+    );
+    if (result.bypass_parameter) |name| {
+        try definition_core.json.safeIdentifier(name, 128);
+    }
     return result;
 }
 
@@ -1400,81 +1636,103 @@ fn decodeEventDerivations(
         allocator.free(items);
     }
     for (items, 0..) |*item, index| {
-        var name: ?[]u8 = try decoder.readBytesAlloc(allocator, 128);
-        errdefer if (name) |value| allocator.free(value);
-        try definition_core.json.safeIdentifier(name.?, 128);
-        var source: ?EventDerivationSource = switch (try decoder.readEnum(
-            std.meta.Tag(EventDerivationSource),
-        )) {
-            .input_text => .{ .input_text = try decodeEventPointer(
-                allocator,
-                decoder,
-            ) },
-            .utc_timestamp => .{ .utc_timestamp = try decoder.readEnum(
-                EventTimestampFormat,
-            ) },
-            .sha1 => .{ .sha1 = .{
-                .encoding = try decoder.readEnum(EventDigestEncoding),
-                .max_bytes = try decoder.readUsize(),
-                .prefix_bytes = if (try decoder.readBool())
-                    try decoder.readU16()
-                else
-                    null,
-                .fragments = try decodeEventDerivationFragments(
-                    allocator,
-                    decoder,
-                ),
-            } },
-            .sha256 => .{ .sha256 = .{
-                .encoding = try decoder.readEnum(EventDigestEncoding),
-                .max_bytes = try decoder.readUsize(),
-                .prefix_bytes = if (try decoder.readBool())
-                    try decoder.readU16()
-                else
-                    null,
-                .fragments = try decodeEventDerivationFragments(
-                    allocator,
-                    decoder,
-                ),
-            } },
-            .concat => .{ .concat = .{
-                .max_bytes = try decoder.readUsize(),
-                .fragments = try decodeEventDerivationFragments(
-                    allocator,
-                    decoder,
-                ),
-            } },
-            .monotonic_identity => .{ .monotonic_identity = .{
-                .prefix = try decoder.readBytesAlloc(allocator, 64),
-                .width = try decoder.readByte(),
-            } },
-        };
-        errdefer if (source) |*value| value.deinit(allocator);
-        const candidate: EventDerivation = .{
-            .name = name.?,
-            .source = source.?,
-        };
-        try validateEventDerivation(&candidate);
-        for (generate) |generated| {
-            if (std.mem.eql(u8, generated.name, candidate.name)) {
-                return error.DuplicateEventGeneration;
-            }
-        }
-        for (items[0..index]) |prior| {
-            if (std.mem.eql(u8, prior.name, candidate.name)) {
-                return error.DuplicateEventGeneration;
-            }
-        }
-        try validateEventDerivationReferences(
+        var candidate = try decodeEventDerivation(allocator, decoder);
+        errdefer candidate.deinit(allocator);
+        try validateDecodedEventDerivation(
             &candidate,
+            generate,
             items[0..index],
         );
         item.* = candidate;
-        name = null;
-        source = null;
         initialized += 1;
     }
     return items;
+}
+
+fn decodeEventDerivation(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventDerivation {
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    var source = try decodeEventDerivationSource(allocator, decoder);
+    errdefer source.deinit(allocator);
+    const result: EventDerivation = .{ .name = name, .source = source };
+    try validateEventDerivation(&result);
+    return result;
+}
+
+fn decodeEventDerivationSource(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventDerivationSource {
+    return switch (try decoder.readEnum(
+        std.meta.Tag(EventDerivationSource),
+    )) {
+        .input_text => .{ .input_text = try decodeEventPointer(
+            allocator,
+            decoder,
+        ) },
+        .utc_timestamp => .{ .utc_timestamp = try decoder.readEnum(
+            EventTimestampFormat,
+        ) },
+        .sha1 => .{ .sha1 = try decodeEventDigestDerivation(
+            allocator,
+            decoder,
+        ) },
+        .sha256 => .{ .sha256 = try decodeEventDigestDerivation(
+            allocator,
+            decoder,
+        ) },
+        .concat => .{ .concat = .{
+            .max_bytes = try decoder.readUsize(),
+            .fragments = try decodeEventDerivationFragments(
+                allocator,
+                decoder,
+            ),
+        } },
+        .monotonic_identity => .{ .monotonic_identity = .{
+            .prefix = try decoder.readBytesAlloc(allocator, 64),
+            .width = try decoder.readByte(),
+        } },
+    };
+}
+
+fn decodeEventDigestDerivation(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EventDigestDerivation {
+    return .{
+        .encoding = try decoder.readEnum(EventDigestEncoding),
+        .max_bytes = try decoder.readUsize(),
+        .prefix_bytes = if (try decoder.readBool())
+            try decoder.readU16()
+        else
+            null,
+        .fragments = try decodeEventDerivationFragments(
+            allocator,
+            decoder,
+        ),
+    };
+}
+
+fn validateDecodedEventDerivation(
+    candidate: *const EventDerivation,
+    generate: []const SecureTokenGeneration,
+    prior: []const EventDerivation,
+) !void {
+    for (generate) |generated| {
+        if (std.mem.eql(u8, generated.name, candidate.name)) {
+            return error.DuplicateEventGeneration;
+        }
+    }
+    for (prior) |item| {
+        if (std.mem.eql(u8, item.name, candidate.name)) {
+            return error.DuplicateEventGeneration;
+        }
+    }
+    try validateEventDerivationReferences(candidate, prior);
 }
 
 fn decodeEventPointer(
@@ -1566,14 +1824,12 @@ fn decodeEventBodyFields(
         const source_tag = try decoder.readEnum(
             std.meta.Tag(EventBodyFieldSource),
         );
-        var source: ?EventBodyFieldSource = switch (source_tag) {
-            .generated_sha256 => .{ .generated_sha256 = try decoder.readBytesAlloc(allocator, 128) },
-            .parameter_sha256 => .{ .parameter_sha256 = try decodeParameterSha256Source(allocator, decoder) },
-            .state_value => .{ .state_value = try decodeStateValueSource(allocator, decoder) },
-            .request_input => .{ .request_input = try decoder.readBytesAlloc(allocator, 128) },
-            .literal_mapping => .{ .literal_mapping = try decodeLiteralMappingSource(allocator, decoder) },
-            .derived => .{ .derived = try decoder.readBytesAlloc(allocator, 128) },
-        };
+        var source: ?EventBodyFieldSource =
+            try decodeEventBodyFieldSource(
+                allocator,
+                decoder,
+                source_tag,
+            );
         errdefer if (source) |*value| value.deinit(allocator);
         const candidate: EventBodyField = .{
             .field = name.?,
@@ -1595,6 +1851,33 @@ fn decodeEventBodyFields(
         initialized += 1;
     }
     return fields;
+}
+
+fn decodeEventBodyFieldSource(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    tag: std.meta.Tag(EventBodyFieldSource),
+) !EventBodyFieldSource {
+    return switch (tag) {
+        .generated_sha256 => .{ .generated_sha256 = try decoder.readBytesAlloc(allocator, 128) },
+        .parameter_sha256 => blk: {
+            const value = try decodeParameterSha256Source(
+                allocator,
+                decoder,
+            );
+            break :blk .{ .parameter_sha256 = value };
+        },
+        .state_value => .{ .state_value = try decodeStateValueSource(allocator, decoder) },
+        .request_input => .{ .request_input = try decoder.readBytesAlloc(allocator, 128) },
+        .literal_mapping => blk: {
+            const value = try decodeLiteralMappingSource(
+                allocator,
+                decoder,
+            );
+            break :blk .{ .literal_mapping = value };
+        },
+        .derived => .{ .derived = try decoder.readBytesAlloc(allocator, 128) },
+    };
 }
 
 fn decodeLiteralMappingSource(
@@ -1779,76 +2062,92 @@ fn compileSlots(
     }
     var iterator = slot_map.iterator();
     while (iterator.next()) |entry| {
-        try definition_core.json.safeIdentifier(entry.key_ptr.*, 128);
-        const slot = try definition_core.json.object(entry.value_ptr.*);
-        try definition_core.json.requireExactKeys(slot, &.{
-            "path",
-            "kind",
-            "codec",
-            "max_bytes",
-        });
-        try definition_core.json.requireFields(slot, &.{
-            "path",
-            "codec",
-            "max_bytes",
-        });
-        const relative_path = try definition_core.json.requiredString(
-            slot,
-            "path",
-        );
-        const path_segments = try compilePathSegments(
+        const slot = try compileSlot(
             allocator,
             definition_plan,
-            relative_path,
+            entry.key_ptr.*,
+            entry.value_ptr.*,
         );
-        errdefer deinitPathSegments(allocator, path_segments);
-        const codec = try definition.Codec.parse(
-            try definition_core.json.requiredString(slot, "codec"),
-        );
-        const kind: SlotKind = if (slot.get("kind")) |raw|
-            try SlotKind.parse(try definition_core.json.string(raw))
-        else if (codec == .jsonl)
-            .event_log
-        else
-            .document;
-        if (kind == .event_log and codec != .jsonl) {
-            return error.EventLogSlotRequiresJsonl;
+        errdefer {
+            var owned = slot;
+            owned.deinit(allocator);
         }
-        if (kind == .document and codec == .jsonl) {
-            return error.JsonlSlotRequiresEventLog;
-        }
-        const max_bytes = try definition_core.json.unsigned(
-            try definition_core.json.field(slot, "max_bytes"),
-        );
-        if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
-            return error.StorageSlotBoundsExceeded;
-        }
-        const owned_name = try allocator.dupe(u8, entry.key_ptr.*);
-        errdefer allocator.free(owned_name);
-        const owned_path = try allocator.dupe(u8, relative_path);
-        errdefer allocator.free(owned_path);
-        try slots.append(allocator, .{
-            .name = owned_name,
-            .relative_path = owned_path,
-            .path_segments = path_segments,
-            .kind = kind,
-            .codec = codec,
-            .max_bytes = max_bytes,
-        });
+        try slots.append(allocator, slot);
     }
     std.sort.heap(Slot, slots.items, {}, struct {
         fn lessThan(_: void, left: Slot, right: Slot) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
     }.lessThan);
-    for (slots.items, 0..) |left, index| {
-        for (slots.items[index + 1 ..]) |right| {
-            if (std.ascii.eqlIgnoreCase(left.relative_path, right.relative_path)) {
-                return error.StoragePathCaseAmbiguity;
-            }
+    try validateSlotPathAmbiguity(slots.items);
+    return slots.toOwnedSlice(allocator);
+}
+
+fn compileSlot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    name: []const u8,
+    raw: std.json.Value,
+) !Slot {
+    try definition_core.json.safeIdentifier(name, 128);
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "path", "kind", "codec", "max_bytes" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "path", "codec", "max_bytes" },
+    );
+    const relative_path = try definition_core.json.requiredString(
+        object,
+        "path",
+    );
+    const path_segments = try compilePathSegments(
+        allocator,
+        definition_plan,
+        relative_path,
+    );
+    errdefer deinitPathSegments(allocator, path_segments);
+    const codec = try definition.Codec.parse(
+        try definition_core.json.requiredString(object, "codec"),
+    );
+    const kind: SlotKind = if (object.get("kind")) |value|
+        try SlotKind.parse(try definition_core.json.string(value))
+    else if (codec == .jsonl)
+        .event_log
+    else
+        .document;
+    try validateDecodedSlotCodec(kind, codec);
+    const max_bytes = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_bytes"),
+    );
+    if (max_bytes == 0 or max_bytes > 4 * 1024 * 1024 * 1024) {
+        return error.StorageSlotBoundsExceeded;
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_path = try allocator.dupe(u8, relative_path);
+    errdefer allocator.free(owned_path);
+    return .{
+        .name = owned_name,
+        .relative_path = owned_path,
+        .path_segments = path_segments,
+        .kind = kind,
+        .codec = codec,
+        .max_bytes = max_bytes,
+    };
+}
+
+fn validateSlotPathAmbiguity(slots: []const Slot) !void {
+    for (slots, 0..) |left, index| {
+        for (slots[index + 1 ..]) |right| {
+            if (std.ascii.eqlIgnoreCase(
+                left.relative_path,
+                right.relative_path,
+            )) return error.StoragePathCaseAmbiguity;
         }
     }
-    return slots.toOwnedSlice(allocator);
 }
 
 fn compileOperations(
@@ -1866,73 +2165,106 @@ fn compileOperations(
         operations.deinit(allocator);
     }
     for (definition_plan.operations) |source| {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
+        const operation = try compileOperation(
             allocator,
-            source.canonical_config,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
+            definition_plan,
+            slots,
+            source,
         );
-        defer parsed.deinit();
-        const object = try definition_core.json.object(parsed.value);
-        try definition_core.json.requireExactKeys(object, &.{ "op", "effects" });
-        const atomic = if (object.get("op")) |raw_operator| blk: {
-            const operator = try definition.Operator.parse(
-                try definition_core.json.string(raw_operator),
-            );
-            if (operator != .atomic_transaction) return error.UnsupportedOperationRoot;
-            if (!definition_plan.requires(operator)) {
-                return error.UndeclaredArtifactOperator;
-            }
-            break :blk true;
-        } else false;
-        const effects_value = object.get("effects") orelse return error.MissingOperationEffects;
-        const effect_values = try definition_core.json.array(effects_value);
-        if (effect_values.items.len == 0 or effect_values.items.len > 64) {
-            return error.InvalidOperationEffectCount;
-        }
-        const effects = try allocator.alloc(Effect, effect_values.items.len);
-        var initialized: usize = 0;
         errdefer {
-            for (effects[0..initialized]) |*effect| effect.deinit(allocator);
-            allocator.free(effects);
+            var owned = operation;
+            owned.deinit(allocator);
         }
-        for (effect_values.items, 0..) |raw_effect, index| {
-            effects[index] = try compileEffect(
-                allocator,
-                definition_plan,
-                slots,
-                raw_effect,
-            );
-            initialized += 1;
-        }
-        for (effects, 0..) |left, index| {
-            for (effects[index + 1 ..]) |right| {
-                if (left.slot_index == right.slot_index) {
-                    return error.DuplicateOperationSlot;
-                }
-            }
-        }
-        var binding_effects: usize = 0;
-        for (effects) |effect| if (effect.kind == .bind_existing) {
-            binding_effects += 1;
-        };
-        if (binding_effects != 0 and binding_effects != effects.len) {
-            return error.BindingOperationCannotMixEffects;
-        }
-        if (!atomic and effects.len > 1) return error.MultiEffectOperationMustBeAtomic;
-        try validateGeneratedOutputNames(effects);
-        const owned_name = try allocator.dupe(u8, source.name);
-        errdefer allocator.free(owned_name);
-        try operations.append(allocator, .{
-            .name = owned_name,
-            .atomic = atomic,
-            .effects = effects,
-        });
+        try operations.append(allocator, operation);
     }
     return operations.toOwnedSlice(allocator);
+}
+
+fn compileOperation(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slots: []const Slot,
+    source: definition.NamedPlan,
+) !Operation {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source.canonical_config,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const object = try definition_core.json.object(parsed.value);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "effects" },
+    );
+    const atomic = try compileOperationAtomic(definition_plan, object);
+    const effects = try compileOperationEffects(
+        allocator,
+        definition_plan,
+        slots,
+        object,
+    );
+    errdefer {
+        for (effects) |*effect| effect.deinit(allocator);
+        allocator.free(effects);
+    }
+    try validateCachedOperation(effects, atomic);
+    return .{
+        .name = try allocator.dupe(u8, source.name),
+        .atomic = atomic,
+        .effects = effects,
+    };
+}
+
+fn compileOperationAtomic(
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !bool {
+    const raw = object.get("op") orelse return false;
+    const operator = try definition.Operator.parse(
+        try definition_core.json.string(raw),
+    );
+    if (operator != .atomic_transaction) {
+        return error.UnsupportedOperationRoot;
+    }
+    if (!definition_plan.requires(operator)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    return true;
+}
+
+fn compileOperationEffects(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slots: []const Slot,
+    object: std.json.ObjectMap,
+) ![]Effect {
+    const raw = object.get("effects") orelse
+        return error.MissingOperationEffects;
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidOperationEffectCount;
+    }
+    const effects = try allocator.alloc(Effect, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (effects[0..initialized]) |*effect| effect.deinit(allocator);
+        allocator.free(effects);
+    }
+    for (values.items, 0..) |value, index| {
+        effects[index] = try compileEffect(
+            allocator,
+            definition_plan,
+            slots,
+            value,
+        );
+        initialized += 1;
+    }
+    return effects;
 }
 
 fn validateGeneratedOutputNames(effects: []const Effect) !void {
@@ -1978,6 +2310,12 @@ fn appendGeneratedOutputName(
     count.* += 1;
 }
 
+const EffectTarget = struct {
+    kind: EffectKind,
+    slot_index: usize,
+    input_index: usize,
+};
+
 fn compileEffect(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -1996,6 +2334,62 @@ fn compileEffect(
         "document",
     });
     try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
+    const target = try compileEffectTarget(
+        definition_plan,
+        slots,
+        object,
+    );
+    const expected_revision_parameter = try optionalParameterName(
+        allocator,
+        definition_plan,
+        object,
+        "expected_revision_param",
+    );
+    errdefer if (expected_revision_parameter) |name| allocator.free(name);
+    const idempotency_parameter = try optionalParameterName(
+        allocator,
+        definition_plan,
+        object,
+        "idempotency_param",
+    );
+    errdefer if (idempotency_parameter) |name| allocator.free(name);
+    var event = try compileEffectEvent(
+        allocator,
+        definition_plan,
+        object,
+    );
+    errdefer if (event) |*value| value.deinit(allocator);
+    var document_plan = try compileEffectDocument(
+        allocator,
+        definition_plan,
+        slots[target.slot_index],
+        target.kind,
+        object,
+    );
+    errdefer if (document_plan) |*value| value.deinit(allocator);
+    try validateCompiledEffectSources(
+        target.kind,
+        expected_revision_parameter,
+        idempotency_parameter,
+        event,
+        document_plan,
+    );
+    return .{
+        .kind = target.kind,
+        .slot_index = @intCast(target.slot_index),
+        .input_index = @intCast(target.input_index),
+        .expected_revision_parameter = expected_revision_parameter,
+        .idempotency_parameter = idempotency_parameter,
+        .event = event,
+        .document = document_plan,
+    };
+}
+
+fn compileEffectTarget(
+    definition_plan: *const definition.Plan,
+    slots: []const Slot,
+    object: std.json.ObjectMap,
+) !EffectTarget {
     const operator = try definition.Operator.parse(
         try definition_core.json.requiredString(object, "op"),
     );
@@ -2013,10 +2407,9 @@ fn compileEffect(
         return error.AppendRequiresEventLogSlot;
     }
     const input_codec = definition_plan.inputs[input_index].codec;
-    if ((kind == .compare_append or
-        (kind == .bind_existing and slots[slot_index].kind == .event_log)) and
-        input_codec != .json)
-    {
+    const event_log_append = kind == .compare_append or
+        (kind == .bind_existing and slots[slot_index].kind == .event_log);
+    if (event_log_append and input_codec != .json) {
         return error.AppendInputMustBeJson;
     }
     if (kind != .compare_append and object.get("document") == null and
@@ -2025,48 +2418,95 @@ fn compileEffect(
     {
         return error.StorageInputCodecMismatch;
     }
-    const expected_revision_parameter = try optionalParameterName(
-        allocator,
-        definition_plan,
-        object,
-        "expected_revision_param",
-    );
-    errdefer if (expected_revision_parameter) |name| allocator.free(name);
-    const idempotency_parameter = try optionalParameterName(
-        allocator,
-        definition_plan,
-        object,
-        "idempotency_param",
-    );
-    errdefer if (idempotency_parameter) |name| allocator.free(name);
-    if (kind == .bind_existing and
-        (expected_revision_parameter != null or idempotency_parameter != null))
-    {
-        return error.BindingEffectHasAdmissionParameter;
-    }
+    return .{
+        .kind = kind,
+        .slot_index = slot_index,
+        .input_index = input_index,
+    };
+}
+
+fn compileEffectEvent(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !?EventMaterialization {
     if (object.get("event") != null and
         object.get("event_from_operation") != null)
     {
         return error.DuplicateEventMaterializationSource;
     }
-    var event = if (object.get("event")) |raw_event|
-        try compileEventMaterialization(
+    if (object.get("event")) |raw_event| {
+        return @as(?EventMaterialization, try compileEventMaterialization(
             allocator,
             definition_plan,
             raw_event,
-        )
-    else if (object.get("event_from_operation")) |raw_operation|
-        try compileReferencedEventMaterialization(
-            allocator,
-            definition_plan,
-            try definition_core.json.string(raw_operation),
-            try definition_core.json.requiredString(object, "slot"),
-            try definition_core.json.requiredString(object, "input"),
-        )
-    else
-        null;
-    errdefer if (event) |*value| value.deinit(allocator);
-    if (event != null and kind != .compare_append and kind != .bind_existing) {
+        ));
+    }
+    if (object.get("event_from_operation")) |raw_operation| {
+        return @as(
+            ?EventMaterialization,
+            try compileReferencedEventMaterialization(
+                allocator,
+                definition_plan,
+                try definition_core.json.string(raw_operation),
+                try definition_core.json.requiredString(object, "slot"),
+                try definition_core.json.requiredString(object, "input"),
+            ),
+        );
+    }
+    return null;
+}
+
+fn compileEffectDocument(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: Slot,
+    kind: EffectKind,
+    object: std.json.ObjectMap,
+) !?document.Plan {
+    const raw = object.get("document") orelse return null;
+    var document_plan = try document.compile(
+        allocator,
+        definition_plan,
+        raw,
+    );
+    errdefer document_plan.deinit(allocator);
+    if (slot.kind != .document or slot.codec != .text) {
+        return error.DocumentMaterializationRequiresTextSlot;
+    }
+    switch (document_plan.mode) {
+        .template => if (kind != .create_new) {
+            return error.TemplateMaterializationRequiresCreate;
+        },
+        .edit => if (kind != .compare_replace) {
+            return error.EditMaterializationRequiresReplace;
+        },
+    }
+    if (document_plan.identity) |identity| {
+        if (!slotPathUsesParameter(
+            slot,
+            document.pathOutputName(identity),
+        )) return error.GeneratedIdentityMustAddressSlot;
+    }
+    return document_plan;
+}
+
+fn validateCompiledEffectSources(
+    kind: EffectKind,
+    expected_revision_parameter: ?[]const u8,
+    idempotency_parameter: ?[]const u8,
+    event: ?EventMaterialization,
+    document_plan: ?document.Plan,
+) !void {
+    if (kind == .bind_existing and
+        (expected_revision_parameter != null or
+            idempotency_parameter != null))
+    {
+        return error.BindingEffectHasAdmissionParameter;
+    }
+    if (event != null and kind != .compare_append and
+        kind != .bind_existing)
+    {
         return error.EventMaterializationRequiresAppend;
     }
     if (idempotency_parameter != null and
@@ -2074,44 +2514,9 @@ fn compileEffect(
     {
         return error.DuplicateIdempotencySource;
     }
-    var document_plan = if (object.get("document")) |raw_document|
-        try document.compile(allocator, definition_plan, raw_document)
-    else
-        null;
-    errdefer if (document_plan) |*value| value.deinit(allocator);
     if (document_plan != null and event != null) {
         return error.DuplicateEffectMaterialization;
     }
-    if (document_plan) |value| {
-        if (slots[slot_index].kind != .document or
-            slots[slot_index].codec != .text)
-        {
-            return error.DocumentMaterializationRequiresTextSlot;
-        }
-        switch (value.mode) {
-            .template => if (kind != .create_new) {
-                return error.TemplateMaterializationRequiresCreate;
-            },
-            .edit => if (kind != .compare_replace) {
-                return error.EditMaterializationRequiresReplace;
-            },
-        }
-        if (value.identity) |identity| {
-            if (!slotPathUsesParameter(
-                slots[slot_index],
-                document.pathOutputName(identity),
-            )) return error.GeneratedIdentityMustAddressSlot;
-        }
-    }
-    return .{
-        .kind = kind,
-        .slot_index = @intCast(slot_index),
-        .input_index = @intCast(input_index),
-        .expected_revision_parameter = expected_revision_parameter,
-        .idempotency_parameter = idempotency_parameter,
-        .event = event,
-        .document = document_plan,
-    };
 }
 
 fn slotPathUsesParameter(slot: Slot, name: []const u8) bool {
@@ -2180,6 +2585,29 @@ fn compileReferencedEventMaterialization(
     );
 }
 
+const EventMaterializationLayout = struct {
+    mode: EventMaterializationMode,
+    body_input_field: []u8,
+    field_order: [][]u8,
+    body_order: [][]u8,
+    object_orders: []EventObjectOrder,
+    escape_non_ascii: bool,
+    fields: []EventField,
+
+    fn deinit(
+        self: *EventMaterializationLayout,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.body_input_field);
+        deinitNames(allocator, self.field_order);
+        deinitNames(allocator, self.body_order);
+        deinitEventObjectOrders(allocator, self.object_orders);
+        for (self.fields) |*field| field.deinit(allocator);
+        allocator.free(self.fields);
+        self.* = undefined;
+    }
+};
+
 fn compileEventMaterialization(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -2211,6 +2639,41 @@ fn compileEventMaterialization(
         object,
         &.{ "mode", "body_input_field", "fields" },
     );
+    var layout = try compileEventMaterializationLayout(allocator, object);
+    errdefer layout.deinit(allocator);
+    var extensions = try compileEventExtensions(
+        allocator,
+        definition_plan,
+        object,
+    );
+    errdefer extensions.deinit(allocator);
+    const result: EventMaterialization = .{
+        .mode = layout.mode,
+        .body_input_field = layout.body_input_field,
+        .field_order = layout.field_order,
+        .body_order = layout.body_order,
+        .object_orders = layout.object_orders,
+        .escape_non_ascii = layout.escape_non_ascii,
+        .fields = layout.fields,
+        .request_literals = extensions.request_literals,
+        .generate = extensions.generate,
+        .derive = extensions.derive,
+        .idempotency = extensions.idempotency,
+        .body_fields = extensions.body_fields,
+        .forbidden_parameters = extensions.forbidden_parameters,
+    };
+    try validateEventMaterialization(allocator, &result);
+    try validateEventMaterializationAgainstDefinition(
+        &result,
+        definition_plan,
+    );
+    return result;
+}
+
+fn compileEventMaterializationLayout(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !EventMaterializationLayout {
     const mode = try EventMaterializationMode.parse(
         try definition_core.json.requiredString(object, "mode"),
     );
@@ -2242,6 +2705,22 @@ fn compileEventMaterialization(
         try definition_core.json.boolean(raw_value)
     else
         false;
+    const fields = try compileEventFields(allocator, object);
+    return .{
+        .mode = mode,
+        .body_input_field = body_input_field,
+        .field_order = field_order,
+        .body_order = body_order,
+        .object_orders = object_orders,
+        .escape_non_ascii = escape_non_ascii,
+        .fields = fields,
+    };
+}
+
+fn compileEventFields(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) ![]EventField {
     const raw_fields = try definition_core.json.array(
         try definition_core.json.field(object, "fields"),
     );
@@ -2263,6 +2742,14 @@ fn compileEventMaterialization(
             return std.mem.lessThan(u8, left.field, right.field);
         }
     }.lessThan);
+    return fields;
+}
+
+fn compileEventExtensions(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !EventExtensions {
     const request_literals = if (object.get("request_literals")) |raw_literals|
         try compileRequestLiterals(allocator, raw_literals)
     else
@@ -2316,14 +2803,7 @@ fn compileEventMaterialization(
         else
             try allocator.alloc([]u8, 0);
     errdefer deinitNames(allocator, forbidden_parameters);
-    const result: EventMaterialization = .{
-        .mode = mode,
-        .body_input_field = body_input_field,
-        .field_order = field_order,
-        .body_order = body_order,
-        .object_orders = object_orders,
-        .escape_non_ascii = escape_non_ascii,
-        .fields = fields,
+    return .{
         .request_literals = request_literals,
         .generate = generate,
         .derive = derive,
@@ -2331,13 +2811,6 @@ fn compileEventMaterialization(
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
-    try validateEventMaterialization(allocator, &result);
-    try validateEventMaterializationAgainstDefinition(
-        &result,
-        definition_plan,
-    );
-    idempotency = null;
-    return result;
 }
 
 fn compileDeclaredOrder(
@@ -2452,45 +2925,10 @@ fn compileSecureTokenGenerations(
         allocator.free(items);
     }
     for (values.items, 0..) |value, index| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "op", "prefix", "bytes" },
+        items[index] = try compileSecureTokenGeneration(
+            allocator,
+            value,
         );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "op", "prefix", "bytes" },
-        );
-        if (!std.mem.eql(
-            u8,
-            try definition_core.json.requiredString(object, "op"),
-            "secure-token",
-        )) return error.UnsupportedEventGeneration;
-        const byte_count = try definition_core.json.unsigned(
-            try definition_core.json.field(object, "bytes"),
-        );
-        if (byte_count > std.math.maxInt(u8)) {
-            return error.SecureTokenByteCountInvalid;
-        }
-        var name: ?[]u8 = try allocator.dupe(
-            u8,
-            try definition_core.json.requiredString(object, "name"),
-        );
-        errdefer if (name) |owned| allocator.free(owned);
-        var prefix: ?[]u8 = try allocator.dupe(
-            u8,
-            try definition_core.json.requiredString(object, "prefix"),
-        );
-        errdefer if (prefix) |owned| allocator.free(owned);
-        const candidate: SecureTokenGeneration = .{
-            .name = name.?,
-            .prefix = prefix.?,
-            .byte_count = @intCast(byte_count),
-        };
-        try validateSecureTokenGeneration(&candidate);
-        items[index] = candidate;
-        name = null;
-        prefix = null;
         initialized += 1;
     }
     std.sort.heap(
@@ -2507,12 +2945,61 @@ fn compileSecureTokenGenerations(
             }
         }.lessThan,
     );
+    try validateUniqueSecureTokenGenerations(items);
+    return items;
+}
+
+fn compileSecureTokenGeneration(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !SecureTokenGeneration {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "prefix", "bytes" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "op", "prefix", "bytes" },
+    );
+    if (!std.mem.eql(
+        u8,
+        try definition_core.json.requiredString(object, "op"),
+        "secure-token",
+    )) return error.UnsupportedEventGeneration;
+    const byte_count = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "bytes"),
+    );
+    if (byte_count > std.math.maxInt(u8)) {
+        return error.SecureTokenByteCountInvalid;
+    }
+    const name = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "name"),
+    );
+    errdefer allocator.free(name);
+    const prefix = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "prefix"),
+    );
+    errdefer allocator.free(prefix);
+    const result: SecureTokenGeneration = .{
+        .name = name,
+        .prefix = prefix,
+        .byte_count = @intCast(byte_count),
+    };
+    try validateSecureTokenGeneration(&result);
+    return result;
+}
+
+fn validateUniqueSecureTokenGenerations(
+    items: []const SecureTokenGeneration,
+) !void {
     for (items[1..], 1..) |item, index| {
         if (std.mem.eql(u8, items[index - 1].name, item.name)) {
             return error.DuplicateEventGeneration;
         }
     }
-    return items;
 }
 
 fn compileEventDerivations(
@@ -2622,101 +3109,148 @@ fn compileEventDerivation(
     );
     errdefer allocator.free(name);
     try definition_core.json.safeIdentifier(name, 128);
-    var source: EventDerivationSource = if (std.mem.eql(
-        u8,
+    var source = try compileEventDerivationSource(
+        allocator,
+        definition_plan,
+        object,
         op,
-        "input-text",
-    )) blk: {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "op", "pointer" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "op", "pointer" },
-        );
-        break :blk .{ .input_text = try compileEventPointer(
+    );
+    errdefer source.deinit(allocator);
+    return .{ .name = name, .source = source };
+}
+
+fn compileEventDerivationSource(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+    op: []const u8,
+) !EventDerivationSource {
+    if (std.mem.eql(u8, op, "input-text")) {
+        return .{ .input_text = try compileInputTextDerivation(
             allocator,
-            try definition_core.json.requiredString(object, "pointer"),
+            object,
         ) };
-    } else if (std.mem.eql(u8, op, "utc-timestamp")) blk: {
+    }
+    if (std.mem.eql(u8, op, "utc-timestamp")) {
         if (!definition_plan.requires(.timestamp)) {
             return error.UndeclaredArtifactOperator;
         }
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "op", "format" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "op", "format" },
-        );
-        break :blk .{ .utc_timestamp = try EventTimestampFormat.parse(
-            try definition_core.json.requiredString(object, "format"),
-        ) };
-    } else if (std.mem.eql(u8, op, "sha1")) blk: {
+        return .{ .utc_timestamp = try compileTimestampDerivation(object) };
+    }
+    if (std.mem.eql(u8, op, "sha1")) {
         if (!definition_plan.requires(.sha1)) {
             return error.UndeclaredArtifactOperator;
         }
-        break :blk .{ .sha1 = try compileEventDigestDerivation(
+        return .{ .sha1 = try compileEventDigestDerivation(
             allocator,
             object,
         ) };
-    } else if (std.mem.eql(u8, op, "sha256")) blk: {
+    }
+    if (std.mem.eql(u8, op, "sha256")) {
         if (!definition_plan.requires(.sha256)) {
             return error.UndeclaredArtifactOperator;
         }
-        break :blk .{ .sha256 = try compileEventDigestDerivation(
+        return .{ .sha256 = try compileEventDigestDerivation(
             allocator,
             object,
         ) };
-    } else if (std.mem.eql(u8, op, "concat")) blk: {
+    }
+    if (std.mem.eql(u8, op, "concat")) {
         if (!definition_plan.requires(.composite_identity)) {
             return error.UndeclaredArtifactOperator;
         }
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "op", "fragments", "max_bytes" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "op", "fragments", "max_bytes" },
-        );
-        break :blk .{ .concat = .{
-            .fragments = try compileEventDerivationFragments(
-                allocator,
-                try definition_core.json.field(object, "fragments"),
-            ),
-            .max_bytes = try compileEventDerivationBound(object),
-        } };
-    } else if (std.mem.eql(u8, op, "monotonic-identity")) blk: {
+        return .{ .concat = try compileConcatDerivation(allocator, object) };
+    }
+    if (std.mem.eql(u8, op, "monotonic-identity")) {
         if (!definition_plan.requires(.monotonic_identity) or
             !definition_plan.requires(.reducer))
         {
             return error.UndeclaredArtifactOperator;
         }
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "op", "prefix", "width" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "op", "prefix", "width" },
-        );
-        const width = try definition_core.json.unsigned(
-            object.get("width").?,
-        );
-        break :blk .{ .monotonic_identity = .{
-            .prefix = try allocator.dupe(
-                u8,
-                try definition_core.json.requiredString(object, "prefix"),
-            ),
-            .width = std.math.cast(u8, width) orelse
-                return error.InvalidEventMonotonicIdentity,
-        } };
-    } else return error.UnsupportedEventDerivation;
-    errdefer source.deinit(allocator);
-    return .{ .name = name, .source = source };
+        return .{ .monotonic_identity = try compileMonotonicIdentityDerivation(allocator, object) };
+    }
+    return error.UnsupportedEventDerivation;
+}
+
+fn compileInputTextDerivation(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !definition_core.json_pointer.Pointer {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "pointer" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "op", "pointer" },
+    );
+    return compileEventPointer(
+        allocator,
+        try definition_core.json.requiredString(object, "pointer"),
+    );
+}
+
+fn compileTimestampDerivation(
+    object: std.json.ObjectMap,
+) !EventTimestampFormat {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "format" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "op", "format" },
+    );
+    return EventTimestampFormat.parse(
+        try definition_core.json.requiredString(object, "format"),
+    );
+}
+
+fn compileConcatDerivation(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !EventConcatDerivation {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "fragments", "max_bytes" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "op", "fragments", "max_bytes" },
+    );
+    const fragments = try compileEventDerivationFragments(
+        allocator,
+        try definition_core.json.field(object, "fragments"),
+    );
+    errdefer deinitEventDerivationFragments(allocator, fragments);
+    return .{
+        .fragments = fragments,
+        .max_bytes = try compileEventDerivationBound(object),
+    };
+}
+
+fn compileMonotonicIdentityDerivation(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !EventMonotonicIdentityDerivation {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "prefix", "width" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "op", "prefix", "width" },
+    );
+    const width = try definition_core.json.unsigned(object.get("width").?);
+    const bounded_width = std.math.cast(u8, width) orelse
+        return error.InvalidEventMonotonicIdentity;
+    return .{
+        .prefix = try allocator.dupe(
+            u8,
+            try definition_core.json.requiredString(object, "prefix"),
+        ),
+        .width = bounded_width,
+    };
 }
 
 fn compileEventDigestDerivation(
@@ -2830,71 +3364,105 @@ fn compileEventDerivationFragment(
             "transform",
         },
     );
-    var source_count: usize = 0;
-    source_count += @intFromBool(object.get("literal") != null);
-    source_count += @intFromBool(object.get("input_text") != null);
-    source_count += @intFromBool(object.get("input_json") != null);
-    source_count += @intFromBool(object.get("canonical_input") != null);
-    source_count += @intFromBool(object.get("derived") != null);
-    if (source_count != 1) return error.InvalidEventDerivationFragment;
+    if (eventDerivationFragmentSourceCount(object) != 1) {
+        return error.InvalidEventDerivationFragment;
+    }
     if (object.get("literal")) |value| {
-        if (object.get("prefix_bytes") != null or
-            object.get("transform") != null)
-        {
-            return error.InvalidEventDerivationFragment;
-        }
-        const literal = try allocator.dupe(
-            u8,
-            try definition_core.json.string(value),
-        );
-        errdefer allocator.free(literal);
-        if (literal.len > 4096 or !std.unicode.utf8ValidateSlice(literal)) {
-            return error.InvalidEventDerivationLiteral;
-        }
-        return .{ .literal = literal };
+        return compileLiteralDerivationFragment(allocator, object, value);
     }
     if (object.get("input_text")) |value| {
-        if (object.get("prefix_bytes") != null) {
-            return error.InvalidEventDerivationFragment;
-        }
-        var pointer = try compileEventPointer(
+        return compileInputTextDerivationFragment(
             allocator,
-            try definition_core.json.string(value),
+            object,
+            value,
         );
-        errdefer pointer.deinit(allocator);
-        const transform = if (object.get("transform")) |raw_transform|
-            try EventInputTextTransform.parse(
-                try definition_core.json.string(raw_transform),
-            )
-        else
-            .none;
-        return .{ .input_text = .{
-            .pointer = pointer,
-            .transform = transform,
-        } };
     }
     if (object.get("input_json")) |value| {
-        if (object.get("prefix_bytes") != null or
-            object.get("transform") != null)
-        {
-            return error.InvalidEventDerivationFragment;
-        }
+        try validatePlainDerivationFragment(object);
         return .{ .input_json = try compileEventPointer(
             allocator,
             try definition_core.json.string(value),
         ) };
     }
     if (object.get("canonical_input")) |value| {
-        if (object.get("prefix_bytes") != null or
-            object.get("transform") != null)
-        {
-            return error.InvalidEventDerivationFragment;
-        }
+        try validatePlainDerivationFragment(object);
         return .{ .canonical_input = try compileEventPointer(
             allocator,
             try definition_core.json.string(value),
         ) };
     }
+    return .{ .derived = try compileDerivedReference(
+        allocator,
+        object,
+    ) };
+}
+
+fn eventDerivationFragmentSourceCount(
+    object: std.json.ObjectMap,
+) usize {
+    var source_count: usize = 0;
+    source_count += @intFromBool(object.get("literal") != null);
+    source_count += @intFromBool(object.get("input_text") != null);
+    source_count += @intFromBool(object.get("input_json") != null);
+    source_count += @intFromBool(object.get("canonical_input") != null);
+    source_count += @intFromBool(object.get("derived") != null);
+    return source_count;
+}
+
+fn validatePlainDerivationFragment(object: std.json.ObjectMap) !void {
+    if (object.get("prefix_bytes") != null or
+        object.get("transform") != null)
+    {
+        return error.InvalidEventDerivationFragment;
+    }
+}
+
+fn compileLiteralDerivationFragment(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    value: std.json.Value,
+) !EventDerivationFragment {
+    try validatePlainDerivationFragment(object);
+    const literal = try allocator.dupe(
+        u8,
+        try definition_core.json.string(value),
+    );
+    errdefer allocator.free(literal);
+    if (literal.len > 4096 or !std.unicode.utf8ValidateSlice(literal)) {
+        return error.InvalidEventDerivationLiteral;
+    }
+    return .{ .literal = literal };
+}
+
+fn compileInputTextDerivationFragment(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    value: std.json.Value,
+) !EventDerivationFragment {
+    if (object.get("prefix_bytes") != null) {
+        return error.InvalidEventDerivationFragment;
+    }
+    var pointer = try compileEventPointer(
+        allocator,
+        try definition_core.json.string(value),
+    );
+    errdefer pointer.deinit(allocator);
+    const transform = if (object.get("transform")) |raw_transform|
+        try EventInputTextTransform.parse(
+            try definition_core.json.string(raw_transform),
+        )
+    else
+        .none;
+    return .{ .input_text = .{
+        .pointer = pointer,
+        .transform = transform,
+    } };
+}
+
+fn compileDerivedReference(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !EventDerivedReference {
     const name = try allocator.dupe(
         u8,
         try definition_core.json.string(object.get("derived").?),
@@ -2914,11 +3482,11 @@ fn compileEventDerivationFragment(
         )
     else
         .none;
-    return .{ .derived = .{
+    return .{
         .name = name,
         .prefix_bytes = prefix_bytes,
         .transform = transform,
-    } };
+    };
 }
 
 fn validateEventDerivationReferences(
@@ -3006,109 +3574,14 @@ fn compileEventBodyField(
         try definition_core.json.requiredString(object, "field"),
     );
     errdefer allocator.free(field);
-    var source_count: usize = 0;
-    source_count += @intFromBool(object.get("generated_sha256") != null);
-    source_count += @intFromBool(object.get("literal_mapping") != null);
-    source_count += @intFromBool(object.get("parameter_sha256") != null);
-    source_count += @intFromBool(object.get("request_input") != null);
-    source_count += @intFromBool(object.get("state_value") != null);
-    source_count += @intFromBool(object.get("derived") != null);
-    if (source_count != 1) return error.InvalidEventBodyFieldSource;
-    var source: EventBodyFieldSource =
-        if (object.get("generated_sha256")) |value| blk: {
-            if (!definition_plan.requires(.sha256)) {
-                return error.UndeclaredArtifactOperator;
-            }
-            break :blk .{ .generated_sha256 = try allocator.dupe(
-                u8,
-                try definition_core.json.string(value),
-            ) };
-        } else if (object.get("parameter_sha256")) |value| blk: {
-            if (!definition_plan.requires(.sha256)) {
-                return error.UndeclaredArtifactOperator;
-            }
-            const config = try definition_core.json.object(value);
-            try definition_core.json.requireExactKeys(
-                config,
-                &.{ "parameter", "expected_state" },
-            );
-            try definition_core.json.requireFields(
-                config,
-                &.{ "parameter", "expected_state" },
-            );
-            const parameter = try allocator.dupe(
-                u8,
-                try definition_core.json.requiredString(
-                    config,
-                    "parameter",
-                ),
-            );
-            errdefer allocator.free(parameter);
-            const declaration =
-                definition_plan.parameter_declarations.find(parameter) orelse
-                return error.UnknownOperationParameter;
-            if (declaration.kind == .integer or
-                declaration.kind == .boolean)
-            {
-                return error.EventHashParameterMustBeText;
-            }
-            break :blk .{ .parameter_sha256 = .{
-                .parameter = parameter,
-                .expected_state = try compileStateValueSource(
-                    allocator,
-                    try definition_core.json.field(
-                        config,
-                        "expected_state",
-                    ),
-                ),
-            } };
-        } else if (object.get("request_input")) |value|
-            .{ .request_input = try allocator.dupe(
-                u8,
-                try definition_core.json.string(value),
-            ) }
-        else if (object.get("derived")) |value|
-            .{ .derived = try allocator.dupe(
-                u8,
-                try definition_core.json.string(value),
-            ) }
-        else if (object.get("literal_mapping")) |value| blk: {
-            const config = try definition_core.json.object(value);
-            try definition_core.json.requireExactKeys(
-                config,
-                &.{ "request", "stored" },
-            );
-            try definition_core.json.requireFields(
-                config,
-                &.{ "request", "stored" },
-            );
-            const request_literal =
-                try definition_core.canonical_json.canonicalJsonAlloc(
-                    allocator,
-                    try definition_core.json.field(config, "request"),
-                );
-            errdefer allocator.free(request_literal);
-            const stored_literal =
-                try definition_core.canonical_json.canonicalJsonAlloc(
-                    allocator,
-                    try definition_core.json.field(config, "stored"),
-                );
-            errdefer allocator.free(stored_literal);
-            try validateCanonicalScalar(allocator, request_literal);
-            try validateCanonicalScalar(allocator, stored_literal);
-            break :blk .{ .literal_mapping = .{
-                .request_literal = request_literal,
-                .stored_literal = stored_literal,
-            } };
-        } else blk: {
-            if (!definition_plan.requires(.reducer)) {
-                return error.UndeclaredArtifactOperator;
-            }
-            break :blk .{ .state_value = try compileStateValueSource(
-                allocator,
-                object.get("state_value").?,
-            ) };
-        };
+    if (eventBodyFieldSourceCount(object) != 1) {
+        return error.InvalidEventBodyFieldSource;
+    }
+    var source = try compileEventBodyFieldSource(
+        allocator,
+        definition_plan,
+        object,
+    );
     errdefer source.deinit(allocator);
     const result: EventBodyField = .{
         .field = field,
@@ -3116,6 +3589,132 @@ fn compileEventBodyField(
     };
     try validateEventBodyField(&result);
     return result;
+}
+
+fn eventBodyFieldSourceCount(object: std.json.ObjectMap) usize {
+    var source_count: usize = 0;
+    source_count += @intFromBool(object.get("generated_sha256") != null);
+    source_count += @intFromBool(object.get("literal_mapping") != null);
+    source_count += @intFromBool(object.get("parameter_sha256") != null);
+    source_count += @intFromBool(object.get("request_input") != null);
+    source_count += @intFromBool(object.get("state_value") != null);
+    source_count += @intFromBool(object.get("derived") != null);
+    return source_count;
+}
+
+fn compileEventBodyFieldSource(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !EventBodyFieldSource {
+    if (object.get("generated_sha256")) |value| {
+        if (!definition_plan.requires(.sha256)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        return .{ .generated_sha256 = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("parameter_sha256")) |value| {
+        if (!definition_plan.requires(.sha256)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        return .{ .parameter_sha256 = try compileParameterSha256Source(
+            allocator,
+            definition_plan,
+            value,
+        ) };
+    }
+    if (object.get("request_input")) |value| {
+        return .{ .request_input = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("derived")) |value| {
+        return .{ .derived = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("literal_mapping")) |value| {
+        return .{ .literal_mapping = try compileLiteralMappingSource(allocator, value) };
+    }
+    if (!definition_plan.requires(.reducer)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    return .{ .state_value = try compileStateValueSource(
+        allocator,
+        object.get("state_value").?,
+    ) };
+}
+
+fn compileParameterSha256Source(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) !ParameterSha256Source {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "parameter", "expected_state" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "parameter", "expected_state" },
+    );
+    const parameter = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "parameter"),
+    );
+    errdefer allocator.free(parameter);
+    const declaration =
+        definition_plan.parameter_declarations.find(parameter) orelse
+        return error.UnknownOperationParameter;
+    if (declaration.kind == .integer or declaration.kind == .boolean) {
+        return error.EventHashParameterMustBeText;
+    }
+    return .{
+        .parameter = parameter,
+        .expected_state = try compileStateValueSource(
+            allocator,
+            try definition_core.json.field(object, "expected_state"),
+        ),
+    };
+}
+
+fn compileLiteralMappingSource(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !LiteralMappingSource {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "request", "stored" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "request", "stored" },
+    );
+    const request_literal =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(object, "request"),
+        );
+    errdefer allocator.free(request_literal);
+    const stored_literal =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(object, "stored"),
+        );
+    errdefer allocator.free(stored_literal);
+    try validateCanonicalScalar(allocator, request_literal);
+    try validateCanonicalScalar(allocator, stored_literal);
+    return .{
+        .request_literal = request_literal,
+        .stored_literal = stored_literal,
+    };
 }
 
 fn compileStateValueSource(
@@ -3201,56 +3800,57 @@ fn compileEventField(
     );
     errdefer allocator.free(field);
     try definition_core.json.safeIdentifier(field, 128);
+    if (eventFieldSourceCount(object) != 1) {
+        return error.InvalidEventFieldSource;
+    }
+    var source = try compileEventFieldSource(allocator, object);
+    errdefer source.deinit(allocator);
+    try validateDecodedEventFieldSource(allocator, source);
+    return .{ .field = field, .source = source };
+}
+
+fn eventFieldSourceCount(object: std.json.ObjectMap) usize {
     var source_count: usize = 0;
     source_count += @intFromBool(object.get("input_field") != null);
     source_count += @intFromBool(object.get("literal") != null);
     source_count += @intFromBool(object.get("sequence_text_prefix") != null);
     source_count += @intFromBool(object.get("unix_seconds") != null);
     source_count += @intFromBool(object.get("derived") != null);
-    if (source_count != 1) return error.InvalidEventFieldSource;
-    var source: EventFieldSource = if (object.get("input_field")) |value|
-        .{ .input_field = try allocator.dupe(
+    return source_count;
+}
+
+fn compileEventFieldSource(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !EventFieldSource {
+    if (object.get("input_field")) |value| {
+        return .{ .input_field = try allocator.dupe(
             u8,
             try definition_core.json.string(value),
-        ) }
-    else if (object.get("literal")) |value|
-        .{ .literal = try definition_core.canonical_json.canonicalJsonAlloc(
+        ) };
+    }
+    if (object.get("literal")) |value| {
+        return .{ .literal = try definition_core.canonical_json.canonicalJsonAlloc(
             allocator,
             value,
-        ) }
-    else if (object.get("sequence_text_prefix")) |value|
-        .{ .sequence_text_prefix = try allocator.dupe(
-            u8,
-            try definition_core.json.string(value),
-        ) }
-    else if (object.get("derived")) |value|
-        .{ .derived = try allocator.dupe(
-            u8,
-            try definition_core.json.string(value),
-        ) }
-    else if (try definition_core.json.boolean(
-        object.get("unix_seconds").?,
-    ))
-        .unix_seconds
-    else
-        return error.InvalidEventUnixSecondsSource;
-    errdefer source.deinit(allocator);
-    switch (source) {
-        .input_field => |value| {
-            try definition_core.json.safeIdentifier(value, 128);
-        },
-        .literal => |value| try validateCanonicalScalar(allocator, value),
-        .sequence_text_prefix => |value| {
-            if (!std.unicode.utf8ValidateSlice(value) or value.len > 128) {
-                return error.InvalidEventSequencePrefix;
-            }
-        },
-        .unix_seconds => {},
-        .derived => |value| {
-            try definition_core.json.safeIdentifier(value, 128);
-        },
+        ) };
     }
-    return .{ .field = field, .source = source };
+    if (object.get("sequence_text_prefix")) |value| {
+        return .{ .sequence_text_prefix = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("derived")) |value| {
+        return .{ .derived = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (try definition_core.json.boolean(
+        object.get("unix_seconds").?,
+    )) return .unix_seconds;
+    return error.InvalidEventUnixSecondsSource;
 }
 
 fn compileRequestLiterals(
@@ -3570,7 +4170,20 @@ fn validateEventMaterializationExtensions(
     {
         return error.InvalidEventMaterializationBounds;
     }
-    for (event.object_orders, 0..) |*order, index| {
+    try validateEventObjectOrders(event.object_orders);
+    try validateEventGenerations(event.generate);
+    try validateEventDerivations(event.generate, event.derive);
+    if (event.idempotency) |*idempotency| {
+        try validateEventIdempotency(event, idempotency);
+    }
+    try validateEventBodyFields(event.body_fields);
+    try validateForbiddenEventParameters(event.forbidden_parameters);
+}
+
+fn validateEventObjectOrders(
+    orders: []const EventObjectOrder,
+) !void {
+    for (orders, 0..) |*order, index| {
         if (order.pointer.segments.len == 0 or order.fields.len == 0 or
             order.fields.len > 64)
         {
@@ -3587,62 +4200,72 @@ fn validateEventMaterializationExtensions(
         if (index != 0 and
             std.mem.order(
                 u8,
-                event.object_orders[index - 1].pointer.raw,
+                orders[index - 1].pointer.raw,
                 order.pointer.raw,
             ) != .lt)
         {
             return error.EventObjectOrdersNotSorted;
         }
     }
-    for (event.generate, 0..) |*item, index| {
+}
+
+fn validateEventGenerations(
+    generate: []const SecureTokenGeneration,
+) !void {
+    for (generate, 0..) |*item, index| {
         try validateSecureTokenGeneration(item);
         if (index != 0 and
             std.mem.order(
                 u8,
-                event.generate[index - 1].name,
+                generate[index - 1].name,
                 item.name,
             ) != .lt)
         {
             return error.EventGenerationsNotSorted;
         }
     }
-    for (event.derive, 0..) |*item, index| {
+}
+
+fn validateEventDerivations(
+    generate: []const SecureTokenGeneration,
+    derive: []const EventDerivation,
+) !void {
+    for (derive, 0..) |*item, index| {
         try validateEventDerivation(item);
-        for (event.generate) |generated| {
+        for (generate) |generated| {
             if (std.mem.eql(u8, generated.name, item.name)) {
                 return error.DuplicateEventGeneration;
             }
         }
-        for (event.derive[0..index]) |prior| {
+        for (derive[0..index]) |prior| {
             if (std.mem.eql(u8, prior.name, item.name)) {
                 return error.DuplicateEventGeneration;
             }
         }
-        try validateEventDerivationReferences(item, event.derive[0..index]);
+        try validateEventDerivationReferences(item, derive[0..index]);
     }
-    if (event.idempotency) |*idempotency| {
-        try validateEventIdempotency(event, idempotency);
-    }
-    for (event.body_fields, 0..) |*field, index| {
+}
+
+fn validateEventBodyFields(fields: []const EventBodyField) !void {
+    for (fields, 0..) |*field, index| {
         try validateEventBodyField(field);
         if (index != 0 and
             std.mem.order(
                 u8,
-                event.body_fields[index - 1].field,
+                fields[index - 1].field,
                 field.field,
             ) != .lt)
         {
             return error.EventBodyFieldsNotSorted;
         }
     }
-    for (event.forbidden_parameters, 0..) |name, index| {
+}
+
+fn validateForbiddenEventParameters(names: []const []u8) !void {
+    for (names, 0..) |name, index| {
         try definition_core.json.safeIdentifier(name, 128);
         if (index != 0 and
-            std.mem.order(
-                u8,
-                event.forbidden_parameters[index - 1],
-                name,
-            ) != .lt)
+            std.mem.order(u8, names[index - 1], name) != .lt)
         {
             return error.EventParameterNamesNotSorted;
         }
@@ -3661,6 +4284,24 @@ fn validateEventMaterializationAgainstDefinition(
     {
         return error.UndeclaredArtifactOperator;
     }
+    try validateEventIdempotencyDefinition(event, definition_plan);
+    try validateEventDerivationOperators(event.derive, definition_plan);
+    try validateEventDerivedFields(event.fields, event.derive);
+    try validateEventBodyFieldDefinitions(
+        event,
+        definition_plan,
+    );
+    for (event.forbidden_parameters) |name| {
+        if (definition_plan.parameter_declarations.find(name) == null) {
+            return error.EventForbiddenParameterMissing;
+        }
+    }
+}
+
+fn validateEventIdempotencyDefinition(
+    event: *const EventMaterialization,
+    definition_plan: *const definition.Plan,
+) !void {
     if (event.idempotency) |idempotency| {
         if (!definition_plan.requires(.idempotency_key)) {
             return error.UndeclaredArtifactOperator;
@@ -3674,7 +4315,13 @@ fn validateEventMaterializationAgainstDefinition(
             }
         }
     }
-    for (event.derive) |item| switch (item.source) {
+}
+
+fn validateEventDerivationOperators(
+    derivations: []const EventDerivation,
+    definition_plan: *const definition.Plan,
+) !void {
+    for (derivations) |item| switch (item.source) {
         .input_text => {},
         .utc_timestamp => {
             if (!definition_plan.requires(.timestamp)) {
@@ -3704,14 +4351,26 @@ fn validateEventMaterializationAgainstDefinition(
             }
         },
     };
-    for (event.fields) |field| switch (field.source) {
+}
+
+fn validateEventDerivedFields(
+    fields: []const EventField,
+    derivations: []const EventDerivation,
+) !void {
+    for (fields) |field| switch (field.source) {
         .derived => |name| {
-            if (findEventDerivation(event.derive, name) == null) {
+            if (findEventDerivation(derivations, name) == null) {
                 return error.EventDerivationDependencyMissing;
             }
         },
         else => {},
     };
+}
+
+fn validateEventBodyFieldDefinitions(
+    event: *const EventMaterialization,
+    definition_plan: *const definition.Plan,
+) !void {
     for (event.body_fields) |field| switch (field.source) {
         .generated_sha256 => |name| {
             if (!definition_plan.requires(.sha256) or
@@ -3744,11 +4403,6 @@ fn validateEventMaterializationAgainstDefinition(
         },
         .request_input, .literal_mapping => {},
     };
-    for (event.forbidden_parameters) |name| {
-        if (definition_plan.parameter_declarations.find(name) == null) {
-            return error.EventForbiddenParameterMissing;
-        }
-    }
 }
 
 fn validateEventIdempotency(
@@ -4080,14 +4734,7 @@ fn compilePathSegments(
     definition_plan: *const definition.Plan,
     path: []const u8,
 ) ![]PathSegment {
-    if (path.len == 0 or path.len > 4096 or
-        std.fs.path.isAbsolute(path) or
-        std.mem.indexOfScalar(u8, path, 0) != null or
-        std.mem.indexOfScalar(u8, path, '\\') != null or
-        path[path.len - 1] == '/')
-    {
-        return error.InvalidStoragePathTemplate;
-    }
+    try validateStoragePathTemplateText(path);
     var segments: std.ArrayList(PathSegment) = .empty;
     errdefer {
         for (segments.items) |*segment| segment.deinit(allocator);
@@ -4100,42 +4747,17 @@ fn compilePathSegments(
             return error.StoragePathSegmentBoundsExceeded;
         }
         if (component.len == 0) return error.InvalidStoragePathTemplate;
-        const kind: PathSegmentKind = if (component.len >= 3 and
-            component[0] == '{' and
-            component[component.len - 1] == '}')
-        blk: {
-            const name = component[1 .. component.len - 1];
-            try definition_core.json.safeIdentifier(name, 128);
-            if (std.mem.indexOfScalar(u8, name, '/') != null) {
-                return error.InvalidStoragePathParameter;
-            }
-            const declaration =
-                definition_plan.parameter_declarations.find(name) orelse
-                return error.UnknownStoragePathParameter;
-            if (declaration.kind != .safe_identifier) {
-                return error.StoragePathParameterMustBeSafeIdentifier;
-            }
-            dynamic = true;
-            break :blk .parameter;
-        } else blk: {
-            if (std.mem.indexOfScalar(u8, component, '{') != null or
-                std.mem.indexOfScalar(u8, component, '}') != null)
-            {
-                return error.InvalidStoragePathTemplate;
-            }
-            try validateLiteralPathSegment(component);
-            break :blk .literal;
-        };
-        const text = switch (kind) {
-            .literal => component,
-            .parameter => component[1 .. component.len - 1],
-        };
-        const owned_text = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned_text);
-        try segments.append(allocator, .{
-            .kind = kind,
-            .text = owned_text,
-        });
+        const segment = try compilePathSegment(
+            allocator,
+            definition_plan,
+            component,
+        );
+        errdefer {
+            var owned = segment;
+            owned.deinit(allocator);
+        }
+        dynamic = dynamic or segment.kind == .parameter;
+        try segments.append(allocator, segment);
     }
     if (dynamic and !definition_plan.requires(.path_format)) {
         return error.UndeclaredArtifactOperator;
@@ -4145,6 +4767,54 @@ fn compilePathSegments(
     errdefer deinitPathSegments(allocator, owned);
     try validateEncodedPathTemplate(allocator, path, owned);
     return owned;
+}
+
+fn validateStoragePathTemplateText(path: []const u8) !void {
+    if (path.len == 0 or path.len > 4096 or
+        std.fs.path.isAbsolute(path) or
+        std.mem.indexOfScalar(u8, path, 0) != null or
+        std.mem.indexOfScalar(u8, path, '\\') != null or
+        path[path.len - 1] == '/')
+    {
+        return error.InvalidStoragePathTemplate;
+    }
+}
+
+fn compilePathSegment(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    component: []const u8,
+) !PathSegment {
+    const parameterized = component.len >= 3 and
+        component[0] == '{' and
+        component[component.len - 1] == '}';
+    if (!parameterized) {
+        if (std.mem.indexOfScalar(u8, component, '{') != null or
+            std.mem.indexOfScalar(u8, component, '}') != null)
+        {
+            return error.InvalidStoragePathTemplate;
+        }
+        try validateLiteralPathSegment(component);
+        return .{
+            .kind = .literal,
+            .text = try allocator.dupe(u8, component),
+        };
+    }
+    const name = component[1 .. component.len - 1];
+    try definition_core.json.safeIdentifier(name, 128);
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        return error.InvalidStoragePathParameter;
+    }
+    const declaration =
+        definition_plan.parameter_declarations.find(name) orelse
+        return error.UnknownStoragePathParameter;
+    if (declaration.kind != .safe_identifier) {
+        return error.StoragePathParameterMustBeSafeIdentifier;
+    }
+    return .{
+        .kind = .parameter,
+        .text = try allocator.dupe(u8, name),
+    };
 }
 
 fn validateEncodedPathTemplate(
@@ -4333,115 +5003,245 @@ fn enumeratePathSegments(
     paths: *std.ArrayList([]u8),
 ) !void {
     if (segment_index >= segments.len) return;
-    const segment = segments[segment_index];
-    const last = segment_index + 1 == segments.len;
-    switch (segment.kind) {
-        .literal => {
-            const absolute = try std.fs.path.join(
+    const frames = try allocator.alloc(
+        PathEnumerationFrame,
+        segments.len - segment_index,
+    );
+    defer allocator.free(frames);
+    var frame_count: usize = 1;
+    frames[0] = try initialPathEnumerationFrame(
+        allocator,
+        absolute_parent,
+        relative_parent,
+        segment_index,
+    );
+    errdefer deinitPathEnumerationFrames(
+        allocator,
+        frames[0..frame_count],
+    );
+    while (frame_count != 0) {
+        const frame = &frames[frame_count - 1];
+        switch (frame.state) {
+            .ready => try advanceReadyPathEnumeration(
                 allocator,
-                &.{ absolute_parent, segment.text },
-            );
-            defer allocator.free(absolute);
-            const relative = if (relative_parent.len == 0)
-                try allocator.dupe(u8, segment.text)
-            else
-                try std.fs.path.join(
-                    allocator,
-                    &.{ relative_parent, segment.text },
-                );
-            defer allocator.free(relative);
-            if (last) {
-                const stat = std.Io.Dir.cwd().statFile(
-                    std.Io.Threaded.global_single_threaded.io(),
-                    absolute,
-                    .{ .follow_symlinks = false },
-                ) catch |err| switch (err) {
-                    error.FileNotFound => return,
-                    else => return err,
-                };
-                if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
-                if (stat.kind != .file) return;
-                try appendEnumeratedPath(
-                    allocator,
-                    paths,
-                    relative,
-                    max_paths,
-                );
-                return;
-            }
-            try enumeratePathSegments(
-                allocator,
-                absolute,
-                relative,
+                frame,
                 segments,
-                segment_index + 1,
                 max_paths,
                 paths,
-            );
-        },
-        .parameter => {
-            var directory = std.Io.Dir.openDirAbsolute(
-                std.Io.Threaded.global_single_threaded.io(),
-                absolute_parent,
-                .{ .iterate = true, .follow_symlinks = false },
-            ) catch |err| switch (err) {
-                error.FileNotFound => return,
-                else => return err,
-            };
-            defer directory.close(std.Io.Threaded.global_single_threaded.io());
-            var iterator = directory.iterate();
-            while (try iterator.next(
-                std.Io.Threaded.global_single_threaded.io(),
-            )) |entry| {
-                definition_core.json.safeIdentifier(
-                    entry.name,
-                    128,
-                ) catch continue;
-                if (std.mem.indexOfScalar(u8, entry.name, '/') != null) {
-                    continue;
-                }
-                const stat = directory.statFile(
-                    std.Io.Threaded.global_single_threaded.io(),
-                    entry.name,
-                    .{ .follow_symlinks = false },
-                ) catch continue;
-                if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
-                const absolute = try std.fs.path.join(
-                    allocator,
-                    &.{ absolute_parent, entry.name },
-                );
-                defer allocator.free(absolute);
-                const relative = if (relative_parent.len == 0)
-                    try allocator.dupe(u8, entry.name)
-                else
-                    try std.fs.path.join(
-                        allocator,
-                        &.{ relative_parent, entry.name },
-                    );
-                defer allocator.free(relative);
-                if (last) {
-                    if (stat.kind != .file) continue;
-                    try appendEnumeratedPath(
-                        allocator,
-                        paths,
-                        relative,
-                        max_paths,
-                    );
-                } else {
-                    if (stat.kind != .directory) continue;
-                    try enumeratePathSegments(
-                        allocator,
-                        absolute,
-                        relative,
-                        segments,
-                        segment_index + 1,
-                        max_paths,
-                        paths,
-                    );
-                }
-            }
-        },
+                &frame_count,
+            ),
+            .parameter => try advanceParameterPathEnumeration(
+                allocator,
+                frames,
+                &frame_count,
+                segments,
+                max_paths,
+                paths,
+            ),
+        }
     }
+}
+
+const PathEnumerationParameter = struct {
+    directory: std.Io.Dir,
+    iterator: std.Io.Dir.Iterator,
+};
+
+const PathEnumerationState = union(enum) {
+    ready,
+    parameter: PathEnumerationParameter,
+};
+
+const PathEnumerationFrame = struct {
+    absolute_parent: []u8,
+    relative_parent: []u8,
+    segment_index: usize,
+    state: PathEnumerationState = .ready,
+
+    fn deinit(
+        self: *PathEnumerationFrame,
+        allocator: std.mem.Allocator,
+    ) void {
+        if (self.state == .parameter) {
+            self.state.parameter.directory.close(storageIo());
+        }
+        allocator.free(self.absolute_parent);
+        allocator.free(self.relative_parent);
+        self.* = undefined;
+    }
+};
+
+fn storageIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn initialPathEnumerationFrame(
+    allocator: std.mem.Allocator,
+    absolute_parent: []const u8,
+    relative_parent: []const u8,
+    segment_index: usize,
+) !PathEnumerationFrame {
+    const absolute = try allocator.dupe(u8, absolute_parent);
+    errdefer allocator.free(absolute);
+    return .{
+        .absolute_parent = absolute,
+        .relative_parent = try allocator.dupe(u8, relative_parent),
+        .segment_index = segment_index,
+    };
+}
+
+fn advanceReadyPathEnumeration(
+    allocator: std.mem.Allocator,
+    frame: *PathEnumerationFrame,
+    segments: []const PathSegment,
+    max_paths: usize,
+    paths: *std.ArrayList([]u8),
+    frame_count: *usize,
+) !void {
+    const segment = segments[frame.segment_index];
+    if (segment.kind == .parameter) {
+        var directory = std.Io.Dir.openDirAbsolute(
+            storageIo(),
+            frame.absolute_parent,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                frame.deinit(allocator);
+                frame_count.* -= 1;
+                return;
+            },
+            else => return err,
+        };
+        frame.state = .{ .parameter = .{
+            .directory = directory,
+            .iterator = directory.iterate(),
+        } };
+        return;
+    }
+    var child = try childPathEnumerationFrame(
+        allocator,
+        frame,
+        segment.text,
+    );
+    errdefer child.deinit(allocator);
+    const last = frame.segment_index + 1 == segments.len;
+    frame.deinit(allocator);
+    if (last) {
+        frame_count.* -= 1;
+        try appendLiteralEnumerationPath(
+            allocator,
+            &child,
+            max_paths,
+            paths,
+        );
+        child.deinit(allocator);
+        return;
+    }
+    frame.* = child;
+}
+
+fn advanceParameterPathEnumeration(
+    allocator: std.mem.Allocator,
+    frames: []PathEnumerationFrame,
+    frame_count: *usize,
+    segments: []const PathSegment,
+    max_paths: usize,
+    paths: *std.ArrayList([]u8),
+) !void {
+    const frame = &frames[frame_count.* - 1];
+    const parameter = &frame.state.parameter;
+    while (try parameter.iterator.next(storageIo())) |entry| {
+        definition_core.json.safeIdentifier(entry.name, 128) catch continue;
+        if (std.mem.indexOfScalar(u8, entry.name, '/') != null) continue;
+        const stat = parameter.directory.statFile(
+            storageIo(),
+            entry.name,
+            .{ .follow_symlinks = false },
+        ) catch continue;
+        if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
+        const last = frame.segment_index + 1 == segments.len;
+        if (last and stat.kind != .file) continue;
+        if (!last and stat.kind != .directory) continue;
+        var child = try childPathEnumerationFrame(
+            allocator,
+            frame,
+            entry.name,
+        );
+        errdefer child.deinit(allocator);
+        if (last) {
+            try appendEnumeratedPath(
+                allocator,
+                paths,
+                child.relative_parent,
+                max_paths,
+            );
+            child.deinit(allocator);
+            continue;
+        }
+        if (frame_count.* == frames.len) {
+            return error.StoragePathSegmentBoundsExceeded;
+        }
+        frames[frame_count.*] = child;
+        frame_count.* += 1;
+        return;
+    }
+    frame.deinit(allocator);
+    frame_count.* -= 1;
+}
+
+fn childPathEnumerationFrame(
+    allocator: std.mem.Allocator,
+    parent: *const PathEnumerationFrame,
+    name: []const u8,
+) !PathEnumerationFrame {
+    const absolute = try std.fs.path.join(
+        allocator,
+        &.{ parent.absolute_parent, name },
+    );
+    errdefer allocator.free(absolute);
+    const relative = if (parent.relative_parent.len == 0)
+        try allocator.dupe(u8, name)
+    else
+        try std.fs.path.join(
+            allocator,
+            &.{ parent.relative_parent, name },
+        );
+    return .{
+        .absolute_parent = absolute,
+        .relative_parent = relative,
+        .segment_index = parent.segment_index + 1,
+    };
+}
+
+fn appendLiteralEnumerationPath(
+    allocator: std.mem.Allocator,
+    child: *const PathEnumerationFrame,
+    max_paths: usize,
+    paths: *std.ArrayList([]u8),
+) !void {
+    const stat = std.Io.Dir.cwd().statFile(
+        storageIo(),
+        child.absolute_parent,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
+    if (stat.kind != .file) return;
+    try appendEnumeratedPath(
+        allocator,
+        paths,
+        child.relative_parent,
+        max_paths,
+    );
+}
+
+fn deinitPathEnumerationFrames(
+    allocator: std.mem.Allocator,
+    frames: []PathEnumerationFrame,
+) void {
+    for (frames) |*frame| frame.deinit(allocator);
 }
 
 fn appendEnumeratedPath(
@@ -4507,149 +5307,135 @@ fn resolveForAllocationFailure(
     defer resolved.deinit(allocator);
 }
 
-test "storage compiler binds generic slots and atomic effects" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["atomic-transaction","compare-and-append","create-new"]},"parameters":{"revision":{"type":"digest","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096},"document":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[]},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536},"document":{"path":"example/document.json","kind":"document","codec":"json","max_bytes":4096}}},"operations":{"capture":{"op":"atomic-transaction","effects":[{"op":"create-new","slot":"document","input":"document"},{"op":"compare-and-append","slot":"events","input":"event","expected_revision_param":"revision"}]}},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), plan.slots.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
-    try std.testing.expect(plan.operations[0].atomic);
-    try std.testing.expectEqual(@as(usize, 2), plan.operations[0].effects.len);
+const storage_protocol_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/protocol\",\"owner\":\"example\",\"requires\":{" ++
+    "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"atomic-transaction\",\"compare-and-append\",\"create-new\"]}," ++
+    "\"parameters\":{\"revision\":{\"type\":\"digest\",\"required\":false}}," ++
+    "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}," ++
+    "\"document\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[]},\"shape\":{},\"constraints\":[]," ++
+    "\"identity\":{},\"storage\":{\"kind\":\"event-log\",\"slots\":{" ++
+    "\"events\":{\"path\":\"example/events.jsonl\",\"kind\":\"event-log\"," ++
+    "\"codec\":\"jsonl\",\"max_bytes\":65536},\"document\":{" ++
+    "\"path\":\"example/document.json\",\"kind\":\"document\"," ++
+    "\"codec\":\"json\",\"max_bytes\":4096}}},\"operations\":{\"capture\":{" ++
+    "\"op\":\"atomic-transaction\",\"effects\":[{\"op\":\"create-new\"," ++
+    "\"slot\":\"document\",\"input\":\"document\"},{" ++
+    "\"op\":\"compare-and-append\",\"slot\":\"events\",\"input\":\"event\"," ++
+    "\"expected_revision_param\":\"revision\"}]}},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":8192,\"max_store_bytes\":65536," ++
+    "\"max_records\":100,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":16}}";
+
+const storage_parameterized_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/parameterized\",\"owner\":\"example\",\"requires\":{" ++
+    "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[\"path-format\"]}," ++
+    "\"parameters\":{\"stream\":{" ++
+    "\"type\":\"safe_identifier\",\"required\":true}},\"inputs\":{" ++
+    "\"event\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{},\"constraints\":[],\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"{stream}/events.jsonl\",\"codec\":\"jsonl\"," ++
+    "\"max_bytes\":4096}}},\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":4096," ++
+    "\"max_records\":10,\"max_output_bytes\":1024,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":4}}";
+
+const storage_reserved_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/reserved\",\"owner\":\"example\",\"requires\":{" ++
+    "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"parameters\":{},\"inputs\":{\"event\":{" ++
+    "\"codec\":\"json\",\"max_bytes\":1024}},\"canonicalization\":{}," ++
+    "\"shape\":{},\"constraints\":[],\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\".definitions/events.jsonl\",\"codec\":\"jsonl\"," ++
+    "\"max_bytes\":1024}}},\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":10,\"max_output_bytes\":1024,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":4}}";
+
+const StorageTestPlan = struct {
+    tmp: std.testing.TmpDir,
+    closure: definition_core.closure.Closure,
+    definition_plan: definition.Plan,
+    plan: Plan,
+
+    fn init(source: []const u8) !StorageTestPlan {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "definition.json",
+            .data = source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        errdefer definition_plan.deinit(std.testing.allocator);
+        return .{
+            .tmp = tmp,
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .plan = try compile(std.testing.allocator, &definition_plan),
+        };
+    }
+
+    fn deinit(self: *StorageTestPlan) void {
+        self.plan.deinit(std.testing.allocator);
+        self.definition_plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+};
+
+fn expectStorageCacheRoundTrip(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    parameters: *const definition_core.parameters.Bindings,
+    expected_path: []const u8,
+) !void {
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
         64 * 1024,
     );
     defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
+    try encodeCache(plan, &encoder);
     const payload = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(payload);
     var decoder = definition_core.cache.Decoder.init(payload);
     var cached = try decodeCache(std.testing.allocator, &decoder);
     defer cached.deinit(std.testing.allocator);
     try decoder.finish();
-    try std.testing.expectEqual(plan.storage_kind, cached.storage_kind);
-    try std.testing.expectEqual(plan.slots.len, cached.slots.len);
-    try std.testing.expectEqual(plan.operations.len, cached.operations.len);
-    try std.testing.expectEqual(
-        plan.operations[0].effects.len,
-        cached.operations[0].effects.len,
-    );
-    var parameters = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
-        &.{},
-    );
-    defer parameters.deinit(std.testing.allocator);
-    var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
-        .{ .fail_index = 0 },
-    );
-    var resolved = try resolve(
-        failing.allocator(),
-        &plan,
-        &parameters,
-    );
-    defer resolved.deinit(failing.allocator());
-}
-
-test "storage path parameters compile once and resolve as safe components" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "parameterized.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/parameterized","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["path-format"]},"parameters":{"stream":{"type":"safe_identifier","required":true}},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"{stream}/events.jsonl","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "parameterized.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "parameterized.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    var parameters = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
-        &.{.{ .name = "stream", .raw_value = "tenant-1" }},
-    );
-    defer parameters.deinit(std.testing.allocator);
+    try validateCachePlan(&cached, definition_plan);
     var resolved = try resolve(
         std.testing.allocator,
-        &plan,
-        &parameters,
+        &cached,
+        parameters,
     );
     defer resolved.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(
-        "tenant-1/events.jsonl",
+        expected_path,
         resolved.slot(0).relative_path,
     );
-    try std.testing.expect(pathTemplateMatches(
-        plan.slots[0],
-        resolved.slot(0).relative_path,
-    ));
-    try std.testing.expect(!pathTemplateMatches(
-        plan.slots[0],
-        "tenant-1/other.jsonl",
-    ));
+}
 
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-    var cached_resolved = try resolve(
-        std.testing.allocator,
-        &cached,
-        &parameters,
-    );
-    defer cached_resolved.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        resolved.slot(0).relative_path,
-        cached_resolved.slot(0).relative_path,
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        resolveForAllocationFailure,
-        .{ &plan, &parameters },
-    );
-
+fn expectStoragePathParameterRejections(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
     var nested = try definition_core.parameters.bind(
         std.testing.allocator,
         &definition_plan.parameter_declarations,
@@ -4658,7 +5444,7 @@ test "storage path parameters compile once and resolve as safe components" {
     defer nested.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.InvalidStoragePathParameter,
-        resolve(std.testing.allocator, &plan, &nested),
+        resolve(std.testing.allocator, plan, &nested),
     );
     var reserved = try definition_core.parameters.bind(
         std.testing.allocator,
@@ -4668,34 +5454,137 @@ test "storage path parameters compile once and resolve as safe components" {
     defer reserved.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.ReservedStoragePath,
-        resolve(std.testing.allocator, &plan, &reserved),
+        resolve(std.testing.allocator, plan, &reserved),
     );
 }
 
-test "storage compiler rejects reserved paths and implicit multi effects" {
+fn expectStorageCompileError(
+    expected: anyerror,
+    source: []const u8,
+) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "reserved.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/reserved","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":".definitions/events.jsonl","codec":"jsonl","max_bytes":1024}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
+        .sub_path = "definition.json",
+        .data = source,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
         &tmp.dir,
-        "reserved.json",
+        "definition.json",
         .{},
     );
     defer closure.deinit(std.testing.allocator);
     var definition_plan = try definition.compile(
         std.testing.allocator,
         &closure,
-        "reserved.json",
+        "definition.json",
     );
     defer definition_plan.deinit(std.testing.allocator);
     try std.testing.expectError(
-        error.ReservedStoragePath,
+        expected,
         compile(std.testing.allocator, &definition_plan),
+    );
+}
+
+test "storage compiler binds generic slots and atomic effects" {
+    var test_plan = try StorageTestPlan.init(storage_protocol_definition);
+    defer test_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), test_plan.plan.slots.len);
+    try std.testing.expectEqual(@as(usize, 1), test_plan.plan.operations.len);
+    try std.testing.expect(test_plan.plan.operations[0].atomic);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        test_plan.plan.operations[0].effects.len,
+    );
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&test_plan.plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(
+        test_plan.plan.storage_kind,
+        cached.storage_kind,
+    );
+    try std.testing.expectEqual(test_plan.plan.slots.len, cached.slots.len);
+    try std.testing.expectEqual(
+        test_plan.plan.operations[0].effects.len,
+        cached.operations[0].effects.len,
+    );
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &test_plan.definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    var resolved = try resolve(
+        failing.allocator(),
+        &test_plan.plan,
+        &parameters,
+    );
+    defer resolved.deinit(failing.allocator());
+}
+
+test "storage path parameters compile once and resolve as safe components" {
+    var test_plan = try StorageTestPlan.init(
+        storage_parameterized_definition,
+    );
+    defer test_plan.deinit();
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &test_plan.definition_plan.parameter_declarations,
+        &.{.{ .name = "stream", .raw_value = "tenant-1" }},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var resolved = try resolve(
+        std.testing.allocator,
+        &test_plan.plan,
+        &parameters,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "tenant-1/events.jsonl",
+        resolved.slot(0).relative_path,
+    );
+    try std.testing.expect(pathTemplateMatches(
+        test_plan.plan.slots[0],
+        resolved.slot(0).relative_path,
+    ));
+    try std.testing.expect(!pathTemplateMatches(
+        test_plan.plan.slots[0],
+        "tenant-1/other.jsonl",
+    ));
+    try expectStorageCacheRoundTrip(
+        &test_plan.plan,
+        &test_plan.definition_plan,
+        &parameters,
+        resolved.slot(0).relative_path,
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resolveForAllocationFailure,
+        .{ &test_plan.plan, &parameters },
+    );
+    try expectStoragePathParameterRejections(
+        &test_plan.plan,
+        &test_plan.definition_plan,
+    );
+}
+
+test "storage compiler rejects reserved paths and implicit multi effects" {
+    try expectStorageCompileError(
+        error.ReservedStoragePath,
+        storage_reserved_definition,
     );
 }
