@@ -6,6 +6,7 @@ pub const compiled_plan = @import("compiled_plan.zig");
 pub const revision_archive = @import("revision_archive.zig");
 pub const validation = @import("validation.zig");
 pub const materialization = @import("materialization.zig");
+pub const document = @import("document.zig");
 pub const storage = @import("storage.zig");
 pub const definition_archive = @import("definition_archive.zig");
 pub const custody = @import("custody.zig");
@@ -24,6 +25,7 @@ test {
     _ = revision_archive;
     _ = validation;
     _ = materialization;
+    _ = document;
     _ = storage;
     _ = definition_archive;
     _ = custody;

@@ -253,6 +253,7 @@ pub const Operator = enum {
             .sha1,
             .content_address,
             .composite_identity,
+            .timestamp_ordinal,
             .monotonic_identity,
             .path_format,
             .immutable_document,
@@ -283,6 +284,7 @@ pub const Operator = enum {
             .relevance,
             .fold,
             .@"export",
+            .text_render,
             => true,
             else => false,
         };

@@ -60,10 +60,8 @@ grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
 grep -Fq '"id":"fold","version":6' <<<"$capabilities"
 grep -Fq '"id":"relevance","version":3' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
-if grep -Fq '"id":"text-render"' <<<"$capabilities"
-then
-  exit 1
-fi
+grep -Fq '"id":"text-render","version":1' <<<"$capabilities"
+grep -Fq '"id":"timestamp-ordinal","version":1' <<<"$capabilities"
 if grep -Eq \
   'actuat|universal|learnings|negative-ledger|synesthesia|SKDC|SDR|EPG' \
   <<<"$capabilities"

@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
+const document = @import("document.zig");
 
 pub const SlotKind = enum {
     document,
@@ -441,11 +442,13 @@ pub const Effect = struct {
     expected_revision_parameter: ?[]u8,
     idempotency_parameter: ?[]u8,
     event: ?EventMaterialization,
+    document: ?document.Plan,
 
     fn deinit(self: *Effect, allocator: std.mem.Allocator) void {
         if (self.expected_revision_parameter) |name| allocator.free(name);
         if (self.idempotency_parameter) |name| allocator.free(name);
         if (self.event) |*event| event.deinit(allocator);
+        if (self.document) |*plan| plan.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -578,6 +581,15 @@ pub fn resolve(
     plan: *const Plan,
     parameters: *const definition_core.parameters.Bindings,
 ) !ResolvedPlan {
+    return resolveWithGenerated(allocator, plan, parameters, &.{});
+}
+
+pub fn resolveWithGenerated(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    parameters: *const definition_core.parameters.Bindings,
+    generated: []const document.Value,
+) !ResolvedPlan {
     var resolved: ResolvedPlan = .{
         .storage_kind = plan.storage_kind,
         .slot_buffer = undefined,
@@ -591,6 +603,7 @@ pub fn resolve(
                 allocator,
                 slot.path_segments,
                 parameters,
+                generated,
             )
         else
             null;
@@ -642,7 +655,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(11);
+    try encoder.writeU16(12);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -748,6 +761,10 @@ pub fn encodeCache(
                     try encoder.writeBytes(name);
                 }
             }
+            try encoder.writeBool(effect.document != null);
+            if (effect.document) |document_plan| {
+                try document.encodeCache(&document_plan, encoder);
+            }
         }
     }
 }
@@ -756,7 +773,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 11) {
+    if (try decoder.readU16() != 12) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -854,7 +871,7 @@ pub fn validateCachePlan(
             if (effect.kind != .compare_append and
                 !(effect.kind == .bind_existing and
                     slot.kind == .event_log) and
-                input.codec != slot.codec)
+                effect.document == null and input.codec != slot.codec)
             {
                 return error.CacheStoragePlanMismatch;
             }
@@ -891,6 +908,35 @@ pub fn validateCachePlan(
                     event.idempotency != null)
                 {
                     return error.CacheStoragePlanMismatch;
+                }
+            }
+            if (effect.document) |*document_plan| {
+                if (slot.kind != .document or slot.codec != .text or
+                    (effect.kind != .create_new and
+                        effect.kind != .compare_replace) or
+                    effect.event != null)
+                {
+                    return error.CacheStoragePlanMismatch;
+                }
+                switch (document_plan.mode) {
+                    .template => if (effect.kind != .create_new) {
+                        return error.CacheStoragePlanMismatch;
+                    },
+                    .edit => if (effect.kind != .compare_replace) {
+                        return error.CacheStoragePlanMismatch;
+                    },
+                }
+                try document.validateCachePlan(
+                    document_plan,
+                    definition_plan,
+                );
+                if (document_plan.identity) |identity| {
+                    if (!slotPathUsesParameter(
+                        slot,
+                        document.pathOutputName(identity),
+                    )) {
+                        return error.CacheStoragePlanMismatch;
+                    }
                 }
             }
         }
@@ -1040,6 +1086,11 @@ fn decodeCacheOperations(
             else
                 null;
             errdefer if (event) |*value| value.deinit(allocator);
+            var document_plan = if (try decoder.readBool())
+                try document.decodeCache(allocator, decoder)
+            else
+                null;
+            errdefer if (document_plan) |*value| value.deinit(allocator);
             if (kind == .bind_existing and
                 (expected_revision_parameter != null or
                     idempotency_parameter != null))
@@ -1056,6 +1107,24 @@ fn decodeCacheOperations(
             {
                 return error.DuplicateIdempotencySource;
             }
+            if (document_plan != null and event != null) {
+                return error.DuplicateEffectMaterialization;
+            }
+            if (document_plan) |value| {
+                if (slots[slot_index].kind != .document or
+                    slots[slot_index].codec != .text)
+                {
+                    return error.DocumentMaterializationRequiresTextSlot;
+                }
+                switch (value.mode) {
+                    .template => if (kind != .create_new) {
+                        return error.TemplateMaterializationRequiresCreate;
+                    },
+                    .edit => if (kind != .compare_replace) {
+                        return error.EditMaterializationRequiresReplace;
+                    },
+                }
+            }
             effect.* = .{
                 .kind = kind,
                 .slot_index = slot_index,
@@ -1063,8 +1132,10 @@ fn decodeCacheOperations(
                 .expected_revision_parameter = expected_revision_parameter,
                 .idempotency_parameter = idempotency_parameter,
                 .event = event,
+                .document = document_plan,
             };
             event = null;
+            document_plan = null;
             effect_initialized += 1;
         }
         try validateCachedOperation(effects, atomic);
@@ -1865,18 +1936,46 @@ fn compileOperations(
 }
 
 fn validateGeneratedOutputNames(effects: []const Effect) !void {
-    for (effects, 0..) |effect, effect_index| {
-        const event = effect.event orelse continue;
-        for (event.generate) |generated| {
-            for (effects[0..effect_index]) |prior_effect| {
-                const prior_event = prior_effect.event orelse continue;
-                if (findSecureTokenGeneration(
-                    prior_event.generate,
-                    generated.name,
-                ) != null) return error.DuplicateGeneratedOutput;
+    var names: [4096][]const u8 = undefined;
+    var count: usize = 0;
+    for (effects) |effect| {
+        if (effect.event) |event| {
+            for (event.generate) |generated| {
+                try appendGeneratedOutputName(&names, &count, generated.name);
+            }
+            for (event.derive) |derived| {
+                try appendGeneratedOutputName(&names, &count, derived.name);
+            }
+        }
+        if (effect.document) |document_plan| {
+            if (document_plan.identity) |identity| {
+                try appendGeneratedOutputName(&names, &count, identity.name);
+                try appendGeneratedOutputName(
+                    &names,
+                    &count,
+                    identity.timestamp_name,
+                );
+                if (identity.path_name) |path_name| {
+                    try appendGeneratedOutputName(&names, &count, path_name);
+                }
             }
         }
     }
+}
+
+fn appendGeneratedOutputName(
+    names: *[4096][]const u8,
+    count: *usize,
+    name: []const u8,
+) !void {
+    for (names[0..count.*]) |prior| {
+        if (std.mem.eql(u8, prior, name)) {
+            return error.DuplicateGeneratedOutput;
+        }
+    }
+    if (count.* >= names.len) return error.GeneratedOutputCountExceeded;
+    names[count.*] = name;
+    count.* += 1;
 }
 
 fn compileEffect(
@@ -1894,6 +1993,7 @@ fn compileEffect(
         "idempotency_param",
         "event",
         "event_from_operation",
+        "document",
     });
     try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
     const operator = try definition.Operator.parse(
@@ -1919,7 +2019,7 @@ fn compileEffect(
     {
         return error.AppendInputMustBeJson;
     }
-    if (kind != .compare_append and
+    if (kind != .compare_append and object.get("document") == null and
         !(kind == .bind_existing and slots[slot_index].kind == .event_log) and
         input_codec != slots[slot_index].codec)
     {
@@ -1974,6 +2074,35 @@ fn compileEffect(
     {
         return error.DuplicateIdempotencySource;
     }
+    var document_plan = if (object.get("document")) |raw_document|
+        try document.compile(allocator, definition_plan, raw_document)
+    else
+        null;
+    errdefer if (document_plan) |*value| value.deinit(allocator);
+    if (document_plan != null and event != null) {
+        return error.DuplicateEffectMaterialization;
+    }
+    if (document_plan) |value| {
+        if (slots[slot_index].kind != .document or
+            slots[slot_index].codec != .text)
+        {
+            return error.DocumentMaterializationRequiresTextSlot;
+        }
+        switch (value.mode) {
+            .template => if (kind != .create_new) {
+                return error.TemplateMaterializationRequiresCreate;
+            },
+            .edit => if (kind != .compare_replace) {
+                return error.EditMaterializationRequiresReplace;
+            },
+        }
+        if (value.identity) |identity| {
+            if (!slotPathUsesParameter(
+                slots[slot_index],
+                document.pathOutputName(identity),
+            )) return error.GeneratedIdentityMustAddressSlot;
+        }
+    }
     return .{
         .kind = kind,
         .slot_index = @intCast(slot_index),
@@ -1981,7 +2110,19 @@ fn compileEffect(
         .expected_revision_parameter = expected_revision_parameter,
         .idempotency_parameter = idempotency_parameter,
         .event = event,
+        .document = document_plan,
     };
+}
+
+fn slotPathUsesParameter(slot: Slot, name: []const u8) bool {
+    for (slot.path_segments) |segment| {
+        if (segment.kind == .parameter and
+            std.mem.eql(u8, segment.text, name))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn compileReferencedEventMaterialization(
@@ -4079,6 +4220,7 @@ fn resolvePathAlloc(
     allocator: std.mem.Allocator,
     segments: []const PathSegment,
     parameters: *const definition_core.parameters.Bindings,
+    generated: []const document.Value,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -4087,7 +4229,11 @@ fn resolvePathAlloc(
         switch (segment.kind) {
             .literal => try output.writer.writeAll(segment.text),
             .parameter => {
-                const value = pathParameter(parameters, segment.text) orelse
+                const value = pathParameter(
+                    parameters,
+                    generated,
+                    segment.text,
+                ) orelse
                     return error.MissingStoragePathParameter;
                 if (std.mem.indexOfScalar(u8, value, '/') != null) {
                     return error.InvalidStoragePathParameter;
@@ -4106,6 +4252,7 @@ fn resolvePathAlloc(
 
 fn pathParameter(
     parameters: *const definition_core.parameters.Bindings,
+    generated: []const document.Value,
     name: []const u8,
 ) ?[]const u8 {
     for (parameters.items) |binding| {
@@ -4115,7 +4262,24 @@ fn pathParameter(
             else => null,
         };
     }
+    for (generated) |value| {
+        if (std.mem.eql(u8, value.name, name)) return value.value;
+    }
     return null;
+}
+
+pub fn resolveSlotPathAlloc(
+    allocator: std.mem.Allocator,
+    slot: Slot,
+    parameters: *const definition_core.parameters.Bindings,
+    generated: []const document.Value,
+) ![]u8 {
+    return resolvePathAlloc(
+        allocator,
+        slot.path_segments,
+        parameters,
+        generated,
+    );
 }
 
 fn validateLogicalSlotPath(path: []const u8) !void {

@@ -4,6 +4,7 @@ const durable_store = @import("durable_store");
 const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const definition_archive = @import("definition_archive.zig");
+const document = @import("document.zig");
 const materialization = @import("materialization.zig");
 const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
@@ -116,10 +117,26 @@ pub fn transact(
         definition_plan.closure_digest[0..],
         definition_closure.digestSlice(),
     )) return error.DefinitionClosureDigestMismatch;
-    var resolved_storage = try storage.resolve(
+    const unresolved_operation = storage_plan.findOperation(operation_name) orelse
+        return error.UnknownOperation;
+    const transaction_generated = try generateDocumentOutputsAlloc(
+        allocator,
+        storage_plan,
+        unresolved_operation,
+        repo_root,
+        parameters,
+    );
+    defer deinitGeneratedOutputs(allocator, transaction_generated);
+    const generated_values = try documentValueViewsAlloc(
+        allocator,
+        transaction_generated,
+    );
+    defer allocator.free(generated_values);
+    var resolved_storage = try storage.resolveWithGenerated(
         allocator,
         storage_plan,
         parameters,
+        generated_values,
     );
     defer resolved_storage.deinit(allocator);
     const operation = resolved_storage.findOperation(operation_name) orelse
@@ -211,6 +228,7 @@ pub fn transact(
         repo_root,
         &execution,
         parameters,
+        transaction_generated,
     );
     defer {
         for (prepared) |*effect| effect.deinit(allocator);
@@ -865,6 +883,7 @@ fn prepareEffects(
     repo_root: []const u8,
     execution: *const validation.Execution,
     parameters: *const definition_core.parameters.Bindings,
+    transaction_generated: []const protocol.GeneratedOutput,
 ) ![]PreparedEffect {
     const prepared = try allocator.alloc(PreparedEffect, operation.effects.len);
     var initialized: usize = 0;
@@ -883,6 +902,7 @@ fn prepareEffects(
             repo_root,
             execution,
             parameters,
+            transaction_generated,
         );
         initialized += 1;
     }
@@ -899,6 +919,7 @@ fn prepareEffect(
     repo_root: []const u8,
     execution: *const validation.Execution,
     parameters: *const definition_core.parameters.Bindings,
+    transaction_generated: []const protocol.GeneratedOutput,
 ) !PreparedEffect {
     const slot = storage_plan.slot(effect.slot_index);
     const slot_path = try std.fs.path.join(
@@ -1128,6 +1149,39 @@ fn prepareEffect(
                 &protocol_state.?,
                 canonical_input_storage.?,
                 parameters,
+            );
+        }
+    } else if (effect.document) |*document_plan| {
+        const generated_values = try documentValueViewsAlloc(
+            allocator,
+            transaction_generated,
+        );
+        defer allocator.free(generated_values);
+        canonical_input_storage = try document.renderAlloc(
+            allocator,
+            document_plan,
+            canonical_request,
+            execution.inputJson(effect.input_index),
+            slot_before,
+            parameters,
+            generated_values,
+            @min(slot.max_bytes, definition_plan.bounds.max_output_bytes),
+        );
+        if (document_plan.identity) |identity| {
+            allocator.free(generated_outputs);
+            var names = [_][]const u8{
+                identity.name,
+                identity.timestamp_name,
+                "",
+            };
+            const name_count: usize = if (identity.path_name) |path_name| count: {
+                names[2] = path_name;
+                break :count 3;
+            } else 2;
+            generated_outputs = try cloneNamedGeneratedOutputsAlloc(
+                allocator,
+                transaction_generated,
+                names[0..name_count],
             );
         }
     } else {
@@ -1524,6 +1578,178 @@ fn collectGeneratedOutputsAlloc(
         }
     }
     return outputs;
+}
+
+fn generateDocumentOutputsAlloc(
+    allocator: std.mem.Allocator,
+    storage_plan: *const storage.Plan,
+    operation: *const storage.Operation,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) ![]protocol.GeneratedOutput {
+    var outputs: std.ArrayList(protocol.GeneratedOutput) = .empty;
+    errdefer {
+        for (outputs.items) |*output| output.deinit(allocator);
+        outputs.deinit(allocator);
+    }
+    const now_ns: i128 = @intCast(
+        std.Io.Clock.real.now(defaultIo()).nanoseconds,
+    );
+    for (operation.effects) |effect| {
+        const document_plan = effect.document orelse continue;
+        const identity = document_plan.identity orelse continue;
+        if (parameters.find(identity.name) != null or
+            (identity.path_name != null and
+                parameters.find(identity.path_name.?) != null))
+        {
+            return error.GeneratedPathParameterCannotBeSupplied;
+        }
+        for (outputs.items) |output| {
+            if (std.mem.eql(u8, output.name, identity.name) or
+                std.mem.eql(u8, output.name, identity.timestamp_name))
+            {
+                return error.DuplicateGeneratedOutput;
+            }
+        }
+        var created_at: ?[]u8 = try document.rfc3339NanosecondTimestampAlloc(
+            allocator,
+            now_ns,
+        );
+        errdefer if (created_at) |value| allocator.free(value);
+        var selected_id: ?[]u8 = null;
+        errdefer if (selected_id) |value| allocator.free(value);
+        var selected_path: ?[]u8 = null;
+        errdefer if (selected_path) |value| allocator.free(value);
+        var ordinal: u32 = 0;
+        while (ordinal <= identity.max_ordinal) : (ordinal += 1) {
+            const candidate = try document.timestampOrdinalIdAlloc(
+                allocator,
+                identity,
+                now_ns,
+                ordinal,
+            );
+            errdefer allocator.free(candidate);
+            const path_component = if (identity.path_name != null)
+                try document.pathComponentAlloc(
+                    allocator,
+                    identity,
+                    candidate,
+                )
+            else
+                null;
+            errdefer if (path_component) |value| allocator.free(value);
+            var temporary = [_]document.Value{
+                .{ .name = identity.name, .value = candidate },
+                .{ .name = identity.timestamp_name, .value = created_at.? },
+                .{
+                    .name = identity.path_name orelse "",
+                    .value = path_component orelse "",
+                },
+            };
+            const temporary_count: usize = if (identity.path_name != null)
+                3
+            else
+                2;
+            const prior_views = try documentValueViewsAlloc(
+                allocator,
+                outputs.items,
+            );
+            defer allocator.free(prior_views);
+            const values = try allocator.alloc(
+                document.Value,
+                prior_views.len + temporary_count,
+            );
+            defer allocator.free(values);
+            @memcpy(values[0..prior_views.len], prior_views);
+            @memcpy(
+                values[prior_views.len..],
+                temporary[0..temporary_count],
+            );
+            const relative_path = try storage.resolveSlotPathAlloc(
+                allocator,
+                storage_plan.slots[effect.slot_index],
+                parameters,
+                values,
+            );
+            defer allocator.free(relative_path);
+            const absolute_path = try std.fs.path.join(
+                allocator,
+                &.{ repo_root, ".ledger", relative_path },
+            );
+            defer allocator.free(absolute_path);
+            const stat = std.Io.Dir.cwd().statFile(
+                defaultIo(),
+                absolute_path,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    selected_id = candidate;
+                    selected_path = path_component;
+                    break;
+                },
+                else => return err,
+            };
+            if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
+            allocator.free(candidate);
+            if (path_component) |value| allocator.free(value);
+        }
+        const document_id = selected_id orelse
+            return error.TimestampOrdinalExhausted;
+        try outputs.append(allocator, .{
+            .name = try allocator.dupe(u8, identity.name),
+            .value = document_id,
+        });
+        selected_id = null;
+        try outputs.append(allocator, .{
+            .name = try allocator.dupe(u8, identity.timestamp_name),
+            .value = created_at.?,
+        });
+        created_at = null;
+        if (identity.path_name) |path_name| {
+            try outputs.append(allocator, .{
+                .name = try allocator.dupe(u8, path_name),
+                .value = selected_path orelse
+                    return error.GeneratedPathComponentMissing,
+            });
+            selected_path = null;
+        }
+    }
+    return outputs.toOwnedSlice(allocator);
+}
+
+fn documentValueViewsAlloc(
+    allocator: std.mem.Allocator,
+    outputs: []const protocol.GeneratedOutput,
+) ![]document.Value {
+    const values = try allocator.alloc(document.Value, outputs.len);
+    for (outputs, 0..) |output, index| {
+        values[index] = .{ .name = output.name, .value = output.value };
+    }
+    return values;
+}
+
+fn cloneNamedGeneratedOutputsAlloc(
+    allocator: std.mem.Allocator,
+    outputs: []const protocol.GeneratedOutput,
+    names: []const []const u8,
+) ![]protocol.GeneratedOutput {
+    const cloned = try allocator.alloc(protocol.GeneratedOutput, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*output| output.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (names, 0..) |name, index| {
+        const source = for (outputs) |output| {
+            if (std.mem.eql(u8, output.name, name)) break output;
+        } else return error.GeneratedOutputMissing;
+        cloned[index] = .{
+            .name = try allocator.dupe(u8, source.name),
+            .value = try allocator.dupe(u8, source.value),
+        };
+        initialized += 1;
+    }
+    return cloned;
 }
 
 fn deinitGeneratedOutputs(
