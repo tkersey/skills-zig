@@ -1096,8 +1096,7 @@ const Builder = struct {
                         "definition",
                     ),
                 )) return error.ImportedDefinitionIdMismatch;
-                if (imported_definition.storage_kind != .pure or
-                    imported_definition.inputs.len != 1 or
+                if (imported_definition.inputs.len != 1 or
                     imported_definition.inputs[0].codec != .json or
                     !imported_definition.inputs[0].required)
                 {
@@ -9121,13 +9120,13 @@ test "compiled sha256 validates canonical documents and framed streams" {
     );
 }
 
-test "definition references compile imported validators and survive cache round trips" {
+test "definition references reuse transacted validators without effects and survive cache round trips" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "receipt.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","exact-object","enum","scalar-type","tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","parent","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","compare-and-append","exact-object","enum","scalar-type","tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","parent","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/receipts.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"receipt"}]}},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -9203,6 +9202,8 @@ test "definition references compile imported validators and survive cache round 
     );
     defer valid.deinit(std.testing.allocator);
     try std.testing.expect(valid.valid);
+    try std.testing.expect(!valid.authority_granted);
+    try std.testing.expect(!valid.storage_mutated);
 
     var valid_with_optional = try validate(
         std.testing.allocator,

@@ -782,6 +782,9 @@ pub fn materializeEvent(
     const generated_outputs = try generateOutputsAlloc(
         allocator,
         materialization.generate,
+        materialization.derive,
+        request,
+        unix_seconds,
         io,
     );
     errdefer deinitGeneratedOutputs(allocator, generated_outputs);
@@ -838,6 +841,7 @@ pub fn materializeEvent(
                 request_object,
                 state.next_sequence,
                 unix_seconds,
+                generated_outputs,
             );
         }
     }
@@ -877,6 +881,9 @@ pub fn materializePlainEvent(
     const generated_outputs = try generateOutputsAlloc(
         allocator,
         materialization.generate,
+        materialization.derive,
+        request,
+        unix_seconds,
         io,
     );
     errdefer deinitGeneratedOutputs(allocator, generated_outputs);
@@ -920,6 +927,7 @@ pub fn materializePlainEvent(
                 request_object,
                 0,
                 unix_seconds,
+                generated_outputs,
             );
         }
     }
@@ -991,7 +999,7 @@ pub fn reconstructInputAlloc(
     try validateEventMaterialization(plan, materialization);
     const event_object = try definition_core.json.object(event);
     try validateEnvelopeKeys(event_object, plan.envelope.keys);
-    return reconstructInputWithLayoutAlloc(
+    const reconstructed = try reconstructInputWithLayoutAlloc(
         allocator,
         plan,
         state,
@@ -999,6 +1007,15 @@ pub fn reconstructInputAlloc(
         event_object,
         plan.envelope.body_key,
     );
+    errdefer allocator.free(reconstructed);
+    try validateStoredEventDerivations(
+        allocator,
+        materialization,
+        event_object,
+        plan.envelope.body_key,
+        reconstructed,
+    );
+    return reconstructed;
 }
 
 pub fn reconstructPlainInputAlloc(
@@ -1010,7 +1027,7 @@ pub fn reconstructPlainInputAlloc(
         return error.EventMaterializationModeMismatch;
     }
     const event_object = try definition_core.json.object(event);
-    return reconstructInputWithLayoutAlloc(
+    const reconstructed = try reconstructInputWithLayoutAlloc(
         allocator,
         null,
         null,
@@ -1018,6 +1035,146 @@ pub fn reconstructPlainInputAlloc(
         event_object,
         materialization.body_input_field,
     );
+    errdefer allocator.free(reconstructed);
+    try validateStoredEventDerivations(
+        allocator,
+        materialization,
+        event_object,
+        materialization.body_input_field,
+        reconstructed,
+    );
+    return reconstructed;
+}
+
+fn validateStoredEventDerivations(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+    body_key: []const u8,
+    reconstructed: []const u8,
+) !void {
+    if (materialization.derive.len == 0) return;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        reconstructed,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const body = try definition_core.json.object(
+        event.get(body_key) orelse return error.EventEnvelopeFieldMissing,
+    );
+    const outputs = try allocator.alloc(
+        GeneratedOutput,
+        materialization.derive.len,
+    );
+    var initialized: usize = 0;
+    defer {
+        for (outputs[0..initialized]) |*output| output.deinit(allocator);
+        allocator.free(outputs);
+    }
+    for (materialization.derive) |item| {
+        const stored = try storedEventDerivedValue(
+            materialization,
+            event,
+            body,
+            item.name,
+        );
+        const expected = switch (item.source) {
+            .utc_timestamp => |format| blk: {
+                const text = stored orelse
+                    return error.EventDerivedOutputMissing;
+                try validateStoredEventTimestamp(
+                    allocator,
+                    text,
+                    format,
+                );
+                break :blk try allocator.dupe(u8, text);
+            },
+            else => try deriveEventValueAlloc(
+                allocator,
+                item,
+                parsed.value,
+                0,
+                outputs[0..initialized],
+            ),
+        };
+        errdefer {
+            @memset(expected, 0);
+            allocator.free(expected);
+        }
+        if (stored) |actual| {
+            if (!std.mem.eql(u8, expected, actual)) {
+                return error.EventDerivedValueMismatch;
+            }
+        }
+        outputs[initialized] = .{
+            .name = try allocator.dupe(u8, item.name),
+            .value = expected,
+        };
+        initialized += 1;
+    }
+}
+
+fn storedEventDerivedValue(
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+    body: std.json.ObjectMap,
+    name: []const u8,
+) !?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (materialization.fields) |field| switch (field.source) {
+        .derived => |candidate| {
+            if (!std.mem.eql(u8, candidate, name)) continue;
+            const value = event.get(field.field) orelse
+                return error.EventEnvelopeFieldMissing;
+            const text = try definition_core.json.string(value);
+            if (found) |prior| {
+                if (!std.mem.eql(u8, prior, text)) {
+                    return error.EventDerivedValueMismatch;
+                }
+            } else {
+                found = text;
+            }
+        },
+        else => {},
+    };
+    for (materialization.body_fields) |field| switch (field.source) {
+        .derived => |candidate| {
+            if (!std.mem.eql(u8, candidate, name)) continue;
+            const value = body.get(field.field) orelse
+                return error.EventBodyFieldMissing;
+            const text = try definition_core.json.string(value);
+            if (found) |prior| {
+                if (!std.mem.eql(u8, prior, text)) {
+                    return error.EventDerivedValueMismatch;
+                }
+            } else {
+                found = text;
+            }
+        },
+        else => {},
+    };
+    return found;
+}
+
+fn validateStoredEventTimestamp(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    format: storage.EventTimestampFormat,
+) !void {
+    switch (format) {
+        .rfc3339_seconds => {
+            const compact = try compactUtcTimestampAlloc(
+                allocator,
+                value,
+            );
+            defer allocator.free(compact);
+        },
+    }
 }
 
 fn reconstructInputWithLayoutAlloc(
@@ -1104,6 +1261,9 @@ fn reconstructInputWithLayoutAlloc(
                 },
                 else => return error.InvalidEventUnixTimestamp,
             },
+            .derived => {
+                if (value != .string) return error.EventDerivedValueInvalid;
+            },
         }
     }
     for (materialization.request_literals) |literal| {
@@ -1172,9 +1332,17 @@ fn validateForbiddenParameters(
 fn generateOutputsAlloc(
     allocator: std.mem.Allocator,
     definitions: []const storage.SecureTokenGeneration,
+    derivations: []const storage.EventDerivation,
+    request: std.json.Value,
+    unix_seconds: i64,
     io: std.Io,
 ) ![]GeneratedOutput {
-    const outputs = try allocator.alloc(GeneratedOutput, definitions.len);
+    const count = std.math.add(
+        usize,
+        definitions.len,
+        derivations.len,
+    ) catch return error.EventGeneratedOutputCountExceeded;
+    const outputs = try allocator.alloc(GeneratedOutput, count);
     var initialized: usize = 0;
     errdefer {
         for (outputs[0..initialized]) |*output| output.deinit(allocator);
@@ -1204,7 +1372,329 @@ fn generateOutputsAlloc(
         };
         initialized += 1;
     }
+    for (derivations) |item| {
+        const value = try deriveEventValueAlloc(
+            allocator,
+            item,
+            request,
+            unix_seconds,
+            outputs[0..initialized],
+        );
+        errdefer {
+            @memset(value, 0);
+            allocator.free(value);
+        }
+        outputs[initialized] = .{
+            .name = try allocator.dupe(u8, item.name),
+            .value = value,
+        };
+        initialized += 1;
+    }
+    std.mem.sort(GeneratedOutput, outputs, {}, struct {
+        fn lessThan(
+            _: void,
+            left: GeneratedOutput,
+            right: GeneratedOutput,
+        ) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
     return outputs;
+}
+
+fn deriveEventValueAlloc(
+    allocator: std.mem.Allocator,
+    item: storage.EventDerivation,
+    request: std.json.Value,
+    unix_seconds: i64,
+    prior: []const GeneratedOutput,
+) ![]u8 {
+    return switch (item.source) {
+        .input_text => |pointer| blk: {
+            const value = definition_core.json_pointer.lookup(
+                request,
+                pointer,
+            ) orelse return error.EventDerivationInputMissing;
+            const text = try definition_core.json.string(value);
+            break :blk try allocator.dupe(u8, text);
+        },
+        .utc_timestamp => |format| formatEventTimestampAlloc(
+            allocator,
+            unix_seconds,
+            format,
+        ),
+        .sha256 => |config| deriveEventSha256Alloc(
+            allocator,
+            request,
+            prior,
+            config,
+        ),
+        .concat => |config| deriveEventConcatAlloc(
+            allocator,
+            request,
+            prior,
+            config,
+        ),
+    };
+}
+
+fn deriveEventSha256Alloc(
+    allocator: std.mem.Allocator,
+    request: std.json.Value,
+    prior: []const GeneratedOutput,
+    config: storage.EventDigestDerivation,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var total_bytes: usize = 0;
+    for (config.fragments) |fragment| {
+        const bytes = try eventDerivationFragmentAlloc(
+            allocator,
+            request,
+            prior,
+            fragment,
+        );
+        defer allocator.free(bytes);
+        total_bytes = std.math.add(
+            usize,
+            total_bytes,
+            bytes.len,
+        ) catch return error.EventDerivationBytesExceeded;
+        if (total_bytes > config.max_bytes) {
+            return error.EventDerivationBytesExceeded;
+        }
+        hasher.update(bytes);
+    }
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return switch (config.encoding) {
+        .hex => allocator.dupe(u8, &hex),
+        .digest => std.fmt.allocPrint(allocator, "sha256:{s}", .{hex}),
+    };
+}
+
+fn deriveEventConcatAlloc(
+    allocator: std.mem.Allocator,
+    request: std.json.Value,
+    prior: []const GeneratedOutput,
+    config: storage.EventConcatDerivation,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    for (config.fragments) |fragment| {
+        const bytes = try eventDerivationFragmentAlloc(
+            allocator,
+            request,
+            prior,
+            fragment,
+        );
+        defer allocator.free(bytes);
+        const next = std.math.add(
+            usize,
+            output.written().len,
+            bytes.len,
+        ) catch return error.EventDerivationBytesExceeded;
+        if (next > config.max_bytes) {
+            return error.EventDerivationBytesExceeded;
+        }
+        try output.writer.writeAll(bytes);
+    }
+    return output.toOwnedSlice();
+}
+
+fn eventDerivationFragmentAlloc(
+    allocator: std.mem.Allocator,
+    request: std.json.Value,
+    prior: []const GeneratedOutput,
+    fragment: storage.EventDerivationFragment,
+) ![]u8 {
+    return switch (fragment) {
+        .literal => |value| allocator.dupe(u8, value),
+        .input_text => |pointer| blk: {
+            const value = definition_core.json_pointer.lookup(
+                request,
+                pointer,
+            ) orelse return error.EventDerivationInputMissing;
+            break :blk try allocator.dupe(
+                u8,
+                try definition_core.json.string(value),
+            );
+        },
+        .input_json => |pointer| blk: {
+            const value = definition_core.json_pointer.lookup(
+                request,
+                pointer,
+            ) orelse return error.EventDerivationInputMissing;
+            var output: std.Io.Writer.Allocating = .init(allocator);
+            errdefer output.deinit();
+            try std.json.Stringify.value(value, .{}, &output.writer);
+            break :blk try output.toOwnedSlice();
+        },
+        .canonical_input => |pointer| blk: {
+            const value = definition_core.json_pointer.lookup(
+                request,
+                pointer,
+            ) orelse return error.EventDerivationInputMissing;
+            break :blk try definition_core.canonical_json.canonicalJsonAlloc(
+                allocator,
+                value,
+            );
+        },
+        .derived => |reference| blk: {
+            const output = findGeneratedOutputLinear(
+                prior,
+                reference.name,
+            ) orelse return error.EventDerivedOutputMissing;
+            const transformed = switch (reference.transform) {
+                .none => try allocator.dupe(u8, output.value),
+                .compact_utc => try compactUtcTimestampAlloc(
+                    allocator,
+                    output.value,
+                ),
+            };
+            errdefer allocator.free(transformed);
+            if (reference.prefix_bytes) |count| {
+                if (count > transformed.len or
+                    !std.unicode.utf8ValidateSlice(transformed[0..count]))
+                {
+                    return error.EventDerivedPrefixInvalid;
+                }
+                const prefix = try allocator.dupe(
+                    u8,
+                    transformed[0..count],
+                );
+                allocator.free(transformed);
+                break :blk prefix;
+            }
+            break :blk transformed;
+        },
+    };
+}
+
+fn formatEventTimestampAlloc(
+    allocator: std.mem.Allocator,
+    unix_seconds: i64,
+    format: storage.EventTimestampFormat,
+) ![]u8 {
+    if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
+    const seconds_per_day: i64 = 86_400;
+    const days = @divFloor(unix_seconds, seconds_per_day);
+    const seconds_of_day = unix_seconds - days * seconds_per_day;
+    const civil = civilDateFromUnixDays(days);
+    const hour = @divFloor(seconds_of_day, 3600);
+    const minute = @divFloor(seconds_of_day - hour * 3600, 60);
+    const second = seconds_of_day - hour * 3600 - minute * 60;
+    return switch (format) {
+        .rfc3339_seconds => std.fmt.allocPrint(
+            allocator,
+            "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+            .{
+                @as(u32, @intCast(civil.year)),
+                @as(u32, @intCast(civil.month)),
+                @as(u32, @intCast(civil.day)),
+                @as(u32, @intCast(hour)),
+                @as(u32, @intCast(minute)),
+                @as(u32, @intCast(second)),
+            },
+        ),
+    };
+}
+
+const EventCivilDate = struct {
+    year: i64,
+    month: i64,
+    day: i64,
+};
+
+fn civilDateFromUnixDays(days_since_epoch: i64) EventCivilDate {
+    const shifted = days_since_epoch + 719_468;
+    const era = @divFloor(shifted, 146_097);
+    const day_of_era = shifted - era * 146_097;
+    const year_of_era = @divFloor(
+        day_of_era - @divFloor(day_of_era, 1460) +
+            @divFloor(day_of_era, 36_524) -
+            @divFloor(day_of_era, 146_096),
+        365,
+    );
+    var year = year_of_era + era * 400;
+    const day_of_year = day_of_era -
+        (365 * year_of_era + @divFloor(year_of_era, 4) -
+            @divFloor(year_of_era, 100));
+    const month_prime = @divFloor(5 * day_of_year + 2, 153);
+    const day = day_of_year -
+        @divFloor(153 * month_prime + 2, 5) + 1;
+    const month = month_prime + (if (month_prime < 10) @as(i64, 3) else -9);
+    year += @intFromBool(month <= 2);
+    return .{ .year = year, .month = month, .day = day };
+}
+
+fn compactUtcTimestampAlloc(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+) ![]u8 {
+    if (value.len != 20 or
+        value[4] != '-' or
+        value[7] != '-' or
+        value[10] != 'T' or
+        value[13] != ':' or
+        value[16] != ':' or
+        value[19] != 'Z')
+    {
+        return error.EventTimestampTransformInvalid;
+    }
+    const digit_indexes = [_]usize{
+        0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18,
+    };
+    for (digit_indexes) |index| {
+        if (!std.ascii.isDigit(value[index])) {
+            return error.EventTimestampTransformInvalid;
+        }
+    }
+    const year = std.fmt.parseInt(u16, value[0..4], 10) catch
+        return error.EventTimestampTransformInvalid;
+    const month = std.fmt.parseInt(u8, value[5..7], 10) catch
+        return error.EventTimestampTransformInvalid;
+    const day = std.fmt.parseInt(u8, value[8..10], 10) catch
+        return error.EventTimestampTransformInvalid;
+    const hour = std.fmt.parseInt(u8, value[11..13], 10) catch
+        return error.EventTimestampTransformInvalid;
+    const minute = std.fmt.parseInt(u8, value[14..16], 10) catch
+        return error.EventTimestampTransformInvalid;
+    const second = std.fmt.parseInt(u8, value[17..19], 10) catch
+        return error.EventTimestampTransformInvalid;
+    if (year == 0 or
+        month == 0 or
+        month > 12 or
+        day == 0 or
+        day > daysInEventMonth(year, month) or
+        hour > 23 or
+        minute > 59 or
+        second > 59)
+    {
+        return error.EventTimestampTransformInvalid;
+    }
+    const compact = try allocator.alloc(u8, 16);
+    @memcpy(compact[0..4], value[0..4]);
+    @memcpy(compact[4..6], value[5..7]);
+    @memcpy(compact[6..8], value[8..10]);
+    compact[8] = 'T';
+    @memcpy(compact[9..11], value[11..13]);
+    @memcpy(compact[11..13], value[14..16]);
+    @memcpy(compact[13..15], value[17..19]);
+    compact[15] = 'Z';
+    return compact;
+}
+
+fn daysInEventMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0))
+            29
+        else
+            28,
+        else => 0,
+    };
 }
 
 fn deinitGeneratedOutputs(
@@ -1256,7 +1746,11 @@ fn materializedBodyAlloc(
                     mapping.request_literal,
                 )) return error.EventLiteralMismatch;
             },
-            .generated_sha256, .parameter_sha256, .state_value => {
+            .generated_sha256,
+            .parameter_sha256,
+            .state_value,
+            .derived,
+            => {
                 if (actual != null) return error.EventBodyFieldCollision;
             },
         }
@@ -1529,6 +2023,16 @@ fn writeMaterializedBodyField(
         .literal_mapping => |mapping| {
             try writer.writeAll(mapping.stored_literal);
         },
+        .derived => |name| {
+            const generated = findGeneratedOutput(
+                generated_outputs,
+                name,
+            ) orelse return error.EventDerivedOutputMissing;
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                generated.value,
+            );
+        },
         .request_input => unreachable,
     }
 }
@@ -1604,7 +2108,11 @@ fn reconstructedBodyAlloc(
                 .value = .{ .literal = mapping.request_literal },
             });
         },
-        .generated_sha256, .parameter_sha256, .state_value => {},
+        .generated_sha256,
+        .parameter_sha256,
+        .state_value,
+        .derived,
+        => {},
     };
     std.mem.sort(Mapping, mappings.items, {}, struct {
         fn lessThan(_: void, left: Mapping, right: Mapping) bool {
@@ -1693,6 +2201,9 @@ fn validateStoredBodyField(
                 actual,
                 mapping.stored_literal,
             )) return error.EventLiteralMismatch;
+        },
+        .derived => {
+            if (actual != .string) return error.EventDerivedValueInvalid;
         },
         .request_input => unreachable,
     }
@@ -1800,6 +2311,16 @@ fn findGeneratedOutput(
             .gt => high = mid,
             .eq => return &outputs[mid],
         }
+    }
+    return null;
+}
+
+fn findGeneratedOutputLinear(
+    outputs: []const GeneratedOutput,
+    name: []const u8,
+) ?*const GeneratedOutput {
+    for (outputs) |*output| {
+        if (std.mem.eql(u8, output.name, name)) return output;
     }
     return null;
 }
@@ -1917,6 +2438,7 @@ fn writeMaterializedField(
     request: std.json.ObjectMap,
     sequence: u64,
     unix_seconds: i64,
+    generated_outputs: []const GeneratedOutput,
 ) !void {
     switch (source) {
         .input_field => |input_field| {
@@ -1942,6 +2464,16 @@ fn writeMaterializedField(
             );
         },
         .unix_seconds => try writer.print("{d}", .{unix_seconds}),
+        .derived => |name| {
+            const generated = findGeneratedOutput(
+                generated_outputs,
+                name,
+            ) orelse return error.EventDerivedOutputMissing;
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                generated.value,
+            );
+        },
     }
 }
 
@@ -2553,6 +3085,7 @@ fn validateEventMaterialization(
             if (matches != 1) return error.EventBodyRequestInputMissing;
         },
         .literal_mapping => {},
+        .derived => {},
     };
 }
 
@@ -3238,4 +3771,198 @@ test "event protocol rejects unknown kinds and broken digest links" {
         error.EventPreviousDigestMismatch,
         apply(std.testing.allocator, &plan, &linked_state, broken),
     );
+}
+
+test "plain event derivations preserve timestamp fingerprint and identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{
+        \\  "schema":"ledger-artifact-definition/v1",
+        \\  "id":"example/derived-events",
+        \\  "owner":"example",
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","composite-identity","event-materialization","exact-object","sha256","timestamp"]},
+        \\  "parameters":{},
+        \\  "inputs":{"submission":{"codec":"json","max_bytes":4096}},
+        \\  "canonicalization":{},
+        \\  "shape":{"rules":[
+        \\    {"op":"exact-object","input":"submission","path":"","keys":["logical_kind","note","physical_kind"]},
+        \\    {"op":"exact-object","input":"submission","path":"/note","keys":["operation","summary"]}
+        \\  ]},
+        \\  "constraints":[],
+        \\  "identity":{},
+        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/derived-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+        \\  "operations":{"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{
+        \\    "mode":"plain",
+        \\    "body_input_field":"note",
+        \\    "field_order":["v","source","event","syn_id","captured_at","kind","logical_kind","operation","note"],
+        \\    "body_order":["id","captured_at","logical_kind","kind","operation","summary","fingerprint"],
+        \\    "fields":[
+        \\      {"field":"v","literal":1},
+        \\      {"field":"source","literal":"synesthesia"},
+        \\      {"field":"event","literal":"synesthesia.capture"},
+        \\      {"field":"syn_id","derived":"syn_id"},
+        \\      {"field":"captured_at","derived":"captured_at"},
+        \\      {"field":"kind","input_field":"physical_kind"},
+        \\      {"field":"logical_kind","input_field":"logical_kind"},
+        \\      {"field":"operation","derived":"operation"}
+        \\    ],
+        \\    "derive":[
+        \\      {"name":"physical_kind","op":"input-text","pointer":"/physical_kind"},
+        \\      {"name":"logical_kind","op":"input-text","pointer":"/logical_kind"},
+        \\      {"name":"operation","op":"input-text","pointer":"/note/operation"},
+        \\      {"name":"captured_at","op":"utc-timestamp","format":"rfc3339-seconds"},
+        \\      {"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[
+        \\        {"literal":"synesthesia\n"},
+        \\        {"input_text":"/physical_kind"},
+        \\        {"literal":"\n"},
+        \\        {"input_text":"/logical_kind"},
+        \\        {"literal":"\n"},
+        \\        {"input_json":"/note"}
+        \\      ],"max_bytes":4096},
+        \\      {"name":"syn_id","op":"concat","fragments":[
+        \\        {"literal":"SYN-"},
+        \\        {"derived":"captured_at","transform":"compact-utc"},
+        \\        {"literal":"-"},
+        \\        {"derived":"fingerprint","prefix_bytes":16}
+        \\      ],"max_bytes":64}
+        \\    ],
+        \\    "body_fields":[
+        \\      {"field":"id","derived":"syn_id"},
+        \\      {"field":"captured_at","derived":"captured_at"},
+        \\      {"field":"logical_kind","derived":"logical_kind"},
+        \\      {"field":"kind","derived":"physical_kind"},
+        \\      {"field":"fingerprint","derived":"fingerprint"}
+        \\    ]
+        \\  }}]}},
+        \\  "projections":{},
+        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try storage.encodeCache(&storage_plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try storage.decodeCache(
+        std.testing.allocator,
+        &decoder,
+    );
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try storage.validateCachePlan(&cached, &definition_plan);
+    const materialization = &cached.operations[0].effects[0].event.?;
+    const request =
+        \\{"logical_kind":"mapping-endorsement","note":{"operation":"assert","summary":"hello"},"physical_kind":"mapping-endorsement"}
+    ;
+    var parsed_request = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        request,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed_request.deinit();
+    var materialized = try materializePlainEvent(
+        std.testing.allocator,
+        materialization,
+        parsed_request.value,
+        null,
+        1_782_822_896,
+        std.testing.io,
+    );
+    defer materialized.deinit(std.testing.allocator);
+    const expected =
+        \\{"v":1,"source":"synesthesia","event":"synesthesia.capture","syn_id":"SYN-20260630T123456Z-572b35ef6ea23262","captured_at":"2026-06-30T12:34:56Z","kind":"mapping-endorsement","logical_kind":"mapping-endorsement","operation":"assert","note":{"id":"SYN-20260630T123456Z-572b35ef6ea23262","captured_at":"2026-06-30T12:34:56Z","logical_kind":"mapping-endorsement","kind":"mapping-endorsement","operation":"assert","summary":"hello","fingerprint":"572b35ef6ea2326244cd17228446b62418557e2c5839db516e83a3bd4fd1504a"}}
+    ;
+    try std.testing.expectEqualStrings(expected, materialized.content);
+    try std.testing.expectEqual(@as(usize, 6), materialized.generated_outputs.len);
+    var parsed_event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        materialized.content,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed_event.deinit();
+    const reconstructed = try reconstructPlainInputAlloc(
+        std.testing.allocator,
+        materialization,
+        parsed_event.value,
+    );
+    defer std.testing.allocator.free(reconstructed);
+    try std.testing.expectEqualStrings(request, reconstructed);
+
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        materialized.content,
+        "572b35ef6ea2326244cd17228446b62418557e2c5839db516e83a3bd4fd1504a",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    defer std.testing.allocator.free(tampered);
+    var parsed_tampered = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        tampered,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed_tampered.deinit();
+    try std.testing.expectError(
+        error.EventDerivedValueMismatch,
+        reconstructPlainInputAlloc(
+            std.testing.allocator,
+            materialization,
+            parsed_tampered.value,
+        ),
+    );
+}
+
+test "compact UTC timestamp rejects impossible calendar values" {
+    const invalid = [_][]const u8{
+        "0000-01-01T00:00:00Z",
+        "2026-00-01T00:00:00Z",
+        "2026-13-01T00:00:00Z",
+        "2026-02-29T00:00:00Z",
+        "2024-02-30T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-01-01T24:00:00Z",
+        "2026-01-01T00:60:00Z",
+        "2026-01-01T00:00:60Z",
+    };
+    for (invalid) |value| {
+        try std.testing.expectError(
+            error.EventTimestampTransformInvalid,
+            compactUtcTimestampAlloc(std.testing.allocator, value),
+        );
+    }
+    const leap = try compactUtcTimestampAlloc(
+        std.testing.allocator,
+        "2024-02-29T23:59:59Z",
+    );
+    defer std.testing.allocator.free(leap);
+    try std.testing.expectEqualStrings("20240229T235959Z", leap);
 }

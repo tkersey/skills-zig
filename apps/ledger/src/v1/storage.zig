@@ -81,6 +81,7 @@ pub const EventFieldSource = union(enum) {
     literal: []u8,
     sequence_text_prefix: []u8,
     unix_seconds,
+    derived: []u8,
 
     fn deinit(self: *EventFieldSource, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -88,6 +89,7 @@ pub const EventFieldSource = union(enum) {
             .literal => |value| allocator.free(value),
             .sequence_text_prefix => |value| allocator.free(value),
             .unix_seconds => {},
+            .derived => |value| allocator.free(value),
         }
         self.* = undefined;
     }
@@ -138,6 +140,133 @@ pub const SecureTokenGeneration = struct {
     }
 };
 
+pub const EventTimestampFormat = enum {
+    rfc3339_seconds,
+
+    fn parse(text: []const u8) !EventTimestampFormat {
+        if (std.mem.eql(u8, text, "rfc3339-seconds")) {
+            return .rfc3339_seconds;
+        }
+        return error.UnsupportedEventTimestampFormat;
+    }
+};
+
+pub const EventDigestEncoding = enum {
+    hex,
+    digest,
+
+    fn parse(text: []const u8) !EventDigestEncoding {
+        if (std.mem.eql(u8, text, "hex")) return .hex;
+        if (std.mem.eql(u8, text, "digest")) return .digest;
+        return error.UnsupportedEventDigestEncoding;
+    }
+};
+
+pub const EventDerivedTransform = enum {
+    none,
+    compact_utc,
+
+    fn parse(text: []const u8) !EventDerivedTransform {
+        if (std.mem.eql(u8, text, "none")) return .none;
+        if (std.mem.eql(u8, text, "compact-utc")) return .compact_utc;
+        return error.UnsupportedEventDerivedTransform;
+    }
+};
+
+pub const EventDerivedReference = struct {
+    name: []u8,
+    prefix_bytes: ?u16,
+    transform: EventDerivedTransform,
+
+    fn deinit(
+        self: *EventDerivedReference,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+pub const EventDerivationFragment = union(enum) {
+    literal: []u8,
+    input_text: definition_core.json_pointer.Pointer,
+    input_json: definition_core.json_pointer.Pointer,
+    canonical_input: definition_core.json_pointer.Pointer,
+    derived: EventDerivedReference,
+
+    fn deinit(
+        self: *EventDerivationFragment,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (self.*) {
+            .literal => |value| allocator.free(value),
+            .input_text, .input_json, .canonical_input => |*pointer| {
+                pointer.deinit(allocator);
+            },
+            .derived => |*reference| reference.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const EventDigestDerivation = struct {
+    encoding: EventDigestEncoding,
+    fragments: []EventDerivationFragment,
+    max_bytes: usize,
+
+    fn deinit(
+        self: *EventDigestDerivation,
+        allocator: std.mem.Allocator,
+    ) void {
+        deinitEventDerivationFragments(allocator, self.fragments);
+        self.* = undefined;
+    }
+};
+
+pub const EventConcatDerivation = struct {
+    fragments: []EventDerivationFragment,
+    max_bytes: usize,
+
+    fn deinit(
+        self: *EventConcatDerivation,
+        allocator: std.mem.Allocator,
+    ) void {
+        deinitEventDerivationFragments(allocator, self.fragments);
+        self.* = undefined;
+    }
+};
+
+pub const EventDerivationSource = union(enum) {
+    input_text: definition_core.json_pointer.Pointer,
+    utc_timestamp: EventTimestampFormat,
+    sha256: EventDigestDerivation,
+    concat: EventConcatDerivation,
+
+    fn deinit(
+        self: *EventDerivationSource,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (self.*) {
+            .input_text => |*pointer| pointer.deinit(allocator),
+            .utc_timestamp => {},
+            .sha256 => |*config| config.deinit(allocator),
+            .concat => |*config| config.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const EventDerivation = struct {
+    name: []u8,
+    source: EventDerivationSource,
+
+    fn deinit(self: *EventDerivation, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.source.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const StateValueSource = struct {
     register: []u8,
     pointer: definition_core.json_pointer.Pointer,
@@ -177,6 +306,7 @@ pub const EventBodyFieldSource = union(enum) {
     state_value: StateValueSource,
     request_input: []u8,
     literal_mapping: LiteralMappingSource,
+    derived: []u8,
 
     fn deinit(self: *EventBodyFieldSource, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -185,6 +315,7 @@ pub const EventBodyFieldSource = union(enum) {
             .state_value => |*source| source.deinit(allocator),
             .request_input => |name| allocator.free(name),
             .literal_mapping => |*source| source.deinit(allocator),
+            .derived => |name| allocator.free(name),
         }
         self.* = undefined;
     }
@@ -209,6 +340,7 @@ pub const EventMaterialization = struct {
     fields: []EventField,
     request_literals: []RequestLiteral,
     generate: []SecureTokenGeneration,
+    derive: []EventDerivation,
     body_fields: []EventBodyField,
     forbidden_parameters: [][]u8,
 
@@ -222,6 +354,8 @@ pub const EventMaterialization = struct {
         allocator.free(self.request_literals);
         for (self.generate) |*item| item.deinit(allocator);
         allocator.free(self.generate);
+        for (self.derive) |*item| item.deinit(allocator);
+        allocator.free(self.derive);
         for (self.body_fields) |*field| field.deinit(allocator);
         allocator.free(self.body_fields);
         for (self.forbidden_parameters) |name| allocator.free(name);
@@ -438,7 +572,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(7);
+    try encoder.writeU16(8);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -483,6 +617,7 @@ pub fn encodeCache(
                             try encoder.writeBytes(value);
                         },
                         .unix_seconds => {},
+                        .derived => |value| try encoder.writeBytes(value),
                     }
                 }
                 try encoder.writeCount(event.request_literals.len);
@@ -496,6 +631,7 @@ pub fn encodeCache(
                     try encoder.writeBytes(item.prefix);
                     try encoder.writeByte(item.byte_count);
                 }
+                try encodeEventDerivations(event.derive, encoder);
                 try encoder.writeCount(event.body_fields.len);
                 for (event.body_fields) |field| {
                     try encoder.writeBytes(field.field);
@@ -521,6 +657,7 @@ pub fn encodeCache(
                             try encoder.writeBytes(source.request_literal);
                             try encoder.writeBytes(source.stored_literal);
                         },
+                        .derived => |name| try encoder.writeBytes(name),
                     }
                 }
                 try encoder.writeCount(event.forbidden_parameters.len);
@@ -536,7 +673,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 7) {
+    if (try decoder.readU16() != 8) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -893,6 +1030,7 @@ fn decodeEventMaterialization(
             .literal => .{ .literal = try decoder.readBytesAlloc(allocator, 4096) },
             .sequence_text_prefix => .{ .sequence_text_prefix = try decoder.readBytesAlloc(allocator, 128) },
             .unix_seconds => .unix_seconds,
+            .derived => .{ .derived = try decoder.readBytesAlloc(allocator, 128) },
         };
         errdefer if (source) |*value| value.deinit(allocator);
         switch (source.?) {
@@ -906,6 +1044,9 @@ fn decodeEventMaterialization(
                 }
             },
             .unix_seconds => {},
+            .derived => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            },
         }
         field.* = .{ .field = name, .source = source.? };
         source = null;
@@ -921,6 +1062,12 @@ fn decodeEventMaterialization(
         decoder,
     );
     errdefer deinitSecureTokenGenerations(allocator, generate);
+    const derive = try decodeEventDerivations(
+        allocator,
+        decoder,
+        generate,
+    );
+    errdefer deinitEventDerivations(allocator, derive);
     const body_fields = try decodeEventBodyFields(
         allocator,
         decoder,
@@ -940,6 +1087,7 @@ fn decodeEventMaterialization(
         .fields = fields,
         .request_literals = request_literals,
         .generate = generate,
+        .derive = derive,
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
@@ -987,6 +1135,193 @@ fn decodeSecureTokenGenerations(
     return items;
 }
 
+fn encodeEventDerivations(
+    items: []const EventDerivation,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(items.len);
+    for (items) |item| {
+        try encoder.writeBytes(item.name);
+        try encoder.writeEnum(std.meta.activeTag(item.source));
+        switch (item.source) {
+            .input_text => |pointer| try encoder.writeBytes(pointer.raw),
+            .utc_timestamp => |format| try encoder.writeEnum(format),
+            .sha256 => |config| {
+                try encoder.writeEnum(config.encoding);
+                try encoder.writeUsize(config.max_bytes);
+                try encodeEventDerivationFragments(
+                    config.fragments,
+                    encoder,
+                );
+            },
+            .concat => |config| {
+                try encoder.writeUsize(config.max_bytes);
+                try encodeEventDerivationFragments(
+                    config.fragments,
+                    encoder,
+                );
+            },
+        }
+    }
+}
+
+fn encodeEventDerivationFragments(
+    fragments: []const EventDerivationFragment,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(fragments.len);
+    for (fragments) |fragment| {
+        try encoder.writeEnum(std.meta.activeTag(fragment));
+        switch (fragment) {
+            .literal => |value| try encoder.writeBytes(value),
+            .input_text, .input_json, .canonical_input => |pointer| {
+                try encoder.writeBytes(pointer.raw);
+            },
+            .derived => |reference| {
+                try encoder.writeBytes(reference.name);
+                try encoder.writeBool(reference.prefix_bytes != null);
+                if (reference.prefix_bytes) |count| {
+                    try encoder.writeU16(count);
+                }
+                try encoder.writeEnum(reference.transform);
+            },
+        }
+    }
+}
+
+fn decodeEventDerivations(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    generate: []const SecureTokenGeneration,
+) ![]EventDerivation {
+    const count = try decoder.readCount(16);
+    const items = try allocator.alloc(EventDerivation, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    for (items, 0..) |*item, index| {
+        var name: ?[]u8 = try decoder.readBytesAlloc(allocator, 128);
+        errdefer if (name) |value| allocator.free(value);
+        try definition_core.json.safeIdentifier(name.?, 128);
+        var source: ?EventDerivationSource = switch (try decoder.readEnum(
+            std.meta.Tag(EventDerivationSource),
+        )) {
+            .input_text => .{ .input_text = try decodeEventPointer(
+                allocator,
+                decoder,
+            ) },
+            .utc_timestamp => .{ .utc_timestamp = try decoder.readEnum(
+                EventTimestampFormat,
+            ) },
+            .sha256 => .{ .sha256 = .{
+                .encoding = try decoder.readEnum(EventDigestEncoding),
+                .max_bytes = try decoder.readUsize(),
+                .fragments = try decodeEventDerivationFragments(
+                    allocator,
+                    decoder,
+                ),
+            } },
+            .concat => .{ .concat = .{
+                .max_bytes = try decoder.readUsize(),
+                .fragments = try decodeEventDerivationFragments(
+                    allocator,
+                    decoder,
+                ),
+            } },
+        };
+        errdefer if (source) |*value| value.deinit(allocator);
+        const candidate: EventDerivation = .{
+            .name = name.?,
+            .source = source.?,
+        };
+        try validateEventDerivation(&candidate);
+        for (generate) |generated| {
+            if (std.mem.eql(u8, generated.name, candidate.name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        for (items[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, candidate.name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        try validateEventDerivationReferences(
+            &candidate,
+            items[0..index],
+        );
+        item.* = candidate;
+        name = null;
+        source = null;
+        initialized += 1;
+    }
+    return items;
+}
+
+fn decodeEventPointer(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !definition_core.json_pointer.Pointer {
+    const text = try decoder.readBytesAlloc(allocator, 1024);
+    defer allocator.free(text);
+    return compileEventPointer(allocator, text);
+}
+
+fn decodeEventDerivationFragments(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]EventDerivationFragment {
+    const count = try decoder.readCount(64);
+    if (count == 0) return error.InvalidEventDerivationFragments;
+    const fragments = try allocator.alloc(EventDerivationFragment, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| {
+            fragment.deinit(allocator);
+        }
+        allocator.free(fragments);
+    }
+    for (fragments) |*fragment| {
+        fragment.* = switch (try decoder.readEnum(
+            std.meta.Tag(EventDerivationFragment),
+        )) {
+            .literal => .{ .literal = try decoder.readBytesAlloc(
+                allocator,
+                4096,
+            ) },
+            .input_text => .{ .input_text = try decodeEventPointer(
+                allocator,
+                decoder,
+            ) },
+            .input_json => .{ .input_json = try decodeEventPointer(
+                allocator,
+                decoder,
+            ) },
+            .canonical_input => .{ .canonical_input = try decodeEventPointer(allocator, decoder) },
+            .derived => blk: {
+                const name = try decoder.readBytesAlloc(allocator, 128);
+                errdefer allocator.free(name);
+                try definition_core.json.safeIdentifier(name, 128);
+                const prefix_bytes = if (try decoder.readBool())
+                    try decoder.readU16()
+                else
+                    null;
+                break :blk .{ .derived = .{
+                    .name = name,
+                    .prefix_bytes = prefix_bytes,
+                    .transform = try decoder.readEnum(
+                        EventDerivedTransform,
+                    ),
+                } };
+            },
+        };
+        initialized += 1;
+    }
+    try validateEventDerivationFragments(fragments);
+    return fragments;
+}
+
 fn decodeEventBodyFields(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
@@ -1010,6 +1345,7 @@ fn decodeEventBodyFields(
             .state_value => .{ .state_value = try decodeStateValueSource(allocator, decoder) },
             .request_input => .{ .request_input = try decoder.readBytesAlloc(allocator, 128) },
             .literal_mapping => .{ .literal_mapping = try decodeLiteralMappingSource(allocator, decoder) },
+            .derived => .{ .derived = try decoder.readBytesAlloc(allocator, 128) },
         };
         errdefer if (source) |*value| value.deinit(allocator);
         const candidate: EventBodyField = .{
@@ -1449,6 +1785,7 @@ fn compileEventMaterialization(
             "fields",
             "request_literals",
             "generate",
+            "derive",
             "body_fields",
             "forbidden_parameters",
         },
@@ -1514,6 +1851,16 @@ fn compileEventMaterialization(
     else
         try allocator.alloc(SecureTokenGeneration, 0);
     errdefer deinitSecureTokenGenerations(allocator, generate);
+    const derive = if (object.get("derive")) |raw_derive|
+        try compileEventDerivations(
+            allocator,
+            definition_plan,
+            raw_derive,
+            generate,
+        )
+    else
+        try allocator.alloc(EventDerivation, 0);
+    errdefer deinitEventDerivations(allocator, derive);
     const body_fields = if (object.get("body_fields")) |raw_body_fields|
         try compileEventBodyFields(
             allocator,
@@ -1541,6 +1888,7 @@ fn compileEventMaterialization(
         .fields = fields,
         .request_literals = request_literals,
         .generate = generate,
+        .derive = derive,
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
@@ -1666,6 +2014,321 @@ fn compileSecureTokenGenerations(
     return items;
 }
 
+fn compileEventDerivations(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+    generate: []const SecureTokenGeneration,
+) ![]EventDerivation {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 16) {
+        return error.InvalidEventDerivationCount;
+    }
+    const items = try allocator.alloc(EventDerivation, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    for (values.items, 0..) |value, index| {
+        items[index] = try compileEventDerivation(
+            allocator,
+            definition_plan,
+            value,
+        );
+        initialized += 1;
+        for (generate) |generated| {
+            if (std.mem.eql(u8, generated.name, items[index].name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        for (items[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, items[index].name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        try validateEventDerivationReferences(
+            &items[index],
+            items[0..index],
+        );
+    }
+    return items;
+}
+
+fn compileEventDerivation(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+) !EventDerivation {
+    const object = try definition_core.json.object(raw);
+    const op = try definition_core.json.requiredString(object, "op");
+    const name = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "name"),
+    );
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    var source: EventDerivationSource = if (std.mem.eql(
+        u8,
+        op,
+        "input-text",
+    )) blk: {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "op", "pointer" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "pointer" },
+        );
+        break :blk .{ .input_text = try compileEventPointer(
+            allocator,
+            try definition_core.json.requiredString(object, "pointer"),
+        ) };
+    } else if (std.mem.eql(u8, op, "utc-timestamp")) blk: {
+        if (!definition_plan.requires(.timestamp)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "op", "format" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "format" },
+        );
+        break :blk .{ .utc_timestamp = try EventTimestampFormat.parse(
+            try definition_core.json.requiredString(object, "format"),
+        ) };
+    } else if (std.mem.eql(u8, op, "sha256")) blk: {
+        if (!definition_plan.requires(.sha256)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{
+                "name",
+                "op",
+                "encoding",
+                "fragments",
+                "max_bytes",
+            },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "encoding", "fragments", "max_bytes" },
+        );
+        break :blk .{ .sha256 = .{
+            .encoding = try EventDigestEncoding.parse(
+                try definition_core.json.requiredString(
+                    object,
+                    "encoding",
+                ),
+            ),
+            .fragments = try compileEventDerivationFragments(
+                allocator,
+                try definition_core.json.field(object, "fragments"),
+            ),
+            .max_bytes = try compileEventDerivationBound(object),
+        } };
+    } else if (std.mem.eql(u8, op, "concat")) blk: {
+        if (!definition_plan.requires(.composite_identity)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "op", "fragments", "max_bytes" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "fragments", "max_bytes" },
+        );
+        break :blk .{ .concat = .{
+            .fragments = try compileEventDerivationFragments(
+                allocator,
+                try definition_core.json.field(object, "fragments"),
+            ),
+            .max_bytes = try compileEventDerivationBound(object),
+        } };
+    } else return error.UnsupportedEventDerivation;
+    errdefer source.deinit(allocator);
+    return .{ .name = name, .source = source };
+}
+
+fn compileEventDerivationBound(object: std.json.ObjectMap) !usize {
+    const max_bytes = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_bytes"),
+    );
+    if (max_bytes == 0 or max_bytes > 16 * 1024 * 1024) {
+        return error.InvalidEventDerivationBound;
+    }
+    return max_bytes;
+}
+
+fn compileEventPointer(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) !definition_core.json_pointer.Pointer {
+    if (text.len == 0 or text.len > 1024 or
+        !std.unicode.utf8ValidateSlice(text))
+    {
+        return error.InvalidJsonPointer;
+    }
+    return definition_core.json_pointer.compile(allocator, text);
+}
+
+fn compileEventDerivationFragments(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) ![]EventDerivationFragment {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidEventDerivationFragments;
+    }
+    const fragments = try allocator.alloc(
+        EventDerivationFragment,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| {
+            fragment.deinit(allocator);
+        }
+        allocator.free(fragments);
+    }
+    for (values.items, 0..) |value, index| {
+        fragments[index] = try compileEventDerivationFragment(
+            allocator,
+            value,
+        );
+        initialized += 1;
+    }
+    return fragments;
+}
+
+fn compileEventDerivationFragment(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !EventDerivationFragment {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{
+            "literal",
+            "input_text",
+            "input_json",
+            "canonical_input",
+            "derived",
+            "prefix_bytes",
+            "transform",
+        },
+    );
+    var source_count: usize = 0;
+    source_count += @intFromBool(object.get("literal") != null);
+    source_count += @intFromBool(object.get("input_text") != null);
+    source_count += @intFromBool(object.get("input_json") != null);
+    source_count += @intFromBool(object.get("canonical_input") != null);
+    source_count += @intFromBool(object.get("derived") != null);
+    if (source_count != 1) return error.InvalidEventDerivationFragment;
+    if (object.get("literal")) |value| {
+        if (object.get("prefix_bytes") != null or
+            object.get("transform") != null)
+        {
+            return error.InvalidEventDerivationFragment;
+        }
+        const literal = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        );
+        errdefer allocator.free(literal);
+        if (literal.len > 4096 or !std.unicode.utf8ValidateSlice(literal)) {
+            return error.InvalidEventDerivationLiteral;
+        }
+        return .{ .literal = literal };
+    }
+    if (object.get("input_text")) |value| {
+        if (object.get("prefix_bytes") != null or
+            object.get("transform") != null)
+        {
+            return error.InvalidEventDerivationFragment;
+        }
+        return .{ .input_text = try compileEventPointer(
+            allocator,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("input_json")) |value| {
+        if (object.get("prefix_bytes") != null or
+            object.get("transform") != null)
+        {
+            return error.InvalidEventDerivationFragment;
+        }
+        return .{ .input_json = try compileEventPointer(
+            allocator,
+            try definition_core.json.string(value),
+        ) };
+    }
+    if (object.get("canonical_input")) |value| {
+        if (object.get("prefix_bytes") != null or
+            object.get("transform") != null)
+        {
+            return error.InvalidEventDerivationFragment;
+        }
+        return .{ .canonical_input = try compileEventPointer(
+            allocator,
+            try definition_core.json.string(value),
+        ) };
+    }
+    const name = try allocator.dupe(
+        u8,
+        try definition_core.json.string(object.get("derived").?),
+    );
+    errdefer allocator.free(name);
+    try definition_core.json.safeIdentifier(name, 128);
+    const prefix_bytes = if (object.get("prefix_bytes")) |value| blk: {
+        const count = try definition_core.json.unsigned(value);
+        if (count == 0 or count > 4096) {
+            return error.InvalidEventDerivedPrefix;
+        }
+        break :blk @as(u16, @intCast(count));
+    } else null;
+    const transform = if (object.get("transform")) |value|
+        try EventDerivedTransform.parse(
+            try definition_core.json.string(value),
+        )
+    else
+        .none;
+    return .{ .derived = .{
+        .name = name,
+        .prefix_bytes = prefix_bytes,
+        .transform = transform,
+    } };
+}
+
+fn validateEventDerivationReferences(
+    item: *const EventDerivation,
+    prior: []const EventDerivation,
+) !void {
+    const fragments = switch (item.source) {
+        .sha256 => |config| config.fragments,
+        .concat => |config| config.fragments,
+        .input_text, .utc_timestamp => return,
+    };
+    for (fragments) |fragment| switch (fragment) {
+        .derived => |reference| {
+            var found = false;
+            for (prior) |candidate| {
+                if (std.mem.eql(u8, candidate.name, reference.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.EventDerivationDependencyMissing;
+        },
+        else => {},
+    };
+}
+
 fn compileEventBodyFields(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -1719,6 +2382,7 @@ fn compileEventBodyField(
         "parameter_sha256",
         "request_input",
         "state_value",
+        "derived",
     });
     try definition_core.json.requireFields(object, &.{"field"});
     const field = try allocator.dupe(
@@ -1732,6 +2396,7 @@ fn compileEventBodyField(
     source_count += @intFromBool(object.get("parameter_sha256") != null);
     source_count += @intFromBool(object.get("request_input") != null);
     source_count += @intFromBool(object.get("state_value") != null);
+    source_count += @intFromBool(object.get("derived") != null);
     if (source_count != 1) return error.InvalidEventBodyFieldSource;
     var source: EventBodyFieldSource =
         if (object.get("generated_sha256")) |value| blk: {
@@ -1783,6 +2448,11 @@ fn compileEventBodyField(
             } };
         } else if (object.get("request_input")) |value|
             .{ .request_input = try allocator.dupe(
+                u8,
+                try definition_core.json.string(value),
+            ) }
+        else if (object.get("derived")) |value|
+            .{ .derived = try allocator.dupe(
                 u8,
                 try definition_core.json.string(value),
             ) }
@@ -1906,6 +2576,7 @@ fn compileEventField(
         "literal",
         "sequence_text_prefix",
         "unix_seconds",
+        "derived",
     });
     try definition_core.json.requireFields(object, &.{"field"});
     const field = try allocator.dupe(
@@ -1919,6 +2590,7 @@ fn compileEventField(
     source_count += @intFromBool(object.get("literal") != null);
     source_count += @intFromBool(object.get("sequence_text_prefix") != null);
     source_count += @intFromBool(object.get("unix_seconds") != null);
+    source_count += @intFromBool(object.get("derived") != null);
     if (source_count != 1) return error.InvalidEventFieldSource;
     var source: EventFieldSource = if (object.get("input_field")) |value|
         .{ .input_field = try allocator.dupe(
@@ -1932,6 +2604,11 @@ fn compileEventField(
         ) }
     else if (object.get("sequence_text_prefix")) |value|
         .{ .sequence_text_prefix = try allocator.dupe(
+            u8,
+            try definition_core.json.string(value),
+        ) }
+    else if (object.get("derived")) |value|
+        .{ .derived = try allocator.dupe(
             u8,
             try definition_core.json.string(value),
         ) }
@@ -1953,6 +2630,9 @@ fn compileEventField(
             }
         },
         .unix_seconds => {},
+        .derived => |value| {
+            try definition_core.json.safeIdentifier(value, 128);
+        },
     }
     return .{ .field = field, .source = source };
 }
@@ -2117,6 +2797,9 @@ fn validateEventMaterialization(
                 }
             },
             .unix_seconds => {},
+            .derived => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            },
         }
     }
     try validateRequestLiterals(
@@ -2175,6 +2858,9 @@ fn validateCachedEventMaterialization(
                 }
             },
             .unix_seconds => {},
+            .derived => |value| {
+                try definition_core.json.safeIdentifier(value, 128);
+            },
         }
     }
     try validateRequestLiterals(
@@ -2235,6 +2921,7 @@ fn validateEventMaterializationLayout(
                     .generated_sha256,
                     .request_input,
                     .literal_mapping,
+                    .derived,
                     => {},
                 }
             }
@@ -2262,7 +2949,8 @@ fn findEventFieldLinear(
 fn validateEventMaterializationExtensions(
     event: *const EventMaterialization,
 ) !void {
-    if (event.generate.len > 16 or event.body_fields.len > 64 or
+    if (event.generate.len > 16 or event.derive.len > 16 or
+        event.body_fields.len > 64 or
         event.forbidden_parameters.len > 64)
     {
         return error.InvalidEventMaterializationBounds;
@@ -2278,6 +2966,20 @@ fn validateEventMaterializationExtensions(
         {
             return error.EventGenerationsNotSorted;
         }
+    }
+    for (event.derive, 0..) |*item, index| {
+        try validateEventDerivation(item);
+        for (event.generate) |generated| {
+            if (std.mem.eql(u8, generated.name, item.name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        for (event.derive[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, item.name)) {
+                return error.DuplicateEventGeneration;
+            }
+        }
+        try validateEventDerivationReferences(item, event.derive[0..index]);
     }
     for (event.body_fields, 0..) |*field, index| {
         try validateEventBodyField(field);
@@ -2317,6 +3019,32 @@ fn validateEventMaterializationAgainstDefinition(
     {
         return error.UndeclaredArtifactOperator;
     }
+    for (event.derive) |item| switch (item.source) {
+        .input_text => {},
+        .utc_timestamp => {
+            if (!definition_plan.requires(.timestamp)) {
+                return error.UndeclaredArtifactOperator;
+            }
+        },
+        .sha256 => {
+            if (!definition_plan.requires(.sha256)) {
+                return error.UndeclaredArtifactOperator;
+            }
+        },
+        .concat => {
+            if (!definition_plan.requires(.composite_identity)) {
+                return error.UndeclaredArtifactOperator;
+            }
+        },
+    };
+    for (event.fields) |field| switch (field.source) {
+        .derived => |name| {
+            if (findEventDerivation(event.derive, name) == null) {
+                return error.EventDerivationDependencyMissing;
+            }
+        },
+        else => {},
+    };
     for (event.body_fields) |field| switch (field.source) {
         .generated_sha256 => |name| {
             if (!definition_plan.requires(.sha256) or
@@ -2340,6 +3068,11 @@ fn validateEventMaterializationAgainstDefinition(
         .state_value => {
             if (!definition_plan.requires(.reducer)) {
                 return error.UndeclaredArtifactOperator;
+            }
+        },
+        .derived => |name| {
+            if (findEventDerivation(event.derive, name) == null) {
+                return error.EventDerivationDependencyMissing;
             }
         },
         .request_input, .literal_mapping => {},
@@ -2370,6 +3103,61 @@ fn validateSecureTokenGeneration(
     }
 }
 
+fn validateEventDerivation(item: *const EventDerivation) !void {
+    try definition_core.json.safeIdentifier(item.name, 128);
+    switch (item.source) {
+        .input_text => |pointer| {
+            if (pointer.raw.len == 0 or pointer.raw.len > 1024) {
+                return error.InvalidJsonPointer;
+            }
+        },
+        .utc_timestamp => {},
+        .sha256 => |config| {
+            if (config.fragments.len == 0 or config.fragments.len > 64 or
+                config.max_bytes == 0 or
+                config.max_bytes > 16 * 1024 * 1024)
+            {
+                return error.InvalidEventDerivation;
+            }
+            try validateEventDerivationFragments(config.fragments);
+        },
+        .concat => |config| {
+            if (config.fragments.len == 0 or config.fragments.len > 64 or
+                config.max_bytes == 0 or
+                config.max_bytes > 16 * 1024 * 1024)
+            {
+                return error.InvalidEventDerivation;
+            }
+            try validateEventDerivationFragments(config.fragments);
+        },
+    }
+}
+
+fn validateEventDerivationFragments(
+    fragments: []const EventDerivationFragment,
+) !void {
+    for (fragments) |fragment| switch (fragment) {
+        .literal => |value| {
+            if (value.len > 4096 or !std.unicode.utf8ValidateSlice(value)) {
+                return error.InvalidEventDerivationLiteral;
+            }
+        },
+        .input_text, .input_json, .canonical_input => |pointer| {
+            if (pointer.raw.len == 0 or pointer.raw.len > 1024) {
+                return error.InvalidJsonPointer;
+            }
+        },
+        .derived => |reference| {
+            try definition_core.json.safeIdentifier(reference.name, 128);
+            if (reference.prefix_bytes) |count| {
+                if (count == 0 or count > 4096) {
+                    return error.InvalidEventDerivedPrefix;
+                }
+            }
+        },
+    };
+}
+
 fn validateEventBodyField(field: *const EventBodyField) !void {
     try definition_core.json.safeIdentifier(field.field, 128);
     switch (field.source) {
@@ -2398,6 +3186,9 @@ fn validateEventBodyField(field: *const EventBodyField) !void {
                 return error.EventLiteralNotCanonical;
             }
         },
+        .derived => |name| {
+            try definition_core.json.safeIdentifier(name, 128);
+        },
     }
 }
 
@@ -2421,6 +3212,16 @@ fn findSecureTokenGeneration(
             .gt => high = mid,
             .eq => return &items[mid],
         }
+    }
+    return null;
+}
+
+fn findEventDerivation(
+    items: []const EventDerivation,
+    name: []const u8,
+) ?*const EventDerivation {
+    for (items) |*item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
     }
     return null;
 }
@@ -2477,6 +3278,22 @@ fn deinitSecureTokenGenerations(
 ) void {
     for (items) |*item| item.deinit(allocator);
     allocator.free(items);
+}
+
+fn deinitEventDerivations(
+    allocator: std.mem.Allocator,
+    items: []EventDerivation,
+) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
+}
+
+fn deinitEventDerivationFragments(
+    allocator: std.mem.Allocator,
+    fragments: []EventDerivationFragment,
+) void {
+    for (fragments) |*fragment| fragment.deinit(allocator);
+    allocator.free(fragments);
 }
 
 fn deinitEventBodyFields(
