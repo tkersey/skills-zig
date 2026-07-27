@@ -208,7 +208,10 @@ fn runTransact(
         documents,
         &bindings,
     ) catch |err| {
-        try emitTransactionError(err);
+        try emitTransactionError(
+            err,
+            ledger.transaction.lastMutationState(),
+        );
         return 2;
     };
     defer result.deinit(allocator);
@@ -968,11 +971,12 @@ fn emitTransaction(
     }
 }
 
-fn emitTransactionError(err: anyerror) !void {
+fn emitTransactionError(err: anyerror, storage_mutated: ?bool) !void {
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     try ledger.envelope.writeTransactionErrorJson(
         &stdout_writer.interface,
         err,
+        storage_mutated,
     );
     try stdout_writer.interface.writeByte('\n');
 }

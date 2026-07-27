@@ -196,8 +196,8 @@ set -e
 test "$conflict_status" -eq 2
 grep -Fq '"schema":"ledger-transaction-error/v1"' <<<"$conflict_output"
 grep -Fq '"code":"IdempotencyConflict"' <<<"$conflict_output"
-grep -Fq '"storage_mutated":null' <<<"$conflict_output"
-grep -Fq '"storage_mutation_state":"unknown"' <<<"$conflict_output"
+grep -Fq '"storage_mutated":false' <<<"$conflict_output"
+grep -Fq '"storage_mutation_state":"known"' <<<"$conflict_output"
 
 chained_check=$("$binary" definition check \
   --definition "$chained_definition" \

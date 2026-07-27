@@ -260,6 +260,7 @@ pub fn writeTransactionJson(
 pub fn writeTransactionErrorJson(
     writer: *std.Io.Writer,
     err: anyerror,
+    storage_mutated: ?bool,
 ) !void {
     try writer.writeAll(
         "{\"schema\":\"ledger-transaction-error/v1\",\"code\":",
@@ -268,9 +269,15 @@ pub fn writeTransactionErrorJson(
         writer,
         @errorName(err),
     );
-    try writer.writeAll(
-        ",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
-    );
+    try writer.writeAll(",\"semantic_authority_granted\":false,\"storage_mutated\":");
+    if (storage_mutated) |mutated| {
+        try writer.writeAll(if (mutated) "true" else "false");
+        try writer.writeAll(",\"storage_mutation_state\":\"known\"}");
+    } else {
+        try writer.writeAll(
+            "null,\"storage_mutation_state\":\"unknown\"}",
+        );
+    }
 }
 
 pub fn writeProjectionJson(
@@ -457,15 +464,27 @@ test "validation envelope preserves definition identity and denies authority" {
     defer parsed.deinit();
 }
 
-test "transaction errors do not claim a known mutation state" {
+test "transaction errors report the transaction phase mutation state" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     try writeTransactionErrorJson(
         &output.writer,
         error.TransactionRecoveryRequired,
+        null,
     );
     try std.testing.expectEqualStrings(
         "{\"schema\":\"ledger-transaction-error/v1\",\"code\":\"TransactionRecoveryRequired\",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
+        output.written(),
+    );
+
+    output.clearRetainingCapacity();
+    try writeTransactionErrorJson(
+        &output.writer,
+        error.ProtocolAdmissionRejected,
+        false,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"ledger-transaction-error/v1\",\"code\":\"ProtocolAdmissionRejected\",\"semantic_authority_granted\":false,\"storage_mutated\":false,\"storage_mutation_state\":\"known\"}",
         output.written(),
     );
 }

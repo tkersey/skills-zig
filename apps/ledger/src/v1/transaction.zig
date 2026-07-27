@@ -12,6 +12,7 @@ const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
 threadlocal var runtime_io: ?std.Io = null;
+threadlocal var last_mutation_state: ?bool = false;
 
 pub const EffectReceipt = struct {
     slot: []u8,
@@ -91,6 +92,10 @@ pub fn installRuntimeIo(io: std.Io) void {
     durable_store.installRuntimeIo(io);
 }
 
+pub fn lastMutationState() ?bool {
+    return last_mutation_state;
+}
+
 pub fn transact(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -104,6 +109,7 @@ pub fn transact(
     documents: []const validation.InputDocument,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
+    last_mutation_state = false;
     if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
     if (!std.mem.eql(
         u8,
@@ -235,6 +241,7 @@ pub fn transact(
             &.{ ledger_root, ".fencing.counter" },
         );
         defer allocator.free(counter_path);
+        last_mutation_state = null;
         var commit = try durable_store.commitTextTransaction(
             allocator,
             transactions_dir,
@@ -249,6 +256,7 @@ pub fn transact(
                 .reject_symlinks = true,
             },
         );
+        last_mutation_state = true;
         defer commit.deinit(allocator);
         transaction_id = try allocator.dupe(u8, commit.transaction_id);
         storage_mutated = true;
@@ -433,6 +441,7 @@ fn bindExisting(
         &.{ ledger_root, ".fencing.counter" },
     );
     defer allocator.free(counter_path);
+    last_mutation_state = null;
     var commit = try durable_store.commitTextTransaction(
         allocator,
         transactions_dir,
@@ -447,6 +456,7 @@ fn bindExisting(
             .reject_symlinks = true,
         },
     );
+    last_mutation_state = true;
     defer commit.deinit(allocator);
     const receipts = try allocator.alloc(EffectReceipt, prepared.len);
     var receipt_count: usize = 0;
@@ -1588,6 +1598,7 @@ test "transaction appends an event and binding in one durable transaction" {
     );
     defer first.deinit(std.testing.allocator);
     try std.testing.expect(first.storage_mutated);
+    try std.testing.expect(lastMutationState().?);
     try std.testing.expect(!first.semantic_authority_granted);
     try std.testing.expectEqualStrings("appended", first.effects[0].result);
 
@@ -1647,6 +1658,7 @@ test "transaction appends an event and binding in one durable transaction" {
     );
     defer duplicate.deinit(std.testing.allocator);
     try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(!lastMutationState().?);
     try std.testing.expectEqualStrings("idempotent", duplicate.effects[0].result);
     try std.testing.expectEqualStrings(
         second.effects[0].revision_after,
@@ -1668,6 +1680,7 @@ test "transaction appends an event and binding in one durable transaction" {
             &third_parameters,
         ),
     );
+    try std.testing.expect(!lastMutationState().?);
     var resolved_storage = try storage.resolve(
         std.testing.allocator,
         &storage_plan,
