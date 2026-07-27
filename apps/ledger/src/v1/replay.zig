@@ -502,8 +502,6 @@ fn validateEventInput(
         return error.HistoricalProtocolBindingMismatch;
     }
     if (resolved.effect.event) |*event_materialization| {
-        const plan = historical_plan orelse
-            return error.HistoricalProtocolBindingMismatch;
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
             allocator,
@@ -514,25 +512,47 @@ fn validateEventInput(
             },
         );
         defer parsed.deinit();
-        const canonical_event =
-            try definition_core.canonical_json.canonicalJsonAlloc(
+        const canonical_event = switch (event_materialization.mode) {
+            .chained => try definition_core.canonical_json.canonicalJsonAlloc(
                 allocator,
                 parsed.value,
-            );
+            ),
+            .plain => try protocol.canonicalPlainStoredEventAlloc(
+                allocator,
+                event_materialization,
+                parsed.value,
+            ),
+        };
         defer allocator.free(canonical_event);
         if (!std.mem.eql(u8, canonical_event, bytes)) {
             return error.HistoricalArtifactNotCanonical;
         }
-        if (protocol_state.* == null) {
-            protocol_state.* = protocol.ReplayState.init(plan);
-        }
-        const reconstructed = try protocol.reconstructInputAlloc(
-            allocator,
-            plan,
-            &protocol_state.*.?,
-            event_materialization,
-            parsed.value,
-        );
+        const reconstructed = switch (event_materialization.mode) {
+            .chained => chained: {
+                const plan = historical_plan orelse
+                    return error.HistoricalProtocolBindingMismatch;
+                if (protocol_state.* == null) {
+                    protocol_state.* = protocol.ReplayState.init(plan);
+                }
+                break :chained try protocol.reconstructInputAlloc(
+                    allocator,
+                    plan,
+                    &protocol_state.*.?,
+                    event_materialization,
+                    parsed.value,
+                );
+            },
+            .plain => plain: {
+                if (historical_plan != null) {
+                    return error.HistoricalProtocolBindingMismatch;
+                }
+                break :plain try protocol.reconstructPlainInputAlloc(
+                    allocator,
+                    event_materialization,
+                    parsed.value,
+                );
+            },
+        };
         defer allocator.free(reconstructed);
         var execution = try validation.execute(
             allocator,
@@ -541,13 +561,15 @@ fn validateEventInput(
         );
         defer execution.deinit();
         if (!execution.isValid()) return error.HistoricalArtifactInvalid;
-        try protocol.applyValueBound(
-            allocator,
-            plan,
-            &protocol_state.*.?,
-            parsed.value,
-            parameters,
-        );
+        if (event_materialization.mode == .chained) {
+            try protocol.applyValueBound(
+                allocator,
+                historical_plan.?,
+                &protocol_state.*.?,
+                parsed.value,
+                parameters,
+            );
+        }
         return;
     }
     var execution = try validation.execute(

@@ -53,6 +53,7 @@ pub const Operator = enum {
     set_order,
     immutable_document,
     append_only_log,
+    event_materialization,
     event_envelope,
     sequence,
     previous_digest,
@@ -129,6 +130,7 @@ pub const Operator = enum {
             .set_order => "set-order",
             .immutable_document => "immutable-document",
             .append_only_log => "append-only-log",
+            .event_materialization => "event-materialization",
             .event_envelope => "event-envelope",
             .previous_digest => "previous-digest",
             .body_digest => "body-digest",
@@ -242,6 +244,7 @@ pub const Operator = enum {
             .path_format,
             .immutable_document,
             .append_only_log,
+            .event_materialization,
             .event_envelope,
             .sequence,
             .previous_digest,
@@ -661,7 +664,7 @@ fn compileAtDepth(
 }
 
 pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -719,7 +722,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readU16() != 3) return error.LedgerPlanCacheVersionMismatch;
     var decoded_count: usize = 0;
     return decodeCachePlan(allocator, decoder, 0, &decoded_count);
 }

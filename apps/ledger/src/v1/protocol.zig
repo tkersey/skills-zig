@@ -764,6 +764,9 @@ pub fn materializeEvent(
     unix_seconds: i64,
     io: std.Io,
 ) !MaterializedEvent {
+    if (materialization.mode != .chained) {
+        return error.EventMaterializationModeMismatch;
+    }
     if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
     try validateEventMaterialization(plan, materialization);
     try validateForbiddenParameters(materialization, parameters);
@@ -791,6 +794,7 @@ pub fn materializeEvent(
         body,
         generated_outputs,
         parameters,
+        null,
     );
     defer allocator.free(canonical_body);
     const body_digest =
@@ -848,6 +852,132 @@ pub fn materializeEvent(
     };
 }
 
+pub fn materializePlainEvent(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    request: std.json.Value,
+    parameters: ?*const definition_core.parameters.Bindings,
+    unix_seconds: i64,
+    io: std.Io,
+) !MaterializedEvent {
+    if (materialization.mode != .plain) {
+        return error.EventMaterializationModeMismatch;
+    }
+    if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
+    try validateForbiddenParameters(materialization, parameters);
+    const request_object = try definition_core.json.object(request);
+    try validateRequestKeys(
+        allocator,
+        request_object,
+        materialization,
+    );
+    const body = request_object.get(
+        materialization.body_input_field,
+    ) orelse return error.EventBodyInputMissing;
+    const generated_outputs = try generateOutputsAlloc(
+        allocator,
+        materialization.generate,
+        io,
+    );
+    errdefer deinitGeneratedOutputs(allocator, generated_outputs);
+    const materialized_body = try materializedBodyAlloc(
+        allocator,
+        null,
+        null,
+        materialization,
+        request_object,
+        body,
+        generated_outputs,
+        parameters,
+        materialization.body_order,
+    );
+    defer allocator.free(materialized_body);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    for (materialization.field_order, 0..) |key, index| {
+        if (index != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            key,
+        );
+        try output.writer.writeByte(':');
+        if (std.mem.eql(
+            u8,
+            key,
+            materialization.body_input_field,
+        )) {
+            try output.writer.writeAll(materialized_body);
+        } else {
+            const field = findEventField(
+                materialization.fields,
+                key,
+            ) orelse return error.EventMaterializationFieldCoverageMismatch;
+            try writeMaterializedField(
+                allocator,
+                &output.writer,
+                field.source,
+                request_object,
+                0,
+                unix_seconds,
+            );
+        }
+    }
+    try output.writer.writeByte('}');
+    return .{
+        .content = try output.toOwnedSlice(),
+        .generated_outputs = generated_outputs,
+    };
+}
+
+pub fn canonicalPlainStoredEventAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.Value,
+) ![]u8 {
+    if (materialization.mode != .plain) {
+        return error.EventMaterializationModeMismatch;
+    }
+    const object = try definition_core.json.object(event);
+    if (object.count() != materialization.field_order.len) {
+        return error.EventMaterializationFieldCoverageMismatch;
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    for (materialization.field_order, 0..) |key, index| {
+        const value = object.get(key) orelse
+            return error.EventEnvelopeFieldMissing;
+        if (index != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            key,
+        );
+        try output.writer.writeByte(':');
+        if (std.mem.eql(
+            u8,
+            key,
+            materialization.body_input_field,
+        )) {
+            const body = try canonicalPlainStoredBodyAlloc(
+                allocator,
+                materialization,
+                value,
+            );
+            defer allocator.free(body);
+            try output.writer.writeAll(body);
+        } else {
+            try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                &output.writer,
+                value,
+            );
+        }
+    }
+    try output.writer.writeByte('}');
+    return output.toOwnedSlice();
+}
+
 pub fn reconstructInputAlloc(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -855,9 +985,49 @@ pub fn reconstructInputAlloc(
     materialization: *const storage.EventMaterialization,
     event: std.json.Value,
 ) ![]u8 {
+    if (materialization.mode != .chained) {
+        return error.EventMaterializationModeMismatch;
+    }
     try validateEventMaterialization(plan, materialization);
     const event_object = try definition_core.json.object(event);
     try validateEnvelopeKeys(event_object, plan.envelope.keys);
+    return reconstructInputWithLayoutAlloc(
+        allocator,
+        plan,
+        state,
+        materialization,
+        event_object,
+        plan.envelope.body_key,
+    );
+}
+
+pub fn reconstructPlainInputAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.Value,
+) ![]u8 {
+    if (materialization.mode != .plain) {
+        return error.EventMaterializationModeMismatch;
+    }
+    const event_object = try definition_core.json.object(event);
+    return reconstructInputWithLayoutAlloc(
+        allocator,
+        null,
+        null,
+        materialization,
+        event_object,
+        materialization.body_input_field,
+    );
+}
+
+fn reconstructInputWithLayoutAlloc(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event_object: std.json.ObjectMap,
+    body_key: []const u8,
+) ![]u8 {
     const Mapping = struct {
         key: []const u8,
         value: union(enum) {
@@ -873,7 +1043,7 @@ pub fn reconstructInputAlloc(
         state,
         materialization,
         event_object,
-        event_object.get(plan.envelope.body_key) orelse
+        event_object.get(body_key) orelse
             return error.EventEnvelopeFieldMissing,
     );
     defer allocator.free(reconstructed_body);
@@ -915,11 +1085,13 @@ pub fn reconstructInputAlloc(
                 }
             },
             .sequence_text_prefix => |prefix| {
+                const replay_state = state orelse
+                    return error.PlainEventRequiresProtocolState;
                 const actual = try definition_core.json.string(value);
                 const expected = try std.fmt.allocPrint(
                     allocator,
                     "{s}{d}",
-                    .{ prefix, state.next_sequence },
+                    .{ prefix, replay_state.next_sequence },
                 );
                 defer allocator.free(expected);
                 if (!std.mem.eql(u8, actual, expected)) {
@@ -1045,15 +1217,16 @@ fn deinitGeneratedOutputs(
 
 fn materializedBodyAlloc(
     allocator: std.mem.Allocator,
-    plan: *const Plan,
-    state: *const ReplayState,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
     materialization: *const storage.EventMaterialization,
     request: std.json.ObjectMap,
     body: std.json.Value,
     generated_outputs: []const GeneratedOutput,
     parameters: ?*const definition_core.parameters.Bindings,
+    declared_order: ?[]const []u8,
 ) ![]u8 {
-    if (materialization.body_fields.len == 0) {
+    if (materialization.body_fields.len == 0 and declared_order == null) {
         return definition_core.canonical_json.canonicalJsonAlloc(
             allocator,
             body,
@@ -1087,6 +1260,18 @@ fn materializedBodyAlloc(
                 if (actual != null) return error.EventBodyFieldCollision;
             },
         }
+    }
+    if (declared_order) |order| {
+        return materializedBodyInDeclaredOrderAlloc(
+            allocator,
+            plan,
+            state,
+            materialization,
+            object,
+            generated_outputs,
+            parameters,
+            order,
+        );
     }
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(allocator);
@@ -1160,11 +1345,118 @@ fn materializedBodyAlloc(
     return output.toOwnedSlice();
 }
 
+fn materializedBodyInDeclaredOrderAlloc(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+    generated_outputs: []const GeneratedOutput,
+    parameters: ?*const definition_core.parameters.Bindings,
+    order: []const []u8,
+) ![]u8 {
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsDeclaredName(order, entry.key_ptr.*)) {
+            return error.EventBodyFieldCoverageMismatch;
+        }
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    var written: usize = 0;
+    for (order) |key| {
+        if (findEventBodyField(
+            materialization.body_fields,
+            key,
+        )) |field| {
+            if (field.source == .request_input) continue;
+            if (written != 0) try output.writer.writeByte(',');
+            try definition_core.canonical_json.writeCanonicalString(
+                &output.writer,
+                key,
+            );
+            try output.writer.writeByte(':');
+            try writeMaterializedBodyField(
+                allocator,
+                &output.writer,
+                plan,
+                state,
+                field.source,
+                generated_outputs,
+                parameters,
+            );
+            written += 1;
+        } else if (object.get(key)) |value| {
+            if (written != 0) try output.writer.writeByte(',');
+            try definition_core.canonical_json.writeCanonicalString(
+                &output.writer,
+                key,
+            );
+            try output.writer.writeByte(':');
+            try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                &output.writer,
+                value,
+            );
+            written += 1;
+        }
+    }
+    try output.writer.writeByte('}');
+    return output.toOwnedSlice();
+}
+
+fn canonicalPlainStoredBodyAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    body: std.json.Value,
+) ![]u8 {
+    const object = try definition_core.json.object(body);
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsDeclaredName(
+            materialization.body_order,
+            entry.key_ptr.*,
+        )) return error.EventBodyFieldCoverageMismatch;
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    var written: usize = 0;
+    for (materialization.body_order) |key| {
+        const value = object.get(key) orelse continue;
+        if (written != 0) try output.writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            &output.writer,
+            key,
+        );
+        try output.writer.writeByte(':');
+        try definition_core.canonical_json.writeCanonicalJson(
+            allocator,
+            &output.writer,
+            value,
+        );
+        written += 1;
+    }
+    try output.writer.writeByte('}');
+    return output.toOwnedSlice();
+}
+
+fn containsDeclaredName(
+    names: []const []u8,
+    expected: []const u8,
+) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, expected)) return true;
+    }
+    return false;
+}
+
 fn writeMaterializedBodyField(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
-    plan: *const Plan,
-    state: *const ReplayState,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
     source: storage.EventBodyFieldSource,
     generated_outputs: []const GeneratedOutput,
     parameters: ?*const definition_core.parameters.Bindings,
@@ -1199,9 +1491,13 @@ fn writeMaterializedBodyField(
                     text,
                 );
             defer allocator.free(digest);
+            const protocol_plan = plan orelse
+                return error.PlainEventRequiresProtocolState;
+            const protocol_state = state orelse
+                return error.PlainEventRequiresProtocolState;
             const expected = try stateSourceValue(
-                plan,
-                state,
+                protocol_plan,
+                protocol_state,
                 config.expected_state,
             );
             if (expected != .string or
@@ -1215,7 +1511,15 @@ fn writeMaterializedBodyField(
             );
         },
         .state_value => |config| {
-            const value = try stateSourceValue(plan, state, config);
+            const protocol_plan = plan orelse
+                return error.PlainEventRequiresProtocolState;
+            const protocol_state = state orelse
+                return error.PlainEventRequiresProtocolState;
+            const value = try stateSourceValue(
+                protocol_plan,
+                protocol_state,
+                config,
+            );
             try definition_core.canonical_json.writeCanonicalJson(
                 allocator,
                 writer,
@@ -1231,8 +1535,8 @@ fn writeMaterializedBodyField(
 
 fn reconstructedBodyAlloc(
     allocator: std.mem.Allocator,
-    plan: *const Plan,
-    state: *const ReplayState,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
     materialization: *const storage.EventMaterialization,
     event: std.json.ObjectMap,
     body: std.json.Value,
@@ -1341,8 +1645,8 @@ fn reconstructedBodyAlloc(
 
 fn validateStoredBodyField(
     allocator: std.mem.Allocator,
-    plan: *const Plan,
-    state: *const ReplayState,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
     source: storage.EventBodyFieldSource,
     actual: std.json.Value,
 ) !void {
@@ -1352,9 +1656,13 @@ fn validateStoredBodyField(
             try definition_core.json.digest(actual.string);
         },
         .parameter_sha256 => |config| {
+            const protocol_plan = plan orelse
+                return error.PlainEventRequiresProtocolState;
+            const protocol_state = state orelse
+                return error.PlainEventRequiresProtocolState;
             const expected = try stateSourceValue(
-                plan,
-                state,
+                protocol_plan,
+                protocol_state,
                 config.expected_state,
             );
             if (!try valuesEqualForCustody(
@@ -1364,7 +1672,15 @@ fn validateStoredBodyField(
             )) return error.EventCapabilityMismatch;
         },
         .state_value => |config| {
-            const expected = try stateSourceValue(plan, state, config);
+            const protocol_plan = plan orelse
+                return error.PlainEventRequiresProtocolState;
+            const protocol_state = state orelse
+                return error.PlainEventRequiresProtocolState;
+            const expected = try stateSourceValue(
+                protocol_plan,
+                protocol_state,
+                config,
+            );
             if (!try valuesEqualForCustody(
                 allocator,
                 actual,
@@ -2167,6 +2483,9 @@ fn validateStorageMaterializations(
         for (operation.effects) |effect| {
             if (effect.slot_index != plan.target_slot_index) continue;
             if (effect.event) |event| {
+                if (event.mode != .chained) {
+                    return error.EventMaterializationModeMismatch;
+                }
                 materialized_effects += 1;
                 try validateEventMaterialization(plan, &event);
             } else {
@@ -2601,7 +2920,7 @@ test "event materialization reconstructs validated request literals" {
         \\  "schema":"ledger-artifact-definition/v1",
         \\  "id":"example/request-literals",
         \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","event-materialization","exact-object","path-format","previous-digest","replay","sequence"]},
         \\  "parameters":{"stream":{"type":"safe_identifier","required":true}},
         \\  "inputs":{
         \\    "alternate":{"codec":"json","max_bytes":4096},
@@ -2625,7 +2944,7 @@ test "event materialization reconstructs validated request literals" {
         \\  "identity":{},
         \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
         \\  "operations":{
-        \\    "append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{
+        \\    "append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{"mode":"chained",
         \\      "body_input_field":"body",
         \\      "fields":[
         \\        {"field":"kind","input_field":"kind"},
@@ -2638,7 +2957,7 @@ test "event materialization reconstructs validated request literals" {
         \\        {"field":"stream_id","request_input":"stream_id"}
         \\      ]
         \\    }}]},
-        \\    "append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{
+        \\    "append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{"mode":"chained",
         \\      "body_input_field":"body",
         \\      "fields":[
         \\        {"field":"kind","input_field":"kind"},

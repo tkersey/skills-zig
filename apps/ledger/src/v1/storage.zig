@@ -104,6 +104,17 @@ pub const EventField = struct {
     }
 };
 
+pub const EventMaterializationMode = enum {
+    chained,
+    plain,
+
+    fn parse(text: []const u8) !EventMaterializationMode {
+        if (std.mem.eql(u8, text, "chained")) return .chained;
+        if (std.mem.eql(u8, text, "plain")) return .plain;
+        return error.UnsupportedEventMaterializationMode;
+    }
+};
+
 pub const RequestLiteral = struct {
     field: []u8,
     literal: []u8,
@@ -191,7 +202,10 @@ pub const EventBodyField = struct {
 };
 
 pub const EventMaterialization = struct {
+    mode: EventMaterializationMode,
     body_input_field: []u8,
+    field_order: [][]u8,
+    body_order: [][]u8,
     fields: []EventField,
     request_literals: []RequestLiteral,
     generate: []SecureTokenGeneration,
@@ -200,6 +214,8 @@ pub const EventMaterialization = struct {
 
     fn deinit(self: *EventMaterialization, allocator: std.mem.Allocator) void {
         allocator.free(self.body_input_field);
+        deinitNames(allocator, self.field_order);
+        deinitNames(allocator, self.body_order);
         for (self.fields) |*field| field.deinit(allocator);
         allocator.free(self.fields);
         for (self.request_literals) |*literal| literal.deinit(allocator);
@@ -422,7 +438,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(6);
+    try encoder.writeU16(7);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -452,7 +468,10 @@ pub fn encodeCache(
             try encoder.writeOptionalBytes(effect.idempotency_parameter);
             try encoder.writeBool(effect.event != null);
             if (effect.event) |event| {
+                try encoder.writeEnum(event.mode);
                 try encoder.writeBytes(event.body_input_field);
+                try encodeNames(event.field_order, encoder);
+                try encodeNames(event.body_order, encoder);
                 try encoder.writeCount(event.fields.len);
                 for (event.fields) |field| {
                     try encoder.writeBytes(field.field);
@@ -517,7 +536,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 6) {
+    if (try decoder.readU16() != 7) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -552,6 +571,14 @@ fn encodeStateValueSource(
 ) !void {
     try encoder.writeBytes(source.register);
     try encoder.writeBytes(source.pointer.raw);
+}
+
+fn encodeNames(
+    names: []const []u8,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(names.len);
+    for (names) |name| try encoder.writeBytes(name);
 }
 
 pub fn validateCachePlan(
@@ -825,9 +852,22 @@ fn decodeEventMaterialization(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !EventMaterialization {
+    const mode = try decoder.readEnum(EventMaterializationMode);
     const body_input_field = try decoder.readBytesAlloc(allocator, 128);
     errdefer allocator.free(body_input_field);
     try definition_core.json.safeIdentifier(body_input_field, 128);
+    const field_order = try decodeDeclaredOrder(
+        allocator,
+        decoder,
+        65,
+    );
+    errdefer deinitNames(allocator, field_order);
+    const body_order = try decodeDeclaredOrder(
+        allocator,
+        decoder,
+        64,
+    );
+    errdefer deinitNames(allocator, body_order);
     const field_count = try decoder.readCount(64);
     if (field_count == 0) return error.InvalidEventMaterializationFields;
     const fields = try allocator.alloc(EventField, field_count);
@@ -893,7 +933,10 @@ fn decodeEventMaterialization(
     );
     errdefer deinitNames(allocator, forbidden_parameters);
     const result: EventMaterialization = .{
+        .mode = mode,
         .body_input_field = body_input_field,
+        .field_order = field_order,
+        .body_order = body_order,
         .fields = fields,
         .request_literals = request_literals,
         .generate = generate,
@@ -1059,6 +1102,31 @@ fn decodeSortedNames(
             std.mem.order(u8, names[index - 1], name.*) != .lt)
         {
             return error.EventParameterNamesNotSorted;
+        }
+    }
+    return names;
+}
+
+fn decodeDeclaredOrder(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    max_count: usize,
+) ![][]u8 {
+    const count = try decoder.readCount(max_count);
+    const names = try allocator.alloc([]u8, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (names, 0..) |*name, index| {
+        name.* = try decoder.readBytesAlloc(allocator, 128);
+        initialized += 1;
+        try definition_core.json.safeIdentifier(name.*, 128);
+        for (names[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, name.*)) {
+                return error.DuplicateEventLayoutField;
+            }
         }
     }
     return names;
@@ -1367,11 +1435,17 @@ fn compileEventMaterialization(
     definition_plan: *const definition.Plan,
     raw: std.json.Value,
 ) !EventMaterialization {
+    if (!definition_plan.requires(.event_materialization)) {
+        return error.UndeclaredArtifactOperator;
+    }
     const object = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(
         object,
         &.{
+            "mode",
             "body_input_field",
+            "field_order",
+            "body_order",
             "fields",
             "request_literals",
             "generate",
@@ -1381,7 +1455,10 @@ fn compileEventMaterialization(
     );
     try definition_core.json.requireFields(
         object,
-        &.{ "body_input_field", "fields" },
+        &.{ "mode", "body_input_field", "fields" },
+    );
+    const mode = try EventMaterializationMode.parse(
+        try definition_core.json.requiredString(object, "mode"),
     );
     const body_input_field = try allocator.dupe(
         u8,
@@ -1392,6 +1469,16 @@ fn compileEventMaterialization(
     );
     errdefer allocator.free(body_input_field);
     try definition_core.json.safeIdentifier(body_input_field, 128);
+    const field_order = if (object.get("field_order")) |raw_order|
+        try compileDeclaredOrder(allocator, raw_order, 65)
+    else
+        try allocator.alloc([]u8, 0);
+    errdefer deinitNames(allocator, field_order);
+    const body_order = if (object.get("body_order")) |raw_order|
+        try compileDeclaredOrder(allocator, raw_order, 64)
+    else
+        try allocator.alloc([]u8, 0);
+    errdefer deinitNames(allocator, body_order);
     const raw_fields = try definition_core.json.array(
         try definition_core.json.field(object, "fields"),
     );
@@ -1447,7 +1534,10 @@ fn compileEventMaterialization(
             try allocator.alloc([]u8, 0);
     errdefer deinitNames(allocator, forbidden_parameters);
     const result: EventMaterialization = .{
+        .mode = mode,
         .body_input_field = body_input_field,
+        .field_order = field_order,
+        .body_order = body_order,
         .fields = fields,
         .request_literals = request_literals,
         .generate = generate,
@@ -1460,6 +1550,35 @@ fn compileEventMaterialization(
         definition_plan,
     );
     return result;
+}
+
+fn compileDeclaredOrder(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    max_count: usize,
+) ![][]u8 {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > max_count) {
+        return error.EventMaterializationLayoutBoundsExceeded;
+    }
+    const names = try allocator.alloc([]u8, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (values.items, 0..) |value, index| {
+        const name = try definition_core.json.string(value);
+        try definition_core.json.safeIdentifier(name, 128);
+        for (names[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, name)) {
+                return error.DuplicateEventLayoutField;
+            }
+        }
+        names[index] = try allocator.dupe(u8, name);
+        initialized += 1;
+    }
+    return names;
 }
 
 fn compileSecureTokenGenerations(
@@ -2008,6 +2127,7 @@ fn validateEventMaterialization(
         error.EventLiteralTooLarge,
     );
     try validateEventMaterializationExtensions(event);
+    try validateEventMaterializationLayout(event);
 }
 
 fn validateCachedEventMaterialization(
@@ -2066,6 +2186,77 @@ fn validateCachedEventMaterialization(
     );
     validateEventMaterializationExtensions(event) catch
         return error.CacheStoragePlanMismatch;
+    validateEventMaterializationLayout(event) catch
+        return error.CacheStoragePlanMismatch;
+}
+
+fn validateEventMaterializationLayout(
+    event: *const EventMaterialization,
+) !void {
+    switch (event.mode) {
+        .chained => {
+            if (event.field_order.len != 0 or event.body_order.len != 0) {
+                return error.ChainedEventHasDeclaredLayout;
+            }
+        },
+        .plain => {
+            if (event.field_order.len != event.fields.len + 1 or
+                event.body_order.len == 0)
+            {
+                return error.EventMaterializationFieldCoverageMismatch;
+            }
+            var body_count: usize = 0;
+            for (event.field_order) |name| {
+                if (std.mem.eql(u8, name, event.body_input_field)) {
+                    body_count += 1;
+                } else if (findEventFieldLinear(event.fields, name) == null) {
+                    return error.EventMaterializationFieldCoverageMismatch;
+                }
+            }
+            if (body_count != 1) {
+                return error.EventMaterializationFieldCoverageMismatch;
+            }
+            for (event.fields) |field| {
+                if (!containsName(event.field_order, field.field)) {
+                    return error.EventMaterializationFieldCoverageMismatch;
+                }
+                if (field.source == .sequence_text_prefix) {
+                    return error.PlainEventRequiresProtocolState;
+                }
+            }
+            for (event.body_fields) |field| {
+                if (!containsName(event.body_order, field.field)) {
+                    return error.EventBodyFieldCoverageMismatch;
+                }
+                switch (field.source) {
+                    .parameter_sha256, .state_value => {
+                        return error.PlainEventRequiresProtocolState;
+                    },
+                    .generated_sha256,
+                    .request_input,
+                    .literal_mapping,
+                    => {},
+                }
+            }
+        },
+    }
+}
+
+fn containsName(names: []const []u8, expected: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, expected)) return true;
+    }
+    return false;
+}
+
+fn findEventFieldLinear(
+    fields: []const EventField,
+    name: []const u8,
+) ?*const EventField {
+    for (fields) |*field| {
+        if (std.mem.eql(u8, field.field, name)) return field;
+    }
+    return null;
 }
 
 fn validateEventMaterializationExtensions(
@@ -2118,6 +2309,9 @@ fn validateEventMaterializationAgainstDefinition(
     event: *const EventMaterialization,
     definition_plan: *const definition.Plan,
 ) !void {
+    if (!definition_plan.requires(.event_materialization)) {
+        return error.UndeclaredArtifactOperator;
+    }
     if (event.generate.len != 0 and
         !definition_plan.requires(.secure_token))
     {
