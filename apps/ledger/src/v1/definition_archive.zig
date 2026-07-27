@@ -110,6 +110,33 @@ pub fn load(
     ) catch return error.InvalidDefinitionArchive;
     defer parsed.deinit();
     const object = try definition_core.json.object(parsed.value);
+    const header = try archiveHeader(object, expected_digest);
+    var closure = try archiveClosure(
+        allocator,
+        object,
+        header.entry_path,
+        expected_digest,
+    );
+    errdefer closure.deinit(allocator);
+    const owned_definition_id = try allocator.dupe(u8, header.definition_id);
+    errdefer allocator.free(owned_definition_id);
+    const owned_entry_path = try allocator.dupe(u8, header.entry_path);
+    return .{
+        .definition_id = owned_definition_id,
+        .entry_path = owned_entry_path,
+        .closure = closure,
+    };
+}
+
+const ArchiveHeader = struct {
+    definition_id: []const u8,
+    entry_path: []const u8,
+};
+
+fn archiveHeader(
+    object: std.json.ObjectMap,
+    expected_digest: []const u8,
+) !ArchiveHeader {
     try definition_core.json.requireExactKeys(object, &.{
         "abi",
         "definition_digest",
@@ -153,6 +180,37 @@ pub fn load(
         object,
         "entry_path",
     );
+    return .{
+        .definition_id = definition_id,
+        .entry_path = entry_path,
+    };
+}
+
+fn archiveClosure(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    entry_path: []const u8,
+    expected_digest: []const u8,
+) !definition_core.Closure {
+    const files = try archiveFiles(allocator, object);
+    defer freeArchiveFiles(allocator, files);
+    var closure = try definition_core.closure.fromCanonicalFiles(
+        allocator,
+        files,
+        entry_path,
+        .{},
+    );
+    errdefer closure.deinit(allocator);
+    if (!std.mem.eql(u8, closure.digestSlice(), expected_digest)) {
+        return error.DefinitionArchiveDigestMismatch;
+    }
+    return closure;
+}
+
+fn archiveFiles(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) ![]definition_core.ClosureFile {
     const values = try definition_core.json.array(
         try definition_core.json.field(object, "files"),
     );
@@ -164,7 +222,7 @@ pub fn load(
         values.items.len,
     );
     var initialized: usize = 0;
-    defer {
+    errdefer {
         for (files[0..initialized]) |file| {
             allocator.free(file.path);
             allocator.free(file.canonical_json);
@@ -189,24 +247,18 @@ pub fn load(
         };
         initialized += 1;
     }
-    var closure = try definition_core.closure.fromCanonicalFiles(
-        allocator,
-        files,
-        entry_path,
-        .{},
-    );
-    errdefer closure.deinit(allocator);
-    if (!std.mem.eql(u8, closure.digestSlice(), expected_digest)) {
-        return error.DefinitionArchiveDigestMismatch;
+    return files;
+}
+
+fn freeArchiveFiles(
+    allocator: std.mem.Allocator,
+    files: []definition_core.ClosureFile,
+) void {
+    for (files) |file| {
+        allocator.free(file.path);
+        allocator.free(file.canonical_json);
     }
-    const owned_definition_id = try allocator.dupe(u8, definition_id);
-    errdefer allocator.free(owned_definition_id);
-    const owned_entry_path = try allocator.dupe(u8, entry_path);
-    return .{
-        .definition_id = owned_definition_id,
-        .entry_path = owned_entry_path,
-        .closure = closure,
-    };
+    allocator.free(files);
 }
 
 pub fn renderAlloc(

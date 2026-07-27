@@ -106,6 +106,16 @@ const Locator = struct {
     }
 };
 
+const VerifiedLocator = struct {
+    value: Locator,
+    source_bytes: usize,
+
+    fn deinit(self: *VerifiedLocator, allocator: std.mem.Allocator) void {
+        self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub fn load(
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
@@ -201,101 +211,117 @@ fn compileFromSource(
         };
     };
     errdefer result.deinit(allocator);
-    switch (route.kind) {
-        .definition => {},
-        .definition_check => {
-            result.validation_plan = try validation.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.storage_plan = try storage.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.protocol_plan = try protocol.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-            );
-            result.projection_plan = try projection.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-                if (result.protocol_plan) |*plan| plan else null,
-            );
-        },
-        .validation => {
-            result.validation_plan = try validation.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.materialization_plan = try materialization.compileForValidation(
-                allocator,
-                &result.definition_plan,
-            );
-        },
-        .materialization => {
-            result.validation_plan = try validation.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.materialization_plan = try materialization.compile(
-                allocator,
-                &result.definition_plan,
-            );
-        },
-        .transact => {
-            result.validation_plan = try validation.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.storage_plan = try storage.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.protocol_plan = try protocol.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-            );
-            if (result.storage_plan.?.findOperation(route.name.?) == null) {
-                return error.UnknownOperation;
-            }
-        },
-        .project => {
-            result.storage_plan = try storage.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.protocol_plan = try protocol.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-            );
-            result.projection_plan = try projection.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-                if (result.protocol_plan) |*plan| plan else null,
-            );
-            if (result.projection_plan.?.find(route.name.?) == null) {
-                return error.UnknownProjection;
-            }
-        },
-        .doctor => {
-            result.storage_plan = try storage.compile(
-                allocator,
-                &result.definition_plan,
-            );
-            result.protocol_plan = try protocol.compile(
-                allocator,
-                &result.definition_plan,
-                &result.storage_plan.?,
-            );
-        },
-    }
+    try compileRoutePlans(allocator, &result, route);
     try validatePlanSet(&result, route);
     return result;
+}
+
+fn compileRoutePlans(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+    route: Route,
+) !void {
+    switch (route.kind) {
+        .definition => {},
+        .definition_check => try compileDefinitionCheck(allocator, result),
+        .validation => try compileValidation(allocator, result),
+        .materialization => try compileMaterialization(allocator, result),
+        .transact => try compileTransaction(allocator, result, route.name.?),
+        .project => try compileProjection(allocator, result, route.name.?),
+        .doctor => try compileDurablePlans(allocator, result),
+    }
+}
+
+fn compileDefinitionCheck(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+) !void {
+    result.validation_plan = try validation.compile(
+        allocator,
+        &result.definition_plan,
+    );
+    try compileDurablePlans(allocator, result);
+    result.projection_plan = try projection.compile(
+        allocator,
+        &result.definition_plan,
+        &result.storage_plan.?,
+        if (result.protocol_plan) |*plan| plan else null,
+    );
+}
+
+fn compileValidation(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+) !void {
+    result.validation_plan = try validation.compile(
+        allocator,
+        &result.definition_plan,
+    );
+    result.materialization_plan = try materialization.compileForValidation(
+        allocator,
+        &result.definition_plan,
+    );
+}
+
+fn compileMaterialization(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+) !void {
+    result.validation_plan = try validation.compile(
+        allocator,
+        &result.definition_plan,
+    );
+    result.materialization_plan = try materialization.compile(
+        allocator,
+        &result.definition_plan,
+    );
+}
+
+fn compileTransaction(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+    operation: []const u8,
+) !void {
+    result.validation_plan = try validation.compile(
+        allocator,
+        &result.definition_plan,
+    );
+    try compileDurablePlans(allocator, result);
+    if (result.storage_plan.?.findOperation(operation) == null) {
+        return error.UnknownOperation;
+    }
+}
+
+fn compileProjection(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+    projection_name: []const u8,
+) !void {
+    try compileDurablePlans(allocator, result);
+    result.projection_plan = try projection.compile(
+        allocator,
+        &result.definition_plan,
+        &result.storage_plan.?,
+        if (result.protocol_plan) |*plan| plan else null,
+    );
+    if (result.projection_plan.?.find(projection_name) == null) {
+        return error.UnknownProjection;
+    }
+}
+
+fn compileDurablePlans(
+    allocator: std.mem.Allocator,
+    result: *PlanSet,
+) !void {
+    result.storage_plan = try storage.compile(
+        allocator,
+        &result.definition_plan,
+    );
+    result.protocol_plan = try protocol.compile(
+        allocator,
+        &result.definition_plan,
+        &result.storage_plan.?,
+    );
 }
 
 fn tryLoadCache(
@@ -313,6 +339,32 @@ fn tryLoadCache(
         route,
         runtime_version,
     );
+    var locator = (try tryLoadLocator(
+        allocator,
+        admitted_root,
+        cache_dir,
+        locator_key,
+        closure_limits,
+    )) orelse return null;
+    defer locator.deinit(allocator);
+    return try loadCachedPlan(
+        allocator,
+        entry_path,
+        route,
+        runtime_version,
+        cache_dir,
+        &locator,
+        closure_limits,
+    );
+}
+
+fn tryLoadLocator(
+    allocator: std.mem.Allocator,
+    admitted_root: []const u8,
+    cache_dir: []const u8,
+    locator_key: [32]u8,
+    closure_limits: definition_core.closure.Limits,
+) !?VerifiedLocator {
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -335,7 +387,7 @@ fn tryLoadCache(
         locator_limits,
     );
     var locator = try decodeLocator(allocator, locator_payload);
-    defer locator.deinit(allocator);
+    errdefer locator.deinit(allocator);
     const verified_source_bytes =
         try definition_core.closure.verifySourceManifest(
             allocator,
@@ -343,12 +395,23 @@ fn tryLoadCache(
             locator.files,
             closure_limits,
         );
+    return .{ .value = locator, .source_bytes = verified_source_bytes };
+}
 
+fn loadCachedPlan(
+    allocator: std.mem.Allocator,
+    entry_path: []const u8,
+    route: Route,
+    runtime_version: []const u8,
+    cache_dir: []const u8,
+    locator: *const VerifiedLocator,
+    closure_limits: definition_core.closure.Limits,
+) !PlanSet {
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
         "plans",
-        locator.plan_key,
+        locator.value.plan_key,
     );
     defer allocator.free(plan_path);
     const plan_entry = try durable_store.readRegularFileNoSymlink(
@@ -358,7 +421,7 @@ fn tryLoadCache(
     );
     defer allocator.free(plan_entry);
     const plan_payload = try definition_core.cache.decode(
-        locator.plan_key,
+        locator.value.plan_key,
         plan_entry,
         cache_limits,
     );
@@ -373,10 +436,10 @@ fn tryLoadCache(
     if (!std.mem.eql(
         u8,
         &result.closure.digest,
-        &locator.closure_digest,
+        &locator.value.closure_digest,
     )) return error.CacheClosureDigestMismatch;
-    if (result.closure.files.len != locator.files.len or
-        result.closure.total_definition_bytes != verified_source_bytes)
+    if (result.closure.files.len != locator.value.files.len or
+        result.closure.total_definition_bytes != locator.source_bytes)
     {
         return error.CacheClosureManifestMismatch;
     }
@@ -385,7 +448,7 @@ fn tryLoadCache(
         route,
         &result.definition_plan,
     );
-    if (!std.mem.eql(u8, &expected_plan_key, &locator.plan_key)) {
+    if (!std.mem.eql(u8, &expected_plan_key, &locator.value.plan_key)) {
         return error.CachePlanKeyMismatch;
     }
     result.stats.cache_hit = true;
@@ -400,6 +463,34 @@ fn writeCache(
     runtime_version: []const u8,
     plan_set: *const PlanSet,
 ) !void {
+    try ensureCacheDirectories(allocator, cache_dir);
+    const plan_key = planKey(
+        runtime_version,
+        route,
+        &plan_set.definition_plan,
+    );
+    try writePlanCache(
+        allocator,
+        cache_dir,
+        route,
+        plan_set,
+        plan_key,
+    );
+    try writeLocatorCache(
+        allocator,
+        cache_dir,
+        admitted_root,
+        route,
+        runtime_version,
+        plan_set,
+        plan_key,
+    );
+}
+
+fn ensureCacheDirectories(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+) !void {
     const plans_dir = try std.fs.path.join(
         allocator,
         &.{ cache_dir, "plans" },
@@ -413,12 +504,15 @@ fn writeCache(
     try durable_store.ensureDirectoryPathNoSymlinks(cache_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(plans_dir);
     try durable_store.ensureDirectoryPathNoSymlinks(locators_dir);
+}
 
-    const plan_key = planKey(
-        runtime_version,
-        route,
-        &plan_set.definition_plan,
-    );
+fn writePlanCache(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    route: Route,
+    plan_set: *const PlanSet,
+    plan_key: [32]u8,
+) !void {
     var plan_encoder = definition_core.cache.Encoder.init(
         allocator,
         cache_limits.max_payload_bytes,
@@ -442,7 +536,17 @@ fn writeCache(
     );
     defer allocator.free(plan_path);
     try durable_store.writeTextAtomic(allocator, plan_path, plan_entry);
+}
 
+fn writeLocatorCache(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    admitted_root: []const u8,
+    route: Route,
+    runtime_version: []const u8,
+    plan_set: *const PlanSet,
+    plan_key: [32]u8,
+) !void {
     const locator_key = locatorKey(
         admitted_root,
         plan_set.entry_path,
@@ -536,81 +640,103 @@ fn decodePlanSet(
     const route = try decodeRoute(cache_allocator, &decoder);
     defer if (route.name) |name| cache_allocator.free(@constCast(name));
     if (!routesEqual(route, expected_route)) return error.CacheRouteMismatch;
-    var result: PlanSet = result: {
-        const entry_path = try decoder.readBytesAlloc(
-            cache_allocator,
-            4 * 1024 * 1024,
-        );
-        errdefer cache_allocator.free(entry_path);
-        if (!std.mem.eql(u8, entry_path, expected_entry_path)) {
-            return error.CacheEntryPathMismatch;
-        }
-        var closure = try decodeClosure(
-            cache_allocator,
-            &decoder,
-            entry_path,
-            closure_limits,
-            route.kind == .transact,
-        );
-        errdefer closure.deinit(cache_allocator);
-        var definition_plan = try definition.decodeCacheWithDetail(
-            cache_allocator,
-            definitionCacheDetail(route),
-            &decoder,
-        );
-        errdefer definition_plan.deinit(cache_allocator);
-        if (!std.mem.eql(
-            u8,
-            &definition_plan.closure_digest,
-            &closure.digest,
-        )) return error.CacheClosureDigestMismatch;
-        break :result .{
-            .closure = closure,
-            .entry_path = entry_path,
-            .definition_plan = definition_plan,
-            .stats = .{
-                .cache_hit = true,
-                .closure_files = closure.files.len,
-                .closure_bytes = closure.total_definition_bytes,
-            },
-        };
-    };
+    var result = try decodePlanCore(
+        cache_allocator,
+        &decoder,
+        route,
+        expected_entry_path,
+        closure_limits,
+    );
     errdefer result.deinit(cache_allocator);
-    if (try decoder.readBool()) {
-        result.validation_plan = try validation.decodeCache(
-            cache_allocator,
-            &decoder,
-        );
-    }
-    if (try decoder.readBool()) {
-        result.materialization_plan = try materialization.decodeCache(
-            cache_allocator,
-            &decoder,
-        );
-    }
-    if (try decoder.readBool()) {
-        result.storage_plan = try storage.decodeCache(
-            cache_allocator,
-            &decoder,
-        );
-    }
-    if (try decoder.readBool()) {
-        result.protocol_plan = try protocol.decodeCache(
-            cache_allocator,
-            &decoder,
-        );
-    }
-    if (try decoder.readBool()) {
-        result.projection_plan = try projection.decodeCache(
-            cache_allocator,
-            &decoder,
-        );
-    }
+    try decodeOptionalPlans(cache_allocator, &decoder, &result);
     try decoder.finish();
     try validatePlanSet(&result, route);
     result.cache_arena = cache_arena;
     cache_arena_owned = false;
     return result;
+}
+
+fn decodePlanCore(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    route: Route,
+    expected_entry_path: []const u8,
+    closure_limits: definition_core.closure.Limits,
+) !PlanSet {
+    const entry_path = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(entry_path);
+    if (!std.mem.eql(u8, entry_path, expected_entry_path)) {
+        return error.CacheEntryPathMismatch;
+    }
+    var closure = try decodeClosure(
+        allocator,
+        decoder,
+        entry_path,
+        closure_limits,
+        route.kind == .transact,
+    );
+    errdefer closure.deinit(allocator);
+    var definition_plan = try definition.decodeCacheWithDetail(
+        allocator,
+        definitionCacheDetail(route),
+        decoder,
+    );
+    errdefer definition_plan.deinit(allocator);
+    if (!std.mem.eql(
+        u8,
+        &definition_plan.closure_digest,
+        &closure.digest,
+    )) return error.CacheClosureDigestMismatch;
+    return .{
+        .closure = closure,
+        .entry_path = entry_path,
+        .definition_plan = definition_plan,
+        .stats = .{
+            .cache_hit = true,
+            .closure_files = closure.files.len,
+            .closure_bytes = closure.total_definition_bytes,
+        },
+    };
+}
+
+fn decodeOptionalPlans(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    result: *PlanSet,
+) !void {
+    if (try decoder.readBool()) {
+        result.validation_plan = try validation.decodeCache(
+            allocator,
+            decoder,
+        );
+    }
+    if (try decoder.readBool()) {
+        result.materialization_plan = try materialization.decodeCache(
+            allocator,
+            decoder,
+        );
+    }
+    if (try decoder.readBool()) {
+        result.storage_plan = try storage.decodeCache(
+            allocator,
+            decoder,
+        );
+    }
+    if (try decoder.readBool()) {
+        result.protocol_plan = try protocol.decodeCache(
+            allocator,
+            decoder,
+        );
+    }
+    if (try decoder.readBool()) {
+        result.projection_plan = try projection.decodeCache(
+            allocator,
+            decoder,
+        );
+    }
 }
 
 fn encodeClosure(
@@ -637,6 +763,45 @@ fn decodeClosure(
     limits: definition_core.closure.Limits,
     include_sources: bool,
 ) !definition_core.Closure {
+    const header = try decodeClosureHeader(decoder, limits);
+    if (!include_sources) {
+        const files = try emptyClosureFiles(allocator, header.file_count);
+        return .{
+            .files = files,
+            .digest = header.digest,
+            .total_definition_bytes = header.total_definition_bytes,
+        };
+    }
+    var closure = definition_core.Closure{
+        .files = try decodeClosureFiles(
+            allocator,
+            decoder,
+            limits,
+            header.file_count,
+        ),
+        .digest = header.digest,
+        .total_definition_bytes = header.total_definition_bytes,
+    };
+    errdefer closure.deinit(allocator);
+    try definition_core.closure.validateCached(
+        allocator,
+        &closure,
+        entry_path,
+        limits,
+    );
+    return closure;
+}
+
+const ClosureHeader = struct {
+    digest: [71]u8,
+    total_definition_bytes: usize,
+    file_count: usize,
+};
+
+fn decodeClosureHeader(
+    decoder: *definition_core.cache.Decoder,
+    limits: definition_core.closure.Limits,
+) !ClosureHeader {
     var digest: [71]u8 = undefined;
     @memcpy(&digest, try decoder.readFixed(digest.len));
     try definition_core.json.digest(&digest);
@@ -647,74 +812,76 @@ fn decodeClosure(
     {
         return error.CacheClosureManifestInvalid;
     }
-    if (!include_sources) {
-        const files = try allocator.alloc(
-            definition_core.ClosureFile,
-            count,
-        );
-        for (files) |*file| {
-            file.* = .{
-                .path = try allocator.alloc(u8, 0),
-                .canonical_json = try allocator.alloc(u8, 0),
-                .source_digest = [_]u8{0} ** 32,
-                .source_bytes = 0,
-            };
-        }
-        return .{
-            .files = files,
-            .digest = digest,
-            .total_definition_bytes = total_definition_bytes,
-        };
-    }
-    var closure: definition_core.Closure = closure: {
-        const files = try allocator.alloc(definition_core.ClosureFile, count);
-        var initialized: usize = 0;
-        errdefer {
-            for (files[0..initialized]) |*file| {
-                allocator.free(file.path);
-                allocator.free(file.canonical_json);
-            }
-            allocator.free(files);
-        }
-        for (files) |*file| {
-            const path = try decoder.readBytesAlloc(
-                allocator,
-                limits.max_file_bytes,
-            );
-            errdefer allocator.free(path);
-            const canonical_json = try decoder.readBytesAlloc(
-                allocator,
-                limits.max_file_bytes,
-            );
-            errdefer allocator.free(canonical_json);
-            var source_digest: [32]u8 = undefined;
-            @memcpy(
-                &source_digest,
-                try decoder.readFixed(source_digest.len),
-            );
-            const source_bytes = try decoder.readUsize();
-            file.* = .{
-                .path = path,
-                .canonical_json = canonical_json,
-                .source_digest = source_digest,
-                .source_bytes = source_bytes,
-            };
-            initialized += 1;
-        }
-        break :closure .{
-            .files = files,
-            .digest = digest,
-            .total_definition_bytes = total_definition_bytes,
-        };
+    return .{
+        .digest = digest,
+        .total_definition_bytes = total_definition_bytes,
+        .file_count = count,
     };
-    errdefer closure.deinit(allocator);
-    try definition_core.closure.validateCached(
-        allocator,
-        &closure,
-        entry_path,
-        limits,
-    );
-    return closure;
+}
+
+fn emptyClosureFiles(
+    allocator: std.mem.Allocator,
+    count: usize,
+) ![]definition_core.ClosureFile {
+    const files = try allocator.alloc(definition_core.ClosureFile, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |file| {
+            allocator.free(file.path);
+            allocator.free(file.canonical_json);
+        }
+        allocator.free(files);
+    }
+    for (files) |*file| {
+        const path = try allocator.alloc(u8, 0);
+        errdefer allocator.free(path);
+        const canonical_json = try allocator.alloc(u8, 0);
+        errdefer allocator.free(canonical_json);
+        file.* = .{
+            .path = path,
+            .canonical_json = canonical_json,
+            .source_digest = [_]u8{0} ** 32,
+            .source_bytes = 0,
+        };
+        initialized += 1;
+    }
+    return files;
+}
+
+fn decodeClosureFiles(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    limits: definition_core.closure.Limits,
+    count: usize,
+) ![]definition_core.ClosureFile {
+    const files = try allocator.alloc(definition_core.ClosureFile, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |file| {
+            allocator.free(file.path);
+            allocator.free(file.canonical_json);
+        }
+        allocator.free(files);
+    }
+    for (files) |*file| {
+        const path = try decoder.readBytesAlloc(allocator, limits.max_file_bytes);
+        errdefer allocator.free(path);
+        const canonical_json = try decoder.readBytesAlloc(
+            allocator,
+            limits.max_file_bytes,
+        );
+        errdefer allocator.free(canonical_json);
+        var source_digest: [32]u8 = undefined;
+        @memcpy(&source_digest, try decoder.readFixed(source_digest.len));
+        file.* = .{
+            .path = path,
+            .canonical_json = canonical_json,
+            .source_digest = source_digest,
+            .source_bytes = try decoder.readUsize(),
+        };
+        initialized += 1;
+    }
+    return files;
 }
 
 fn encodeLocator(
@@ -793,6 +960,12 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
             }
         }
     }
+    try validatePlanShape(plan_set, route);
+    try validateNestedPlans(plan_set);
+    try validateRouteTarget(plan_set, route);
+}
+
+fn validatePlanShape(plan_set: *const PlanSet, route: Route) !void {
     const required_validation = route.kind == .definition_check or
         route.kind == .validation or
         route.kind == .materialization or
@@ -816,6 +989,9 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
     {
         return error.CachePlanSetShapeMismatch;
     }
+}
+
+fn validateNestedPlans(plan_set: *const PlanSet) !void {
     if (plan_set.validation_plan) |*plan| {
         try validation.validateCachePlan(plan, &plan_set.definition_plan);
     }
@@ -846,6 +1022,9 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
                 null,
         );
     }
+}
+
+fn validateRouteTarget(plan_set: *const PlanSet, route: Route) !void {
     switch (route.kind) {
         .transact => if (plan_set.storage_plan.?.findOperation(
             route.name.?,
@@ -959,31 +1138,11 @@ fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-test "compiled plan cache rebuilds misses and skips definition parsing on hits" {
-    var source_tmp = std.testing.tmpDir(.{});
-    defer source_tmp.cleanup();
-    try source_tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object"]},"parameters":{},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
-        ,
-    });
-    const source_root = try source_tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(source_root);
-    var cache_tmp = std.testing.tmpDir(.{});
-    defer cache_tmp.cleanup();
-    const cache_root = try cache_tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(cache_root);
-    const route: Route = .{ .kind = .validation };
-
+fn expectColdAndWarmCache(
+    source_root: []const u8,
+    cache_root: []const u8,
+    route: Route,
+) !void {
     var cold = try load(
         std.testing.allocator,
         source_root,
@@ -997,7 +1156,6 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     try std.testing.expect(cold.validation_plan != null);
     try std.testing.expect(cold.closure.files[0].canonical_json.len > 0);
     try std.testing.expect(cold.definition_plan.rules.len > 0);
-
     var warm = try load(
         std.testing.allocator,
         source_root,
@@ -1012,22 +1170,19 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
         @as(usize, 0),
         warm.closure.files[0].canonical_json.len,
     );
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        warm.definition_plan.rules.len,
-    );
+    try std.testing.expectEqual(@as(usize, 0), warm.definition_plan.rules.len);
     try std.testing.expectEqualStrings(
         cold.definition_plan.closure_digest[0..],
         warm.definition_plan.closure_digest[0..],
     );
+}
 
-    try source_tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema": "ledger-artifact-definition/v1","id":"example/cache","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object"]},"parameters":{},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["value"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
-        ,
-    });
-    var changed_source = try load(
+fn expectChangedAndCorruptCacheRebuild(
+    source_root: []const u8,
+    cache_root: []const u8,
+    route: Route,
+) !void {
+    var changed = try load(
         std.testing.allocator,
         source_root,
         "artifact.json",
@@ -1035,14 +1190,9 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
         "1.0.0-test",
         .{ .cache_dir = cache_root },
     );
-    defer changed_source.deinit(std.testing.allocator);
-    try std.testing.expect(!changed_source.stats.cache_hit);
-
-    const key = planKey(
-        "1.0.0-test",
-        route,
-        &changed_source.definition_plan,
-    );
+    defer changed.deinit(std.testing.allocator);
+    try std.testing.expect(!changed.stats.cache_hit);
+    const key = planKey("1.0.0-test", route, &changed.definition_plan);
     const path = try cachePathAlloc(
         std.testing.allocator,
         cache_root,
@@ -1061,6 +1211,42 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     );
     defer rebuilt.deinit(std.testing.allocator);
     try std.testing.expect(!rebuilt.stats.cache_hit);
+}
+
+test "compiled plan cache rebuilds misses and skips definition parsing on hits" {
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    try source_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = @embedFile("fixtures/record-definition.json"),
+    });
+    const source_root = try source_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(source_root);
+    var cache_tmp = std.testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    const cache_root = try cache_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(cache_root);
+    const route: Route = .{ .kind = .validation };
+    try expectColdAndWarmCache(source_root, cache_root, route);
+    const changed_definition = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{ " ", @embedFile("fixtures/record-definition.json") },
+    );
+    defer std.testing.allocator.free(changed_definition);
+    try source_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = changed_definition,
+    });
+    try expectChangedAndCorruptCacheRebuild(source_root, cache_root, route);
 }
 
 test "transaction cache retains canonical definition archive sources" {
@@ -1148,9 +1334,7 @@ test "compiled plan cache releases every allocation on compile and decode failur
     defer source_tmp.cleanup();
     try source_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/cache-allocation","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","fold","path-format","previous-digest","reducer","replay","sequence","transition-table"]},"parameters":{"limit":{"type":"integer","required":false,"default":10},"stream":{"type":"safe_identifier","required":false,"default":"events"}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","input":"event","path":"","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"]},{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["captured"]},{"op":"transition-table","states":["current"],"transitions":[{"from":null,"on":"captured","to":"current"}]},{"op":"reducer","key":"/body/id","on":"/kind"}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{"current":{"slot":"events","pipeline":[{"op":"fold","key_field":"id","state_field":"status"}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
-        ,
+        .data = @embedFile("fixtures/chained-event-definition.json"),
     });
     const source_root = try source_tmp.dir.realPathFileAlloc(
         std.testing.io,
