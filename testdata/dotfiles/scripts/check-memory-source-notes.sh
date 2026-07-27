@@ -153,9 +153,28 @@ cmp -s \
   "$scratch/expected-memory-note.json" \
   "$scratch/actual-memory-note.json"
 
+jq -r '.returned_content' "$source_transaction" |
+  jq -c \
+    '[.record |
+      {
+        id: .id,
+        captured_at: .captured_at,
+        kind: .kind,
+        operation: .operation,
+        summary: .summary
+      }]' >"$scratch/expected-recent.json"
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection recent \
+  --repo "$projection_repo" \
+  --param limit=1 \
+  --payload-only \
+  --format json >"$scratch/actual-recent.json"
+cmp -s "$scratch/expected-recent.json" "$scratch/actual-recent.json"
+
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=2\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=3\n' \
   "$valid_count" \
   "$invalid_count"
