@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "mapping-endorsement": "bases/mapping-endorsement.json"
-  },
-  "cases": [
-    {
-      "id": "mapping-endorsement",
-      "base": "mapping-endorsement",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "mapping-endorsement"
+  ],
+  "valid": [
     {
       "id": "mapping-confirmation",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/logical_kind": "mapping-confirmation",
         "/source/record/authority": "repeated-accepted-use",
@@ -25,8 +18,6 @@
     },
     {
       "id": "mapping-correction",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/logical_kind": "mapping-correction",
         "/source/physical_kind": "mapping-correction",
@@ -38,8 +29,6 @@
     },
     {
       "id": "mapping-rejection",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/logical_kind": "mapping-rejection",
         "/source/physical_kind": "mapping-rejection",
@@ -53,8 +42,6 @@
     },
     {
       "id": "activation-boundary",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/logical_kind": "activation-boundary",
         "/source/physical_kind": "activation-boundary"
@@ -62,8 +49,6 @@
     },
     {
       "id": "boundary-retraction",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/logical_kind": "boundary-retraction",
         "/source/physical_kind": "boundary-retraction",
@@ -77,8 +62,6 @@
     },
     {
       "id": "scope-global",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/record/scope/kind": "global",
         "/source/record/scope/paths": [],
@@ -90,8 +73,6 @@
     },
     {
       "id": "scope-path-family-whitespace",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/record/scope/kind": "path-family",
         "/source/record/scope/paths": [
@@ -103,19 +84,17 @@
     },
     {
       "id": "scope-repo-whitespace",
-      "base": "mapping-endorsement",
-      "expect": "valid",
       "set": {
         "/source/record/scope/paths": [],
         "/source/record/scope/repo": " ",
         "/source/record/payload/scope_anchor": " ",
         "/scope_anchor_source": "repo"
       }
-    },
+    }
+  ],
+  "invalid": [
     {
       "id": "confirmation-without-prior",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/logical_kind": "mapping-confirmation",
         "/source/record/operation": "confirm"
@@ -123,16 +102,12 @@
     },
     {
       "id": "endorsement-mismatch",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/record/payload/endorsement_type": "repeated-accepted-use"
       }
     },
     {
       "id": "malformed-prior-id",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/record/related_ids": [
           "MSN-invalid"
@@ -141,40 +116,30 @@
     },
     {
       "id": "mapping-without-translation",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "remove": [
         "/source/record/payload/engineering_translation"
       ]
     },
     {
       "id": "physical-kind-mismatch",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/physical_kind": "mapping-correction"
       }
     },
     {
       "id": "scope-mapping-mismatch",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/record/payload/scope": "global_default"
       }
     },
     {
       "id": "scope-anchor-priority",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/record/payload/scope_anchor": "owner/repo"
       }
     },
     {
       "id": "sensitive-nested-key",
-      "base": "mapping-endorsement",
-      "expect": "invalid",
       "set": {
         "/source/record/payload/secret": "redacted"
       }

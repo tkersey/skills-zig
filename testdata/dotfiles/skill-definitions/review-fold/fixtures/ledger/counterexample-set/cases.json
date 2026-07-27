@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "accepted": "bases/accepted.json"
-  },
-  "cases": [
-    {
-      "id": "accepted",
-      "base": "accepted",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "accepted"
+  ],
+  "invalid": [
     {
       "id": "unknown-discrepancy",
-      "base": "accepted",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/classes/0/discrepancy": "preference",
         "/artifact/payload/classes/0/finding_refs": []

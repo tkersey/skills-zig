@@ -1,66 +1,20 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "effect-recorded": "bases/effect-recorded.json",
-    "operation-aborted": "bases/operation-aborted.json",
-    "operation-observed": "bases/operation-observed.json",
-    "publication-observed": "bases/publication-observed.json",
-    "review-attempt-completed": "bases/review-attempt-completed.json",
-    "review-attempt-started": "bases/review-attempt-started.json",
-    "review-campaign-started": "bases/review-campaign-started.json",
-    "review-request-bound": "bases/review-request-bound.json",
-    "review-transport-failed": "bases/review-transport-failed.json"
-  },
-  "cases": [
-    {
-      "id": "effect-recorded",
-      "base": "effect-recorded",
-      "expect": "valid"
-    },
-    {
-      "id": "operation-aborted",
-      "base": "operation-aborted",
-      "expect": "valid"
-    },
-    {
-      "id": "operation-observed",
-      "base": "operation-observed",
-      "expect": "valid"
-    },
-    {
-      "id": "publication-observed",
-      "base": "publication-observed",
-      "expect": "valid"
-    },
-    {
-      "id": "review-attempt-completed",
-      "base": "review-attempt-completed",
-      "expect": "valid"
-    },
-    {
-      "id": "review-attempt-started",
-      "base": "review-attempt-started",
-      "expect": "valid"
-    },
-    {
-      "id": "review-campaign-started",
-      "base": "review-campaign-started",
-      "expect": "valid"
-    },
-    {
-      "id": "review-request-bound",
-      "base": "review-request-bound",
-      "expect": "valid"
-    },
-    {
-      "id": "review-transport-failed",
-      "base": "review-transport-failed",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "effect-recorded",
+    "operation-aborted",
+    "operation-observed",
+    "publication-observed",
+    "review-attempt-completed",
+    "review-attempt-started",
+    "review-campaign-started",
+    "review-request-bound",
+    "review-transport-failed"
+  ],
+  "invalid": [
     {
       "id": "body-schema-mismatch",
       "base": "operation-aborted",
-      "expect": "invalid",
       "set": {
         "/body/schema": "operation-observed/v1"
       }
@@ -68,7 +22,6 @@
     {
       "id": "duplicate-findings",
       "base": "review-attempt-completed",
-      "expect": "invalid",
       "set": {
         "/body/verdict": "findings",
         "/body/finding_refs": [
@@ -81,7 +34,6 @@
     {
       "id": "empty-evidence-refs",
       "base": "operation-observed",
-      "expect": "invalid",
       "set": {
         "/body/discharged_refs": [],
         "/body/evidence_refs": []
@@ -90,7 +42,6 @@
     {
       "id": "unknown-kind",
       "base": "operation-aborted",
-      "expect": "invalid",
       "set": {
         "/kind": "unknown"
       },

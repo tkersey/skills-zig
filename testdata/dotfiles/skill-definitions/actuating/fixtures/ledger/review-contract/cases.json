@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "current": "bases/current.json"
-  },
-  "cases": [
-    {
-      "id": "current",
-      "base": "current",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "current"
+  ],
+  "invalid": [
     {
       "id": "review-digest",
-      "base": "current",
-      "expect": "invalid",
       "set": {
         "/review_contract/contract_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }

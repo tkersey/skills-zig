@@ -1,44 +1,19 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
+  "schema": "ledger-definition-conformance-cases/v4",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
   },
-  "bases": {
-    "essential-expansion": "bases/essential-expansion.json",
-    "initial": "bases/initial.json",
-    "normalized": "bases/normalized.json",
-    "unchanged-realization": "bases/unchanged-realization.json"
-  },
-  "cases": [
-    {
-      "id": "essential-expansion",
-      "base": "essential-expansion",
-      "expect": "valid"
-    },
-    {
-      "id": "initial",
-      "base": "initial",
-      "expect": "valid",
-      "materialization": {
-        "artifact_id": "sha256:ec81c6d46fcd84f82fa1280ce2928def5486e532f82ef6b552d6ac83508852a7",
-        "canonical_content_digest": "sha256:014b12c3942baa7a232d86d9ed9079d8c6a5a25ad487994880be924f46cfbf28"
-      }
-    },
-    {
-      "id": "normalized",
-      "base": "normalized",
-      "expect": "valid"
-    },
-    {
-      "id": "unchanged-realization",
-      "base": "unchanged-realization",
-      "expect": "valid"
-    },
+  "bases": [
+    "essential-expansion",
+    "initial",
+    "normalized",
+    "unchanged-realization"
+  ],
+  "invalid": [
     {
       "id": "ambiguous-proof-role",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/retirements": [
           {
@@ -58,7 +33,6 @@
     {
       "id": "candidate-family-order",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/recompilation/candidates/1/family": "ablation-normalization"
       }
@@ -66,7 +40,6 @@
     {
       "id": "essential-missing-addition",
       "base": "essential-expansion",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/supersession/essential_additions": []
       }
@@ -74,7 +47,6 @@
     {
       "id": "initial-with-counterexample-set",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/recompilation/counterexample_set_ref": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       }
@@ -82,7 +54,6 @@
     {
       "id": "multiple-selected-candidates",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/recompilation/candidates/1/status": "selected"
       }
@@ -90,7 +61,6 @@
     {
       "id": "normalized-identity",
       "base": "unchanged-realization",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/supersession/disposition": "normalized"
       }
@@ -98,7 +68,6 @@
     {
       "id": "reserved-proof-role",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/proof_obligations/0/obligation_id": "proof-1#falsifier"
       }
@@ -106,7 +75,6 @@
     {
       "id": "selected-surface-mismatch",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/semantic_surface/successor_factors/0/description": "changed preserved value"
       }
@@ -114,7 +82,6 @@
     {
       "id": "unchanged-changed-factor",
       "base": "unchanged-realization",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/recompilation/candidates/0/factors/0/description": "changed preserved factor",
         "/artifact/payload/semantic_surface/successor_factors/0/description": "changed preserved factor"
@@ -123,11 +90,16 @@
     {
       "id": "unclassified-successor",
       "base": "initial",
-      "expect": "invalid",
       "set": {
         "/artifact/payload/supersession/introduced_factor_refs": []
       }
     }
   ],
+  "materializations": {
+    "initial": {
+      "artifact_id": "sha256:ec81c6d46fcd84f82fa1280ce2928def5486e532f82ef6b552d6ac83508852a7",
+      "canonical_content_digest": "sha256:014b12c3942baa7a232d86d9ed9079d8c6a5a25ad487994880be924f46cfbf28"
+    }
+  },
   "reconstructed_cases_digest": "sha256:89377c46635dae24a66551262cdc9280d5dd6952b626248d11704317590f0289"
 }

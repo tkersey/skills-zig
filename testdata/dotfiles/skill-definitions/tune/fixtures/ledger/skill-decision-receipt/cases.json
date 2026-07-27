@@ -1,22 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "complete": "bases/complete.json"
-  },
-  "cases": [
-    {
-      "id": "complete",
-      "base": "complete",
-      "expect": "valid",
-      "materialization": {
-        "artifact_id": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070",
-        "canonical_content_digest": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070"
-      }
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "complete"
+  ],
+  "valid": [
     {
       "id": "minimal",
-      "base": "complete",
-      "expect": "valid",
       "remove": [
         "/skill_decision_receipt/alternatives_considered",
         "/skill_decision_receipt/clause_refs",
@@ -28,11 +17,11 @@
         "/skill_decision_receipt/skill_version",
         "/skill_decision_receipt/trigger_refs"
       ]
-    },
+    }
+  ],
+  "invalid": [
     {
       "id": "selected-route-rejected",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_decision_receipt/rejected_routes": [
           "route-a"
@@ -41,28 +30,28 @@
     },
     {
       "id": "missing-artifact-state",
-      "base": "complete",
-      "expect": "invalid",
       "remove": [
         "/skill_decision_receipt/artifact_state"
       ]
     },
     {
       "id": "unstable-decision-id",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_decision_receipt/decision_id": "x"
       }
     },
     {
       "id": "non-string-clause-ref",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_decision_receipt/clause_refs/0": 1
       }
     }
   ],
+  "materializations": {
+    "complete": {
+      "artifact_id": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070",
+      "canonical_content_digest": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070"
+    }
+  },
   "reconstructed_cases_digest": "sha256:ab17f4dd0f13493245e282586a53af44f51d0282a1108e93ccf6b5bac76f5c54"
 }

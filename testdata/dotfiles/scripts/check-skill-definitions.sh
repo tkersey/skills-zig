@@ -96,8 +96,16 @@ for manifest in $manifests; do
             '
               . as $suite |
               type == "object" and
-              ((keys - ["bases", "cases", "oracle", "reconstructed_cases_digest", "schema"]) | length) == 0 and
-              .schema == "ledger-definition-conformance-cases/v3" and
+              ((keys - [
+                "bases",
+                "invalid",
+                "materializations",
+                "oracle",
+                "reconstructed_cases_digest",
+                "schema",
+                "valid"
+              ]) | length) == 0 and
+              .schema == "ledger-definition-conformance-cases/v4" and
               (.reconstructed_cases_digest |
                 type == "string" and test("^sha256:[0-9a-f]{64}$")) and
               (.oracle == null or (
@@ -109,33 +117,48 @@ for manifest in $manifests; do
                 (.oracle.ledger_version |
                   type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
               )) and
-              (.bases | type == "object" and length > 0) and
+              (.bases | type == "array" and length > 0) and
+              (.bases | unique | length) == (.bases | length) and
               all(.bases[];
-                type == "string" and
-                startswith("/") == false and
-                (split("/") | all(. != "" and . != "." and . != ".."))
+                type == "string" and test("^[A-Za-z0-9._-]+$")
               ) and
-              (.cases | type == "array" and length > 0) and
-              ([.cases[].id] | unique | length) == (.cases | length) and
-              all(.cases[];
+              ((.valid // []) | type == "array") and
+              ((.invalid // []) | type == "array") and
+              all([(.valid // [])[], (.invalid // [])[]][];
                 type == "object" and
-                ((keys - ["base", "expect", "id", "materialization", "remove", "set"]) | length) == 0 and
+                ((keys - ["base", "id", "remove", "set"]) | length) == 0 and
                 (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-                (.base | type == "string") and
-                (.expect == "valid" or .expect == "invalid") and
-                (.materialization == null or (
-                  .expect == "valid" and
-                  (.materialization | type == "object") and
-                  (.materialization | keys | sort) ==
-                    ["artifact_id", "canonical_content_digest"] and
-                  (.materialization.artifact_id |
-                    type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-                  (.materialization.canonical_content_digest |
-                    type == "string" and test("^sha256:[0-9a-f]{64}$"))
-                ))
+                (.base == null or (
+                  .base as $base |
+                  ($base | type == "string") and
+                  ($suite.bases | index($base)) != null
+                )) and
+                (.base != null or ($suite.bases | length) == 1)
               ) and
-              all($suite.cases[].base;
-                . as $base | $suite.bases | has($base))
+              (
+                [
+                  $suite.bases[],
+                  ($suite.valid // [])[].id,
+                  ($suite.invalid // [])[].id
+                ] as $case_ids |
+                ($case_ids | unique | length) == ($case_ids | length)
+              ) and
+              (($suite.materializations // {}) | type == "object") and
+              all(($suite.materializations // {}) | to_entries[];
+                . as $materialization |
+                (
+                  $suite.bases +
+                  [($suite.valid // [])[].id]
+                | index($materialization.key)
+                ) != null and
+                ($materialization.value | type == "object") and
+                ($materialization.value | keys | sort) ==
+                  ["artifact_id", "canonical_content_digest"] and
+                ($materialization.value.artifact_id |
+                  type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+                ($materialization.value.canonical_content_digest |
+                  type == "string" and test("^sha256:[0-9a-f]{64}$"))
+              )
             ' \
             "$fixture_suite" >/dev/null
           validate_json_pointer_deltas "$fixture_suite"
@@ -169,9 +192,7 @@ for manifest in $manifests; do
               expected_materialization=$(
                 jq -c \
                   --arg case_id "$case_id" \
-                  '.cases[] |
-                   select(.id == $case_id) |
-                   .materialization // empty' \
+                  '.materializations[$case_id] // empty' \
                   "$fixture_suite"
               )
               if [[ -n "$expected_materialization" ]]; then
@@ -236,7 +257,7 @@ for manifest in $manifests; do
                 <<<"$result" >/dev/null
             fi
           done < <(
-            jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite"
+            definition_suite_case_rows "$fixture_suite"
           )
           verify_reconstructed_digest_set \
             "$reconstructed_digests" \

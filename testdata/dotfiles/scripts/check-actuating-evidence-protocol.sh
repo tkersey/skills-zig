@@ -23,10 +23,11 @@ command -v "$ledger_bin" >/dev/null
 
 jq -e \
   '
+    . as $suite |
     type == "object" and
     (keys | sort) ==
-      ["cases", "protocol_definition", "reconstructed_candidates_digest", "schema", "sources"] and
-    .schema == "actuating-evidence-protocol-cases/v3" and
+      ["defaults", "invalid", "protocol_definition", "reconstructed_candidates_digest", "schema", "sources", "valid"] and
+    .schema == "actuating-evidence-protocol-cases/v4" and
     (.reconstructed_candidates_digest |
       type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.protocol_definition |
@@ -46,20 +47,36 @@ jq -e \
         (split("/") | all(. != "" and . != "." and . != ".."))
       )
     ) and
-    (.cases | type == "array" and length > 0) and
-    ([.cases[].id] | unique | length) == (.cases | length) and
-    all(.cases[];
+    (.defaults | type == "object") and
+    (.defaults | keys | sort) == ["candidate", "error", "setup"] and
+    (.defaults.setup == "accepted-debt" or
+     .defaults.setup == "rejected-review") and
+    (.defaults.candidate == "construction-successor" or
+     .defaults.candidate == "goal-successor") and
+    (.defaults.error | type == "string" and length > 0) and
+    (.valid | type == "array") and
+    (.invalid | type == "array") and
+    ((.valid | length) + (.invalid | length) > 0) and
+    ([.valid[].id, .invalid[].id] | unique | length) ==
+      ((.valid | length) + (.invalid | length)) and
+    all(.valid[];
       type == "object" and
-      ((keys - ["remove", "set"]) | sort) ==
-        ["candidate", "error", "expect", "id", "setup"] and
+      ((keys - ["candidate", "id", "remove", "set", "setup"]) | length) == 0 and
       (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-      (.setup == "accepted-debt" or .setup == "rejected-review") and
-      (.candidate == "construction-successor" or
-       .candidate == "goal-successor") and
-      (.expect == "valid" or .expect == "invalid") and
-      ((.expect == "valid" and .error == null) or
-       (.expect == "invalid" and
-        (.error | type == "string" and length > 0)))
+      ((.setup // $suite.defaults.setup) == "accepted-debt" or
+       (.setup // $suite.defaults.setup) == "rejected-review") and
+      ((.candidate // $suite.defaults.candidate) == "construction-successor" or
+       (.candidate // $suite.defaults.candidate) == "goal-successor")
+    ) and
+    all(.invalid[];
+      type == "object" and
+      ((keys - ["candidate", "error", "id", "remove", "set", "setup"]) | length) == 0 and
+      (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
+      ((.setup // $suite.defaults.setup) == "accepted-debt" or
+       (.setup // $suite.defaults.setup) == "rejected-review") and
+      ((.candidate // $suite.defaults.candidate) == "construction-successor" or
+       (.candidate // $suite.defaults.candidate) == "goal-successor") and
+      ((.error // $suite.defaults.error) | type == "string" and length > 0)
     )
   ' \
   "$scenarios" >/dev/null
@@ -450,19 +467,19 @@ prepare_candidate() {
   local source_document="$case_tmp/candidate-source.json"
   local bound_document="$case_tmp/candidate-bound.json"
   local candidate_document="$case_tmp/candidate.json"
+  local case_spec
   local set_values
   local remove_paths
 
-  set_values=$(
+  case_spec=$(
     jq -c --arg case_id "$case_id" \
-      '.cases[] | select(.id == $case_id) | .set // {}' \
+      '[.valid[], .invalid[]] |
+       map(select(.id == $case_id)) |
+       first' \
       "$scenarios"
   )
-  remove_paths=$(
-    jq -c --arg case_id "$case_id" \
-      '.cases[] | select(.id == $case_id) | .remove // []' \
-      "$scenarios"
-  )
+  set_values=$(jq -c '.set // {}' <<<"$case_spec")
+  remove_paths=$(jq -c '.remove // []' <<<"$case_spec")
   if [[ "$candidate_kind" == "construction-successor" ]]; then
     reconstruct_source successor-construction "$source_document"
     jq -S -c \
@@ -616,8 +633,23 @@ while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error;
   fi
 done < <(
   jq -r \
-    '.cases[] |
-     [.id, .setup, .candidate, .expect, (.error // "-")] |
+    '.defaults as $defaults |
+     (.valid[] |
+       [
+         .id,
+         (.setup // $defaults.setup),
+         (.candidate // $defaults.candidate),
+         "valid",
+         "-"
+       ]),
+     (.invalid[] |
+       [
+         .id,
+         (.setup // $defaults.setup),
+         (.candidate // $defaults.candidate),
+         "invalid",
+         (.error // $defaults.error)
+       ]) |
      @tsv' \
     "$scenarios"
 )

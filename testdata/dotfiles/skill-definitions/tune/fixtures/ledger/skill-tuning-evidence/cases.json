@@ -1,22 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "complete": "bases/complete.json"
-  },
-  "cases": [
-    {
-      "id": "complete",
-      "base": "complete",
-      "expect": "valid",
-      "materialization": {
-        "artifact_id": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf",
-        "canonical_content_digest": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf"
-      }
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "complete"
+  ],
+  "valid": [
     {
       "id": "nullable-cursor-and-scope",
-      "base": "complete",
-      "expect": "valid",
       "set": {
         "/skill_tuning_evidence/contract/fingerprint": null,
         "/skill_tuning_evidence/cursor_end/contract_fingerprint": null,
@@ -30,55 +19,51 @@
         "/skill_tuning_evidence/window/until": null,
         "/skill_tuning_evidence/window/workdir": null
       }
-    },
+    }
+  ],
+  "invalid": [
     {
       "id": "missing-denominator",
-      "base": "complete",
-      "expect": "invalid",
       "remove": [
         "/skill_tuning_evidence/denominator"
       ]
     },
     {
       "id": "negative-counter",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_tuning_evidence/denominator/candidate_sessions": -1
       }
     },
     {
       "id": "noninteger-compliance-count",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_tuning_evidence/contract_compliance/followed/clause-1": "one"
       }
     },
     {
       "id": "unknown-causality",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/metadata/causality": "proven"
       }
     },
     {
       "id": "extra-top-level-field",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/semantic_authority": true
       }
     },
     {
       "id": "nonstring-limitation",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/skill_tuning_evidence/evidence_limitations/0": 1
       }
     }
   ],
+  "materializations": {
+    "complete": {
+      "artifact_id": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf",
+      "canonical_content_digest": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf"
+    }
+  },
   "reconstructed_cases_digest": "sha256:b35734ca4c32ff1584f35b0f2c4689f223870a48c44edc2d419ace209d6a43df"
 }

@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "minimal": "bases/minimal.json"
-  },
-  "cases": [
-    {
-      "id": "minimal",
-      "base": "minimal",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "minimal"
+  ],
+  "invalid": [
     {
       "id": "unknown-route",
-      "base": "minimal",
-      "expect": "invalid",
       "set": {
         "/skill_decision_contract/triggers/0/cue_literals": [],
         "/skill_decision_contract/clauses/0/expected_routes/0": "MISSING-ROUTE",

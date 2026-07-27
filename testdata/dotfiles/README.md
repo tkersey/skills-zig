@@ -4,21 +4,12 @@ This is test-only black-box data for validating the passive definitions shipped
 by dotfiles against exact Seq and Ledger candidate binaries. It is not compiled
 into either product and is not part of a deployed skill package.
 
-Each single-input artifact suite uses
-`ledger-definition-conformance-cases/v3`:
-
-- `bases` keeps one canonical compact document per genuinely distinct valid
-  structural family.
-- `cases` names the base and expected verdict. Optional `set` and `remove`
-  fields are JSON-Pointer deltas; they omit JSON Patch ceremony and never copy
-  an enclosing object for a one-field variant.
-- One `reconstructed_cases_digest` binds the ordered set of case IDs and
-  reconstructed-byte digests. It provides the same exact-case integrity check
-  without repeating a digest in every case row.
-- `materialization` retains the expected artifact ID and canonical-content
-  digest; `oracle`, when present, binds those values to the frozen base binary.
-  The harness reconstructs and compares the complete canonical output, so
-  expected files do not duplicate it.
+Each `ledger-definition-conformance-cases/v4` suite lists canonical base IDs;
+`bases/<id>.json` is both the source file and an implicit valid case. Only
+additional `valid` variants and `invalid` counterexamples are catalogued.
+Variants use JSON-Pointer `set`/`remove` deltas and may omit `base` when the
+suite has one. `materializations` is keyed by case ID. One
+`reconstructed_cases_digest` still binds every reconstructed case byte-for-byte.
 
 Stateful protocol suites reuse those named cases and the same pointer-delta
 encoding. Their catalog contains only source-case references, dynamic bindings,
@@ -33,12 +24,4 @@ DOTFILES_ROOT=/path/to/dotfiles \
 SEQ_BIN=/path/to/seq-v1-candidate \
 LEDGER_BIN=/path/to/ledger-v1-candidate \
 testdata/dotfiles/scripts/check-skill-definitions.sh
-```
-
-The Actuating Evidence protocol proof is:
-
-```bash
-DOTFILES_ROOT=/path/to/dotfiles \
-LEDGER_BIN=/path/to/ledger-v1-candidate \
-testdata/dotfiles/scripts/check-actuating-evidence-protocol.sh
 ```

@@ -1,46 +1,33 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
+  "schema": "ledger-definition-conformance-cases/v4",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
   },
-  "bases": {
-    "frozen-export": "bases/frozen-export.json"
-  },
-  "cases": [
-    {
-      "id": "frozen-export",
-      "base": "frozen-export",
-      "expect": "valid"
-    },
+  "bases": [
+    "frozen-export"
+  ],
+  "invalid": [
     {
       "id": "active-without-applicability",
-      "base": "frozen-export",
-      "expect": "invalid",
       "set": {
         "/payload/applicability_conditions": []
       }
     },
     {
       "id": "projection-fingerprint-shape",
-      "base": "frozen-export",
-      "expect": "invalid",
       "set": {
         "/payload/projection_fingerprint": "not-a-fingerprint"
       }
     },
     {
       "id": "reopened-with-assert-operation",
-      "base": "frozen-export",
-      "expect": "invalid",
       "set": {
         "/payload/status": "reopened"
       }
     },
     {
       "id": "repo-mismatch",
-      "base": "frozen-export",
-      "expect": "invalid",
       "set": {
         "/payload/repository_id": "other/repo"
       }

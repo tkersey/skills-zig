@@ -1,54 +1,37 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "complete": "bases/complete.json"
-  },
-  "cases": [
-    {
-      "id": "complete",
-      "base": "complete",
-      "expect": "valid",
-      "materialization": {
-        "artifact_id": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7",
-        "canonical_content_digest": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7"
-      }
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "complete"
+  ],
+  "valid": [
     {
       "id": "unborn-head",
-      "base": "complete",
-      "expect": "valid",
       "set": {
         "/subject/head_oid": null
       }
-    },
+    }
+  ],
+  "invalid": [
     {
       "id": "missing-changed-paths",
-      "base": "complete",
-      "expect": "invalid",
       "remove": [
         "/evidence/changed_paths"
       ]
     },
     {
       "id": "absolute-changed-path",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/evidence/changed_paths/0": "/tmp/outside"
       }
     },
     {
       "id": "unbound-workspace-fingerprint",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/subject/workspace_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     },
     {
       "id": "nested-evidence-array",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/evidence/attempted_routes/0": [
           "route"
@@ -57,12 +40,16 @@
     },
     {
       "id": "empty-decision-delta",
-      "base": "complete",
-      "expect": "invalid",
       "set": {
         "/evidence/decision_delta": " "
       }
     }
   ],
+  "materializations": {
+    "complete": {
+      "artifact_id": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7",
+      "canonical_content_digest": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7"
+    }
+  },
   "reconstructed_cases_digest": "sha256:347ea4f4e426a396223ffaa52bbf1eb2419a3823fd725569bd8cdf186643d78b"
 }

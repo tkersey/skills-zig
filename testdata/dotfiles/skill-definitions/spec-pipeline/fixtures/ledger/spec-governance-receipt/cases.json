@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "complete": "bases/complete.json"
-  },
-  "cases": [
-    {
-      "id": "complete",
-      "base": "complete",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "complete"
+  ],
+  "invalid": [
     {
       "id": "missing-retro",
-      "base": "complete",
-      "expect": "invalid",
       "remove": [
         "/spec_governance_receipt/retro"
       ]

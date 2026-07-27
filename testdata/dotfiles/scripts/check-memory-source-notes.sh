@@ -105,7 +105,7 @@ while IFS=$'\t' read -r case_id expectation; do
          startswith("structurally invalid under memory-source-notes/synesthesia-memory-note-payload@sha256:"))' \
       "$errors" >/dev/null
   fi
-done < <(jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite")
+done < <(definition_suite_case_rows "$fixture_suite")
 
 source_definition="$dotfiles_root/codex/skills/synesthesia/definitions/ledger/synesthesia-protocol.json"
 source_submission="$scratch/source-submission.json"

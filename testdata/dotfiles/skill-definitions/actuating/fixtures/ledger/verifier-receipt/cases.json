@@ -1,18 +1,11 @@
 {
-  "schema": "ledger-definition-conformance-cases/v3",
-  "bases": {
-    "passing": "bases/passing.json"
-  },
-  "cases": [
-    {
-      "id": "passing",
-      "base": "passing",
-      "expect": "valid"
-    },
+  "schema": "ledger-definition-conformance-cases/v4",
+  "bases": [
+    "passing"
+  ],
+  "invalid": [
     {
       "id": "empty-argv",
-      "base": "passing",
-      "expect": "invalid",
       "set": {
         "/verifier/argv": [],
         "/output_digests": []
@@ -20,8 +13,6 @@
     },
     {
       "id": "non-integer-exit",
-      "base": "passing",
-      "expect": "invalid",
       "set": {
         "/exit_status": "pass",
         "/output_digests": []
