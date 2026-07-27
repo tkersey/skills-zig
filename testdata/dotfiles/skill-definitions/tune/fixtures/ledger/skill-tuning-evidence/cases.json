@@ -1,0 +1,159 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete",
+      "base": "complete",
+      "patch": [],
+      "fixture_digest": "sha256:f85f0e1380401fc0ada07095f8f0807c7cdc8106e1acb38792d4cc38b199225e",
+      "expect": "valid",
+      "materialization": {
+        "artifact_id": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf",
+        "canonical_content_digest": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf"
+      }
+    },
+    {
+      "id": "nullable-cursor-and-scope",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/contract/fingerprint",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/contract_fingerprint",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/file_identity",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/file_size",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/last_timestamp",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/session_id",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/cursor_end/session_path",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/window/repo",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/window/since",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/window/until",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/window/workdir",
+          "value": null
+        }
+      ],
+      "fixture_digest": "sha256:2e3eb5825f1b61ac1dfa08d306c1ef901db32bfde7bc633e94821382b269a349",
+      "expect": "valid"
+    },
+    {
+      "id": "missing-denominator",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/skill_tuning_evidence/denominator"
+        }
+      ],
+      "fixture_digest": "sha256:f9971eb28bbd5bfa86488a8dcb692227751e0968c86292fc4e86cd9bb168ee7e",
+      "expect": "invalid"
+    },
+    {
+      "id": "negative-counter",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/denominator/candidate_sessions",
+          "value": -1
+        }
+      ],
+      "fixture_digest": "sha256:0005f0b6e0c745be8028f0f165a2d48e58a393e9c544b4096d4fd1bdd2611de8",
+      "expect": "invalid"
+    },
+    {
+      "id": "noninteger-compliance-count",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/contract_compliance/followed/clause-1",
+          "value": "one"
+        }
+      ],
+      "fixture_digest": "sha256:9b2f9f4ec876cbb593b616ce195c1e9d0322ba28a04c6ba9e50f3308efc358d9",
+      "expect": "invalid"
+    },
+    {
+      "id": "unknown-causality",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/metadata/causality",
+          "value": "proven"
+        }
+      ],
+      "fixture_digest": "sha256:15740661182e280b6e5ebe834fc236720db26befec0abf21fff37408478a66aa",
+      "expect": "invalid"
+    },
+    {
+      "id": "extra-top-level-field",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/semantic_authority",
+          "value": true
+        }
+      ],
+      "fixture_digest": "sha256:8f53545695cf489733029741208b22190228c68e2787558cd9a073e99c287af3",
+      "expect": "invalid"
+    },
+    {
+      "id": "nonstring-limitation",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_tuning_evidence/evidence_limitations/0",
+          "value": 1
+        }
+      ],
+      "fixture_digest": "sha256:81ed6fc8091c0f65d14ca9946b4ee77f2971832940b62fc8e3922fc52ef3a4eb",
+      "expect": "invalid"
+    }
+  ]
+}
