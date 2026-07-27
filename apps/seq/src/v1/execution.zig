@@ -132,18 +132,50 @@ pub fn compile(
         projection_name,
     ) orelse return error.UnknownObservationProjection;
     const projection = native_plan.projections[projection_index];
+    const resolved = try resolveSource(
+        definition_plan,
+        native_plan,
+        projection.stage_index,
+    );
+    var builder = try ProgramBuilder.init(
+        allocator,
+        definition_plan,
+        native_plan,
+        bindings,
+        resolved.source_width,
+    );
+    defer builder.deinit();
+    var path_index = resolved.stage_count;
+    while (path_index > 0) {
+        path_index -= 1;
+        const stage = &native_plan.stages[
+            resolved.stage_path[path_index]
+        ];
+        try builder.applyStage(stage);
+    }
+    return builder.finish(&resolved, &projection);
+}
 
-    var stage_path: [256]u16 = undefined;
-    var stage_count: usize = 0;
-    var current_index = projection.stage_index;
-    var source: Source = undefined;
-    var source_width: usize = undefined;
-    var physical_field_indices: ?[]const u16 = null;
-    var source_row_bound: ?usize = null;
-    var source_resolved = false;
-    while (stage_count < stage_path.len) {
-        stage_path[stage_count] = current_index;
-        stage_count += 1;
+const ResolvedSource = struct {
+    source: Source,
+    source_width: usize,
+    physical_field_indices: ?[]const u16,
+    source_row_bound: ?usize,
+    stage_path: [256]u16,
+    stage_count: usize,
+};
+
+fn resolveSource(
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    projection_stage_index: u16,
+) !ResolvedSource {
+    var resolved: ResolvedSource = undefined;
+    resolved.stage_count = 0;
+    var current_index = projection_stage_index;
+    while (resolved.stage_count < resolved.stage_path.len) {
+        resolved.stage_path[resolved.stage_count] = current_index;
+        resolved.stage_count += 1;
         const stage = &native_plan.stages[current_index];
         if (stage.source) |stage_source| {
             switch (stage_source) {
@@ -152,11 +184,13 @@ pub fn compile(
                     continue;
                 },
                 .external => |index| {
-                    source = .{ .external = index };
-                    source_width = definition_plan.inputs[index].fields.len;
-                    source_row_bound = definition_plan.inputs[index].max_rows;
-                    source_resolved = true;
-                    break;
+                    resolved.source = .{ .external = index };
+                    resolved.source_width =
+                        definition_plan.inputs[index].fields.len;
+                    resolved.source_row_bound =
+                        definition_plan.inputs[index].max_rows;
+                    resolved.physical_field_indices = null;
+                    return resolved;
                 },
             }
         }
@@ -164,263 +198,345 @@ pub fn compile(
             .scan => |value| value,
             else => return error.ObservationPipelineSourceMissing,
         };
-        source = .{ .physical = scan.relation };
-        source_width = scan.field_indices.len;
-        physical_field_indices = scan.field_indices;
-        source_resolved = true;
-        break;
+        resolved.source = .{ .physical = scan.relation };
+        resolved.source_width = scan.field_indices.len;
+        resolved.physical_field_indices = scan.field_indices;
+        resolved.source_row_bound = null;
+        return resolved;
     }
-    if (!source_resolved) return error.ObservationPipelineTooDeep;
+    return error.ObservationPipelineTooDeep;
+}
 
-    if (source_width == 0 or source_width > 256) {
-        return error.InvalidObservationSourceWidth;
-    }
-    var field_map: [256]u16 = undefined;
-    for (field_map[0..source_width], 0..) |*field, index| {
-        field.* = @intCast(index);
-    }
-    var field_count = source_width;
-    const source_fields = try allocator.alloc(u16, source_width);
-    errdefer allocator.free(source_fields);
-    if (physical_field_indices) |indices| {
-        @memcpy(source_fields, indices);
-    } else {
-        @memcpy(source_fields, field_map[0..source_width]);
+const ProgramBuilder = struct {
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    native_plan: *const plan.Plan,
+    bindings: *const definition_core.parameters.Bindings,
+    field_map: [256]u16,
+    field_count: usize,
+    predicates: std.ArrayList(RuntimePredicate) = .empty,
+    operations: std.ArrayList(RuntimeOperation) = .empty,
+    sort_keys: std.ArrayList(RuntimeSortKey) = .empty,
+    distinct_fields: std.ArrayList(u16) = .empty,
+    aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty,
+    limit_state_count: u16 = 0,
+    first_blocking_operation: ?u16 = null,
+    aggregate_seen: bool = false,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        definition_plan: *const definition.Plan,
+        native_plan: *const plan.Plan,
+        bindings: *const definition_core.parameters.Bindings,
+        source_width: usize,
+    ) !ProgramBuilder {
+        if (source_width == 0 or source_width > 256) {
+            return error.InvalidObservationSourceWidth;
+        }
+        var builder = ProgramBuilder{
+            .allocator = allocator,
+            .definition_plan = definition_plan,
+            .native_plan = native_plan,
+            .bindings = bindings,
+            .field_map = undefined,
+            .field_count = source_width,
+        };
+        for (builder.field_map[0..source_width], 0..) |*field, index| {
+            field.* = @intCast(index);
+        }
+        return builder;
     }
 
-    var predicates: std.ArrayList(RuntimePredicate) = .empty;
-    errdefer predicates.deinit(allocator);
-    var operations: std.ArrayList(RuntimeOperation) = .empty;
-    errdefer operations.deinit(allocator);
-    var sort_keys: std.ArrayList(RuntimeSortKey) = .empty;
-    errdefer sort_keys.deinit(allocator);
-    var distinct_fields: std.ArrayList(u16) = .empty;
-    errdefer distinct_fields.deinit(allocator);
-    var aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty;
-    errdefer aggregate_metrics.deinit(allocator);
-    var limit_state_count: u16 = 0;
-    var first_blocking_operation: ?u16 = null;
-    var aggregate_seen = false;
+    fn deinit(self: *ProgramBuilder) void {
+        self.predicates.deinit(self.allocator);
+        self.operations.deinit(self.allocator);
+        self.sort_keys.deinit(self.allocator);
+        self.distinct_fields.deinit(self.allocator);
+        self.aggregate_metrics.deinit(self.allocator);
+        self.* = undefined;
+    }
 
-    var path_index = stage_count;
-    while (path_index > 0) {
-        path_index -= 1;
-        const stage = &native_plan.stages[stage_path[path_index]];
+    fn applyStage(self: *ProgramBuilder, stage: *const plan.Stage) !void {
         switch (stage.operation) {
             .scan, .alias => {},
-            .filter => |filter| {
-                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
-                const start = predicates.items.len;
-                for (filter.predicates) |predicate| {
-                    if (predicate.field_index >= field_count) {
-                        return error.ObservationFieldIndexInvalid;
-                    }
-                    try predicates.append(allocator, .{
-                        .field_index = field_map[predicate.field_index],
-                        .operator = predicate.operator,
-                        .operand = try resolveOperand(
-                            definition_plan,
-                            bindings,
-                            predicate.operand,
-                        ),
-                        .case_insensitive = predicate.case_insensitive,
-                    });
-                }
-                try operations.append(allocator, .{
-                    .filter = .{
-                        .start = @intCast(start),
-                        .len = @intCast(predicates.items.len - start),
-                    },
-                });
-            },
-            .project => |project| {
-                var projected: [256]u16 = undefined;
-                if (project.input_field_indices.len > projected.len) {
-                    return error.InvalidProjectionFieldCount;
-                }
-                for (project.input_field_indices, 0..) |field_index, index| {
-                    if (field_index >= field_count) {
-                        return error.ObservationFieldIndexInvalid;
-                    }
-                    projected[index] = field_map[field_index];
-                }
-                field_count = project.input_field_indices.len;
-                @memcpy(field_map[0..field_count], projected[0..field_count]);
-            },
-            .limit => |limit| {
-                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
-                if (limit_state_count == 256) {
-                    return error.TooManyObservationLimits;
-                }
-                try operations.append(allocator, .{
-                    .limit = .{
-                        .count = try resolveLimit(
-                            definition_plan,
-                            bindings,
-                            limit,
-                            native_plan.max_rows,
-                        ),
-                        .state_index = limit_state_count,
-                    },
-                });
-                limit_state_count += 1;
-            },
-            .sort => |sort| {
-                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
-                if (first_blocking_operation == null) {
-                    first_blocking_operation = @intCast(operations.items.len);
-                }
-                const start = sort_keys.items.len;
-                for (sort.keys) |key| {
-                    if (key.field_index >= field_count) {
-                        return error.ObservationFieldIndexInvalid;
-                    }
-                    try sort_keys.append(allocator, .{
-                        .field_index = field_map[key.field_index],
-                        .direction = key.direction,
-                        .nulls = key.nulls,
-                    });
-                }
-                try operations.append(allocator, .{
-                    .sort = .{
-                        .start = @intCast(start),
-                        .len = @intCast(sort_keys.items.len - start),
-                    },
-                });
-            },
-            .top_k => |top_k| {
-                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
-                if (first_blocking_operation == null) {
-                    first_blocking_operation = @intCast(operations.items.len);
-                }
-                const start = sort_keys.items.len;
-                for (top_k.keys) |key| {
-                    if (key.field_index >= field_count) {
-                        return error.ObservationFieldIndexInvalid;
-                    }
-                    try sort_keys.append(allocator, .{
-                        .field_index = field_map[key.field_index],
-                        .direction = key.direction,
-                        .nulls = key.nulls,
-                    });
-                }
-                try operations.append(allocator, .{
-                    .top_k = .{
-                        .keys = .{
-                            .start = @intCast(start),
-                            .len = @intCast(sort_keys.items.len - start),
-                        },
-                        .count = try resolveLimit(
-                            definition_plan,
-                            bindings,
-                            top_k.limit,
-                            native_plan.max_rows,
-                        ),
-                    },
-                });
-            },
-            .distinct => |distinct| {
-                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
-                if (first_blocking_operation == null) {
-                    first_blocking_operation = @intCast(operations.items.len);
-                }
-                const start = distinct_fields.items.len;
-                for (distinct.field_indices) |field_index| {
-                    if (field_index >= field_count) {
-                        return error.ObservationFieldIndexInvalid;
-                    }
-                    try distinct_fields.append(
-                        allocator,
-                        field_map[field_index],
-                    );
-                }
-                try operations.append(allocator, .{
-                    .distinct = .{
-                        .start = @intCast(start),
-                        .len = @intCast(
-                            distinct_fields.items.len - start,
-                        ),
-                    },
-                });
-            },
+            .filter => |filter| try self.applyFilter(filter),
+            .project => |project| try self.applyProject(project),
+            .limit => |limit| try self.applyLimit(limit),
+            .sort => |sort| try self.applySort(sort),
+            .top_k => |top_k| try self.applyTopK(top_k),
+            .distinct => |distinct| try self.applyDistinct(distinct),
             .aggregate => |aggregate| {
-                if (aggregate_seen) {
-                    return error.ObservationAggregateMustBeTerminal;
-                }
-                if (first_blocking_operation != null) {
-                    return error.ObservationAggregateRequiresStreamingPrefix;
-                }
-                const start = aggregate_metrics.items.len;
-                for (aggregate.metrics, 0..) |metric, metric_index| {
-                    if (metric.field_index) |field_index| {
-                        if (field_index >= field_count) {
-                            return error.ObservationFieldIndexInvalid;
-                        }
-                    }
-                    try aggregate_metrics.append(allocator, .{
-                        .function = metric.function,
-                        .field_index = if (metric.field_index) |field_index|
-                            field_map[field_index]
-                        else
-                            null,
-                        .output_kind = stage.schema.columns[metric_index].kind,
-                    });
-                }
-                try operations.append(allocator, .{
-                    .aggregate = .{
-                        .start = @intCast(start),
-                        .len = @intCast(aggregate_metrics.items.len - start),
-                    },
-                });
-                field_count = aggregate.metrics.len;
-                for (field_map[0..field_count], 0..) |*field, index| {
-                    field.* = @intCast(index);
-                }
-                aggregate_seen = true;
+                try self.applyAggregate(aggregate, stage);
             },
         }
     }
 
-    const output_fields = try allocator.alloc(
-        u16,
-        projection.field_indices.len,
-    );
-    errdefer allocator.free(output_fields);
-    for (projection.field_indices, 0..) |field_index, index| {
-        if (field_index >= field_count) {
-            return error.ObservationFieldIndexInvalid;
+    fn requireStreaming(self: ProgramBuilder) !void {
+        if (self.aggregate_seen) {
+            return error.ObservationAggregateMustBeTerminal;
         }
-        output_fields[index] = field_map[field_index];
     }
-    const operation_slice = try operations.toOwnedSlice(allocator);
-    errdefer allocator.free(operation_slice);
-    const predicate_slice = try predicates.toOwnedSlice(allocator);
-    errdefer allocator.free(predicate_slice);
-    const sort_key_slice = try sort_keys.toOwnedSlice(allocator);
-    errdefer allocator.free(sort_key_slice);
-    const distinct_field_slice =
-        try distinct_fields.toOwnedSlice(allocator);
-    errdefer allocator.free(distinct_field_slice);
-    const aggregate_metric_slice =
-        try aggregate_metrics.toOwnedSlice(allocator);
-    errdefer allocator.free(aggregate_metric_slice);
 
-    return .{
-        .source = source,
-        .source_width = @intCast(source_width),
-        .source_field_indices = source_fields,
-        .source_row_bound = source_row_bound,
-        .operations = operation_slice,
-        .predicates = predicate_slice,
-        .sort_keys = sort_key_slice,
-        .distinct_fields = distinct_field_slice,
-        .aggregate_metrics = aggregate_metric_slice,
-        .output_field_indices = output_fields,
-        .limit_state_count = limit_state_count,
-        .first_blocking_operation = first_blocking_operation,
-        .max_rows = native_plan.max_rows,
-    };
-}
+    fn markBlocking(self: *ProgramBuilder) void {
+        if (self.first_blocking_operation == null) {
+            self.first_blocking_operation =
+                @intCast(self.operations.items.len);
+        }
+    }
+
+    fn applyFilter(
+        self: *ProgramBuilder,
+        filter: plan.Filter,
+    ) !void {
+        try self.requireStreaming();
+        const start = self.predicates.items.len;
+        for (filter.predicates) |predicate| {
+            if (predicate.field_index >= self.field_count) {
+                return error.ObservationFieldIndexInvalid;
+            }
+            try self.predicates.append(self.allocator, .{
+                .field_index = self.field_map[predicate.field_index],
+                .operator = predicate.operator,
+                .operand = try resolveOperand(
+                    self.definition_plan,
+                    self.bindings,
+                    predicate.operand,
+                ),
+                .case_insensitive = predicate.case_insensitive,
+            });
+        }
+        try self.operations.append(self.allocator, .{
+            .filter = .{
+                .start = @intCast(start),
+                .len = @intCast(self.predicates.items.len - start),
+            },
+        });
+    }
+
+    fn applyProject(
+        self: *ProgramBuilder,
+        project: plan.Project,
+    ) !void {
+        var projected: [256]u16 = undefined;
+        if (project.input_field_indices.len > projected.len) {
+            return error.InvalidProjectionFieldCount;
+        }
+        for (project.input_field_indices, 0..) |field_index, index| {
+            if (field_index >= self.field_count) {
+                return error.ObservationFieldIndexInvalid;
+            }
+            projected[index] = self.field_map[field_index];
+        }
+        self.field_count = project.input_field_indices.len;
+        @memcpy(
+            self.field_map[0..self.field_count],
+            projected[0..self.field_count],
+        );
+    }
+
+    fn applyLimit(self: *ProgramBuilder, limit: plan.Limit) !void {
+        try self.requireStreaming();
+        if (self.limit_state_count == 256) {
+            return error.TooManyObservationLimits;
+        }
+        try self.operations.append(self.allocator, .{
+            .limit = .{
+                .count = try resolveLimit(
+                    self.definition_plan,
+                    self.bindings,
+                    limit,
+                    self.native_plan.max_rows,
+                ),
+                .state_index = self.limit_state_count,
+            },
+        });
+        self.limit_state_count += 1;
+    }
+
+    fn appendSortKeys(
+        self: *ProgramBuilder,
+        keys: []const plan.SortKey,
+    ) !FieldRange {
+        const start = self.sort_keys.items.len;
+        for (keys) |key| {
+            if (key.field_index >= self.field_count) {
+                return error.ObservationFieldIndexInvalid;
+            }
+            try self.sort_keys.append(self.allocator, .{
+                .field_index = self.field_map[key.field_index],
+                .direction = key.direction,
+                .nulls = key.nulls,
+            });
+        }
+        return .{
+            .start = @intCast(start),
+            .len = @intCast(self.sort_keys.items.len - start),
+        };
+    }
+
+    fn applySort(self: *ProgramBuilder, sort: plan.Sort) !void {
+        try self.requireStreaming();
+        self.markBlocking();
+        const keys = try self.appendSortKeys(sort.keys);
+        try self.operations.append(self.allocator, .{ .sort = keys });
+    }
+
+    fn applyTopK(self: *ProgramBuilder, top_k: plan.TopK) !void {
+        try self.requireStreaming();
+        self.markBlocking();
+        const keys = try self.appendSortKeys(top_k.keys);
+        try self.operations.append(self.allocator, .{
+            .top_k = .{
+                .keys = keys,
+                .count = try resolveLimit(
+                    self.definition_plan,
+                    self.bindings,
+                    top_k.limit,
+                    self.native_plan.max_rows,
+                ),
+            },
+        });
+    }
+
+    fn applyDistinct(
+        self: *ProgramBuilder,
+        distinct: plan.Distinct,
+    ) !void {
+        try self.requireStreaming();
+        self.markBlocking();
+        const start = self.distinct_fields.items.len;
+        for (distinct.field_indices) |field_index| {
+            if (field_index >= self.field_count) {
+                return error.ObservationFieldIndexInvalid;
+            }
+            try self.distinct_fields.append(
+                self.allocator,
+                self.field_map[field_index],
+            );
+        }
+        try self.operations.append(self.allocator, .{
+            .distinct = .{
+                .start = @intCast(start),
+                .len = @intCast(self.distinct_fields.items.len - start),
+            },
+        });
+    }
+
+    fn applyAggregate(
+        self: *ProgramBuilder,
+        aggregate: plan.Aggregate,
+        stage: *const plan.Stage,
+    ) !void {
+        try self.requireStreaming();
+        if (self.first_blocking_operation != null) {
+            return error.ObservationAggregateRequiresStreamingPrefix;
+        }
+        const start = self.aggregate_metrics.items.len;
+        for (aggregate.metrics, 0..) |metric, metric_index| {
+            if (metric.field_index) |field_index| {
+                if (field_index >= self.field_count) {
+                    return error.ObservationFieldIndexInvalid;
+                }
+            }
+            try self.aggregate_metrics.append(self.allocator, .{
+                .function = metric.function,
+                .field_index = if (metric.field_index) |field_index|
+                    self.field_map[field_index]
+                else
+                    null,
+                .output_kind = stage.schema.columns[metric_index].kind,
+            });
+        }
+        try self.operations.append(self.allocator, .{
+            .aggregate = .{
+                .start = @intCast(start),
+                .len = @intCast(
+                    self.aggregate_metrics.items.len - start,
+                ),
+            },
+        });
+        self.field_count = aggregate.metrics.len;
+        for (self.field_map[0..self.field_count], 0..) |*field, index| {
+            field.* = @intCast(index);
+        }
+        self.aggregate_seen = true;
+    }
+
+    fn finish(
+        self: *ProgramBuilder,
+        resolved: *const ResolvedSource,
+        projection: *const plan.Projection,
+    ) !Program {
+        const source_fields = try self.sourceFields(resolved);
+        errdefer self.allocator.free(source_fields);
+        const output_fields = try self.outputFields(projection);
+        errdefer self.allocator.free(output_fields);
+        const operation_slice =
+            try self.operations.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(operation_slice);
+        const predicate_slice =
+            try self.predicates.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(predicate_slice);
+        const sort_key_slice =
+            try self.sort_keys.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(sort_key_slice);
+        const distinct_field_slice =
+            try self.distinct_fields.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(distinct_field_slice);
+        const aggregate_metric_slice =
+            try self.aggregate_metrics.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(aggregate_metric_slice);
+        return .{
+            .source = resolved.source,
+            .source_width = @intCast(resolved.source_width),
+            .source_field_indices = source_fields,
+            .source_row_bound = resolved.source_row_bound,
+            .operations = operation_slice,
+            .predicates = predicate_slice,
+            .sort_keys = sort_key_slice,
+            .distinct_fields = distinct_field_slice,
+            .aggregate_metrics = aggregate_metric_slice,
+            .output_field_indices = output_fields,
+            .limit_state_count = self.limit_state_count,
+            .first_blocking_operation = self.first_blocking_operation,
+            .max_rows = self.native_plan.max_rows,
+        };
+    }
+
+    fn sourceFields(
+        self: ProgramBuilder,
+        resolved: *const ResolvedSource,
+    ) ![]u16 {
+        const fields = try self.allocator.alloc(
+            u16,
+            resolved.source_width,
+        );
+        if (resolved.physical_field_indices) |indices| {
+            @memcpy(fields, indices);
+        } else {
+            for (fields, 0..) |*field, index| field.* = @intCast(index);
+        }
+        return fields;
+    }
+
+    fn outputFields(
+        self: ProgramBuilder,
+        projection: *const plan.Projection,
+    ) ![]u16 {
+        const fields = try self.allocator.alloc(
+            u16,
+            projection.field_indices.len,
+        );
+        errdefer self.allocator.free(fields);
+        for (projection.field_indices, 0..) |field_index, index| {
+            if (field_index >= self.field_count) {
+                return error.ObservationFieldIndexInvalid;
+            }
+            fields[index] = self.field_map[field_index];
+        }
+        return fields;
+    }
+};
 
 pub const Feed = enum {
     continue_scanning,
@@ -1412,73 +1528,281 @@ fn compileForAllocationFailure(
     defer program.deinit(allocator);
 }
 
-test "compiled execution filters projects and limits without intermediate rows" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+const filter_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/messages",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["scan","filter","project","limit"]
+    \\  },
+    \\  "parameters":{"needle":{"type":"string","required":true}},
+    \\  "selectors":["path"],
+    \\  "relations":[{
+    \\    "name":"messages",
+    \\    "fields":["session_id","role","text"]
+    \\  }],
+    \\  "inputs":[],
+    \\  "pipeline":[
+    \\    {"op":"scan","relation":"messages","as":"source"},
+    \\    {
+    \\      "op":"filter","input":"source","as":"matched",
+    \\      "where":[{
+    \\        "field":"text","op":"contains","param":"needle",
+    \\        "case_insensitive":true
+    \\      }]
+    \\    },
+    \\    {
+    \\      "op":"project","input":"matched","as":"rows",
+    \\      "fields":["session_id","text"]
+    \\    },
+    \\    {"op":"limit","input":"rows","as":"bounded","limit":2}
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"bounded","schema":"example-message-rows/v1",
+    \\    "fields":["session_id","text"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":100,"max_output_bytes":4096,"max_fold_states":8
+    \\  }
+    \\}
+;
+
+const ordered_limit_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/ordered",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["limit","filter","project"]
+    \\  },
+    \\  "parameters":{},"selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"score","type":"integer","nullable":false}
+    \\    ],
+    \\    "max_rows":3,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {"op":"limit","input":"facts","as":"first","limit":2},
+    \\    {
+    \\      "op":"filter","input":"first","as":"matched",
+    \\      "where":[{"field":"score","op":"exact","value":1}]
+    \\    },
+    \\    {
+    \\      "op":"project","input":"matched","as":"rows","fields":["id"]
+    \\    }
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-rows/v1",
+    \\    "fields":["id"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":3,"max_output_bytes":4096,"max_fold_states":2
+    \\  }
+    \\}
+;
+
+const sort_distinct_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/ranked-distinct",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["sort","distinct","limit","project"]
+    \\  },
+    \\  "parameters":{},"selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"group","type":"string","nullable":false},
+    \\      {"name":"score","type":"integer","nullable":true}
+    \\    ],
+    \\    "max_rows":5,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {
+    \\      "op":"sort","input":"facts","as":"ranked",
+    \\      "by":[{
+    \\        "field":"score","direction":"desc","nulls":"last"
+    \\      }]
+    \\    },
+    \\    {
+    \\      "op":"distinct","input":"ranked","as":"unique",
+    \\      "keys":["group"]
+    \\    },
+    \\    {"op":"limit","input":"unique","as":"bounded","limit":3},
+    \\    {
+    \\      "op":"project","input":"bounded","as":"rows",
+    \\      "fields":["id","score"]
+    \\    }
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-ranked/v1",
+    \\    "fields":["id","score"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":5,"max_output_bytes":4096,"max_fold_states":2
+    \\  }
+    \\}
+;
+
+const top_k_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/top",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["top-k","project"]
+    \\  },
+    \\  "parameters":{"k":{"type":"integer","required":true}},
+    \\  "selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"score","type":"integer","nullable":false}
+    \\    ],
+    \\    "max_rows":4,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {
+    \\      "op":"top-k","input":"facts","as":"ranked",
+    \\      "by":[{"field":"score","direction":"desc"}],"limit":"k"
+    \\    },
+    \\    {
+    \\      "op":"project","input":"ranked","as":"rows","fields":["id"]
+    \\    }
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-top/v1",
+    \\    "fields":["id"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":4,"max_output_bytes":4096,"max_fold_states":2
+    \\  }
+    \\}
+;
+
+const aggregate_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/aggregate",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1","operators":["aggregate"]
+    \\  },
+    \\  "parameters":{},"selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"amount","type":"integer","nullable":true},
+    \\      {"name":"score","type":"float","nullable":true}
+    \\    ],
+    \\    "max_rows":3,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[{
+    \\    "op":"aggregate","input":"facts","as":"summary",
+    \\    "metrics":[
+    \\      {"name":"row_count","op":"count"},
+    \\      {"name":"observed_amount","op":"count","field":"amount"},
+    \\      {"name":"sum_amount","op":"sum","field":"amount"},
+    \\      {"name":"min_amount","op":"min","field":"amount"},
+    \\      {"name":"max_amount","op":"max","field":"amount"},
+    \\      {"name":"avg_amount","op":"average","field":"amount"},
+    \\      {"name":"sum_score","op":"sum","field":"score"}
+    \\    ]
+    \\  }],
+    \\  "projections":{"summary":{
+    \\    "relation":"summary","schema":"example-summary/v1",
+    \\    "fields":[
+    \\      "row_count","observed_amount","sum_amount","min_amount",
+    \\      "max_amount","avg_amount","sum_score"
+    \\    ],
+    \\    "renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":3,"max_output_bytes":4096,"max_fold_states":8
+    \\  }
+    \\}
+;
+
+const TestProgram = struct {
+    closure: definition_core.Closure,
+    definition_plan: definition.Plan,
+    native_plan: plan.Plan,
+    bindings: definition_core.parameters.Bindings,
+    program: Program,
+
+    fn deinit(self: *TestProgram) void {
+        self.program.deinit(std.testing.allocator);
+        self.bindings.deinit(std.testing.allocator);
+        self.native_plan.deinit(std.testing.allocator);
+        self.definition_plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileTestProgram(
+    directory: *std.Io.Dir,
+    definition_bytes: []const u8,
+    parameter_inputs: []const definition_core.parameters.Input,
+    projection_name: []const u8,
+) !TestProgram {
+    try directory.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/messages","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project","limit"]},"parameters":{"needle":{"type":"string","required":true}},"selectors":["path"],"relations":[{"name":"messages","fields":["session_id","role","text"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"messages","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"text","op":"contains","param":"needle","case_insensitive":true}]},{"op":"project","input":"matched","as":"rows","fields":["session_id","text"]},{"op":"limit","input":"rows","as":"bounded","limit":2}],"projections":{"rows":{"relation":"bounded","schema":"example-message-rows/v1","fields":["session_id","text"],"renderers":["json"]}},"bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":8}}
-        ,
+        .data = definition_bytes,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
-        &tmp.dir,
+        directory,
         "observation.json",
         .{},
     );
-    defer closure.deinit(std.testing.allocator);
+    errdefer closure.deinit(std.testing.allocator);
     var definition_plan = try definition.compile(
         std.testing.allocator,
         &closure,
         "observation.json",
     );
-    defer definition_plan.deinit(std.testing.allocator);
+    errdefer definition_plan.deinit(std.testing.allocator);
     var native_plan = try plan.compile(
         std.testing.allocator,
         &definition_plan,
     );
-    defer native_plan.deinit(std.testing.allocator);
+    errdefer native_plan.deinit(std.testing.allocator);
     var bindings = try definition_core.parameters.bind(
         std.testing.allocator,
         &definition_plan.parameter_declarations,
-        &.{.{ .name = "needle", .raw_value = "FAIL" }},
+        parameter_inputs,
     );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try compile(
+    errdefer bindings.deinit(std.testing.allocator);
+    const program = try compile(
         std.testing.allocator,
         &definition_plan,
         &native_plan,
         &bindings,
-        "rows",
+        projection_name,
     );
-    defer program.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(
-        u16,
-        &.{ 1, 3, 4 },
-        program.source_field_indices,
-    );
-
-    const source = [_]Value{
-        .{ .string = "s1" }, .{ .string = "assistant" }, .{ .string = "pass" },
-        .{ .string = "s2" }, .{ .string = "tool" },      .{ .string = "FAIL one" },
-        .{ .string = "s3" }, .{ .string = "assistant" }, .{ .string = "fail two" },
-        .{ .string = "s4" }, .{ .string = "assistant" }, .{ .string = "fail three" },
+    return .{
+        .closure = closure,
+        .definition_plan = definition_plan,
+        .native_plan = native_plan,
+        .bindings = bindings,
+        .program = program,
     };
-    var output: [4]Value = undefined;
-    const result = try execute(
-        &program,
-        .{ .values = &source, .width = 3 },
-        &output,
-    );
-    try std.testing.expectEqual(@as(usize, 2), result.row_count);
-    try std.testing.expectEqualStrings("s2", result.rows().row(0)[0].string);
-    try std.testing.expectEqualStrings("FAIL one", result.rows().row(0)[1].string);
-    try std.testing.expectEqualStrings("s3", result.rows().row(1)[0].string);
-    try std.testing.expectEqualStrings("fail two", result.rows().row(1)[1].string);
+}
 
-    var streamed_output: [4]Value = undefined;
-    var runner = try Runner.init(&program, &streamed_output);
+fn expectStreamingFilterResult(
+    program: *const Program,
+    source: []const Value,
+    expected: Result,
+) !void {
+    var output: [4]Value = undefined;
+    var runner = try Runner.init(program, &output);
     defer runner.deinit();
     try std.testing.expectEqual(
         Feed.continue_scanning,
@@ -1495,67 +1819,78 @@ test "compiled execution filters projects and limits without intermediate rows" 
     try std.testing.expectEqual(Feed.stop, try runner.feed(source[9..12]));
     const streamed = try runner.finish();
     try std.testing.expectEqual(@as(usize, 3), runner.source_row_count);
-    try std.testing.expectEqual(result.row_count, streamed.row_count);
+    try std.testing.expectEqual(expected.row_count, streamed.row_count);
     try std.testing.expectEqualStrings(
-        result.rows().row(0)[0].string,
+        expected.rows().row(0)[0].string,
         streamed.rows().row(0)[0].string,
     );
     try std.testing.expectEqualStrings(
-        result.rows().row(1)[1].string,
+        expected.rows().row(1)[1].string,
         streamed.rows().row(1)[1].string,
     );
+}
+
+test "compiled execution filters projects and limits without intermediate rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try compileTestProgram(
+        &tmp.dir,
+        filter_test_definition,
+        &.{.{ .name = "needle", .raw_value = "FAIL" }},
+        "rows",
+    );
+    defer fixture.deinit();
+    const program = &fixture.program;
+    try std.testing.expectEqualSlices(
+        u16,
+        &.{ 1, 3, 4 },
+        program.source_field_indices,
+    );
+
+    const source = [_]Value{
+        .{ .string = "s1" }, .{ .string = "assistant" }, .{ .string = "pass" },
+        .{ .string = "s2" }, .{ .string = "tool" },      .{ .string = "FAIL one" },
+        .{ .string = "s3" }, .{ .string = "assistant" }, .{ .string = "fail two" },
+        .{ .string = "s4" }, .{ .string = "assistant" }, .{ .string = "fail three" },
+    };
+    var output: [4]Value = undefined;
+    const result = try execute(
+        program,
+        .{ .values = &source, .width = 3 },
+        &output,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqualStrings("s2", result.rows().row(0)[0].string);
+    try std.testing.expectEqualStrings("FAIL one", result.rows().row(0)[1].string);
+    try std.testing.expectEqualStrings("s3", result.rows().row(1)[0].string);
+    try std.testing.expectEqualStrings("fail two", result.rows().row(1)[1].string);
+
+    try expectStreamingFilterResult(program, &source, result);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
-        .{ &definition_plan, &native_plan, &bindings },
+        .{
+            &fixture.definition_plan,
+            &fixture.native_plan,
+            &fixture.bindings,
+        },
     );
 }
 
 test "ordered limits retain their position before later filters" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/ordered","requires":{"abi":"seq-observation-abi/v1","operators":["limit","filter","project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"score","type":"integer","nullable":false}],"max_rows":3,"max_bytes":4096}],"pipeline":[{"op":"limit","input":"facts","as":"first","limit":2},{"op":"filter","input":"first","as":"matched","where":[{"field":"score","op":"exact","value":1}]},{"op":"project","input":"matched","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":3,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
+    var fixture = try compileTestProgram(
         &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer native_plan.deinit(std.testing.allocator);
-    var bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        ordered_limit_test_definition,
         &.{},
-    );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &native_plan,
-        &bindings,
         "rows",
     );
-    defer program.deinit(std.testing.allocator);
+    defer fixture.deinit();
     try std.testing.expectEqualSlices(
         u16,
         &.{ 0, 1 },
-        program.source_field_indices,
+        fixture.program.source_field_indices,
     );
 
     const source = [_]Value{
@@ -1565,7 +1900,7 @@ test "ordered limits retain their position before later filters" {
     };
     var output: [1]Value = undefined;
     const result = try execute(
-        &program,
+        &fixture.program,
         .{ .values = &source, .width = 2 },
         &output,
     );
@@ -1593,44 +1928,14 @@ fn executeBlockingForAllocationFailure(
 test "compiled sort and distinct preserve stable bounded semantics" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/ranked-distinct","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct","limit","project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":5,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"last"}]},{"op":"distinct","input":"ranked","as":"unique","keys":["group"]},{"op":"limit","input":"unique","as":"bounded","limit":3},{"op":"project","input":"bounded","as":"rows","fields":["id","score"]}],"projections":{"rows":{"relation":"rows","schema":"example-ranked/v1","fields":["id","score"],"renderers":["json"]}},"bounds":{"max_rows":5,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
+    var fixture = try compileTestProgram(
         &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer native_plan.deinit(std.testing.allocator);
-    var bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        sort_distinct_test_definition,
         &.{},
-    );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &native_plan,
-        &bindings,
         "rows",
     );
-    defer program.deinit(std.testing.allocator);
+    defer fixture.deinit();
+    const program = &fixture.program;
 
     try std.testing.expectEqual(@as(?u16, 0), program.first_blocking_operation);
     try std.testing.expectEqualSlices(
@@ -1649,14 +1954,14 @@ test "compiled sort and distinct preserve stable bounded semantics" {
     try std.testing.expectError(
         error.ObservationMaterializationWorkspaceRequired,
         execute(
-            &program,
+            program,
             .{ .values = &source, .width = 3 },
             &output,
         ),
     );
     const result = try executeAlloc(
         std.testing.allocator,
-        &program,
+        program,
         .{ .values = &source, .width = 3 },
         &output,
     );
@@ -1679,51 +1984,20 @@ test "compiled sort and distinct preserve stable bounded semantics" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         executeBlockingForAllocationFailure,
-        .{ &program, &source },
+        .{ program, &source },
     );
 }
 
 test "compiled top-k binds its count once before execution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/top","requires":{"abi":"seq-observation-abi/v1","operators":["top-k","project"]},"parameters":{"k":{"type":"integer","required":true}},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"score","type":"integer","nullable":false}],"max_rows":4,"max_bytes":4096}],"pipeline":[{"op":"top-k","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc"}],"limit":"k"},{"op":"project","input":"ranked","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-top/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":4,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
+    var fixture = try compileTestProgram(
         &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer native_plan.deinit(std.testing.allocator);
-    var bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        top_k_test_definition,
         &.{.{ .name = "k", .raw_value = "2" }},
-    );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &native_plan,
-        &bindings,
         "rows",
     );
-    defer program.deinit(std.testing.allocator);
+    defer fixture.deinit();
 
     const source = [_]Value{
         .{ .string = "a" }, .{ .integer = 2 },
@@ -1734,7 +2008,7 @@ test "compiled top-k binds its count once before execution" {
     var output: [4]Value = undefined;
     const result = try executeAlloc(
         std.testing.allocator,
-        &program,
+        &fixture.program,
         .{ .values = &source, .width = 2 },
         &output,
     );
@@ -1752,44 +2026,13 @@ test "compiled top-k binds its count once before execution" {
 test "compiled aggregate streams bounded numeric summaries in one pass" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/aggregate","requires":{"abi":"seq-observation-abi/v1","operators":["aggregate"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"amount","type":"integer","nullable":true},{"name":"score","type":"float","nullable":true}],"max_rows":3,"max_bytes":4096}],"pipeline":[{"op":"aggregate","input":"facts","as":"summary","metrics":[{"name":"row_count","op":"count"},{"name":"observed_amount","op":"count","field":"amount"},{"name":"sum_amount","op":"sum","field":"amount"},{"name":"min_amount","op":"min","field":"amount"},{"name":"max_amount","op":"max","field":"amount"},{"name":"avg_amount","op":"average","field":"amount"},{"name":"sum_score","op":"sum","field":"score"}]}],"projections":{"summary":{"relation":"summary","schema":"example-summary/v1","fields":["row_count","observed_amount","sum_amount","min_amount","max_amount","avg_amount","sum_score"],"renderers":["json"]}},"bounds":{"max_rows":3,"max_output_bytes":4096,"max_fold_states":8}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
+    var fixture = try compileTestProgram(
         &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer native_plan.deinit(std.testing.allocator);
-    var bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        aggregate_test_definition,
         &.{},
-    );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &native_plan,
-        &bindings,
         "summary",
     );
-    defer program.deinit(std.testing.allocator);
+    defer fixture.deinit();
 
     const source = [_]Value{
         .{ .integer = 5 }, .{ .float = 1.5 },
@@ -1798,7 +2041,7 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
     };
     var output: [7]Value = undefined;
     const result = try execute(
-        &program,
+        &fixture.program,
         .{ .values = &source, .width = 2 },
         &output,
     );
@@ -1823,7 +2066,7 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
     );
 
     var empty_output: [7]Value = undefined;
-    var runner = try Runner.init(&program, &empty_output);
+    var runner = try Runner.init(&fixture.program, &empty_output);
     defer runner.deinit();
     const empty = try runner.finish();
     const empty_summary = empty.rows().row(0);
