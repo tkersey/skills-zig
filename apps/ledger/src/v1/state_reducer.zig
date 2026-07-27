@@ -313,15 +313,7 @@ pub fn compile(
         object,
         &.{ "op", "mode", "event_kind", "registers", "admissions" },
     );
-    if (!std.mem.eql(
-        u8,
-        try definition_core.json.requiredString(object, "op"),
-        "reducer",
-    ) or !std.mem.eql(
-        u8,
-        try definition_core.json.requiredString(object, "mode"),
-        "retained",
-    )) return error.RetainedReducerModeMismatch;
+    try validateRetainedRuleHeader(object);
     var event_kind = try definition_core.json_pointer.compile(
         allocator,
         try definition_core.json.requiredString(object, "event_kind"),
@@ -365,79 +357,122 @@ pub fn compile(
     return result;
 }
 
+fn validateRetainedRuleHeader(object: std.json.ObjectMap) !void {
+    if (!std.mem.eql(
+        u8,
+        try definition_core.json.requiredString(object, "op"),
+        "reducer",
+    ) or !std.mem.eql(
+        u8,
+        try definition_core.json.requiredString(object, "mode"),
+        "retained",
+    )) return error.RetainedReducerModeMismatch;
+}
+
 pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
     try encoder.writeU16(3);
     try encoder.writeBytes(plan.event_kind.raw);
-    try encoder.writeCount(plan.registers.len);
-    for (plan.registers) |register| {
+    try encodeRegisters(plan.registers, encoder);
+    try encodeSets(plan.sets, encoder);
+    try encoder.writeCount(plan.admissions.len);
+    for (plan.admissions) |admission| {
+        try encodeAdmission(admission, encoder);
+    }
+}
+
+fn encodeRegisters(
+    registers: []const Register,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(registers.len);
+    for (registers) |register| {
         try encoder.writeBytes(register.name);
         try encoder.writeUsize(register.max_bytes);
     }
-    try encoder.writeCount(plan.sets.len);
-    for (plan.sets) |set| {
+}
+
+fn encodeSets(
+    sets: []const RetainedSet,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(sets.len);
+    for (sets) |set| {
         try encoder.writeBytes(set.name);
         try encoder.writeUsize(set.max_entries);
         try encoder.writeUsize(set.max_key_bytes);
         try encoder.writeUsize(set.max_bytes);
     }
-    try encoder.writeCount(plan.admissions.len);
-    for (plan.admissions) |admission| {
-        try encoder.writeBytes(admission.on);
-        try encodeIndexes(admission.required, encoder);
-        try encodeIndexes(admission.forbidden, encoder);
-        try encoder.writeCount(admission.set_guards.len);
-        for (admission.set_guards) |guard| {
-            try encoder.writeU16(guard.set);
-            try encodeSource(guard.source, encoder);
-            try encoder.writeBytes(guard.pointer.raw);
-            try encoder.writeEnum(guard.presence);
-            try encoder.writeEnum(guard.mode);
-        }
-        try validation.encodeCache(&admission.validation_plan, encoder);
-        try encoder.writeCount(admission.actions.len);
-        for (admission.actions) |action| switch (action) {
-            .set => |set| {
-                try encoder.writeByte(0);
-                try encoder.writeU16(set.target);
-                switch (set.source) {
-                    .event => try encoder.writeByte(0),
-                    .register => |index| {
-                        try encoder.writeByte(1);
-                        try encoder.writeU16(index);
-                    },
-                }
-                try encoder.writeBytes(set.pointer.raw);
-            },
-            .clear => |target| {
-                try encoder.writeByte(1);
-                try encoder.writeU16(target);
-            },
-            .insert => |insert| {
-                try encoder.writeByte(2);
-                try encoder.writeU16(insert.target);
-                try encodeSource(insert.source, encoder);
-                try encoder.writeBytes(insert.pointer.raw);
-            },
-            .upsert => |upsert| {
-                try encoder.writeByte(3);
-                try encoder.writeU16(upsert.target);
-                try encodeSource(upsert.source, encoder);
-                try encoder.writeBytes(upsert.collection.raw);
-                try encoder.writeBytes(upsert.key.raw);
-                try encoder.writeBytes(upsert.source_ref.raw);
-                try encoder.writeBytes(upsert.predecessor_refs.raw);
-                try encoder.writeCount(upsert.stable.len);
-                for (upsert.stable) |pointer| {
-                    try encoder.writeBytes(pointer.raw);
-                }
-                try encoder.writeUsize(upsert.max_entries);
-                try encoder.writeUsize(upsert.max_key_bytes);
-            },
-        };
+}
+
+fn encodeAdmission(
+    admission: Admission,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeBytes(admission.on);
+    try encodeIndexes(admission.required, encoder);
+    try encodeIndexes(admission.forbidden, encoder);
+    try encoder.writeCount(admission.set_guards.len);
+    for (admission.set_guards) |guard| {
+        try encoder.writeU16(guard.set);
+        try encodeSource(guard.source, encoder);
+        try encoder.writeBytes(guard.pointer.raw);
+        try encoder.writeEnum(guard.presence);
+        try encoder.writeEnum(guard.mode);
     }
+    try validation.encodeCache(&admission.validation_plan, encoder);
+    try encoder.writeCount(admission.actions.len);
+    for (admission.actions) |action| try encodeAction(action, encoder);
+}
+
+fn encodeAction(
+    action: Action,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    switch (action) {
+        .set => |set| {
+            try encoder.writeByte(0);
+            try encoder.writeU16(set.target);
+            switch (set.source) {
+                .event => try encoder.writeByte(0),
+                .register => |index| {
+                    try encoder.writeByte(1);
+                    try encoder.writeU16(index);
+                },
+            }
+            try encoder.writeBytes(set.pointer.raw);
+        },
+        .clear => |target| {
+            try encoder.writeByte(1);
+            try encoder.writeU16(target);
+        },
+        .insert => |insert| {
+            try encoder.writeByte(2);
+            try encoder.writeU16(insert.target);
+            try encodeSource(insert.source, encoder);
+            try encoder.writeBytes(insert.pointer.raw);
+        },
+        .upsert => |upsert| try encodeUpsertAction(upsert, encoder),
+    }
+}
+
+fn encodeUpsertAction(
+    upsert: UpsertAction,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeByte(3);
+    try encoder.writeU16(upsert.target);
+    try encodeSource(upsert.source, encoder);
+    try encoder.writeBytes(upsert.collection.raw);
+    try encoder.writeBytes(upsert.key.raw);
+    try encoder.writeBytes(upsert.source_ref.raw);
+    try encoder.writeBytes(upsert.predecessor_refs.raw);
+    try encoder.writeCount(upsert.stable.len);
+    for (upsert.stable) |pointer| try encoder.writeBytes(pointer.raw);
+    try encoder.writeUsize(upsert.max_entries);
+    try encoder.writeUsize(upsert.max_key_bytes);
 }
 
 pub fn decodeCache(
@@ -454,188 +489,17 @@ pub fn decodeCache(
         raw_event_kind,
     );
     errdefer event_kind.deinit(allocator);
-    const register_count = try decoder.readCount(max_registers);
-    if (register_count == 0) return error.InvalidRetainedRegisterCount;
-    const registers = try allocator.alloc(Register, register_count);
-    var registers_initialized: usize = 0;
-    errdefer {
-        for (registers[0..registers_initialized]) |*register| {
-            register.deinit(allocator);
-        }
-        allocator.free(registers);
-    }
-    for (registers) |*register| {
-        register.* = .{
-            .name = try decoder.readBytesAlloc(allocator, 128),
-            .max_bytes = try decoder.readUsize(),
-        };
-        registers_initialized += 1;
-    }
-    const set_count = try decoder.readCount(max_sets);
-    const sets = try allocator.alloc(RetainedSet, set_count);
-    var sets_initialized: usize = 0;
-    errdefer {
-        for (sets[0..sets_initialized]) |*set| set.deinit(allocator);
-        allocator.free(sets);
-    }
-    for (sets) |*set| {
-        var name: ?[]u8 = try decoder.readBytesAlloc(allocator, 128);
-        errdefer if (name) |owned| allocator.free(owned);
-        const max_entries = try decoder.readUsize();
-        const max_key_bytes = try decoder.readUsize();
-        const max_bytes = try decoder.readUsize();
-        set.* = .{
-            .name = name.?,
-            .max_entries = max_entries,
-            .max_key_bytes = max_key_bytes,
-            .max_bytes = max_bytes,
-        };
-        name = null;
-        sets_initialized += 1;
-    }
-    const admission_count = try decoder.readCount(max_admissions);
-    if (admission_count == 0) return error.InvalidRetainedAdmissionCount;
-    const admissions = try allocator.alloc(Admission, admission_count);
-    var admissions_initialized: usize = 0;
-    errdefer {
-        for (admissions[0..admissions_initialized]) |*admission| {
-            admission.deinit(allocator);
-        }
-        allocator.free(admissions);
-    }
-    for (admissions) |*admission| {
-        const on = try decoder.readBytesAlloc(allocator, 256);
-        errdefer allocator.free(on);
-        const required = try decodeIndexes(
-            allocator,
-            decoder,
-            register_count,
-        );
-        errdefer allocator.free(required);
-        const forbidden = try decodeIndexes(
-            allocator,
-            decoder,
-            register_count,
-        );
-        errdefer allocator.free(forbidden);
-        const set_guards = try decodeSetGuards(
-            allocator,
-            decoder,
-            register_count,
-            set_count,
-        );
-        errdefer deinitSetGuards(allocator, set_guards);
-        var validation_plan = try validation.decodeCache(
-            allocator,
-            decoder,
-        );
-        errdefer validation_plan.deinit(allocator);
-        const action_count = try decoder.readCount(max_actions);
-        const actions = try allocator.alloc(Action, action_count);
-        var actions_initialized: usize = 0;
-        errdefer {
-            for (actions[0..actions_initialized]) |*action| {
-                action.deinit(allocator);
-            }
-            allocator.free(actions);
-        }
-        for (actions) |*action| {
-            action.* = switch (try decoder.readByte()) {
-                0 => set: {
-                    const target = try decoder.readU16();
-                    const source: Source = switch (try decoder.readByte()) {
-                        0 => .event,
-                        1 => .{ .register = try decoder.readU16() },
-                        else => return error.CacheStateActionSourceInvalid,
-                    };
-                    const raw_pointer = try decoder.readBytesAlloc(
-                        allocator,
-                        1024,
-                    );
-                    defer allocator.free(raw_pointer);
-                    break :set .{ .set = .{
-                        .target = target,
-                        .source = source,
-                        .pointer = try definition_core.json_pointer.compile(
-                            allocator,
-                            raw_pointer,
-                        ),
-                    } };
-                },
-                1 => .{ .clear = try decoder.readU16() },
-                2 => .{ .insert = .{
-                    .target = try decoder.readU16(),
-                    .source = try decodeSource(decoder, register_count),
-                    .pointer = try decodePointer(allocator, decoder),
-                } },
-                3 => upsert: {
-                    const target = try decoder.readU16();
-                    const source = try decodeSource(decoder, register_count);
-                    var collection: ?definition_core.json_pointer.Pointer =
-                        try decodePointer(allocator, decoder);
-                    errdefer if (collection) |*owned| owned.deinit(allocator);
-                    var key: ?definition_core.json_pointer.Pointer =
-                        try decodePointer(allocator, decoder);
-                    errdefer if (key) |*owned| owned.deinit(allocator);
-                    var source_ref: ?definition_core.json_pointer.Pointer =
-                        try decodePointer(allocator, decoder);
-                    errdefer if (source_ref) |*owned| owned.deinit(allocator);
-                    var predecessor_refs: ?definition_core.json_pointer.Pointer =
-                        try decodePointer(allocator, decoder);
-                    errdefer if (predecessor_refs) |*owned| {
-                        owned.deinit(allocator);
-                    };
-                    const stable_count = try decoder.readCount(
-                        max_stable_pointers,
-                    );
-                    const stable = try allocator.alloc(
-                        definition_core.json_pointer.Pointer,
-                        stable_count,
-                    );
-                    var stable_initialized: usize = 0;
-                    errdefer {
-                        for (stable[0..stable_initialized]) |*pointer| {
-                            pointer.deinit(allocator);
-                        }
-                        allocator.free(stable);
-                    }
-                    for (stable) |*pointer| {
-                        pointer.* = try decodePointer(allocator, decoder);
-                        stable_initialized += 1;
-                    }
-                    const max_entries = try decoder.readUsize();
-                    const max_key_bytes = try decoder.readUsize();
-                    const result: Action = .{ .upsert = .{
-                        .target = target,
-                        .source = source,
-                        .collection = collection.?,
-                        .key = key.?,
-                        .source_ref = source_ref.?,
-                        .predecessor_refs = predecessor_refs.?,
-                        .stable = stable,
-                        .max_entries = max_entries,
-                        .max_key_bytes = max_key_bytes,
-                    } };
-                    collection = null;
-                    key = null;
-                    source_ref = null;
-                    predecessor_refs = null;
-                    break :upsert result;
-                },
-                else => return error.CacheStateActionInvalid,
-            };
-            actions_initialized += 1;
-        }
-        admission.* = .{
-            .on = on,
-            .required = required,
-            .forbidden = forbidden,
-            .set_guards = set_guards,
-            .validation_plan = validation_plan,
-            .actions = actions,
-        };
-        admissions_initialized += 1;
-    }
+    const registers = try decodeRegisters(allocator, decoder);
+    errdefer deinitRegisters(allocator, registers);
+    const sets = try decodeSets(allocator, decoder);
+    errdefer deinitSets(allocator, sets);
+    const admissions = try decodeAdmissions(
+        allocator,
+        decoder,
+        registers.len,
+        sets.len,
+    );
+    errdefer deinitAdmissions(allocator, admissions);
     return .{
         .event_kind = event_kind,
         .registers = registers,
@@ -643,6 +507,229 @@ pub fn decodeCache(
         .admissions = admissions,
         .layout_digest = retainedLayoutDigest(registers, sets),
     };
+}
+
+fn decodeRegisters(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Register {
+    const count = try decoder.readCount(max_registers);
+    if (count == 0) return error.InvalidRetainedRegisterCount;
+    const registers = try allocator.alloc(Register, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (registers[0..initialized]) |*register| register.deinit(allocator);
+        allocator.free(registers);
+    }
+    for (registers) |*register| {
+        register.* = .{
+            .name = try decoder.readBytesAlloc(allocator, 128),
+            .max_bytes = try decoder.readUsize(),
+        };
+        initialized += 1;
+    }
+    return registers;
+}
+
+fn decodeSets(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]RetainedSet {
+    const count = try decoder.readCount(max_sets);
+    const sets = try allocator.alloc(RetainedSet, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (sets[0..initialized]) |*set| set.deinit(allocator);
+        allocator.free(sets);
+    }
+    for (sets) |*set| {
+        const name = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(name);
+        set.* = .{
+            .name = name,
+            .max_entries = try decoder.readUsize(),
+            .max_key_bytes = try decoder.readUsize(),
+            .max_bytes = try decoder.readUsize(),
+        };
+        initialized += 1;
+    }
+    return sets;
+}
+
+fn decodeAdmissions(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    register_count: usize,
+    set_count: usize,
+) ![]Admission {
+    const count = try decoder.readCount(max_admissions);
+    if (count == 0) return error.InvalidRetainedAdmissionCount;
+    const admissions = try allocator.alloc(Admission, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (admissions[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(admissions);
+    }
+    for (admissions) |*admission| {
+        admission.* = try decodeAdmission(
+            allocator,
+            decoder,
+            register_count,
+            set_count,
+        );
+        initialized += 1;
+    }
+    return admissions;
+}
+
+fn decodeAdmission(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    register_count: usize,
+    set_count: usize,
+) !Admission {
+    const on = try decoder.readBytesAlloc(allocator, 256);
+    errdefer allocator.free(on);
+    const required = try decodeIndexes(allocator, decoder, register_count);
+    errdefer allocator.free(required);
+    const forbidden = try decodeIndexes(allocator, decoder, register_count);
+    errdefer allocator.free(forbidden);
+    const set_guards = try decodeSetGuards(
+        allocator,
+        decoder,
+        register_count,
+        set_count,
+    );
+    errdefer deinitSetGuards(allocator, set_guards);
+    var validation_plan = try validation.decodeCache(allocator, decoder);
+    errdefer validation_plan.deinit(allocator);
+    const actions = try decodeActions(allocator, decoder, register_count);
+    errdefer {
+        for (actions) |*action| action.deinit(allocator);
+        allocator.free(actions);
+    }
+    return .{
+        .on = on,
+        .required = required,
+        .forbidden = forbidden,
+        .set_guards = set_guards,
+        .validation_plan = validation_plan,
+        .actions = actions,
+    };
+}
+
+fn decodeActions(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    register_count: usize,
+) ![]Action {
+    const count = try decoder.readCount(max_actions);
+    const actions = try allocator.alloc(Action, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (actions[0..initialized]) |*action| action.deinit(allocator);
+        allocator.free(actions);
+    }
+    for (actions) |*action| {
+        action.* = try decodeAction(allocator, decoder, register_count);
+        initialized += 1;
+    }
+    return actions;
+}
+
+fn decodeAction(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    register_count: usize,
+) !Action {
+    return switch (try decoder.readByte()) {
+        0 => .{ .set = try decodeSetAction(
+            allocator,
+            decoder,
+            register_count,
+        ) },
+        1 => .{ .clear = try decoder.readU16() },
+        2 => .{ .insert = .{
+            .target = try decoder.readU16(),
+            .source = try decodeSource(decoder, register_count),
+            .pointer = try decodePointer(allocator, decoder),
+        } },
+        3 => .{ .upsert = try decodeUpsertAction(
+            allocator,
+            decoder,
+            register_count,
+        ) },
+        else => error.CacheStateActionInvalid,
+    };
+}
+
+fn decodeSetAction(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    _: usize,
+) !SetAction {
+    const target = try decoder.readU16();
+    const source: Source = switch (try decoder.readByte()) {
+        0 => .event,
+        1 => .{ .register = try decoder.readU16() },
+        else => return error.CacheStateActionSourceInvalid,
+    };
+    return .{
+        .target = target,
+        .source = source,
+        .pointer = try decodePointer(allocator, decoder),
+    };
+}
+
+fn decodeUpsertAction(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    register_count: usize,
+) !UpsertAction {
+    const target = try decoder.readU16();
+    const source = try decodeSource(decoder, register_count);
+    var collection = try decodePointer(allocator, decoder);
+    errdefer collection.deinit(allocator);
+    var key = try decodePointer(allocator, decoder);
+    errdefer key.deinit(allocator);
+    var source_ref = try decodePointer(allocator, decoder);
+    errdefer source_ref.deinit(allocator);
+    var predecessors = try decodePointer(allocator, decoder);
+    errdefer predecessors.deinit(allocator);
+    const stable = try decodeStablePointers(allocator, decoder);
+    errdefer deinitPointers(allocator, stable);
+    return .{
+        .target = target,
+        .source = source,
+        .collection = collection,
+        .key = key,
+        .source_ref = source_ref,
+        .predecessor_refs = predecessors,
+        .stable = stable,
+        .max_entries = try decoder.readUsize(),
+        .max_key_bytes = try decoder.readUsize(),
+    };
+}
+
+fn decodeStablePointers(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]definition_core.json_pointer.Pointer {
+    const count = try decoder.readCount(max_stable_pointers);
+    const pointers = try allocator.alloc(
+        definition_core.json_pointer.Pointer,
+        count,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (pointers[0..initialized]) |*pointer| pointer.deinit(allocator);
+        allocator.free(pointers);
+    }
+    for (pointers) |*pointer| {
+        pointer.* = try decodePointer(allocator, decoder);
+        initialized += 1;
+    }
+    return pointers;
 }
 
 pub fn validatePlan(
@@ -660,6 +747,23 @@ pub fn validatePlan(
     {
         return error.InvalidRetainedReducerPlan;
     }
+    try validateRegisterPlans(plan, definition_plan);
+    try validateSetPlans(plan, definition_plan);
+    for (plan.admissions, 0..) |*admission, index| {
+        try validateAdmissionPlan(
+            plan,
+            definition_plan,
+            admission,
+            index,
+            event_max_bytes,
+        );
+    }
+}
+
+fn validateRegisterPlans(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
     for (plan.registers, 0..) |register, index| {
         try definition_core.json.safeIdentifier(register.name, 128);
         if (std.mem.eql(u8, register.name, "event") or
@@ -675,6 +779,12 @@ pub fn validatePlan(
             return error.InvalidRetainedReducerPlan;
         }
     }
+}
+
+fn validateSetPlans(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
     var retained_set_bytes: usize = 0;
     for (plan.sets, 0..) |set, index| {
         try definition_core.json.safeIdentifier(set.name, 128);
@@ -703,138 +813,165 @@ pub fn validatePlan(
     if (retained_set_bytes > definition_plan.bounds.max_store_bytes) {
         return error.InvalidRetainedReducerPlan;
     }
-    for (plan.admissions, 0..) |admission, index| {
-        try definition_core.json.safeIdentifier(admission.on, 256);
-        try validateIndexes(admission.required, plan.registers.len);
-        try validateIndexes(admission.forbidden, plan.registers.len);
-        if (setsIntersect(admission.required, admission.forbidden)) {
-            return error.ConflictingRetainedAdmissionState;
+}
+
+fn validateAdmissionPlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    admission: *const Admission,
+    index: usize,
+    event_max_bytes: usize,
+) !void {
+    try definition_core.json.safeIdentifier(admission.on, 256);
+    try validateIndexes(admission.required, plan.registers.len);
+    try validateIndexes(admission.forbidden, plan.registers.len);
+    if (setsIntersect(admission.required, admission.forbidden)) {
+        return error.ConflictingRetainedAdmissionState;
+    }
+    try validateSetGuards(plan, admission);
+    try validation.validateEmbeddedCachePlan(
+        &admission.validation_plan,
+        definition_plan,
+    );
+    try validateAdmissionInputs(plan, admission, event_max_bytes);
+    try validateActions(plan, definition_plan, admission);
+    for (plan.admissions[0..index]) |prior| {
+        if (std.mem.eql(u8, prior.on, admission.on) and
+            admissionsOverlap(prior, admission.*))
+        {
+            return error.AmbiguousRetainedAdmission;
         }
-        for (admission.set_guards, 0..) |guard, guard_index| {
-            if (guard.set >= plan.sets.len) {
-                return error.InvalidRetainedSetGuard;
+    }
+}
+
+fn validateSetGuards(
+    plan: *const Plan,
+    admission: *const Admission,
+) !void {
+    for (admission.set_guards, 0..) |guard, index| {
+        if (guard.set >= plan.sets.len) {
+            return error.InvalidRetainedSetGuard;
+        }
+        try validateSource(
+            guard.source,
+            plan.registers.len,
+            admission.required,
+        );
+        if (guard.pointer.raw.len > 1024) {
+            return error.InvalidRetainedSetGuard;
+        }
+        for (admission.set_guards[0..index]) |prior| {
+            if (prior.set != guard.set or
+                !sourceEqual(prior.source, guard.source) or
+                !std.mem.eql(u8, prior.pointer.raw, guard.pointer.raw))
+            {
+                continue;
+            }
+            if (prior.presence != guard.presence or prior.mode != guard.mode) {
+                return error.ConflictingRetainedSetGuard;
+            }
+            return error.DuplicateRetainedSetGuard;
+        }
+    }
+}
+
+fn validateActions(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    admission: *const Admission,
+) !void {
+    for (admission.actions, 0..) |action, index| {
+        try validateAction(plan, definition_plan, admission, action);
+        for (admission.actions[0..index]) |prior| {
+            if (actionsConflict(prior, action)) {
+                return error.DuplicateRetainedActionTarget;
+            }
+        }
+    }
+}
+
+fn validateAction(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    admission: *const Admission,
+    action: Action,
+) !void {
+    switch (action) {
+        .set => |set| {
+            if (set.target >= plan.registers.len) {
+                return error.InvalidRetainedActionTarget;
+            }
+            if (set.source == .register and
+                set.source.register >= plan.registers.len)
+            {
+                return error.InvalidRetainedActionSource;
+            }
+            if (set.source == .register and
+                !containsIndex(admission.required, set.source.register))
+            {
+                return error.RetainedActionSourceNotRequired;
+            }
+        },
+        .clear => |target| if (target >= plan.registers.len) {
+            return error.InvalidRetainedActionTarget;
+        },
+        .insert => |insert| {
+            if (insert.target >= plan.sets.len) {
+                return error.InvalidRetainedActionTarget;
             }
             try validateSource(
-                guard.source,
+                insert.source,
                 plan.registers.len,
                 admission.required,
             );
-            if (guard.pointer.raw.len > 1024) {
-                return error.InvalidRetainedSetGuard;
+            if (insert.pointer.raw.len > 1024) {
+                return error.InvalidRetainedActionSource;
             }
-            for (admission.set_guards[0..guard_index]) |prior| {
-                if (prior.set == guard.set and
-                    sourceEqual(prior.source, guard.source) and
-                    std.mem.eql(
-                        u8,
-                        prior.pointer.raw,
-                        guard.pointer.raw,
-                    ))
-                {
-                    if (prior.presence != guard.presence or
-                        prior.mode != guard.mode)
-                    {
-                        return error.ConflictingRetainedSetGuard;
-                    }
-                    return error.DuplicateRetainedSetGuard;
-                }
-            }
-        }
-        try validation.validateEmbeddedCachePlan(
-            &admission.validation_plan,
-            definition_plan,
-        );
-        try validateAdmissionInputs(
+        },
+        .upsert => |upsert| try validateUpsertAction(
             plan,
-            &admission,
-            event_max_bytes,
-        );
-        for (admission.actions, 0..) |action, action_index| {
-            switch (action) {
-                .set => |set| {
-                    if (set.target >= plan.registers.len) {
-                        return error.InvalidRetainedActionTarget;
-                    }
-                    if (set.source == .register and
-                        set.source.register >= plan.registers.len)
-                    {
-                        return error.InvalidRetainedActionSource;
-                    }
-                    if (set.source == .register and
-                        !containsIndex(
-                            admission.required,
-                            set.source.register,
-                        ))
-                    {
-                        return error.RetainedActionSourceNotRequired;
-                    }
-                },
-                .clear => |target| {
-                    if (target >= plan.registers.len) {
-                        return error.InvalidRetainedActionTarget;
-                    }
-                },
-                .insert => |insert| {
-                    if (insert.target >= plan.sets.len) {
-                        return error.InvalidRetainedActionTarget;
-                    }
-                    try validateSource(
-                        insert.source,
-                        plan.registers.len,
-                        admission.required,
-                    );
-                    if (insert.pointer.raw.len > 1024) {
-                        return error.InvalidRetainedActionSource;
-                    }
-                },
-                .upsert => |upsert| {
-                    if (upsert.target >= plan.registers.len or
-                        !containsIndex(admission.required, upsert.target))
-                    {
-                        return error.InvalidRetainedActionTarget;
-                    }
-                    try validateSource(
-                        upsert.source,
-                        plan.registers.len,
-                        admission.required,
-                    );
-                    if (upsert.collection.raw.len > 1024 or
-                        upsert.key.raw.len > 1024 or
-                        upsert.source_ref.raw.len > 1024 or
-                        upsert.predecessor_refs.raw.len > 1024 or
-                        upsert.stable.len > max_stable_pointers or
-                        upsert.max_entries == 0 or
-                        upsert.max_entries >
-                            definition_plan.bounds.max_records or
-                        upsert.max_key_bytes == 0 or
-                        upsert.max_key_bytes >
-                            plan.registers[upsert.target].max_bytes)
-                    {
-                        return error.InvalidRetainedUpsertAction;
-                    }
-                    for (upsert.stable, 0..) |pointer, pointer_index| {
-                        if (pointer.raw.len > 1024) {
-                            return error.InvalidRetainedUpsertAction;
-                        }
-                        for (upsert.stable[0..pointer_index]) |prior| {
-                            if (std.mem.eql(u8, prior.raw, pointer.raw)) {
-                                return error.InvalidRetainedUpsertAction;
-                            }
-                        }
-                    }
-                },
-            }
-            for (admission.actions[0..action_index]) |prior| {
-                if (actionsConflict(prior, action)) {
-                    return error.DuplicateRetainedActionTarget;
-                }
-            }
+            definition_plan,
+            admission,
+            upsert,
+        ),
+    }
+}
+
+fn validateUpsertAction(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    admission: *const Admission,
+    upsert: UpsertAction,
+) !void {
+    if (upsert.target >= plan.registers.len or
+        !containsIndex(admission.required, upsert.target))
+    {
+        return error.InvalidRetainedActionTarget;
+    }
+    try validateSource(
+        upsert.source,
+        plan.registers.len,
+        admission.required,
+    );
+    if (upsert.collection.raw.len > 1024 or
+        upsert.key.raw.len > 1024 or
+        upsert.source_ref.raw.len > 1024 or
+        upsert.predecessor_refs.raw.len > 1024 or
+        upsert.stable.len > max_stable_pointers or
+        upsert.max_entries == 0 or
+        upsert.max_entries > definition_plan.bounds.max_records or
+        upsert.max_key_bytes == 0 or
+        upsert.max_key_bytes > plan.registers[upsert.target].max_bytes)
+    {
+        return error.InvalidRetainedUpsertAction;
+    }
+    for (upsert.stable, 0..) |pointer, index| {
+        if (pointer.raw.len > 1024) {
+            return error.InvalidRetainedUpsertAction;
         }
-        for (plan.admissions[0..index]) |prior| {
-            if (std.mem.eql(u8, prior.on, admission.on) and
-                admissionsOverlap(prior, admission))
-            {
-                return error.AmbiguousRetainedAdmission;
+        for (upsert.stable[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.raw, pointer.raw)) {
+                return error.InvalidRetainedUpsertAction;
             }
         }
     }
@@ -982,42 +1119,12 @@ fn compileSets(
         allocator.free(sets);
     }
     for (values.items) |value| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "name", "max_entries", "max_key_bytes", "max_bytes" },
+        sets[initialized] = try compileSet(
+            allocator,
+            try definition_core.json.object(value),
+            max_entries,
+            max_store_bytes,
         );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "name", "max_entries", "max_key_bytes", "max_bytes" },
-        );
-        const name = try definition_core.json.requiredString(object, "name");
-        try definition_core.json.safeIdentifier(name, 128);
-        if (std.mem.eql(u8, name, "event")) {
-            return error.ReservedRetainedSetName;
-        }
-        const entry_bound = try definition_core.json.unsigned(
-            try definition_core.json.field(object, "max_entries"),
-        );
-        const key_bound = try definition_core.json.unsigned(
-            try definition_core.json.field(object, "max_key_bytes"),
-        );
-        const byte_bound = try definition_core.json.unsigned(
-            try definition_core.json.field(object, "max_bytes"),
-        );
-        if (entry_bound == 0 or entry_bound > max_entries or
-            key_bound == 0 or key_bound > max_store_bytes or
-            byte_bound == 0 or byte_bound > max_store_bytes or
-            key_bound > byte_bound)
-        {
-            return error.RetainedSetBoundsExceeded;
-        }
-        sets[initialized] = .{
-            .name = try allocator.dupe(u8, name),
-            .max_entries = entry_bound,
-            .max_key_bytes = key_bound,
-            .max_bytes = byte_bound,
-        };
         initialized += 1;
     }
     std.sort.heap(RetainedSet, sets, {}, struct {
@@ -1037,6 +1144,49 @@ fn compileSets(
         }
     }
     return sets;
+}
+
+fn compileSet(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    max_entries: usize,
+    max_store_bytes: usize,
+) !RetainedSet {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "max_entries", "max_key_bytes", "max_bytes" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "name", "max_entries", "max_key_bytes", "max_bytes" },
+    );
+    const name = try definition_core.json.requiredString(object, "name");
+    try definition_core.json.safeIdentifier(name, 128);
+    if (std.mem.eql(u8, name, "event")) {
+        return error.ReservedRetainedSetName;
+    }
+    const entry_bound = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_entries"),
+    );
+    const key_bound = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_key_bytes"),
+    );
+    const byte_bound = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_bytes"),
+    );
+    if (entry_bound == 0 or entry_bound > max_entries or
+        key_bound == 0 or key_bound > max_store_bytes or
+        byte_bound == 0 or byte_bound > max_store_bytes or
+        key_bound > byte_bound)
+    {
+        return error.RetainedSetBoundsExceeded;
+    }
+    return .{
+        .name = try allocator.dupe(u8, name),
+        .max_entries = entry_bound,
+        .max_key_bytes = key_bound,
+        .max_bytes = byte_bound,
+    };
 }
 
 fn compileAdmissions(
@@ -1060,90 +1210,132 @@ fn compileAdmissions(
         allocator.free(admissions);
     }
     for (values.items) |value| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{
-                "on",
-                "requires",
-                "forbids",
-                "set_guards",
-                "rules",
-                "actions",
-            },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "on", "requires", "forbids", "rules", "actions" },
-        );
-        const on = try definition_core.json.requiredString(object, "on");
-        try definition_core.json.safeIdentifier(on, 256);
-        const required = try compileRegisterSet(
-            allocator,
-            registers,
-            try definition_core.json.field(object, "requires"),
-        );
-        errdefer allocator.free(required);
-        const forbidden = try compileRegisterSet(
-            allocator,
-            registers,
-            try definition_core.json.field(object, "forbids"),
-        );
-        errdefer allocator.free(forbidden);
-        if (setsIntersect(required, forbidden)) {
-            return error.ConflictingRetainedAdmissionState;
-        }
-        const set_guards = if (object.get("set_guards")) |raw_guards|
-            try compileSetGuards(
-                allocator,
-                registers,
-                sets,
-                required,
-                raw_guards,
-            )
-        else
-            try allocator.alloc(SetGuard, 0);
-        errdefer deinitSetGuards(allocator, set_guards);
-        const inputs = try admissionInputsAlloc(
-            allocator,
-            event_max_bytes,
-            registers,
-            required,
-        );
-        defer deinitInputs(allocator, inputs);
-        var validation_plan = try validation.compileEmbedded(
+        admissions[initialized] = try compileAdmission(
             allocator,
             definition_plan,
-            inputs,
-            try definition_core.json.field(object, "rules"),
-            definition_plan.bounds.max_input_bytes,
-            definition_plan.bounds.max_records,
-            definition_plan.bounds.max_diagnostics,
-        );
-        errdefer validation_plan.deinit(allocator);
-        const actions = try compileActions(
-            allocator,
             registers,
             sets,
-            required,
-            try definition_core.json.field(object, "actions"),
-            definition_plan.bounds.max_records,
+            try definition_core.json.object(value),
+            event_max_bytes,
         );
-        errdefer {
-            for (actions) |*action| action.deinit(allocator);
-            allocator.free(actions);
-        }
-        admissions[initialized] = .{
-            .on = try allocator.dupe(u8, on),
-            .required = required,
-            .forbidden = forbidden,
-            .set_guards = set_guards,
-            .validation_plan = validation_plan,
-            .actions = actions,
-        };
         initialized += 1;
     }
     return admissions;
+}
+
+fn compileAdmission(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    object: std.json.ObjectMap,
+    event_max_bytes: usize,
+) !Admission {
+    const on = try validateAdmissionObject(object);
+    const required = try compileRegisterSet(
+        allocator,
+        registers,
+        try definition_core.json.field(object, "requires"),
+    );
+    errdefer allocator.free(required);
+    const forbidden = try compileRegisterSet(
+        allocator,
+        registers,
+        try definition_core.json.field(object, "forbids"),
+    );
+    errdefer allocator.free(forbidden);
+    if (setsIntersect(required, forbidden)) {
+        return error.ConflictingRetainedAdmissionState;
+    }
+    const guards = try compileOptionalSetGuards(
+        allocator,
+        registers,
+        sets,
+        required,
+        object,
+    );
+    errdefer deinitSetGuards(allocator, guards);
+    var validator = try compileAdmissionValidator(
+        allocator,
+        definition_plan,
+        registers,
+        required,
+        object,
+        event_max_bytes,
+    );
+    errdefer validator.deinit(allocator);
+    const actions = try compileActions(
+        allocator,
+        registers,
+        sets,
+        required,
+        try definition_core.json.field(object, "actions"),
+        definition_plan.bounds.max_records,
+    );
+    errdefer {
+        for (actions) |*action| action.deinit(allocator);
+        allocator.free(actions);
+    }
+    return .{
+        .on = try allocator.dupe(u8, on),
+        .required = required,
+        .forbidden = forbidden,
+        .set_guards = guards,
+        .validation_plan = validator,
+        .actions = actions,
+    };
+}
+
+fn validateAdmissionObject(object: std.json.ObjectMap) ![]const u8 {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "on", "requires", "forbids", "set_guards", "rules", "actions" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "on", "requires", "forbids", "rules", "actions" },
+    );
+    const on = try definition_core.json.requiredString(object, "on");
+    try definition_core.json.safeIdentifier(on, 256);
+    return on;
+}
+
+fn compileOptionalSetGuards(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    required: []const u16,
+    object: std.json.ObjectMap,
+) ![]SetGuard {
+    const raw = object.get("set_guards") orelse
+        return allocator.alloc(SetGuard, 0);
+    return compileSetGuards(allocator, registers, sets, required, raw);
+}
+
+fn compileAdmissionValidator(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    registers: []const Register,
+    required: []const u16,
+    object: std.json.ObjectMap,
+    event_max_bytes: usize,
+) !validation.Plan {
+    const inputs = try admissionInputsAlloc(
+        allocator,
+        event_max_bytes,
+        registers,
+        required,
+    );
+    defer deinitInputs(allocator, inputs);
+    return validation.compileEmbedded(
+        allocator,
+        definition_plan,
+        inputs,
+        try definition_core.json.field(object, "rules"),
+        definition_plan.bounds.max_input_bytes,
+        definition_plan.bounds.max_records,
+        definition_plan.bounds.max_diagnostics,
+    );
 }
 
 fn compileSetGuards(
@@ -1162,47 +1354,17 @@ fn compileSetGuards(
         allocator.free(guards);
     }
     for (values.items) |value| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "set", "input", "path", "presence", "mode" },
-        );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "set", "input", "path", "presence" },
-        );
-        const set_index = findSet(
-            sets,
-            try definition_core.json.requiredString(object, "set"),
-        ) orelse return error.UnknownRetainedSet;
-        const source = try compileSource(
-            registers,
-            required,
-            try definition_core.json.requiredString(object, "input"),
-        );
-        var pointer = try definition_core.json_pointer.compile(
+        const candidate = try compileSetGuard(
             allocator,
-            try definition_core.json.requiredString(object, "path"),
+            registers,
+            sets,
+            required,
+            try definition_core.json.object(value),
         );
-        errdefer pointer.deinit(allocator);
-        const presence = std.meta.stringToEnum(
-            SetPresence,
-            try definition_core.json.requiredString(object, "presence"),
-        ) orelse return error.InvalidRetainedSetPresence;
-        const mode = if (object.get("mode")) |raw_mode|
-            std.meta.stringToEnum(
-                SetGuardMode,
-                try definition_core.json.string(raw_mode),
-            ) orelse return error.InvalidRetainedSetGuardMode
-        else
-            .scalar;
-        const candidate: SetGuard = .{
-            .set = @intCast(set_index),
-            .source = source,
-            .pointer = pointer,
-            .presence = presence,
-            .mode = mode,
-        };
+        errdefer {
+            var owned = candidate;
+            owned.deinit(allocator);
+        }
         for (guards[0..initialized]) |prior| {
             if (prior.set == candidate.set and
                 sourceEqual(prior.source, candidate.source) and
@@ -1224,6 +1386,55 @@ fn compileSetGuards(
         initialized += 1;
     }
     return guards;
+}
+
+fn compileSetGuard(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    required: []const u16,
+    object: std.json.ObjectMap,
+) !SetGuard {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "set", "input", "path", "presence", "mode" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "set", "input", "path", "presence" },
+    );
+    const set_index = findSet(
+        sets,
+        try definition_core.json.requiredString(object, "set"),
+    ) orelse return error.UnknownRetainedSet;
+    const source = try compileSource(
+        registers,
+        required,
+        try definition_core.json.requiredString(object, "input"),
+    );
+    var pointer = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(object, "path"),
+    );
+    errdefer pointer.deinit(allocator);
+    const presence = std.meta.stringToEnum(
+        SetPresence,
+        try definition_core.json.requiredString(object, "presence"),
+    ) orelse return error.InvalidRetainedSetPresence;
+    const mode = if (object.get("mode")) |raw_mode|
+        std.meta.stringToEnum(
+            SetGuardMode,
+            try definition_core.json.string(raw_mode),
+        ) orelse return error.InvalidRetainedSetGuardMode
+    else
+        .scalar;
+    return .{
+        .set = @intCast(set_index),
+        .source = source,
+        .pointer = pointer,
+        .presence = presence,
+        .mode = mode,
+    };
 }
 
 fn compileActions(
@@ -1250,202 +1461,288 @@ fn compileActions(
     @memset(seen_set_targets, false);
     for (values.items) |value| {
         const object = try definition_core.json.object(value);
-        const operator = try definition_core.json.requiredString(object, "op");
-        if (std.mem.eql(u8, operator, "set")) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "register", "input", "path" },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "op", "register", "input", "path" },
-            );
-            const target = findRegister(
-                registers,
-                try definition_core.json.requiredString(object, "register"),
-            ) orelse return error.UnknownRetainedRegister;
-            if (seen_targets[target]) {
-                return error.DuplicateRetainedActionTarget;
-            }
-            seen_targets[target] = true;
-            const input = try definition_core.json.requiredString(
-                object,
-                "input",
-            );
-            const source: Source = if (std.mem.eql(u8, input, "event"))
-                .event
-            else
-                .{ .register = @intCast(findRegister(
-                    registers,
-                    input,
-                ) orelse return error.UnknownRetainedRegister) };
-            actions[initialized] = .{ .set = .{
-                .target = @intCast(target),
-                .source = source,
-                .pointer = try definition_core.json_pointer.compile(
-                    allocator,
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "path"),
-                    ),
-                ),
-            } };
-        } else if (std.mem.eql(u8, operator, "clear")) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "register" },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "op", "register" },
-            );
-            const target = findRegister(
-                registers,
-                try definition_core.json.requiredString(
-                    object,
-                    "register",
-                ),
-            ) orelse return error.UnknownRetainedRegister;
-            if (seen_targets[target]) {
-                return error.DuplicateRetainedActionTarget;
-            }
-            seen_targets[target] = true;
-            actions[initialized] = .{ .clear = @intCast(target) };
-        } else if (std.mem.eql(u8, operator, "insert")) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "set", "input", "path" },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "op", "set", "input", "path" },
-            );
-            const target = findSet(
-                sets,
-                try definition_core.json.requiredString(object, "set"),
-            ) orelse return error.UnknownRetainedSet;
-            if (seen_set_targets[target]) {
-                return error.DuplicateRetainedActionTarget;
-            }
-            seen_set_targets[target] = true;
-            const source = try compileSource(
-                registers,
-                required,
-                try definition_core.json.requiredString(object, "input"),
-            );
-            actions[initialized] = .{ .insert = .{
-                .target = @intCast(target),
-                .source = source,
-                .pointer = try definition_core.json_pointer.compile(
-                    allocator,
-                    try definition_core.json.requiredString(object, "path"),
-                ),
-            } };
-        } else if (std.mem.eql(u8, operator, "upsert")) {
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{
-                    "op",
-                    "register",
-                    "input",
-                    "path",
-                    "key",
-                    "source_ref",
-                    "predecessor_refs",
-                    "stable",
-                    "max_entries",
-                    "max_key_bytes",
-                },
-            );
-            try definition_core.json.requireFields(
-                object,
-                &.{
-                    "op",
-                    "register",
-                    "input",
-                    "path",
-                    "key",
-                    "source_ref",
-                    "predecessor_refs",
-                    "stable",
-                    "max_entries",
-                    "max_key_bytes",
-                },
-            );
-            const target = findRegister(
-                registers,
-                try definition_core.json.requiredString(
-                    object,
-                    "register",
-                ),
-            ) orelse return error.UnknownRetainedRegister;
-            if (seen_targets[target]) {
-                return error.DuplicateRetainedActionTarget;
-            }
-            if (!containsIndex(required, @intCast(target))) {
-                return error.RetainedActionTargetNotRequired;
-            }
-            seen_targets[target] = true;
-            const source = try compileSource(
-                registers,
-                required,
-                try definition_core.json.requiredString(object, "input"),
-            );
-            const entry_bound = try definition_core.json.unsigned(
-                try definition_core.json.field(object, "max_entries"),
-            );
-            const key_bound = try definition_core.json.unsigned(
-                try definition_core.json.field(object, "max_key_bytes"),
-            );
-            if (entry_bound == 0 or entry_bound > max_records or
-                key_bound == 0 or key_bound > registers[target].max_bytes)
-            {
-                return error.RetainedUpsertBoundsExceeded;
-            }
-            var collection = try definition_core.json_pointer.compile(
-                allocator,
-                try definition_core.json.requiredString(object, "path"),
-            );
-            errdefer collection.deinit(allocator);
-            var key = try definition_core.json_pointer.compile(
-                allocator,
-                try definition_core.json.requiredString(object, "key"),
-            );
-            errdefer key.deinit(allocator);
-            var source_ref = try definition_core.json_pointer.compile(
-                allocator,
-                try definition_core.json.requiredString(object, "source_ref"),
-            );
-            errdefer source_ref.deinit(allocator);
-            var predecessor_refs =
-                try definition_core.json_pointer.compile(
-                    allocator,
-                    try definition_core.json.requiredString(
-                        object,
-                        "predecessor_refs",
-                    ),
-                );
-            errdefer predecessor_refs.deinit(allocator);
-            const stable = try compilePointerList(
-                allocator,
-                try definition_core.json.field(object, "stable"),
-                max_stable_pointers,
-            );
-            errdefer deinitPointers(allocator, stable);
-            actions[initialized] = .{ .upsert = .{
-                .target = @intCast(target),
-                .source = source,
-                .collection = collection,
-                .key = key,
-                .source_ref = source_ref,
-                .predecessor_refs = predecessor_refs,
-                .stable = stable,
-                .max_entries = entry_bound,
-                .max_key_bytes = key_bound,
-            } };
-        } else return error.UnsupportedRetainedAction;
+        actions[initialized] = try compileAction(
+            allocator,
+            registers,
+            sets,
+            required,
+            object,
+            max_records,
+            seen_targets,
+            seen_set_targets,
+        );
         initialized += 1;
     }
     return actions;
+}
+
+fn compileAction(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    required: []const u16,
+    object: std.json.ObjectMap,
+    max_records: usize,
+    seen_registers: []bool,
+    seen_sets: []bool,
+) !Action {
+    const operator = try definition_core.json.requiredString(object, "op");
+    if (std.mem.eql(u8, operator, "set")) {
+        return .{ .set = try compileSetAction(
+            allocator,
+            registers,
+            object,
+            seen_registers,
+        ) };
+    }
+    if (std.mem.eql(u8, operator, "clear")) {
+        return .{ .clear = try compileClearAction(
+            registers,
+            object,
+            seen_registers,
+        ) };
+    }
+    if (std.mem.eql(u8, operator, "insert")) {
+        return .{ .insert = try compileInsertAction(
+            allocator,
+            registers,
+            sets,
+            required,
+            object,
+            seen_sets,
+        ) };
+    }
+    if (std.mem.eql(u8, operator, "upsert")) {
+        return .{ .upsert = try compileUpsertAction(
+            allocator,
+            registers,
+            required,
+            object,
+            max_records,
+            seen_registers,
+        ) };
+    }
+    return error.UnsupportedRetainedAction;
+}
+
+fn compileSetAction(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    object: std.json.ObjectMap,
+    seen: []bool,
+) !SetAction {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "register", "input", "path" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "register", "input", "path" },
+    );
+    const target = findRegister(
+        registers,
+        try definition_core.json.requiredString(object, "register"),
+    ) orelse return error.UnknownRetainedRegister;
+    try claimActionTarget(seen, target);
+    const input = try definition_core.json.requiredString(object, "input");
+    const source: Source = if (std.mem.eql(u8, input, "event"))
+        .event
+    else
+        .{ .register = @intCast(findRegister(registers, input) orelse
+            return error.UnknownRetainedRegister) };
+    return .{
+        .target = @intCast(target),
+        .source = source,
+        .pointer = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.string(
+                try definition_core.json.field(object, "path"),
+            ),
+        ),
+    };
+}
+
+fn compileClearAction(
+    registers: []const Register,
+    object: std.json.ObjectMap,
+    seen: []bool,
+) !u16 {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "register" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "register" },
+    );
+    const target = findRegister(
+        registers,
+        try definition_core.json.requiredString(object, "register"),
+    ) orelse return error.UnknownRetainedRegister;
+    try claimActionTarget(seen, target);
+    return @intCast(target);
+}
+
+fn compileInsertAction(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    required: []const u16,
+    object: std.json.ObjectMap,
+    seen: []bool,
+) !InsertAction {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "set", "input", "path" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "set", "input", "path" },
+    );
+    const target = findSet(
+        sets,
+        try definition_core.json.requiredString(object, "set"),
+    ) orelse return error.UnknownRetainedSet;
+    try claimActionTarget(seen, target);
+    return .{
+        .target = @intCast(target),
+        .source = try compileSource(
+            registers,
+            required,
+            try definition_core.json.requiredString(object, "input"),
+        ),
+        .pointer = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.requiredString(object, "path"),
+        ),
+    };
+}
+
+fn claimActionTarget(seen: []bool, target: usize) !void {
+    if (seen[target]) return error.DuplicateRetainedActionTarget;
+    seen[target] = true;
+}
+
+const UpsertPointers = struct {
+    collection: definition_core.json_pointer.Pointer,
+    key: definition_core.json_pointer.Pointer,
+    source_ref: definition_core.json_pointer.Pointer,
+    predecessor_refs: definition_core.json_pointer.Pointer,
+    stable: []definition_core.json_pointer.Pointer,
+
+    fn deinit(self: *UpsertPointers, allocator: std.mem.Allocator) void {
+        self.collection.deinit(allocator);
+        self.key.deinit(allocator);
+        self.source_ref.deinit(allocator);
+        self.predecessor_refs.deinit(allocator);
+        deinitPointers(allocator, self.stable);
+        self.* = undefined;
+    }
+};
+
+fn compileUpsertAction(
+    allocator: std.mem.Allocator,
+    registers: []const Register,
+    required: []const u16,
+    object: std.json.ObjectMap,
+    max_records: usize,
+    seen: []bool,
+) !UpsertAction {
+    try requireUpsertFields(object);
+    const target = findRegister(
+        registers,
+        try definition_core.json.requiredString(object, "register"),
+    ) orelse return error.UnknownRetainedRegister;
+    if (seen[target]) return error.DuplicateRetainedActionTarget;
+    if (!containsIndex(required, @intCast(target))) {
+        return error.RetainedActionTargetNotRequired;
+    }
+    seen[target] = true;
+    const source = try compileSource(
+        registers,
+        required,
+        try definition_core.json.requiredString(object, "input"),
+    );
+    const entry_bound = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_entries"),
+    );
+    const key_bound = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_key_bytes"),
+    );
+    if (entry_bound == 0 or entry_bound > max_records or
+        key_bound == 0 or key_bound > registers[target].max_bytes)
+    {
+        return error.RetainedUpsertBoundsExceeded;
+    }
+    var pointers = try compileUpsertPointers(allocator, object);
+    errdefer pointers.deinit(allocator);
+    return .{
+        .target = @intCast(target),
+        .source = source,
+        .collection = pointers.collection,
+        .key = pointers.key,
+        .source_ref = pointers.source_ref,
+        .predecessor_refs = pointers.predecessor_refs,
+        .stable = pointers.stable,
+        .max_entries = entry_bound,
+        .max_key_bytes = key_bound,
+    };
+}
+
+fn requireUpsertFields(object: std.json.ObjectMap) !void {
+    const fields = &.{
+        "op",
+        "register",
+        "input",
+        "path",
+        "key",
+        "source_ref",
+        "predecessor_refs",
+        "stable",
+        "max_entries",
+        "max_key_bytes",
+    };
+    try definition_core.json.requireExactKeys(object, fields);
+    try definition_core.json.requireFields(object, fields);
+}
+
+fn compileUpsertPointers(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !UpsertPointers {
+    var collection = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(object, "path"),
+    );
+    errdefer collection.deinit(allocator);
+    var key = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(object, "key"),
+    );
+    errdefer key.deinit(allocator);
+    var source_ref = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(object, "source_ref"),
+    );
+    errdefer source_ref.deinit(allocator);
+    var predecessors = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(object, "predecessor_refs"),
+    );
+    errdefer predecessors.deinit(allocator);
+    const stable = try compilePointerList(
+        allocator,
+        try definition_core.json.field(object, "stable"),
+        max_stable_pointers,
+    );
+    errdefer deinitPointers(allocator, stable);
+    return .{
+        .collection = collection,
+        .key = key,
+        .source_ref = source_ref,
+        .predecessor_refs = predecessors,
+        .stable = stable,
+    };
 }
 
 fn compileSource(
@@ -1580,72 +1877,26 @@ fn applyActionsAtomically(
     event: std.json.Value,
     actions: []const Action,
 ) !void {
-    const prepared = try allocator.alloc(?OwnedValue, actions.len);
-    defer allocator.free(prepared);
-    @memset(prepared, null);
-    const prepared_keys = try allocator.alloc(?[]u8, actions.len);
-    defer allocator.free(prepared_keys);
-    @memset(prepared_keys, null);
-    errdefer for (prepared) |*value| {
-        if (value.*) |*owned| owned.deinit(allocator);
-    };
-    errdefer for (prepared_keys) |key| {
-        if (key) |owned| allocator.free(owned);
-    };
+    var prepared = try PreparedActions.init(allocator, actions.len);
+    defer prepared.deinit(allocator);
     for (actions, 0..) |action, index| switch (action) {
         .clear => {},
-        .set => |set| {
-            const root = try sourceValue(plan, state, set.source, event);
-            const value = definition_core.json_pointer.lookup(
-                root,
-                set.pointer,
-            ) orelse return error.RetainedActionValueMissing;
-            const canonical =
-                try definition_core.canonical_json.canonicalJsonAlloc(
-                    allocator,
-                    value,
-                );
-            errdefer allocator.free(canonical);
-            if (canonical.len > plan.registers[set.target].max_bytes) {
-                return error.RetainedRegisterBoundsExceeded;
-            }
-            var parsed = try std.json.parseFromSlice(
-                std.json.Value,
-                allocator,
-                canonical,
-                .{
-                    .allocate = .alloc_always,
-                    .duplicate_field_behavior = .@"error",
-                },
-            );
-            errdefer parsed.deinit();
-            prepared[index] = .{
-                .bytes = canonical,
-                .parsed = parsed,
-            };
-        },
-        .insert => |insert| {
-            const root = try sourceValue(plan, state, insert.source, event);
-            const value = definition_core.json_pointer.lookup(
-                root,
-                insert.pointer,
-            ) orelse return error.RetainedActionValueMissing;
-            const key = try definition_core.json.string(value);
-            const set_plan = plan.sets[insert.target];
-            const set_state = &setState(state, insert.target).value;
-            if (key.len > set_plan.max_key_bytes or
-                set_state.entries.count() >= set_plan.max_entries or
-                set_state.bytes > set_plan.max_bytes -| key.len)
-            {
-                return error.RetainedSetBoundsExceeded;
-            }
-            if (try set_state.contains(key)) {
-                return error.RetainedSetDuplicateKey;
-            }
-            prepared_keys[index] = try allocator.dupe(u8, key);
-        },
+        .set => |set| prepared.values[index] = try prepareSet(
+            allocator,
+            plan,
+            state,
+            event,
+            set,
+        ),
+        .insert => |insert| prepared.keys[index] = try prepareInsert(
+            allocator,
+            plan,
+            state,
+            event,
+            insert,
+        ),
         .upsert => |upsert| {
-            prepared[index] = try prepareUpsert(
+            prepared.values[index] = try prepareUpsert(
                 allocator,
                 plan,
                 state,
@@ -1654,6 +1905,104 @@ fn applyActionsAtomically(
             );
         },
     };
+    try reserveSetActions(allocator, state, actions);
+    commitActions(allocator, state, actions, &prepared);
+}
+
+const PreparedActions = struct {
+    values: []?OwnedValue,
+    keys: []?[]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        count: usize,
+    ) !PreparedActions {
+        const values = try allocator.alloc(?OwnedValue, count);
+        errdefer allocator.free(values);
+        @memset(values, null);
+        const keys = try allocator.alloc(?[]u8, count);
+        errdefer allocator.free(keys);
+        @memset(keys, null);
+        return .{ .values = values, .keys = keys };
+    }
+
+    fn deinit(self: *PreparedActions, allocator: std.mem.Allocator) void {
+        for (self.values) |*value| {
+            if (value.*) |*owned| owned.deinit(allocator);
+        }
+        for (self.keys) |key| {
+            if (key) |owned| allocator.free(owned);
+        }
+        allocator.free(self.values);
+        allocator.free(self.keys);
+        self.* = undefined;
+    }
+};
+
+fn prepareSet(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    event: std.json.Value,
+    action: SetAction,
+) !OwnedValue {
+    const root = try sourceValue(plan, state, action.source, event);
+    const value = definition_core.json_pointer.lookup(
+        root,
+        action.pointer,
+    ) orelse return error.RetainedActionValueMissing;
+    const canonical =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            value,
+        );
+    errdefer allocator.free(canonical);
+    if (canonical.len > plan.registers[action.target].max_bytes) {
+        return error.RetainedRegisterBoundsExceeded;
+    }
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        canonical,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    errdefer parsed.deinit();
+    return .{ .bytes = canonical, .parsed = parsed };
+}
+
+fn prepareInsert(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    event: std.json.Value,
+    action: InsertAction,
+) ![]u8 {
+    const root = try sourceValue(plan, state, action.source, event);
+    const value = definition_core.json_pointer.lookup(
+        root,
+        action.pointer,
+    ) orelse return error.RetainedActionValueMissing;
+    const key = try definition_core.json.string(value);
+    const set_plan = plan.sets[action.target];
+    const set_state = &setStateConst(state, action.target).value;
+    if (key.len > set_plan.max_key_bytes or
+        set_state.entries.count() >= set_plan.max_entries or
+        set_state.bytes > set_plan.max_bytes -| key.len)
+    {
+        return error.RetainedSetBoundsExceeded;
+    }
+    if (try set_state.contains(key)) return error.RetainedSetDuplicateKey;
+    return allocator.dupe(u8, key);
+}
+
+fn reserveSetActions(
+    allocator: std.mem.Allocator,
+    state: *State,
+    actions: []const Action,
+) !void {
     for (actions) |action| switch (action) {
         .insert => |insert| {
             try setState(state, insert.target).value.entries.ensureUnusedCapacity(
@@ -1663,6 +2012,14 @@ fn applyActionsAtomically(
         },
         .set, .clear, .upsert => {},
     };
+}
+
+fn commitActions(
+    allocator: std.mem.Allocator,
+    state: *State,
+    actions: []const Action,
+    prepared: *PreparedActions,
+) void {
     for (actions, 0..) |action, index| {
         switch (action) {
             .set => |set| {
@@ -1670,8 +2027,8 @@ fn applyActionsAtomically(
                 if (target.value) |*prior| {
                     prior.deinit(allocator);
                 }
-                target.value = prepared[index];
-                prepared[index] = null;
+                target.value = prepared.values[index];
+                prepared.values[index] = null;
             },
             .clear => |target| {
                 const target_state = registerState(state, target);
@@ -1680,15 +2037,15 @@ fn applyActionsAtomically(
             },
             .insert => |insert| {
                 setState(state, insert.target).value.insertAssumeCapacity(
-                    prepared_keys[index].?,
+                    prepared.keys[index].?,
                 );
-                prepared_keys[index] = null;
+                prepared.keys[index] = null;
             },
             .upsert => |upsert| {
                 const target = registerState(state, upsert.target);
                 if (target.value) |*prior| prior.deinit(allocator);
-                target.value = prepared[index];
-                prepared[index] = null;
+                target.value = prepared.values[index];
+                prepared.values[index] = null;
             },
         }
     }
@@ -1714,25 +2071,82 @@ fn prepareUpsert(
     event: std.json.Value,
     action: UpsertAction,
 ) !OwnedValue {
+    const existing_values = try resolveExistingUpsertValues(state, action);
+    const root = try sourceValue(plan, state, action.source, event);
+    const inputs = try resolveUpsertInputs(root, action, existing_values);
+    var predecessors: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
+    defer predecessors.deinit(allocator);
+    try indexPredecessors(
+        allocator,
+        &predecessors,
+        inputs.predecessors,
+        action.max_key_bytes,
+    );
+    var existing = try ExistingUpsertIndex.init(
+        allocator,
+        inputs.existing,
+        action,
+    );
+    defer existing.deinit(allocator);
+    var source_keys: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
+    defer source_keys.deinit(allocator);
+    var new_entries: std.ArrayList(NewUpsertEntry) = .empty;
+    defer new_entries.deinit(allocator);
+    try mergeIncomingEntries(
+        allocator,
+        action,
+        inputs.incoming,
+        &predecessors,
+        &existing,
+        &source_keys,
+        &new_entries,
+    );
+    return materializeUpsert(
+        allocator,
+        plan.registers[action.target].max_bytes,
+        inputs.source_ref,
+        existing.entries,
+        new_entries.items,
+    );
+}
+
+fn resolveExistingUpsertValues(
+    state: *const State,
+    action: UpsertAction,
+) ![]const std.json.Value {
     const current = registerStateConst(state, action.target).value orelse
         return error.RetainedUpsertTargetMissing;
-    const existing_values = switch (current.parsed.value) {
-        .array => |array| array.items,
-        else => return error.RetainedUpsertStateInvalid,
-    };
-    if (existing_values.len > action.max_entries) {
+    const existing = try upsertArray(
+        current.parsed.value,
+        error.RetainedUpsertStateInvalid,
+    );
+    if (existing.len > action.max_entries) {
         return error.RetainedUpsertBoundsExceeded;
     }
+    return existing;
+}
 
-    const root = try sourceValue(plan, state, action.source, event);
-    const incoming_values = switch (definition_core.json_pointer.lookup(
+const UpsertInputs = struct {
+    existing: []const std.json.Value,
+    incoming: []const std.json.Value,
+    predecessors: []const std.json.Value,
+    source_ref: []const u8,
+};
+
+fn resolveUpsertInputs(
+    root: std.json.Value,
+    action: UpsertAction,
+    existing: []const std.json.Value,
+) !UpsertInputs {
+    const incoming_value = definition_core.json_pointer.lookup(
         root,
         action.collection,
-    ) orelse return error.RetainedUpsertSourceMissing) {
-        .array => |array| array.items,
-        else => return error.RetainedUpsertSourceInvalid,
-    };
-    if (incoming_values.len > action.max_entries) {
+    ) orelse return error.RetainedUpsertSourceMissing;
+    const incoming = try upsertArray(
+        incoming_value,
+        error.RetainedUpsertSourceInvalid,
+    );
+    if (incoming.len > action.max_entries) {
         return error.RetainedUpsertBoundsExceeded;
     }
     const source_ref = try boundedUpsertString(
@@ -1742,192 +2156,259 @@ fn prepareUpsert(
         ) orelse return error.RetainedUpsertSourceMissing,
         action.max_key_bytes,
     );
-    const predecessor_values = switch (definition_core.json_pointer.lookup(
+    const predecessor_value = definition_core.json_pointer.lookup(
         root,
         action.predecessor_refs,
-    ) orelse return error.RetainedUpsertSourceMissing) {
-        .array => |array| array.items,
-        else => return error.RetainedUpsertSourceInvalid,
-    };
-    if (predecessor_values.len > action.max_entries) {
+    ) orelse return error.RetainedUpsertSourceMissing;
+    const predecessors = try upsertArray(
+        predecessor_value,
+        error.RetainedUpsertSourceInvalid,
+    );
+    if (predecessors.len > action.max_entries) {
         return error.RetainedUpsertBoundsExceeded;
     }
-    var predecessor_index: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
-    defer predecessor_index.deinit(allocator);
-    for (predecessor_values) |predecessor| {
-        const predecessor_ref = try boundedUpsertString(
-            predecessor,
-            action.max_key_bytes,
-        );
-        const result = try predecessor_index.getOrPut(
+    return .{
+        .existing = existing,
+        .incoming = incoming,
+        .predecessors = predecessors,
+        .source_ref = source_ref,
+    };
+}
+
+fn upsertArray(
+    value: std.json.Value,
+    failure: anyerror,
+) ![]const std.json.Value {
+    return switch (value) {
+        .array => |array| array.items,
+        else => failure,
+    };
+}
+
+fn indexPredecessors(
+    allocator: std.mem.Allocator,
+    index: *std.AutoHashMapUnmanaged([32]u8, []const u8),
+    values: []const std.json.Value,
+    max_key_bytes: usize,
+) !void {
+    for (values) |value| {
+        const reference = try boundedUpsertString(value, max_key_bytes);
+        const result = try index.getOrPut(
             allocator,
-            retainedKeyDigest(predecessor_ref),
+            retainedKeyDigest(reference),
         );
         if (result.found_existing and
-            !std.mem.eql(u8, result.value_ptr.*, predecessor_ref))
+            !std.mem.eql(u8, result.value_ptr.*, reference))
         {
             return error.RetainedUpsertDigestCollision;
         }
-        result.value_ptr.* = predecessor_ref;
+        result.value_ptr.* = reference;
     }
+}
 
-    const existing = try allocator.alloc(
-        ExistingUpsertEntry,
-        existing_values.len,
-    );
-    defer allocator.free(existing);
-    var existing_index: std.AutoHashMapUnmanaged([32]u8, usize) = .empty;
-    defer existing_index.deinit(allocator);
-    for (existing_values, 0..) |raw_entry, index| {
-        const object = definition_core.json.object(raw_entry) catch
-            return error.RetainedUpsertStateInvalid;
-        definition_core.json.requireExactKeys(
-            object,
-            &.{ "key", "occurrences", "source", "value" },
-        ) catch return error.RetainedUpsertStateInvalid;
-        definition_core.json.requireFields(
-            object,
-            &.{ "key", "occurrences", "source", "value" },
-        ) catch return error.RetainedUpsertStateInvalid;
-        const key = boundedUpsertString(
-            object.get("key").?,
-            action.max_key_bytes,
-        ) catch return error.RetainedUpsertStateInvalid;
-        const occurrences = switch (object.get("occurrences").?) {
-            .integer => |number| number,
-            else => return error.RetainedUpsertStateInvalid,
-        };
-        if (occurrences <= 0) return error.RetainedUpsertStateInvalid;
-        const source = boundedUpsertString(
-            object.get("source").?,
-            action.max_key_bytes,
-        ) catch return error.RetainedUpsertStateInvalid;
-        const retained_value = object.get("value").?;
-        const retained_key = definition_core.json_pointer.lookup(
-            retained_value,
-            action.key,
-        ) orelse return error.RetainedUpsertStateInvalid;
-        const retained_key_string = boundedUpsertString(
-            retained_key,
-            action.max_key_bytes,
-        ) catch return error.RetainedUpsertStateInvalid;
-        if (!std.mem.eql(u8, key, retained_key_string)) {
-            return error.RetainedUpsertStateInvalid;
-        }
-        existing[index] = .{
-            .key = key,
-            .occurrences = occurrences,
-            .source = source,
-            .value = retained_value,
-        };
-        const digest = retainedKeyDigest(key);
-        const result = try existing_index.getOrPut(allocator, digest);
-        if (result.found_existing) {
-            if (!std.mem.eql(u8, existing[result.value_ptr.*].key, key)) {
-                return error.RetainedUpsertDigestCollision;
+const ExistingUpsertIndex = struct {
+    entries: []ExistingUpsertEntry,
+    positions: std.AutoHashMapUnmanaged([32]u8, usize),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        values: []const std.json.Value,
+        action: UpsertAction,
+    ) !ExistingUpsertIndex {
+        const entries = try allocator.alloc(ExistingUpsertEntry, values.len);
+        errdefer allocator.free(entries);
+        var positions: std.AutoHashMapUnmanaged([32]u8, usize) = .empty;
+        errdefer positions.deinit(allocator);
+        for (values, 0..) |value, index| {
+            entries[index] = try parseExistingUpsertEntry(value, action);
+            const result = try positions.getOrPut(
+                allocator,
+                retainedKeyDigest(entries[index].key),
+            );
+            if (result.found_existing) {
+                if (!std.mem.eql(
+                    u8,
+                    entries[result.value_ptr.*].key,
+                    entries[index].key,
+                )) return error.RetainedUpsertDigestCollision;
+                return error.RetainedUpsertStateInvalid;
             }
-            return error.RetainedUpsertStateInvalid;
+            result.value_ptr.* = index;
         }
-        result.value_ptr.* = index;
+        return .{ .entries = entries, .positions = positions };
     }
 
-    var source_keys: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
-    defer source_keys.deinit(allocator);
-    var new_entries: std.ArrayList(NewUpsertEntry) = .empty;
-    defer new_entries.deinit(allocator);
-    for (incoming_values) |incoming| {
-        const raw_key = definition_core.json_pointer.lookup(
-            incoming,
-            action.key,
-        ) orelse return error.RetainedUpsertKeyMissing;
-        const key = try boundedUpsertString(
-            raw_key,
-            action.max_key_bytes,
+    fn deinit(
+        self: *ExistingUpsertIndex,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.entries);
+        self.positions.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn parseExistingUpsertEntry(
+    value: std.json.Value,
+    action: UpsertAction,
+) !ExistingUpsertEntry {
+    const object = definition_core.json.object(value) catch
+        return error.RetainedUpsertStateInvalid;
+    definition_core.json.requireExactKeys(
+        object,
+        &.{ "key", "occurrences", "source", "value" },
+    ) catch return error.RetainedUpsertStateInvalid;
+    definition_core.json.requireFields(
+        object,
+        &.{ "key", "occurrences", "source", "value" },
+    ) catch return error.RetainedUpsertStateInvalid;
+    const key = boundedUpsertString(
+        object.get("key").?,
+        action.max_key_bytes,
+    ) catch return error.RetainedUpsertStateInvalid;
+    const occurrences = switch (object.get("occurrences").?) {
+        .integer => |number| number,
+        else => return error.RetainedUpsertStateInvalid,
+    };
+    if (occurrences <= 0) return error.RetainedUpsertStateInvalid;
+    const source = boundedUpsertString(
+        object.get("source").?,
+        action.max_key_bytes,
+    ) catch return error.RetainedUpsertStateInvalid;
+    const retained_value = object.get("value").?;
+    const retained_key = definition_core.json_pointer.lookup(
+        retained_value,
+        action.key,
+    ) orelse return error.RetainedUpsertStateInvalid;
+    const selected = boundedUpsertString(
+        retained_key,
+        action.max_key_bytes,
+    ) catch return error.RetainedUpsertStateInvalid;
+    if (!std.mem.eql(u8, key, selected)) {
+        return error.RetainedUpsertStateInvalid;
+    }
+    return .{
+        .key = key,
+        .occurrences = occurrences,
+        .source = source,
+        .value = retained_value,
+    };
+}
+
+fn mergeIncomingEntries(
+    allocator: std.mem.Allocator,
+    action: UpsertAction,
+    incoming: []const std.json.Value,
+    predecessors: *const std.AutoHashMapUnmanaged([32]u8, []const u8),
+    existing: *ExistingUpsertIndex,
+    source_keys: *std.AutoHashMapUnmanaged([32]u8, []const u8),
+    new_entries: *std.ArrayList(NewUpsertEntry),
+) !void {
+    for (incoming) |value| {
+        try mergeIncomingEntry(
+            allocator,
+            action,
+            value,
+            predecessors,
+            existing,
+            source_keys,
+            new_entries,
         );
-        const digest = retainedKeyDigest(key);
-        const source_result = try source_keys.getOrPut(allocator, digest);
-        if (source_result.found_existing) {
-            if (!std.mem.eql(u8, source_result.value_ptr.*, key)) {
-                return error.RetainedUpsertDigestCollision;
-            }
-            return error.RetainedUpsertDuplicateKey;
-        }
-        source_result.value_ptr.* = key;
+    }
+}
 
-        if (existing_index.get(digest)) |existing_position| {
-            const prior = &existing[existing_position];
-            if (!std.mem.eql(u8, prior.key, key)) {
-                return error.RetainedUpsertDigestCollision;
-            }
-            const predecessor = predecessor_index.get(
-                retainedKeyDigest(prior.source),
-            ) orelse return error.RetainedUpsertPredecessorMissing;
-            if (!std.mem.eql(u8, predecessor, prior.source)) {
-                return error.RetainedUpsertDigestCollision;
-            }
-            for (action.stable) |pointer| {
-                const prior_value = definition_core.json_pointer.lookup(
-                    prior.value,
-                    pointer,
-                ) orelse return error.RetainedUpsertStableValueMissing;
-                const next_value = definition_core.json_pointer.lookup(
-                    incoming,
-                    pointer,
-                ) orelse return error.RetainedUpsertStableValueMissing;
-                if (!validation.valuesEqual(prior_value, next_value)) {
-                    return error.RetainedUpsertStableValueChanged;
-                }
-            }
-            if (prior.occurrences == std.math.maxInt(i64)) {
-                return error.RetainedUpsertOccurrenceOverflow;
-            }
-            prior.replacement = incoming;
-        } else {
-            if (existing.len + new_entries.items.len >= action.max_entries) {
-                return error.RetainedUpsertBoundsExceeded;
-            }
-            try new_entries.append(allocator, .{
-                .key = key,
-                .value = incoming,
-            });
+fn mergeIncomingEntry(
+    allocator: std.mem.Allocator,
+    action: UpsertAction,
+    incoming: std.json.Value,
+    predecessors: *const std.AutoHashMapUnmanaged([32]u8, []const u8),
+    existing: *ExistingUpsertIndex,
+    source_keys: *std.AutoHashMapUnmanaged([32]u8, []const u8),
+    new_entries: *std.ArrayList(NewUpsertEntry),
+) !void {
+    const raw_key = definition_core.json_pointer.lookup(
+        incoming,
+        action.key,
+    ) orelse return error.RetainedUpsertKeyMissing;
+    const key = try boundedUpsertString(raw_key, action.max_key_bytes);
+    const digest = retainedKeyDigest(key);
+    const result = try source_keys.getOrPut(allocator, digest);
+    if (result.found_existing) {
+        if (!std.mem.eql(u8, result.value_ptr.*, key)) {
+            return error.RetainedUpsertDigestCollision;
+        }
+        return error.RetainedUpsertDuplicateKey;
+    }
+    result.value_ptr.* = key;
+    if (existing.positions.get(digest)) |position| {
+        return replaceExistingUpsert(
+            action,
+            incoming,
+            key,
+            predecessors,
+            &existing.entries[position],
+        );
+    }
+    if (existing.entries.len + new_entries.items.len >= action.max_entries) {
+        return error.RetainedUpsertBoundsExceeded;
+    }
+    try new_entries.append(allocator, .{ .key = key, .value = incoming });
+}
+
+fn replaceExistingUpsert(
+    action: UpsertAction,
+    incoming: std.json.Value,
+    key: []const u8,
+    predecessors: *const std.AutoHashMapUnmanaged([32]u8, []const u8),
+    prior: *ExistingUpsertEntry,
+) !void {
+    if (!std.mem.eql(u8, prior.key, key)) {
+        return error.RetainedUpsertDigestCollision;
+    }
+    const predecessor = predecessors.get(
+        retainedKeyDigest(prior.source),
+    ) orelse return error.RetainedUpsertPredecessorMissing;
+    if (!std.mem.eql(u8, predecessor, prior.source)) {
+        return error.RetainedUpsertDigestCollision;
+    }
+    for (action.stable) |pointer| {
+        const old = definition_core.json_pointer.lookup(
+            prior.value,
+            pointer,
+        ) orelse return error.RetainedUpsertStableValueMissing;
+        const new = definition_core.json_pointer.lookup(
+            incoming,
+            pointer,
+        ) orelse return error.RetainedUpsertStableValueMissing;
+        if (!validation.valuesEqual(old, new)) {
+            return error.RetainedUpsertStableValueChanged;
         }
     }
+    if (prior.occurrences == std.math.maxInt(i64)) {
+        return error.RetainedUpsertOccurrenceOverflow;
+    }
+    prior.replacement = incoming;
+}
 
+fn materializeUpsert(
+    allocator: std.mem.Allocator,
+    max_bytes: usize,
+    source_ref: []const u8,
+    existing: []const ExistingUpsertEntry,
+    new_entries: []const NewUpsertEntry,
+) !OwnedValue {
     var output = std.Io.Writer.Allocating.init(allocator);
     errdefer output.deinit();
-    try output.writer.writeByte('[');
-    var emitted: usize = 0;
-    for (existing) |entry| {
-        if (emitted != 0) try output.writer.writeByte(',');
-        try writeUpsertEntry(
-            allocator,
-            &output.writer,
-            entry.key,
-            if (entry.replacement != null)
-                entry.occurrences + 1
-            else
-                entry.occurrences,
-            if (entry.replacement != null) source_ref else entry.source,
-            entry.replacement orelse entry.value,
-        );
-        emitted += 1;
-    }
-    for (new_entries.items) |entry| {
-        if (emitted != 0) try output.writer.writeByte(',');
-        try writeUpsertEntry(
-            allocator,
-            &output.writer,
-            entry.key,
-            1,
-            source_ref,
-            entry.value,
-        );
-        emitted += 1;
-    }
-    try output.writer.writeByte(']');
+    try writeUpsertEntries(
+        allocator,
+        &output.writer,
+        source_ref,
+        existing,
+        new_entries,
+    );
     const canonical = try output.toOwnedSlice();
     errdefer allocator.free(canonical);
-    if (canonical.len > plan.registers[action.target].max_bytes) {
+    if (canonical.len > max_bytes) {
         return error.RetainedRegisterBoundsExceeded;
     }
     var parsed = try std.json.parseFromSlice(
@@ -1944,6 +2425,45 @@ fn prepareUpsert(
         .bytes = canonical,
         .parsed = parsed,
     };
+}
+
+fn writeUpsertEntries(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    source_ref: []const u8,
+    existing: []const ExistingUpsertEntry,
+    new_entries: []const NewUpsertEntry,
+) !void {
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (existing) |entry| {
+        if (emitted != 0) try writer.writeByte(',');
+        try writeUpsertEntry(
+            allocator,
+            writer,
+            entry.key,
+            if (entry.replacement != null)
+                entry.occurrences + 1
+            else
+                entry.occurrences,
+            if (entry.replacement != null) source_ref else entry.source,
+            entry.replacement orelse entry.value,
+        );
+        emitted += 1;
+    }
+    for (new_entries) |entry| {
+        if (emitted != 0) try writer.writeByte(',');
+        try writeUpsertEntry(
+            allocator,
+            writer,
+            entry.key,
+            1,
+            source_ref,
+            entry.value,
+        );
+        emitted += 1;
+    }
+    try writer.writeByte(']');
 }
 
 fn boundedUpsertString(
@@ -2076,6 +2596,32 @@ fn ensureState(
         }
         missing_sets.deinit(allocator);
     }
+    try mapStateRegisters(
+        allocator,
+        plan,
+        state,
+        register_map,
+        &missing_registers,
+    );
+    try mapStateSets(allocator, plan, state, set_map, &missing_sets);
+    try installStateLayout(
+        allocator,
+        plan,
+        state,
+        register_map,
+        set_map,
+        &missing_registers,
+        &missing_sets,
+    );
+}
+
+fn mapStateRegisters(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    register_map: []u16,
+    missing: *std.ArrayList([]u8),
+) !void {
     for (plan.registers, 0..) |register, index| {
         if (findNamedRegister(state.registers.items, register.name)) |found| {
             if (state.registers.items[found].value) |owned| {
@@ -2089,18 +2635,25 @@ fn ensureState(
         if (findNamedSet(state.sets.items, register.name) != null) {
             return error.RetainedStateKindMismatch;
         }
-        if (state.registers.items.len + missing_registers.items.len >=
-            max_registers)
-        {
+        if (state.registers.items.len + missing.items.len >= max_registers) {
             return error.RetainedStateCarrierBoundsExceeded;
         }
         register_map[index] = @intCast(
-            state.registers.items.len + missing_registers.items.len,
+            state.registers.items.len + missing.items.len,
         );
         const owned_name = try allocator.dupe(u8, register.name);
         errdefer allocator.free(owned_name);
-        try missing_registers.append(allocator, owned_name);
+        try missing.append(allocator, owned_name);
     }
+}
+
+fn mapStateSets(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *const State,
+    set_map: []u16,
+    missing: *std.ArrayList([]u8),
+) !void {
     for (plan.sets, 0..) |set, index| {
         if (findNamedSet(state.sets.items, set.name)) |found| {
             const existing = &state.sets.items[found].value;
@@ -2121,16 +2674,27 @@ fn ensureState(
         if (findNamedRegister(state.registers.items, set.name) != null) {
             return error.RetainedStateKindMismatch;
         }
-        if (state.sets.items.len + missing_sets.items.len >= max_sets) {
+        if (state.sets.items.len + missing.items.len >= max_sets) {
             return error.RetainedStateCarrierBoundsExceeded;
         }
         set_map[index] = @intCast(
-            state.sets.items.len + missing_sets.items.len,
+            state.sets.items.len + missing.items.len,
         );
         const owned_name = try allocator.dupe(u8, set.name);
         errdefer allocator.free(owned_name);
-        try missing_sets.append(allocator, owned_name);
+        try missing.append(allocator, owned_name);
     }
+}
+
+fn installStateLayout(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+    register_map: []u16,
+    set_map: []u16,
+    missing_registers: *std.ArrayList([]u8),
+    missing_sets: *std.ArrayList([]u8),
+) !void {
     try state.registers.ensureUnusedCapacity(
         allocator,
         missing_registers.items.len,
@@ -2675,52 +3239,535 @@ fn applyUpsertForAllocationFailure(
     }
 }
 
-test "retained reducer cache binds event bounds and actions commit atomically" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "definition.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-state","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["reducer"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096},{"name":"shadow","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]},{"on":"updated","requires":["current"],"forbids":[],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"},{"op":"set","register":"shadow","input":"event","path":"/body/missing"}]}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":8192,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "definition.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "definition.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    const reducer_rule = for (definition_plan.rules) |rule| {
+const TestPlan = struct {
+    closure: definition_core.Closure,
+    artifact: definition.Plan,
+    reducer: Plan,
+    cache_payload: []u8,
+
+    fn init(source: []const u8) !TestPlan {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "definition.json",
+            .data = source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            &tmp.dir,
+            "definition.json",
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        var artifact = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "definition.json",
+        );
+        errdefer artifact.deinit(std.testing.allocator);
+        const reducer_rule = findTestReducerRule(&artifact);
+        var compiled = try compile(
+            std.testing.allocator,
+            &artifact,
+            reducer_rule,
+            4096,
+        );
+        defer compiled.deinit(std.testing.allocator);
+        var encoder = definition_core.cache.Encoder.init(
+            std.testing.allocator,
+            256 * 1024,
+        );
+        defer encoder.deinit();
+        try encodeCache(&compiled, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        errdefer std.testing.allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var reducer = try decodeCache(std.testing.allocator, &decoder);
+        errdefer reducer.deinit(std.testing.allocator);
+        try decoder.finish();
+        try validatePlan(&reducer, &artifact, 4096);
+        return .{
+            .closure = closure,
+            .artifact = artifact,
+            .reducer = reducer,
+            .cache_payload = payload,
+        };
+    }
+
+    fn deinit(self: *TestPlan) void {
+        std.testing.allocator.free(self.cache_payload);
+        self.reducer.deinit(std.testing.allocator);
+        self.artifact.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+
+    fn rule(self: *const TestPlan) definition.Rule {
+        return findTestReducerRule(&self.artifact);
+    }
+};
+
+fn findTestReducerRule(plan: *const definition.Plan) definition.Rule {
+    return for (plan.rules) |rule| {
         if (rule.operator == .reducer) break rule;
-    } else return error.TestReducerRuleMissing;
-    var plan = try compile(
+    } else unreachable;
+}
+
+fn parseTestEvent(
+    source: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(
+        std.json.Value,
         std.testing.allocator,
-        &definition_plan,
-        reducer_rule,
-        4096,
+        source,
+        .{ .allocate = .alloc_always },
     );
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
+}
+
+fn applyTestEvent(
+    plan: *const Plan,
+    state: *State,
+    source: []const u8,
+) !void {
+    var event = try parseTestEvent(source);
+    defer event.deinit();
+    try apply(std.testing.allocator, plan, state, event.value);
+}
+
+fn expectTestEventError(
+    expected: anyerror,
+    plan: *const Plan,
+    state: *State,
+    source: []const u8,
+) !void {
+    var event = try parseTestEvent(source);
+    defer event.deinit();
+    try std.testing.expectError(
+        expected,
+        apply(std.testing.allocator, plan, state, event.value),
+    );
+}
+
+fn expectRetainedStatus(
+    plan: *const Plan,
+    state: *const State,
+    expected: []const u8,
+) !void {
+    var pointer = try definition_core.json_pointer.compile(
         std.testing.allocator,
-        256 * 1024,
+        "/status",
     );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validatePlan(&cached, &definition_plan, 4096);
-    for (cached.admissions[0].validation_plan.inputs) |*input| {
+    defer pointer.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        expected,
+        definition_core.json_pointer.lookup(
+            state.get(plan, "current").?,
+            pointer,
+        ).?.string,
+    );
+}
+
+const retained_test_prefix =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/retained-test",
+    \\  "owner":"example",
+    \\  "requires":{
+    \\    "abi":"ledger-artifact-abi/v1",
+    \\    "operators":["reducer"]
+    \\  },
+    \\  "parameters":{},
+    \\  "inputs":{"event":{"codec":"json","max_bytes":4096}},
+    \\  "canonicalization":{},
+    \\  "shape":{},
+    \\  "constraints":[
+;
+
+const retained_test_suffix =
+    \\  ],
+    \\  "identity":{},
+    \\  "storage":{"kind":"pure"},
+    \\  "operations":{},
+    \\  "projections":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":4096,
+    \\    "max_store_bytes":8192,
+    \\    "max_records":4,
+    \\    "max_output_bytes":4096,
+    \\    "max_diagnostics":8,
+    \\    "max_reducer_states":4
+    \\  }
+    \\}
+;
+
+const retained_upsert_suffix =
+    \\  ],
+    \\  "identity":{},
+    \\  "storage":{"kind":"pure"},
+    \\  "operations":{},
+    \\  "projections":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":4096,
+    \\    "max_store_bytes":4096,
+    \\    "max_records":3,
+    \\    "max_output_bytes":4096,
+    \\    "max_diagnostics":8,
+    \\    "max_reducer_states":1
+    \\  }
+    \\}
+;
+
+const retained_state_definition =
+    retained_test_prefix ++
+    \\    {
+    \\      "op":"reducer",
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[
+    \\        {"name":"current","max_bytes":4096},
+    \\        {"name":"shadow","max_bytes":4096}
+    \\      ],
+    \\      "admissions":[
+    \\        {
+    \\          "on":"created",
+    \\          "requires":[],
+    \\          "forbids":["current"],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            }
+    \\          ]
+    \\        },
+    \\        {
+    \\          "on":"updated",
+    \\          "requires":["current"],
+    \\          "forbids":[],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            },
+    \\            {
+    \\              "op":"set",
+    \\              "register":"shadow",
+    \\              "input":"event",
+    \\              "path":"/body/missing"
+    \\            }
+    \\          ]
+    \\        }
+    \\      ]
+    \\    }
+    ++ retained_test_suffix;
+
+const retained_sets_definition =
+    retained_test_prefix ++
+    \\    {
+    \\      "op":"reducer",
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"current","max_bytes":4096}],
+    \\      "sets":[
+    \\        {
+    \\          "name":"used_ids",
+    \\          "max_entries":2,
+    \\          "max_key_bytes":8,
+    \\          "max_bytes":16
+    \\        }
+    \\      ],
+    \\      "admissions":[
+    \\        {
+    \\          "on":"created",
+    \\          "requires":[],
+    \\          "forbids":["current"],
+    \\          "set_guards":[
+    \\            {
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id",
+    \\              "presence":"absent"
+    \\            }
+    \\          ],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            },
+    \\            {
+    \\              "op":"insert",
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id"
+    \\            }
+    \\          ]
+    \\        },
+    \\        {
+    \\          "on":"updated",
+    \\          "requires":["current"],
+    \\          "forbids":[],
+    \\          "set_guards":[
+    \\            {
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id",
+    \\              "presence":"absent"
+    \\            },
+    \\            {
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/predecessors",
+    \\              "presence":"present",
+    \\              "mode":"each"
+    \\            }
+    \\          ],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            },
+    \\            {
+    \\              "op":"insert",
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id"
+    \\            }
+    \\          ]
+    \\        }
+    \\      ]
+    \\    }
+    ++ retained_test_suffix;
+
+const retained_upsert_definition =
+    retained_test_prefix ++
+    \\    {
+    \\      "op":"reducer",
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"items","max_bytes":4096}],
+    \\      "admissions":[
+    \\        {
+    \\          "on":"created",
+    \\          "requires":[],
+    \\          "forbids":["items"],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"items",
+    \\              "input":"event",
+    \\              "path":"/body/items"
+    \\            }
+    \\          ]
+    \\        },
+    \\        {
+    \\          "on":"upserted",
+    \\          "requires":["items"],
+    \\          "forbids":[],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"upsert",
+    \\              "register":"items",
+    \\              "input":"event",
+    \\              "path":"/body/items",
+    \\              "key":"/id",
+    \\              "source_ref":"/body/set_id",
+    \\              "predecessor_refs":"/body/predecessors",
+    \\              "stable":["/owner"],
+    \\              "max_entries":3,
+    \\              "max_key_bytes":32
+    \\            }
+    \\          ]
+    \\        }
+    \\      ]
+    \\    }
+    ++ retained_upsert_suffix;
+
+const retained_evolution_first =
+    retained_test_prefix ++
+    \\    {
+    \\      "op":"reducer",
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"current","max_bytes":4096}],
+    \\      "admissions":[
+    \\        {
+    \\          "on":"created",
+    \\          "requires":[],
+    \\          "forbids":["current"],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            }
+    \\          ]
+    \\        }
+    \\      ]
+    \\    }
+    ++ retained_test_suffix;
+
+const retained_evolution_second =
+    retained_test_prefix ++
+    \\    {
+    \\      "op":"reducer",
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"current","max_bytes":4096}],
+    \\      "sets":[
+    \\        {
+    \\          "name":"used_ids",
+    \\          "max_entries":4,
+    \\          "max_key_bytes":16,
+    \\          "max_bytes":64
+    \\        }
+    \\      ],
+    \\      "admissions":[
+    \\        {
+    \\          "on":"updated",
+    \\          "requires":["current"],
+    \\          "forbids":[],
+    \\          "set_guards":[
+    \\            {
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id",
+    \\              "presence":"absent"
+    \\            }
+    \\          ],
+    \\          "rules":[],
+    \\          "actions":[
+    \\            {
+    \\              "op":"set",
+    \\              "register":"current",
+    \\              "input":"event",
+    \\              "path":"/body"
+    \\            },
+    \\            {
+    \\              "op":"insert",
+    \\              "set":"used_ids",
+    \\              "input":"event",
+    \\              "path":"/body/id"
+    \\            }
+    \\          ]
+    \\        }
+    \\      ]
+    \\    }
+    ++ retained_test_suffix;
+
+const upsert_created_event =
+    "{\"kind\":\"created\",\"body\":{\"items\":[]}}";
+
+const upsert_first_event =
+    "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-1\"," ++
+    "\"predecessors\":[],\"items\":[{\"id\":\"alpha\"," ++
+    "\"owner\":\"owner-a\",\"status\":\"open\"}]}}";
+
+const upsert_second_event =
+    "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-2\"," ++
+    "\"predecessors\":[\"set-1\"],\"items\":[{\"id\":\"alpha\"," ++
+    "\"owner\":\"owner-a\",\"status\":\"closed\"},{\"id\":\"beta\"," ++
+    "\"owner\":\"owner-b\",\"status\":\"open\"}]}}";
+
+const expected_upsert_state =
+    "[{\"key\":\"alpha\",\"occurrences\":2,\"source\":\"set-2\"," ++
+    "\"value\":{\"id\":\"alpha\",\"owner\":\"owner-a\"," ++
+    "\"status\":\"closed\"}},{\"key\":\"beta\",\"occurrences\":1," ++
+    "\"source\":\"set-2\",\"value\":{\"id\":\"beta\"," ++
+    "\"owner\":\"owner-b\",\"status\":\"open\"}}]";
+
+fn expectUpsertFailure(
+    expected: anyerror,
+    plan: *const Plan,
+    state: *State,
+    item_index: usize,
+    prior: []const u8,
+    source: []const u8,
+) !void {
+    try expectTestEventError(expected, plan, state, source);
+    try std.testing.expectEqualStrings(
+        prior,
+        registerStateConst(state, item_index).value.?.bytes,
+    );
+}
+
+fn expectInvalidUpserts(
+    plan: *const Plan,
+    state: *State,
+    item_index: usize,
+    prior: []const u8,
+) !void {
+    try expectUpsertFailure(
+        error.RetainedUpsertStableValueChanged,
+        plan,
+        state,
+        item_index,
+        prior,
+        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\"," ++
+            "\"predecessors\":[\"set-2\"],\"items\":[{\"id\":\"alpha\"," ++
+            "\"owner\":\"owner-c\",\"status\":\"wrong\"}]}}",
+    );
+    try expectUpsertFailure(
+        error.RetainedUpsertPredecessorMissing,
+        plan,
+        state,
+        item_index,
+        prior,
+        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\"," ++
+            "\"predecessors\":[\"set-1\"],\"items\":[{\"id\":\"alpha\"," ++
+            "\"owner\":\"owner-a\",\"status\":\"wrong\"}]}}",
+    );
+    try expectDuplicateUpsertFailures(plan, state, item_index, prior);
+}
+
+fn expectDuplicateUpsertFailures(
+    plan: *const Plan,
+    state: *State,
+    item_index: usize,
+    prior: []const u8,
+) !void {
+    try expectUpsertFailure(
+        error.RetainedUpsertDuplicateKey,
+        plan,
+        state,
+        item_index,
+        prior,
+        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\"," ++
+            "\"predecessors\":[],\"items\":[{\"id\":\"gamma\"," ++
+            "\"owner\":\"owner-c\",\"status\":\"open\"},{\"id\":\"gamma\"," ++
+            "\"owner\":\"owner-c\",\"status\":\"closed\"}]}}",
+    );
+    try expectUpsertFailure(
+        error.RetainedUpsertBoundsExceeded,
+        plan,
+        state,
+        item_index,
+        prior,
+        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\"," ++
+            "\"predecessors\":[],\"items\":[{\"id\":\"gamma\"," ++
+            "\"owner\":\"owner-c\",\"status\":\"open\"},{\"id\":\"delta\"," ++
+            "\"owner\":\"owner-d\",\"status\":\"open\"}]}}",
+    );
+}
+
+test "retained reducer cache binds event bounds and actions commit atomically" {
+    var test_plan = try TestPlan.init(retained_state_definition);
+    defer test_plan.deinit();
+    for (test_plan.reducer.admissions[0].validation_plan.inputs) |*input| {
         if (std.mem.eql(u8, input.name, "event")) {
             input.max_bytes = 2048;
             break;
@@ -2728,9 +3775,9 @@ test "retained reducer cache binds event bounds and actions commit atomically" {
     }
     try std.testing.expectError(
         error.CacheRetainedAdmissionInputsMismatch,
-        validatePlan(&cached, &definition_plan, 4096),
+        validatePlan(&test_plan.reducer, &test_plan.artifact, 4096),
     );
-    for (cached.admissions[0].validation_plan.inputs) |*input| {
+    for (test_plan.reducer.admissions[0].validation_plan.inputs) |*input| {
         if (std.mem.eql(u8, input.name, "event")) {
             input.max_bytes = 4096;
             break;
@@ -2739,338 +3786,130 @@ test "retained reducer cache binds event bounds and actions commit atomically" {
 
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
-    var created = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
+    try applyTestEvent(
+        &test_plan.reducer,
+        &state,
         "{\"kind\":\"created\",\"body\":{\"id\":\"item-1\",\"status\":\"open\"}}",
-        .{ .allocate = .alloc_always },
     );
-    defer created.deinit();
-    try apply(std.testing.allocator, &cached, &state, created.value);
-    var updated = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"item-1\",\"status\":\"closed\"}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer updated.deinit();
-    try std.testing.expectError(
+    try expectTestEventError(
         error.RetainedActionValueMissing,
-        apply(std.testing.allocator, &cached, &state, updated.value),
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"item-1\",\"status\":\"closed\"}}",
     );
-    var status_pointer = try definition_core.json_pointer.compile(
-        std.testing.allocator,
-        "/status",
+    try expectRetainedStatus(&test_plan.reducer, &state, "open");
+    try std.testing.expect(
+        state.get(&test_plan.reducer, "shadow") == null,
     );
-    defer status_pointer.deinit(std.testing.allocator);
-    const current = state.get(&cached, "current").?;
-    try std.testing.expectEqualStrings(
-        "open",
-        definition_core.json_pointer.lookup(
-            current,
-            status_pointer,
-        ).?.string,
-    );
-    try std.testing.expect(state.get(&cached, "shadow") == null);
 }
 
 test "retained sets reject duplicate and over-bound keys atomically" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "definition.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-sets","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["reducer"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"sets":[{"name":"used_ids","max_entries":2,"max_key_bytes":8,"max_bytes":16}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"set_guards":[{"set":"used_ids","input":"event","path":"/body/id","presence":"absent"}],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"},{"op":"insert","set":"used_ids","input":"event","path":"/body/id"}]},{"on":"updated","requires":["current"],"forbids":[],"set_guards":[{"set":"used_ids","input":"event","path":"/body/id","presence":"absent"},{"set":"used_ids","input":"event","path":"/body/predecessors","presence":"present","mode":"each"}],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"},{"op":"insert","set":"used_ids","input":"event","path":"/body/id"}]}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":8192,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "definition.json",
-        .{},
+    var test_plan = try TestPlan.init(retained_sets_definition);
+    defer test_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), test_plan.reducer.sets.len);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        test_plan.reducer.admissions[1].set_guards.len,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "definition.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    const reducer_rule = for (definition_plan.rules) |rule| {
-        if (rule.operator == .reducer) break rule;
-    } else return error.TestReducerRuleMissing;
-    var plan = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        reducer_rule,
-        4096,
-    );
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validatePlan(&cached, &definition_plan, 4096);
-    try std.testing.expectEqual(@as(usize, 1), cached.sets.len);
-    try std.testing.expectEqual(@as(usize, 2), cached.admissions[1].set_guards.len);
 
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
-    var created = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
+    try applyTestEvent(
+        &test_plan.reducer,
+        &state,
         "{\"kind\":\"created\",\"body\":{\"id\":\"first\",\"status\":\"open\"}}",
-        .{ .allocate = .alloc_always },
     );
-    defer created.deinit();
-    try apply(std.testing.allocator, &cached, &state, created.value);
-    var updated = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"second\",\"predecessors\":[\"first\"],\"status\":\"closed\"}}",
-        .{ .allocate = .alloc_always },
+    try applyTestEvent(
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"second\"," ++
+            "\"predecessors\":[\"first\"],\"status\":\"closed\"}}",
     );
-    defer updated.deinit();
-    try apply(std.testing.allocator, &cached, &state, updated.value);
     try std.testing.expectEqual(
         @as(usize, 2),
         state.sets.items[0].value.entries.count(),
     );
-    var unknown_predecessor = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"third\",\"predecessors\":[\"unknown\"],\"status\":\"wrong\"}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer unknown_predecessor.deinit();
-    try std.testing.expectError(
+    try expectTestEventError(
         error.IllegalRetainedTransition,
-        apply(
-            std.testing.allocator,
-            &cached,
-            &state,
-            unknown_predecessor.value,
-        ),
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"third\"," ++
+            "\"predecessors\":[\"unknown\"],\"status\":\"wrong\"}}",
     );
-
-    var duplicate = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"first\",\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer duplicate.deinit();
-    try std.testing.expectError(
+    try expectTestEventError(
         error.IllegalRetainedTransition,
-        apply(std.testing.allocator, &cached, &state, duplicate.value),
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"first\"," ++
+            "\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
     );
-    var overflow = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"third\",\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer overflow.deinit();
-    try std.testing.expectError(
+    try expectTestEventError(
         error.RetainedSetBoundsExceeded,
-        apply(std.testing.allocator, &cached, &state, overflow.value),
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"third\"," ++
+            "\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
     );
-    var oversized = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"updated\",\"body\":{\"id\":\"too-large\",\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer oversized.deinit();
-    try std.testing.expectError(
+    try expectTestEventError(
         error.RetainedSetKeyBoundsExceeded,
-        apply(std.testing.allocator, &cached, &state, oversized.value),
+        &test_plan.reducer,
+        &state,
+        "{\"kind\":\"updated\",\"body\":{\"id\":\"too-large\"," ++
+            "\"predecessors\":[\"first\"],\"status\":\"wrong\"}}",
     );
     try std.testing.expectEqual(
         @as(usize, 2),
         state.sets.items[0].value.entries.count(),
     );
-    var status_pointer = try definition_core.json_pointer.compile(
-        std.testing.allocator,
-        "/status",
-    );
-    defer status_pointer.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "closed",
-        definition_core.json_pointer.lookup(
-            state.get(&cached, "current").?,
-            status_pointer,
-        ).?.string,
-    );
+    try expectRetainedStatus(&test_plan.reducer, &state, "closed");
 }
 
 test "retained keyed upserts preserve lineage and stable fields atomically" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "definition.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-upsert","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["reducer"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"items","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["items"],"rules":[],"actions":[{"op":"set","register":"items","input":"event","path":"/body/items"}]},{"on":"upserted","requires":["items"],"forbids":[],"rules":[],"actions":[{"op":"upsert","register":"items","input":"event","path":"/body/items","key":"/id","source_ref":"/body/set_id","predecessor_refs":"/body/predecessors","stable":["/owner"],"max_entries":3,"max_key_bytes":32}]}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "definition.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "definition.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    const reducer_rule = for (definition_plan.rules) |rule| {
-        if (rule.operator == .reducer) break rule;
-    } else return error.TestReducerRuleMissing;
-    var plan = try compile(
-        std.testing.allocator,
-        &definition_plan,
-        reducer_rule,
-        4096,
-    );
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validatePlan(&cached, &definition_plan, 4096);
+    var test_plan = try TestPlan.init(retained_upsert_definition);
+    defer test_plan.deinit();
     try std.testing.expectEqual(
         @as(usize, 1),
-        cached.admissions[1].actions.len,
+        test_plan.reducer.admissions[1].actions.len,
     );
-    try std.testing.expect(cached.admissions[1].actions[0] == .upsert);
+    try std.testing.expect(
+        test_plan.reducer.admissions[1].actions[0] == .upsert,
+    );
 
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
-    var created = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"created\",\"body\":{\"items\":[]}}",
-        .{ .allocate = .alloc_always },
-    );
+    var created = try parseTestEvent(upsert_created_event);
     defer created.deinit();
-    try apply(std.testing.allocator, &cached, &state, created.value);
-
-    var first = try std.json.parseFromSlice(
-        std.json.Value,
+    try apply(
         std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-1\",\"predecessors\":[],\"items\":[{\"id\":\"alpha\",\"owner\":\"owner-a\",\"status\":\"open\"}]}}",
-        .{ .allocate = .alloc_always },
+        &test_plan.reducer,
+        &state,
+        created.value,
     );
+    var first = try parseTestEvent(upsert_first_event);
     defer first.deinit();
-    try apply(std.testing.allocator, &cached, &state, first.value);
-
-    var second = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-2\",\"predecessors\":[\"set-1\"],\"items\":[{\"id\":\"alpha\",\"owner\":\"owner-a\",\"status\":\"closed\"},{\"id\":\"beta\",\"owner\":\"owner-b\",\"status\":\"open\"}]}}",
-        .{ .allocate = .alloc_always },
-    );
+    try apply(std.testing.allocator, &test_plan.reducer, &state, first.value);
+    var second = try parseTestEvent(upsert_second_event);
     defer second.deinit();
-    try apply(std.testing.allocator, &cached, &state, second.value);
-    const item_index = findRegister(cached.registers, "items").?;
+    try apply(std.testing.allocator, &test_plan.reducer, &state, second.value);
+    const item_index = findRegister(test_plan.reducer.registers, "items").?;
     const items_state = registerStateConst(&state, item_index).value.?;
-    try std.testing.expectEqualStrings(
-        "[{\"key\":\"alpha\",\"occurrences\":2,\"source\":\"set-2\",\"value\":{\"id\":\"alpha\",\"owner\":\"owner-a\",\"status\":\"closed\"}},{\"key\":\"beta\",\"occurrences\":1,\"source\":\"set-2\",\"value\":{\"id\":\"beta\",\"owner\":\"owner-b\",\"status\":\"open\"}}]",
-        items_state.bytes,
-    );
+    try std.testing.expectEqualStrings(expected_upsert_state, items_state.bytes);
     const before_invalid = try std.testing.allocator.dupe(
         u8,
         items_state.bytes,
     );
     defer std.testing.allocator.free(before_invalid);
-
-    var unstable = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\",\"predecessors\":[\"set-2\"],\"items\":[{\"id\":\"alpha\",\"owner\":\"owner-c\",\"status\":\"wrong\"}]}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer unstable.deinit();
-    try std.testing.expectError(
-        error.RetainedUpsertStableValueChanged,
-        apply(std.testing.allocator, &cached, &state, unstable.value),
-    );
-    try std.testing.expectEqualStrings(
+    try expectInvalidUpserts(
+        &test_plan.reducer,
+        &state,
+        item_index,
         before_invalid,
-        registerStateConst(&state, item_index).value.?.bytes,
-    );
-
-    var stale = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\",\"predecessors\":[\"set-1\"],\"items\":[{\"id\":\"alpha\",\"owner\":\"owner-a\",\"status\":\"wrong\"}]}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer stale.deinit();
-    try std.testing.expectError(
-        error.RetainedUpsertPredecessorMissing,
-        apply(std.testing.allocator, &cached, &state, stale.value),
-    );
-    try std.testing.expectEqualStrings(
-        before_invalid,
-        registerStateConst(&state, item_index).value.?.bytes,
-    );
-
-    var duplicate = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\",\"predecessors\":[],\"items\":[{\"id\":\"gamma\",\"owner\":\"owner-c\",\"status\":\"open\"},{\"id\":\"gamma\",\"owner\":\"owner-c\",\"status\":\"closed\"}]}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer duplicate.deinit();
-    try std.testing.expectError(
-        error.RetainedUpsertDuplicateKey,
-        apply(std.testing.allocator, &cached, &state, duplicate.value),
-    );
-    try std.testing.expectEqualStrings(
-        before_invalid,
-        registerStateConst(&state, item_index).value.?.bytes,
-    );
-
-    var overflow = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"kind\":\"upserted\",\"body\":{\"set_id\":\"set-3\",\"predecessors\":[],\"items\":[{\"id\":\"gamma\",\"owner\":\"owner-c\",\"status\":\"open\"},{\"id\":\"delta\",\"owner\":\"owner-d\",\"status\":\"open\"}]}}",
-        .{ .allocate = .alloc_always },
-    );
-    defer overflow.deinit();
-    try std.testing.expectError(
-        error.RetainedUpsertBoundsExceeded,
-        apply(std.testing.allocator, &cached, &state, overflow.value),
-    );
-    try std.testing.expectEqualStrings(
-        before_invalid,
-        registerStateConst(&state, item_index).value.?.bytes,
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         applyUpsertForAllocationFailure,
         .{
-            &cached,
+            &test_plan.reducer,
             created.value,
             first.value,
             second.value,
@@ -3079,129 +3918,46 @@ test "retained keyed upserts preserve lineage and stable fields atomically" {
 }
 
 test "retained state follows carrier names across definition plans" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "first.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/state-evolution","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["reducer"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":8192,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "second.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/state-evolution","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["reducer"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"sets":[{"name":"used_ids","max_entries":4,"max_key_bytes":16,"max_bytes":64}],"admissions":[{"on":"updated","requires":["current"],"forbids":[],"set_guards":[{"set":"used_ids","input":"event","path":"/body/id","presence":"absent"}],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"},{"op":"insert","set":"used_ids","input":"event","path":"/body/id"}]}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":8192,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var first_closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "first.json",
-        .{},
-    );
-    defer first_closure.deinit(std.testing.allocator);
-    var first_definition = try definition.compile(
-        std.testing.allocator,
-        &first_closure,
-        "first.json",
-    );
-    defer first_definition.deinit(std.testing.allocator);
-    const first_rule = for (first_definition.rules) |rule| {
-        if (rule.operator == .reducer) break rule;
-    } else return error.TestReducerRuleMissing;
-    var first_plan = try compile(
-        std.testing.allocator,
-        &first_definition,
-        first_rule,
-        4096,
-    );
-    defer first_plan.deinit(std.testing.allocator);
-
-    var second_closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "second.json",
-        .{},
-    );
-    defer second_closure.deinit(std.testing.allocator);
-    var second_definition = try definition.compile(
-        std.testing.allocator,
-        &second_closure,
-        "second.json",
-    );
-    defer second_definition.deinit(std.testing.allocator);
-    const second_rule = for (second_definition.rules) |rule| {
-        if (rule.operator == .reducer) break rule;
-    } else return error.TestReducerRuleMissing;
-    var second_plan = try compile(
-        std.testing.allocator,
-        &second_definition,
-        second_rule,
-        4096,
-    );
-    defer second_plan.deinit(std.testing.allocator);
+    var first = try TestPlan.init(retained_evolution_first);
+    defer first.deinit();
+    var second = try TestPlan.init(retained_evolution_second);
+    defer second.deinit();
 
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
-    var created = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
+    var created = try parseTestEvent(
         "{\"kind\":\"created\",\"body\":{\"id\":\"item-1\",\"status\":\"open\"}}",
-        .{ .allocate = .alloc_always },
     );
     defer created.deinit();
-    try apply(std.testing.allocator, &first_plan, &state, created.value);
-    var updated = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
+    try apply(std.testing.allocator, &first.reducer, &state, created.value);
+    var updated = try parseTestEvent(
         "{\"kind\":\"updated\",\"body\":{\"id\":\"item-2\",\"status\":\"closed\"}}",
-        .{ .allocate = .alloc_always },
     );
     defer updated.deinit();
-    try apply(std.testing.allocator, &second_plan, &state, updated.value);
+    try apply(std.testing.allocator, &second.reducer, &state, updated.value);
     try std.testing.expectEqual(@as(usize, 1), state.registers.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.sets.items.len);
     try std.testing.expectError(
         error.IllegalRetainedTransition,
-        apply(std.testing.allocator, &second_plan, &state, updated.value),
+        apply(std.testing.allocator, &second.reducer, &state, updated.value),
     );
-    var status_pointer = try definition_core.json_pointer.compile(
-        std.testing.allocator,
-        "/status",
-    );
-    defer status_pointer.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "closed",
-        definition_core.json_pointer.lookup(
-            state.get(&second_plan, "current").?,
-            status_pointer,
-        ).?.string,
-    );
-
+    try expectRetainedStatus(&second.reducer, &state, "closed");
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
-        .{ &second_definition, second_rule, @as(usize, 4096) },
+        .{ &second.artifact, second.rule(), @as(usize, 4096) },
     );
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&second_plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
-        .{payload},
+        .{second.cache_payload},
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         applyEvolutionForAllocationFailure,
         .{
-            &first_plan,
-            &second_plan,
+            &first.reducer,
+            &second.reducer,
             created.value,
             updated.value,
         },
