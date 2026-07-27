@@ -39,7 +39,44 @@ test {
     _ = envelope;
 }
 
-test "plain protocol binds appends replays and folds without rewriting history" {
+const PlainPlans = struct {
+    closure: definition_core.closure.Closure,
+    artifact: definition.Plan,
+    validator: validation.Plan,
+    store: storage.Plan,
+    protocol: protocol.Plan,
+    projection: projection.Plan,
+    parameters: definition_core.parameters.Bindings,
+
+    fn deinit(self: *PlainPlans) void {
+        self.parameters.deinit(std.testing.allocator);
+        self.projection.deinit(std.testing.allocator);
+        self.protocol.deinit(std.testing.allocator);
+        self.store.deinit(std.testing.allocator);
+        self.validator.deinit(std.testing.allocator);
+        self.artifact.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
+fn roundTripPlainProtocol(compiled: *const protocol.Plan) !protocol.Plan {
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try protocol.encodeCache(compiled, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var plan = try protocol.decodeCache(std.testing.allocator, &decoder);
+    errdefer plan.deinit(std.testing.allocator);
+    try decoder.finish();
+    return plan;
+}
+
+fn compilePlainPlans() !PlainPlans {
     var definition_tmp = std.testing.tmpDir(.{});
     defer definition_tmp.cleanup();
     try definition_tmp.dir.writeFile(std.testing.io, .{
@@ -52,67 +89,124 @@ test "plain protocol binds appends replays and folds without rewriting history" 
         "plain.json",
         .{},
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
+    errdefer closure.deinit(std.testing.allocator);
+    var artifact = try definition.compile(
         std.testing.allocator,
         &closure,
         "plain.json",
     );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
+    errdefer artifact.deinit(std.testing.allocator);
+    var validator = try validation.compile(
         std.testing.allocator,
-        &definition_plan,
+        &artifact,
     );
-    defer validation_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
+    errdefer validator.deinit(std.testing.allocator);
+    var store = try storage.compile(
         std.testing.allocator,
-        &definition_plan,
+        &artifact,
     );
-    defer storage_plan.deinit(std.testing.allocator);
+    errdefer store.deinit(std.testing.allocator);
     var compiled_protocol = (try protocol.compile(
         std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
+        &artifact,
+        &store,
     )).?;
     defer compiled_protocol.deinit(std.testing.allocator);
-    var protocol_encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer protocol_encoder.deinit();
-    try protocol.encodeCache(&compiled_protocol, &protocol_encoder);
-    const protocol_payload = try protocol_encoder.toOwnedSlice();
-    defer std.testing.allocator.free(protocol_payload);
-    var protocol_decoder =
-        definition_core.cache.Decoder.init(protocol_payload);
-    var protocol_plan = try protocol.decodeCache(
-        std.testing.allocator,
-        &protocol_decoder,
-    );
-    defer protocol_plan.deinit(std.testing.allocator);
-    try protocol_decoder.finish();
+    var protocol_plan = try roundTripPlainProtocol(&compiled_protocol);
+    errdefer protocol_plan.deinit(std.testing.allocator);
     try protocol.validateCachePlan(
         &protocol_plan,
-        &definition_plan,
-        &storage_plan,
+        &artifact,
+        &store,
     );
     try std.testing.expectEqual(protocol.Mode.plain, protocol_plan.mode);
     try std.testing.expect(protocol_plan.reducer_plan != null);
     try std.testing.expect(protocol_plan.state_reducer_plan == null);
     var projection_plan = try projection.compile(
         std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
+        &artifact,
+        &store,
         &protocol_plan,
     );
-    defer projection_plan.deinit(std.testing.allocator);
+    errdefer projection_plan.deinit(std.testing.allocator);
     var parameters = try definition_core.parameters.bind(
         std.testing.allocator,
-        &definition_plan.parameter_declarations,
+        &artifact.parameter_declarations,
         &.{},
     );
-    defer parameters.deinit(std.testing.allocator);
+    errdefer parameters.deinit(std.testing.allocator);
+    return .{
+        .closure = closure,
+        .artifact = artifact,
+        .validator = validator,
+        .store = store,
+        .protocol = protocol_plan,
+        .projection = projection_plan,
+        .parameters = parameters,
+    };
+}
 
+fn bindPlainStore(plans: *const PlainPlans, repo_root: []const u8) !void {
+    var binding = try transaction.transact(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.validator,
+        &plans.store,
+        &plans.protocol,
+        "bind-existing",
+        repo_root,
+        &.{},
+        &plans.parameters,
+    );
+    defer binding.deinit(std.testing.allocator);
+    try std.testing.expect(binding.storage_mutated);
+}
+
+fn appendPlainEvent(plans: *const PlainPlans, repo_root: []const u8) !void {
+    var appended = try transaction.transact(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.closure,
+        "plain.json",
+        &plans.validator,
+        &plans.store,
+        &plans.protocol,
+        "append",
+        repo_root,
+        &.{.{
+            .name = "event",
+            .bytes = "{\"kind\":\"updated\",\"value\":{\"id\":\"item-1\",\"revision\":1}}",
+        }},
+        &plans.parameters,
+    );
+    defer appended.deinit(std.testing.allocator);
+    try std.testing.expect(appended.storage_mutated);
+}
+
+fn expectPlainProjection(plans: *const PlainPlans, repo_root: []const u8) !void {
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "[{\"current\":{\"id\":\"item-1\",\"revision\":1}," ++
+            "\"event_count\":2,\"id\":\"item-1\",\"status\":\"current\"}]",
+        result.payload,
+    );
+}
+
+test "plain protocol binds appends replays and folds without rewriting history" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
     var repo_tmp = std.testing.tmpDir(.{});
     defer repo_tmp.cleanup();
     try repo_tmp.dir.createDirPath(std.testing.io, ".ledger/example");
@@ -128,22 +222,7 @@ test "plain protocol binds appends replays and folds without rewriting history" 
         std.testing.allocator,
     );
     defer std.testing.allocator.free(repo_root);
-
-    var binding = try transaction.transact(
-        std.testing.allocator,
-        &definition_plan,
-        &closure,
-        "plain.json",
-        &validation_plan,
-        &storage_plan,
-        &protocol_plan,
-        "bind-existing",
-        repo_root,
-        &.{},
-        &parameters,
-    );
-    defer binding.deinit(std.testing.allocator);
-    try std.testing.expect(binding.storage_mutated);
+    try bindPlainStore(&plans, repo_root);
     const after_binding = try repo_tmp.dir.readFileAlloc(
         std.testing.io,
         ".ledger/example/plain.jsonl",
@@ -152,39 +231,6 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     );
     defer std.testing.allocator.free(after_binding);
     try std.testing.expectEqualStrings(original, after_binding);
-
-    var appended = try transaction.transact(
-        std.testing.allocator,
-        &definition_plan,
-        &closure,
-        "plain.json",
-        &validation_plan,
-        &storage_plan,
-        &protocol_plan,
-        "append",
-        repo_root,
-        &.{.{
-            .name = "event",
-            .bytes = "{\"kind\":\"updated\",\"value\":{\"id\":\"item-1\",\"revision\":1}}",
-        }},
-        &parameters,
-    );
-    defer appended.deinit(std.testing.allocator);
-    try std.testing.expect(appended.storage_mutated);
-
-    var result = try projection.execute(
-        std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
-        &protocol_plan,
-        &projection_plan,
-        "current",
-        repo_root,
-        &parameters,
-    );
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "[{\"current\":{\"id\":\"item-1\",\"revision\":1},\"event_count\":2,\"id\":\"item-1\",\"status\":\"current\"}]",
-        result.payload,
-    );
+    try appendPlainEvent(&plans, repo_root);
+    try expectPlainProjection(&plans, repo_root);
 }
