@@ -7,7 +7,7 @@ const storage = @import("storage.zig");
 
 const max_event_kinds: usize = 256;
 
-const required_operator_mask =
+const chained_required_operator_mask =
     operatorBit(.event_envelope) |
     operatorBit(.sequence) |
     operatorBit(.previous_digest) |
@@ -16,8 +16,22 @@ const required_operator_mask =
     operatorBit(.event_kinds) |
     operatorBit(.replay);
 
+const plain_required_operator_mask =
+    operatorBit(.append_only_log) |
+    operatorBit(.event_kinds) |
+    operatorBit(.reducer) |
+    operatorBit(.replay);
+
+const chained_only_operator_mask =
+    operatorBit(.event_envelope) |
+    operatorBit(.sequence) |
+    operatorBit(.previous_digest) |
+    operatorBit(.body_digest) |
+    operatorBit(.event_digest);
+
 const protocol_operator_mask =
-    required_operator_mask |
+    chained_required_operator_mask |
+    plain_required_operator_mask |
     operatorBit(.transition_table) |
     operatorBit(.reducer);
 
@@ -78,7 +92,13 @@ const Genesis = union(enum) {
     }
 };
 
+pub const Mode = enum {
+    chained,
+    plain,
+};
+
 pub const Plan = struct {
+    mode: Mode,
     envelope: Envelope,
     sequence_start: u64,
     genesis: Genesis,
@@ -130,6 +150,7 @@ pub const ReplayState = struct {
         self: *const ReplayState,
         plan: *const Plan,
     ) ?[]const u8 {
+        if (plan.mode == .plain) return null;
         if (self.previousDigest()) |digest| return digest;
         return switch (plan.genesis) {
             .null => null,
@@ -178,6 +199,7 @@ pub const MaterializedEvent = struct {
 };
 
 const ProtocolRules = struct {
+    append_only_log: ?definition.Rule = null,
     envelope: ?definition.Rule = null,
     sequence: ?definition.Rule = null,
     previous_digest: ?definition.Rule = null,
@@ -198,13 +220,9 @@ pub fn compile(
     if (definition_plan.storage_kind != .event_log) {
         return error.ProtocolRequiresEventLogStorage;
     }
-    if ((definition_plan.operator_mask & required_operator_mask) !=
-        required_operator_mask)
-    {
-        return error.IncompleteEventProtocolOperators;
-    }
     var rules: ProtocolRules = .{};
     for (definition_plan.rules) |rule| switch (rule.operator) {
+        .append_only_log => try setRule(&rules.append_only_log, rule),
         .event_envelope => try setRule(&rules.envelope, rule),
         .sequence => try setRule(&rules.sequence, rule),
         .previous_digest => try setRule(&rules.previous_digest, rule),
@@ -215,6 +233,21 @@ pub fn compile(
         .reducer => try setRule(&rules.reducer, rule),
         else => {},
     };
+    if (rules.append_only_log != null or
+        definition_plan.requires(.append_only_log))
+    {
+        return try compilePlain(
+            allocator,
+            definition_plan,
+            storage_plan,
+            rules,
+        );
+    }
+    if ((definition_plan.operator_mask & chained_required_operator_mask) !=
+        chained_required_operator_mask)
+    {
+        return error.IncompleteEventProtocolOperators;
+    }
     if (rules.envelope == null or
         rules.sequence == null or
         rules.previous_digest == null or
@@ -306,6 +339,7 @@ pub fn compile(
         return error.IncompleteReducerRules;
     }
     const result: Plan = .{
+        .mode = .chained,
         .envelope = envelope,
         .sequence_start = sequence_start,
         .genesis = genesis,
@@ -319,11 +353,86 @@ pub fn compile(
     return result;
 }
 
+fn compilePlain(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    rules: ProtocolRules,
+) !Plan {
+    if ((definition_plan.operator_mask & plain_required_operator_mask) !=
+        plain_required_operator_mask)
+    {
+        return error.IncompleteEventProtocolOperators;
+    }
+    if ((definition_plan.operator_mask & chained_only_operator_mask) != 0 or
+        rules.envelope != null or
+        rules.sequence != null or
+        rules.previous_digest != null or
+        rules.body_digest != null or
+        rules.event_digest != null or
+        rules.transition_table != null or
+        definition_plan.requires(.transition_table))
+    {
+        return error.MixedEventProtocolModes;
+    }
+    const append_rule = rules.append_only_log orelse
+        return error.IncompleteEventProtocolRules;
+    const event_kinds_rule = rules.event_kinds orelse
+        return error.IncompleteEventProtocolRules;
+    const reducer_rule = rules.reducer orelse
+        return error.IncompleteReducerRules;
+    if (!try state_reducer.isRetainedRule(allocator, reducer_rule)) {
+        return error.PlainProtocolRequiresRetainedReducer;
+    }
+
+    var envelope = try compilePlainEnvelope(
+        allocator,
+        definition_plan,
+        append_rule,
+    );
+    errdefer envelope.deinit(allocator);
+    const event_kinds = try compileEventKinds(
+        allocator,
+        event_kinds_rule,
+    );
+    errdefer deinitStringSet(allocator, event_kinds);
+    var state_reducer_plan = try state_reducer.compile(
+        allocator,
+        definition_plan,
+        reducer_rule,
+        definition_plan.bounds.max_input_bytes,
+    );
+    errdefer state_reducer_plan.deinit(allocator);
+    try state_reducer.validateEventKinds(
+        &state_reducer_plan,
+        event_kinds,
+    );
+    const target_slot_index = try compileTargetSlot(
+        storage_plan,
+        envelope.input_index,
+    );
+    const result: Plan = .{
+        .mode = .plain,
+        .envelope = envelope,
+        .sequence_start = 0,
+        .genesis = .null,
+        .event_kinds = event_kinds,
+        .max_records = definition_plan.bounds.max_records,
+        .target_slot_index = target_slot_index,
+        .reducer_plan = null,
+        .state_reducer_plan = state_reducer_plan,
+    };
+    try validatePlan(&result);
+    try validateStorageMaterializations(&result, storage_plan);
+    return result;
+}
+
 pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(4);
+    try encoder.writeU16(5);
+    try encoder.writeEnum(plan.mode);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
     try encoder.writeBytes(plan.envelope.sequence_key);
@@ -360,12 +469,18 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 4) {
+    if (try decoder.readU16() != 5) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
+        const mode = try decoder.readEnum(Mode);
         const input_index = try decoder.readU16();
-        const keys = try decodeStringSet(allocator, decoder, 64);
+        const keys = try decodeStringSet(
+            allocator,
+            decoder,
+            64,
+            mode == .plain,
+        );
         errdefer deinitStringSet(allocator, keys);
         var field_keys: [6][]u8 = undefined;
         var initialized: usize = 0;
@@ -373,7 +488,13 @@ pub fn decodeCache(
         for (&field_keys) |*field_key| {
             field_key.* = try decoder.readBytesAlloc(allocator, 256);
             initialized += 1;
-            try definition_core.json.safeIdentifier(field_key.*, 256);
+            if (mode == .plain) {
+                if (field_key.*.len != 0) {
+                    return error.CachePlainProtocolEnvelopeInvalid;
+                }
+            } else {
+                try definition_core.json.safeIdentifier(field_key.*, 256);
+            }
         }
         const partition_bindings = try decodePartitionBindings(
             allocator,
@@ -396,7 +517,12 @@ pub fn decodeCache(
             break :digest .{ .digest = digest };
         } else .null;
         errdefer genesis.deinit(allocator);
-        const event_kinds = try decodeStringSet(allocator, decoder, 256);
+        const event_kinds = try decodeStringSet(
+            allocator,
+            decoder,
+            256,
+            false,
+        );
         errdefer deinitStringSet(allocator, event_kinds);
         var reducer_plan: ?reducer.Plan = null;
         errdefer if (reducer_plan) |*compiled| compiled.deinit(allocator);
@@ -416,6 +542,7 @@ pub fn decodeCache(
             );
         }
         break :plan .{
+            .mode = mode,
             .envelope = .{
                 .input_index = std.math.cast(u8, input_index) orelse
                     return error.CacheProtocolInputIndexInvalid,
@@ -451,16 +578,26 @@ pub fn validateCachePlan(
     const transition_declared = definition_plan.requires(.transition_table);
     const legacy_reducer = plan.reducer_plan != null;
     const retained_reducer = plan.state_reducer_plan != null;
+    const expected_operator_mask = switch (plan.mode) {
+        .chained => chained_required_operator_mask,
+        .plain => plain_required_operator_mask,
+    };
     try validatePlan(plan);
     if (plan.envelope.input_index >= definition_plan.inputs.len or
         definition_plan.inputs[plan.envelope.input_index].codec != .json or
         plan.max_records != definition_plan.bounds.max_records or
         definition_plan.storage_kind != .event_log or
-        (definition_plan.operator_mask & required_operator_mask) !=
-            required_operator_mask or
+        (definition_plan.operator_mask & expected_operator_mask) !=
+            expected_operator_mask or
+        (plan.mode == .plain and
+            (definition_plan.operator_mask & chained_only_operator_mask) != 0) or
+        (plan.mode == .chained and
+            definition_plan.requires(.append_only_log)) or
         (legacy_reducer and retained_reducer) or
         reducer_declared != (legacy_reducer or retained_reducer) or
-        transition_declared != legacy_reducer)
+        transition_declared != legacy_reducer or
+        (plan.mode == .plain and
+            (!retained_reducer or legacy_reducer or transition_declared)))
     {
         return error.CacheProtocolPlanMismatch;
     }
@@ -479,10 +616,12 @@ pub fn validateCachePlan(
         );
         try state_reducer.validateEventKinds(compiled, plan.event_kinds);
     }
-    try validatePartitionBindingsAgainstDefinition(
-        plan.envelope.partition_bindings,
-        definition_plan,
-    );
+    if (plan.mode == .chained) {
+        try validatePartitionBindingsAgainstDefinition(
+            plan.envelope.partition_bindings,
+            definition_plan,
+        );
+    }
     const expected_slot = try compileTargetSlot(
         storage_plan,
         plan.envelope.input_index,
@@ -590,6 +729,31 @@ fn applyValueWithParameters(
 ) !void {
     if (state.records >= plan.max_records) {
         return error.ProtocolRecordBoundsExceeded;
+    }
+    if (plan.mode == .plain) {
+        const retained = if (plan.state_reducer_plan) |*compiled|
+            compiled
+        else
+            return error.PlainProtocolRequiresRetainedReducer;
+        const kind = try definition_core.json.string(
+            definition_core.json_pointer.lookup(
+                event,
+                retained.event_kind,
+            ) orelse return error.EventEnvelopeFieldMissing,
+        );
+        const kind_index = findSortedIndex(
+            plan.event_kinds,
+            kind,
+        ) orelse return error.UnknownEventKind;
+        try state_reducer.apply(
+            allocator,
+            retained,
+            &state.state_reducer_state,
+            event,
+        );
+        state.kind_counts[kind_index] += 1;
+        state.records += 1;
+        return;
     }
     const object = try definition_core.json.object(event);
     try validateEnvelopeKeys(object, plan.envelope.keys);
@@ -764,7 +928,7 @@ pub fn materializeEvent(
     unix_seconds: i64,
     io: std.Io,
 ) !MaterializedEvent {
-    if (materialization.mode != .chained) {
+    if (plan.mode != .chained or materialization.mode != .chained) {
         return error.EventMaterializationModeMismatch;
     }
     if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
@@ -1039,7 +1203,7 @@ pub fn reconstructInputAlloc(
     materialization: *const storage.EventMaterialization,
     event: std.json.Value,
 ) ![]u8 {
-    if (materialization.mode != .chained) {
+    if (plan.mode != .chained or materialization.mode != .chained) {
         return error.EventMaterializationModeMismatch;
     }
     try validateEventMaterialization(plan, materialization);
@@ -2538,6 +2702,53 @@ fn setRule(slot: *?definition.Rule, rule: definition.Rule) !void {
     slot.* = rule;
 }
 
+fn compilePlainEnvelope(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rule: definition.Rule,
+) !Envelope {
+    var parsed = try parseRule(allocator, rule);
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "input" },
+    );
+    try requireOperator(object, .append_only_log);
+    const input_index = findInput(
+        definition_plan.inputs,
+        try definition_core.json.requiredString(object, "input"),
+    ) orelse return error.UnknownProtocolInput;
+    if (definition_plan.inputs[input_index].codec != .json) {
+        return error.ProtocolInputMustBeJson;
+    }
+    const keys = try allocator.alloc([]u8, 0);
+    errdefer allocator.free(keys);
+    var field_keys: [6][]u8 = undefined;
+    var initialized: usize = 0;
+    errdefer for (field_keys[0..initialized]) |key| allocator.free(key);
+    for (&field_keys) |*key| {
+        key.* = try allocator.alloc(u8, 0);
+        initialized += 1;
+    }
+    const partition_bindings = try allocator.alloc(PartitionBinding, 0);
+    return .{
+        .input_index = @intCast(input_index),
+        .keys = keys,
+        .sequence_key = field_keys[0],
+        .kind_key = field_keys[1],
+        .previous_digest_key = field_keys[2],
+        .body_key = field_keys[3],
+        .body_digest_key = field_keys[4],
+        .event_digest_key = field_keys[5],
+        .partition_bindings = partition_bindings,
+    };
+}
+
 fn compileEnvelope(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -2871,9 +3082,10 @@ fn decodeStringSet(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
     max_count: usize,
+    allow_empty: bool,
 ) ![][]u8 {
     const count = try decoder.readCount(max_count);
-    if (count == 0) return error.InvalidProtocolStringSet;
+    if (count == 0 and !allow_empty) return error.InvalidProtocolStringSet;
     const out = try allocator.alloc([]u8, count);
     var initialized: usize = 0;
     errdefer {
@@ -2944,52 +3156,80 @@ fn deinitStringSet(
 }
 
 fn validatePlan(plan: *const Plan) !void {
-    if (plan.envelope.keys.len == 0 or plan.envelope.keys.len > 64 or
-        plan.event_kinds.len == 0 or plan.event_kinds.len > 256 or
-        plan.sequence_start > std.math.maxInt(i64) or
+    if (plan.event_kinds.len == 0 or plan.event_kinds.len > 256 or
         plan.max_records == 0 or plan.max_records > 10_000_000)
     {
         return error.InvalidProtocolPlan;
     }
-    try validateSortedStringSet(plan.envelope.keys);
     try validateSortedStringSet(plan.event_kinds);
-    if (plan.envelope.partition_bindings.len > 32) {
-        return error.InvalidProtocolPartitionBindings;
-    }
-    for (plan.envelope.partition_bindings, 0..) |binding, index| {
-        try definition_core.json.safeIdentifier(binding.parameter, 128);
-        if (index != 0 and
-            std.mem.order(
-                u8,
-                plan.envelope.partition_bindings[index - 1].parameter,
-                binding.parameter,
-            ) != .lt)
-        {
-            return error.InvalidProtocolPartitionBindings;
-        }
-    }
-    const fields = [_][]const u8{
-        plan.envelope.sequence_key,
-        plan.envelope.kind_key,
-        plan.envelope.previous_digest_key,
-        plan.envelope.body_key,
-        plan.envelope.body_digest_key,
-        plan.envelope.event_digest_key,
-    };
-    for (fields, 0..) |field, index| {
-        try definition_core.json.safeIdentifier(field, 256);
-        if (!containsSorted(plan.envelope.keys, field)) {
-            return error.EventEnvelopeFieldNotDeclared;
-        }
-        for (fields[0..index]) |prior| {
-            if (std.mem.eql(u8, prior, field)) {
-                return error.DuplicateEventEnvelopeField;
+    switch (plan.mode) {
+        .plain => {
+            if (plan.envelope.keys.len != 0 or
+                plan.envelope.partition_bindings.len != 0 or
+                plan.envelope.sequence_key.len != 0 or
+                plan.envelope.kind_key.len != 0 or
+                plan.envelope.previous_digest_key.len != 0 or
+                plan.envelope.body_key.len != 0 or
+                plan.envelope.body_digest_key.len != 0 or
+                plan.envelope.event_digest_key.len != 0 or
+                plan.sequence_start != 0 or
+                !switch (plan.genesis) {
+                    .null => true,
+                    .digest => false,
+                } or
+                plan.reducer_plan != null or
+                plan.state_reducer_plan == null)
+            {
+                return error.InvalidPlainProtocolPlan;
             }
-        }
-    }
-    switch (plan.genesis) {
-        .null => {},
-        .digest => |digest| try definition_core.json.digest(digest),
+        },
+        .chained => {
+            if (plan.envelope.keys.len == 0 or
+                plan.envelope.keys.len > 64 or
+                plan.sequence_start > std.math.maxInt(i64))
+            {
+                return error.InvalidProtocolPlan;
+            }
+            try validateSortedStringSet(plan.envelope.keys);
+            if (plan.envelope.partition_bindings.len > 32) {
+                return error.InvalidProtocolPartitionBindings;
+            }
+            for (plan.envelope.partition_bindings, 0..) |binding, index| {
+                try definition_core.json.safeIdentifier(binding.parameter, 128);
+                if (index != 0 and
+                    std.mem.order(
+                        u8,
+                        plan.envelope.partition_bindings[index - 1].parameter,
+                        binding.parameter,
+                    ) != .lt)
+                {
+                    return error.InvalidProtocolPartitionBindings;
+                }
+            }
+            const fields = [_][]const u8{
+                plan.envelope.sequence_key,
+                plan.envelope.kind_key,
+                plan.envelope.previous_digest_key,
+                plan.envelope.body_key,
+                plan.envelope.body_digest_key,
+                plan.envelope.event_digest_key,
+            };
+            for (fields, 0..) |field, index| {
+                try definition_core.json.safeIdentifier(field, 256);
+                if (!containsSorted(plan.envelope.keys, field)) {
+                    return error.EventEnvelopeFieldNotDeclared;
+                }
+                for (fields[0..index]) |prior| {
+                    if (std.mem.eql(u8, prior, field)) {
+                        return error.DuplicateEventEnvelopeField;
+                    }
+                }
+            }
+            switch (plan.genesis) {
+                .null => {},
+                .digest => |digest| try definition_core.json.digest(digest),
+            }
+        },
     }
     if (plan.reducer_plan) |*compiled| try reducer.validatePlan(compiled);
     if (plan.reducer_plan != null and plan.state_reducer_plan != null) {
@@ -3071,17 +3311,27 @@ fn validateStorageMaterializations(
         for (operation.effects) |effect| {
             if (effect.slot_index != plan.target_slot_index) continue;
             if (effect.event) |event| {
-                if (event.mode != .chained) {
+                const expected_mode: storage.EventMaterializationMode =
+                    switch (plan.mode) {
+                        .chained => .chained,
+                        .plain => .plain,
+                    };
+                if (event.mode != expected_mode) {
                     return error.EventMaterializationModeMismatch;
                 }
                 materialized_effects += 1;
-                try validateEventMaterialization(plan, &event);
+                if (plan.mode == .chained) {
+                    try validateEventMaterialization(plan, &event);
+                }
             } else {
                 plain_effects += 1;
             }
         }
     }
-    if (materialized_effects != 0 and plain_effects != 0) {
+    if (plan.mode == .chained and
+        materialized_effects != 0 and
+        plain_effects != 0)
+    {
         return error.MixedEventMaterializationModes;
     }
 }

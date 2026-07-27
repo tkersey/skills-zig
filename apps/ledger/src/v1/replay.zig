@@ -531,6 +531,9 @@ fn validateEventInput(
             .chained => chained: {
                 const plan = historical_plan orelse
                     return error.HistoricalProtocolBindingMismatch;
+                if (plan.mode != .chained) {
+                    return error.HistoricalProtocolBindingMismatch;
+                }
                 if (protocol_state.* == null) {
                     protocol_state.* = protocol.ReplayState.init(plan);
                 }
@@ -543,8 +546,13 @@ fn validateEventInput(
                 );
             },
             .plain => plain: {
-                if (historical_plan != null) {
-                    return error.HistoricalProtocolBindingMismatch;
+                if (historical_plan) |plan| {
+                    if (plan.mode != .plain) {
+                        return error.HistoricalProtocolBindingMismatch;
+                    }
+                    if (protocol_state.* == null) {
+                        protocol_state.* = protocol.ReplayState.init(plan);
+                    }
                 }
                 break :plain try protocol.reconstructPlainInputAlloc(
                     allocator,
@@ -561,10 +569,10 @@ fn validateEventInput(
         );
         defer execution.deinit();
         if (!execution.isValid()) return error.HistoricalArtifactInvalid;
-        if (event_materialization.mode == .chained) {
+        if (historical_plan) |plan| {
             try protocol.applyValueBound(
                 allocator,
-                historical_plan.?,
+                plan,
                 &protocol_state.*.?,
                 parsed.value,
                 parameters,

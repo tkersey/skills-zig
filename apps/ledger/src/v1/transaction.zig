@@ -719,17 +719,27 @@ fn validateExistingEvent(
             return error.ExistingStoreValidationFailed;
         }
         const reconstructed = switch (materialized.mode) {
-            .chained => try protocol.reconstructInputAlloc(
-                allocator,
-                event_protocol orelse
-                    return error.EventMaterializationRequiresProtocol,
-                protocol_state orelse
-                    return error.EventMaterializationRequiresProtocol,
-                &materialized,
-                parsed.value,
-            ),
+            .chained => chained: {
+                const plan = event_protocol orelse
+                    return error.EventMaterializationRequiresProtocol;
+                if (plan.mode != .chained) {
+                    return error.EventMaterializationModeMismatch;
+                }
+                break :chained try protocol.reconstructInputAlloc(
+                    allocator,
+                    plan,
+                    protocol_state orelse
+                        return error.EventMaterializationRequiresProtocol,
+                    &materialized,
+                    parsed.value,
+                );
+            },
             .plain => plain: {
-                if (event_protocol != null or protocol_state != null) {
+                if (event_protocol) |plan| {
+                    if (plan.mode != .plain or protocol_state == null) {
+                        return error.EventMaterializationModeMismatch;
+                    }
+                } else if (protocol_state != null) {
                     return error.EventMaterializationModeMismatch;
                 }
                 break :plain try protocol.reconstructPlainInputAlloc(
@@ -747,11 +757,12 @@ fn validateExistingEvent(
         );
         defer execution.deinit();
         if (!execution.isValid()) return error.ExistingStoreValidationFailed;
-        if (materialized.mode == .chained) {
+        if (event_protocol) |plan| {
             try protocol.applyValueBound(
                 allocator,
-                event_protocol.?,
-                protocol_state.?,
+                plan,
+                protocol_state orelse
+                    return error.EventMaterializationRequiresProtocol,
                 parsed.value,
                 parameters,
             );
@@ -1061,6 +1072,9 @@ fn prepareEffect(
                     return error.EventMaterializationRequiresProtocol;
                 }
                 const current_protocol = event_protocol.?;
+                if (current_protocol.mode != .chained) {
+                    return error.EventMaterializationModeMismatch;
+                }
                 if (protocol_state == null) {
                     protocol_state = protocol.ReplayState.init(
                         current_protocol,
@@ -1080,7 +1094,15 @@ fn prepareEffect(
             },
             .plain => plain: {
                 if (protocol_required) {
-                    return error.EventMaterializationModeMismatch;
+                    const current_protocol = event_protocol.?;
+                    if (current_protocol.mode != .plain) {
+                        return error.EventMaterializationModeMismatch;
+                    }
+                    if (protocol_state == null) {
+                        protocol_state = protocol.ReplayState.init(
+                            current_protocol,
+                        );
+                    }
                 }
                 break :plain try protocol.materializePlainEvent(
                     allocator,

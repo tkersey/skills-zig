@@ -179,6 +179,7 @@ pub const Operator = enum {
             .regex => 2,
             .sha256 => 4,
             .reducer => 3,
+            .append_only_log => 2,
             .compare_append, .bind_existing => 2,
             .event_envelope => 4,
             .cross_input_equal => 2,
