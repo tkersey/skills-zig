@@ -1085,7 +1085,7 @@ fn validatePredicateTypes(
     case_insensitive: bool,
 ) !void {
     if ((operator.requiresString() or case_insensitive) and
-        column.kind != .string)
+        column.kind != .string and column.kind != .json)
     {
         return error.FilterPredicateTypeMismatch;
     }
@@ -1104,6 +1104,11 @@ fn validatePredicateTypes(
             definition_plan.parameter_declarations.items[index].kind,
         ),
     };
+    if (column.kind == .json and operand_kind == .string and
+        operator.requiresString())
+    {
+        return;
+    }
     if (column.kind == .float and operand_kind == .integer) return;
     if (column.kind != operand_kind) {
         return error.FilterPredicateTypeMismatch;

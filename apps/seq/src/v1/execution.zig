@@ -1250,6 +1250,7 @@ fn stringOperation(
 ) bool {
     const haystack = switch (value) {
         .string => |text| text,
+        .json => |text| text,
         else => return false,
     };
     const needle = switch (operand) {
