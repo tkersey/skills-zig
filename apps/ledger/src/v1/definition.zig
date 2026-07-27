@@ -199,95 +199,15 @@ pub const Operator = enum {
     }
 
     pub fn supported(self: Operator) bool {
-        return switch (self) {
-            .exact_object,
-            .required_field,
-            .field_absent,
-            .optional_field,
-            .scalar_type,
-            .bounded_string,
-            .regex,
-            .bounded_number,
-            .bounded_array,
-            .bounded_object,
-            .enum_value,
-            .digest,
-            .timestamp,
-            .safe_identifier,
-            .safe_relative_path,
-            .tagged_union,
-            .one_of,
-            .definition_ref,
-            .unique,
-            .sorted,
-            .set_equality,
-            .subset,
-            .superset,
-            .disjoint,
-            .total_partition,
-            .exactly_one,
-            .at_least_one,
-            .all_rules,
-            .any_rules,
-            .no_rules,
-            .keyed_unique,
-            .keyed_join,
-            .reference_exists,
-            .field_equal,
-            .field_not_equal,
-            .cross_input_equal,
-            .implies,
-            .predecessor_successor,
-            .total_mapping,
-            .declared_field_values,
-            .object_values,
-            .secure_token,
-            .path_scope_subset,
-            .path_scope_disjoint,
-            .member_of,
-            .not_member_of,
-            .forbidden_object_keys,
-            .canonical_json,
-            .canonical_text,
-            .sha256,
-            .sha1,
-            .content_address,
-            .composite_identity,
-            .timestamp_ordinal,
-            .monotonic_identity,
-            .path_format,
-            .immutable_document,
-            .append_only_log,
-            .event_materialization,
-            .event_envelope,
-            .sequence,
-            .previous_digest,
-            .body_digest,
-            .event_digest,
-            .event_kinds,
-            .transition_table,
-            .reducer,
-            .idempotency_key,
-            .compare_append,
-            .compare_replace,
-            .create_new,
-            .bind_existing,
-            .exclusive_custody,
-            .atomic_transaction,
-            .replay,
-            .filter,
-            .select,
-            .sort,
-            .limit,
-            .id_lookup,
-            .latest,
-            .relevance,
-            .fold,
-            .@"export",
-            .text_render,
-            => true,
-            else => false,
-        };
+        comptime {
+            const fields = @typeInfo(Operator).@"enum".fields;
+            if (fields.len != 86 or
+                !std.mem.eql(u8, fields[46].name, "set_order"))
+            {
+                @compileError("update the explicit operator admission set");
+            }
+        }
+        return self != .set_order;
     }
 };
 
@@ -515,13 +435,11 @@ fn compileAtDepth(
     compiled_count: *usize,
 ) anyerror!Plan {
     if (depth > 32) return error.ImportDepthExceeded;
-    compiled_count.* = std.math.add(
-        usize,
-        compiled_count.*,
-        1,
-    ) catch return error.TooManyImportedDefinitions;
+    compiled_count.* = std.math.add(usize, compiled_count.*, 1) catch
+        return error.TooManyImportedDefinitions;
     if (compiled_count.* > 128) return error.TooManyImportedDefinitions;
-    const entry = closure.find(entry_path) orelse return error.EntryDefinitionMissing;
+    const entry = closure.find(entry_path) orelse
+        return error.EntryDefinitionMissing;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -533,7 +451,51 @@ fn compileAtDepth(
     );
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
-    try rejectExecutableFields(parsed.value, 0);
+    try rejectExecutableFields(allocator, parsed.value);
+    try validateDefinitionRoot(root);
+    const id = try definition_core.json.requiredString(root, "id");
+    const owner = try definition_core.json.requiredString(root, "owner");
+    var header = try compileDefinitionHeader(
+        allocator,
+        closure,
+        entry_path,
+        root,
+        depth,
+        compiled_count,
+    );
+    errdefer header.deinit(allocator);
+    var body = try compileDefinitionBody(
+        allocator,
+        root,
+        header.operator_mask,
+        header.imports,
+    );
+    errdefer body.deinit(allocator);
+    const owned_id = try allocator.dupe(u8, id);
+    errdefer allocator.free(owned_id);
+    const owned_owner = try allocator.dupe(u8, owner);
+    errdefer allocator.free(owned_owner);
+    return .{
+        .id = owned_id,
+        .owner = owned_owner,
+        .closure_digest = closure.digest,
+        .operator_mask = header.operator_mask,
+        .parameter_declarations = header.parameter_declarations,
+        .inputs = header.inputs,
+        .storage_kind = header.storage_kind,
+        .imports = header.imports,
+        .pointers = body.pointers,
+        .rules = body.rules,
+        .operations = body.operations,
+        .projections = body.projections,
+        .bounds = header.bounds,
+        .canonicalization_json = body.canonicalization_json,
+        .identity_json = body.identity_json,
+        .storage_json = body.storage_json,
+    };
+}
+
+fn validateDefinitionRoot(root: std.json.ObjectMap) !void {
     try definition_core.json.requireExactKeys(root, &.{
         "schema",
         "id",
@@ -576,7 +538,32 @@ fn compileAtDepth(
     const owner = try definition_core.json.requiredString(root, "owner");
     try definition_core.json.safeIdentifier(id, 256);
     try definition_core.json.safeIdentifier(owner, 128);
+}
 
+const DefinitionHeader = struct {
+    operator_mask: u128,
+    parameter_declarations: definition_core.parameters.Declarations,
+    inputs: []Input,
+    storage_kind: StorageKind,
+    bounds: Bounds,
+    imports: []Plan,
+
+    fn deinit(self: *DefinitionHeader, allocator: std.mem.Allocator) void {
+        deinitPlans(allocator, self.imports);
+        deinitInputs(allocator, self.inputs);
+        self.parameter_declarations.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileDefinitionHeader(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    entry_path: []const u8,
+    root: std.json.ObjectMap,
+    depth: usize,
+    compiled_count: *usize,
+) anyerror!DefinitionHeader {
     const operator_mask = try parseRequires(try definition_core.json.object(
         try definition_core.json.field(root, "requires"),
     ));
@@ -587,7 +574,9 @@ fn compileAtDepth(
     errdefer parameter_declarations.deinit(allocator);
     const inputs = try parseInputs(
         allocator,
-        try definition_core.json.object(try definition_core.json.field(root, "inputs")),
+        try definition_core.json.object(
+            try definition_core.json.field(root, "inputs"),
+        ),
     );
     errdefer deinitInputs(allocator, inputs);
     const storage_object = try definition_core.json.object(
@@ -609,7 +598,43 @@ fn compileAtDepth(
         compiled_count,
     );
     errdefer deinitPlans(allocator, imports);
+    return .{
+        .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
+        .inputs = inputs,
+        .storage_kind = storage_kind,
+        .bounds = bounds,
+        .imports = imports,
+    };
+}
 
+const DefinitionBody = struct {
+    operations: []NamedPlan,
+    projections: []NamedPlan,
+    canonicalization_json: []u8,
+    identity_json: []u8,
+    storage_json: []u8,
+    pointers: [][]u8,
+    rules: []Rule,
+
+    fn deinit(self: *DefinitionBody, allocator: std.mem.Allocator) void {
+        deinitRules(allocator, self.rules);
+        deinitPointers(allocator, self.pointers);
+        allocator.free(self.storage_json);
+        allocator.free(self.identity_json);
+        allocator.free(self.canonicalization_json);
+        deinitNamedPlans(allocator, self.projections);
+        deinitNamedPlans(allocator, self.operations);
+        self.* = undefined;
+    }
+};
+
+fn compileDefinitionBody(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    operator_mask: u128,
+    imports: []const Plan,
+) !DefinitionBody {
     var compiler = Compiler{
         .allocator = allocator,
         .operator_mask = operator_mask,
@@ -625,58 +650,52 @@ fn compileAtDepth(
     const operations = try parseNamedPlans(
         allocator,
         &compiler,
-        try definition_core.json.object(try definition_core.json.field(root, "operations")),
+        try definition_core.json.object(
+            try definition_core.json.field(root, "operations"),
+        ),
     );
     errdefer deinitNamedPlans(allocator, operations);
     const projections = try parseNamedPlans(
         allocator,
         &compiler,
-        try definition_core.json.object(try definition_core.json.field(root, "projections")),
+        try definition_core.json.object(
+            try definition_core.json.field(root, "projections"),
+        ),
     );
     errdefer deinitNamedPlans(allocator, projections);
     if (root.get("diagnostics")) |diagnostics| try compiler.compileValue(diagnostics, 0);
 
-    const canonicalization_json = try definition_core.canonical_json.canonicalJsonAlloc(
-        allocator,
-        try definition_core.json.field(root, "canonicalization"),
-    );
+    const canonicalization_json =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(root, "canonicalization"),
+        );
     errdefer allocator.free(canonicalization_json);
-    const identity_json = try definition_core.canonical_json.canonicalJsonAlloc(
-        allocator,
-        try definition_core.json.field(root, "identity"),
-    );
+    const identity_json =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(root, "identity"),
+        );
     errdefer allocator.free(identity_json);
-    const storage_json = try definition_core.canonical_json.canonicalJsonAlloc(
-        allocator,
-        try definition_core.json.field(root, "storage"),
-    );
+    const storage_json =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(root, "storage"),
+        );
     errdefer allocator.free(storage_json);
 
     const pointers = try compiler.pointers.toOwnedSlice(allocator);
     errdefer deinitPointers(allocator, pointers);
     const rules = try compiler.rules.toOwnedSlice(allocator);
     errdefer deinitRules(allocator, rules);
-    const owned_id = try allocator.dupe(u8, id);
-    errdefer allocator.free(owned_id);
-    const owned_owner = try allocator.dupe(u8, owner);
-    errdefer allocator.free(owned_owner);
     return .{
-        .id = owned_id,
-        .owner = owned_owner,
-        .closure_digest = closure.digest,
-        .operator_mask = operator_mask,
-        .parameter_declarations = parameter_declarations,
-        .inputs = inputs,
-        .storage_kind = storage_kind,
-        .imports = imports,
-        .pointers = pointers,
-        .rules = rules,
         .operations = operations,
         .projections = projections,
-        .bounds = bounds,
         .canonicalization_json = canonicalization_json,
         .identity_json = identity_json,
         .storage_json = storage_json,
+        .pointers = pointers,
+        .rules = rules,
     };
 }
 
@@ -699,16 +718,48 @@ pub fn encodeCacheWithDetail(
 ) !void {
     try encoder.writeU16(5);
     try encoder.writeEnum(detail);
-    try encodeCachePlan(plan, detail, encoder, 0);
+    try encodeCachePlan(plan, detail, encoder);
 }
 
 fn encodeCachePlan(
     plan: *const Plan,
     detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
-    depth: usize,
 ) !void {
-    if (depth > 32) return error.ImportDepthExceeded;
+    const step_limit: usize = 384;
+    var frames: [33]EncodeFrame = undefined;
+    frames[0] = .{ .plan = plan };
+    var frame_count: usize = 1;
+    var steps: usize = 0;
+    while (frame_count != 0 and steps < step_limit) : (steps += 1) {
+        var frame = &frames[frame_count - 1];
+        if (!frame.prefix_written) {
+            try encodePlanPrefix(frame.plan, encoder);
+            frame.prefix_written = true;
+        } else if (frame.next_import < frame.plan.imports.len) {
+            if (frame_count == frames.len) return error.ImportDepthExceeded;
+            const imported = &frame.plan.imports[frame.next_import];
+            frame.next_import += 1;
+            frames[frame_count] = .{ .plan = imported };
+            frame_count += 1;
+        } else {
+            try encodePlanSuffix(frame.plan, detail, encoder);
+            frame_count -= 1;
+        }
+    }
+    if (frame_count != 0) return error.TooManyImportedDefinitions;
+}
+
+const EncodeFrame = struct {
+    plan: *const Plan,
+    next_import: usize = 0,
+    prefix_written: bool = false,
+};
+
+fn encodePlanPrefix(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
     try encoder.writeBytes(plan.id);
     try encoder.writeBytes(plan.owner);
     try encoder.writeFixed(&plan.closure_digest);
@@ -726,9 +777,13 @@ fn encodeCachePlan(
     }
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.imports.len);
-    for (plan.imports) |*imported| {
-        try encodeCachePlan(imported, detail, encoder, depth + 1);
-    }
+}
+
+fn encodePlanSuffix(
+    plan: *const Plan,
+    detail: CacheDetail,
+    encoder: *definition_core.cache.Encoder,
+) !void {
     if (detail == .full) {
         try encoder.writeCount(plan.pointers.len);
         for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
@@ -775,13 +830,10 @@ pub fn decodeCacheWithDetail(
     if (try decoder.readEnum(CacheDetail) != expected_detail) {
         return error.LedgerPlanCacheDetailMismatch;
     }
-    var decoded_count: usize = 0;
     return decodeCachePlan(
         allocator,
         expected_detail,
         decoder,
-        0,
-        &decoded_count,
     );
 }
 
@@ -789,10 +841,98 @@ fn decodeCachePlan(
     allocator: std.mem.Allocator,
     detail: CacheDetail,
     decoder: *definition_core.cache.Decoder,
-    depth: usize,
-    decoded_count: *usize,
 ) !Plan {
-    if (depth > 32) return error.CacheImportDepthExceeded;
+    const step_limit: usize = 384;
+    var root: Plan = undefined;
+    var decoded_count: usize = 0;
+    var frames: [33]DecodeFrame = undefined;
+    frames[0] = .{
+        .prefix = try decodePlanPrefix(
+            allocator,
+            decoder,
+            &decoded_count,
+        ),
+        .target = &root,
+    };
+    var frame_count: usize = 1;
+    errdefer {
+        var index = frame_count;
+        while (index != 0) {
+            index -= 1;
+            frames[index].prefix.deinit(allocator);
+        }
+    }
+    var steps: usize = 0;
+    while (frame_count != 0 and steps < step_limit) : (steps += 1) {
+        var frame = &frames[frame_count - 1];
+        if (frame.next_import < frame.prefix.imports.len) {
+            if (frame_count == frames.len) {
+                return error.CacheImportDepthExceeded;
+            }
+            const target = &frame.prefix.imports[frame.next_import];
+            frame.next_import += 1;
+            frames[frame_count] = .{
+                .prefix = try decodePlanPrefix(
+                    allocator,
+                    decoder,
+                    &decoded_count,
+                ),
+                .target = target,
+            };
+            frame_count += 1;
+        } else {
+            try validateImportedPlans(frame.prefix.imports);
+            frame.target.* = try decodePlanSuffix(
+                allocator,
+                detail,
+                decoder,
+                &frame.prefix,
+            );
+            frame_count -= 1;
+            if (frame_count != 0) {
+                frames[frame_count - 1].prefix.imports_initialized += 1;
+            }
+        }
+    }
+    if (frame_count != 0) return error.CacheImportCountExceeded;
+    return root;
+}
+
+const DecodeFrame = struct {
+    prefix: DecodedPrefix,
+    target: *Plan,
+    next_import: usize = 0,
+};
+
+const DecodedPrefix = struct {
+    id: []u8,
+    owner: []u8,
+    closure_digest: [71]u8,
+    operator_mask: u128,
+    parameter_declarations: definition_core.parameters.Declarations,
+    inputs: []Input,
+    storage_kind: StorageKind,
+    imports: []Plan,
+    imports_initialized: usize = 0,
+
+    fn deinit(self: *DecodedPrefix, allocator: std.mem.Allocator) void {
+        for (self.imports[0..self.imports_initialized]) |*imported| {
+            imported.deinit(allocator);
+        }
+        allocator.free(self.imports);
+        deinitInputs(allocator, self.inputs);
+        self.parameter_declarations.deinit(allocator);
+        allocator.free(self.owner);
+        allocator.free(self.id);
+        self.* = undefined;
+    }
+};
+
+fn decodePlanPrefix(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    decoded_count: *usize,
+) !DecodedPrefix {
     decoded_count.* = std.math.add(
         usize,
         decoded_count.*,
@@ -809,14 +949,7 @@ fn decodeCachePlan(
     @memcpy(&closure_digest, try decoder.readFixed(closure_digest.len));
     try definition_core.json.digest(&closure_digest);
     const operator_mask = try decoder.readU128();
-    var known_operator_mask: u128 = 0;
-    inline for (@typeInfo(Operator).@"enum".fields) |field| {
-        const operator: Operator = @enumFromInt(field.value);
-        if (operator.supported()) {
-            known_operator_mask |= operatorBit(operator);
-        }
-    }
-    if ((operator_mask & ~known_operator_mask) != 0) {
+    if ((operator_mask & ~knownOperatorMask()) != 0) {
         return error.CacheArtifactOperatorInvalid;
     }
     var parameter_declarations = try definition_core.parameters.decodeCache(
@@ -829,24 +962,101 @@ fn decodeCachePlan(
     const storage_kind = try decoder.readEnum(StorageKind);
     const import_count = try decoder.readCount(128);
     const imports = try allocator.alloc(Plan, import_count);
-    var imports_initialized: usize = 0;
-    errdefer {
-        for (imports[0..imports_initialized]) |*imported| {
-            imported.deinit(allocator);
-        }
-        allocator.free(imports);
+    errdefer allocator.free(imports);
+    return .{
+        .id = id,
+        .owner = owner,
+        .closure_digest = closure_digest,
+        .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
+        .inputs = inputs,
+        .storage_kind = storage_kind,
+        .imports = imports,
+    };
+}
+
+fn knownOperatorMask() u128 {
+    var result: u128 = 0;
+    inline for (@typeInfo(Operator).@"enum".fields) |field| {
+        const operator: Operator = @enumFromInt(field.value);
+        if (operator.supported()) result |= operatorBit(operator);
     }
-    for (imports) |*imported| {
-        imported.* = try decodeCachePlan(
-            allocator,
-            detail,
-            decoder,
-            depth + 1,
-            decoded_count,
-        );
-        imports_initialized += 1;
+    return result;
+}
+
+fn decodePlanSuffix(
+    allocator: std.mem.Allocator,
+    detail: CacheDetail,
+    decoder: *definition_core.cache.Decoder,
+    prefix: *DecodedPrefix,
+) !Plan {
+    var compiled = try decodeCompiledDefinition(
+        allocator,
+        detail,
+        decoder,
+        prefix,
+    );
+    errdefer compiled.deinit(allocator);
+    const bounds = try decodeBounds(decoder);
+    const canonicalization_json = try decodeDefinitionJson(
+        allocator,
+        detail,
+        decoder,
+    );
+    errdefer allocator.free(canonicalization_json);
+    const identity_json = try decodeDefinitionJson(
+        allocator,
+        detail,
+        decoder,
+    );
+    errdefer allocator.free(identity_json);
+    const storage_json = try decodeDefinitionJson(
+        allocator,
+        detail,
+        decoder,
+    );
+    errdefer allocator.free(storage_json);
+    return .{
+        .id = prefix.id,
+        .owner = prefix.owner,
+        .closure_digest = prefix.closure_digest,
+        .operator_mask = prefix.operator_mask,
+        .parameter_declarations = prefix.parameter_declarations,
+        .inputs = prefix.inputs,
+        .storage_kind = prefix.storage_kind,
+        .imports = prefix.imports,
+        .pointers = compiled.pointers,
+        .rules = compiled.rules,
+        .operations = compiled.operations,
+        .projections = compiled.projections,
+        .bounds = bounds,
+        .canonicalization_json = canonicalization_json,
+        .identity_json = identity_json,
+        .storage_json = storage_json,
+    };
+}
+
+const DecodedDefinition = struct {
+    pointers: [][]u8,
+    rules: []Rule,
+    operations: []NamedPlan,
+    projections: []NamedPlan,
+
+    fn deinit(self: *DecodedDefinition, allocator: std.mem.Allocator) void {
+        deinitNamedPlans(allocator, self.projections);
+        deinitNamedPlans(allocator, self.operations);
+        deinitRules(allocator, self.rules);
+        deinitPointers(allocator, self.pointers);
+        self.* = undefined;
     }
-    try validateImportedPlans(imports);
+};
+
+fn decodeCompiledDefinition(
+    allocator: std.mem.Allocator,
+    detail: CacheDetail,
+    decoder: *definition_core.cache.Decoder,
+    prefix: *const DecodedPrefix,
+) !DecodedDefinition {
     const pointers = if (detail == .full)
         try decodePointers(allocator, decoder)
     else
@@ -856,8 +1066,8 @@ fn decodeCachePlan(
         try decodeRules(
             allocator,
             decoder,
-            operator_mask,
-            imports.len,
+            prefix.operator_mask,
+            prefix.imports.len,
             pointers.len,
         )
     else
@@ -873,7 +1083,16 @@ fn decodeCachePlan(
     else
         try allocator.alloc(NamedPlan, 0);
     errdefer deinitNamedPlans(allocator, projections);
-    const bounds: Bounds = .{
+    return .{
+        .pointers = pointers,
+        .rules = rules,
+        .operations = operations,
+        .projections = projections,
+    };
+}
+
+fn decodeBounds(decoder: *definition_core.cache.Decoder) !Bounds {
+    const result: Bounds = .{
         .max_input_bytes = try decoder.readUsize(),
         .max_store_bytes = try decoder.readUsize(),
         .max_records = try decoder.readUsize(),
@@ -881,40 +1100,19 @@ fn decodeCachePlan(
         .max_diagnostics = try decoder.readUsize(),
         .max_reducer_states = try decoder.readUsize(),
     };
-    try validateBounds(bounds);
-    const canonicalization_json = if (detail == .full)
+    try validateBounds(result);
+    return result;
+}
+
+fn decodeDefinitionJson(
+    allocator: std.mem.Allocator,
+    detail: CacheDetail,
+    decoder: *definition_core.cache.Decoder,
+) ![]u8 {
+    return if (detail == .full)
         try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
     else
         try allocator.alloc(u8, 0);
-    errdefer allocator.free(canonicalization_json);
-    const identity_json = if (detail == .full)
-        try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
-    else
-        try allocator.alloc(u8, 0);
-    errdefer allocator.free(identity_json);
-    const storage_json = if (detail == .full)
-        try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
-    else
-        try allocator.alloc(u8, 0);
-    errdefer allocator.free(storage_json);
-    return .{
-        .id = id,
-        .owner = owner,
-        .closure_digest = closure_digest,
-        .operator_mask = operator_mask,
-        .parameter_declarations = parameter_declarations,
-        .inputs = inputs,
-        .storage_kind = storage_kind,
-        .imports = imports,
-        .pointers = pointers,
-        .rules = rules,
-        .operations = operations,
-        .projections = projections,
-        .bounds = bounds,
-        .canonicalization_json = canonicalization_json,
-        .identity_json = identity_json,
-        .storage_json = storage_json,
-    };
 }
 
 fn encodeNamedPlans(
@@ -1128,49 +1326,15 @@ fn parseImportedPlans(
     }
     const base_dir = std.fs.path.dirname(entry_path) orelse "";
     for (items.items, 0..) |item, index| {
-        var declared_id: ?[]const u8 = null;
-        const raw_path = switch (item) {
-            .string => |path| path,
-            .object => |object| blk: {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "id", "path" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "id", "path" },
-                );
-                declared_id = try definition_core.json.requiredString(
-                    object,
-                    "id",
-                );
-                try definition_core.json.safeIdentifier(declared_id.?, 256);
-                break :blk try definition_core.json.requiredString(
-                    object,
-                    "path",
-                );
-            },
-            else => return error.InvalidImports,
-        };
-        const normalized = try definition_core.closure.normalizeRelativeAlloc(
-            allocator,
-            base_dir,
-            raw_path,
-        );
-        defer allocator.free(normalized);
-        imports[index] = try compileAtDepth(
+        imports[index] = try compileImportedPlan(
             allocator,
             closure,
-            normalized,
-            depth + 1,
+            base_dir,
+            item,
+            depth,
             compiled_count,
         );
         initialized += 1;
-        if (declared_id) |expected| {
-            if (!std.mem.eql(u8, expected, imports[index].id)) {
-                return error.ImportedDefinitionIdMismatch;
-            }
-        }
     }
     std.sort.heap(Plan, imports, {}, struct {
         fn lessThan(_: void, left: Plan, right: Plan) bool {
@@ -1179,6 +1343,69 @@ fn parseImportedPlans(
     }.lessThan);
     try validateImportedPlans(imports);
     return imports;
+}
+
+const ImportSpec = struct {
+    path: []const u8,
+    declared_id: ?[]const u8,
+};
+
+fn parseImportSpec(value: std.json.Value) !ImportSpec {
+    return switch (value) {
+        .string => |path| .{ .path = path, .declared_id = null },
+        .object => |object| result: {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "id", "path" },
+            );
+            try definition_core.json.requireFields(
+                object,
+                &.{ "id", "path" },
+            );
+            const declared_id =
+                try definition_core.json.requiredString(object, "id");
+            try definition_core.json.safeIdentifier(declared_id, 256);
+            break :result .{
+                .path = try definition_core.json.requiredString(
+                    object,
+                    "path",
+                ),
+                .declared_id = declared_id,
+            };
+        },
+        else => error.InvalidImports,
+    };
+}
+
+fn compileImportedPlan(
+    allocator: std.mem.Allocator,
+    closure: *const definition_core.Closure,
+    base_dir: []const u8,
+    value: std.json.Value,
+    depth: usize,
+    compiled_count: *usize,
+) anyerror!Plan {
+    const spec = try parseImportSpec(value);
+    const normalized = try definition_core.closure.normalizeRelativeAlloc(
+        allocator,
+        base_dir,
+        spec.path,
+    );
+    defer allocator.free(normalized);
+    var plan = try compileAtDepth(
+        allocator,
+        closure,
+        normalized,
+        depth + 1,
+        compiled_count,
+    );
+    errdefer plan.deinit(allocator);
+    if (spec.declared_id) |expected| {
+        if (!std.mem.eql(u8, expected, plan.id)) {
+            return error.ImportedDefinitionIdMismatch;
+        }
+    }
+    return plan;
 }
 
 fn validateImportedPlans(imports: []const Plan) !void {
@@ -1358,21 +1585,44 @@ fn rejectExecutableKeys(object: std.json.ObjectMap) !void {
     }
 }
 
-fn rejectExecutableFields(value: std.json.Value, depth: usize) !void {
-    if (depth > 64) return error.ArtifactRuleDepthExceeded;
-    switch (value) {
-        .object => |object| {
-            try rejectExecutableKeys(object);
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try rejectExecutableFields(entry.value_ptr.*, depth + 1);
-            }
-        },
-        .array => |items| for (items.items) |item| {
-            try rejectExecutableFields(item, depth + 1);
-        },
-        else => {},
+const ExecutableFieldNode = struct {
+    value: std.json.Value,
+    depth: usize,
+};
+
+fn rejectExecutableFields(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const node_limit: usize = 65_536;
+    var pending: std.ArrayList(ExecutableFieldNode) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, .{ .value = value, .depth = 0 });
+    var visited: usize = 0;
+    while (pending.items.len != 0 and visited < node_limit) : (visited += 1) {
+        const node = pending.pop().?;
+        if (node.depth > 64) return error.ArtifactRuleDepthExceeded;
+        switch (node.value) {
+            .object => |object| {
+                try rejectExecutableKeys(object);
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    try pending.append(allocator, .{
+                        .value = entry.value_ptr.*,
+                        .depth = node.depth + 1,
+                    });
+                }
+            },
+            .array => |items| for (items.items) |item| {
+                try pending.append(allocator, .{
+                    .value = item,
+                    .depth = node.depth + 1,
+                });
+            },
+            else => {},
+        }
     }
+    if (pending.items.len != 0) return error.ArtifactRuleNodeLimitExceeded;
 }
 
 fn validateJsonPointer(pointer: []const u8) !void {
@@ -1424,29 +1674,124 @@ fn deinitNamedPlans(allocator: std.mem.Allocator, plans: []NamedPlan) void {
     allocator.free(plans);
 }
 
+const compiled_definition_json =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/record",
+    \\  "owner":"example",
+    \\  "requires":{
+    \\    "abi":"ledger-artifact-abi/v1",
+    \\    "operators":[
+    \\      "canonical-json","exact-object","scalar-type","enum",
+    \\      "content-address","immutable-document","create-new","select"
+    \\    ]
+    \\  },
+    \\  "inputs":{"record":{"codec":"json","max_bytes":1048576}},
+    \\  "canonicalization":{"steps":[
+    \\    {"op":"canonical-json","input":"record"}
+    \\  ]},
+    \\  "shape":{"rules":[
+    \\    {"op":"exact-object","path":"","keys":["schema","record_id","value"]},
+    \\    {"op":"scalar-type","path":"/schema","type":"string"},
+    \\    {"op":"enum","path":"/schema","values":["example-record/v1"]}
+    \\  ]},
+    \\  "constraints":[],
+    \\  "identity":{
+    \\    "op":"content-address","input":"record","exclude":"/record_id"
+    \\  },
+    \\  "storage":{"kind":"addressed-document","slots":[
+    \\    {"op":"immutable-document","name":"records"}
+    \\  ]},
+    \\  "operations":{"create":{"effects":[
+    \\    {"op":"create-new","slot":"records"}
+    \\  ]}},
+    \\  "projections":{"show":{"pipeline":[
+    \\    {"op":"select","fields":["record_id","value"]}
+    \\  ]}},
+    \\  "diagnostics":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":1048576,
+    \\    "max_store_bytes":16777216,
+    \\    "max_records":10000,
+    \\    "max_output_bytes":1048576,
+    \\    "max_diagnostics":64,
+    \\    "max_reducer_states":256
+    \\  }
+    \\}
+;
+
+const hook_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/hook\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{\"hook\":\"run\"}," ++
+    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
+const nested_hook_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/nested-hook\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"exact-object\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"exact-object\"," ++
+    "\"path\":\"\",\"keys\":[],\"extension\":{\"hook\":\"run\"}}]}," ++
+    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
+const undeclared_operator_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/operator\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"scalar-type\"," ++
+    "\"path\":\"/value\",\"type\":\"string\"}]}," ++
+    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
+const unsupported_operator_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/unsupported\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"set-order\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{},\"constraints\":[]," ++
+    "\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
+const inert_command_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/inert-command\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"exact-object\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"exact-object\"," ++
+    "\"path\":\"\",\"keys\":[\"argv\",\"command\"]}]}," ++
+    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
 test "artifact definition compiles structural rules and effect plans" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{
-        \\  "schema":"ledger-artifact-definition/v1",
-        \\  "id":"example/record",
-        \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","exact-object","scalar-type","enum","content-address","immutable-document","create-new","select"]},
-        \\  "inputs":{"record":{"codec":"json","max_bytes":1048576}},
-        \\  "canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},
-        \\  "shape":{"rules":[{"op":"exact-object","path":"","keys":["schema","record_id","value"]},{"op":"scalar-type","path":"/schema","type":"string"},{"op":"enum","path":"/schema","values":["example-record/v1"]}]},
-        \\  "constraints":[],
-        \\  "identity":{"op":"content-address","input":"record","exclude":"/record_id"},
-        \\  "storage":{"kind":"addressed-document","slots":[{"op":"immutable-document","name":"records"}]},
-        \\  "operations":{"create":{"effects":[{"op":"create-new","slot":"records"}]}},
-        \\  "projections":{"show":{"pipeline":[{"op":"select","fields":["record_id","value"]}]}},
-        \\  "diagnostics":{},
-        \\  "bounds":{"max_input_bytes":1048576,"max_store_bytes":16777216,"max_records":10000,"max_output_bytes":1048576,"max_diagnostics":64,"max_reducer_states":256}
-        \\}
-        ,
+        .data = compiled_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1494,9 +1839,7 @@ test "artifact definition rejects executable hooks and undeclared operators" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "hook.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/hook","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"hook":"run"},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
-        ,
+        .data = hook_definition_json,
     });
     var hook_closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1512,9 +1855,7 @@ test "artifact definition rejects executable hooks and undeclared operators" {
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "nested-hook.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/nested-hook","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":[],"extension":{"hook":"run"}}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
-        ,
+        .data = nested_hook_definition_json,
     });
     var nested_hook_closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1530,9 +1871,7 @@ test "artifact definition rejects executable hooks and undeclared operators" {
 
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "operator.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/operator","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"scalar-type","path":"/value","type":"string"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
-        ,
+        .data = undeclared_operator_definition_json,
     });
     var operator_closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1552,9 +1891,7 @@ test "artifact definition rejects named but unimplemented operators" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/unsupported","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["set-order"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
-        ,
+        .data = unsupported_operator_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1574,9 +1911,7 @@ test "artifact definition permits inert command data fields" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "inert.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/inert-command","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["argv","command"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":1,"max_reducer_states":1}}
-        ,
+        .data = inert_command_definition_json,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
