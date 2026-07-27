@@ -108,9 +108,30 @@ done < <(jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite")
 source_definition="$dotfiles_root/codex/skills/synesthesia/definitions/ledger/synesthesia-protocol.json"
 source_submission="$scratch/source-submission.json"
 source_transaction="$scratch/source-transaction.json"
+assert_source_doctor() {
+  local repo=$1
+  local state=$2
+  local healthy=$3
+  local expected_exit=$4
+
+  assert_ledger_doctor_slot_state \
+    "$ledger_bin" "$source_definition" "$repo" events \
+    "$state" "$healthy" "$expected_exit" "$scratch/doctor-$state.json"
+}
+
 projection_repo="$scratch/projection-repo"
 mkdir -p "$projection_repo"
 projection_repo=$(cd "$projection_repo" && pwd -P)
+assert_source_doctor "$projection_repo" missing true 0
+
+unbound_repo="$scratch/unbound-repo"
+mkdir -p "$unbound_repo/.ledger/synesthesia"
+unbound_repo=$(cd "$unbound_repo" && pwd -P)
+jq -nc \
+  '{schema: "synesthesia-event/v1"}' \
+  >"$unbound_repo/.ledger/synesthesia/events.jsonl"
+assert_source_doctor "$unbound_repo" invalid false 2
+
 jq -S -c '.source' "$scratch/mapping-endorsement.json" >"$source_submission"
 "$ledger_bin" transact \
   --definition "$source_definition" \
@@ -119,6 +140,7 @@ jq -S -c '.source' "$scratch/mapping-endorsement.json" >"$source_submission"
   --input "submission=$source_submission" \
   --format json >"$source_transaction"
 source_id=$(jq -r '.generated_outputs.syn_id' "$source_transaction")
+assert_source_doctor "$projection_repo" current true 0
 jq -r '.returned_content' "$source_transaction" >"$scratch/expected-record.json"
 "$ledger_bin" project \
   --definition "$source_definition" \
@@ -214,6 +236,6 @@ cmp -s "$scratch/expected-recall.json" "$scratch/actual-recall.json"
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=3\n' \
   "$valid_count" \
   "$invalid_count"

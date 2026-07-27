@@ -152,3 +152,37 @@ verify_definition_suite_digest() {
     "$expected" \
     "$scratch/reconstructed-digest-set.json"
 }
+
+assert_ledger_doctor_slot_state() {
+  local ledger_bin=$1
+  local definition=$2
+  local repo=$3
+  local slot_name=$4
+  local expected_state=$5
+  local expected_healthy=$6
+  local expected_exit=$7
+  local output=$8
+  local doctor_exit
+
+  set +e
+  "$ledger_bin" doctor \
+    --definition "$definition" \
+    --repo "$repo" \
+    --format json >"$output"
+  doctor_exit=$?
+  set -e
+  [[ "$doctor_exit" -eq "$expected_exit" ]]
+  jq -e \
+    --arg slot_name "$slot_name" \
+    --arg expected_state "$expected_state" \
+    --argjson expected_healthy "$expected_healthy" \
+    '.schema == "ledger-doctor-result/v1" and
+     .healthy == $expected_healthy and
+     .authority_granted == false and
+     .storage_mutated == false and
+     any(.slots[];
+       .name == $slot_name and
+       .status == $expected_state and
+       .healthy == $expected_healthy)' \
+    "$output" >/dev/null
+}
