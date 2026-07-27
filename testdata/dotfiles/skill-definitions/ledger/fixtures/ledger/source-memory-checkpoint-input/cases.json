@@ -1,50 +1,40 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "complete"
-  ],
-  "valid": [
-    {
-      "id": "unborn-head",
+  "valid": {
+    "unborn-head": {
       "set": {
         "/subject/head_oid": null
       }
     }
-  ],
-  "invalid": [
-    {
-      "id": "missing-changed-paths",
+  },
+  "invalid": {
+    "missing-changed-paths": {
       "remove": [
         "/evidence/changed_paths"
       ]
     },
-    {
-      "id": "absolute-changed-path",
+    "absolute-changed-path": {
       "set": {
         "/evidence/changed_paths/0": "/tmp/outside"
       }
     },
-    {
-      "id": "unbound-workspace-fingerprint",
+    "unbound-workspace-fingerprint": {
       "set": {
         "/subject/workspace_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     },
-    {
-      "id": "nested-evidence-array",
+    "nested-evidence-array": {
       "set": {
         "/evidence/attempted_routes/0": [
           "route"
         ]
       }
     },
-    {
-      "id": "empty-decision-delta",
+    "empty-decision-delta": {
       "set": {
         "/evidence/decision_delta": " "
       }
     }
-  ],
+  },
   "materializations": {
     "complete": {
       "artifact_id": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7",

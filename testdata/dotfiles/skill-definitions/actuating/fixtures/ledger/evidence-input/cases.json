@@ -1,26 +1,12 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "effect-recorded",
-    "operation-aborted",
-    "operation-observed",
-    "publication-observed",
-    "review-attempt-completed",
-    "review-attempt-started",
-    "review-campaign-started",
-    "review-request-bound",
-    "review-transport-failed"
-  ],
-  "invalid": [
-    {
-      "id": "body-schema-mismatch",
+  "invalid": {
+    "body-schema-mismatch": {
       "base": "operation-aborted",
       "set": {
         "/body/schema": "operation-observed/v1"
       }
     },
-    {
-      "id": "duplicate-findings",
+    "duplicate-findings": {
       "base": "review-attempt-completed",
       "set": {
         "/body/verdict": "findings",
@@ -31,16 +17,14 @@
         "/body/receipt_ref": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
       }
     },
-    {
-      "id": "empty-evidence-refs",
+    "empty-evidence-refs": {
       "base": "operation-observed",
       "set": {
         "/body/discharged_refs": [],
         "/body/evidence_refs": []
       }
     },
-    {
-      "id": "unknown-kind",
+    "unknown-kind": {
       "base": "operation-aborted",
       "set": {
         "/kind": "unknown"
@@ -51,6 +35,6 @@
         "/body/reason"
       ]
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:61903b1df8cd5f8deb681c9e91f004e4beadc17b9ee5ed10656cb000d2ca8fd4"
 }

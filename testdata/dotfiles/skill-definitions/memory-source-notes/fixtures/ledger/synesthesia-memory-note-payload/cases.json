@@ -1,11 +1,6 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "mapping-endorsement"
-  ],
-  "valid": [
-    {
-      "id": "mapping-confirmation",
+  "valid": {
+    "mapping-confirmation": {
       "set": {
         "/source/logical_kind": "mapping-confirmation",
         "/source/record/authority": "repeated-accepted-use",
@@ -16,8 +11,7 @@
         ]
       }
     },
-    {
-      "id": "mapping-correction",
+    "mapping-correction": {
       "set": {
         "/source/logical_kind": "mapping-correction",
         "/source/physical_kind": "mapping-correction",
@@ -27,8 +21,7 @@
         "/source/record/supersedes_id": "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
       }
     },
-    {
-      "id": "mapping-rejection",
+    "mapping-rejection": {
       "set": {
         "/source/logical_kind": "mapping-rejection",
         "/source/physical_kind": "mapping-rejection",
@@ -40,15 +33,13 @@
         ]
       }
     },
-    {
-      "id": "activation-boundary",
+    "activation-boundary": {
       "set": {
         "/source/logical_kind": "activation-boundary",
         "/source/physical_kind": "activation-boundary"
       }
     },
-    {
-      "id": "boundary-retraction",
+    "boundary-retraction": {
       "set": {
         "/source/logical_kind": "boundary-retraction",
         "/source/physical_kind": "boundary-retraction",
@@ -60,8 +51,7 @@
         ]
       }
     },
-    {
-      "id": "scope-global",
+    "scope-global": {
       "set": {
         "/source/record/scope/kind": "global",
         "/source/record/scope/paths": [],
@@ -71,8 +61,7 @@
         "/scope_anchor_source": "kind"
       }
     },
-    {
-      "id": "scope-path-family-whitespace",
+    "scope-path-family-whitespace": {
       "set": {
         "/source/record/scope/kind": "path-family",
         "/source/record/scope/paths": [
@@ -82,8 +71,7 @@
         "/source/record/payload/scope_anchor": " "
       }
     },
-    {
-      "id": "scope-repo-whitespace",
+    "scope-repo-whitespace": {
       "set": {
         "/source/record/scope/paths": [],
         "/source/record/scope/repo": " ",
@@ -91,59 +79,51 @@
         "/scope_anchor_source": "repo"
       }
     }
-  ],
-  "invalid": [
-    {
-      "id": "confirmation-without-prior",
+  },
+  "invalid": {
+    "confirmation-without-prior": {
       "set": {
         "/source/logical_kind": "mapping-confirmation",
         "/source/record/operation": "confirm"
       }
     },
-    {
-      "id": "endorsement-mismatch",
+    "endorsement-mismatch": {
       "set": {
         "/source/record/payload/endorsement_type": "repeated-accepted-use"
       }
     },
-    {
-      "id": "malformed-prior-id",
+    "malformed-prior-id": {
       "set": {
         "/source/record/related_ids": [
           "MSN-invalid"
         ]
       }
     },
-    {
-      "id": "mapping-without-translation",
+    "mapping-without-translation": {
       "remove": [
         "/source/record/payload/engineering_translation"
       ]
     },
-    {
-      "id": "physical-kind-mismatch",
+    "physical-kind-mismatch": {
       "set": {
         "/source/physical_kind": "mapping-correction"
       }
     },
-    {
-      "id": "scope-mapping-mismatch",
+    "scope-mapping-mismatch": {
       "set": {
         "/source/record/payload/scope": "global_default"
       }
     },
-    {
-      "id": "scope-anchor-priority",
+    "scope-anchor-priority": {
       "set": {
         "/source/record/payload/scope_anchor": "owner/repo"
       }
     },
-    {
-      "id": "sensitive-nested-key",
+    "sensitive-nested-key": {
       "set": {
         "/source/record/payload/secret": "redacted"
       }
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:6903a6b563fb3f40e4a96a93a6dbd0c1de5286981355abf5d196dabad6b2721c"
 }

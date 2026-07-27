@@ -1,27 +1,20 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "reviewed"
-  ],
-  "invalid": [
-    {
-      "id": "empty-reason",
+  "invalid": {
+    "empty-reason": {
       "set": {
         "/decisions/learnings/lrn-20260727T032727Z-e3769968/reason": ""
       }
     },
-    {
-      "id": "unknown-disposition",
+    "unknown-disposition": {
       "set": {
         "/decisions/learnings/lrn-20260727T032727Z-e3769968/disposition": "candidate"
       }
     },
-    {
-      "id": "unknown-source",
+    "unknown-source": {
       "set": {
         "/decisions/other": {}
       }
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:921fa8843cc43a02bc9530cf69e1888c3890b49dd375274a1b02539d431361cf"
 }

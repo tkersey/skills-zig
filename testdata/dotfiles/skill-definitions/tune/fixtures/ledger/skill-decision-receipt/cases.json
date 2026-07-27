@@ -1,11 +1,6 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "complete"
-  ],
-  "valid": [
-    {
-      "id": "minimal",
+  "valid": {
+    "minimal": {
       "remove": [
         "/skill_decision_receipt/alternatives_considered",
         "/skill_decision_receipt/clause_refs",
@@ -18,35 +13,31 @@
         "/skill_decision_receipt/trigger_refs"
       ]
     }
-  ],
-  "invalid": [
-    {
-      "id": "selected-route-rejected",
+  },
+  "invalid": {
+    "selected-route-rejected": {
       "set": {
         "/skill_decision_receipt/rejected_routes": [
           "route-a"
         ]
       }
     },
-    {
-      "id": "missing-artifact-state",
+    "missing-artifact-state": {
       "remove": [
         "/skill_decision_receipt/artifact_state"
       ]
     },
-    {
-      "id": "unstable-decision-id",
+    "unstable-decision-id": {
       "set": {
         "/skill_decision_receipt/decision_id": "x"
       }
     },
-    {
-      "id": "non-string-clause-ref",
+    "non-string-clause-ref": {
       "set": {
         "/skill_decision_receipt/clause_refs/0": 1
       }
     }
-  ],
+  },
   "materializations": {
     "complete": {
       "artifact_id": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070",

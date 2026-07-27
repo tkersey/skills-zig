@@ -1,23 +1,17 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "passing"
-  ],
-  "invalid": [
-    {
-      "id": "empty-argv",
+  "invalid": {
+    "empty-argv": {
       "set": {
         "/verifier/argv": [],
         "/output_digests": []
       }
     },
-    {
-      "id": "non-integer-exit",
+    "non-integer-exit": {
       "set": {
         "/exit_status": "pass",
         "/output_digests": []
       }
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:093aef565be4c98724bedd117b954fd31c2e0bc67a1683be0abd4355a86bfe60"
 }

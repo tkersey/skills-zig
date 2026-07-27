@@ -1,15 +1,6 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "oracle": {
-    "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
-    "ledger_version": "0.13.3"
-  },
-  "bases": [
-    "complete-all-no-op"
-  ],
-  "valid": [
-    {
-      "id": "degraded-after-canonical-success",
+  "valid": {
+    "degraded-after-canonical-success": {
       "set": {
         "/participants/learnings": {
           "admission": "blocked",
@@ -25,8 +16,7 @@
         "/evidence_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       }
     },
-    {
-      "id": "blocked-canonical-participant",
+    "blocked-canonical-participant": {
       "set": {
         "/participants/negative-ledger": {
           "admission": "not-applicable",
@@ -36,16 +26,14 @@
         "/status": "blocked"
       }
     }
-  ],
-  "invalid": [
-    {
-      "id": "missing-participant",
+  },
+  "invalid": {
+    "missing-participant": {
       "remove": [
         "/participants/negative-ledger"
       ]
     },
-    {
-      "id": "candidate-cannot-create-note",
+    "candidate-cannot-create-note": {
       "set": {
         "/participants/synesthesia": {
           "admission": "created",
@@ -55,20 +43,17 @@
         }
       }
     },
-    {
-      "id": "degraded-without-admission-failure",
+    "degraded-without-admission-failure": {
       "set": {
         "/status": "degraded"
       }
     },
-    {
-      "id": "blocked-without-canonical-failure",
+    "blocked-without-canonical-failure": {
       "set": {
         "/status": "blocked"
       }
     },
-    {
-      "id": "canonical-write-needs-proof",
+    "canonical-write-needs-proof": {
       "set": {
         "/participants/learnings": {
           "admission": "not-eligible",
@@ -78,8 +63,7 @@
         }
       }
     },
-    {
-      "id": "record-id-prefix-mismatch",
+    "record-id-prefix-mismatch": {
       "set": {
         "/participants/learnings": {
           "admission": "duplicate-skip",
@@ -90,7 +74,7 @@
         }
       }
     }
-  ],
+  },
   "materializations": {
     "complete-all-no-op": {
       "artifact_id": "sha256:b028068be64931408170c944d55b4f2e4dfb23aa76ba006be55b562f9879dc61",

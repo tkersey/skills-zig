@@ -15,6 +15,36 @@ command -v jq >/dev/null
 command -v "$seq_bin" >/dev/null
 command -v "$ledger_bin" >/dev/null
 
+conformance_index="$skills_zig_root/testdata/dotfiles/skill-definitions/conformance.json"
+[[ -f "$conformance_index" && ! -L "$conformance_index" ]]
+jq -e \
+  '
+    type == "object" and
+    (keys | sort) == ["cases_schema", "oracle", "schema"] and
+    .schema == "ledger-definition-conformance-index/v1" and
+    .cases_schema == "ledger-definition-conformance-cases/v5" and
+    (.oracle | type == "object") and
+    (.oracle | keys | sort) ==
+      ["definitions", "ledger_version", "skills_zig_commit"] and
+    (.oracle.skills_zig_commit |
+      type == "string" and test("^[0-9a-f]{40}$")) and
+    (.oracle.ledger_version |
+      type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+    (.oracle.definitions |
+      type == "array" and length > 0 and
+      all(.[]; type == "string" and
+        test("^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$")) and
+      (unique | length) == length)
+  ' \
+  "$conformance_index" >/dev/null
+
+while IFS= read -r oracle_definition; do
+  oracle_skill=${oracle_definition%%/*}
+  oracle_name=${oracle_definition#*/}
+  oracle_suite="$skills_zig_root/testdata/dotfiles/skill-definitions/$oracle_skill/fixtures/ledger/$oracle_name/cases.json"
+  [[ -f "$oracle_suite" && ! -L "$oracle_suite" ]]
+done < <(jq -r '.oracle.definitions[]' "$conformance_index")
+
 manifests=$(rg --files codex/skills | LC_ALL=C sort | grep '/definitions/manifest\.json$' || true)
 if [[ -z "$manifests" ]]; then
   echo "no skill definition manifests found" >&2
@@ -79,12 +109,19 @@ for manifest in $manifests; do
             "$definition"
         )
         fixture_root="$skills_zig_root/testdata/dotfiles/skill-definitions/$expected_skill/fixtures/ledger/${id##*/}"
-        fixture_suite="$fixture_root/cases.json"
-        if [[ -f "$fixture_suite" && ! -L "$fixture_suite" ]]; then
+        fixture_source="$fixture_root/cases.json"
+        if [[ -f "$fixture_source" && ! -L "$fixture_source" ]]; then
           if [[ "$required_input_count" -ne 1 ]]; then
             echo "$fixture_root requires an explicit multi-input fixture runner" >&2
             exit 1
           fi
+          fixture_tmp=$(mktemp -d)
+          fixture_suite="$fixture_tmp/suite.json"
+          materialize_definition_suite \
+            "$fixture_root" \
+            "$fixture_source" \
+            "$fixture_suite" \
+            "$fixture_tmp"
           input_name=$(
             jq -r \
               '.inputs | to_entries[] |
@@ -100,46 +137,39 @@ for manifest in $manifests; do
                 "bases",
                 "invalid",
                 "materializations",
-                "oracle",
                 "reconstructed_cases_digest",
-                "schema",
                 "valid"
               ]) | length) == 0 and
-              .schema == "ledger-definition-conformance-cases/v4" and
               (.reconstructed_cases_digest |
                 type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-              (.oracle == null or (
-                (.oracle | type == "object") and
-                (.oracle | keys | sort) ==
-                  ["ledger_version", "skills_zig_commit"] and
-                (.oracle.skills_zig_commit |
-                  type == "string" and test("^[0-9a-f]{40}$")) and
-                (.oracle.ledger_version |
-                  type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
-              )) and
               (.bases | type == "array" and length > 0) and
               (.bases | unique | length) == (.bases | length) and
               all(.bases[];
                 type == "string" and test("^[A-Za-z0-9._-]+$")
               ) and
-              ((.valid // []) | type == "array") and
-              ((.invalid // []) | type == "array") and
-              all([(.valid // [])[], (.invalid // [])[]][];
-                type == "object" and
-                ((keys - ["base", "id", "remove", "set"]) | length) == 0 and
-                (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-                (.base == null or (
-                  .base as $base |
+              ((.valid // {}) | type == "object") and
+              ((.invalid // {}) | type == "object") and
+              all([
+                ((.valid // {}) | to_entries[]),
+                ((.invalid // {}) | to_entries[])
+              ][];
+                (.key |
+                  type == "string" and test("^[A-Za-z0-9._-]+$")) and
+                (.value | type == "object") and
+                .value as $case |
+                (($case | keys - ["base", "remove", "set"]) | length) == 0 and
+                ($case.base == null or (
+                  $case.base as $base |
                   ($base | type == "string") and
                   ($suite.bases | index($base)) != null
                 )) and
-                (.base != null or ($suite.bases | length) == 1)
+                ($case.base != null or ($suite.bases | length) == 1)
               ) and
               (
                 [
                   $suite.bases[],
-                  ($suite.valid // [])[].id,
-                  ($suite.invalid // [])[].id
+                  (($suite.valid // {}) | keys[]),
+                  (($suite.invalid // {}) | keys[])
                 ] as $case_ids |
                 ($case_ids | unique | length) == ($case_ids | length)
               ) and
@@ -148,7 +178,7 @@ for manifest in $manifests; do
                 . as $materialization |
                 (
                   $suite.bases +
-                  [($suite.valid // [])[].id]
+                  (($suite.valid // {}) | keys)
                 | index($materialization.key)
                 ) != null and
                 ($materialization.value | type == "object") and
@@ -163,7 +193,6 @@ for manifest in $manifests; do
             "$fixture_suite" >/dev/null
           validate_json_pointer_deltas "$fixture_suite"
 
-          fixture_tmp=$(mktemp -d)
           reconstructed_digests="$fixture_tmp/reconstructed-digests.jsonl"
           : >"$reconstructed_digests"
           while IFS=$'\t' read -r case_id expectation; do

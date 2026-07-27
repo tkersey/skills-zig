@@ -106,12 +106,14 @@ source_value() {
 reconstruct_source() {
   local source_name=$1
   local output=$2
+  local fixture_relative
   local fixture_root
   local fixture_suite
   local case_id
 
-  fixture_root="$fixture_sets/$(source_value "$source_name" fixture_root)"
-  fixture_suite="$fixture_root/cases.json"
+  fixture_relative=$(source_value "$source_name" fixture_root)
+  fixture_root="$fixture_sets/$fixture_relative"
+  fixture_suite="$scenario_tmp/source-suites/$fixture_relative/suite.json"
   case_id=$(source_value "$source_name" case)
   [[ -f "$fixture_suite" && ! -L "$fixture_suite" ]]
   reconstruct_definition_case \
@@ -121,15 +123,22 @@ reconstruct_source() {
     "$output"
 }
 
-source_suite_index=0
 while IFS= read -r source_fixture_root; do
-  source_suite_index=$((source_suite_index + 1))
   source_fixture_root="$fixture_sets/$source_fixture_root"
-  verify_definition_suite_digest \
+  source_suite_tmp="$scenario_tmp/source-suites/${source_fixture_root#"$fixture_sets/"}"
+  mkdir -p "$source_suite_tmp"
+  materialize_definition_suite \
     "$source_fixture_root" \
     "$source_fixture_root/cases.json" \
-    "$scenario_tmp/source-suite-$source_suite_index"
-done < <(jq -r '.sources[].fixture_root' "$scenarios" | LC_ALL=C sort -u)
+    "$source_suite_tmp/suite.json" \
+    "$source_suite_tmp"
+  verify_definition_suite_digest \
+    "$source_fixture_root" \
+    "$source_suite_tmp/suite.json" \
+    "$source_suite_tmp/digest"
+done < <(
+  jq -r '.sources[].fixture_root' "$scenarios" | LC_ALL=C sort -u
+)
 
 materialize_source() {
   local source_name=$1

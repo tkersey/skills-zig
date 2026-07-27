@@ -10,7 +10,7 @@ dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
 ledger_bin=${LEDGER_BIN:-ledger}
 memory_note_bin=${MEMORY_NOTE_BIN:-"$skills_zig_root/zig-out/bin/memory-note"}
 fixture_root="$skills_zig_root/testdata/dotfiles/skill-definitions/memory-source-notes/fixtures/ledger/synesthesia-memory-note-payload"
-fixture_suite="$fixture_root/cases.json"
+fixture_source="$fixture_root/cases.json"
 adapter="$dotfiles_root/codex/skills/memory-source-notes/scripts/synesthesia_memory_note.py"
 
 command -v jq >/dev/null
@@ -21,6 +21,12 @@ command -v "$ledger_bin" >/dev/null
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
+fixture_suite="$scratch/suite.json"
+materialize_definition_suite \
+  "$fixture_root" \
+  "$fixture_source" \
+  "$fixture_suite" \
+  "$scratch"
 valid_count=0
 invalid_count=0
 

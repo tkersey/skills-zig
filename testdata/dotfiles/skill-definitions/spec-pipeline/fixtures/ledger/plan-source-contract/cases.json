@@ -1,15 +1,10 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "complete"
-  ],
-  "invalid": [
-    {
-      "id": "gate-only",
+  "invalid": {
+    "gate-only": {
       "set": {
         "/plan_source_contract/sgr_v2/spec_governance_receipt/mode": "gate-only"
       }
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:5c12d609358bddbc5127c6c032f07245fe25cdf74ad4ea11fd4679c658cd3a77"
 }

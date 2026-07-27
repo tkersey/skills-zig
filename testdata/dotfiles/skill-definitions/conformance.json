@@ -1,0 +1,15 @@
+{
+  "schema": "ledger-definition-conformance-index/v1",
+  "cases_schema": "ledger-definition-conformance-cases/v5",
+  "oracle": {
+    "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
+    "ledger_version": "0.13.3",
+    "definitions": [
+      "actuating/construction-contract",
+      "goal-contract/goal-contract",
+      "ledger/source-memory-checkpoint-receipt",
+      "memory-source-notes/learnings-memory-note-payload",
+      "memory-source-notes/negative-ledger-memory-note-payload"
+    ]
+  }
+}

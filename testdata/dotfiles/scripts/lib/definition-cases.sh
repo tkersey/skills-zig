@@ -18,7 +18,10 @@ validate_json_pointer_deltas() {
               startswith($paths[$right] + "/") | not)
           )
         );
-      [(.valid // [])[], (.invalid // [])[]] as $variants |
+      [
+        ((.valid // {}) | to_entries[] | .value),
+        ((.invalid // {}) | to_entries[] | .value)
+      ] as $variants |
       all($variants[];
         (.set // {} | type == "object") and
         all((.set // {}) | keys[]; valid_pointer) and
@@ -62,14 +65,43 @@ apply_json_pointer_delta() {
     "$input" >"$output"
 }
 
+materialize_definition_suite() {
+  local fixture_root=$1
+  local source_suite=$2
+  local output_suite=$3
+  local scratch=$4
+  local base_root="$fixture_root/bases"
+  local base_rows="$scratch/base-ids.jsonl"
+  local base_ids="$scratch/base-ids.json"
+  local base_fixture
+  local relative
+  local base_id
+
+  [[ -d "$base_root" && ! -L "$base_root" ]]
+  : >"$base_rows"
+  while IFS= read -r base_fixture; do
+    [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
+    relative=${base_fixture#"$base_root/"}
+    [[ "$relative" != */* && "$relative" == *.json ]]
+    base_id=${relative%.json}
+    [[ "$base_id" =~ ^[A-Za-z0-9._-]+$ ]]
+    jq -nc --arg id "$base_id" '$id' >>"$base_rows"
+  done < <(rg --files "$base_root" -g '*.json' | LC_ALL=C sort)
+  [[ -s "$base_rows" ]]
+  jq -s '.' "$base_rows" >"$base_ids"
+  jq --slurpfile bases "$base_ids" \
+    '. + {bases: $bases[0]}' \
+    "$source_suite" >"$output_suite"
+}
+
 definition_suite_case_rows() {
   local suite=$1
 
   jq -r \
     '
       (.bases[] | [., "valid"]),
-      ((.valid // [])[] | [.id, "valid"]),
-      ((.invalid // [])[] | [.id, "invalid"]) |
+      (((.valid // {}) | keys[]) | [., "valid"]),
+      (((.invalid // {}) | keys[]) | [., "invalid"]) |
       @tsv
     ' \
     "$suite"
@@ -92,11 +124,13 @@ definition_suite_case_spec() {
         }
       else
         (
-          [($suite.valid // [])[], ($suite.invalid // [])[]] |
-          map(select(.id == $case_id)) |
-          first
+          ($suite.valid // {})[$case_id] //
+          ($suite.invalid // {})[$case_id] //
+          error("unknown conformance case")
         ) as $case |
-        $case + {
+        {
+          id: $case_id
+        } + $case + {
           base: (
             $case.base //
             if ($suite.bases | length) == 1 then

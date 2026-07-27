@@ -1,32 +1,21 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "oracle": {
-    "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
-    "ledger_version": "0.13.3"
-  },
-  "bases": [
-    "initial-draft"
-  ],
-  "invalid": [
-    {
-      "id": "blank-law",
+  "invalid": {
+    "blank-law": {
       "set": {
         "/artifact/payload/laws/0/statement": " \t"
       }
     },
-    {
-      "id": "reserved-path",
+    "reserved-path": {
       "set": {
         "/artifact/payload/scope/allowed_paths/0": ".GIT/config"
       }
     },
-    {
-      "id": "uppercase-goal-id",
+    "uppercase-goal-id": {
       "set": {
         "/artifact/goal_id": "Goal-1"
       }
     }
-  ],
+  },
   "materializations": {
     "initial-draft": {
       "artifact_id": "sha256:dbd8e445fe0b11bb8e5b8b26f535c4a52d217301c37a4cdbd59b4cca91bfa54d",

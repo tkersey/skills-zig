@@ -1,27 +1,20 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "complete",
-    "complete-addressed"
-  ],
-  "invalid": [
-    {
-      "id": "identity-mismatch",
+  "invalid": {
+    "identity-mismatch": {
       "base": "complete-addressed",
       "set": {
         "/receipt_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "/cited_premise_refs": []
       }
     },
-    {
-      "id": "unknown-field",
+    "unknown-field": {
       "base": "complete",
       "set": {
         "/cited_premise_refs": [],
         "/approved": true
       }
     }
-  ],
+  },
   "materializations": {
     "complete": {
       "artifact_id": "sha256:db03dc2b8a57357e2775a3bffbf5205483006c027c824aa6ef2e4c7ffe809e70",

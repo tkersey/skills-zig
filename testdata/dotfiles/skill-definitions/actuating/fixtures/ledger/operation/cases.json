@@ -1,19 +1,12 @@
 {
-  "schema": "ledger-definition-conformance-cases/v4",
-  "bases": [
-    "edit",
-    "inspect"
-  ],
-  "invalid": [
-    {
-      "id": "edit-without-path",
+  "invalid": {
+    "edit-without-path": {
       "base": "edit",
       "set": {
         "/paths": []
       }
     },
-    {
-      "id": "multiple-proof-roles",
+    "multiple-proof-roles": {
       "base": "edit",
       "set": {
         "/effect": "verify",
@@ -23,6 +16,6 @@
         ]
       }
     }
-  ],
+  },
   "reconstructed_cases_digest": "sha256:422b539a8aeb804bf97fcb91e8403f80e13ff0bf2559266813e1a633dc5535a5"
 }
