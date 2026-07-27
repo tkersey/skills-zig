@@ -141,6 +141,19 @@ jq -S -c '.source' "$scratch/mapping-endorsement.json" >"$source_submission"
   --format json >"$source_transaction"
 source_id=$(jq -r '.generated_outputs.syn_id' "$source_transaction")
 assert_source_doctor "$projection_repo" current true 0
+adapter_doctor_home="$scratch/adapter-doctor-home"
+mkdir -p "$adapter_doctor_home"
+LEDGER_BIN="$ledger_bin" \
+  uv run "$adapter" doctor \
+    --repo "$projection_repo" \
+    --codex-home "$adapter_doctor_home" \
+    --format json >"$scratch/adapter-doctor.json"
+jq -e \
+  '.synesthesia_memory_doctor.source_ledger.status == "current" and
+   .synesthesia_memory_doctor.source_ledger.healthy == true and
+   .synesthesia_memory_doctor.source_ledger.result.authority_granted == false and
+   .synesthesia_memory_doctor.source_ledger.result.storage_mutated == false' \
+  "$scratch/adapter-doctor.json" >/dev/null
 jq -r '.returned_content' "$source_transaction" >"$scratch/expected-record.json"
 "$ledger_bin" project \
   --definition "$source_definition" \
@@ -236,6 +249,6 @@ cmp -s "$scratch/expected-recall.json" "$scratch/actual-recall.json"
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=3\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=4\n' \
   "$valid_count" \
   "$invalid_count"
