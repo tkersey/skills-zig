@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 skills_zig_root=$(cd "$script_dir/../../.." && pwd -P)
+source "$script_dir/lib/definition-cases.sh"
 dotfiles_root=${DOTFILES_ROOT:-"$HOME/.dotfiles"}
 dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
 cd "$dotfiles_root"
@@ -145,52 +146,13 @@ for manifest in $manifests; do
             "$fixture_suite" >/dev/null
 
           fixture_tmp=$(mktemp -d)
-          while IFS=$'\t' read -r case_id base_id expectation; do
-            base_relative=$(jq -r --arg base "$base_id" '.bases[$base]' "$fixture_suite")
-            base_fixture="$fixture_root/$base_relative"
-            [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
+          while IFS=$'\t' read -r case_id expectation; do
             fixture="$fixture_tmp/$case_id.json"
-            jq -S -c \
-              --arg case_id "$case_id" \
-              --slurpfile suite "$fixture_suite" \
-              '
-                def pointer_path($pointer):
-                  $pointer |
-                  ltrimstr("/") |
-                  split("/") |
-                  map(
-                    gsub("~1"; "/") |
-                    gsub("~0"; "~") |
-                    if test("^(0|[1-9][0-9]*)$") then
-                      tonumber
-                    else
-                      .
-                    end
-                  );
-                reduce (
-                  $suite[0].cases[] |
-                  select(.id == $case_id) |
-                  (.patch // [])[]
-                ) as $operation (.;
-                  (pointer_path($operation.path)) as $path |
-                  if $operation.op == "remove" then
-                    delpaths([$path])
-                  else
-                    setpath($path; $operation.value)
-                  end
-                )
-              ' \
-              "$base_fixture" >"$fixture"
-            expected_fixture_digest=$(
-              jq -r \
-                --arg case_id "$case_id" \
-                '.cases[] |
-                 select(.id == $case_id) |
-                 .fixture_digest' \
-                "$fixture_suite"
-            )
-            actual_fixture_digest="sha256:$(shasum -a 256 "$fixture" | awk '{print $1}')"
-            [[ "$actual_fixture_digest" == "$expected_fixture_digest" ]]
+            reconstruct_definition_case \
+              "$fixture_root" \
+              "$fixture_suite" \
+              "$case_id" \
+              "$fixture"
             fixture_count=$((fixture_count + 1))
 
             if [[ "$expectation" == "valid" ]]; then
@@ -270,7 +232,7 @@ for manifest in $manifests; do
                 <<<"$result" >/dev/null
             fi
           done < <(
-            jq -r '.cases[] | [.id, .base, .expect] | @tsv' "$fixture_suite"
+            jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite"
           )
           rm -rf -- "$fixture_tmp"
         fi
