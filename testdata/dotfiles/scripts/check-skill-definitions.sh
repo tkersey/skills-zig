@@ -74,15 +74,24 @@ for manifest in $manifests; do
           --format json |
           jq -e '.valid == true and .authority_granted == false' >/dev/null
 
-        input_count=$(jq '.inputs | length' "$definition")
+        required_input_count=$(
+          jq '[.inputs | to_entries[] | select(.value.required != false)] | length' \
+            "$definition"
+        )
         fixture_root="$skills_zig_root/testdata/dotfiles/skill-definitions/$expected_skill/fixtures/ledger/${id##*/}"
         fixture_suite="$fixture_root/cases.json"
         if [[ -f "$fixture_suite" && ! -L "$fixture_suite" ]]; then
-          if [[ "$input_count" -ne 1 ]]; then
+          if [[ "$required_input_count" -ne 1 ]]; then
             echo "$fixture_root requires an explicit multi-input fixture runner" >&2
             exit 1
           fi
-          input_name=$(jq -r '.inputs | keys[0]' "$definition")
+          input_name=$(
+            jq -r \
+              '.inputs | to_entries[] |
+               select(.value.required != false) |
+               .key' \
+              "$definition"
+          )
           jq -e \
             '
               . as $suite |

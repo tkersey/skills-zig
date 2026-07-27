@@ -8,6 +8,7 @@ source "$script_dir/lib/definition-cases.sh"
 dotfiles_root=${DOTFILES_ROOT:-"$HOME/.dotfiles"}
 dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
 ledger_bin=${LEDGER_BIN:-ledger}
+memory_note_bin=${MEMORY_NOTE_BIN:-"$skills_zig_root/zig-out/bin/memory-note"}
 fixture_root="$skills_zig_root/testdata/dotfiles/skill-definitions/memory-source-notes/fixtures/ledger/synesthesia-memory-note-payload"
 fixture_suite="$fixture_root/cases.json"
 adapter="$dotfiles_root/codex/skills/memory-source-notes/scripts/synesthesia_memory_note.py"
@@ -15,6 +16,7 @@ adapter="$dotfiles_root/codex/skills/memory-source-notes/scripts/synesthesia_mem
 command -v jq >/dev/null
 command -v uv >/dev/null
 command -v "$ledger_bin" >/dev/null
+[[ -x "$memory_note_bin" ]]
 [[ -f "$adapter" && ! -L "$adapter" ]]
 
 scratch=$(mktemp -d)
@@ -122,6 +124,15 @@ assert_source_doctor() {
 projection_repo="$scratch/projection-repo"
 mkdir -p "$projection_repo"
 projection_repo=$(cd "$projection_repo" && pwd -P)
+run_adapter_doctor() {
+  LEDGER_BIN="$ledger_bin" \
+    MEMORY_NOTE_BIN="$memory_note_bin" \
+    uv run "$adapter" doctor \
+      --repo "$projection_repo" \
+      --codex-home "$1" \
+      --format json >"$2"
+}
+
 assert_source_doctor "$projection_repo" missing true 0
 
 unbound_repo="$scratch/unbound-repo"
@@ -141,19 +152,6 @@ jq -S -c '.source' "$scratch/mapping-endorsement.json" >"$source_submission"
   --format json >"$source_transaction"
 source_id=$(jq -r '.generated_outputs.syn_id' "$source_transaction")
 assert_source_doctor "$projection_repo" current true 0
-adapter_doctor_home="$scratch/adapter-doctor-home"
-mkdir -p "$adapter_doctor_home"
-LEDGER_BIN="$ledger_bin" \
-  uv run "$adapter" doctor \
-    --repo "$projection_repo" \
-    --codex-home "$adapter_doctor_home" \
-    --format json >"$scratch/adapter-doctor.json"
-jq -e \
-  '.synesthesia_memory_doctor.source_ledger.status == "current" and
-   .synesthesia_memory_doctor.source_ledger.healthy == true and
-   .synesthesia_memory_doctor.source_ledger.result.authority_granted == false and
-   .synesthesia_memory_doctor.source_ledger.result.storage_mutated == false' \
-  "$scratch/adapter-doctor.json" >/dev/null
 jq -r '.returned_content' "$source_transaction" >"$scratch/expected-record.json"
 "$ledger_bin" project \
   --definition "$source_definition" \
@@ -187,6 +185,53 @@ jq -c \
 cmp -s \
   "$scratch/expected-memory-note.json" \
   "$scratch/actual-memory-note.json"
+
+adapter_doctor_home="$scratch/adapter-doctor-home"
+mkdir -p "$adapter_doctor_home"
+adapter_doctor_home=$(cd "$adapter_doctor_home" && pwd -P)
+for attempt in created duplicate; do
+  LEDGER_BIN="$ledger_bin" \
+    MEMORY_NOTE_BIN="$memory_note_bin" \
+    uv run "$adapter" append \
+      --kind mapping-endorsement \
+      --json "$scratch/actual-memory-note.json" \
+      --codex-home "$adapter_doctor_home" \
+      >"$scratch/adapter-append-$attempt.json"
+done
+jq -e '.status == "created"' "$scratch/adapter-append-created.json" >/dev/null
+jq -e '.status == "duplicate_skip"' "$scratch/adapter-append-duplicate.json" >/dev/null
+"$memory_note_bin" list \
+  --extension synesthesia \
+  --codex-home "$adapter_doctor_home" \
+  --format json >"$scratch/adapter-notes.json"
+jq -e '.notes | length == 1' "$scratch/adapter-notes.json" >/dev/null
+run_adapter_doctor "$adapter_doctor_home" "$scratch/adapter-doctor.json"
+jq -e \
+  '.synesthesia_memory_doctor.source_ledger.status == "current" and
+   .synesthesia_memory_doctor.source_ledger.healthy == true and
+   .synesthesia_memory_doctor.source_ledger.result.authority_granted == false and
+   .synesthesia_memory_doctor.source_ledger.result.storage_mutated == false and
+   .synesthesia_memory_doctor.notes.count == 1 and
+   .synesthesia_memory_doctor.notes.valid_count == 1 and
+   (.synesthesia_memory_doctor.notes.parse_errors | length) == 0 and
+   .synesthesia_memory_doctor.digest.status == "current"' \
+  "$scratch/adapter-doctor.json" >/dev/null
+
+note_path=$(jq -r '.notes[0].path' "$scratch/adapter-notes.json")
+jq '.extension = "wrong-extension"' "$note_path" >"$scratch/tampered-note.json"
+mv "$scratch/tampered-note.json" "$note_path"
+set +e
+run_adapter_doctor \
+  "$adapter_doctor_home" \
+  "$scratch/adapter-doctor-invalid-note.json"
+invalid_note_doctor_exit=$?
+set -e
+[[ "$invalid_note_doctor_exit" -eq 2 ]]
+jq -e \
+  '.synesthesia_memory_doctor.stage == "source-notes-invalid" and
+   .synesthesia_memory_doctor.notes.valid_count == 0 and
+   (.synesthesia_memory_doctor.notes.parse_errors | length) == 1' \
+  "$scratch/adapter-doctor-invalid-note.json" >/dev/null
 
 jq -r '.returned_content' "$source_transaction" |
   jq -c \
@@ -249,6 +294,6 @@ cmp -s "$scratch/expected-recall.json" "$scratch/actual-recall.json"
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=4\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=5\n' \
   "$valid_count" \
   "$invalid_count"
