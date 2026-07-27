@@ -911,12 +911,16 @@ const Builder = struct {
                         0,
                     );
                 } else {
-                    if (object.get("rules") != null) {
-                        return error.CountRuleRulesUnexpected;
-                    }
                     rule.path_ids = try self.parsePaths(
                         try definition_core.json.field(object, "paths"),
                     );
+                    if (object.get("rules")) |raw_rules| {
+                        rule.children = try self.compileItemRules(
+                            raw_rules,
+                            input_index,
+                            0,
+                        );
+                    }
                 }
             },
             .keyed_join => {
@@ -1931,12 +1935,16 @@ const Builder = struct {
                         depth + 1,
                     );
                 } else {
-                    if (object.get("rules") != null) {
-                        return error.CountRuleRulesUnexpected;
-                    }
                     rule.path_ids = try self.parsePaths(
                         try definition_core.json.field(object, "paths"),
                     );
+                    if (object.get("rules")) |raw_rules| {
+                        rule.children = try self.compileItemRules(
+                            raw_rules,
+                            input_index,
+                            depth + 1,
+                        );
+                    }
                 }
             },
             .keyed_unique => {
@@ -3643,7 +3651,7 @@ fn validateCachedRule(
         },
         .exactly_one, .at_least_one => {
             const field_mode = rule.path_ids.len != 0 and
-                rule.pointer_id == null and rule.children.len == 0;
+                rule.pointer_id == null and rule.children.len <= 64;
             const collection_mode = rule.path_ids.len == 0 and
                 rule.pointer_id != null and rule.children.len != 0;
             if (!field_mode and !collection_mode) {
@@ -4663,8 +4671,16 @@ fn applyRule(
         .field_not_equal,
         .cross_input_equal,
         => compareRule(plan, loaded, rule),
-        .exactly_one, .at_least_one => if (rule.children.len == 0)
-            countPresent(plan, root, rule)
+        .exactly_one, .at_least_one => if (rule.path_ids.len != 0)
+            if (rule.children.len == 0)
+                countPresent(plan, root, rule)
+            else
+                try countMatchingFields(
+                    allocator,
+                    plan,
+                    root,
+                    rule,
+                )
         else
             try countMatching(allocator, plan, root, rule),
         else => true,
@@ -4987,8 +5003,16 @@ fn itemRuleHolds(
         .field_not_equal,
         .cross_input_equal,
         => compareRuleRoots(plan, rule, root, root),
-        .exactly_one, .at_least_one => if (rule.children.len == 0)
-            countPresent(plan, root, rule)
+        .exactly_one, .at_least_one => if (rule.path_ids.len != 0)
+            if (rule.children.len == 0)
+                countPresent(plan, root, rule)
+            else
+                try countMatchingFields(
+                    allocator,
+                    plan,
+                    root,
+                    rule,
+                )
         else
             try countMatching(allocator, plan, root, rule),
         .one_of => if (target) |value|
@@ -5122,6 +5146,24 @@ fn countPresent(plan: *const Plan, root: std.json.Value, rule: CompiledRule) boo
         if (resolve(root, plan.pointers[pointer_id]) != null) count += 1;
     }
     return if (rule.operator == .exactly_one) count == 1 else count >= 1;
+}
+
+fn countMatchingFields(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) !bool {
+    var count: usize = 0;
+    for (rule.path_ids) |pointer_id| {
+        const value = resolve(root, plan.pointers[pointer_id]) orelse continue;
+        if (try itemRulesHold(allocator, plan, rule.children, value)) {
+            count += 1;
+            if (rule.operator == .exactly_one and count > 1) return false;
+            if (rule.operator == .at_least_one) return true;
+        }
+    }
+    return count == 1;
 }
 
 fn countMatching(
@@ -8553,6 +8595,71 @@ test "validation reports missing and malformed inputs without granting authority
     try std.testing.expect(!malformed.valid);
     try std.testing.expect(!malformed.authority_granted);
     try std.testing.expect(!malformed.storage_mutated);
+}
+
+test "count rules apply predicates across declared fields and survive cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/field-count","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"at-least-one","paths":["/first","/second","/third"],"rules":[{"op":"enum","values":["blocked"]}]},{"op":"exactly-one","paths":["/left","/right"],"rules":[{"op":"enum","values":["selected"]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        1024 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+
+    const cases = [_]struct { bytes: []const u8, valid: bool }{
+        .{
+            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"second\":\"blocked\"}",
+            .valid = true,
+        },
+        .{
+            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"second\":\"clear\"}",
+            .valid = false,
+        },
+        .{
+            .bytes = "{\"first\":\"blocked\",\"left\":\"selected\",\"right\":\"selected\"}",
+            .valid = false,
+        },
+    };
+    for (cases) |case| {
+        var result = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &cached,
+            &.{.{ .name = "record", .bytes = case.bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.valid, result.valid);
+    }
 }
 
 test "compiled correspondence rules bind selected values and total successor partitions" {
