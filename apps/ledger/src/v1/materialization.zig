@@ -81,153 +81,218 @@ pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
 ) !Plan {
-    var input_index: ?u8 = null;
-    var normalize_line_endings = false;
-    var trailing_newline: TrailingNewline = .preserve;
-    var identity: Identity = .none;
-    errdefer identity.deinit(allocator);
-
+    var state: CompileState = .{};
+    errdefer state.identity.deinit(allocator);
     for (definition_plan.rules) |rule| {
         switch (rule.operator) {
-            .canonical_json, .canonical_text => {
-                var parsed = try parseRule(allocator, rule.canonical_config);
-                defer parsed.deinit();
-                const object = parsed.value.object;
-                const candidate = try ruleInputIndex(definition_plan, object);
-                if (input_index != null and input_index.? != candidate) {
-                    return error.MultipleCanonicalOutputs;
-                }
-                input_index = candidate;
-                if (rule.operator == .canonical_text) {
-                    if (object.get("line_endings")) |raw| {
-                        const value = try definition_core.json.string(raw);
-                        if (!std.mem.eql(u8, value, "preserve") and
-                            !std.mem.eql(u8, value, "lf"))
-                        {
-                            return error.UnsupportedLineEndingMode;
-                        }
-                        normalize_line_endings = std.mem.eql(u8, value, "lf");
-                    }
-                    if (object.get("trailing_newline")) |raw| {
-                        const value = try definition_core.json.string(raw);
-                        trailing_newline = if (std.mem.eql(u8, value, "preserve"))
-                            .preserve
-                        else if (std.mem.eql(u8, value, "one"))
-                            .one
-                        else if (std.mem.eql(u8, value, "none"))
-                            .none
-                        else
-                            return error.UnsupportedTrailingNewlineMode;
-                    }
-                }
-            },
+            .canonical_json, .canonical_text => try compileCanonicalRule(
+                allocator,
+                definition_plan,
+                rule,
+                &state,
+            ),
             .content_address => {
-                if (identity != .none) return error.MultipleIdentityDerivations;
-                var parsed = try parseRule(allocator, rule.canonical_config);
-                defer parsed.deinit();
-                const object = parsed.value.object;
-                try definition_core.json.requireExactKeys(object, &.{
-                    "op",
-                    "input",
-                    "exclude",
-                    "exclude_recursive",
-                    "prefix",
-                    "field",
-                    "basis_null",
-                });
-                const candidate = try ruleInputIndex(definition_plan, object);
-                if (input_index != null and input_index.? != candidate) {
-                    return error.IdentityInputMismatch;
-                }
-                input_index = candidate;
-                var config: @FieldType(Identity, "content_address") = .{
-                    .exclude_key = null,
-                    .exclude_recursive = false,
-                    .prefix = null,
-                    .claimed = null,
-                    .basis_null = null,
-                };
-                errdefer {
-                    if (config.exclude_key) |key| allocator.free(key);
-                    if (config.prefix) |prefix| allocator.free(prefix);
-                    if (config.claimed) |*field| field.deinit(allocator);
-                    if (config.basis_null) |*field| field.deinit(allocator);
-                }
-                if (object.get("exclude")) |raw| {
-                    config.exclude_key = try rootKeyFromPointer(
-                        allocator,
-                        try definition_core.json.string(raw),
-                    );
-                }
-                if (object.get("exclude_recursive")) |raw| {
-                    config.exclude_recursive =
-                        try definition_core.json.boolean(raw);
-                }
-                if (try definition_core.json.optionalString(
-                    object,
-                    "prefix",
-                )) |prefix| {
-                    try validateIdentityStaticText(prefix, 128, true);
-                    config.prefix = try allocator.dupe(u8, prefix);
-                }
-                if (object.get("field")) |raw| {
-                    config.claimed = try definition_core.json_pointer.compile(
-                        allocator,
-                        try definition_core.json.string(raw),
-                    );
-                }
-                if (object.get("basis_null")) |raw| {
-                    config.basis_null = try definition_core.json_pointer.compile(
-                        allocator,
-                        try definition_core.json.string(raw),
-                    );
-                }
-                try validateContentAddressConfig(config);
-                if (config.basis_null != null and
-                    definition_plan.inputs[candidate].codec != .json)
-                {
-                    return error.ContentAddressBasisRequiresJson;
-                }
-                identity = .{ .content_address = config };
+                try state.requireNoIdentity();
+                var compiled = try compileContentAddressRule(
+                    allocator,
+                    definition_plan,
+                    rule,
+                );
+                errdefer deinitContentAddressConfig(
+                    allocator,
+                    &compiled.config,
+                );
+                try state.bindIdentityInput(compiled.input_index);
+                state.identity = .{ .content_address = compiled.config };
             },
             .composite_identity => {
-                if (identity != .none) {
-                    return error.MultipleIdentityDerivations;
-                }
-                var parsed = try parseRule(
+                try state.requireNoIdentity();
+                const compiled = try compileCompositeRule(
                     allocator,
-                    rule.canonical_config,
-                );
-                defer parsed.deinit();
-                const object = parsed.value.object;
-                const candidate = try ruleInputIndex(
                     definition_plan,
-                    object,
+                    rule,
                 );
-                if (input_index != null and input_index.? != candidate) {
-                    return error.IdentityInputMismatch;
+                errdefer {
+                    var identity: Identity = .{
+                        .composite = compiled.config,
+                    };
+                    identity.deinit(allocator);
                 }
-                input_index = candidate;
-                identity = .{
-                    .composite = try compileCompositeIdentity(
-                        allocator,
-                        object,
-                    ),
-                };
+                try state.bindIdentityInput(compiled.input_index);
+                state.identity = .{ .composite = compiled.config };
             },
             else => {},
         }
     }
-    if (input_index == null) {
+    if (state.input_index == null) {
         if (definition_plan.inputs.len != 1) return error.AmbiguousMaterializationInput;
-        input_index = 0;
+        state.input_index = 0;
     }
     return .{
-        .input_index = input_index.?,
-        .codec = definition_plan.inputs[input_index.?].codec,
-        .normalize_line_endings = normalize_line_endings,
-        .trailing_newline = trailing_newline,
-        .identity = identity,
+        .input_index = state.input_index.?,
+        .codec = definition_plan.inputs[state.input_index.?].codec,
+        .normalize_line_endings = state.normalize_line_endings,
+        .trailing_newline = state.trailing_newline,
+        .identity = state.identity,
+    };
+}
+
+const CompileState = struct {
+    input_index: ?u8 = null,
+    normalize_line_endings: bool = false,
+    trailing_newline: TrailingNewline = .preserve,
+    identity: Identity = .none,
+
+    fn requireNoIdentity(self: CompileState) !void {
+        if (self.identity != .none) return error.MultipleIdentityDerivations;
+    }
+
+    fn bindIdentityInput(self: *CompileState, candidate: u8) !void {
+        if (self.input_index != null and self.input_index.? != candidate) {
+            return error.IdentityInputMismatch;
+        }
+        self.input_index = candidate;
+    }
+};
+
+fn compileCanonicalRule(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rule: definition.Rule,
+    state: *CompileState,
+) !void {
+    var parsed = try parseRule(allocator, rule.canonical_config);
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const candidate = try ruleInputIndex(definition_plan, object);
+    if (state.input_index != null and state.input_index.? != candidate) {
+        return error.MultipleCanonicalOutputs;
+    }
+    state.input_index = candidate;
+    if (rule.operator != .canonical_text) return;
+    if (object.get("line_endings")) |raw| {
+        const value = try definition_core.json.string(raw);
+        if (!std.mem.eql(u8, value, "preserve") and
+            !std.mem.eql(u8, value, "lf"))
+        {
+            return error.UnsupportedLineEndingMode;
+        }
+        state.normalize_line_endings = std.mem.eql(u8, value, "lf");
+    }
+    if (object.get("trailing_newline")) |raw| {
+        state.trailing_newline = try parseTrailingNewline(
+            try definition_core.json.string(raw),
+        );
+    }
+}
+
+fn parseTrailingNewline(value: []const u8) !TrailingNewline {
+    if (std.mem.eql(u8, value, "preserve")) return .preserve;
+    if (std.mem.eql(u8, value, "one")) return .one;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    return error.UnsupportedTrailingNewlineMode;
+}
+
+const ContentAddressRule = struct {
+    input_index: u8,
+    config: @FieldType(Identity, "content_address"),
+};
+
+fn compileContentAddressRule(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rule: definition.Rule,
+) !ContentAddressRule {
+    var parsed = try parseRule(allocator, rule.canonical_config);
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try definition_core.json.requireExactKeys(object, &.{
+        "op",
+        "input",
+        "exclude",
+        "exclude_recursive",
+        "prefix",
+        "field",
+        "basis_null",
+    });
+    const input_index = try ruleInputIndex(definition_plan, object);
+    var config: @FieldType(Identity, "content_address") = .{
+        .exclude_key = null,
+        .exclude_recursive = false,
+        .prefix = null,
+        .claimed = null,
+        .basis_null = null,
+    };
+    errdefer deinitContentAddressConfig(allocator, &config);
+    try compileContentAddressFields(allocator, object, &config);
+    try validateContentAddressConfig(config);
+    if (config.basis_null != null and
+        definition_plan.inputs[input_index].codec != .json)
+    {
+        return error.ContentAddressBasisRequiresJson;
+    }
+    return .{ .input_index = input_index, .config = config };
+}
+
+fn compileContentAddressFields(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    config: *@FieldType(Identity, "content_address"),
+) !void {
+    if (object.get("exclude")) |raw| {
+        config.exclude_key = try rootKeyFromPointer(
+            allocator,
+            try definition_core.json.string(raw),
+        );
+    }
+    if (object.get("exclude_recursive")) |raw| {
+        config.exclude_recursive = try definition_core.json.boolean(raw);
+    }
+    if (try definition_core.json.optionalString(object, "prefix")) |prefix| {
+        try validateIdentityStaticText(prefix, 128, true);
+        config.prefix = try allocator.dupe(u8, prefix);
+    }
+    if (object.get("field")) |raw| {
+        config.claimed = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.string(raw),
+        );
+    }
+    if (object.get("basis_null")) |raw| {
+        config.basis_null = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.string(raw),
+        );
+    }
+}
+
+fn deinitContentAddressConfig(
+    allocator: std.mem.Allocator,
+    config: *@FieldType(Identity, "content_address"),
+) void {
+    if (config.exclude_key) |key| allocator.free(key);
+    if (config.prefix) |prefix| allocator.free(prefix);
+    if (config.claimed) |*field| field.deinit(allocator);
+    if (config.basis_null) |*field| field.deinit(allocator);
+    config.* = undefined;
+}
+
+const CompositeRule = struct {
+    input_index: u8,
+    config: @FieldType(Identity, "composite"),
+};
+
+fn compileCompositeRule(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rule: definition.Rule,
+) !CompositeRule {
+    var parsed = try parseRule(allocator, rule.canonical_config);
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    return .{
+        .input_index = try ruleInputIndex(definition_plan, object),
+        .config = try compileCompositeIdentity(allocator, object),
     };
 }
 
@@ -399,146 +464,15 @@ pub fn materialize(
     var artifact_id: ?[]u8 = null;
     errdefer if (artifact_id) |value| allocator.free(value);
 
-    if (execution.isValid()) materialized: {
-        if (materialization_plan.identity == .content_address and
-            materialization_plan.identity.content_address.basis_null != null)
-        {
-            try materializeDraftContentAddress(
-                allocator,
-                &execution,
-                materialization_plan,
-                materialization_plan.identity.content_address,
-                &canonical_content,
-                &canonical_digest,
-                &artifact_id,
-            );
-            break :materialized;
-        }
-        if (materialization_plan.identity == .content_address and
-            materialization_plan.identity.content_address.exclude_key != null and
-            materialization_plan.identity.content_address.claimed != null)
-        {
-            try materializeExcludedContentAddress(
-                allocator,
-                &execution,
-                materialization_plan,
-                materialization_plan.identity.content_address,
-                &canonical_content,
-                &canonical_digest,
-                &artifact_id,
-            );
-            break :materialized;
-        }
-        canonical_content = try canonicalize(
+    if (execution.isValid()) {
+        try materializeValid(
             allocator,
             &execution,
             materialization_plan,
+            &canonical_content,
+            &canonical_digest,
+            &artifact_id,
         );
-        canonical_digest = try definition_core.canonical_json.digestBytesAlloc(
-            allocator,
-            canonical_content.?,
-        );
-        switch (materialization_plan.identity) {
-            .none => {},
-            .content_address => |config| {
-                artifact_id = if (config.exclude_key) |exclude_key|
-                    try contentAddressOmittingAlloc(
-                        allocator,
-                        execution.inputJson(materialization_plan.input_index).?,
-                        exclude_key,
-                        config.exclude_recursive,
-                        config.prefix,
-                    )
-                else
-                    try contentAddressFromDigestAlloc(
-                        allocator,
-                        canonical_digest.?,
-                        config.prefix,
-                    );
-                if (config.claimed) |claimed_pointer| {
-                    const root = execution.inputJson(
-                        materialization_plan.input_index,
-                    ) orelse return error.MaterializationInputInvalid;
-                    const claimed = definition_core.json_pointer.lookup(
-                        root,
-                        claimed_pointer,
-                    );
-                    const matches = if (claimed) |value|
-                        value == .string and
-                            std.mem.eql(u8, value.string, artifact_id.?)
-                    else
-                        false;
-                    if (!matches) {
-                        try execution.addDiagnostic(
-                            "content-address",
-                            claimed_pointer.raw,
-                            "claimed artifact identity does not match canonical content",
-                        );
-                        discardMaterialized(
-                            allocator,
-                            &canonical_content,
-                            &canonical_digest,
-                            &artifact_id,
-                        );
-                    }
-                }
-            },
-            .composite => |config| {
-                const root = execution.inputJson(
-                    materialization_plan.input_index,
-                ) orelse return error.MaterializationInputInvalid;
-                artifact_id = deriveCompositeIdentityAlloc(
-                    allocator,
-                    root,
-                    config,
-                ) catch |err| switch (err) {
-                    error.CompositeIdentityFieldMissing,
-                    error.CompositeIdentityFieldInvalid,
-                    error.CompositeIdentityBytesExceeded,
-                    => identity: {
-                        try execution.addDiagnostic(
-                            "composite-identity",
-                            "",
-                            "composite identity cannot be derived from the declared scalar fields",
-                        );
-                        discardMaterialized(
-                            allocator,
-                            &canonical_content,
-                            &canonical_digest,
-                            &artifact_id,
-                        );
-                        break :identity null;
-                    },
-                    else => return err,
-                };
-                if (artifact_id) |derived| {
-                    if (config.claimed) |claimed_pointer| {
-                        const claimed = definition_core.json_pointer.lookup(
-                            root,
-                            claimed_pointer,
-                        );
-                        const matches = if (claimed) |value|
-                            value == .string and
-                                std.mem.eql(u8, value.string, derived)
-                        else
-                            false;
-                        if (!matches) {
-                            try execution.addDiagnostic(
-                                "composite-identity",
-                                claimed_pointer.raw,
-                                "claimed artifact identity does not match the derived composite identity",
-                            );
-                            discardMaterialized(
-                                allocator,
-                                &canonical_content,
-                                &canonical_digest,
-                                &artifact_id,
-                            );
-                        }
-                    }
-                }
-            },
-        }
     }
     const validation_result = try execution.takeResult(allocator, definition_plan);
     return .{
@@ -547,6 +481,195 @@ pub fn materialize(
         .canonical_content_digest = canonical_digest,
         .artifact_id = artifact_id,
     };
+}
+
+fn materializeValid(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    if (plan.identity == .content_address and
+        plan.identity.content_address.basis_null != null)
+    {
+        return materializeDraftContentAddress(
+            allocator,
+            execution,
+            plan,
+            plan.identity.content_address,
+            canonical_content,
+            canonical_digest,
+            artifact_id,
+        );
+    }
+    if (plan.identity == .content_address and
+        plan.identity.content_address.exclude_key != null and
+        plan.identity.content_address.claimed != null)
+    {
+        return materializeExcludedContentAddress(
+            allocator,
+            execution,
+            plan,
+            plan.identity.content_address,
+            canonical_content,
+            canonical_digest,
+            artifact_id,
+        );
+    }
+    canonical_content.* = try canonicalize(allocator, execution, plan);
+    canonical_digest.* =
+        try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            canonical_content.*.?,
+        );
+    try deriveMaterializedIdentity(
+        allocator,
+        execution,
+        plan,
+        canonical_content,
+        canonical_digest,
+        artifact_id,
+    );
+}
+
+fn deriveMaterializedIdentity(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    switch (plan.identity) {
+        .none => {},
+        .content_address => |config| try deriveContentAddressIdentity(
+            allocator,
+            execution,
+            plan,
+            config,
+            canonical_content,
+            canonical_digest,
+            artifact_id,
+        ),
+        .composite => |config| try deriveCompositeMaterializedIdentity(
+            allocator,
+            execution,
+            plan,
+            config,
+            canonical_content,
+            canonical_digest,
+            artifact_id,
+        ),
+    }
+}
+
+fn deriveContentAddressIdentity(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "content_address"),
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    artifact_id.* = if (config.exclude_key) |exclude_key|
+        try contentAddressOmittingAlloc(
+            allocator,
+            execution.inputJson(plan.input_index).?,
+            exclude_key,
+            config.exclude_recursive,
+            config.prefix,
+        )
+    else
+        try contentAddressFromDigestAlloc(
+            allocator,
+            canonical_digest.*.?,
+            config.prefix,
+        );
+    const claimed_pointer = config.claimed orelse return;
+    const root = execution.inputJson(plan.input_index) orelse
+        return error.MaterializationInputInvalid;
+    const claimed = definition_core.json_pointer.lookup(
+        root,
+        claimed_pointer,
+    );
+    const matches = if (claimed) |value|
+        value == .string and
+            std.mem.eql(u8, value.string, artifact_id.*.?)
+    else
+        false;
+    if (matches) return;
+    try execution.addDiagnostic(
+        "content-address",
+        claimed_pointer.raw,
+        "claimed artifact identity does not match canonical content",
+    );
+    discardMaterialized(
+        allocator,
+        canonical_content,
+        canonical_digest,
+        artifact_id,
+    );
+}
+
+fn deriveCompositeMaterializedIdentity(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "composite"),
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    const root = execution.inputJson(plan.input_index) orelse
+        return error.MaterializationInputInvalid;
+    artifact_id.* = deriveCompositeIdentityAlloc(
+        allocator,
+        root,
+        config,
+    ) catch |err| switch (err) {
+        error.CompositeIdentityFieldMissing,
+        error.CompositeIdentityFieldInvalid,
+        error.CompositeIdentityBytesExceeded,
+        => identity: {
+            try execution.addDiagnostic(
+                "composite-identity",
+                "",
+                "composite identity cannot be derived from " ++
+                    "the declared scalar fields",
+            );
+            discardMaterialized(
+                allocator,
+                canonical_content,
+                canonical_digest,
+                artifact_id,
+            );
+            break :identity null;
+        },
+        else => return err,
+    };
+    const derived = artifact_id.* orelse return;
+    const claimed_pointer = config.claimed orelse return;
+    const claimed = definition_core.json_pointer.lookup(root, claimed_pointer);
+    const matches = if (claimed) |value|
+        value == .string and std.mem.eql(u8, value.string, derived)
+    else
+        false;
+    if (matches) return;
+    try execution.addDiagnostic(
+        "composite-identity",
+        claimed_pointer.raw,
+        "claimed artifact identity does not match " ++
+            "the derived composite identity",
+    );
+    discardMaterialized(
+        allocator,
+        canonical_content,
+        canonical_digest,
+        artifact_id,
+    );
 }
 
 pub fn validateArtifact(
@@ -575,159 +698,218 @@ fn validateClaimedIdentity(
 ) !void {
     switch (plan.identity) {
         .none => {},
-        .content_address => |config| {
-            const claimed_pointer = config.claimed orelse return;
-            const root = execution.inputJsonPtr(plan.input_index) orelse {
-                try execution.addDiagnostic(
-                    "content-address",
-                    claimed_pointer.raw,
-                    "content identity requires a JSON input",
-                );
-                return;
-            };
-            if (config.basis_null) |basis_pointer| {
-                const field = definition_core.json_pointer.lookupPtr(
-                    root,
-                    basis_pointer,
-                ) orelse {
-                    try execution.addDiagnostic(
-                        "content-address",
-                        basis_pointer.raw,
-                        "declared identity field is missing",
-                    );
-                    return;
-                };
-                const supplied = field.*;
-                if (supplied == .null) return;
-                if (supplied != .string) {
-                    try execution.addDiagnostic(
-                        "content-address",
-                        claimed_pointer.raw,
-                        "draft identity must be null or the matching content address",
-                    );
-                    return;
-                }
-                field.* = .null;
-                defer field.* = supplied;
-                const digest =
-                    try definition_core.canonical_json.digestValueAlloc(
-                        allocator,
-                        root.*,
-                    );
-                defer allocator.free(digest);
-                const derived = try contentAddressFromDigestAlloc(
-                    allocator,
-                    digest,
-                    config.prefix,
-                );
-                defer allocator.free(derived);
-                if (!std.mem.eql(u8, supplied.string, derived)) {
-                    try execution.addDiagnostic(
-                        "content-address",
-                        claimed_pointer.raw,
-                        "claimed artifact identity does not match canonical content",
-                    );
-                }
-                return;
-            }
+        .content_address => |config| try validateContentAddressClaim(
+            allocator,
+            execution,
+            plan,
+            config,
+        ),
+        .composite => |config| try validateCompositeClaim(
+            allocator,
+            execution,
+            plan,
+            config,
+        ),
+    }
+}
 
-            const root_value = root.*;
-            const claimed = definition_core.json_pointer.lookup(
-                root_value,
-                claimed_pointer,
+fn validateContentAddressClaim(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "content_address"),
+) !void {
+    const claimed_pointer = config.claimed orelse return;
+    const root = execution.inputJsonPtr(plan.input_index) orelse {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "content identity requires a JSON input",
+        );
+        return;
+    };
+    if (config.basis_null) |basis_pointer| {
+        return validateBasisNullClaim(
+            allocator,
+            execution,
+            root,
+            config,
+            claimed_pointer,
+            basis_pointer,
+        );
+    }
+    const claimed = definition_core.json_pointer.lookup(
+        root.*,
+        claimed_pointer,
+    );
+    if (!try requireStringClaim(execution, claimed_pointer, claimed)) return;
+    const supplied = claimed.?.string;
+    const derived = try deriveContentAddressClaim(
+        allocator,
+        execution,
+        plan,
+        config,
+        root.*,
+    );
+    defer allocator.free(derived);
+    if (!std.mem.eql(u8, supplied, derived)) {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "claimed artifact identity does not match canonical content",
+        );
+    }
+}
+
+fn requireStringClaim(
+    execution: *validation.Execution,
+    pointer: definition_core.json_pointer.Pointer,
+    claimed: ?std.json.Value,
+) !bool {
+    if (claimed == null) {
+        try execution.addDiagnostic(
+            "content-address",
+            pointer.raw,
+            "declared identity field is missing",
+        );
+        return false;
+    }
+    if (claimed.? == .null) return false;
+    if (claimed.? == .string) return true;
+    try execution.addDiagnostic(
+        "content-address",
+        pointer.raw,
+        "draft identity must be null or the matching content address",
+    );
+    return false;
+}
+
+fn validateBasisNullClaim(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    root: *std.json.Value,
+    config: @FieldType(Identity, "content_address"),
+    claimed_pointer: definition_core.json_pointer.Pointer,
+    basis_pointer: definition_core.json_pointer.Pointer,
+) !void {
+    const field = definition_core.json_pointer.lookupPtr(
+        root,
+        basis_pointer,
+    ) orelse {
+        try execution.addDiagnostic(
+            "content-address",
+            basis_pointer.raw,
+            "declared identity field is missing",
+        );
+        return;
+    };
+    const supplied = field.*;
+    if (supplied == .null) return;
+    if (supplied != .string) {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "draft identity must be null or the matching content address",
+        );
+        return;
+    }
+    field.* = .null;
+    defer field.* = supplied;
+    const digest = try definition_core.canonical_json.digestValueAlloc(
+        allocator,
+        root.*,
+    );
+    defer allocator.free(digest);
+    const derived = try contentAddressFromDigestAlloc(
+        allocator,
+        digest,
+        config.prefix,
+    );
+    defer allocator.free(derived);
+    if (!std.mem.eql(u8, supplied.string, derived)) {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "claimed artifact identity does not match canonical content",
+        );
+    }
+}
+
+fn deriveContentAddressClaim(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "content_address"),
+    root: std.json.Value,
+) ![]u8 {
+    if (config.exclude_key) |exclude_key| {
+        return contentAddressOmittingAlloc(
+            allocator,
+            root,
+            exclude_key,
+            config.exclude_recursive,
+            config.prefix,
+        );
+    }
+    const canonical = try canonicalize(allocator, execution, plan);
+    defer allocator.free(canonical);
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        canonical,
+    );
+    defer allocator.free(digest);
+    return contentAddressFromDigestAlloc(
+        allocator,
+        digest,
+        config.prefix,
+    );
+}
+
+fn validateCompositeClaim(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "composite"),
+) !void {
+    const claimed_pointer = config.claimed orelse return;
+    const root = execution.inputJson(plan.input_index) orelse {
+        try execution.addDiagnostic(
+            "composite-identity",
+            claimed_pointer.raw,
+            "composite identity requires a JSON input",
+        );
+        return;
+    };
+    const derived = deriveCompositeIdentityAlloc(
+        allocator,
+        root,
+        config,
+    ) catch |err| switch (err) {
+        error.CompositeIdentityFieldMissing,
+        error.CompositeIdentityFieldInvalid,
+        error.CompositeIdentityBytesExceeded,
+        => {
+            try execution.addDiagnostic(
+                "composite-identity",
+                "",
+                "composite identity cannot be derived from " ++
+                    "the declared scalar fields",
             );
-            if (claimed == null) {
-                try execution.addDiagnostic(
-                    "content-address",
-                    claimed_pointer.raw,
-                    "declared identity field is missing",
-                );
-                return;
-            }
-            if (claimed.? == .null) return;
-            if (claimed.? != .string) {
-                try execution.addDiagnostic(
-                    "content-address",
-                    claimed_pointer.raw,
-                    "draft identity must be null or the matching content address",
-                );
-                return;
-            }
-            const derived = if (config.exclude_key) |exclude_key|
-                try contentAddressOmittingAlloc(
-                    allocator,
-                    root_value,
-                    exclude_key,
-                    config.exclude_recursive,
-                    config.prefix,
-                )
-            else derived: {
-                const canonical = try canonicalize(allocator, execution, plan);
-                defer allocator.free(canonical);
-                const digest =
-                    try definition_core.canonical_json.digestBytesAlloc(
-                        allocator,
-                        canonical,
-                    );
-                defer allocator.free(digest);
-                break :derived try contentAddressFromDigestAlloc(
-                    allocator,
-                    digest,
-                    config.prefix,
-                );
-            };
-            defer allocator.free(derived);
-            if (!std.mem.eql(u8, claimed.?.string, derived)) {
-                try execution.addDiagnostic(
-                    "content-address",
-                    claimed_pointer.raw,
-                    "claimed artifact identity does not match canonical content",
-                );
-            }
+            return;
         },
-        .composite => |config| {
-            const claimed_pointer = config.claimed orelse return;
-            const root = execution.inputJson(plan.input_index) orelse {
-                try execution.addDiagnostic(
-                    "composite-identity",
-                    claimed_pointer.raw,
-                    "composite identity requires a JSON input",
-                );
-                return;
-            };
-            const derived = deriveCompositeIdentityAlloc(
-                allocator,
-                root,
-                config,
-            ) catch |err| switch (err) {
-                error.CompositeIdentityFieldMissing,
-                error.CompositeIdentityFieldInvalid,
-                error.CompositeIdentityBytesExceeded,
-                => {
-                    try execution.addDiagnostic(
-                        "composite-identity",
-                        "",
-                        "composite identity cannot be derived from the declared scalar fields",
-                    );
-                    return;
-                },
-                else => return err,
-            };
-            defer allocator.free(derived);
-            const claimed = definition_core.json_pointer.lookup(
-                root,
-                claimed_pointer,
-            );
-            if (claimed == null or claimed.? != .string or
-                !std.mem.eql(u8, claimed.?.string, derived))
-            {
-                try execution.addDiagnostic(
-                    "composite-identity",
-                    claimed_pointer.raw,
-                    "claimed artifact identity does not match the derived composite identity",
-                );
-            }
-        },
+        else => return err,
+    };
+    defer allocator.free(derived);
+    const claimed = definition_core.json_pointer.lookup(root, claimed_pointer);
+    if (claimed == null or claimed.? != .string or
+        !std.mem.eql(u8, claimed.?.string, derived))
+    {
+        try execution.addDiagnostic(
+            "composite-identity",
+            claimed_pointer.raw,
+            "claimed artifact identity does not match " ++
+                "the derived composite identity",
+        );
     }
 }
 
@@ -1144,7 +1326,32 @@ fn compileCompositeIdentity(
     try validateIdentityStaticText(separator_text, 16, true);
     const separator = try allocator.dupe(u8, separator_text);
     errdefer allocator.free(separator);
+    const fields = try compileCompositeFields(allocator, object);
+    errdefer deinitPointers(allocator, fields);
+    var claimed = try compileCompositeClaimed(allocator, object, fields);
+    errdefer if (claimed) |*pointer| pointer.deinit(allocator);
 
+    const max_bytes = if (object.get("max_bytes")) |raw|
+        try definition_core.json.unsigned(raw)
+    else
+        256;
+    if (max_bytes == 0 or max_bytes > 4096) {
+        return error.CompositeIdentityBytesInvalid;
+    }
+
+    return .{
+        .prefix = prefix,
+        .separator = separator,
+        .fields = fields,
+        .claimed = claimed,
+        .max_bytes = max_bytes,
+    };
+}
+
+fn compileCompositeFields(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) ![]definition_core.json_pointer.Pointer {
     const raw_fields = try definition_core.json.array(
         try definition_core.json.field(object, "fields"),
     );
@@ -1178,39 +1385,37 @@ fn compileCompositeIdentity(
         }
         try fields.append(allocator, pointer);
     }
+    return fields.toOwnedSlice(allocator);
+}
 
-    var claimed: ?definition_core.json_pointer.Pointer = null;
-    errdefer if (claimed) |*pointer| pointer.deinit(allocator);
-    if (try definition_core.json.optionalString(object, "field")) |pointer_text| {
-        if (pointer_text.len == 0 or pointer_text.len > 1024) {
-            return error.InvalidJsonPointer;
-        }
-        for (fields.items) |field| {
-            if (std.mem.eql(u8, field.raw, pointer_text)) {
-                return error.CompositeIdentityCycle;
-            }
-        }
-        claimed = try definition_core.json_pointer.compile(
-            allocator,
-            pointer_text,
-        );
+fn compileCompositeClaimed(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    fields: []const definition_core.json_pointer.Pointer,
+) !?definition_core.json_pointer.Pointer {
+    const pointer_text =
+        try definition_core.json.optionalString(object, "field") orelse
+        return null;
+    if (pointer_text.len == 0 or pointer_text.len > 1024) {
+        return error.InvalidJsonPointer;
     }
-
-    const max_bytes = if (object.get("max_bytes")) |raw|
-        try definition_core.json.unsigned(raw)
-    else
-        256;
-    if (max_bytes == 0 or max_bytes > 4096) {
-        return error.CompositeIdentityBytesInvalid;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.raw, pointer_text)) {
+            return error.CompositeIdentityCycle;
+        }
     }
+    return @as(
+        ?definition_core.json_pointer.Pointer,
+        try definition_core.json_pointer.compile(allocator, pointer_text),
+    );
+}
 
-    return .{
-        .prefix = prefix,
-        .separator = separator,
-        .fields = try fields.toOwnedSlice(allocator),
-        .claimed = claimed,
-        .max_bytes = max_bytes,
-    };
+fn deinitPointers(
+    allocator: std.mem.Allocator,
+    fields: []definition_core.json_pointer.Pointer,
+) void {
+    for (fields) |*field| field.deinit(allocator);
+    allocator.free(fields);
 }
 
 fn decodeCompositeIdentity(
@@ -1466,14 +1671,149 @@ fn decodeForAllocationFailure(
     try decoder.finish();
 }
 
-test "materialization reuses validation parse and derives content address" {
+const pure_definition_tail_one =
+    "\"storage\":{\"kind\":\"pure\"},\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":4096," ++
+    "\"max_records\":1,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":1}}";
+
+const materialized_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/materialized\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"exact-object\",\"content-address\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"record\"}]}," ++
+    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"path\":\"\"," ++
+    "\"keys\":[\"record_id\",\"value\"]}]},\"constraints\":[]," ++
+    "\"identity\":{\"op\":\"content-address\",\"input\":\"record\"," ++
+    "\"exclude\":\"/record_id\"}," ++ pure_definition_tail_one;
+
+const claimed_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/claimed\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"content-address\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":[]," ++
+    "\"identity\":{\"op\":\"content-address\",\"input\":\"record\"," ++
+    "\"exclude\":\"/record_id\",\"field\":\"/record_id\"}," ++
+    pure_definition_tail_one;
+
+const prefixed_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/prefixed\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"content-address\",\"exact-object\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"record\"}]}," ++
+    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"path\":\"\"," ++
+    "\"keys\":[\"envelope\"]},{\"op\":\"exact-object\"," ++
+    "\"path\":\"/envelope\",\"keys\":[\"record_id\",\"value\"]}]}," ++
+    "\"constraints\":[],\"identity\":{\"op\":\"content-address\"," ++
+    "\"input\":\"record\",\"exclude\":\"/record_id\"," ++
+    "\"exclude_recursive\":true,\"prefix\":\"OBJ-\"," ++
+    "\"field\":\"/envelope/record_id\"}," ++ pure_definition_tail_one;
+
+const nested_draft_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/nested-draft\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"content-address\",\"exact-object\"]}," ++
+    "\"inputs\":{\"contract\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"contract\"}]}," ++
+    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"contract\"," ++
+    "\"path\":\"\",\"keys\":[\"artifact\"]},{\"op\":\"exact-object\"," ++
+    "\"input\":\"contract\",\"path\":\"/artifact\"," ++
+    "\"keys\":[\"artifact_id\",\"value\"]}]},\"constraints\":[]," ++
+    "\"identity\":{\"op\":\"content-address\",\"input\":\"contract\"," ++
+    "\"basis_null\":\"/artifact/artifact_id\"," ++
+    "\"field\":\"/artifact/artifact_id\"}," ++ pure_definition_tail_one;
+
+const composite_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/composite\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"composite-identity\"," ++
+    "\"exact-object\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"record\"}]}," ++
+    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"record\"," ++
+    "\"path\":\"\",\"keys\":[\"kind\",\"record_id\",\"sequence\"]}]}," ++
+    "\"constraints\":[],\"identity\":{\"op\":\"composite-identity\"," ++
+    "\"input\":\"record\",\"prefix\":\"REC\"," ++
+    "\"fields\":[\"/kind\",\"/sequence\"],\"separator\":\"-\"," ++
+    "\"field\":\"/record_id\",\"max_bytes\":128}," ++ pure_definition_tail_one;
+
+const composite_bounds_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/composite-bounds\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"composite-identity\"]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":[]," ++
+    "\"identity\":{\"op\":\"composite-identity\",\"input\":\"record\"," ++
+    "\"fields\":[\"/value\"],\"max_bytes\":3}," ++ pure_definition_tail_one;
+
+const request_family_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/request-family\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
+    "\"operators\":[\"canonical-json\",\"exact-object\"]}," ++
+    "\"inputs\":{\"left\":{\"codec\":\"json\",\"required\":false," ++
+    "\"max_bytes\":4096},\"right\":{\"codec\":\"json\",\"required\":false," ++
+    "\"max_bytes\":4096}}," ++
+    "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
+    "\"input\":\"left\"},{\"op\":\"canonical-json\",\"input\":\"right\"}]}," ++
+    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"left\"," ++
+    "\"path\":\"\",\"keys\":[\"id\"]},{\"op\":\"exact-object\"," ++
+    "\"input\":\"right\",\"path\":\"\",\"keys\":[\"id\"]}]}," ++
+    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":4096," ++
+    "\"max_records\":2,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":1}}";
+
+const TestPlans = struct {
+    closure: definition_core.Closure,
+    artifact: definition.Plan,
+    validator: validation.Plan,
+    materializer: Plan,
+    cache_payload: []u8,
+
+    fn deinit(self: *TestPlans) void {
+        std.testing.allocator.free(self.cache_payload);
+        self.materializer.deinit(std.testing.allocator);
+        self.validator.deinit(std.testing.allocator);
+        self.artifact.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileTestPlans(source: []const u8) !TestPlans {
+    return compileTestPlansMode(source, false);
+}
+
+fn compileValidationTestPlans(source: []const u8) !TestPlans {
+    return compileTestPlansMode(source, true);
+}
+
+fn compileTestPlansMode(
+    source: []const u8,
+    validation_only: bool,
+) !TestPlans {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","exact-object","content-address"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{"rules":[{"op":"exact-object","path":"","keys":["record_id","value"]}]},"constraints":[],"identity":{"op":"content-address","input":"record","exclude":"/record_id"},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = source,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1481,43 +1821,55 @@ test "materialization reuses validation parse and derives content address" {
         "artifact.json",
         .{},
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
+    errdefer closure.deinit(std.testing.allocator);
+    var artifact = try definition.compile(
         std.testing.allocator,
         &closure,
         "artifact.json",
     );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
+    errdefer artifact.deinit(std.testing.allocator);
+    var validator = try validation.compile(std.testing.allocator, &artifact);
+    errdefer validator.deinit(std.testing.allocator);
+    var compiled = if (validation_only)
+        try compileForValidation(std.testing.allocator, &artifact)
+    else
+        try compile(std.testing.allocator, &artifact);
+    defer compiled.deinit(std.testing.allocator);
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
         4096,
     );
     defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
+    try encodeCache(&compiled, &encoder);
     const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
+    errdefer std.testing.allocator.free(payload);
     var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
+    var materializer = try decodeCache(std.testing.allocator, &decoder);
+    errdefer materializer.deinit(std.testing.allocator);
     try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
+    try validateCachePlan(&materializer, &artifact);
+    return .{
+        .closure = closure,
+        .artifact = artifact,
+        .validator = validator,
+        .materializer = materializer,
+        .cache_payload = payload,
+    };
+}
+
+test "materialization reuses validation parse and derives content address" {
+    var plans = try compileTestPlans(materialized_definition_json);
+    defer plans.deinit();
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
-        .{payload},
+        .{plans.cache_payload},
     );
     var result = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{
             .name = "record",
             .bytes = "{\"value\":1,\"record_id\":\"pending\"}",
@@ -1537,40 +1889,17 @@ test "materialization reuses validation parse and derives content address" {
 }
 
 test "claimed content address mismatch fails structural materialization" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/claimed","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","content-address"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{},"constraints":[],"identity":{"op":"content-address","input":"record","exclude":"/record_id","field":"/record_id"},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
+    var plans = try compileTestPlans(claimed_definition_json);
+    defer plans.deinit();
     var result = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &plan,
-        &.{.{ .name = "record", .bytes = "{\"record_id\":\"wrong\",\"value\":1}" }},
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
+        &.{.{
+            .name = "record",
+            .bytes = "{\"record_id\":\"wrong\",\"value\":1}",
+        }},
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.validation_result.valid);
@@ -1579,51 +1908,12 @@ test "claimed content address mismatch fails structural materialization" {
 }
 
 test "content address supports bounded recursive omission and a static prefix" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/prefixed","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","content-address","exact-object"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{"rules":[{"op":"exact-object","path":"","keys":["envelope"]},{"op":"exact-object","path":"/envelope","keys":["record_id","value"]}]},"constraints":[],"identity":{"op":"content-address","input":"record","exclude":"/record_id","exclude_recursive":true,"prefix":"OBJ-","field":"/envelope/record_id"},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        4096,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
+    var plans = try compileTestPlans(prefixed_definition_json);
+    defer plans.deinit();
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
-        .{payload},
+        .{plans.cache_payload},
     );
 
     const basis = "{\"envelope\":{\"value\":1}}";
@@ -1647,9 +1937,9 @@ test "content address supports bounded recursive omission and a static prefix" {
 
     var result = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{
             .name = "record",
             .bytes = "{\"envelope\":{\"record_id\":null,\"value\":1}}",
@@ -1664,93 +1954,15 @@ test "content address supports bounded recursive omission and a static prefix" {
     );
 }
 
-test "nested draft content address materializes and verifies canonical identity" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/nested-draft","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","content-address","exact-object"]},"inputs":{"contract":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"contract"}]},"shape":{"rules":[{"op":"exact-object","input":"contract","path":"","keys":["artifact"]},{"op":"exact-object","input":"contract","path":"/artifact","keys":["artifact_id","value"]}]},"constraints":[],"identity":{"op":"content-address","input":"contract","basis_null":"/artifact/artifact_id","field":"/artifact/artifact_id"},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        4096,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        compileForAllocationFailure,
-        .{&definition_plan},
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        decodeForAllocationFailure,
-        .{payload},
-    );
-
-    const draft = "{\"artifact\":{\"value\":1,\"artifact_id\":null}}";
-    const basis = "{\"artifact\":{\"artifact_id\":null,\"value\":1}}";
-    const expected_id = try definition_core.canonical_json.digestBytesAlloc(
-        std.testing.allocator,
-        basis,
-    );
-    defer std.testing.allocator.free(expected_id);
-    var result = try materialize(
-        std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
-        &.{.{ .name = "contract", .bytes = draft }},
-    );
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.validation_result.valid);
-    try std.testing.expectEqualStrings(expected_id, result.artifact_id.?);
-    const expected_canonical = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"artifact\":{{\"artifact_id\":\"{s}\",\"value\":1}}}}",
-        .{expected_id},
-    );
-    defer std.testing.allocator.free(expected_canonical);
-    try std.testing.expectEqualStrings(
-        expected_canonical,
-        result.canonical_content.?,
-    );
-
+fn expectNestedDraftRepeat(
+    plans: *const TestPlans,
+    result: *const Result,
+) !void {
     var repeated = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{
             .name = "contract",
             .bytes = result.canonical_content.?,
@@ -1766,32 +1978,40 @@ test "nested draft content address materializes and verifies canonical identity"
         result.artifact_id.?,
         repeated.artifact_id.?,
     );
+}
 
+fn expectNestedDraftRejection(
+    plans: *const TestPlans,
+    result: *const Result,
+    expected_id: []const u8,
+) !void {
+    const wrong_digest =
+        "sha256:11111111111111111111111111111111" ++
+        "11111111111111111111111111111111";
     const wrong = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         result.canonical_content.?,
         expected_id,
-        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        wrong_digest,
     );
     defer std.testing.allocator.free(wrong);
     var rejected = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{ .name = "contract", .bytes = wrong }},
     );
     defer rejected.deinit(std.testing.allocator);
     try std.testing.expect(!rejected.validation_result.valid);
     try std.testing.expect(rejected.canonical_content == null);
     try std.testing.expect(rejected.artifact_id == null);
-
     var rejected_validation = try validateArtifact(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{ .name = "contract", .bytes = wrong }},
     );
     defer rejected_validation.deinit(std.testing.allocator);
@@ -1802,82 +2022,93 @@ test "nested draft content address materializes and verifies canonical identity"
     );
 }
 
-test "compiled composite identity derives bounded scalar identity" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/composite","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","composite-identity","exact-object"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{"rules":[{"op":"exact-object","input":"record","path":"","keys":["kind","record_id","sequence"]}]},"constraints":[],"identity":{"op":"composite-identity","input":"record","prefix":"REC","fields":["/kind","/sequence"],"separator":"-","field":"/record_id","max_bytes":128},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        4096,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
+test "nested draft content address materializes and verifies canonical identity" {
+    var plans = try compileTestPlans(nested_draft_definition_json);
+    defer plans.deinit();
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
-        .{&definition_plan},
+        .{&plans.artifact},
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
-        .{payload},
+        .{plans.cache_payload},
     );
 
+    const draft = "{\"artifact\":{\"value\":1,\"artifact_id\":null}}";
+    const basis = "{\"artifact\":{\"artifact_id\":null,\"value\":1}}";
+    const expected_id = try definition_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        basis,
+    );
+    defer std.testing.allocator.free(expected_id);
+    var result = try materialize(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
+        &.{.{ .name = "contract", .bytes = draft }},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.validation_result.valid);
+    try std.testing.expectEqualStrings(expected_id, result.artifact_id.?);
+    const expected_canonical = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"artifact\":{{\"artifact_id\":\"{s}\",\"value\":1}}}}",
+        .{expected_id},
+    );
+    defer std.testing.allocator.free(expected_canonical);
+    try std.testing.expectEqualStrings(
+        expected_canonical,
+        result.canonical_content.?,
+    );
+    try expectNestedDraftRepeat(&plans, &result);
+    try expectNestedDraftRejection(&plans, &result, expected_id);
+}
+
+test "compiled composite identity derives bounded scalar identity" {
+    var plans = try compileTestPlans(composite_definition_json);
+    defer plans.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        compileForAllocationFailure,
+        .{&plans.artifact},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeForAllocationFailure,
+        .{plans.cache_payload},
+    );
+
+    const valid_record =
+        "{\"sequence\":7,\"record_id\":\"REC-alpha-7\"," ++
+        "\"kind\":\"alpha\"}";
     var valid = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{
             .name = "record",
-            .bytes = "{\"sequence\":7,\"record_id\":\"REC-alpha-7\",\"kind\":\"alpha\"}",
+            .bytes = valid_record,
         }},
     );
     defer valid.deinit(std.testing.allocator);
     try std.testing.expect(valid.validation_result.valid);
     try std.testing.expectEqualStrings("REC-alpha-7", valid.artifact_id.?);
 
+    const mismatch_record =
+        "{\"record_id\":\"wrong\",\"kind\":\"alpha\"," ++
+        "\"sequence\":7}";
     var mismatch = try materialize(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
-        &cached,
+        &plans.artifact,
+        &plans.validator,
+        &plans.materializer,
         &.{.{
             .name = "record",
-            .bytes = "{\"record_id\":\"wrong\",\"kind\":\"alpha\",\"sequence\":7}",
+            .bytes = mismatch_record,
         }},
     );
     defer mismatch.deinit(std.testing.allocator);
@@ -1888,34 +2119,8 @@ test "compiled composite identity derives bounded scalar identity" {
 }
 
 test "composite identity rejects non-scalar and oversized components" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/composite-bounds","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","composite-identity"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{},"constraints":[],"identity":{"op":"composite-identity","input":"record","fields":["/value"],"max_bytes":3},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
+    var plans = try compileTestPlans(composite_bounds_definition_json);
+    defer plans.deinit();
 
     for ([_][]const u8{
         "{\"value\":{\"nested\":true}}",
@@ -1924,9 +2129,9 @@ test "composite identity rejects non-scalar and oversized components" {
     }) |bytes| {
         var result = try materialize(
             std.testing.allocator,
-            &definition_plan,
-            &validation_plan,
-            &plan,
+            &plans.artifact,
+            &plans.validator,
+            &plans.materializer,
             &.{.{ .name = "record", .bytes = bytes }},
         );
         defer result.deinit(std.testing.allocator);
@@ -1936,48 +2141,23 @@ test "composite identity rejects non-scalar and oversized components" {
 }
 
 test "validation compiles identity-free request families without choosing an output" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/request-family","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","exact-object"]},"inputs":{"left":{"codec":"json","required":false,"max_bytes":4096},"right":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"left"},{"op":"canonical-json","input":"right"}]},"shape":{"rules":[{"op":"exact-object","input":"left","path":"","keys":["id"]},{"op":"exact-object","input":"right","path":"","keys":["id"]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var validation_plan = try validation.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer validation_plan.deinit(std.testing.allocator);
-
+    var plans = try compileValidationTestPlans(request_family_definition_json);
+    defer plans.deinit();
     try std.testing.expectError(
         error.MultipleCanonicalOutputs,
-        compile(std.testing.allocator, &definition_plan),
+        compile(std.testing.allocator, &plans.artifact),
     );
     var plan = try compileForValidation(
         std.testing.allocator,
-        &definition_plan,
+        &plans.artifact,
     );
     defer plan.deinit(std.testing.allocator);
     try std.testing.expect(plan.identity == .none);
 
     var result = try validateArtifact(
         std.testing.allocator,
-        &definition_plan,
-        &validation_plan,
+        &plans.artifact,
+        &plans.validator,
         &plan,
         &.{.{ .name = "right", .bytes = "{\"id\":\"record-1\"}" }},
     );
