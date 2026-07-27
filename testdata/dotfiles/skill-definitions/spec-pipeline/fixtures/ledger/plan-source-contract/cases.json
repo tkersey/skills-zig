@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -13,13 +13,9 @@
       "id": "gate-only",
       "base": "complete",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/plan_source_contract/sgr_v2/spec_governance_receipt/mode",
-          "value": "gate-only"
-        }
-      ]
+      "set": {
+        "/plan_source_contract/sgr_v2/spec_governance_receipt/mode": "gate-only"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:5c12d609358bddbc5127c6c032f07245fe25cdf74ad4ea11fd4679c658cd3a77"

@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "passing": "bases/passing.json"
   },
@@ -13,35 +13,19 @@
       "id": "empty-argv",
       "base": "passing",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/verifier/argv",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/output_digests",
-          "value": []
-        }
-      ]
+      "set": {
+        "/verifier/argv": [],
+        "/output_digests": []
+      }
     },
     {
       "id": "non-integer-exit",
       "base": "passing",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/exit_status",
-          "value": "pass"
-        },
-        {
-          "op": "replace",
-          "path": "/output_digests",
-          "value": []
-        }
-      ]
+      "set": {
+        "/exit_status": "pass",
+        "/output_digests": []
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:093aef565be4c98724bedd117b954fd31c2e0bc67a1683be0abd4355a86bfe60"

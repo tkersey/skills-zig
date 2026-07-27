@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "edit": "bases/edit.json",
     "inspect": "bases/inspect.json"
@@ -19,33 +19,21 @@
       "id": "edit-without-path",
       "base": "edit",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/paths",
-          "value": []
-        }
-      ]
+      "set": {
+        "/paths": []
+      }
     },
     {
       "id": "multiple-proof-roles",
       "base": "edit",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/effect",
-          "value": "verify"
-        },
-        {
-          "op": "replace",
-          "path": "/proof_obligation_refs",
-          "value": [
-            "proof-1",
-            "proof-2"
-          ]
-        }
-      ]
+      "set": {
+        "/effect": "verify",
+        "/proof_obligation_refs": [
+          "proof-1",
+          "proof-2"
+        ]
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:422b539a8aeb804bf97fcb91e8403f80e13ff0bf2559266813e1a633dc5535a5"

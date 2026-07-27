@@ -1,5 +1,5 @@
 {
-  "schema": "actuating-evidence-protocol-cases/v2",
+  "schema": "actuating-evidence-protocol-cases/v3",
   "protocol_definition": "codex/skills/actuating/definitions/ledger/evidence-protocol.json",
   "sources": {
     "accepted-counterexample": {
@@ -32,7 +32,6 @@
       "id": "accepted-successor",
       "setup": "accepted-debt",
       "candidate": "construction-successor",
-      "patch": [],
       "expect": "valid",
       "error": null
     },
@@ -40,54 +39,37 @@
       "id": "accepted-class-omitted",
       "setup": "accepted-debt",
       "candidate": "construction-successor",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/artifact/payload/counterexample_class_refs",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/artifact/payload/recompilation/evaluated_class_refs",
-          "value": []
-        }
-      ],
       "expect": "invalid",
-      "error": "ProtocolAdmissionRejected"
+      "error": "ProtocolAdmissionRejected",
+      "set": {
+        "/artifact/payload/counterexample_class_refs": [],
+        "/artifact/payload/recompilation/evaluated_class_refs": []
+      }
     },
     {
       "id": "stale-counterexample-set",
       "setup": "accepted-debt",
       "candidate": "construction-successor",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/artifact/payload/recompilation/counterexample_set_ref",
-          "value": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        }
-      ],
       "expect": "invalid",
-      "error": "ProtocolAdmissionRejected"
+      "error": "ProtocolAdmissionRejected",
+      "set": {
+        "/artifact/payload/recompilation/counterexample_set_ref": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
     },
     {
       "id": "high-severity-example-only-proof",
       "setup": "accepted-debt",
       "candidate": "construction-successor",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/artifact/payload/proof_obligations/0/proof_mode",
-          "value": "example-regression"
-        }
-      ],
       "expect": "invalid",
-      "error": "ProtocolAdmissionRejected"
+      "error": "ProtocolAdmissionRejected",
+      "set": {
+        "/artifact/payload/proof_obligations/0/proof_mode": "example-regression"
+      }
     },
     {
       "id": "goal-successor-with-active-debt",
       "setup": "accepted-debt",
       "candidate": "goal-successor",
-      "patch": [],
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     },
@@ -95,20 +77,12 @@
       "id": "rejected-only-review-without-prior-debt",
       "setup": "rejected-review",
       "candidate": "construction-successor",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/artifact/payload/counterexample_class_refs",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/artifact/payload/recompilation/evaluated_class_refs",
-          "value": []
-        }
-      ],
       "expect": "invalid",
-      "error": "ProtocolAdmissionRejected"
+      "error": "ProtocolAdmissionRejected",
+      "set": {
+        "/artifact/payload/counterexample_class_refs": [],
+        "/artifact/payload/recompilation/evaluated_class_refs": []
+      }
     }
   ],
   "reconstructed_candidates_digest": "sha256:fa3d9f766314702993e89cf8d4844b9fd17985215329c4d719ddf53e82449090"

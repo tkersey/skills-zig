@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "mapping-endorsement": "bases/mapping-endorsement.json"
   },
@@ -13,362 +13,171 @@
       "id": "mapping-confirmation",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "mapping-confirmation"
-        },
-        {
-          "op": "replace",
-          "path": "/note/authority",
-          "value": "repeated-accepted-use"
-        },
-        {
-          "op": "replace",
-          "path": "/note/operation",
-          "value": "confirm"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/endorsement_type",
-          "value": "repeated-accepted-use"
-        },
-        {
-          "op": "replace",
-          "path": "/note/related_ids",
-          "value": [
-            "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
-          ]
-        }
-      ]
+      "set": {
+        "/logical_kind": "mapping-confirmation",
+        "/note/authority": "repeated-accepted-use",
+        "/note/operation": "confirm",
+        "/note/payload/endorsement_type": "repeated-accepted-use",
+        "/note/related_ids": [
+          "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
+        ]
+      }
     },
     {
       "id": "mapping-correction",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "mapping-correction"
-        },
-        {
-          "op": "replace",
-          "path": "/physical_kind",
-          "value": "mapping-correction"
-        },
-        {
-          "op": "replace",
-          "path": "/note/authority",
-          "value": "explicit-user-correction"
-        },
-        {
-          "op": "replace",
-          "path": "/note/operation",
-          "value": "supersede"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/endorsement_type",
-          "value": "explicit-user-correction"
-        },
-        {
-          "op": "replace",
-          "path": "/note/supersedes_id",
-          "value": "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
-        }
-      ]
+      "set": {
+        "/logical_kind": "mapping-correction",
+        "/physical_kind": "mapping-correction",
+        "/note/authority": "explicit-user-correction",
+        "/note/operation": "supersede",
+        "/note/payload/endorsement_type": "explicit-user-correction",
+        "/note/supersedes_id": "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
+      }
     },
     {
       "id": "mapping-rejection",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "mapping-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/physical_kind",
-          "value": "mapping-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/note/authority",
-          "value": "explicit-user-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/note/operation",
-          "value": "reject"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/endorsement_type",
-          "value": "explicit-user-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/note/related_ids",
-          "value": [
-            "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
-          ]
-        }
-      ]
+      "set": {
+        "/logical_kind": "mapping-rejection",
+        "/physical_kind": "mapping-rejection",
+        "/note/authority": "explicit-user-rejection",
+        "/note/operation": "reject",
+        "/note/payload/endorsement_type": "explicit-user-rejection",
+        "/note/related_ids": [
+          "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
+        ]
+      }
     },
     {
       "id": "activation-boundary",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "activation-boundary"
-        },
-        {
-          "op": "replace",
-          "path": "/physical_kind",
-          "value": "activation-boundary"
-        }
-      ]
+      "set": {
+        "/logical_kind": "activation-boundary",
+        "/physical_kind": "activation-boundary"
+      }
     },
     {
       "id": "boundary-retraction",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "boundary-retraction"
-        },
-        {
-          "op": "replace",
-          "path": "/physical_kind",
-          "value": "boundary-retraction"
-        },
-        {
-          "op": "replace",
-          "path": "/note/authority",
-          "value": "explicit-user-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/note/operation",
-          "value": "retract"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/endorsement_type",
-          "value": "explicit-user-rejection"
-        },
-        {
-          "op": "replace",
-          "path": "/note/related_ids",
-          "value": [
-            "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
-          ]
-        }
-      ]
+      "set": {
+        "/logical_kind": "boundary-retraction",
+        "/physical_kind": "boundary-retraction",
+        "/note/authority": "explicit-user-rejection",
+        "/note/operation": "retract",
+        "/note/payload/endorsement_type": "explicit-user-rejection",
+        "/note/related_ids": [
+          "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
+        ]
+      }
     },
     {
       "id": "scope-global",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/scope/kind",
-          "value": "global"
-        },
-        {
-          "op": "replace",
-          "path": "/note/scope/paths",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/note/scope/repo",
-          "value": null
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/scope",
-          "value": "global_default"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/scope_anchor",
-          "value": "global"
-        },
-        {
-          "op": "replace",
-          "path": "/scope_anchor_source",
-          "value": "kind"
-        }
-      ]
+      "set": {
+        "/note/scope/kind": "global",
+        "/note/scope/paths": [],
+        "/note/scope/repo": null,
+        "/note/payload/scope": "global_default",
+        "/note/payload/scope_anchor": "global",
+        "/scope_anchor_source": "kind"
+      }
     },
     {
       "id": "scope-path-family-whitespace",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/scope/kind",
-          "value": "path-family"
-        },
-        {
-          "op": "replace",
-          "path": "/note/scope/paths",
-          "value": [
-            " "
-          ]
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/scope",
-          "value": "path_family_scoped"
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/scope_anchor",
-          "value": " "
-        }
-      ]
+      "set": {
+        "/note/scope/kind": "path-family",
+        "/note/scope/paths": [
+          " "
+        ],
+        "/note/payload/scope": "path_family_scoped",
+        "/note/payload/scope_anchor": " "
+      }
     },
     {
       "id": "scope-repo-whitespace",
       "base": "mapping-endorsement",
       "expect": "valid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/scope/paths",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/note/scope/repo",
-          "value": " "
-        },
-        {
-          "op": "replace",
-          "path": "/note/payload/scope_anchor",
-          "value": " "
-        },
-        {
-          "op": "replace",
-          "path": "/scope_anchor_source",
-          "value": "repo"
-        }
-      ]
+      "set": {
+        "/note/scope/paths": [],
+        "/note/scope/repo": " ",
+        "/note/payload/scope_anchor": " ",
+        "/scope_anchor_source": "repo"
+      }
     },
     {
       "id": "confirmation-without-prior",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/logical_kind",
-          "value": "mapping-confirmation"
-        },
-        {
-          "op": "replace",
-          "path": "/note/operation",
-          "value": "confirm"
-        }
-      ]
+      "set": {
+        "/logical_kind": "mapping-confirmation",
+        "/note/operation": "confirm"
+      }
     },
     {
       "id": "endorsement-mismatch",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/payload/endorsement_type",
-          "value": "repeated-accepted-use"
-        }
-      ]
+      "set": {
+        "/note/payload/endorsement_type": "repeated-accepted-use"
+      }
     },
     {
       "id": "malformed-prior-id",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/related_ids",
-          "value": [
-            "MSN-invalid"
-          ]
-        }
-      ]
+      "set": {
+        "/note/related_ids": [
+          "MSN-invalid"
+        ]
+      }
     },
     {
       "id": "mapping-without-translation",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "remove",
-          "path": "/note/payload/engineering_translation"
-        }
+      "remove": [
+        "/note/payload/engineering_translation"
       ]
     },
     {
       "id": "physical-kind-mismatch",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/physical_kind",
-          "value": "mapping-correction"
-        }
-      ]
+      "set": {
+        "/physical_kind": "mapping-correction"
+      }
     },
     {
       "id": "scope-mapping-mismatch",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/payload/scope",
-          "value": "global_default"
-        }
-      ]
+      "set": {
+        "/note/payload/scope": "global_default"
+      }
     },
     {
       "id": "scope-anchor-priority",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/note/payload/scope_anchor",
-          "value": "owner/repo"
-        }
-      ]
+      "set": {
+        "/note/payload/scope_anchor": "owner/repo"
+      }
     },
     {
       "id": "sensitive-nested-key",
       "base": "mapping-endorsement",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "add",
-          "path": "/note/payload/secret",
-          "value": "redacted"
-        }
-      ]
+      "set": {
+        "/note/payload/secret": "redacted"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:d78d20744575da9649b6acda5f0dca041d57f44b2c3a9fe6ed3e6704bdc0b5ac"

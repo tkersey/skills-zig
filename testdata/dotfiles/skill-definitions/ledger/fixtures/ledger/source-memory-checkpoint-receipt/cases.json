@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
@@ -11,7 +11,6 @@
     {
       "id": "complete-all-no-op",
       "base": "complete",
-      "patch": [],
       "expect": "valid",
       "materialization": {
         "artifact_id": "sha256:b028068be64931408170c944d55b4f2e4dfb23aa76ba006be55b562f9879dc61",
@@ -21,145 +20,98 @@
     {
       "id": "degraded-after-canonical-success",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/participants/learnings",
-          "value": {
-            "admission": "blocked",
-            "admission_reason": "memory-note unavailable",
-            "disposition": "appended",
-            "proof_refs": [
-              "test:learning"
-            ],
-            "record_id": "lrn-20260715T000000Z-12345678"
-          }
+      "expect": "valid",
+      "set": {
+        "/participants/learnings": {
+          "admission": "blocked",
+          "admission_reason": "memory-note unavailable",
+          "disposition": "appended",
+          "proof_refs": [
+            "test:learning"
+          ],
+          "record_id": "lrn-20260715T000000Z-12345678"
         },
-        {
-          "op": "replace",
-          "path": "/status",
-          "value": "degraded"
-        },
-        {
-          "op": "replace",
-          "path": "/subject_fingerprint",
-          "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        },
-        {
-          "op": "replace",
-          "path": "/evidence_fingerprint",
-          "value": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        }
-      ],
-      "expect": "valid"
+        "/status": "degraded",
+        "/subject_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "/evidence_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
     },
     {
       "id": "blocked-canonical-participant",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/participants/negative-ledger",
-          "value": {
-            "admission": "not-applicable",
-            "disposition": "blocked",
-            "reason": "current exact exclusion remains active"
-          }
+      "expect": "valid",
+      "set": {
+        "/participants/negative-ledger": {
+          "admission": "not-applicable",
+          "disposition": "blocked",
+          "reason": "current exact exclusion remains active"
         },
-        {
-          "op": "replace",
-          "path": "/status",
-          "value": "blocked"
-        }
-      ],
-      "expect": "valid"
+        "/status": "blocked"
+      }
     },
     {
       "id": "missing-participant",
       "base": "complete",
-      "patch": [
-        {
-          "op": "remove",
-          "path": "/participants/negative-ledger"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "remove": [
+        "/participants/negative-ledger"
+      ]
     },
     {
       "id": "candidate-cannot-create-note",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/participants/synesthesia",
-          "value": {
-            "admission": "created",
-            "disposition": "candidate",
-            "note_id": "MSN-illegal",
-            "reason": "needs endorsement"
-          }
+      "expect": "invalid",
+      "set": {
+        "/participants/synesthesia": {
+          "admission": "created",
+          "disposition": "candidate",
+          "note_id": "MSN-illegal",
+          "reason": "needs endorsement"
         }
-      ],
-      "expect": "invalid"
+      }
     },
     {
       "id": "degraded-without-admission-failure",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/status",
-          "value": "degraded"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/status": "degraded"
+      }
     },
     {
       "id": "blocked-without-canonical-failure",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/status",
-          "value": "blocked"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/status": "blocked"
+      }
     },
     {
       "id": "canonical-write-needs-proof",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/participants/learnings",
-          "value": {
-            "admission": "not-eligible",
-            "admission_reason": "source-local only",
-            "disposition": "appended",
-            "record_id": "lrn-20260715T000000Z-12345678"
-          }
+      "expect": "invalid",
+      "set": {
+        "/participants/learnings": {
+          "admission": "not-eligible",
+          "admission_reason": "source-local only",
+          "disposition": "appended",
+          "record_id": "lrn-20260715T000000Z-12345678"
         }
-      ],
-      "expect": "invalid"
+      }
     },
     {
       "id": "record-id-prefix-mismatch",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/participants/learnings",
-          "value": {
-            "admission": "duplicate-skip",
-            "disposition": "duplicate-skip",
-            "note_id": "MSN-existing",
-            "reason": "already captured",
-            "record_id": "NEG-wrong-owner"
-          }
+      "expect": "invalid",
+      "set": {
+        "/participants/learnings": {
+          "admission": "duplicate-skip",
+          "disposition": "duplicate-skip",
+          "note_id": "MSN-existing",
+          "reason": "already captured",
+          "record_id": "NEG-wrong-owner"
         }
-      ],
-      "expect": "invalid"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:7183ae2f7636531d5ec9563a2bb13f41e1128dd9fc3b5f1d5274fb89702c0649"

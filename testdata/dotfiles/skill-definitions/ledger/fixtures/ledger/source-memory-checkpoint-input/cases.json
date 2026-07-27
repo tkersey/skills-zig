@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -7,7 +7,6 @@
     {
       "id": "complete",
       "base": "complete",
-      "patch": [],
       "expect": "valid",
       "materialization": {
         "artifact_id": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7",
@@ -17,75 +16,52 @@
     {
       "id": "unborn-head",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/subject/head_oid",
-          "value": null
-        }
-      ],
-      "expect": "valid"
+      "expect": "valid",
+      "set": {
+        "/subject/head_oid": null
+      }
     },
     {
       "id": "missing-changed-paths",
       "base": "complete",
-      "patch": [
-        {
-          "op": "remove",
-          "path": "/evidence/changed_paths"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "remove": [
+        "/evidence/changed_paths"
+      ]
     },
     {
       "id": "absolute-changed-path",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/evidence/changed_paths/0",
-          "value": "/tmp/outside"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/evidence/changed_paths/0": "/tmp/outside"
+      }
     },
     {
       "id": "unbound-workspace-fingerprint",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/subject/workspace_fingerprint",
-          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/subject/workspace_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
     },
     {
       "id": "nested-evidence-array",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/evidence/attempted_routes/0",
-          "value": [
-            "route"
-          ]
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/evidence/attempted_routes/0": [
+          "route"
+        ]
+      }
     },
     {
       "id": "empty-decision-delta",
       "base": "complete",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/evidence/decision_delta",
-          "value": " "
-        }
-      ],
-      "expect": "invalid"
+      "expect": "invalid",
+      "set": {
+        "/evidence/decision_delta": " "
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:347ea4f4e426a396223ffaa52bbf1eb2419a3823fd725569bd8cdf186643d78b"

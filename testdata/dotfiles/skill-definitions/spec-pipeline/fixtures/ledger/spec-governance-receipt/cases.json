@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -13,11 +13,8 @@
       "id": "missing-retro",
       "base": "complete",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "remove",
-          "path": "/spec_governance_receipt/retro"
-        }
+      "remove": [
+        "/spec_governance_receipt/retro"
       ]
     }
   ],

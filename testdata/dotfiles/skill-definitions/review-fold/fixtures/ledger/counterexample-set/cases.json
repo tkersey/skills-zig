@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "accepted": "bases/accepted.json"
   },
@@ -13,18 +13,10 @@
       "id": "unknown-discrepancy",
       "base": "accepted",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/artifact/payload/classes/0/discrepancy",
-          "value": "preference"
-        },
-        {
-          "op": "replace",
-          "path": "/artifact/payload/classes/0/finding_refs",
-          "value": []
-        }
-      ]
+      "set": {
+        "/artifact/payload/classes/0/discrepancy": "preference",
+        "/artifact/payload/classes/0/finding_refs": []
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:6eb61a5ffe6c4bd9223d68a5a0c8eea410e7d8bcbcc152be8b179a011351a1ce"

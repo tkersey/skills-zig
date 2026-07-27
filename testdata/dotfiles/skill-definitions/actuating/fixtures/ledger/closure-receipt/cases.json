@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "complete-addressed": "bases/complete-addressed.json",
     "complete": "bases/complete.json"
@@ -23,35 +23,19 @@
       "id": "identity-mismatch",
       "base": "complete-addressed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/receipt_id",
-          "value": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-        },
-        {
-          "op": "replace",
-          "path": "/cited_premise_refs",
-          "value": []
-        }
-      ]
+      "set": {
+        "/receipt_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "/cited_premise_refs": []
+      }
     },
     {
       "id": "unknown-field",
       "base": "complete",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/cited_premise_refs",
-          "value": []
-        },
-        {
-          "op": "add",
-          "path": "/approved",
-          "value": true
-        }
-      ]
+      "set": {
+        "/cited_premise_refs": [],
+        "/approved": true
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:68b2c6264060b4163a17603b23b3b1a30a0e7d9dfbee369e206e2c03e4d576d9"

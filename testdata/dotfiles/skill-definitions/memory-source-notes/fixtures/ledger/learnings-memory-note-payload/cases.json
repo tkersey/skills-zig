@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
@@ -17,49 +17,33 @@
       "id": "empty-evidence",
       "base": "frozen-export",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/payload/evidence_snapshot",
-          "value": []
-        }
-      ]
+      "set": {
+        "/payload/evidence_snapshot": []
+      }
     },
     {
       "id": "fingerprint-shape",
       "base": "frozen-export",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/payload/canonical_fingerprint",
-          "value": "not-a-fingerprint"
-        }
-      ]
+      "set": {
+        "/payload/canonical_fingerprint": "not-a-fingerprint"
+      }
     },
     {
       "id": "repo-mismatch",
       "base": "frozen-export",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/payload/repo",
-          "value": "other/repo"
-        }
-      ]
+      "set": {
+        "/payload/repo": "other/repo"
+      }
     },
     {
       "id": "sensitive-nested-key",
       "base": "frozen-export",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "add",
-          "path": "/payload/secret",
-          "value": "redacted"
-        }
-      ]
+      "set": {
+        "/payload/secret": "redacted"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:7838926c74f19cf06175a1b7718b205a66febfb711efdf24885f69e924727fb1"

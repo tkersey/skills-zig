@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "minimal": "bases/minimal.json"
   },
@@ -13,23 +13,11 @@
       "id": "unknown-route",
       "base": "minimal",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/skill_decision_contract/triggers/0/cue_literals",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/skill_decision_contract/clauses/0/expected_routes/0",
-          "value": "MISSING-ROUTE"
-        },
-        {
-          "op": "replace",
-          "path": "/skill_decision_contract/clauses/0/rationale",
-          "value": "The missing route must fail closed."
-        }
-      ]
+      "set": {
+        "/skill_decision_contract/triggers/0/cue_literals": [],
+        "/skill_decision_contract/clauses/0/expected_routes/0": "MISSING-ROUTE",
+        "/skill_decision_contract/clauses/0/rationale": "The missing route must fail closed."
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:cb289f87d2f2d1374ba5b9ede41d44a7c8450b11f696ede6a730df3709715684"

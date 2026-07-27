@@ -26,7 +26,7 @@ jq -e \
     type == "object" and
     (keys | sort) ==
       ["cases", "protocol_definition", "reconstructed_candidates_digest", "schema", "sources"] and
-    .schema == "actuating-evidence-protocol-cases/v2" and
+    .schema == "actuating-evidence-protocol-cases/v3" and
     (.reconstructed_candidates_digest |
       type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.protocol_definition |
@@ -50,8 +50,8 @@ jq -e \
     ([.cases[].id] | unique | length) == (.cases | length) and
     all(.cases[];
       type == "object" and
-      (keys | sort) ==
-        ["candidate", "error", "expect", "id", "patch", "setup"] and
+      ((keys - ["remove", "set"]) | sort) ==
+        ["candidate", "error", "expect", "id", "setup"] and
       (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
       (.setup == "accepted-debt" or .setup == "rejected-review") and
       (.candidate == "construction-successor" or
@@ -59,23 +59,11 @@ jq -e \
       (.expect == "valid" or .expect == "invalid") and
       ((.expect == "valid" and .error == null) or
        (.expect == "invalid" and
-        (.error | type == "string" and length > 0))) and
-      (.patch | type == "array") and
-      all(.patch[];
-        type == "object" and
-        (.path |
-          type == "string" and
-          test("^/(?:[^~/]|~[01])+(?:/(?:[^~/]|~[01])+)*$")) and
-        (
-          (.op == "remove" and
-            (keys | sort) == ["op", "path"]) or
-          ((.op == "add" or .op == "replace") and
-            (keys | sort) == ["op", "path", "value"])
-        )
-      )
+        (.error | type == "string" and length > 0)))
     )
   ' \
   "$scenarios" >/dev/null
+validate_json_pointer_deltas "$scenarios"
 
 [[ -f "$protocol_definition" && ! -L "$protocol_definition" ]]
 "$ledger_bin" definition check \
@@ -462,11 +450,17 @@ prepare_candidate() {
   local source_document="$case_tmp/candidate-source.json"
   local bound_document="$case_tmp/candidate-bound.json"
   local candidate_document="$case_tmp/candidate.json"
-  local patch
+  local set_values
+  local remove_paths
 
-  patch=$(
+  set_values=$(
     jq -c --arg case_id "$case_id" \
-      '.cases[] | select(.id == $case_id) | .patch' \
+      '.cases[] | select(.id == $case_id) | .set // {}' \
+      "$scenarios"
+  )
+  remove_paths=$(
+    jq -c --arg case_id "$case_id" \
+      '.cases[] | select(.id == $case_id) | .remove // []' \
       "$scenarios"
   )
   if [[ "$candidate_kind" == "construction-successor" ]]; then
@@ -499,7 +493,11 @@ prepare_candidate() {
       ' \
       "$source_document" >"$bound_document"
   fi
-  apply_json_patch_document "$bound_document" "$patch" "$candidate_document"
+  apply_json_pointer_delta \
+    "$bound_document" \
+    "$set_values" \
+    "$remove_paths" \
+    "$candidate_document"
 }
 
 run_candidate() {

@@ -1,12 +1,44 @@
 #!/usr/bin/env bash
 
-apply_json_patch_document() {
+validate_json_pointer_deltas() {
+  local suite=$1
+
+  jq -e \
+    '
+      def valid_pointer:
+        type == "string" and
+        test("^/(?:[^~/]|~[01])+(?:/(?:[^~/]|~[01])+)*$");
+      def unambiguous_pointers($paths):
+        all(range(0; ($paths | length)); . as $left |
+          all(range($left + 1; ($paths | length)); . as $right |
+            ($paths[$left] != $paths[$right]) and
+            ($paths[$right] |
+              startswith($paths[$left] + "/") | not) and
+            ($paths[$left] |
+              startswith($paths[$right] + "/") | not)
+          )
+        );
+      all(.cases[];
+        (.set // {} | type == "object") and
+        all((.set // {}) | keys[]; valid_pointer) and
+        (.remove // [] | type == "array") and
+        all((.remove // [])[]; valid_pointer) and
+        unambiguous_pointers(
+          (((.set // {}) | keys) + (.remove // [])))
+      )
+    ' \
+    "$suite" >/dev/null
+}
+
+apply_json_pointer_delta() {
   local input=$1
-  local patch=$2
-  local output=$3
+  local set_values=$2
+  local remove_paths=$3
+  local output=$4
 
   jq -S -c \
-    --argjson patch "$patch" \
+    --argjson set_values "$set_values" \
+    --argjson remove_paths "$remove_paths" \
     '
       def pointer_path($pointer):
         $pointer |
@@ -21,14 +53,10 @@ apply_json_patch_document() {
             .
           end
         );
-      reduce $patch[] as $operation (.;
-        (pointer_path($operation.path)) as $path |
-        if $operation.op == "remove" then
-          delpaths([$path])
-        else
-          setpath($path; $operation.value)
-        end
-      )
+      reduce ($set_values | to_entries | sort_by(.key)[]) as $entry (.;
+        setpath(pointer_path($entry.key); $entry.value)
+      ) |
+      delpaths($remove_paths | sort | map(pointer_path(.)))
     ' \
     "$input" >"$output"
 }
@@ -41,7 +69,8 @@ reconstruct_definition_case() {
   local base_id
   local base_relative
   local base_fixture
-  local patch
+  local set_values
+  local remove_paths
 
   base_id=$(
     jq -r \
@@ -53,13 +82,23 @@ reconstruct_definition_case() {
   base_fixture="$fixture_root/$base_relative"
   [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
 
-  patch=$(
+  set_values=$(
     jq -c \
       --arg case_id "$case_id" \
-      '.cases[] | select(.id == $case_id) | .patch // []' \
+      '.cases[] | select(.id == $case_id) | .set // {}' \
       "$fixture_suite"
   )
-  apply_json_patch_document "$base_fixture" "$patch" "$output"
+  remove_paths=$(
+    jq -c \
+      --arg case_id "$case_id" \
+      '.cases[] | select(.id == $case_id) | .remove // []' \
+      "$fixture_suite"
+  )
+  apply_json_pointer_delta \
+    "$base_fixture" \
+    "$set_values" \
+    "$remove_paths" \
+    "$output"
 }
 
 append_reconstructed_digest() {

@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "current": "bases/current.json"
   },
@@ -13,13 +13,9 @@
       "id": "review-digest",
       "base": "current",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/review_contract/contract_digest",
-          "value": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        }
-      ]
+      "set": {
+        "/review_contract/contract_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:45854020e88016375f50fbb15d6176bc94622cdb5c54afdcc5eccf33c4374138"

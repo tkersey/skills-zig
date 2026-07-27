@@ -5,14 +5,13 @@ by dotfiles against exact Seq and Ledger candidate binaries. It is not compiled
 into either product and is not part of a deployed skill package.
 
 Each single-input artifact suite uses
-`ledger-definition-conformance-cases/v2`:
+`ledger-definition-conformance-cases/v3`:
 
 - `bases` keeps one canonical compact document per genuinely distinct valid
   structural family.
-- `cases` names the base, expected verdict, and optional ordered JSON Patch
-  `add`, `remove`, or `replace` operations. JSON Pointer edits address nested
-  objects and array members directly, so a one-field variant does not copy its
-  enclosing container.
+- `cases` names the base and expected verdict. Optional `set` and `remove`
+  fields are JSON-Pointer deltas; they omit JSON Patch ceremony and never copy
+  an enclosing object for a one-field variant.
 - One `reconstructed_cases_digest` binds the ordered set of case IDs and
   reconstructed-byte digests. It provides the same exact-case integrity check
   without repeating a digest in every case row.
@@ -21,10 +20,9 @@ Each single-input artifact suite uses
   The harness reconstructs and compares the complete canonical output, so
   expected files do not duplicate it.
 
-Stateful protocol suites reuse those same named cases. Their scenario catalog
-contains only source-case references, dynamic bindings, ordered JSON Pointer
-deltas, one reconstructed-candidate-set digest, and expected transaction
-outcomes.
+Stateful protocol suites reuse those named cases and the same pointer-delta
+encoding. Their catalog contains only source-case references, dynamic bindings,
+one reconstructed-candidate-set digest, and expected transaction outcomes.
 Shared setup is executed by the protocol runner; canonical Goal, Construction,
 and Counterexample documents are never copied into protocol fixtures.
 

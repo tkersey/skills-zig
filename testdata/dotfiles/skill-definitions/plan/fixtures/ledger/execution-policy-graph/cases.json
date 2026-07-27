@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -13,13 +13,9 @@
       "id": "unknown-condition-atom",
       "base": "complete",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/execution_policy_graph/actions/0/preconditions/all/0",
-          "value": "fact:MISSING"
-        }
-      ]
+      "set": {
+        "/execution_policy_graph/actions/0/preconditions/all/0": "fact:MISSING"
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:741d10b8ad85eeb7d6109f7ec446ad537448be8408de6562ac3eaa4d1b46bd54"

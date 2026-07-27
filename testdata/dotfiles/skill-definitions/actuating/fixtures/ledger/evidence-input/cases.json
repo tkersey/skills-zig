@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "effect-recorded": "bases/effect-recorded.json",
     "operation-aborted": "bases/operation-aborted.json",
@@ -61,78 +61,43 @@
       "id": "body-schema-mismatch",
       "base": "operation-aborted",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/body/schema",
-          "value": "operation-observed/v1"
-        }
-      ]
+      "set": {
+        "/body/schema": "operation-observed/v1"
+      }
     },
     {
       "id": "duplicate-findings",
       "base": "review-attempt-completed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/body/verdict",
-          "value": "findings"
-        },
-        {
-          "op": "replace",
-          "path": "/body/finding_refs",
-          "value": [
-            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-            "sha256:3333333333333333333333333333333333333333333333333333333333333333"
-          ]
-        },
-        {
-          "op": "replace",
-          "path": "/body/receipt_ref",
-          "value": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
-        }
-      ]
+      "set": {
+        "/body/verdict": "findings",
+        "/body/finding_refs": [
+          "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        ],
+        "/body/receipt_ref": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      }
     },
     {
       "id": "empty-evidence-refs",
       "base": "operation-observed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/body/discharged_refs",
-          "value": []
-        },
-        {
-          "op": "replace",
-          "path": "/body/evidence_refs",
-          "value": []
-        }
-      ]
+      "set": {
+        "/body/discharged_refs": [],
+        "/body/evidence_refs": []
+      }
     },
     {
       "id": "unknown-kind",
       "base": "operation-aborted",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/kind",
-          "value": "unknown"
-        },
-        {
-          "op": "remove",
-          "path": "/body/schema"
-        },
-        {
-          "op": "remove",
-          "path": "/body/step_id"
-        },
-        {
-          "op": "remove",
-          "path": "/body/reason"
-        }
+      "set": {
+        "/kind": "unknown"
+      },
+      "remove": [
+        "/body/schema",
+        "/body/step_id",
+        "/body/reason"
       ]
     }
   ],

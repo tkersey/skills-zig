@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v2",
+  "schema": "ledger-definition-conformance-cases/v3",
   "bases": {
     "reviewed": "bases/reviewed.json"
   },
@@ -13,37 +13,25 @@
       "id": "empty-reason",
       "base": "reviewed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/decisions/learnings/lrn-20260727T032727Z-e3769968/reason",
-          "value": ""
-        }
-      ]
+      "set": {
+        "/decisions/learnings/lrn-20260727T032727Z-e3769968/reason": ""
+      }
     },
     {
       "id": "unknown-disposition",
       "base": "reviewed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "replace",
-          "path": "/decisions/learnings/lrn-20260727T032727Z-e3769968/disposition",
-          "value": "candidate"
-        }
-      ]
+      "set": {
+        "/decisions/learnings/lrn-20260727T032727Z-e3769968/disposition": "candidate"
+      }
     },
     {
       "id": "unknown-source",
       "base": "reviewed",
       "expect": "invalid",
-      "patch": [
-        {
-          "op": "add",
-          "path": "/decisions/other",
-          "value": {}
-        }
-      ]
+      "set": {
+        "/decisions/other": {}
+      }
     }
   ],
   "reconstructed_cases_digest": "sha256:921fa8843cc43a02bc9530cf69e1888c3890b49dd375274a1b02539d431361cf"

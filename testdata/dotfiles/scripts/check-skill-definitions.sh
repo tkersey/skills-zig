@@ -88,7 +88,7 @@ for manifest in $manifests; do
               . as $suite |
               type == "object" and
               ((keys - ["bases", "cases", "oracle", "reconstructed_cases_digest", "schema"]) | length) == 0 and
-              .schema == "ledger-definition-conformance-cases/v2" and
+              .schema == "ledger-definition-conformance-cases/v3" and
               (.reconstructed_cases_digest |
                 type == "string" and test("^sha256:[0-9a-f]{64}$")) and
               (.oracle == null or (
@@ -110,25 +110,10 @@ for manifest in $manifests; do
               ([.cases[].id] | unique | length) == (.cases | length) and
               all(.cases[];
                 type == "object" and
-                ((keys - ["base", "expect", "id", "materialization", "patch"]) | length) == 0 and
+                ((keys - ["base", "expect", "id", "materialization", "remove", "set"]) | length) == 0 and
                 (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
                 (.base | type == "string") and
                 (.expect == "valid" or .expect == "invalid") and
-                (.patch == null or (
-                  (.patch | type == "array") and
-                  all(.patch[];
-                    type == "object" and
-                    (.path |
-                      type == "string" and
-                      test("^/(?:[^~/]|~[01])+(?:/(?:[^~/]|~[01])+)*$")) and
-                    (
-                      (.op == "remove" and
-                        (keys | sort) == ["op", "path"]) or
-                      ((.op == "add" or .op == "replace") and
-                        (keys | sort) == ["op", "path", "value"])
-                    )
-                  )
-                )) and
                 (.materialization == null or (
                   .expect == "valid" and
                   (.materialization | type == "object") and
@@ -144,6 +129,7 @@ for manifest in $manifests; do
                 . as $base | $suite.bases | has($base))
             ' \
             "$fixture_suite" >/dev/null
+          validate_json_pointer_deltas "$fixture_suite"
 
           fixture_tmp=$(mktemp -d)
           reconstructed_digests="$fixture_tmp/reconstructed-digests.jsonl"
