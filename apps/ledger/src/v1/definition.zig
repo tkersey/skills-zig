@@ -86,6 +86,7 @@ pub const Operator = enum {
     path_scope_subset,
     path_scope_disjoint,
     member_of,
+    not_member_of,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -149,6 +150,7 @@ pub const Operator = enum {
             .path_scope_subset => "path-scope-subset",
             .path_scope_disjoint => "path-scope-disjoint",
             .member_of => "member-of",
+            .not_member_of => "not-member-of",
             else => @tagName(self),
         };
     }
@@ -228,6 +230,7 @@ pub const Operator = enum {
             .path_scope_subset,
             .path_scope_disjoint,
             .member_of,
+            .not_member_of,
             .canonical_json,
             .canonical_text,
             .sha256,

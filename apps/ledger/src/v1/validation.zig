@@ -585,6 +585,7 @@ const Builder = struct {
             .path_scope_subset,
             .path_scope_disjoint,
             .member_of,
+            .not_member_of,
             .field_equal,
             .field_not_equal,
             => {
@@ -1890,6 +1891,7 @@ const Builder = struct {
             .path_scope_subset,
             .path_scope_disjoint,
             .member_of,
+            .not_member_of,
             .field_equal,
             .field_not_equal,
             => {
@@ -3624,6 +3626,7 @@ fn validateCachedRule(
         .path_scope_subset,
         .path_scope_disjoint,
         .member_of,
+        .not_member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -4655,6 +4658,7 @@ fn applyRule(
         .path_scope_subset,
         .path_scope_disjoint,
         .member_of,
+        .not_member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -4978,6 +4982,7 @@ fn itemRuleHolds(
         .path_scope_subset,
         .path_scope_disjoint,
         .member_of,
+        .not_member_of,
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
@@ -5106,6 +5111,7 @@ fn compareValues(
             max_records,
         ),
         .member_of => valueMemberOf(left, right, max_records),
+        .not_member_of => !valueMemberOf(left, right, max_records),
         else => false,
     };
 }
@@ -7636,6 +7642,7 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .path_scope_subset,
         .path_scope_disjoint,
         .member_of,
+        .not_member_of,
         .exactly_one,
         .at_least_one,
         .all_rules,
@@ -7689,6 +7696,7 @@ fn isItemOperator(operator: definition.Operator) bool {
         .path_scope_subset,
         .path_scope_disjoint,
         .member_of,
+        .not_member_of,
         .field_equal,
         .field_not_equal,
         .exactly_one,
@@ -8413,7 +8421,7 @@ test "compiled path scope comparisons preserve hierarchy and bounds" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","member-of","path-scope-disjoint","path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["allowed","choices","paths","prohibited","selection"]}]},"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{"op":"member-of","left":"/selection","right":"/choices"}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","member-of","not-member-of","path-scope-disjoint","path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["allowed","choices","paths","prohibited","selection"]}]},"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{"op":"member-of","left":"/selection","right":"/choices"},{"op":"not-member-of","left":"/selection","right":"/prohibited"}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -8473,6 +8481,7 @@ test "compiled path scope comparisons preserve hierarchy and bounds" {
 
     const invalid_cases = [_][]const u8{
         "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"vendor/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[\"inspect\"],\"selection\":\"inspect\"}",
         "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src\"],\"prohibited\":[\"src/generated\"],\"selection\":\"inspect\"}",
         "{\"allowed\":[\"src\",\"bad/../scope\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
         "{\"allowed\":[\".\"],\"choices\":[\"inspect\"],\"paths\":[\"a\",\"b\",\"c\",\"d\",\"e\"],\"prohibited\":[],\"selection\":\"inspect\"}",

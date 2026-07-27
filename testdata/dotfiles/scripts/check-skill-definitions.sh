@@ -180,25 +180,28 @@ for manifest in $manifests; do
                   jq -r '.canonical_content_digest' <<<"$expected_materialization"
                 )
                 identity_pointer=$(jq -r '.identity.field // empty' "$definition")
-                [[ -n "$identity_pointer" ]]
-                expected_content=$(
-                  jq -S -c \
-                    --arg pointer "$identity_pointer" \
-                    --arg artifact_id "$expected_id" \
-                    '
-                      def pointer_path($pointer):
-                        if $pointer == "" then
-                          []
-                        else
-                          $pointer |
-                          ltrimstr("/") |
-                          split("/") |
-                          map(gsub("~1"; "/") | gsub("~0"; "~"))
-                        end;
-                      setpath(pointer_path($pointer); $artifact_id)
-                    ' \
-                    "$fixture"
-                )
+                if [[ -n "$identity_pointer" ]]; then
+                  expected_content=$(
+                    jq -S -c \
+                      --arg pointer "$identity_pointer" \
+                      --arg artifact_id "$expected_id" \
+                      '
+                        def pointer_path($pointer):
+                          if $pointer == "" then
+                            []
+                          else
+                            $pointer |
+                            ltrimstr("/") |
+                            split("/") |
+                            map(gsub("~1"; "/") | gsub("~0"; "~"))
+                          end;
+                        setpath(pointer_path($pointer); $artifact_id)
+                      ' \
+                      "$fixture"
+                  )
+                else
+                  expected_content=$(jq -S -c '.' "$fixture")
+                fi
                 "$ledger_bin" materialize \
                   --definition "$definition" \
                   --input "$input_name=$fixture" \

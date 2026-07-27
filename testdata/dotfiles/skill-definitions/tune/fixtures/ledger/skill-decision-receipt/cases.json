@@ -1,0 +1,116 @@
+{
+  "schema": "ledger-definition-conformance-cases/v1",
+  "bases": {
+    "complete": "bases/complete.json"
+  },
+  "cases": [
+    {
+      "id": "complete",
+      "base": "complete",
+      "patch": [],
+      "fixture_digest": "sha256:4b800f6c61c53de61a1932e5c9f2d2fe60dd511051a0762b25e17800dddd0574",
+      "expect": "valid",
+      "materialization": {
+        "artifact_id": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070",
+        "canonical_content_digest": "sha256:d6db7a80f24d3d343cf8fd250bcc58d0fa2881cdf26d98df6e28779f62fbf070"
+      }
+    },
+    {
+      "id": "minimal",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/alternatives_considered"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/clause_refs"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/evidence_refs"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/expected_outcome"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/question"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/rejected_routes"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/skill_contract_fingerprint"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/skill_version"
+        },
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/trigger_refs"
+        }
+      ],
+      "fixture_digest": "sha256:57ab2316a3288618281529dadcacfe4bdcc51ad95f61b4c3a993769add763109",
+      "expect": "valid"
+    },
+    {
+      "id": "selected-route-rejected",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_decision_receipt/rejected_routes",
+          "value": [
+            "route-a"
+          ]
+        }
+      ],
+      "fixture_digest": "sha256:47e41a7fdcba8658d88952fac93bf4f7525799ed577f69f76588f23280032a9b",
+      "expect": "invalid"
+    },
+    {
+      "id": "missing-artifact-state",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/skill_decision_receipt/artifact_state"
+        }
+      ],
+      "fixture_digest": "sha256:cbb82f88ea0a0bc9b396ec097b60cc7dd9eba15c18c7a52640d61bdebf807842",
+      "expect": "invalid"
+    },
+    {
+      "id": "unstable-decision-id",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_decision_receipt/decision_id",
+          "value": "x"
+        }
+      ],
+      "fixture_digest": "sha256:8ab74a15a3f401573d33a19221c1b4be8b9fb85b86da0c919486d05de96d65b1",
+      "expect": "invalid"
+    },
+    {
+      "id": "non-string-clause-ref",
+      "base": "complete",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/skill_decision_receipt/clause_refs/0",
+          "value": 1
+        }
+      ],
+      "fixture_digest": "sha256:02977fefc41a2cb13a75ddef51a2499c5ac743e465e06418de17245c5140500c",
+      "expect": "invalid"
+    }
+  ]
+}
