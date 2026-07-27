@@ -7,7 +7,7 @@ source "$script_dir/lib/definition-cases.sh"
 
 dotfiles_root=${DOTFILES_ROOT:-"$HOME/.dotfiles"}
 dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
-ledger_bin=${LEDGER_BIN:-"$skills_zig_root/zig-out/bin/ledger-v1-candidate"}
+ledger_bin=${LEDGER_BIN:-"$skills_zig_root/zig-out/bin/ledger"}
 definition="$dotfiles_root/codex/skills/negative-ledger/definitions/ledger/negative-evidence-protocol.json"
 
 command -v jq >/dev/null

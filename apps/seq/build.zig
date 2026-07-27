@@ -5,34 +5,11 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const sqlite = b.dependency("sqlite", .{});
-    const core_path = b.createModule(.{
-        .root_source_file = b.path("../../libs/core/src/path_helpers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const core_perf = b.createModule(.{
-        .root_source_file = b.path("../../libs/core/src/perf_helpers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const core_cli = b.createModule(.{
-        .root_source_file = b.path("../../libs/core/src/cli_helpers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+
     const jsonl_core = b.createModule(.{
         .root_source_file = b.path("../../libs/jsonl_core/src/lib.zig"),
         .target = target,
         .optimize = optimize,
-    });
-    const retrace_core = b.createModule(.{
-        .root_source_file = b.path("../../libs/retrace_core/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "jsonl_core", .module = jsonl_core },
-        },
     });
     const durable_store = b.createModule(.{
         .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
@@ -42,36 +19,44 @@ pub fn build(b: *std.Build) void {
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
-    const execution_policy_core = b.createModule(.{
-        .root_source_file = b.path("../../libs/execution_policy_core/src/root.zig"),
+    const definition_core = b.createModule(.{
+        .root_source_file = b.path("../../libs/definition_core/src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const seq_meta = addVersionModule(b, @embedFile("VERSION"));
-    const ledger_actuation_core = b.createModule(.{
-        .root_source_file = b.path("../ledger/scripts/actuation.zig"),
+    const trace_core = b.createModule(.{
+        .root_source_file = b.path("../../libs/trace_core/src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "app_meta", .module = seq_meta },
+            .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
-
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    const seq_time = b.createModule(.{
+        .root_source_file = b.path("src/time_utils.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const seq_core = b.createModule(.{
+        .root_source_file = b.path("src/v1/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "core_path", .module = core_path },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "definition_core", .module = definition_core },
             .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
+            .{ .name = "trace_core", .module = trace_core },
+            .{ .name = "seq_time", .module = seq_time },
+        },
+    });
+    const seq_meta = addVersionModule(b, @embedFile("VERSION"));
+    const root_module = b.createModule(.{
+        .root_source_file = b.path("src/v1/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
             .{ .name = "app_meta", .module = seq_meta },
+            .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "seq_v1_core", .module = seq_core },
         },
     });
 
@@ -79,96 +64,20 @@ pub fn build(b: *std.Build) void {
         .name = "seq",
         .root_module = root_module,
     });
-    addSqlite(exe.root_module, sqlite);
-
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run seq");
+    const run_step = b.step("run", "Run Seq");
     run_step.dependOn(&run_cmd.step);
 
-    const tests_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_path", .module = core_path },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "retrace_core", .module = retrace_core },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
-
     const unit_tests = b.addTest(.{
-        .root_module = tests_mod,
+        .root_module = root_module,
     });
-    addSqlite(unit_tests.root_module, sqlite);
     const run_unit_tests = b.addRunArtifact(unit_tests);
-
-    const test_step = b.step("test", "Run unit tests");
+    const test_step = b.step("test", "Run Seq 1.0 tests");
     test_step.dependOn(&run_unit_tests.step);
-
-    const perf_mod = b.createModule(.{
-        .root_source_file = b.path("src/perf_harness.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
-
-    const perf_exe = b.addExecutable(.{
-        .name = "seq-perf",
-        .root_module = perf_mod,
-    });
-    b.installArtifact(perf_exe);
-
-    const perf_run = b.addRunArtifact(perf_exe);
-    perf_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| perf_run.addArgs(args);
-
-    const bench_step = b.step("bench", "Run frozen workload performance harness");
-    bench_step.dependOn(&perf_run.step);
-
-    const parser_perf_mod = b.createModule(.{
-        .root_source_file = b.path("src/perf_parser.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_perf", .module = core_perf },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
-
-    const parser_perf_exe = b.addExecutable(.{
-        .name = "seq-perf-parser",
-        .root_module = parser_perf_mod,
-    });
-    b.installArtifact(parser_perf_exe);
-
-    const parser_perf_run = b.addRunArtifact(parser_perf_exe);
-    parser_perf_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| parser_perf_run.addArgs(args);
-
-    const parser_bench_step = b.step("bench-parser", "Run token parser performance harness");
-    parser_bench_step.dependOn(&parser_perf_run.step);
-}
-
-fn addSqlite(module: *std.Build.Module, sqlite: *std.Build.Dependency) void {
-    module.addCSourceFile(.{
-        .file = sqlite.path("sqlite3.c"),
-        .flags = &.{},
-    });
-    module.addIncludePath(sqlite.path(""));
-    module.linkSystemLibrary("c", .{});
 }
 
 fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {

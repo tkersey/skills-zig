@@ -7,7 +7,7 @@ source "$script_dir/lib/definition-cases.sh"
 
 dotfiles_root=${DOTFILES_ROOT:-"$HOME/.dotfiles"}
 dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
-ledger_bin=${LEDGER_BIN:-"$skills_zig_root/zig-out/bin/ledger-v1-candidate"}
+ledger_bin=${LEDGER_BIN:-"$skills_zig_root/zig-out/bin/ledger"}
 definition="$dotfiles_root/codex/skills/learnings/definitions/ledger/learnings-protocol.json"
 memory_definition="$dotfiles_root/codex/skills/memory-source-notes/definitions/ledger/learnings-memory-note-payload.json"
 

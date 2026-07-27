@@ -19,7 +19,7 @@ Run the exact-candidate gate with:
 
 ```bash
 DOTFILES_ROOT=/path/to/dotfiles \
-SEQ_BIN=/path/to/seq-v1-candidate \
-LEDGER_BIN=/path/to/ledger-v1-candidate \
+SEQ_BIN=/path/to/seq \
+LEDGER_BIN=/path/to/ledger \
 testdata/dotfiles/scripts/check-skill-definitions.sh
 ```

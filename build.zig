@@ -156,7 +156,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
-    const seq_v1_candidate_root = b.createModule(.{
+    const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/v1/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -185,7 +185,7 @@ pub fn build(b: *std.Build) void {
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
-    const ledger_v1_candidate_root = b.createModule(.{
+    const ledger_root = b.createModule(.{
         .root_source_file = b.path("apps/ledger/src/v1/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -234,44 +234,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const seq_root = b.createModule(.{
-        .root_source_file = b.path("apps/seq/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_path", .module = core_path },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "retrace_core", .module = retrace_core },
-            .{ .name = "definition_core", .module = definition_core },
-            .{ .name = "trace_core", .module = trace_core },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
     const seq_perf_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/perf_harness.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
-    const seq_tests_root = b.createModule(.{
-        .root_source_file = b.path("apps/seq/src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_path", .module = core_path },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "retrace_core", .module = retrace_core },
-            .{ .name = "definition_core", .module = definition_core },
-            .{ .name = "trace_core", .module = trace_core },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "ledger_actuation_core", .module = ledger_actuation_core },
-            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -467,19 +435,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = ledger_meta },
         },
     });
-    const ledger_root = b.createModule(.{
-        .root_source_file = b.path("apps/ledger/scripts/ledger.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "learnings_cli", .module = learnings_root },
-            .{ .name = "synesthesia_cli", .module = synesthesia_root },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "app_meta", .module = ledger_meta },
-        },
-    });
     const memory_note_root = b.createModule(.{
         .root_source_file = b.path("apps/memory-note/scripts/memory_note.zig"),
         .target = target,
@@ -512,13 +467,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const seq = addExecutable(b, "seq", seq_root);
-    seq.root_module.linkSystemLibrary("c", .{});
-    seq.root_module.linkSystemLibrary("sqlite3", .{});
-    const seq_v1_candidate = addExecutable(
-        b,
-        "seq-v1-candidate",
-        seq_v1_candidate_root,
-    );
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
@@ -539,18 +487,12 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
-    const ledger_v1_candidate = addExecutable(
-        b,
-        "ledger-v1-candidate",
-        ledger_v1_candidate_root,
-    );
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
     const durable_store_perf = addExecutable(b, "durable-store-perf", durable_store_perf_root);
 
     const seq_install = addInstallStep(b, seq);
-    const seq_v1_candidate_install = addInstallStep(b, seq_v1_candidate);
     const seq_perf_install = addInstallStep(b, seq_perf);
     const bench_stats_install = addInstallStep(b, bench_stats);
     const perf_report_install = addInstallStep(b, perf_report);
@@ -566,7 +508,6 @@ pub fn build(b: *std.Build) void {
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
     const ledger_install = addInstallStep(b, ledger);
-    const ledger_v1_candidate_install = addInstallStep(b, ledger_v1_candidate);
     const memory_note_install = addInstallStep(b, memory_note);
     const img_install = addInstallStep(b, img);
     const perf_hub_install = addInstallStep(b, perf_hub);
@@ -592,16 +533,11 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&img_install.step);
     install_all.dependOn(&perf_hub_install.step);
 
-    const run_seq_tests = addTestStepWithOptions(
+    const run_seq_tests = addTestStep(
         b,
-        seq_tests_root,
+        seq_root,
         "test-seq",
-        "Run seq tests",
-        .{
-            .link_libc = true,
-            .sqlite = true,
-            .cwd = b.path("apps/seq"),
-        },
+        "Run Seq 1.0 command and observation tests",
     );
 
     addBenchStep(
@@ -767,26 +703,12 @@ pub fn build(b: *std.Build) void {
         "test-synesthesia",
         "Run internal ledger synesthesia-source tests",
     );
-    const ledger_test_filter = b.option(
-        []const u8,
-        "ledger-test-filter",
-        "Override the Ledger test filter",
+    const run_ledger_tests = addTestStep(
+        b,
+        ledger_root,
+        "test-ledger-cli",
+        "Run Ledger 1.0 command and artifact tests",
     );
-    const ledger_routine_test_filters = &.{
-        "ledger.test.",
-        "actuation.test.",
-        "universalist.test.",
-        "validation.test.",
-    };
-    const ledger_tests = b.addTest(.{
-        .root_module = ledger_root,
-        .filters = if (ledger_test_filter) |filter| &.{filter} else ledger_routine_test_filters,
-    });
-    const run_ledger_tests = std.Build.Step.Run.create(b, "run ledger tests (terminal)");
-    run_ledger_tests.addArtifactArg(ledger_tests);
-    run_ledger_tests.addArg(b.fmt("--seed=0x{x}", .{b.graph.random_seed}));
-    run_ledger_tests.stdio = .inherit;
-    if (b.args) |args| run_ledger_tests.addArgs(args);
     const test_ledger = b.step("test-ledger", "Run ledger tests");
     test_ledger.dependOn(&run_ledger_tests.step);
     const run_memory_note_tests = addTestStep(
@@ -847,50 +769,38 @@ pub fn build(b: *std.Build) void {
         "Run canonical physical trace tests",
         .{ .cwd = b.path("apps/seq") },
     );
-    const run_seq_v1_core_tests = addTestStep(
+    const run_seq_core_tests = addTestStep(
         b,
         seq_v1_core,
-        "test-seq-v1-core",
+        "test-seq-core",
         "Run Seq 1.0 observation-definition compiler tests",
     );
-    const run_seq_v1_cli_tests = addTestStep(
-        b,
-        seq_v1_candidate_root,
-        "test-seq-v1-cli",
-        "Run Seq 1.0 candidate command-surface tests",
-    );
-    const seq_v1_cli_smoke_cmd = b.addSystemCommand(&.{
+    const seq_cli_smoke_cmd = b.addSystemCommand(&.{
         "bash",
-        "scripts/test-seq-v1-cli.sh",
+        "scripts/test-seq-cli.sh",
     });
-    seq_v1_cli_smoke_cmd.addArtifactArg(seq_v1_candidate);
-    const run_seq_v1_cli_smoke = b.step(
-        "test-seq-v1-cli-smoke",
-        "Run Seq 1.0 candidate definition and observation smoke tests",
+    seq_cli_smoke_cmd.addArtifactArg(seq);
+    const run_seq_cli_smoke = b.step(
+        "test-seq-cli-smoke",
+        "Run Seq 1.0 definition and observation smoke tests",
     );
-    run_seq_v1_cli_smoke.dependOn(&seq_v1_cli_smoke_cmd.step);
-    const run_ledger_v1_core_tests = addTestStep(
+    run_seq_cli_smoke.dependOn(&seq_cli_smoke_cmd.step);
+    const run_ledger_core_tests = addTestStep(
         b,
         ledger_v1_core,
-        "test-ledger-v1-core",
+        "test-ledger-core",
         "Run Ledger 1.0 artifact-definition compiler tests",
     );
-    const run_ledger_v1_cli_tests = addTestStep(
-        b,
-        ledger_v1_candidate_root,
-        "test-ledger-v1-cli",
-        "Run Ledger 1.0 candidate command-surface tests",
-    );
-    const ledger_v1_cli_smoke_cmd = b.addSystemCommand(&.{
+    const ledger_cli_smoke_cmd = b.addSystemCommand(&.{
         "bash",
-        "scripts/test-ledger-v1-cli.sh",
+        "scripts/test-ledger-cli.sh",
     });
-    ledger_v1_cli_smoke_cmd.addArtifactArg(ledger_v1_candidate);
-    const run_ledger_v1_cli_smoke = b.step(
-        "test-ledger-v1-cli-smoke",
-        "Run Ledger 1.0 candidate definition, validation, and materialization smoke tests",
+    ledger_cli_smoke_cmd.addArtifactArg(ledger);
+    const run_ledger_cli_smoke = b.step(
+        "test-ledger-cli-smoke",
+        "Run Ledger 1.0 definition, validation, and materialization smoke tests",
     );
-    run_ledger_v1_cli_smoke.dependOn(&ledger_v1_cli_smoke_cmd.step);
+    run_ledger_cli_smoke.dependOn(&ledger_cli_smoke_cmd.step);
     const run_execution_policy_core_tests = addTestStep(
         b,
         execution_policy_core,
@@ -1009,29 +919,16 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_definition_core_tests.step);
     test_all.dependOn(run_definition_core_guard);
     test_all.dependOn(&run_trace_core_tests.step);
-    test_all.dependOn(&run_seq_v1_core_tests.step);
-    test_all.dependOn(&run_seq_v1_cli_tests.step);
-    test_all.dependOn(run_seq_v1_cli_smoke);
-    test_all.dependOn(&run_ledger_v1_core_tests.step);
-    test_all.dependOn(&run_ledger_v1_cli_tests.step);
-    test_all.dependOn(run_ledger_v1_cli_smoke);
+    test_all.dependOn(&run_seq_core_tests.step);
+    test_all.dependOn(run_seq_cli_smoke);
+    test_all.dependOn(&run_ledger_core_tests.step);
+    test_all.dependOn(run_ledger_cli_smoke);
     test_all.dependOn(&run_execution_policy_core_tests.step);
     test_all.dependOn(&run_retrace_core_tests.step);
 
     const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
     test_full.dependOn(test_all);
     test_full.dependOn(&run_retrace_corpus_tests.step);
-
-    const build_ledger_v1_candidate = b.step(
-        "build-ledger-v1-candidate",
-        "Build the unreleased Ledger 1.0 exact-candidate binary",
-    );
-    build_ledger_v1_candidate.dependOn(&ledger_v1_candidate_install.step);
-    const build_seq_v1_candidate = b.step(
-        "build-seq-v1-candidate",
-        "Build the unreleased Seq 1.0 exact-candidate binary",
-    );
-    build_seq_v1_candidate.dependOn(&seq_v1_candidate_install.step);
 
     const enable_zlinter = b.option(
         bool,
