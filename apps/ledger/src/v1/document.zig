@@ -101,6 +101,75 @@ pub fn compile(
     else
         return error.UnsupportedDocumentMaterializationMode;
 
+    var content = try compileDocumentContent(
+        allocator,
+        definition_plan,
+        object,
+    );
+    errdefer content.deinit(allocator);
+    var edit = try compileDocumentEdit(
+        allocator,
+        definition_plan,
+        content.identity,
+        object,
+    );
+    errdefer edit.deinit(allocator);
+    const trim_end = if (object.get("trim_end")) |value|
+        try definition_core.json.boolean(value)
+    else
+        false;
+    const final_newline = if (object.get("final_newline")) |value|
+        try definition_core.json.boolean(value)
+    else
+        false;
+    try validateDocumentMode(mode, content, edit, trim_end);
+    return .{
+        .mode = mode,
+        .identity = content.identity,
+        .fragments = content.fragments,
+        .line_prefix = edit.line_prefix,
+        .line_replacement = edit.line_replacement,
+        .insert_before = edit.insert_before,
+        .reject_contains = edit.reject_contains,
+        .append_separator = edit.append_separator,
+        .trim_end = trim_end,
+        .final_newline = final_newline,
+    };
+}
+
+const DocumentContent = struct {
+    identity: ?Identity,
+    fragments: []Fragment,
+
+    fn deinit(self: *DocumentContent, allocator: std.mem.Allocator) void {
+        if (self.identity) |*identity| identity.deinit(allocator);
+        deinitFragments(allocator, self.fragments);
+        self.* = undefined;
+    }
+};
+
+const DocumentEdit = struct {
+    line_prefix: ?[]u8,
+    line_replacement: []Fragment,
+    insert_before: ?[]u8,
+    reject_contains: ?[]u8,
+    append_separator: ?[]u8,
+
+    fn deinit(self: *DocumentEdit, allocator: std.mem.Allocator) void {
+        if (self.line_prefix) |value| allocator.free(value);
+        deinitFragments(allocator, self.line_replacement);
+        if (self.insert_before) |value| allocator.free(value);
+        if (self.reject_contains) |value| allocator.free(value);
+        if (self.append_separator) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+fn compileDocumentContent(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !DocumentContent {
     var identity = if (object.get("identity")) |value|
         try compileIdentity(allocator, definition_plan, value)
     else
@@ -111,6 +180,15 @@ pub fn compile(
     else
         try allocator.alloc(Fragment, 0);
     errdefer deinitFragments(allocator, fragments);
+    return .{ .identity = identity, .fragments = fragments };
+}
+
+fn compileDocumentEdit(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    identity: ?Identity,
+    object: std.json.ObjectMap,
+) !DocumentEdit {
     const line_prefix = try optionalBoundedStringAlloc(
         allocator,
         object.get("line_prefix"),
@@ -140,44 +218,42 @@ pub fn compile(
         4096,
     );
     errdefer if (append_separator) |value| allocator.free(value);
-    const trim_end = if (object.get("trim_end")) |value|
-        try definition_core.json.boolean(value)
-    else
-        false;
-    const final_newline = if (object.get("final_newline")) |value|
-        try definition_core.json.boolean(value)
-    else
-        false;
-
-    switch (mode) {
-        .template => {
-            if (fragments.len == 0 or line_prefix != null or
-                line_replacement.len != 0 or insert_before != null or
-                reject_contains != null or append_separator != null or trim_end)
-            {
-                return error.InvalidTemplateMaterialization;
-            }
-        },
-        .edit => {
-            if (identity != null or fragments.len != 0 or line_prefix == null or
-                line_replacement.len == 0 or append_separator == null)
-            {
-                return error.InvalidEditMaterialization;
-            }
-        },
-    }
     return .{
-        .mode = mode,
-        .identity = identity,
-        .fragments = fragments,
         .line_prefix = line_prefix,
         .line_replacement = line_replacement,
         .insert_before = insert_before,
         .reject_contains = reject_contains,
         .append_separator = append_separator,
-        .trim_end = trim_end,
-        .final_newline = final_newline,
     };
+}
+
+fn validateDocumentMode(
+    mode: Mode,
+    content: DocumentContent,
+    edit: DocumentEdit,
+    trim_end: bool,
+) !void {
+    switch (mode) {
+        .template => {
+            if (content.fragments.len == 0 or edit.line_prefix != null or
+                edit.line_replacement.len != 0 or
+                edit.insert_before != null or
+                edit.reject_contains != null or
+                edit.append_separator != null or trim_end)
+            {
+                return error.InvalidTemplateMaterialization;
+            }
+        },
+        .edit => {
+            if (content.identity != null or content.fragments.len != 0 or
+                edit.line_prefix == null or
+                edit.line_replacement.len == 0 or
+                edit.append_separator == null)
+            {
+                return error.InvalidEditMaterialization;
+            }
+        },
+    }
 }
 
 fn compileIdentity(
@@ -219,88 +295,115 @@ fn compileIdentity(
     if (std.mem.eql(u8, name_text, timestamp_name_text)) {
         return error.DuplicateGeneratedOutput;
     }
-    const declaration =
-        definition_plan.parameter_declarations.find(name_text) orelse
-        return error.UnknownGeneratedPathParameter;
-    if (declaration.kind != .safe_identifier or declaration.required or
-        declaration.default_value != null)
-    {
-        return error.GeneratedPathParameterMustBeOptional;
-    }
-    const path_name_text = if (object.get("path_name")) |value|
-        try definition_core.json.string(value)
-    else
-        null;
-    if (path_name_text) |path_name| {
-        if (!definition_plan.requires(.path_format)) {
-            return error.UndeclaredArtifactOperator;
-        }
-        try definition_core.json.safeIdentifier(path_name, 128);
-        if (std.mem.eql(u8, path_name, name_text) or
-            std.mem.eql(u8, path_name, timestamp_name_text))
-        {
-            return error.DuplicateGeneratedOutput;
-        }
-        const path_declaration =
-            definition_plan.parameter_declarations.find(path_name) orelse
-            return error.UnknownGeneratedPathParameter;
-        if (path_declaration.kind != .safe_identifier or
-            path_declaration.required or path_declaration.default_value != null)
-        {
-            return error.GeneratedPathParameterMustBeOptional;
-        }
-    }
-    const path_prefix_text = if (object.get("path_prefix")) |value|
-        try definition_core.json.string(value)
-    else
-        "";
-    const path_suffix_text = if (object.get("path_suffix")) |value|
-        try definition_core.json.string(value)
-    else
-        "";
-    if (path_name_text == null and
-        (path_prefix_text.len != 0 or path_suffix_text.len != 0))
-    {
-        return error.GeneratedPathFormattingRequiresOutput;
-    }
-    try validatePathAffix(path_prefix_text);
-    try validatePathAffix(path_suffix_text);
-    const ordinal_width: u8 = @intCast(if (object.get("ordinal_width")) |value|
-        try definition_core.json.unsigned(value)
-    else
-        4);
-    if (ordinal_width == 0 or ordinal_width > 9) {
-        return error.InvalidTimestampOrdinalWidth;
-    }
-    const max_ordinal: u32 = @intCast(if (object.get("max_ordinal")) |value|
-        try definition_core.json.unsigned(value)
-    else
-        9999);
-    var capacity: u64 = 1;
-    for (0..ordinal_width) |_| capacity *= 10;
-    if (@as(u64, max_ordinal) >= capacity) {
-        return error.InvalidTimestampOrdinalMaximum;
-    }
+    try validateGeneratedOutput(definition_plan, name_text);
+    const path = try identityPath(
+        definition_plan,
+        object,
+        name_text,
+        timestamp_name_text,
+    );
+    const ordinal = try identityOrdinal(object);
     const name = try allocator.dupe(u8, name_text);
     errdefer allocator.free(name);
     const timestamp_name = try allocator.dupe(u8, timestamp_name_text);
     errdefer allocator.free(timestamp_name);
-    const path_name = if (path_name_text) |value|
+    const path_name = if (path.name) |value|
         try allocator.dupe(u8, value)
     else
         null;
     errdefer if (path_name) |value| allocator.free(value);
-    const path_prefix = try allocator.dupe(u8, path_prefix_text);
+    const path_prefix = try allocator.dupe(u8, path.prefix);
     errdefer allocator.free(path_prefix);
     return .{
         .name = name,
         .timestamp_name = timestamp_name,
         .path_name = path_name,
         .path_prefix = path_prefix,
-        .path_suffix = try allocator.dupe(u8, path_suffix_text),
-        .ordinal_width = ordinal_width,
-        .max_ordinal = max_ordinal,
+        .path_suffix = try allocator.dupe(u8, path.suffix),
+        .ordinal_width = ordinal.width,
+        .max_ordinal = ordinal.maximum,
     };
+}
+
+const IdentityPath = struct {
+    name: ?[]const u8,
+    prefix: []const u8,
+    suffix: []const u8,
+};
+
+fn identityPath(
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+    identity_name: []const u8,
+    timestamp_name: []const u8,
+) !IdentityPath {
+    const name = if (object.get("path_name")) |value|
+        try definition_core.json.string(value)
+    else
+        null;
+    if (name) |path_name| {
+        if (!definition_plan.requires(.path_format)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        try definition_core.json.safeIdentifier(path_name, 128);
+        if (std.mem.eql(u8, path_name, identity_name) or
+            std.mem.eql(u8, path_name, timestamp_name))
+        {
+            return error.DuplicateGeneratedOutput;
+        }
+        try validateGeneratedOutput(definition_plan, path_name);
+    }
+    const prefix = if (object.get("path_prefix")) |value|
+        try definition_core.json.string(value)
+    else
+        "";
+    const suffix = if (object.get("path_suffix")) |value|
+        try definition_core.json.string(value)
+    else
+        "";
+    if (name == null and (prefix.len != 0 or suffix.len != 0)) {
+        return error.GeneratedPathFormattingRequiresOutput;
+    }
+    try validatePathAffix(prefix);
+    try validatePathAffix(suffix);
+    return .{ .name = name, .prefix = prefix, .suffix = suffix };
+}
+
+fn validateGeneratedOutput(
+    definition_plan: *const definition.Plan,
+    name: []const u8,
+) !void {
+    const declaration =
+        definition_plan.parameter_declarations.find(name) orelse
+        return error.UnknownGeneratedPathParameter;
+    if (declaration.kind != .safe_identifier or declaration.required or
+        declaration.default_value != null)
+    {
+        return error.GeneratedPathParameterMustBeOptional;
+    }
+}
+
+const IdentityOrdinal = struct {
+    width: u8,
+    maximum: u32,
+};
+
+fn identityOrdinal(object: std.json.ObjectMap) !IdentityOrdinal {
+    const width: u8 = @intCast(if (object.get("ordinal_width")) |value|
+        try definition_core.json.unsigned(value)
+    else
+        4);
+    if (width == 0 or width > 9) return error.InvalidTimestampOrdinalWidth;
+    const maximum: u32 = @intCast(if (object.get("max_ordinal")) |value|
+        try definition_core.json.unsigned(value)
+    else
+        9999);
+    var capacity: u64 = 1;
+    for (0..width) |_| capacity *= 10;
+    if (@as(u64, maximum) >= capacity) {
+        return error.InvalidTimestampOrdinalMaximum;
+    }
+    return .{ .width = width, .maximum = maximum };
 }
 
 fn validatePathAffix(text: []const u8) !void {
@@ -333,76 +436,105 @@ fn compileFragments(
         allocator.free(fragments);
     }
     for (values.items, 0..) |value, index| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{
-                "literal",
-                "input",
-                "input_text",
-                "parameter",
-                "generated",
-            },
+        fragments[index] = try compileFragment(
+            allocator,
+            definition_plan,
+            identity,
+            value,
+            &literal_bytes,
         );
-        var source_count: usize = 0;
-        source_count += @intFromBool(object.get("literal") != null);
-        source_count += @intFromBool(object.get("input") != null);
-        source_count += @intFromBool(object.get("input_text") != null);
-        source_count += @intFromBool(object.get("parameter") != null);
-        source_count += @intFromBool(object.get("generated") != null);
-        if (source_count != 1) return error.InvalidTextFragment;
-        if (object.get("literal")) |raw_literal| {
-            const text = try definition_core.json.string(raw_literal);
-            if (!std.unicode.utf8ValidateSlice(text) or text.len > 64 * 1024) {
-                return error.InvalidTextFragment;
-            }
-            literal_bytes = std.math.add(
-                usize,
-                literal_bytes,
-                text.len,
-            ) catch return error.TextFragmentBoundsExceeded;
-            if (literal_bytes > 64 * 1024) {
-                return error.TextFragmentBoundsExceeded;
-            }
-            fragments[index] = .{ .literal = try allocator.dupe(u8, text) };
-        } else if (object.get("input")) |raw_input| {
-            if (!(try definition_core.json.boolean(raw_input))) {
-                return error.InvalidTextFragment;
-            }
-            fragments[index] = .input;
-        } else if (object.get("input_text")) |raw_pointer| {
-            const pointer_text = try definition_core.json.string(raw_pointer);
-            if (pointer_text.len > 1024) return error.InvalidJsonPointer;
-            fragments[index] = .{
-                .input_text = try definition_core.json_pointer.compile(
-                    allocator,
-                    pointer_text,
-                ),
-            };
-        } else if (object.get("parameter")) |raw_parameter| {
-            const name = try definition_core.json.string(raw_parameter);
-            try validateTextParameter(definition_plan, name);
-            fragments[index] = .{
-                .parameter = try allocator.dupe(u8, name),
-            };
-        } else {
-            const name = try definition_core.json.string(
-                object.get("generated").?,
-            );
-            try definition_core.json.safeIdentifier(name, 128);
-            const configured = if (identity) |current|
-                std.mem.eql(u8, name, current.name) or
-                    std.mem.eql(u8, name, current.timestamp_name) or
-                    (current.path_name != null and
-                        std.mem.eql(u8, name, current.path_name.?))
-            else
-                false;
-            if (!configured) return error.UnknownGeneratedOutput;
-            fragments[index] = .{ .generated = try allocator.dupe(u8, name) };
-        }
         initialized += 1;
     }
     return fragments;
+}
+
+fn compileFragment(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    identity: ?Identity,
+    raw: std.json.Value,
+    literal_bytes: *usize,
+) !Fragment {
+    const object = try definition_core.json.object(raw);
+    const keys = [_][]const u8{
+        "literal", "input", "input_text", "parameter", "generated",
+    };
+    try definition_core.json.requireExactKeys(object, &keys);
+    var source_count: usize = 0;
+    for (keys) |key| source_count += @intFromBool(object.get(key) != null);
+    if (source_count != 1) return error.InvalidTextFragment;
+    if (object.get("literal")) |value| {
+        return compileLiteralFragment(allocator, value, literal_bytes);
+    }
+    if (object.get("input")) |value| {
+        if (!(try definition_core.json.boolean(value))) {
+            return error.InvalidTextFragment;
+        }
+        return .input;
+    }
+    if (object.get("input_text")) |value| {
+        const pointer = try definition_core.json.string(value);
+        if (pointer.len > 1024) return error.InvalidJsonPointer;
+        return .{
+            .input_text = try definition_core.json_pointer.compile(
+                allocator,
+                pointer,
+            ),
+        };
+    }
+    return compileNamedFragment(
+        allocator,
+        definition_plan,
+        identity,
+        object,
+    );
+}
+
+fn compileLiteralFragment(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    literal_bytes: *usize,
+) !Fragment {
+    const text = try definition_core.json.string(raw);
+    if (!std.unicode.utf8ValidateSlice(text) or text.len > 64 * 1024) {
+        return error.InvalidTextFragment;
+    }
+    literal_bytes.* = std.math.add(
+        usize,
+        literal_bytes.*,
+        text.len,
+    ) catch return error.TextFragmentBoundsExceeded;
+    if (literal_bytes.* > 64 * 1024) {
+        return error.TextFragmentBoundsExceeded;
+    }
+    return .{ .literal = try allocator.dupe(u8, text) };
+}
+
+fn compileNamedFragment(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    identity: ?Identity,
+    object: std.json.ObjectMap,
+) !Fragment {
+    if (object.get("parameter")) |value| {
+        const name = try definition_core.json.string(value);
+        try validateTextParameter(definition_plan, name);
+        return .{ .parameter = try allocator.dupe(u8, name) };
+    }
+    const name = try definition_core.json.string(object.get("generated").?);
+    try definition_core.json.safeIdentifier(name, 128);
+    if (!generatedOutputConfigured(identity, name)) {
+        return error.UnknownGeneratedOutput;
+    }
+    return .{ .generated = try allocator.dupe(u8, name) };
+}
+
+fn generatedOutputConfigured(identity: ?Identity, name: []const u8) bool {
+    const current = identity orelse return false;
+    return std.mem.eql(u8, name, current.name) or
+        std.mem.eql(u8, name, current.timestamp_name) or
+        (current.path_name != null and
+            std.mem.eql(u8, name, current.path_name.?));
 }
 
 fn validateTextParameter(
@@ -550,54 +682,9 @@ pub fn decodeCache(
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
     const mode = try decoder.readEnum(Mode);
-    var identity: ?Identity = if (try decoder.readBool()) identity: {
-        const name = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(name);
-        const timestamp_name = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(timestamp_name);
-        const path_name = try decoder.readOptionalBytesAlloc(allocator, 128);
-        errdefer if (path_name) |value| allocator.free(value);
-        const path_prefix = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(path_prefix);
-        const path_suffix = try decoder.readBytesAlloc(allocator, 128);
-        errdefer allocator.free(path_suffix);
-        break :identity .{
-            .name = name,
-            .timestamp_name = timestamp_name,
-            .path_name = path_name,
-            .path_prefix = path_prefix,
-            .path_suffix = path_suffix,
-            .ordinal_width = try decoder.readByte(),
-            .max_ordinal = @intCast(try decoder.readUsize()),
-        };
-    } else null;
+    var identity = try decodeIdentity(allocator, decoder);
     errdefer if (identity) |*value| value.deinit(allocator);
-    if (identity) |*value| {
-        try definition_core.json.safeIdentifier(value.name, 128);
-        try definition_core.json.safeIdentifier(value.timestamp_name, 128);
-        if (value.path_name) |path_name| {
-            try definition_core.json.safeIdentifier(path_name, 128);
-            if (std.mem.eql(u8, path_name, value.name) or
-                std.mem.eql(u8, path_name, value.timestamp_name))
-            {
-                return error.CacheStoragePlanMismatch;
-            }
-        } else if (value.path_prefix.len != 0 or value.path_suffix.len != 0) {
-            return error.CacheStoragePlanMismatch;
-        }
-        validatePathAffix(value.path_prefix) catch
-            return error.CacheStoragePlanMismatch;
-        validatePathAffix(value.path_suffix) catch
-            return error.CacheStoragePlanMismatch;
-        if (value.ordinal_width == 0 or value.ordinal_width > 9) {
-            return error.CacheStoragePlanMismatch;
-        }
-        var capacity: u64 = 1;
-        for (0..value.ordinal_width) |_| capacity *= 10;
-        if (@as(u64, value.max_ordinal) >= capacity) {
-            return error.CacheStoragePlanMismatch;
-        }
-    }
+    if (identity) |*value| try validateDecodedIdentity(value);
     const fragments = try decodeFragments(allocator, decoder);
     errdefer deinitFragments(allocator, fragments);
     const line_prefix = try decoder.readOptionalBytesAlloc(allocator, 4096);
@@ -644,6 +731,59 @@ pub fn decodeCache(
         .trim_end = trim_end,
         .final_newline = final_newline,
     };
+}
+
+fn decodeIdentity(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !?Identity {
+    if (!try decoder.readBool()) return null;
+    const name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(name);
+    const timestamp_name = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(timestamp_name);
+    const path_name = try decoder.readOptionalBytesAlloc(allocator, 128);
+    errdefer if (path_name) |value| allocator.free(value);
+    const path_prefix = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(path_prefix);
+    const path_suffix = try decoder.readBytesAlloc(allocator, 128);
+    errdefer allocator.free(path_suffix);
+    return .{
+        .name = name,
+        .timestamp_name = timestamp_name,
+        .path_name = path_name,
+        .path_prefix = path_prefix,
+        .path_suffix = path_suffix,
+        .ordinal_width = try decoder.readByte(),
+        .max_ordinal = @intCast(try decoder.readUsize()),
+    };
+}
+
+fn validateDecodedIdentity(identity: *const Identity) !void {
+    try definition_core.json.safeIdentifier(identity.name, 128);
+    try definition_core.json.safeIdentifier(identity.timestamp_name, 128);
+    if (identity.path_name) |path_name| {
+        try definition_core.json.safeIdentifier(path_name, 128);
+        if (std.mem.eql(u8, path_name, identity.name) or
+            std.mem.eql(u8, path_name, identity.timestamp_name))
+        {
+            return error.CacheStoragePlanMismatch;
+        }
+    } else if (identity.path_prefix.len != 0 or identity.path_suffix.len != 0) {
+        return error.CacheStoragePlanMismatch;
+    }
+    validatePathAffix(identity.path_prefix) catch
+        return error.CacheStoragePlanMismatch;
+    validatePathAffix(identity.path_suffix) catch
+        return error.CacheStoragePlanMismatch;
+    if (identity.ordinal_width == 0 or identity.ordinal_width > 9) {
+        return error.CacheStoragePlanMismatch;
+    }
+    var capacity: u64 = 1;
+    for (0..identity.ordinal_width) |_| capacity *= 10;
+    if (@as(u64, identity.max_ordinal) >= capacity) {
+        return error.CacheStoragePlanMismatch;
+    }
 }
 
 fn decodeFragments(
@@ -732,62 +872,16 @@ pub fn renderAlloc(
                 generated,
             );
         },
-        .edit => {
-            const before = existing orelse return error.EditRequiresExistingSlot;
-            if (!std.unicode.utf8ValidateSlice(before)) {
-                return error.StoredDocumentNotUtf8;
-            }
-            if (plan.reject_contains) |needle| {
-                if (std.mem.indexOf(u8, before, needle) != null) {
-                    return error.DocumentAppendAlreadyPresent;
-                }
-            }
-            var replacement: std.Io.Writer.Allocating = .init(allocator);
-            defer replacement.deinit();
-            try writeFragments(
-                &replacement.writer,
-                plan.line_replacement,
-                input,
-                input_json,
-                parameters,
-                generated,
-            );
-            if (lineRange(before, plan.line_prefix.?)) |range| {
-                try output.writer.writeAll(before[0..range.start]);
-                try output.writer.writeAll(replacement.written());
-                try output.writer.writeAll(before[range.end..]);
-            } else if (plan.insert_before) |prefix| {
-                if (lineRange(before, prefix)) |range| {
-                    try output.writer.writeAll(before[0..range.start]);
-                    try output.writer.writeAll(replacement.written());
-                    try output.writer.writeByte('\n');
-                    try output.writer.writeAll(before[range.start..]);
-                } else {
-                    try appendReplacementAtEnd(
-                        &output.writer,
-                        before,
-                        replacement.written(),
-                    );
-                }
-            } else {
-                try appendReplacementAtEnd(
-                    &output.writer,
-                    before,
-                    replacement.written(),
-                );
-            }
-            const base = if (plan.trim_end)
-                std.mem.trimEnd(u8, output.written(), " \t\r\n")
-            else
-                output.written();
-            var combined: std.Io.Writer.Allocating = .init(allocator);
-            errdefer combined.deinit();
-            try combined.writer.writeAll(base);
-            try combined.writer.writeAll(plan.append_separator.?);
-            try combined.writer.writeAll(std.mem.trimEnd(u8, input, " \t\r\n"));
-            output.deinit();
-            output = combined;
-        },
+        .edit => try renderEdit(
+            allocator,
+            plan,
+            input,
+            input_json,
+            existing,
+            parameters,
+            generated,
+            &output,
+        ),
     }
     if (plan.final_newline and
         (output.written().len == 0 or
@@ -799,6 +893,82 @@ pub fn renderAlloc(
         return error.DocumentMaterializationBoundsExceeded;
     }
     return output.toOwnedSlice();
+}
+
+fn renderEdit(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    input: []const u8,
+    input_json: ?std.json.Value,
+    existing: ?[]const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    generated: []const Value,
+    output: *std.Io.Writer.Allocating,
+) !void {
+    const before = existing orelse return error.EditRequiresExistingSlot;
+    if (!std.unicode.utf8ValidateSlice(before)) {
+        return error.StoredDocumentNotUtf8;
+    }
+    if (plan.reject_contains) |needle| {
+        if (std.mem.indexOf(u8, before, needle) != null) {
+            return error.DocumentAppendAlreadyPresent;
+        }
+    }
+    var replacement: std.Io.Writer.Allocating = .init(allocator);
+    defer replacement.deinit();
+    try writeFragments(
+        &replacement.writer,
+        plan.line_replacement,
+        input,
+        input_json,
+        parameters,
+        generated,
+    );
+    try writeEditedBase(&output.writer, plan, before, replacement.written());
+    try appendEditedInput(allocator, output, plan, input);
+}
+
+fn writeEditedBase(
+    writer: *std.Io.Writer,
+    plan: *const Plan,
+    before: []const u8,
+    replacement: []const u8,
+) !void {
+    if (lineRange(before, plan.line_prefix.?)) |range| {
+        try writer.writeAll(before[0..range.start]);
+        try writer.writeAll(replacement);
+        try writer.writeAll(before[range.end..]);
+        return;
+    }
+    if (plan.insert_before) |prefix| {
+        if (lineRange(before, prefix)) |range| {
+            try writer.writeAll(before[0..range.start]);
+            try writer.writeAll(replacement);
+            try writer.writeByte('\n');
+            try writer.writeAll(before[range.start..]);
+            return;
+        }
+    }
+    try appendReplacementAtEnd(writer, before, replacement);
+}
+
+fn appendEditedInput(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    plan: *const Plan,
+    input: []const u8,
+) !void {
+    const base = if (plan.trim_end)
+        std.mem.trimEnd(u8, output.written(), " \t\r\n")
+    else
+        output.written();
+    var combined: std.Io.Writer.Allocating = .init(allocator);
+    errdefer combined.deinit();
+    try combined.writer.writeAll(base);
+    try combined.writer.writeAll(plan.append_separator.?);
+    try combined.writer.writeAll(std.mem.trimEnd(u8, input, " \t\r\n"));
+    output.deinit();
+    output.* = combined;
 }
 
 fn writeFragments(
@@ -1030,15 +1200,66 @@ fn deinitFragments(
     allocator.free(fragments);
 }
 
+const document_test_definition =
+    \\{
+    \\  "schema": "ledger-artifact-definition/v1",
+    \\  "id": "example/documents",
+    \\  "owner": "example",
+    \\  "requires": {
+    \\    "abi": "ledger-artifact-abi/v1",
+    \\    "operators": ["text-render", "timestamp-ordinal"]
+    \\  },
+    \\  "parameters": {
+    \\    "decision_id": {"type": "safe_identifier", "required": false},
+    \\    "document_id": {"type": "safe_identifier", "required": false}
+    \\  },
+    \\  "inputs": {"text": {"codec": "text", "max_bytes": 4096}},
+    \\  "canonicalization": {},
+    \\  "shape": {},
+    \\  "constraints": [],
+    \\  "identity": {},
+    \\  "storage": {"kind": "pure"},
+    \\  "operations": {},
+    \\  "projections": {},
+    \\  "bounds": {
+    \\    "max_input_bytes": 4096,
+    \\    "max_store_bytes": 4096,
+    \\    "max_records": 1,
+    \\    "max_output_bytes": 4096,
+    \\    "max_diagnostics": 8,
+    \\    "max_reducer_states": 1
+    \\  }
+    \\}
+;
+
+const timestamp_template =
+    \\{
+    \\  "mode": "template",
+    \\  "identity": {
+    \\    "op": "timestamp-ordinal",
+    \\    "name": "document_id",
+    \\    "timestamp_name": "created_at",
+    \\    "ordinal_width": 4,
+    \\    "max_ordinal": 9999
+    \\  },
+    \\  "fragments": [
+    \\    {"literal": "id: "},
+    \\    {"generated": "document_id"},
+    \\    {"literal": "\nat: "},
+    \\    {"generated": "created_at"},
+    \\    {"literal": "\n\n"},
+    \\    {"input": true}
+    \\  ],
+    \\  "final_newline": true
+    \\}
+;
+
 test "bounded document plans render timestamp templates and append-once edits" {
-    const definition_text =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/documents","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["text-render","timestamp-ordinal"]},"parameters":{"decision_id":{"type":"safe_identifier","required":false},"document_id":{"type":"safe_identifier","required":false}},"inputs":{"text":{"codec":"text","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-    ;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "definition.json",
-        .data = definition_text,
+        .data = document_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -1053,18 +1274,20 @@ test "bounded document plans render timestamp templates and append-once edits" {
         "definition.json",
     );
     defer definition_plan.deinit(std.testing.allocator);
+    try expectTimestampTemplate(&definition_plan);
+}
 
+fn expectTimestampTemplate(definition_plan: *const definition.Plan) !void {
     var template_json = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"mode":"template","identity":{"op":"timestamp-ordinal","name":"document_id","timestamp_name":"created_at","ordinal_width":4,"max_ordinal":9999},"fragments":[{"literal":"id: "},{"generated":"document_id"},{"literal":"\nat: "},{"generated":"created_at"},{"literal":"\n\n"},{"input":true}],"final_newline":true}
-    ,
+        timestamp_template,
         .{},
     );
     defer template_json.deinit();
     var template_plan = try compile(
         std.testing.allocator,
-        &definition_plan,
+        definition_plan,
         template_json.value,
     );
     defer template_plan.deinit(std.testing.allocator);
