@@ -172,9 +172,48 @@ jq -r '.returned_content' "$source_transaction" |
   --format json >"$scratch/actual-recent.json"
 cmp -s "$scratch/expected-recent.json" "$scratch/actual-recent.json"
 
+jq -r '.returned_content' "$source_transaction" |
+  jq -c \
+    '[.record |
+      {
+        id: .id,
+        kind: .kind,
+        operation: .operation,
+        summary: .summary
+      }]' >"$scratch/expected-query.json"
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection query \
+  --repo "$projection_repo" \
+  --param "query=map a sensory phrase" \
+  --param search_limit=1 \
+  --payload-only \
+  --format json >"$scratch/actual-query.json"
+cmp -s "$scratch/expected-query.json" "$scratch/actual-query.json"
+
+jq -r '.returned_content' "$source_transaction" |
+  jq -c \
+    '[.record |
+      {
+        score: 2,
+        id: .id,
+        kind: .kind,
+        operation: .operation,
+        summary: .summary
+      }]' >"$scratch/expected-recall.json"
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection recall \
+  --repo "$projection_repo" \
+  --param "query=porous authority" \
+  --param search_limit=1 \
+  --payload-only \
+  --format json >"$scratch/actual-recall.json"
+cmp -s "$scratch/expected-recall.json" "$scratch/actual-recall.json"
+
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=3\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5\n' \
   "$valid_count" \
   "$invalid_count"
