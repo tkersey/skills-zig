@@ -62,7 +62,8 @@
       "op": "reducer",
       "key": "/value/id",
       "on": "/kind",
-      "event_kind": "/kind"
+      "event_kind": "/kind",
+      "retain_once": "/value"
     },
     {
       "op": "transition-table",
@@ -122,7 +123,9 @@
         {
           "op": "fold",
           "key_field": "id",
-          "state_field": "status"
+          "state_field": "status",
+          "retained_field": "current",
+          "event_count_field": "event_count"
         }
       ]
     }

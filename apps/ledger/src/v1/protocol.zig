@@ -329,7 +329,7 @@ pub fn compile(
                 allocator,
                 rules.transition_table.?,
                 reducer_rule,
-                definition_plan.bounds.max_reducer_states,
+                definition_plan.bounds,
             );
             if (reducer_plan.?.event_kind != null) {
                 return error.ChainedProtocolRejectsReducerEventKind;
@@ -423,7 +423,7 @@ fn compilePlain(
             allocator,
             rules.transition_table.?,
             reducer_rule,
-            definition_plan.bounds.max_reducer_states,
+            definition_plan.bounds,
         );
         if (reducer_plan.?.event_kind == null) {
             return error.PlainKeyedReducerRequiresEventKind;
@@ -453,7 +453,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(6);
+    try encoder.writeU16(7);
     try encoder.writeEnum(plan.mode);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
@@ -491,7 +491,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 6) {
+    if (try decoder.readU16() != 7) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
@@ -627,7 +627,11 @@ pub fn validateCachePlan(
     }
     if (plan.reducer_plan) |*compiled| {
         if (compiled.max_entries !=
-            definition_plan.bounds.max_reducer_states)
+            definition_plan.bounds.max_reducer_states or
+            compiled.max_retained_value_bytes !=
+                definition_plan.bounds.max_input_bytes or
+            compiled.max_retained_total_bytes !=
+                definition_plan.bounds.max_store_bytes)
         {
             return error.CacheProtocolPlanMismatch;
         }

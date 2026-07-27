@@ -30,10 +30,13 @@ pub const Plan = struct {
     key: definition_core.json_pointer.Pointer,
     on: definition_core.json_pointer.Pointer,
     event_kind: ?definition_core.json_pointer.Pointer,
+    retain_once: ?definition_core.json_pointer.Pointer,
     assert_from: ?definition_core.json_pointer.Pointer,
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
     max_entries: usize,
+    max_retained_value_bytes: usize,
+    max_retained_total_bytes: usize,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         deinitStringSet(allocator, self.states);
@@ -42,6 +45,7 @@ pub const Plan = struct {
         self.key.deinit(allocator);
         self.on.deinit(allocator);
         if (self.event_kind) |*pointer| pointer.deinit(allocator);
+        if (self.retain_once) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         self.* = undefined;
@@ -53,15 +57,28 @@ const Entry = struct {
     key_len: u16,
     state_bytes: [max_text_bytes]u8 = undefined,
     state_len: u16,
+    retained: ?[]u8,
+    event_count: usize,
 
-    fn init(raw_key: []const u8, state_text: []const u8) Entry {
+    fn init(
+        raw_key: []const u8,
+        state_text: []const u8,
+        retained: ?[]u8,
+    ) Entry {
         var result: Entry = .{
             .key_len = @intCast(raw_key.len),
             .state_len = @intCast(state_text.len),
+            .retained = retained,
+            .event_count = 1,
         };
         @memcpy(result.key_bytes[0..raw_key.len], raw_key);
         @memcpy(result.state_bytes[0..state_text.len], state_text);
         return result;
+    }
+
+    fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+        if (self.retained) |value| allocator.free(value);
+        self.* = undefined;
     }
 
     fn key(self: *const Entry) []const u8 {
@@ -78,10 +95,25 @@ const Entry = struct {
     }
 };
 
+const ProjectionFieldKind = enum {
+    key,
+    state,
+    retained,
+    event_count,
+};
+
+const ProjectionField = struct {
+    name: []const u8,
+    kind: ProjectionFieldKind,
+};
+
 pub const State = struct {
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+    retained_bytes: usize = 0,
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| entry.deinit(allocator);
         self.entries.deinit(allocator);
         self.* = undefined;
     }
@@ -96,13 +128,45 @@ pub const State = struct {
         output: *std.Io.Writer.Allocating,
         key_field: []const u8,
         state_field: []const u8,
+        retained_field: ?[]const u8,
+        event_count_field: ?[]const u8,
         limit: usize,
         max_output_bytes: usize,
     ) !usize {
-        try definition_core.json.safeIdentifier(key_field, 128);
-        try definition_core.json.safeIdentifier(state_field, 128);
-        if (std.mem.eql(u8, key_field, state_field)) {
-            return error.ReducerProjectionFieldsConflict;
+        var field_storage: [4]ProjectionField = undefined;
+        var field_count: usize = 0;
+        field_storage[field_count] = .{ .name = key_field, .kind = .key };
+        field_count += 1;
+        field_storage[field_count] = .{
+            .name = state_field,
+            .kind = .state,
+        };
+        field_count += 1;
+        if (retained_field) |name| {
+            field_storage[field_count] = .{
+                .name = name,
+                .kind = .retained,
+            };
+            field_count += 1;
+        }
+        if (event_count_field) |name| {
+            field_storage[field_count] = .{
+                .name = name,
+                .kind = .event_count,
+            };
+            field_count += 1;
+        }
+        const fields = field_storage[0..field_count];
+        std.mem.sort(ProjectionField, fields, {}, projectionFieldLessThan);
+        for (fields, 0..) |field, field_index| {
+            try definition_core.json.safeIdentifier(field.name, 128);
+            if (field_index != 0 and std.mem.eql(
+                u8,
+                fields[field_index - 1].name,
+                field.name,
+            )) {
+                return error.ReducerProjectionFieldsConflict;
+            }
         }
         const values = try allocator.alloc(*const Entry, self.entries.count());
         defer allocator.free(values);
@@ -117,14 +181,29 @@ pub const State = struct {
         for (values[0..emitted], 0..) |entry, row_index| {
             if (row_index != 0) try output.writer.writeByte(',');
             try output.writer.writeByte('{');
-            if (std.mem.order(u8, key_field, state_field) == .lt) {
-                try writeField(&output.writer, key_field, entry.key());
-                try output.writer.writeByte(',');
-                try writeField(&output.writer, state_field, entry.state());
-            } else {
-                try writeField(&output.writer, state_field, entry.state());
-                try output.writer.writeByte(',');
-                try writeField(&output.writer, key_field, entry.key());
+            for (fields, 0..) |field, field_index| {
+                if (field_index != 0) try output.writer.writeByte(',');
+                try writeFieldName(&output.writer, field.name);
+                switch (field.kind) {
+                    .key => try definition_core.canonical_json
+                        .writeCanonicalString(
+                        &output.writer,
+                        entry.key(),
+                    ),
+                    .state => try definition_core.canonical_json
+                        .writeCanonicalString(
+                        &output.writer,
+                        entry.state(),
+                    ),
+                    .retained => try output.writer.writeAll(
+                        entry.retained orelse
+                            return error.ReducerRetainedValueMissing,
+                    ),
+                    .event_count => try output.writer.print(
+                        "{d}",
+                        .{entry.event_count},
+                    ),
+                }
             }
             try output.writer.writeByte('}');
             if (output.written().len > max_output_bytes) {
@@ -143,8 +222,9 @@ pub fn compile(
     allocator: std.mem.Allocator,
     table_rule: definition.Rule,
     reducer_rule: definition.Rule,
-    max_entries: usize,
+    bounds: definition.Bounds,
 ) !Plan {
+    const max_entries = bounds.max_reducer_states;
     if (max_entries == 0 or max_entries > max_states) {
         return error.InvalidReducerStateBound;
     }
@@ -186,6 +266,7 @@ pub fn compile(
             "key",
             "on",
             "event_kind",
+            "retain_once",
             "from",
             "to",
             "assertion_presence",
@@ -209,6 +290,12 @@ pub fn compile(
         "event_kind",
     );
     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
+    var retain_once = try compileOptionalPointer(
+        allocator,
+        reducer,
+        "retain_once",
+    );
+    errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
     var assert_from = try compileOptionalPointer(allocator, reducer, "from");
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try compileOptionalPointer(allocator, reducer, "to");
@@ -220,10 +307,13 @@ pub fn compile(
         .key = key,
         .on = on,
         .event_kind = event_kind,
+        .retain_once = retain_once,
         .assert_from = assert_from,
         .assert_to = assert_to,
         .assertion_presence = assertion_presence,
         .max_entries = max_entries,
+        .max_retained_value_bytes = bounds.max_input_bytes,
+        .max_retained_total_bytes = bounds.max_store_bytes,
     };
     try validatePlan(&result);
     return result;
@@ -233,7 +323,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(2);
+    try encoder.writeU16(3);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
@@ -247,6 +337,10 @@ pub fn encodeCache(
         pointer.raw
     else
         null);
+    try encoder.writeOptionalBytes(if (plan.retain_once) |pointer|
+        pointer.raw
+    else
+        null);
     try encoder.writeOptionalBytes(if (plan.assert_from) |pointer|
         pointer.raw
     else
@@ -257,13 +351,15 @@ pub fn encodeCache(
         null);
     try encoder.writeEnum(plan.assertion_presence);
     try encoder.writeUsize(plan.max_entries);
+    try encoder.writeUsize(plan.max_retained_value_bytes);
+    try encoder.writeUsize(plan.max_retained_total_bytes);
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 2) {
+    if (try decoder.readU16() != 3) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
@@ -299,6 +395,8 @@ pub fn decodeCache(
     errdefer on.deinit(allocator);
     var event_kind = try decodeOptionalPointer(allocator, decoder);
     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
+    var retain_once = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
     var assert_from = try decodeOptionalPointer(allocator, decoder);
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try decodeOptionalPointer(allocator, decoder);
@@ -309,10 +407,13 @@ pub fn decodeCache(
         .key = key,
         .on = on,
         .event_kind = event_kind,
+        .retain_once = retain_once,
         .assert_from = assert_from,
         .assert_to = assert_to,
         .assertion_presence = try decoder.readEnum(AssertionPresence),
         .max_entries = try decoder.readUsize(),
+        .max_retained_value_bytes = try decoder.readUsize(),
+        .max_retained_total_bytes = try decoder.readUsize(),
     };
     try validatePlan(&result);
     return result;
@@ -368,8 +469,47 @@ pub fn apply(
             error.ReducerToAssertionMismatch,
         );
     }
+    var retained_value: ?[]u8 = null;
+    defer if (retained_value) |value| allocator.free(value);
+    if (plan.retain_once) |pointer| {
+        if (definition_core.json_pointer.lookup(event, pointer)) |value| {
+            const canonical =
+                try definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    value,
+                );
+            var canonical_owned: ?[]u8 = canonical;
+            defer if (canonical_owned) |owned| allocator.free(owned);
+            if (canonical.len > plan.max_retained_value_bytes) {
+                return error.ReducerRetainedValueBoundsExceeded;
+            }
+            if (prior) |entry| {
+                const retained = entry.retained orelse
+                    return error.ReducerRetainedValueMissing;
+                if (!std.mem.eql(u8, retained, canonical)) {
+                    return error.ReducerRetainedValueChanged;
+                }
+            } else {
+                retained_value = canonical;
+                canonical_owned = null;
+            }
+        } else if (prior == null) {
+            return error.ReducerRetainedValueMissing;
+        }
+    }
     if (prior == null and state.entries.count() >= plan.max_entries) {
         return error.ReducerStateBoundsExceeded;
+    }
+    if (prior == null and retained_value != null and
+        state.retained_bytes >
+            plan.max_retained_total_bytes -| retained_value.?.len)
+    {
+        return error.ReducerRetainedTotalBoundsExceeded;
+    }
+    if (prior) |entry| {
+        if (entry.event_count == std.math.maxInt(usize)) {
+            return error.ReducerEventCountOverflow;
+        }
     }
     const result = try state.entries.getOrPut(allocator, key_digest);
     if (result.found_existing) {
@@ -377,8 +517,15 @@ pub fn apply(
             return error.ReducerKeyDigestCollision;
         }
         result.value_ptr.setState(transition.to);
+        result.value_ptr.event_count += 1;
     } else {
-        result.value_ptr.* = Entry.init(key, transition.to);
+        result.value_ptr.* = Entry.init(
+            key,
+            transition.to,
+            retained_value,
+        );
+        if (retained_value) |value| state.retained_bytes += value.len;
+        retained_value = null;
     }
 }
 
@@ -451,7 +598,10 @@ pub fn validatePlan(plan: *const Plan) !void {
     if (plan.states.len == 0 or plan.states.len > max_states or
         plan.transitions.len == 0 or
         plan.transitions.len > max_transitions or
-        plan.max_entries == 0 or plan.max_entries > max_states)
+        plan.max_entries == 0 or plan.max_entries > max_states or
+        plan.max_retained_value_bytes == 0 or
+        plan.max_retained_total_bytes == 0 or
+        plan.max_retained_value_bytes > plan.max_retained_total_bytes)
     {
         return error.InvalidReducerPlan;
     }
@@ -477,6 +627,7 @@ pub fn validatePlan(plan: *const Plan) !void {
     try validatePointer(plan.key);
     try validatePointer(plan.on);
     if (plan.event_kind) |pointer| try validatePointer(pointer);
+    if (plan.retain_once) |pointer| try validatePointer(pointer);
     if (plan.assert_from) |pointer| try validatePointer(pointer);
     if (plan.assert_to) |pointer| try validatePointer(pointer);
     if (plan.assertion_presence == .when_present and
@@ -773,14 +924,31 @@ fn entryLessThan(_: void, left: *const Entry, right: *const Entry) bool {
     return std.mem.lessThan(u8, left.key(), right.key());
 }
 
-fn writeField(
+fn projectionFieldLessThan(
+    _: void,
+    left: ProjectionField,
+    right: ProjectionField,
+) bool {
+    return std.mem.lessThan(u8, left.name, right.name);
+}
+
+fn writeFieldName(
     writer: *std.Io.Writer,
     name: []const u8,
-    value: []const u8,
 ) !void {
     try definition_core.canonical_json.writeCanonicalString(writer, name);
     try writer.writeByte(':');
-    try definition_core.canonical_json.writeCanonicalString(writer, value);
+}
+
+fn testBounds(max_reducer_states: usize) definition.Bounds {
+    return .{
+        .max_input_bytes = 4096,
+        .max_store_bytes = 8192,
+        .max_records = 16,
+        .max_output_bytes = 4096,
+        .max_diagnostics = 8,
+        .max_reducer_states = max_reducer_states,
+    };
 }
 
 test "compiled reducer admits deterministic keyed transitions" {
@@ -802,7 +970,7 @@ test "compiled reducer admits deterministic keyed transitions" {
         std.testing.allocator,
         table_rule,
         reducer_rule,
-        2,
+        testBounds(2),
     );
     defer plan.deinit(std.testing.allocator);
     var state: State = .{};
@@ -863,6 +1031,8 @@ test "compiled reducer admits deterministic keyed transitions" {
             &projection,
             "id",
             "status",
+            null,
+            null,
             2,
             4096,
         ),
@@ -882,7 +1052,7 @@ test "compiled reducer admits deterministic keyed transitions" {
         std.testing.allocator,
         table_rule,
         reducer_rule,
-        1,
+        testBounds(1),
     );
     defer constrained_plan.deinit(std.testing.allocator);
     try std.testing.expectError(
@@ -912,14 +1082,14 @@ test "keyed reducer checks transition assertions when rows carry them" {
         .operator = .reducer,
         .pointer_id = null,
         .canonical_config = @constCast(
-            "{\"assertion_presence\":\"when-present\",\"event_kind\":\"/event\",\"from\":\"/from\",\"key\":\"/id\",\"on\":\"/status\",\"op\":\"reducer\",\"to\":\"/to\"}",
+            "{\"assertion_presence\":\"when-present\",\"event_kind\":\"/event\",\"from\":\"/from\",\"key\":\"/id\",\"on\":\"/status\",\"op\":\"reducer\",\"retain_once\":\"/record\",\"to\":\"/to\"}",
         ),
     };
     var compiled = try compile(
         std.testing.allocator,
         table_rule,
         reducer_rule,
-        2,
+        testBounds(2),
     );
     defer compiled.deinit(std.testing.allocator);
     var encoder = definition_core.cache.Encoder.init(
@@ -935,6 +1105,7 @@ test "keyed reducer checks transition assertions when rows carry them" {
     defer plan.deinit(std.testing.allocator);
     try decoder.finish();
     try std.testing.expect(plan.event_kind != null);
+    try std.testing.expect(plan.retain_once != null);
     try std.testing.expectEqual(
         AssertionPresence.when_present,
         plan.assertion_presence,
@@ -945,7 +1116,7 @@ test "keyed reducer checks transition assertions when rows carry them" {
     var captured = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"event\":\"capture\",\"id\":\"item-1\",\"status\":\"active\"}",
+        "{\"event\":\"capture\",\"id\":\"item-1\",\"record\":{\"value\":1},\"status\":\"active\"}",
         .{},
     );
     defer captured.deinit();
@@ -971,4 +1142,23 @@ test "keyed reducer checks transition assertions when rows carry them" {
     );
     defer closed.deinit();
     try apply(std.testing.allocator, &plan, &state, closed.value);
+    var projection: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer projection.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try state.writeCanonicalRows(
+            std.testing.allocator,
+            &projection,
+            "id",
+            "status",
+            "record",
+            "event_count",
+            2,
+            4096,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "[{\"event_count\":2,\"id\":\"item-1\",\"record\":{\"value\":1},\"status\":\"closed\"}]",
+        projection.written(),
+    );
 }

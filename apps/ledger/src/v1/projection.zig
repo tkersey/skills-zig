@@ -124,10 +124,14 @@ const Relevance = struct {
 const KeyedFold = struct {
     key_field: []u8,
     state_field: []u8,
+    retained_field: ?[]u8,
+    event_count_field: ?[]u8,
 
     fn deinit(self: *KeyedFold, allocator: std.mem.Allocator) void {
         allocator.free(self.key_field);
         allocator.free(self.state_field);
+        if (self.retained_field) |field| allocator.free(field);
+        if (self.event_count_field) |field| allocator.free(field);
         self.* = undefined;
     }
 };
@@ -316,7 +320,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(6);
+    try encoder.writeU16(7);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
@@ -392,6 +396,8 @@ pub fn encodeCache(
                     try encoder.writeByte(0);
                     try encoder.writeBytes(keyed.key_field);
                     try encoder.writeBytes(keyed.state_field);
+                    try encoder.writeOptionalBytes(keyed.retained_field);
+                    try encoder.writeOptionalBytes(keyed.event_count_field);
                 },
                 .retained => |retained| {
                     try encoder.writeByte(1);
@@ -425,7 +431,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 6) {
+    if (try decoder.readU16() != 7) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const count = try decoder.readCount(128);
@@ -495,22 +501,22 @@ pub fn validateCachePlan(
             }
             switch (fold) {
                 .keyed => |keyed| {
-                    if (event_protocol.?.reducer_plan == null or
-                        std.mem.eql(
-                            u8,
-                            keyed.key_field,
-                            keyed.state_field,
-                        ))
+                    const keyed_plan =
+                        if (event_protocol.?.reducer_plan) |*value|
+                            value
+                        else
+                            return error.CacheProjectionPlanMismatch;
+                    if (keyed.retained_field != null and
+                        keyed_plan.retain_once == null)
                     {
                         return error.CacheProjectionPlanMismatch;
                     }
-                    try definition_core.json.safeIdentifier(
+                    try validateKeyedFoldFields(
                         keyed.key_field,
-                        128,
-                    );
-                    try definition_core.json.safeIdentifier(
                         keyed.state_field,
-                        128,
+                        keyed.retained_field,
+                        keyed.event_count_field,
+                        error.CacheProjectionPlanMismatch,
                     );
                 },
                 .retained => |retained| {
@@ -710,11 +716,10 @@ fn decodeCacheProjection(
                     1024,
                 );
                 defer allocator.free(raw_pointer);
-                break :pointer .{ .pointer =
-                    try definition_core.json_pointer.compile(
-                        allocator,
-                        raw_pointer,
-                    ) };
+                break :pointer .{ .pointer = try definition_core.json_pointer.compile(
+                    allocator,
+                    raw_pointer,
+                ) };
             },
             1 => .record_order,
             2 => .relevance_score,
@@ -835,12 +840,26 @@ fn decodeCacheProjection(
                     state_field,
                     128,
                 );
-                if (std.mem.eql(u8, key_field, state_field)) {
-                    return error.CacheProjectionFieldsConflict;
-                }
+                const retained_field = try decoder.readOptionalBytesAlloc(
+                    allocator,
+                    128,
+                );
+                errdefer if (retained_field) |field| allocator.free(field);
+                const event_count_field =
+                    try decoder.readOptionalBytesAlloc(allocator, 128);
+                errdefer if (event_count_field) |field| allocator.free(field);
+                try validateKeyedFoldFields(
+                    key_field,
+                    state_field,
+                    retained_field,
+                    event_count_field,
+                    error.CacheProjectionFieldsConflict,
+                );
                 break :keyed .{ .keyed = .{
                     .key_field = key_field,
                     .state_field = state_field,
+                    .retained_field = retained_field,
+                    .event_count_field = event_count_field,
                 } };
             },
             1 => retained: {
@@ -1164,7 +1183,13 @@ fn compileProjection(
                     }
                     try definition_core.json.requireExactKeys(
                         step,
-                        &.{ "op", "key_field", "state_field" },
+                        &.{
+                            "op",
+                            "key_field",
+                            "state_field",
+                            "retained_field",
+                            "event_count_field",
+                        },
                     );
                     try definition_core.json.requireFields(
                         step,
@@ -1188,8 +1213,33 @@ fn compileProjection(
                         state_field,
                         128,
                     );
-                    if (std.mem.eql(u8, key_field, state_field)) {
-                        return error.ProjectionFieldsConflict;
+                    const retained_field = try compileOptionalFieldName(
+                        allocator,
+                        step,
+                        "retained_field",
+                    );
+                    errdefer if (retained_field) |field| {
+                        allocator.free(field);
+                    };
+                    const event_count_field = try compileOptionalFieldName(
+                        allocator,
+                        step,
+                        "event_count_field",
+                    );
+                    errdefer if (event_count_field) |field| {
+                        allocator.free(field);
+                    };
+                    try validateKeyedFoldFields(
+                        key_field,
+                        state_field,
+                        retained_field,
+                        event_count_field,
+                        error.ProjectionFieldsConflict,
+                    );
+                    if (retained_field != null and
+                        event_protocol.?.reducer_plan.?.retain_once == null)
+                    {
+                        return error.FoldRetainedFieldRequiresRetainedValue;
                     }
                     fold = fold: {
                         const owned_key =
@@ -1200,6 +1250,8 @@ fn compileProjection(
                         break :fold .{ .keyed = .{
                             .key_field = owned_key,
                             .state_field = owned_state,
+                            .retained_field = retained_field,
+                            .event_count_field = event_count_field,
                         } };
                     };
                 }
@@ -1466,6 +1518,46 @@ fn compileSortKeys(
         initialized += 1;
     }
     return keys;
+}
+
+fn compileOptionalFieldName(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) !?[]u8 {
+    const value = object.get(key) orelse return null;
+    const name = try definition_core.json.string(value);
+    try definition_core.json.safeIdentifier(name, 128);
+    return try allocator.dupe(u8, name);
+}
+
+fn validateKeyedFoldFields(
+    key_field: []const u8,
+    state_field: []const u8,
+    retained_field: ?[]const u8,
+    event_count_field: ?[]const u8,
+    comptime conflict: anyerror,
+) !void {
+    var fields: [4][]const u8 = undefined;
+    var count: usize = 0;
+    fields[count] = key_field;
+    count += 1;
+    fields[count] = state_field;
+    count += 1;
+    if (retained_field) |field| {
+        fields[count] = field;
+        count += 1;
+    }
+    if (event_count_field) |field| {
+        fields[count] = field;
+        count += 1;
+    }
+    for (fields[0..count], 0..) |field, index| {
+        try definition_core.json.safeIdentifier(field, 128);
+        for (fields[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, field)) return conflict;
+        }
+    }
 }
 
 fn compileFields(
@@ -1750,6 +1842,8 @@ pub fn execute(
                         &output,
                         keyed.key_field,
                         keyed.state_field,
+                        keyed.retained_field,
+                        keyed.event_count_field,
                         effective_limit,
                         plan.max_output_bytes,
                     );

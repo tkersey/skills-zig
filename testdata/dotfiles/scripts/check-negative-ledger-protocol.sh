@@ -78,7 +78,6 @@ set -e
 jq -e '.valid == false' "$scratch/status-invalid-result.json" >/dev/null
 
 jq -c . "$scratch/capture.json" >"$repo/.ledger/negative-ledger/events.jsonl"
-jq -c . "$scratch/status.json" >>"$repo/.ledger/negative-ledger/events.jsonl"
 store_digest_before=$(shasum -a 256 "$repo/.ledger/negative-ledger/events.jsonl" | awk '{print $1}')
 
 "$ledger_bin" transact \
@@ -95,22 +94,38 @@ jq -e \
 store_digest_after=$(shasum -a 256 "$repo/.ledger/negative-ledger/events.jsonl" | awk '{print $1}')
 [[ "$store_digest_before" == "$store_digest_after" ]]
 
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation append-event \
+  --repo "$repo" \
+  --input "event=$scratch/status.json" \
+  --format json >"$scratch/append.json"
+jq -e \
+  '.operation == "append-event" and
+   .effects[0].result == "appended" and
+   .semantic_authority_granted == false and
+   .storage_mutated == true' \
+  "$scratch/append.json" >/dev/null
+expected_status=$(jq -cS . "$scratch/status.json")
+actual_status=$(tail -n 1 "$repo/.ledger/negative-ledger/events.jsonl")
+[[ "$expected_status" == "$actual_status" ]]
+
 assert_ledger_doctor_slot_state \
   "$ledger_bin" "$definition" "$repo" events \
   current true 0 "$scratch/doctor-current.json"
 
 "$ledger_bin" project \
   --definition "$definition" \
-  --projection current-states \
+  --projection current-records \
   --repo "$repo" \
   --payload-only \
   --format json >"$scratch/current-states.json"
-jq -e \
+jq -e --slurpfile capture "$scratch/capture.json" \
   'length == 1 and
-   .[0] == {
-     neg_id: "NEG-000001",
-     status: "superseded"
-   }' \
+   .[0].neg_id == "NEG-000001" and
+   .[0].status == "superseded" and
+   .[0].source_event_count == 2 and
+   .[0].record == $capture[0].record' \
   "$scratch/current-states.json" >/dev/null
 
 jq -c \
@@ -133,4 +148,4 @@ jq -e \
    any(.slots[]; .name == "events" and .status == "invalid")' \
   "$scratch/doctor-invalid.json" >/dev/null
 
-printf 'negative-ledger protocol conformance passed: generated=2 invalid=2 bindings=1 projections=1\n'
+printf 'negative-ledger protocol conformance passed: generated=2 invalid=2 bindings=1 transactions=1 projections=1\n'

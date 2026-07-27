@@ -163,7 +163,7 @@ test "plain protocol binds appends replays and folds without rewriting history" 
         repo_root,
         &.{.{
             .name = "event",
-            .bytes = "{\"kind\":\"updated\",\"value\":{\"id\":\"item-1\",\"revision\":2}}",
+            .bytes = "{\"kind\":\"updated\",\"value\":{\"id\":\"item-1\",\"revision\":1}}",
         }},
         &parameters,
     );
@@ -182,7 +182,7 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(
-        "[{\"id\":\"item-1\",\"status\":\"current\"}]",
+        "[{\"current\":{\"id\":\"item-1\",\"revision\":1},\"event_count\":2,\"id\":\"item-1\",\"status\":\"current\"}]",
         result.payload,
     );
 }
