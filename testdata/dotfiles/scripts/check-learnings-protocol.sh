@@ -252,4 +252,128 @@ bound_digest_after=$(
 )
 [[ "$bound_digest_before" == "$bound_digest_after" ]]
 
-printf 'learnings protocol conformance passed: generated=1 invalid=1 bindings=1 transactions=2 projections=2 memory_validations=1\n'
+recall_repo="$scratch/recall-repo"
+mkdir -p "$recall_repo/.ledger/learnings"
+recall_repo=$(cd "$recall_repo" && pwd -P)
+jq -c -n \
+  '
+    def event($id; $captured_at; $learning; $paths; $tag; $supersedes):
+      {
+        v: 1,
+        source: "learnings",
+        event: "learning.capture",
+        learning_id: $id,
+        status: "do_more",
+        record: ({
+          id: $id,
+          captured_at: $captured_at,
+          status: "do_more",
+          learning: $learning,
+          evidence: ["proof"],
+          application: "Apply the selected route.",
+          context: {
+            repo: "owner/repo",
+            branch: "main",
+            paths: $paths
+          },
+          source: "ledger:learnings",
+          fingerprint: ($id | split("-")[-1] + "00000000"),
+          tags: [$tag],
+          related_ids: []
+        } + if $supersedes == null then {} else {
+          supersedes_id: $supersedes
+        } end)
+      };
+    [
+      ["lrn-20260701T000000Z-11111111", "2026-07-01T00:00:00Z", "Preserve the cache definition.", [], "retired", null],
+      ["lrn-20260702T000000Z-22222222", "2026-07-02T00:00:00Z", "Preserve the cache definition.", [], "same", "lrn-20260701T000000Z-11111111"],
+      ["lrn-20260703T000000Z-33333333", "2026-07-03T00:00:00Z", "Preserve the cache definition.", [], "same", null],
+      ["lrn-20260704T000000Z-44444444", "2026-07-04T00:00:00Z", "Preserve the cache definition.", [], "same", null],
+      ["lrn-20260705T000000Z-55555555", "2026-07-05T00:00:00Z", "Use a distinct route.", ["src/ledger.zig"], "other", null]
+    ][]
+    | event(.[0]; .[1]; .[2]; .[3]; .[4]; .[5])
+  ' >"$recall_repo/.ledger/learnings/events.jsonl"
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation bind-existing \
+  --repo "$recall_repo" \
+  --format json >"$scratch/recall-bind.json"
+jq -e \
+  '.effects[0].result == "bound" and
+   .semantic_authority_granted == false and
+   .storage_mutated == true' \
+  "$scratch/recall-bind.json" >/dev/null
+
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection recent \
+  --repo "$recall_repo" \
+  --param "limit=3" \
+  --payload-only \
+  --format json >"$scratch/recent.json"
+jq -e \
+  'map(.id) == [
+     "lrn-20260705T000000Z-55555555",
+     "lrn-20260704T000000Z-44444444",
+     "lrn-20260703T000000Z-33333333"
+   ]' \
+  "$scratch/recent.json" >/dev/null
+
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection recall \
+  --repo "$recall_repo" \
+  --param "query=cache src/ledger.zig" \
+  --param "now=2026-07-06T00:00:00Z" \
+  --param "drop_superseded=true" \
+  --param "search_limit=5" \
+  --payload-only \
+  --format json >"$scratch/recall.json"
+jq -e \
+  'map(.id) == [
+     "lrn-20260705T000000Z-55555555",
+     "lrn-20260704T000000Z-44444444",
+     "lrn-20260703T000000Z-33333333"
+   ] and
+   all(.[]; (.score | type) == "number")' \
+  "$scratch/recall.json" >/dev/null
+
+if [[ -n ${BASE_LEDGER_BIN:-} ]]; then
+  command -v "$BASE_LEDGER_BIN" >/dev/null
+  comparison_now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  (
+    cd "$recall_repo"
+    "$BASE_LEDGER_BIN" recall \
+      --source learnings \
+      --query "cache src/ledger.zig" \
+      --limit 5 \
+      --format json \
+      --drop-superseded
+  ) >"$scratch/base-recall.json"
+  "$ledger_bin" project \
+    --definition "$definition" \
+    --projection recall \
+    --repo "$recall_repo" \
+    --param "query=cache src/ledger.zig" \
+    --param "now=$comparison_now" \
+    --param "drop_superseded=true" \
+    --param "search_limit=5" \
+    --payload-only \
+    --format json >"$scratch/candidate-recall.json"
+  jq -e \
+    --slurpfile base "$scratch/base-recall.json" \
+    '
+      def absolute: if . < 0 then -. else . end;
+      . as $candidate |
+      ($candidate | length) == ($base[0] | length) and
+      all(range(0; $candidate | length);
+        . as $index |
+        $candidate[$index].id == $base[0][$index].id and
+        (($candidate[$index].score - $base[0][$index].score) | absolute) <
+          0.00001
+      )
+    ' \
+    "$scratch/candidate-recall.json" >/dev/null
+fi
+
+printf 'learnings protocol conformance passed: generated=1 invalid=1 bindings=2 transactions=2 projections=4 memory_validations=1\n'

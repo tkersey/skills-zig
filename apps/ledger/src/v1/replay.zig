@@ -106,6 +106,10 @@ pub const Stats = struct {
     }
 };
 
+const IgnoreRecords = struct {
+    pub fn observe(_: *@This(), _: std.json.Value) !void {}
+};
+
 pub fn validateSlot(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
@@ -115,6 +119,31 @@ pub fn validateSlot(
     parameters: *const definition_core.parameters.Bindings,
     current_max_records: usize,
     protocol_required: bool,
+) !Stats {
+    var observer: IgnoreRecords = .{};
+    return validateSlotObserved(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        snapshot,
+        parameters,
+        current_max_records,
+        protocol_required,
+        &observer,
+    );
+}
+
+pub fn validateSlotObserved(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    current_max_records: usize,
+    protocol_required: bool,
+    observer: anytype,
 ) !Stats {
     if (current_max_records == 0 or current_max_records > 10_000_000) {
         return error.InvalidReplayRecordBound;
@@ -133,6 +162,7 @@ pub fn validateSlot(
         parameters,
         current_max_records,
         protocol_required,
+        observer,
     );
     return .{
         .records_validated = history.records_validated,
@@ -154,6 +184,7 @@ fn validateHistory(
     parameters: *const definition_core.parameters.Bindings,
     current_max_records: usize,
     protocol_required: bool,
+    observer: anytype,
 ) !HistoryResult {
     if (snapshot.binding.rows.len == 0) return error.InvalidStoreBinding;
     var epoch_start: usize = 0;
@@ -177,15 +208,18 @@ fn validateHistory(
                 resolved.slot.max_bytes,
             );
             defer allocator.free(prior_content);
+            var ignored: IgnoreRecords = .{};
             _ = try validateEpoch(
                 allocator,
                 cache,
                 current_slot,
                 snapshot.binding.rows[epoch_start..index],
                 prior_content,
+                prior_revision,
                 parameters,
                 null,
                 false,
+                &ignored,
             );
             epoch_start = index;
         }
@@ -196,9 +230,11 @@ fn validateHistory(
         current_slot,
         snapshot.binding.rows[epoch_start..],
         snapshot.content,
+        snapshot.revision,
         parameters,
         current_max_records,
         protocol_required,
+        observer,
     );
 }
 
@@ -241,17 +277,18 @@ fn validateEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    content_revision: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     current_max_records: ?usize,
     protocol_required: bool,
+    observer: anytype,
 ) !HistoryResult {
     if (rows.len == 0) return error.InvalidStoreBinding;
-    const digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        content,
-    );
-    defer allocator.free(digest);
-    if (!std.mem.eql(u8, digest, rows[rows.len - 1].revision_after)) {
+    if (!std.mem.eql(
+        u8,
+        content_revision,
+        rows[rows.len - 1].revision_after,
+    )) {
         return error.HistoricalRevisionMismatch;
     }
     return switch (current_slot.kind) {
@@ -265,6 +302,7 @@ fn validateEpoch(
                     current_slot,
                     rows,
                     content,
+                    content_revision,
                 ),
                 .protocol_state = null,
             },
@@ -274,9 +312,11 @@ fn validateEpoch(
             current_slot,
             rows,
             content,
+            content_revision,
             parameters,
             current_max_records,
             protocol_required,
+            observer,
         ),
     };
 }
@@ -287,10 +327,16 @@ fn validateDocumentEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    content_revision: []const u8,
 ) !usize {
     if (rows.len != 1) return error.HistoricalDocumentReplayInvalid;
     const row = rows[0];
-    try validateBoundExtent(allocator, row, content);
+    try validateBoundExtent(
+        allocator,
+        row,
+        content,
+        content_revision,
+    );
     if (row.record_start != null or row.record_end != null or
         row.extent_start != 0 or row.extent_end != content.len)
     {
@@ -325,9 +371,11 @@ fn validateEventEpoch(
     current_slot: storage.ResolvedSlot,
     rows: []const custody.BindingRow,
     content: []const u8,
+    content_revision: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     current_max_records: ?usize,
     protocol_required: bool,
+    observer: anytype,
 ) !HistoryResult {
     var records: std.ArrayList([]const u8) = .empty;
     defer records.deinit(allocator);
@@ -359,7 +407,12 @@ fn validateEventEpoch(
         {
             return error.StoreBindingRecordCountMismatch;
         }
-        try validateBoundExtent(allocator, row, content);
+        try validateBoundExtent(
+            allocator,
+            row,
+            content,
+            content_revision,
+        );
         const resolved = try resolveEffect(cache, current_slot, row);
         if (record_end > resolved.archived.definition_plan.bounds.max_records) {
             return error.HistoricalRecordBoundsExceeded;
@@ -378,6 +431,7 @@ fn validateEventEpoch(
                         record,
                         parameters,
                         false,
+                        observer,
                     );
                 }
             },
@@ -394,6 +448,7 @@ fn validateEventEpoch(
                         content[row.extent_start..row.extent_end],
                         parameters,
                         true,
+                        observer,
                     );
                 },
                 .create_new, .compare_replace => {
@@ -436,11 +491,24 @@ fn validateBoundExtent(
     allocator: std.mem.Allocator,
     row: custody.BindingRow,
     content: []const u8,
+    content_revision: []const u8,
 ) !void {
     if (row.extent_start > row.extent_end or
         row.extent_end > content.len)
     {
         return error.StoreBindingExtentMismatch;
+    }
+    if (row.extent_start == 0 and row.extent_end == content.len) {
+        // Custody and the revision archive already verified this digest
+        // against the complete content.
+        if (!std.mem.eql(
+            u8,
+            content_revision,
+            row.canonical_input_digest,
+        )) {
+            return error.HistoricalInputDigestMismatch;
+        }
+        return;
     }
     const digest = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
@@ -488,6 +556,7 @@ fn validateEventInput(
     bytes: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     require_canonical: bool,
+    observer: anytype,
 ) !void {
     const input =
         resolved.archived.definition_plan.inputs[resolved.effect.input_index];
@@ -578,6 +647,7 @@ fn validateEventInput(
                 parameters,
             );
         }
+        try observer.observe(parsed.value);
         return;
     }
     var execution = try validation.execute(
@@ -599,19 +669,23 @@ fn validateEventInput(
             return error.HistoricalArtifactNotCanonical;
         }
     }
-    const plan = historical_plan orelse return;
-    const event = execution.inputJson(resolved.effect.input_index) orelse
-        return error.HistoricalProtocolInputMustBeJson;
-    if (protocol_state.* == null) {
-        protocol_state.* = protocol.ReplayState.init(plan);
+    if (historical_plan) |plan| {
+        const event = execution.inputJson(resolved.effect.input_index) orelse
+            return error.HistoricalProtocolInputMustBeJson;
+        if (protocol_state.* == null) {
+            protocol_state.* = protocol.ReplayState.init(plan);
+        }
+        try protocol.applyValueBound(
+            allocator,
+            plan,
+            &protocol_state.*.?,
+            event,
+            parameters,
+        );
+        try observer.observe(event);
+    } else if (execution.inputJson(resolved.effect.input_index)) |event| {
+        try observer.observe(event);
     }
-    try protocol.applyValueBound(
-        allocator,
-        plan,
-        &protocol_state.*.?,
-        event,
-        parameters,
-    );
 }
 
 fn findEffectForSlot(

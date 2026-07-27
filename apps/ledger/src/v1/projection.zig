@@ -4,6 +4,7 @@ const custody = @import("custody.zig");
 const definition = @import("definition.zig");
 const projection_value = @import("projection_value.zig");
 const protocol = @import("protocol.zig");
+const ranked_relevance = @import("ranked_relevance.zig");
 const replay = @import("replay.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
@@ -25,11 +26,15 @@ const SortedRow = struct {
     payload: []u8,
     keys: []Scalar,
     record_index: usize,
+    row_id: ?[]u8,
+    theme: ?[]u8,
 
     fn deinit(self: *SortedRow, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
         for (self.keys) |*key| key.deinit(allocator);
         allocator.free(self.keys);
+        if (self.row_id) |value| allocator.free(value);
+        if (self.theme) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -105,6 +110,7 @@ const SortKey = struct {
 const RelevanceMode = enum {
     literal,
     tokens,
+    ranked_tokens,
 };
 
 const Relevance = struct {
@@ -112,12 +118,30 @@ const Relevance = struct {
     parameter: []u8,
     mode: RelevanceMode,
     score_field: ?[]u8,
+    ranked_plan: ?ranked_relevance.Plan,
 
     fn deinit(self: *Relevance, allocator: std.mem.Allocator) void {
         for (self.paths) |*path| path.deinit(allocator);
         allocator.free(self.paths);
         allocator.free(self.parameter);
         if (self.score_field) |field| allocator.free(field);
+        if (self.ranked_plan) |*plan| plan.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const PreparedRelevance = union(enum) {
+    basic: []u8,
+    ranked: ranked_relevance.Prepared,
+
+    fn deinit(
+        self: *PreparedRelevance,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (self.*) {
+            .basic => |bytes| allocator.free(bytes),
+            .ranked => |*prepared| prepared.deinit(allocator),
+        }
         self.* = undefined;
     }
 };
@@ -292,6 +316,238 @@ pub const Result = struct {
     }
 };
 
+const SortedAccumulator = struct {
+    allocator: std.mem.Allocator,
+    projection: *const Projection,
+    parameters: *const definition_core.parameters.Bindings,
+    rows: std.ArrayList(SortedRow) = .empty,
+    prepared_relevance: ?PreparedRelevance,
+    referenced_ids: std.StringHashMap(void),
+    records_seen: usize = 0,
+    records_matched: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        projection: *const Projection,
+        parameters: *const definition_core.parameters.Bindings,
+    ) !SortedAccumulator {
+        return .{
+            .allocator = allocator,
+            .projection = projection,
+            .parameters = parameters,
+            .prepared_relevance = if (projection.relevance) |relevance|
+                try prepareRelevanceAlloc(
+                    allocator,
+                    relevance,
+                    parameters,
+                )
+            else
+                null,
+            .referenced_ids = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *SortedAccumulator) void {
+        for (self.rows.items) |*row| row.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
+        if (self.prepared_relevance) |*prepared| {
+            prepared.deinit(self.allocator);
+        }
+        var iterator = self.referenced_ids.keyIterator();
+        while (iterator.next()) |key| self.allocator.free(key.*);
+        self.referenced_ids.deinit();
+        self.* = undefined;
+    }
+
+    pub fn observe(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+    ) !void {
+        return self.observeValue(value, null);
+    }
+
+    fn observeRaw(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: []const u8,
+    ) !void {
+        return self.observeValue(value, raw);
+    }
+
+    fn observeValue(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: ?[]const u8,
+    ) !void {
+        const record_index = self.records_seen;
+        self.records_seen += 1;
+        if (self.projection.relevance) |relevance| {
+            if (relevance.ranked_plan) |ranked| {
+                if (self.prepared_relevance.?.ranked.exclude_referenced) {
+                    if (ranked_relevance.referencedId(
+                        ranked,
+                        value,
+                    )) |reference| {
+                        if (!self.referenced_ids.contains(reference)) {
+                            try self.referenced_ids.put(
+                                try self.allocator.dupe(u8, reference),
+                                {},
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if (!matches(self.projection, value, self.parameters)) return;
+        const relevance_score = if (self.projection.relevance) |relevance|
+            (try relevanceScoreAlloc(
+                self.allocator,
+                relevance,
+                &self.prepared_relevance.?,
+                value,
+            )) orelse return
+        else
+            0.0;
+        self.records_matched += 1;
+        const keys = try self.allocator.alloc(
+            Scalar,
+            self.projection.sort_keys.len,
+        );
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |*key| key.deinit(self.allocator);
+            self.allocator.free(keys);
+        }
+        for (
+            self.projection.sort_keys,
+            0..,
+        ) |sort_key, key_index| {
+            keys[key_index] = switch (sort_key.source) {
+                .record_order => .{ .integer = @intCast(record_index) },
+                .relevance_score => .{ .float = relevance_score },
+                .pointer => |pointer| key: {
+                    const selected = definition_core.json_pointer.lookup(
+                        value,
+                        pointer,
+                    ) orelse return error.ProjectionSortFieldMissing;
+                    const key = try scalarFromJsonAlloc(
+                        self.allocator,
+                        selected,
+                    );
+                    switch (key) {
+                        .string, .integer, .float => {},
+                        else => {
+                            var owned = key;
+                            owned.deinit(self.allocator);
+                            return error.ProjectionSortScalarRequired;
+                        },
+                    }
+                    break :key key;
+                },
+            };
+            initialized += 1;
+            if (self.rows.items.len != 0 and
+                std.meta.activeTag(
+                    self.rows.items[0].keys[key_index],
+                ) != std.meta.activeTag(keys[key_index]))
+            {
+                return error.ProjectionOrderingTypeMismatch;
+            }
+        }
+        const payload = if (self.projection.raw)
+            try self.allocator.dupe(
+                u8,
+                raw orelse return error.FusedRawProjectionUnsupported,
+            )
+        else if (self.projection.relevance) |relevance|
+            try projectedValueWithScoreAlloc(
+                self.allocator,
+                self.projection,
+                value,
+                relevance.score_field,
+                relevance_score,
+            )
+        else
+            try projectedValueAlloc(
+                self.allocator,
+                self.projection,
+                value,
+            );
+        errdefer self.allocator.free(payload);
+        var row_id: ?[]u8 = null;
+        errdefer if (row_id) |owned| self.allocator.free(owned);
+        var theme: ?[]u8 = null;
+        errdefer if (theme) |owned| self.allocator.free(owned);
+        if (self.projection.relevance) |relevance| {
+            if (relevance.ranked_plan) |ranked| {
+                if (self.prepared_relevance.?.ranked.exclude_referenced) {
+                    if (ranked_relevance.rowId(ranked, value)) |id| {
+                        row_id = try self.allocator.dupe(u8, id);
+                    }
+                }
+                theme = try ranked_relevance.themeAlloc(
+                    self.allocator,
+                    ranked,
+                    value,
+                );
+            }
+        }
+        try self.rows.append(self.allocator, .{
+            .payload = payload,
+            .keys = keys,
+            .record_index = record_index,
+            .row_id = row_id,
+            .theme = theme,
+        });
+    }
+
+    fn write(
+        self: *SortedAccumulator,
+        writer: *std.Io.Writer,
+        limit: usize,
+        stats: *Stats,
+    ) !void {
+        std.mem.sort(
+            SortedRow,
+            self.rows.items,
+            self.projection.sort_keys,
+            lessSortedRow,
+        );
+        try writer.writeByte('[');
+        var theme_counts = std.StringHashMap(usize).init(self.allocator);
+        defer theme_counts.deinit();
+        const max_per_theme = if (self.projection.relevance) |relevance|
+            if (relevance.ranked_plan) |ranked|
+                ranked_relevance.maxPerTheme(ranked)
+            else
+                null
+        else
+            null;
+        var emitted: usize = 0;
+        for (self.rows.items) |row| {
+            if (emitted >= limit) break;
+            if (row.row_id) |id| {
+                if (self.referenced_ids.contains(id)) continue;
+            }
+            if (max_per_theme) |maximum| {
+                if (row.theme) |theme| {
+                    if (theme.len != 0) {
+                        const count = theme_counts.get(theme) orelse 0;
+                        if (count >= maximum) continue;
+                        try theme_counts.put(theme, count + 1);
+                    }
+                }
+            }
+            if (emitted != 0) try writer.writeByte(',');
+            try writer.writeAll(row.payload);
+            emitted += 1;
+        }
+        try writer.writeByte(']');
+        stats.records_matched = self.records_matched;
+        stats.records_emitted = emitted;
+    }
+};
+
 pub fn compile(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -325,7 +581,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(8);
+    try encoder.writeU16(9);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
@@ -381,6 +637,10 @@ pub fn encodeCache(
             try encoder.writeBool(relevance.score_field != null);
             if (relevance.score_field) |field| {
                 try encoder.writeBytes(field);
+            }
+            try encoder.writeBool(relevance.ranked_plan != null);
+            if (relevance.ranked_plan) |ranked| {
+                try ranked_relevance.encodeCache(ranked, encoder);
             }
         }
         try encoder.writeCount(projection.fields.len);
@@ -444,7 +704,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 8) {
+    if (try decoder.readU16() != 9) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const max_records = try decoder.readUsize();
@@ -628,6 +888,8 @@ pub fn validateCachePlan(
             if (declaration.kind != .string or
                 relevance.paths.len == 0 or
                 relevance.paths.len > 64 or
+                (relevance.mode == .ranked_tokens) !=
+                    (relevance.ranked_plan != null) or
                 relevance.score_field != null and
                     projection.fields.len == 0 or
                 projection.raw or
@@ -635,6 +897,12 @@ pub fn validateCachePlan(
                 projection.constructed_value != null)
             {
                 return error.CacheProjectionPlanMismatch;
+            }
+            if (relevance.ranked_plan) |ranked| {
+                try ranked_relevance.validateCache(
+                    ranked,
+                    &definition_plan.parameter_declarations,
+                );
             }
             if (relevance.score_field) |score_field| {
                 for (projection.fields) |field| {
@@ -817,11 +1085,20 @@ fn decodeCacheProjection(
             try definition_core.json.safeIdentifier(field, 128);
             break :score field;
         } else null;
+        var ranked_plan = if (try decoder.readBool())
+            try ranked_relevance.decodeCache(allocator, decoder)
+        else
+            null;
+        errdefer if (ranked_plan) |*plan| plan.deinit(allocator);
+        if ((mode == .ranked_tokens) != (ranked_plan != null)) {
+            return error.CacheProjectionRelevanceInvalid;
+        }
         relevance = .{
             .paths = paths,
             .parameter = parameter,
             .mode = mode,
             .score_field = score_field,
+            .ranked_plan = ranked_plan,
         };
     }
     const field_count = try decoder.readCount(256);
@@ -1477,7 +1754,7 @@ fn compileRelevance(
 ) !Relevance {
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "op", "paths", "param", "mode", "score_field" },
+        &.{ "op", "paths", "param", "mode", "score_field", "ranking" },
     );
     try definition_core.json.requireFields(
         object,
@@ -1523,6 +1800,8 @@ fn compileRelevance(
             .literal
         else if (std.mem.eql(u8, raw_mode, "tokens"))
             .tokens
+        else if (std.mem.eql(u8, raw_mode, "ranked-tokens"))
+            .ranked_tokens
         else
             return error.InvalidProjectionRelevanceMode;
     const score_field = if (object.get("score_field")) |value| field: {
@@ -1530,11 +1809,24 @@ fn compileRelevance(
         try definition_core.json.safeIdentifier(raw_field, 128);
         break :field try allocator.dupe(u8, raw_field);
     } else null;
+    var ranked_plan = if (object.get("ranking")) |value|
+        try ranked_relevance.compile(
+            allocator,
+            value,
+            &definition_plan.parameter_declarations,
+        )
+    else
+        null;
+    errdefer if (ranked_plan) |*plan| plan.deinit(allocator);
+    if ((mode == .ranked_tokens) != (ranked_plan != null)) {
+        return error.InvalidProjectionRelevanceMode;
+    }
     return .{
         .paths = paths,
         .parameter = parameter,
         .mode = mode,
         .score_field = score_field,
+        .ranked_plan = ranked_plan,
     };
 }
 
@@ -1879,17 +2171,44 @@ pub fn execute(
         slot,
     );
     defer snapshot.deinit(allocator);
-    var replay_stats = try replay.validateSlot(
-        allocator,
-        repo_root,
-        definition_plan.id,
-        slot,
-        &snapshot,
-        parameters,
-        definition_plan.bounds.max_records,
-        event_protocol != null and
-            event_protocol.?.target_slot_index == compiled.slot_index,
-    );
+    var fused_sorted: ?SortedAccumulator =
+        if (compiled.fold == null and
+        slot.codec == .jsonl and
+        compiled.sort_keys.len != 0 and
+        !compiled.raw)
+            try SortedAccumulator.init(
+                allocator,
+                compiled,
+                parameters,
+            )
+        else
+            null;
+    defer if (fused_sorted) |*accumulator| accumulator.deinit();
+    const protocol_required = event_protocol != null and
+        event_protocol.?.target_slot_index == compiled.slot_index;
+    var replay_stats = if (fused_sorted) |*accumulator|
+        try replay.validateSlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            accumulator,
+        )
+    else
+        try replay.validateSlot(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+        );
     defer replay_stats.deinit(allocator);
     const effective_limit = try resolveLimit(
         compiled.limit,
@@ -1968,6 +2287,31 @@ pub fn execute(
                     &output.writer,
                     &stats,
                 )
+            else if (fused_sorted) |*accumulator|
+                if (accumulator.records_seen ==
+                    replay_stats.records_validated)
+                {
+                    stats.records_scanned =
+                        replay_stats.records_validated;
+                    try accumulator.write(
+                        &output.writer,
+                        effective_limit,
+                        &stats,
+                    );
+                } else {
+                    accumulator.deinit();
+                    fused_sorted = null;
+                    try executeSortedJsonl(
+                        allocator,
+                        compiled,
+                        snapshot.content,
+                        parameters,
+                        effective_limit,
+                        plan.max_records,
+                        &output.writer,
+                        &stats,
+                    );
+                }
             else
                 try executeSortedJsonl(
                     allocator,
@@ -2238,18 +2582,13 @@ fn executeSortedJsonl(
     if (projection.single or projection.latest != null) {
         return error.InvalidSortedProjectionCardinality;
     }
-    var rows: std.ArrayList(SortedRow) = .empty;
-    defer {
-        for (rows.items) |*row| row.deinit(allocator);
-        rows.deinit(allocator);
-    }
-    const query = if (projection.relevance) |relevance|
-        try relevanceQueryLowerAlloc(allocator, relevance, parameters)
-    else
-        null;
-    defer if (query) |owned| allocator.free(owned);
+    var accumulator = try SortedAccumulator.init(
+        allocator,
+        projection,
+        parameters,
+    );
+    defer accumulator.deinit();
     var lines = std.mem.splitScalar(u8, bytes, '\n');
-    var record_index: usize = 0;
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
         if (line.len == 0) continue;
@@ -2264,94 +2603,9 @@ fn executeSortedJsonl(
             .{ .duplicate_field_behavior = .@"error" },
         );
         defer parsed.deinit();
-        if (!matches(projection, parsed.value, parameters)) {
-            record_index += 1;
-            continue;
-        }
-        const relevance_score = if (projection.relevance) |relevance|
-            (try relevanceScoreAlloc(
-                allocator,
-                relevance,
-                query.?,
-                parsed.value,
-            )) orelse {
-                record_index += 1;
-                continue;
-            }
-        else
-            0;
-        stats.records_matched += 1;
-        const keys = try allocator.alloc(Scalar, projection.sort_keys.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (keys[0..initialized]) |*key| key.deinit(allocator);
-            allocator.free(keys);
-        }
-        for (projection.sort_keys, 0..) |sort_key, key_index| {
-            keys[key_index] = switch (sort_key.source) {
-                .record_order => .{ .integer = @intCast(record_index) },
-                .relevance_score => .{
-                    .integer = @intCast(relevance_score),
-                },
-                .pointer => |pointer| key: {
-                    const value = definition_core.json_pointer.lookup(
-                        parsed.value,
-                        pointer,
-                    ) orelse return error.ProjectionSortFieldMissing;
-                    const key = try scalarFromJsonAlloc(allocator, value);
-                    switch (key) {
-                        .string, .integer, .float => {},
-                        else => {
-                            var owned = key;
-                            owned.deinit(allocator);
-                            return error.ProjectionSortScalarRequired;
-                        },
-                    }
-                    break :key key;
-                },
-            };
-            initialized += 1;
-            if (rows.items.len != 0 and
-                std.meta.activeTag(rows.items[0].keys[key_index]) !=
-                    std.meta.activeTag(keys[key_index]))
-            {
-                return error.ProjectionOrderingTypeMismatch;
-            }
-        }
-        const payload = if (projection.raw)
-            try allocator.dupe(u8, line)
-        else if (projection.relevance) |relevance|
-            try projectedValueWithScoreAlloc(
-                allocator,
-                projection,
-                parsed.value,
-                relevance.score_field,
-                relevance_score,
-            )
-        else
-            try projectedValueAlloc(allocator, projection, parsed.value);
-        errdefer allocator.free(payload);
-        try rows.append(allocator, .{
-            .payload = payload,
-            .keys = keys,
-            .record_index = record_index,
-        });
-        record_index += 1;
+        try accumulator.observeRaw(parsed.value, line);
     }
-    std.mem.sort(
-        SortedRow,
-        rows.items,
-        projection.sort_keys,
-        lessSortedRow,
-    );
-    try writer.writeByte('[');
-    const emitted = @min(limit, rows.items.len);
-    for (rows.items[0..emitted], 0..) |row, index| {
-        if (index != 0) try writer.writeByte(',');
-        try writer.writeAll(row.payload);
-    }
-    try writer.writeByte(']');
-    stats.records_emitted = emitted;
+    try accumulator.write(writer, limit, stats);
 }
 
 fn lessSortedRow(
@@ -2467,7 +2721,7 @@ fn projectedValueWithScoreAlloc(
     projection: *const Projection,
     value: std.json.Value,
     score_field: ?[]const u8,
-    score: usize,
+    score: f64,
 ) ![]u8 {
     const field = score_field orelse
         return projectedValueAlloc(allocator, projection, value);
@@ -2494,11 +2748,11 @@ fn projectedValueWithScoreAlloc(
     return output.toOwnedSlice();
 }
 
-fn relevanceQueryLowerAlloc(
+fn prepareRelevanceAlloc(
     allocator: std.mem.Allocator,
     relevance: Relevance,
     parameters: *const definition_core.parameters.Bindings,
-) ![]u8 {
+) !PreparedRelevance {
     const binding = parameters.find(relevance.parameter) orelse
         return error.MissingParameter;
     const query = switch (binding.value) {
@@ -2506,19 +2760,37 @@ fn relevanceQueryLowerAlloc(
         else => return error.ProjectionRelevanceParameterMustBeString,
     };
     if (query.len == 0) return error.ProjectionQueryEmpty;
+    if (relevance.ranked_plan) |ranked| {
+        return .{ .ranked = try ranked_relevance.prepare(
+            allocator,
+            ranked,
+            query,
+            parameters,
+        ) };
+    }
     const lower = try allocator.alloc(u8, query.len);
     for (query, 0..) |char, index| {
         lower[index] = asciiLower(char);
     }
-    return lower;
+    return .{ .basic = lower };
 }
 
 fn relevanceScoreAlloc(
     allocator: std.mem.Allocator,
     relevance: Relevance,
-    query_lower: []const u8,
+    prepared: *const PreparedRelevance,
     value: std.json.Value,
-) !?usize {
+) !?f64 {
+    if (relevance.ranked_plan) |ranked| {
+        return ranked_relevance.score(
+            allocator,
+            ranked,
+            &prepared.ranked,
+            relevance.paths,
+            value,
+        );
+    }
+    const query_lower = prepared.basic;
     var search_text: std.Io.Writer.Allocating = .init(allocator);
     defer search_text.deinit();
     var emitted = false;
@@ -2542,10 +2814,11 @@ fn relevanceScoreAlloc(
     const score = lexicalRelevanceScore(query_lower, haystack);
     return switch (relevance.mode) {
         .literal => if (containsAsciiFold(haystack, query_lower))
-            score
+            @floatFromInt(score)
         else
             null,
-        .tokens => if (score != 0) score else null,
+        .tokens => if (score != 0) @floatFromInt(score) else null,
+        .ranked_tokens => unreachable,
     };
 }
 
