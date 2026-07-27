@@ -1,9 +1,0 @@
-{"type":"event_msg","timestamp":"2026-02-19T10:00:00Z","payload":{"type":"user_message","message":"hello world"}}
-{"type":"event_msg","timestamp":"2026-02-19T10:01:00Z","payload":{"type":"agent_message","message":"Run $tk now"}}
-{"type":"event_msg","timestamp":"2026-02-19T10:02:00Z","payload":{"type":"agent_message","message":"<skill><name>fix</name></skill>"}}
-{"type":"response_item","timestamp":"2026-02-19T10:03:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Need $mesh please"}]}}
-{"type":"event_msg","timestamp":"2026-02-19T10:10:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}
-{"type":"event_msg","timestamp":"2026-02-19T10:11:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":18}}}}
-{"type":"event_msg","timestamp":"2026-02-19T10:12:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5}}}}
-{"type":"response_item","timestamp":"2026-02-19T10:20:00Z","payload":{"type":"function_call","name":"search","call_id":"c1","arguments":"{}"}}
-{"type":"response_item","timestamp":"2026-02-19T10:21:00Z","payload":{"type":"custom_tool_call","name":"shell","call_id":"c2","input":"ls","status":"ok"}}

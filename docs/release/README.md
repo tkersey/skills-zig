@@ -27,10 +27,9 @@ Release contract:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - `build.zig` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
    - broad shared shipped surfaces (`build.zig.zon`, `libs/core/**`) count for every shipped CLI.
-   - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
+   - `libs/definition_core/**` counts for its shipped consumers: `seq` and `ledger`.
    - `libs/durable_store/**` counts for its shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
-   - `libs/execution_policy_core/**` counts for its shipped consumer: `seq`.
-   - `libs/retrace_core/**` counts for its shipped consumers: `seq` and `cas`.
+   - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; the workflow qualifies both release targets before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.

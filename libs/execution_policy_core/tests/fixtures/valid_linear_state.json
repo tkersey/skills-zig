@@ -1,1 +1,0 @@
-{"policy_id":"linear","revision":1,"policy_digest":"sha256:policy","state_id":"s1","state_digest":"sha256:s1","satisfied_atoms":["fact:start"],"completed_actions":[],"failed_actions":[],"potential":[1]}

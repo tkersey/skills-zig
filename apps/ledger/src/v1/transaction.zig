@@ -2148,7 +2148,7 @@ test "transaction materializes passive event requests before chained append" {
     try definition_tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","event-digest","event-envelope","event-kinds","event-materialization","exact-object","idempotency-key","previous-digest","replay","secure-token","sequence","sha256"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"request":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"request"}]},"shape":{"rules":[{"op":"exact-object","input":"request","path":"","keys":["body","construction_ref","goal_id","kind","subject_digest"]},{"op":"event-envelope","input":"request","keys":["body","body_digest","construction_ref","event_digest","event_id","goal_id","kind","previous_digest","recorded_at","schema","sequence","subject_digest"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/materialized-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","idempotency_param":"request","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"construction_ref","input_field":"construction_ref"},{"field":"event_id","sequence_text_prefix":"e-"},{"field":"goal_id","input_field":"goal_id"},{"field":"kind","input_field":"kind"},{"field":"recorded_at","unix_seconds":true},{"field":"schema","literal":"example-event/v1"},{"field":"subject_digest","input_field":"subject_digest"}],"generate":[{"name":"capability","op":"secure-token","prefix":"AKC2-","bytes":32}],"body_fields":[{"field":"capability_digest","generated_sha256":"capability"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/materialized-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","event-digest","event-envelope","event-kinds","event-materialization","exact-object","idempotency-key","previous-digest","replay","secure-token","sequence","sha256"]},"parameters":{"request":{"type":"safe_identifier","required":true}},"inputs":{"request":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"request"}]},"shape":{"rules":[{"op":"exact-object","input":"request","path":"","keys":["body","content_ref","kind","predecessor_ref","stream_id"]},{"op":"event-envelope","input":"request","keys":["body","body_digest","content_ref","event_digest","event_id","kind","predecessor_ref","previous_digest","recorded_at","schema","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/materialized-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","idempotency_param":"request","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"content_ref","input_field":"content_ref"},{"field":"event_id","sequence_text_prefix":"e-"},{"field":"kind","input_field":"kind"},{"field":"predecessor_ref","input_field":"predecessor_ref"},{"field":"recorded_at","unix_seconds":true},{"field":"schema","literal":"example-event/v1"},{"field":"stream_id","input_field":"stream_id"}],"generate":[{"name":"capability","op":"secure-token","prefix":"TOK-","bytes":32}],"body_fields":[{"field":"capability_digest","generated_sha256":"capability"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -2223,7 +2223,7 @@ test "transaction materializes passive event requests before chained append" {
     );
     defer std.testing.allocator.free(repo_root);
     const first_request =
-        "{\"body\":{\"id\":\"item-1\"},\"construction_ref\":null,\"goal_id\":\"goal-1\",\"kind\":\"created\",\"subject_digest\":null}";
+        "{\"body\":{\"id\":\"item-1\"},\"content_ref\":null,\"kind\":\"created\",\"predecessor_ref\":null,\"stream_id\":\"stream-1\"}";
     var first = try transact(
         std.testing.allocator,
         &definition_plan,
@@ -2248,13 +2248,13 @@ test "transaction materializes passive event requests before chained append" {
         first.generated_outputs[0].name,
     );
     try std.testing.expectEqual(
-        @as(usize, "AKC2-".len + 64),
+        @as(usize, "TOK-".len + 64),
         first.generated_outputs[0].value.len,
     );
     try std.testing.expect(std.mem.startsWith(
         u8,
         first.generated_outputs[0].value,
-        "AKC2-",
+        "TOK-",
     ));
     const first_event = first.returned_content orelse
         return error.TestExpectedEqual;
@@ -2315,7 +2315,7 @@ test "transaction materializes passive event requests before chained append" {
         "event_digest",
     );
     const second_request =
-        "{\"body\":{\"id\":\"item-1\"},\"construction_ref\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"goal_id\":\"goal-1\",\"kind\":\"updated\",\"subject_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"}";
+        "{\"body\":{\"id\":\"item-1\"},\"content_ref\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"kind\":\"updated\",\"predecessor_ref\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"stream_id\":\"stream-1\"}";
     var second = try transact(
         std.testing.allocator,
         &definition_plan,

@@ -4,7 +4,6 @@ const core_cli = @import("core_cli");
 const core_perf = @import("core_perf");
 const cron_cli = @import("cron_cli");
 const perf_contract = @import("perf_contract");
-const seq_cli = @import("seq_perf_cli");
 
 const Version = "0.0.0-dev";
 const HelpSurface = core_cli.HelpSurface{
@@ -49,12 +48,18 @@ const Command = enum {
 
 const CompatBuilder = enum {
     root,
-    seq_local,
 };
 
 const CompatSetup = enum {
     seq_help,
-    seq_parser_driver,
+    seq_definition_check,
+    seq_observe,
+    seq_sessions,
+    seq_query,
+    ledger_help,
+    ledger_definition_check,
+    ledger_validate,
+    ledger_materialize,
     bench_stats_help,
     bench_stats_parse,
     perf_report_help,
@@ -68,14 +73,6 @@ const CompatSetup = enum {
     cas_budget_governor_driver,
     cron_help,
     cron_list,
-    learnings_help,
-    learnings_recent,
-    learnings_recall,
-    learnings_query,
-    learnings_codify,
-    learnings_quality,
-    append_learning_help,
-    append_learning_append,
 };
 
 const CompatCase = struct {
@@ -90,49 +87,6 @@ const CompatCase = struct {
 };
 
 const DeepSetup = enum {
-    seq_query_tool_calls,
-    seq_skill_success_rank,
-    seq_skill_audit,
-    seq_skill_blocks,
-    seq_tool_audit,
-    seq_memory_inventory,
-    seq_message_search,
-    seq_message_audit,
-    seq_skill_cohort,
-    seq_tool_search,
-    seq_memory_extension_audit,
-    seq_token_window,
-    seq_workdir_report,
-    seq_plan_search,
-    seq_reply_latency,
-    seq_sessions_limit,
-    seq_turns,
-    seq_session_detail,
-    seq_tool_lifecycle,
-    seq_session_graph,
-    seq_tail_once,
-    seq_token_cost,
-    seq_goal_audit,
-    seq_workflow_audit,
-    seq_memory_map,
-    seq_memory_history,
-    seq_session_tooling,
-    seq_orchestration_concurrency,
-    seq_datasets,
-    seq_dataset_schema,
-    seq_artifact_search,
-    seq_find_session,
-    seq_session_prompts,
-    seq_query_diagnose,
-    seq_skills_rank,
-    seq_skill_trend,
-    seq_skill_report,
-    seq_role_breakdown,
-    seq_occurrence_export,
-    seq_report_bundle,
-    seq_section_audit,
-    seq_token_usage,
-    seq_routing_gap,
     cron_show,
     cron_create,
     cron_update,
@@ -152,56 +106,54 @@ const DeepCase = struct {
 };
 
 const SeqCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "seq-help", .binary = "seq", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "seq-query-tool-calls", .binary = "seq", .family = "query", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-success-rank", .binary = "seq", .family = "skill-success-rank", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-audit", .binary = "seq", .family = "skill-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-blocks", .binary = "seq", .family = "skill-blocks", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-tool-audit", .binary = "seq", .family = "tool-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-message-search", .binary = "seq", .family = "message-search", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-message-audit", .binary = "seq", .family = "message-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-cohort", .binary = "seq", .family = "skill-cohort", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-tool-search", .binary = "seq", .family = "tool-search", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-token-window", .binary = "seq", .family = "token-window", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-workdir-report", .binary = "seq", .family = "workdir-report", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-plan-search", .binary = "seq", .family = "plan-search", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-sessions-limit", .binary = "seq", .family = "sessions", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-turns", .binary = "seq", .family = "turns", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-session-detail", .binary = "seq", .family = "session-detail", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-tool-lifecycle", .binary = "seq", .family = "tool-lifecycle", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-tail-once", .binary = "seq", .family = "tail", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-session-tooling", .binary = "seq", .family = "session-tooling", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-orchestration-concurrency", .binary = "seq", .family = "orchestration-concurrency", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-datasets", .binary = "seq", .family = "datasets", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-dataset-schema", .binary = "seq", .family = "dataset-schema", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-artifact-search", .binary = "seq", .family = "artifact-search", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-find-session", .binary = "seq", .family = "find-session", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-session-prompts", .binary = "seq", .family = "session-prompts", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-query-diagnose", .binary = "seq", .family = "query-diagnose", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skills-rank", .binary = "seq", .family = "skills-rank", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-trend", .binary = "seq", .family = "skill-trend", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-skill-report", .binary = "seq", .family = "skill-report", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-role-breakdown", .binary = "seq", .family = "role-breakdown", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-occurrence-export", .binary = "seq", .family = "occurrence-export", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-report-bundle", .binary = "seq", .family = "report-bundle", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-section-audit", .binary = "seq", .family = "section-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-token-usage", .binary = "seq", .family = "token-usage", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-routing-gap", .binary = "seq", .family = "routing-gap", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-memory-inventory", .binary = "seq", .family = "memory-inventory", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-memory-extension-audit", .binary = "seq", .family = "memory-extension-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-reply-latency", .binary = "seq", .family = "reply-latency", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-token-cost", .binary = "seq", .family = "token-cost", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-goal-audit", .binary = "seq", .family = "goal-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-workflow-audit", .binary = "seq", .family = "workflow-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-session-graph", .binary = "seq", .family = "session-graph", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-memory-map", .binary = "seq", .family = "memory-map", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-memory-history", .binary = "seq", .family = "memory-history", .case_kind = .native, .measurement_mode = .latency_alloc },
-    .{ .case_id = "seq-parser-driver", .binary = "seq", .family = "parser", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
+    .{ .case_id = "seq-help", .binary = "seq", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "seq-definition-check", .binary = "seq", .family = "definition", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "seq-observe", .binary = "seq", .family = "observe", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "seq-sessions", .binary = "seq", .family = "sessions", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "seq-query", .binary = "seq", .family = "query", .case_kind = .subprocess, .measurement_mode = .latency_only },
 };
 
-const SeqCoverages = buildSeqCoverages();
+const SeqCoverages = [_]perf_contract.CommandCoverage{
+    .{ .family = "definition", .coverage = .shallow, .reason = "definition compilation case" },
+    .{ .family = "observe", .coverage = .shallow, .reason = "compiled observation case" },
+    .{ .family = "explain", .coverage = .shallow, .reason = "shares definition compiler" },
+    .{ .family = "sessions", .coverage = .shallow, .reason = "physical corpus case" },
+    .{ .family = "turns", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .family = "session-detail", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .family = "tool-lifecycle", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .family = "session-graph", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .family = "tail", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .family = "find-session", .coverage = .shallow, .reason = "physical corpus case" },
+    .{ .family = "datasets", .coverage = .shallow, .reason = "static physical catalog" },
+    .{ .family = "dataset-schema", .coverage = .shallow, .reason = "static physical catalog" },
+    .{ .family = "query", .coverage = .shallow, .reason = "generic query case" },
+    .{ .family = "index", .coverage = .shallow, .reason = "physical index smoke lane" },
+    .{ .family = "capabilities", .coverage = .shallow, .reason = "command-surface gate" },
+    .{ .family = "version", .coverage = .shallow, .reason = "command-surface gate" },
+};
 const SeqDatasets = [_]perf_contract.DataSurface{
-    .{ .name = "memory_blocks", .coverage = .shallow, .reason = "current seq dataset surface integrated into native manifest" },
+    .{ .name = "sessions", .coverage = .shallow, .reason = "physical corpus case" },
+    .{ .name = "turns", .coverage = .shallow, .reason = "physical trace case" },
+    .{ .name = "messages", .coverage = .shallow, .reason = "compiled observation case" },
+    .{ .name = "structured_values", .coverage = .shallow, .reason = "generic structured evidence lane" },
+};
+
+const LedgerCases = [_]perf_contract.CaseDescriptor{
+    .{ .case_id = "ledger-help", .binary = "ledger", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "ledger-definition-check", .binary = "ledger", .family = "definition", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "ledger-validate", .binary = "ledger", .family = "validate", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    .{ .case_id = "ledger-materialize", .binary = "ledger", .family = "materialize", .case_kind = .subprocess, .measurement_mode = .latency_only },
+};
+
+const LedgerCoverages = [_]perf_contract.CommandCoverage{
+    .{ .family = "definition", .coverage = .shallow, .reason = "definition compilation case" },
+    .{ .family = "validate", .coverage = .shallow, .reason = "compiled validation case" },
+    .{ .family = "materialize", .coverage = .shallow, .reason = "canonicalization and identity case" },
+    .{ .family = "transact", .coverage = .shallow, .reason = "durable protocol qualification lane" },
+    .{ .family = "project", .coverage = .shallow, .reason = "durable protocol qualification lane" },
+    .{ .family = "doctor", .coverage = .shallow, .reason = "durable protocol qualification lane" },
+    .{ .family = "capabilities", .coverage = .shallow, .reason = "command-surface gate" },
+    .{ .family = "version", .coverage = .shallow, .reason = "command-surface gate" },
 };
 
 const CronCases = [_]perf_contract.CaseDescriptor{
@@ -231,23 +183,22 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "cas-review-session-help", .binary = "cas_review_session", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-review-session-version", .binary = "cas_review_session", .family = "version", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-budget-governor-driver", .binary = "cas", .family = "driver", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
-    .{ .case_id = "learnings-help", .binary = "learnings", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "learnings-recent", .binary = "learnings", .family = "recent", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "learnings-recall", .binary = "learnings", .family = "recall", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "learnings-query", .binary = "learnings", .family = "query", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "learnings-codify", .binary = "learnings", .family = "codify-candidates", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "learnings-quality", .binary = "learnings", .family = "quality-audit", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "append-learning-help", .binary = "append_learning", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "append-learning-append", .binary = "append_learning", .family = "append", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
 };
 
 const MiscCoverages = [_]perf_contract.CommandCoverage{
-    .{ .family = "compat", .coverage = .shallow, .reason = "preserved compatibility matrix" },
+    .{ .family = "utilities", .coverage = .shallow, .reason = "current utility matrix" },
 };
 
 const CompatCases = [_]CompatCase{
-    .{ .descriptor = SeqCases[0], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq", .setup = .seq_help },
-    .{ .descriptor = SeqCases[SeqCases.len - 1], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq-perf-parser", .setup = .seq_parser_driver, .tolerance_pct = 20.0 },
+    .{ .descriptor = SeqCases[0], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_help },
+    .{ .descriptor = SeqCases[1], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_definition_check },
+    .{ .descriptor = SeqCases[2], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_observe },
+    .{ .descriptor = SeqCases[3], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_sessions },
+    .{ .descriptor = SeqCases[4], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_query },
+    .{ .descriptor = LedgerCases[0], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_help },
+    .{ .descriptor = LedgerCases[1], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_definition_check },
+    .{ .descriptor = LedgerCases[2], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_validate },
+    .{ .descriptor = LedgerCases[3], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_materialize },
     .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
@@ -261,60 +212,9 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
     .{ .descriptor = CronCases[0], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_help, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[1], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_list, .tolerance_pct = 35.0 },
-    .{ .descriptor = MiscCases[11], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_help, .tolerance_pct = 150.0 },
-    .{ .descriptor = MiscCases[12], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recent, .tolerance_pct = 120.0 },
-    .{ .descriptor = MiscCases[13], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recall, .tolerance_pct = 20.0 },
-    .{ .descriptor = MiscCases[14], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_query, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[15], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_codify, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
-    .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
 };
 
 const DeepCases = [_]DeepCase{
-    .{ .descriptor = SeqCases[1], .setup = .seq_query_tool_calls, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[2], .setup = .seq_skill_success_rank, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[3], .setup = .seq_skill_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[4], .setup = .seq_skill_blocks, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[5], .setup = .seq_tool_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[6], .setup = .seq_message_search, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[7], .setup = .seq_message_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[8], .setup = .seq_skill_cohort, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[9], .setup = .seq_tool_search, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[10], .setup = .seq_token_window, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[11], .setup = .seq_workdir_report, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[12], .setup = .seq_plan_search, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[13], .setup = .seq_sessions_limit, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[14], .setup = .seq_turns, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[15], .setup = .seq_session_detail, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[16], .setup = .seq_tool_lifecycle, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[17], .setup = .seq_tail_once, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[18], .setup = .seq_session_tooling, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[19], .setup = .seq_orchestration_concurrency, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[20], .setup = .seq_datasets, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[21], .setup = .seq_dataset_schema, .tolerance_pct = 75.0 },
-    .{ .descriptor = SeqCases[22], .setup = .seq_artifact_search, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[23], .setup = .seq_find_session, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[24], .setup = .seq_session_prompts, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[25], .setup = .seq_query_diagnose, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[26], .setup = .seq_skills_rank, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[27], .setup = .seq_skill_trend, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[28], .setup = .seq_skill_report, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[29], .setup = .seq_role_breakdown, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[30], .setup = .seq_occurrence_export, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[31], .setup = .seq_report_bundle, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[32], .setup = .seq_section_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[33], .setup = .seq_token_usage, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[34], .setup = .seq_routing_gap, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[35], .setup = .seq_memory_inventory, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[36], .setup = .seq_memory_extension_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[37], .setup = .seq_reply_latency, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[38], .setup = .seq_token_cost, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[39], .setup = .seq_goal_audit, .tolerance_pct = 80.0 },
-    .{ .descriptor = SeqCases[40], .setup = .seq_workflow_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[41], .setup = .seq_session_graph, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[42], .setup = .seq_memory_map, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[43], .setup = .seq_memory_history, .tolerance_pct = 40.0 },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
@@ -324,65 +224,6 @@ const DeepCases = [_]DeepCase{
     .{ .descriptor = CronCases[8], .setup = .cron_delete, .tolerance_pct = 60.0 },
     .{ .descriptor = CronCases[9], .setup = .cron_run_due, .tolerance_pct = 125.0 },
 };
-
-fn buildSeqCoverages() [seq_cli.commandNames().len]perf_contract.CommandCoverage {
-    @setEvalBranchQuota(5000);
-    var out: [seq_cli.commandNames().len]perf_contract.CommandCoverage = undefined;
-    for (seq_cli.commandNames(), 0..) |def, idx| {
-        const coverage, const reason = if (std.mem.eql(u8, def.name, "query") or
-            std.mem.eql(u8, def.name, "sessions") or
-            std.mem.eql(u8, def.name, "turns") or
-            std.mem.eql(u8, def.name, "session-detail") or
-            std.mem.eql(u8, def.name, "tool-lifecycle") or
-            std.mem.eql(u8, def.name, "tail") or
-            std.mem.eql(u8, def.name, "session-tooling") or
-            std.mem.eql(u8, def.name, "orchestration-concurrency") or
-            std.mem.eql(u8, def.name, "datasets") or
-            std.mem.eql(u8, def.name, "dataset-schema") or
-            std.mem.eql(u8, def.name, "artifact-search") or
-            std.mem.eql(u8, def.name, "tool-audit") or
-            std.mem.eql(u8, def.name, "memory-inventory") or
-            std.mem.eql(u8, def.name, "message-search") or
-            std.mem.eql(u8, def.name, "message-audit") or
-            std.mem.eql(u8, def.name, "skill-cohort") or
-            std.mem.eql(u8, def.name, "tool-search") or
-            std.mem.eql(u8, def.name, "memory-extension-audit") or
-            std.mem.eql(u8, def.name, "token-window") or
-            std.mem.eql(u8, def.name, "workdir-report") or
-            std.mem.eql(u8, def.name, "find-session") or
-            std.mem.eql(u8, def.name, "plan-search") or
-            std.mem.eql(u8, def.name, "reply-latency") or
-            std.mem.eql(u8, def.name, "session-prompts") or
-            std.mem.eql(u8, def.name, "query-diagnose") or
-            std.mem.eql(u8, def.name, "skills-rank") or
-            std.mem.eql(u8, def.name, "skill-success-rank") or
-            std.mem.eql(u8, def.name, "skill-trend") or
-            std.mem.eql(u8, def.name, "skill-report") or
-            std.mem.eql(u8, def.name, "skill-audit") or
-            std.mem.eql(u8, def.name, "skill-blocks") or
-            std.mem.eql(u8, def.name, "role-breakdown") or
-            std.mem.eql(u8, def.name, "occurrence-export") or
-            std.mem.eql(u8, def.name, "report-bundle") or
-            std.mem.eql(u8, def.name, "section-audit") or
-            std.mem.eql(u8, def.name, "token-usage") or
-            std.mem.eql(u8, def.name, "token-cost") or
-            std.mem.eql(u8, def.name, "goal-audit") or
-            std.mem.eql(u8, def.name, "workflow-audit") or
-            std.mem.eql(u8, def.name, "session-graph") or
-            std.mem.eql(u8, def.name, "memory-map") or
-            std.mem.eql(u8, def.name, "memory-history") or
-            std.mem.eql(u8, def.name, "routing-gap"))
-            .{ perf_contract.CoverageKind.deep, "native deep case landed" }
-        else if (std.mem.eql(u8, def.name, "memory-provenance"))
-            .{ perf_contract.CoverageKind.excluded, "state-db provenance fixture deferred" }
-        else if (std.mem.eql(u8, def.name, "opencode-prompts") or std.mem.eql(u8, def.name, "opencode-events"))
-            .{ perf_contract.CoverageKind.excluded, "opencode db/jsonl wave deferred" }
-        else
-            .{ perf_contract.CoverageKind.missing, "native deep case not landed" };
-        out[idx] = .{ .family = def.name, .coverage = coverage, .reason = reason };
-    }
-    return out;
-}
 
 fn buildCronCoverages() [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage {
     var out: [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
@@ -401,6 +242,7 @@ fn buildCronCoverages() [cron_cli.commandDefinitions().len]perf_contract.Command
 fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
         .{ .binary = "seq", .coverages = &SeqCoverages, .datasets = &SeqDatasets, .cases = &SeqCases },
+        .{ .binary = "ledger", .coverages = &LedgerCoverages, .cases = &LedgerCases },
         .{ .binary = "cron", .coverages = &CronCoverages, .cases = &CronCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
     };
@@ -825,19 +667,13 @@ fn ensureCurrentMachineDir(allocator: std.mem.Allocator) ![]u8 {
 
 fn ensureBuilt(allocator: std.mem.Allocator, built: *BuiltState, case_cfg: CompatCase) !void {
     const key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{
-        switch (case_cfg.builder) {
-            .root => "root",
-            .seq_local => "seq_local",
-        },
+        "root",
         case_cfg.build_step orelse "default",
     });
     defer allocator.free(key);
     if (built.keys.contains(key)) return;
 
-    const cwd = switch (case_cfg.builder) {
-        .root => ".",
-        .seq_local => "apps/seq",
-    };
+    const cwd = ".";
 
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
@@ -853,17 +689,13 @@ fn ensureBuilt(allocator: std.mem.Allocator, built: *BuiltState, case_cfg: Compa
 }
 
 fn resolveBinaryPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
-    return switch (case_cfg.builder) {
-        .root => std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path }),
-        .seq_local => std.fs.path.join(allocator, &.{ "apps/seq", case_cfg.binary_path }),
-    };
+    _ = case_cfg.builder;
+    return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
 }
 
 fn resolveBinaryExecPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
-    return switch (case_cfg.builder) {
-        .root => std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path }),
-        .seq_local => allocator.dupe(u8, case_cfg.binary_path),
-    };
+    _ = case_cfg.builder;
+    return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
 }
 
 fn compatBaselinePath(allocator: std.mem.Allocator, machine_dir: []const u8, binary: []const u8, case_id: []const u8, latest: bool) ![]u8 {
@@ -891,13 +723,6 @@ fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bo
     defer args.deinit(allocator);
     try args.append(allocator, binary_path);
     switch (case_cfg.setup) {
-        .seq_parser_driver => {
-            try args.appendSlice(allocator, &.{ "--config", "apps/seq/perf/parser/workload_config.json", "--artifact", artifact_path, "--report-only" });
-            const result = try runChildCapture(allocator, ".", args.items);
-            defer allocator.free(result.stdout);
-            defer allocator.free(result.stderr);
-            if (result.exit_code != 0) return error.DriverFailed;
-        },
         .lift_bench_stats_driver => {
             try args.appendSlice(allocator, &.{ "--config", "apps/lift/perf/bench_stats/workload_config.json", "--artifact", artifact_path, "--report-only" });
             const result = try runChildCapture(allocator, ".", args.items);
@@ -1017,49 +842,6 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
 
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
     switch (setup) {
-        .seq_query_tool_calls => try seq_cli.runPerfCase(allocator, .query_tool_calls, temp_root),
-        .seq_skill_success_rank => try seq_cli.runPerfCase(allocator, .skill_success_rank, temp_root),
-        .seq_skill_audit => try seq_cli.runPerfCase(allocator, .skill_audit, temp_root),
-        .seq_skill_blocks => try seq_cli.runPerfCase(allocator, .skill_blocks, temp_root),
-        .seq_tool_audit => try seq_cli.runPerfCase(allocator, .tool_audit, temp_root),
-        .seq_memory_inventory => try seq_cli.runPerfCase(allocator, .memory_inventory, temp_root),
-        .seq_message_search => try seq_cli.runPerfCase(allocator, .message_search, temp_root),
-        .seq_message_audit => try seq_cli.runPerfCase(allocator, .message_audit, temp_root),
-        .seq_skill_cohort => try seq_cli.runPerfCase(allocator, .skill_cohort, temp_root),
-        .seq_tool_search => try seq_cli.runPerfCase(allocator, .tool_search, temp_root),
-        .seq_memory_extension_audit => try seq_cli.runPerfCase(allocator, .memory_extension_audit, temp_root),
-        .seq_token_window => try seq_cli.runPerfCase(allocator, .token_window, temp_root),
-        .seq_workdir_report => try seq_cli.runPerfCase(allocator, .workdir_report, temp_root),
-        .seq_plan_search => try seq_cli.runPerfCase(allocator, .plan_search, temp_root),
-        .seq_reply_latency => try seq_cli.runPerfCase(allocator, .reply_latency, temp_root),
-        .seq_sessions_limit => try seq_cli.runPerfCase(allocator, .sessions_limit, temp_root),
-        .seq_turns => try seq_cli.runPerfCase(allocator, .turns, temp_root),
-        .seq_session_detail => try seq_cli.runPerfCase(allocator, .session_detail, temp_root),
-        .seq_tool_lifecycle => try seq_cli.runPerfCase(allocator, .tool_lifecycle, temp_root),
-        .seq_session_graph => try seq_cli.runPerfCase(allocator, .session_graph, temp_root),
-        .seq_tail_once => try seq_cli.runPerfCase(allocator, .tail_once, temp_root),
-        .seq_token_cost => try seq_cli.runPerfCase(allocator, .token_cost, temp_root),
-        .seq_goal_audit => try seq_cli.runPerfCase(allocator, .goal_audit, temp_root),
-        .seq_workflow_audit => try seq_cli.runPerfCase(allocator, .workflow_audit, temp_root),
-        .seq_memory_map => try seq_cli.runPerfCase(allocator, .memory_map, temp_root),
-        .seq_memory_history => try seq_cli.runPerfCase(allocator, .memory_history, temp_root),
-        .seq_session_tooling => try seq_cli.runPerfCase(allocator, .session_tooling, temp_root),
-        .seq_orchestration_concurrency => try seq_cli.runPerfCase(allocator, .orchestration_concurrency, temp_root),
-        .seq_datasets => try seq_cli.runPerfCase(allocator, .datasets, temp_root),
-        .seq_dataset_schema => try seq_cli.runPerfCase(allocator, .dataset_schema, temp_root),
-        .seq_artifact_search => try seq_cli.runPerfCase(allocator, .artifact_search, temp_root),
-        .seq_find_session => try seq_cli.runPerfCase(allocator, .find_session, temp_root),
-        .seq_session_prompts => try seq_cli.runPerfCase(allocator, .session_prompts, temp_root),
-        .seq_query_diagnose => try seq_cli.runPerfCase(allocator, .query_diagnose, temp_root),
-        .seq_skills_rank => try seq_cli.runPerfCase(allocator, .skills_rank, temp_root),
-        .seq_skill_trend => try seq_cli.runPerfCase(allocator, .skill_trend, temp_root),
-        .seq_skill_report => try seq_cli.runPerfCase(allocator, .skill_report, temp_root),
-        .seq_role_breakdown => try seq_cli.runPerfCase(allocator, .role_breakdown, temp_root),
-        .seq_occurrence_export => try seq_cli.runPerfCase(allocator, .occurrence_export, temp_root),
-        .seq_report_bundle => try seq_cli.runPerfCase(allocator, .report_bundle, temp_root),
-        .seq_section_audit => try seq_cli.runPerfCase(allocator, .section_audit, temp_root),
-        .seq_token_usage => try seq_cli.runPerfCase(allocator, .token_usage, temp_root),
-        .seq_routing_gap => try seq_cli.runPerfCase(allocator, .routing_gap, temp_root),
         .cron_show => try cron_cli.runPerfCase(allocator, .show, temp_root),
         .cron_create => try cron_cli.runPerfCase(allocator, .create, temp_root),
         .cron_update => try cron_cli.runPerfCase(allocator, .update, temp_root),
@@ -1076,7 +858,7 @@ fn compareLatencyMetrics(case_cfg: CompatCase, baseline: std.json.Value, metrics
     const baseline_metrics = root.get("metrics") orelse return error.InvalidData;
     const metric_obj = baseline_metrics.object;
     if (case_cfg.descriptor.measurement_mode == .latency_alloc and baseline_metrics.object.get("p50_alloc_calls") == null) {
-        return .{ .status = "FAIL", .detail = "legacy baseline missing alloc metrics; recapture baseline" };
+        return .{ .status = "FAIL", .detail = "baseline missing allocation metrics; recapture baseline" };
     }
     const base_p50 = try jsonFieldU64(metric_obj, "p50_ns");
     const base_p95 = try jsonFieldU64(metric_obj, "p95_ns");
@@ -1104,20 +886,6 @@ fn compareDriverRaw(allocator: std.mem.Allocator, case_cfg: CompatCase, baseline
     const baseline_raw = baseline.object.get("raw_artifact") orelse return error.InvalidData;
     const current_raw = current.value;
     switch (case_cfg.setup) {
-        .seq_parser_driver => {
-            const p95 = try jsonObjectFieldU64(current_raw, "fast_p95_ns_per_line");
-            const base_p95 = try jsonObjectFieldU64(baseline_raw, "fast_p95_ns_per_line");
-            const allowed_p95 = allowedUpperBoundWithTolerance(base_p95, case_cfg.tolerance_pct);
-            if (p95 > allowed_p95) return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(allocator, "fast_p95_ns_per_line {d} > {d}", .{ p95, allowed_p95 }) };
-            const speedup = try jsonObjectFieldF64(current_raw, "speedup_pct");
-            const base_speedup = try jsonObjectFieldF64(baseline_raw, "speedup_pct");
-            const speedup_floor = base_speedup * @max(0.0, 1.0 - (case_cfg.tolerance_pct / 100.0));
-            if (speedup < speedup_floor) return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(allocator, "speedup_pct {d:.2} < {d:.2}", .{ speedup, speedup_floor }) };
-            const alloc_reduction = try jsonObjectFieldF64(current_raw, "alloc_call_reduction_pct");
-            const base_alloc_reduction = try jsonObjectFieldF64(baseline_raw, "alloc_call_reduction_pct");
-            const alloc_floor = base_alloc_reduction * @max(0.0, 1.0 - (case_cfg.tolerance_pct / 100.0));
-            if (alloc_reduction < alloc_floor) return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(allocator, "alloc_call_reduction_pct {d:.2} < {d:.2}", .{ alloc_reduction, alloc_floor }) };
-        },
         .lift_bench_stats_driver => {
             if (try compareUpperBoundField(allocator, current_raw, baseline_raw, "p95_ns_per_line", case_cfg.tolerance_pct)) |detail| {
                 return .{ .status = "FAIL", .detail = detail };
@@ -1197,16 +965,83 @@ fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg:
 fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root: []const u8) !CommandRun {
     const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
     errdefer allocator.free(binary_path);
-    const cwd = switch (case_cfg.builder) {
-        .root => try allocator.dupe(u8, "."),
-        .seq_local => try allocator.dupe(u8, "apps/seq"),
-    };
+    _ = case_cfg.builder;
+    const cwd = try allocator.dupe(u8, ".");
     var args: std.ArrayList([]const u8) = .empty;
     errdefer args.deinit(allocator);
 
     switch (case_cfg.setup) {
         .seq_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .learnings_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .seq_definition_check => try args.appendSlice(allocator, &.{
+            binary_path,
+            "definition",
+            "check",
+            "--definition",
+            "apps/seq/src/v1/fixtures/message-observation.json",
+            "--format",
+            "json",
+        }),
+        .seq_observe => try args.appendSlice(allocator, &.{
+            binary_path,
+            "observe",
+            "--definition",
+            "apps/seq/src/v1/fixtures/message-observation.json",
+            "--projection",
+            "rows",
+            "--path",
+            "apps/seq/src/v1/fixtures/rollout.jsonl",
+            "--param",
+            "needle=failure",
+            "--format",
+            "json",
+        }),
+        .seq_sessions => try args.appendSlice(allocator, &.{
+            binary_path,
+            "sessions",
+            "--root",
+            "apps/seq/src/v1/fixtures",
+            "--format",
+            "json",
+        }),
+        .seq_query => try args.appendSlice(allocator, &.{
+            binary_path,
+            "query",
+            "--root",
+            "apps/seq/src/v1/fixtures",
+            "--spec",
+            "{\"dataset\":\"messages\",\"where\":[{\"field\":\"text\",\"op\":\"contains\",\"value\":\"failure\",\"case_insensitive\":true}],\"select\":[\"session_id\",\"role\",\"text\"],\"limit\":5,\"format\":\"json\"}",
+        }),
+        .ledger_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .ledger_definition_check => try args.appendSlice(allocator, &.{
+            binary_path,
+            "definition",
+            "check",
+            "--definition",
+            "apps/ledger/src/v1/fixtures/record-definition.json",
+            "--format",
+            "json",
+        }),
+        .ledger_validate => try args.appendSlice(allocator, &.{
+            binary_path,
+            "validate",
+            "--definition",
+            "apps/ledger/src/v1/fixtures/record-definition.json",
+            "--input",
+            "record=apps/ledger/src/v1/fixtures/record-valid.json",
+            "--format",
+            "json",
+        }),
+        .ledger_materialize => try args.appendSlice(allocator, &.{
+            binary_path,
+            "materialize",
+            "--definition",
+            "apps/ledger/src/v1/fixtures/record-definition.json",
+            "--input",
+            "record=apps/ledger/src/v1/fixtures/record-valid.json",
+            "--format",
+            "json",
+        }),
+        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -1234,17 +1069,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
             try seedCronDb(allocator, db_path);
             try args.appendSlice(allocator, &.{ binary_path, "--db", db_path, "list" });
-        },
-        .learnings_recent => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "recent", "--limit", "3" }),
-        .learnings_recall => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "recall", "--query", "benchmark regression", "--limit", "3", "--format", "json", "--drop-superseded" }),
-        .learnings_query => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "query", "--spec", "@apps/learnings/perf/fixtures/query_spec.json" }),
-        .learnings_codify => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "codify-candidates", "--min-count", "2", "--limit", "5", "--format", "json" }),
-        .learnings_quality => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "quality-audit", "--format", "json" }),
-        .append_learning_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .append_learning_append => {
-            const fixture_path = try std.fs.path.join(allocator, &.{ temp_root, "learnings.jsonl" });
-            try std.Io.Dir.copyFileAbsolute("apps/learnings/perf/fixtures/learnings.jsonl", fixture_path, std.Io.Threaded.global_single_threaded.io(), .{});
-            try args.appendSlice(allocator, &.{ binary_path, "--path", fixture_path, "--status", "do_more", "--learning", "When running local perf comparisons, prefer machine-scoped baselines to avoid cross-host noise.", "--evidence", "Local compare uses one machine and one baseline directory.", "--application", "Use .perf-local baselines before refactors to avoid cross-host drift.", "--tag", "perf" });
         },
         else => return error.InvalidCommand,
     }
@@ -1603,9 +1427,8 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
 
 fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
+    if (std.mem.startsWith(u8, case_id, "ledger-")) return "ledger";
     if (std.mem.startsWith(u8, case_id, "cron-")) return "cron";
-    if (std.mem.startsWith(u8, case_id, "learnings-")) return "learnings";
-    if (std.mem.startsWith(u8, case_id, "append-learning-")) return "append_learning";
     if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "lift-bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "perf-report")) return "perf_report";
@@ -1719,31 +1542,16 @@ fn writeLatestReport(
 }
 
 fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.json.Array) !void {
-    var preserved_matrix_parity = true;
+    var all_cases_pass = true;
     for (rows.items) |row| {
         if (!std.mem.eql(u8, row.object.get("status").?.string, "PASS")) {
-            preserved_matrix_parity = false;
+            all_cases_pass = false;
             break;
         }
     }
 
-    const seq_manifest = allManifests()[0];
-    var seq_has_artifact_search = false;
-    for (seq_manifest.coverages) |coverage| {
-        if (std.mem.eql(u8, coverage.family, "artifact-search")) {
-            seq_has_artifact_search = true;
-            break;
-        }
-    }
-    var seq_has_memory_blocks = false;
-    for (seq_manifest.datasets) |dataset| {
-        if (std.mem.eql(u8, dataset.name, "memory_blocks")) {
-            seq_has_memory_blocks = true;
-            break;
-        }
-    }
-    const seq_surface_integrated = seq_has_artifact_search and seq_has_memory_blocks;
-
+    const seq_status = coverageStatusFor("seq");
+    const ledger_status = coverageStatusFor("ledger");
     const cron_status = coverageStatusFor("cron");
 
     var residuals = std.ArrayList([]const u8).empty;
@@ -1768,10 +1576,11 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
     try writer.print(
-        "{{\"native_public_ownership\":true,\"preserved_matrix_parity\":{s},\"seq_surface_integrated\":{s},\"cron_deep_driver_status\":\"{s}\",\"wave_b_residuals\":[",
+        "{{\"native_public_ownership\":true,\"all_cases_pass\":{s},\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\",\"cron_status\":\"{s}\",\"residuals\":[",
         .{
-            if (preserved_matrix_parity) "true" else "false",
-            if (seq_surface_integrated) "true" else "false",
+            if (all_cases_pass) "true" else "false",
+            seq_status,
+            ledger_status,
             cron_status,
         },
     );
@@ -1787,14 +1596,16 @@ fn coverageStatusFor(binary: []const u8) []const u8 {
     for (allManifests()) |manifest| {
         if (!std.mem.eql(u8, manifest.binary, binary)) continue;
         var saw_deep = false;
+        var saw_shallow = false;
         for (manifest.coverages) |coverage| {
             switch (coverage.coverage) {
                 .missing => return if (saw_deep) "partial" else "not_landed",
                 .deep => saw_deep = true,
-                .shallow, .excluded => {},
+                .shallow => saw_shallow = true,
+                .excluded => {},
             }
         }
-        return if (saw_deep) "landed" else "not_landed";
+        return if (saw_deep) "landed" else if (saw_shallow) "qualified" else "not_landed";
     }
     return "unknown";
 }
@@ -1875,11 +1686,12 @@ test "inferBinary maps lift driver case to bench_stats" {
 }
 
 test "coverageStatusFor reflects current manifest coverage" {
-    try std.testing.expectEqualStrings("partial", coverageStatusFor("seq"));
+    try std.testing.expectEqualStrings("qualified", coverageStatusFor("seq"));
+    try std.testing.expectEqualStrings("qualified", coverageStatusFor("ledger"));
     try std.testing.expectEqualStrings("landed", coverageStatusFor("cron"));
 }
 
-test "compareLatencyMetrics fails closed for latency_alloc legacy baselines" {
+test "compareLatencyMetrics fails closed for incomplete allocation baselines" {
     const alloc = std.testing.allocator;
     const baseline_json =
         \\{"metrics":{"p50_ns":100,"p95_ns":200}}
@@ -1894,7 +1706,7 @@ test "compareLatencyMetrics fails closed for latency_alloc legacy baselines" {
 
     const result = try compareLatencyMetrics(.{
         .descriptor = .{
-            .case_id = "seq-query-tool-calls",
+            .case_id = "synthetic-allocation-case",
             .binary = "seq",
             .family = "query",
             .case_kind = .native,
@@ -1914,7 +1726,7 @@ test "compareLatencyMetrics fails closed for latency_alloc legacy baselines" {
     });
 
     try std.testing.expectEqualStrings("FAIL", result.status);
-    try std.testing.expectEqualStrings("legacy baseline missing alloc metrics; recapture baseline", result.detail);
+    try std.testing.expectEqualStrings("baseline missing allocation metrics; recapture baseline", result.detail);
 }
 
 test "doctor counts compat and deep cases" {

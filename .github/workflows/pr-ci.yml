@@ -10,21 +10,19 @@ on:
       - "apps/lift/**"
       - "apps/cas/**"
       - "apps/cron/**"
-      - "apps/learnings/**"
-      - "apps/synesthesia/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
       - "apps/img/**"
       - "libs/core/**"
+      - "libs/definition_core/**"
       - "libs/durable_store/**"
-      - "libs/execution_policy_core/**"
       - "libs/jsonl_core/**"
-      - "libs/retrace_core/**"
+      - "libs/trace_core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
       - "tools/durable_store_perf.zig"
-      - "scripts/perf/**"
+      - "tools/perf_hub.zig"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
 
@@ -76,7 +74,7 @@ jobs:
           done
 
           perf=false
-          if grep -Eq '^scripts/perf/' <<<"$changed_paths"; then
+          if grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths"; then
             perf=true
           fi
           echo "perf=$perf" >> "$GITHUB_OUTPUT"
@@ -162,15 +160,17 @@ jobs:
           path: |
             .zig-cache
             .zig-cache-global
-          key: zig-seq-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', '.github/workflows/pr-ci.yml') }}
+          key: zig-seq-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', 'libs/definition_core/src/*', 'libs/definition_core/tests/*', 'libs/trace_core/src/*', 'libs/trace_core/tests/*', '.github/workflows/pr-ci.yml') }}
           restore-keys: |
             zig-seq-${{ runner.os }}-0.16.0-
       - name: Build seq integration surface
-        run: zig build build-seq -Doptimize=Debug --summary all
-      - name: Test seq
-        run: zig build test-seq --summary all
-      - name: Test Retrace core contracts
-        run: zig build test-retrace-core --summary all
+        run: zig build build-seq -Doptimize=ReleaseFast --summary all
+      - name: Test Seq 1.0 kernel and command surface
+        run: zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=ReleaseFast --summary all
+      - name: Test definition core contracts
+        run: zig build test-definition-core test-definition-core-guard -Doptimize=ReleaseFast --summary all
+      - name: Test trace core contracts
+        run: zig build test-trace-core -Doptimize=ReleaseFast --summary all
       - name: Test JSONL core contracts
         run: zig build test-jsonl-core --summary all
       - name: Test durable store contracts
@@ -185,16 +185,13 @@ jobs:
     if: needs.changes.outputs.seq == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: apps/seq
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Fuzz seq (Linux)
-        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli --dep retrace_core -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig --dep jsonl_core -Mretrace_core=../../libs/retrace_core/src/lib.zig -Mjsonl_core=../../libs/jsonl_core/src/lib.zig -ffuzz --test-filter "fuzz "
+      - name: Fuzz passive definition parsing (Linux)
+        run: .github/scripts/linux_fuzz_gate.sh -- zig test libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "
 
   lift:
     needs: changes
@@ -309,9 +306,11 @@ jobs:
         with:
           version: 0.16.0
       - name: Build ledger
-        run: zig build build-ledger
-      - name: Test generic ledger and portable validators
-        run: zig build test-ledger test-learnings test-append-learning test-synesthesia --summary all
+        run: zig build build-ledger -Doptimize=ReleaseFast
+      - name: Test Ledger 1.0 kernel and command surface
+        run: zig build test-ledger test-ledger-core test-ledger-cli-smoke -Doptimize=ReleaseFast --summary all
+      - name: Verify Ledger native command surface
+        run: apps/ledger/scripts/release/command_surface_gate.sh zig-out/bin/ledger
 
   memory-note:
     needs: changes

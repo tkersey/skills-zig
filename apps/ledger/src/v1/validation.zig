@@ -8674,7 +8674,7 @@ test "compiled identifier and repository path policies preserve exact boundaries
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","bounded-string","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["goal_id","identity","label","paths"]},{"op":"safe-identifier","path":"/goal_id","max":128,"style":"lowercase-component"},{"op":"bounded-string","path":"/label","trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","bounded-string","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["identity","label","paths","record_id"]},{"op":"safe-identifier","path":"/record_id","max":128,"style":"lowercase-component"},{"op":"bounded-string","path":"/label","trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -8722,7 +8722,7 @@ test "compiled identifier and repository path policies preserve exact boundaries
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".\",\".github\",\"src/lib\"]}",
+            .bytes = "{\"identity\":null,\"label\":\"value\",\"paths\":[\".\",\".github\",\"src/lib\"],\"record_id\":\"record-1\"}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -8734,20 +8734,20 @@ test "compiled identifier and repository path policies preserve exact boundaries
         &cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"goal_id\":\"goal-1\",\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"label\":\"value\",\"paths\":[\"src\"]}",
+            .bytes = "{\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
         }},
     );
     defer valid_digest.deinit(std.testing.allocator);
     try std.testing.expect(valid_digest.valid);
 
     const invalid_cases = [_][]const u8{
-        "{\"goal_id\":\"Goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"]}",
-        "{\"goal_id\":\".goal\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".GIT/config\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\".ledger\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\"value\",\"paths\":[\"src/../lib\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":\"not-a-digest\",\"label\":\"value\",\"paths\":[\"src\"]}",
-        "{\"goal_id\":\"goal-1\",\"identity\":null,\"label\":\" \\t\",\"paths\":[\"src\"]}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"Record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\".record\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".GIT/config\"],\"record_id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".ledger\"],\"record_id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src/../lib\"],\"record_id\":\"record-1\"}",
+        "{\"identity\":\"not-a-digest\",\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\" \\t\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
     };
     for (invalid_cases) |bytes| {
         var rejected = try validate(
@@ -9117,10 +9117,10 @@ test "compiled sha256 validates canonical documents and framed streams" {
         .sub_path = "artifact.json",
         .data =
         \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
-        \\{"op":"sha256","path":"/review","mode":"canonical-json-null","field":"/contract_digest","null":"/contract_digest","max_bytes":4096},
-        \\{"op":"object-values","path":"/manifests","rules":[{"op":"sha256","mode":"framed-items","field":"/contract_digest","items":"/resources","prefix":"lens-contract/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/digest"},{"literal":"\u0000"}],"max_bytes":4096}]},
-        \\{"op":"sha256","path":"/campaign","mode":"framed-fields","field":"/campaign_id","prefix":"campaign/v1\u0000","fragments":[{"parent":"/goal_id"},{"literal":"\u0000"},{"parent":"/construction_ref"},{"literal":"\u0000"},{"parent":"/subject_digest"},{"literal":"\u0000"},{"parent":"/review_contract_digest"}],"max_bytes":4096},
-        \\{"op":"sha256","path":"/writer","mode":"framed-fields","field":"/fingerprint","prefix":"","fragments":[{"parent":"/extension"},{"literal":"\n"},{"parent":"/kind"},{"literal":"\n"},{"parent":"/raw"}],"max_bytes":4096}
+        \\{"op":"sha256","path":"/document","mode":"canonical-json-null","field":"/digest","null":"/digest","max_bytes":4096},
+        \\{"op":"object-values","path":"/groups","rules":[{"op":"sha256","mode":"framed-items","field":"/digest","items":"/entries","prefix":"group/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/checksum"},{"literal":"\u0000"}],"max_bytes":4096}]},
+        \\{"op":"sha256","path":"/bundle","mode":"framed-fields","field":"/digest","prefix":"bundle/v1\u0000","fragments":[{"parent":"/owner_id"},{"literal":"\u0000"},{"parent":"/parent_ref"},{"literal":"\u0000"},{"parent":"/subject_ref"},{"literal":"\u0000"},{"parent":"/document_digest"}],"max_bytes":4096},
+        \\{"op":"sha256","path":"/transport","mode":"framed-fields","field":"/fingerprint","prefix":"","fragments":[{"parent":"/channel"},{"literal":"\n"},{"parent":"/type"},{"literal":"\n"},{"parent":"/payload"}],"max_bytes":4096}
         \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
         ,
     });
@@ -9140,19 +9140,19 @@ test "compiled sha256 validates canonical documents and framed streams" {
     var plan = try compile(std.testing.allocator, &definition_plan);
     defer plan.deinit(std.testing.allocator);
 
-    const review_basis =
-        "{\"contract_digest\":null,\"contract_id\":\"review\",\"schema\":\"review/v1\"}";
-    const review_digest =
+    const document_basis =
+        "{\"digest\":null,\"id\":\"doc\",\"schema\":\"document/v1\"}";
+    const document_digest =
         try definition_core.canonical_json.digestBytesAlloc(
             std.testing.allocator,
-            review_basis,
+            document_basis,
         );
-    defer std.testing.allocator.free(review_digest);
+    defer std.testing.allocator.free(document_digest);
     const resource_digest =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     var framed_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    framed_hasher.update("lens-contract/v1\x00");
-    framed_hasher.update("lens.md");
+    framed_hasher.update("group/v1\x00");
+    framed_hasher.update("item.txt");
     framed_hasher.update("\x00");
     framed_hasher.update(resource_digest);
     framed_hasher.update("\x00");
@@ -9166,10 +9166,10 @@ test "compiled sha256 validates canonical documents and framed streams" {
     );
     defer std.testing.allocator.free(framed_digest);
     var field_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    field_hasher.update("campaign/v1\x00");
-    field_hasher.update("goal-1");
+    field_hasher.update("bundle/v1\x00");
+    field_hasher.update("owner-1");
     field_hasher.update("\x00");
-    field_hasher.update("construction-1");
+    field_hasher.update("parent-1");
     field_hasher.update("\x00");
     field_hasher.update("subject-1");
     field_hasher.update("\x00");
@@ -9183,27 +9183,27 @@ test "compiled sha256 validates canonical documents and framed streams" {
         .{field_hex},
     );
     defer std.testing.allocator.free(field_digest);
-    var writer_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    writer_hasher.update("synesthesia\nmapping-endorsement\n{}\n");
-    var writer_raw: [32]u8 = undefined;
-    writer_hasher.final(&writer_raw);
-    const writer_hex = std.fmt.bytesToHex(writer_raw, .lower);
-    const writer_digest = try std.fmt.allocPrint(
+    var transport_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    transport_hasher.update("example\nrecord\n{}\n");
+    var transport_raw: [32]u8 = undefined;
+    transport_hasher.final(&transport_raw);
+    const transport_hex = std.fmt.bytesToHex(transport_raw, .lower);
+    const transport_digest = try std.fmt.allocPrint(
         std.testing.allocator,
         "sha256:{s}",
-        .{writer_hex},
+        .{transport_hex},
     );
-    defer std.testing.allocator.free(writer_digest);
+    defer std.testing.allocator.free(transport_digest);
     const valid_bytes = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"campaign\":{{\"campaign_id\":\"{s}\",\"construction_ref\":\"construction-1\",\"goal_id\":\"goal-1\",\"review_contract_digest\":\"{s}\",\"subject_digest\":\"subject-1\"}},\"manifests\":{{\"standard\":{{\"contract_digest\":\"{s}\",\"resources\":[{{\"digest\":\"{s}\",\"path\":\"lens.md\"}}]}}}},\"review\":{{\"contract_digest\":\"{s}\",\"contract_id\":\"review\",\"schema\":\"review/v1\"}},\"writer\":{{\"extension\":\"synesthesia\",\"fingerprint\":\"{s}\",\"kind\":\"mapping-endorsement\",\"raw\":\"{{}}\\n\"}}}}",
+        "{{\"bundle\":{{\"digest\":\"{s}\",\"document_digest\":\"{s}\",\"owner_id\":\"owner-1\",\"parent_ref\":\"parent-1\",\"subject_ref\":\"subject-1\"}},\"document\":{{\"digest\":\"{s}\",\"id\":\"doc\",\"schema\":\"document/v1\"}},\"groups\":{{\"standard\":{{\"digest\":\"{s}\",\"entries\":[{{\"checksum\":\"{s}\",\"path\":\"item.txt\"}}]}}}},\"transport\":{{\"channel\":\"example\",\"fingerprint\":\"{s}\",\"payload\":\"{{}}\\n\",\"type\":\"record\"}}}}",
         .{
             field_digest,
             resource_digest,
+            document_digest,
             framed_digest,
             resource_digest,
-            review_digest,
-            writer_digest,
+            transport_digest,
         },
     );
     defer std.testing.allocator.free(valid_bytes);
@@ -9233,71 +9233,71 @@ test "compiled sha256 validates canonical documents and framed streams" {
 
     const wrong_digest =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const invalid_review_bytes = try std.mem.replaceOwned(
+    const invalid_document_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         valid_bytes,
-        review_digest,
+        document_digest,
         wrong_digest,
     );
-    defer std.testing.allocator.free(invalid_review_bytes);
-    var invalid_review = try validate(
+    defer std.testing.allocator.free(invalid_document_bytes);
+    var invalid_document = try validate(
         std.testing.allocator,
         &definition_plan,
         &cached,
-        &.{.{ .name = "record", .bytes = invalid_review_bytes }},
+        &.{.{ .name = "record", .bytes = invalid_document_bytes }},
     );
-    defer invalid_review.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_review.valid);
+    defer invalid_document.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_document.valid);
 
-    const invalid_manifest_bytes = try std.mem.replaceOwned(
+    const invalid_group_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         valid_bytes,
         framed_digest,
         wrong_digest,
     );
-    defer std.testing.allocator.free(invalid_manifest_bytes);
-    var invalid_manifest = try validate(
+    defer std.testing.allocator.free(invalid_group_bytes);
+    var invalid_group = try validate(
         std.testing.allocator,
         &definition_plan,
         &cached,
-        &.{.{ .name = "record", .bytes = invalid_manifest_bytes }},
+        &.{.{ .name = "record", .bytes = invalid_group_bytes }},
     );
-    defer invalid_manifest.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_manifest.valid);
-    const invalid_campaign_bytes = try std.mem.replaceOwned(
+    defer invalid_group.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_group.valid);
+    const invalid_bundle_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         valid_bytes,
         field_digest,
         wrong_digest,
     );
-    defer std.testing.allocator.free(invalid_campaign_bytes);
-    var invalid_campaign = try validate(
+    defer std.testing.allocator.free(invalid_bundle_bytes);
+    var invalid_bundle = try validate(
         std.testing.allocator,
         &definition_plan,
         &cached,
-        &.{.{ .name = "record", .bytes = invalid_campaign_bytes }},
+        &.{.{ .name = "record", .bytes = invalid_bundle_bytes }},
     );
-    defer invalid_campaign.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_campaign.valid);
-    const invalid_writer_bytes = try std.mem.replaceOwned(
+    defer invalid_bundle.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_bundle.valid);
+    const invalid_transport_bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         valid_bytes,
-        writer_digest,
+        transport_digest,
         wrong_digest,
     );
-    defer std.testing.allocator.free(invalid_writer_bytes);
-    var invalid_writer = try validate(
+    defer std.testing.allocator.free(invalid_transport_bytes);
+    var invalid_transport = try validate(
         std.testing.allocator,
         &definition_plan,
         &cached,
-        &.{.{ .name = "record", .bytes = invalid_writer_bytes }},
+        &.{.{ .name = "record", .bytes = invalid_transport_bytes }},
     );
-    defer invalid_writer.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_writer.valid);
+    defer invalid_transport.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_transport.valid);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         validateForAllocationFailure,
@@ -9694,10 +9694,10 @@ test "embedded validation compares borrowed event and retained state values" {
         std.json.Value,
         std.testing.allocator,
         \\[
-        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"},
-        \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","then_input":"state","then":"/mutation_allowed","then_equals":true},
-        \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","rules":[{"op":"enum","input":"state","path":"/debt_state","values":["clear"]}]},
-        \\  {"op":"implies","input":"state","if":"/prior_refs","empty":true,"rules":[{"op":"bounded-array","input":"event","path":"/replacement_refs","min":1}]}
+        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/stream_id","right_input":"state","right":"/stream_id"},
+        \\  {"op":"implies","input":"event","if":"/operation","equals":"replace","then_input":"state","then":"/replacement_allowed","then_equals":true},
+        \\  {"op":"implies","input":"event","if":"/operation","equals":"replace","rules":[{"op":"enum","input":"state","path":"/phase","values":["open"]}]},
+        \\  {"op":"implies","input":"state","if":"/existing_refs","empty":true,"rules":[{"op":"bounded-array","input":"event","path":"/new_refs","min":1}]}
         \\]
     ,
         .{},
@@ -9729,14 +9729,14 @@ test "embedded validation compares borrowed event and retained state values" {
     var event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\",\"replacement_refs\":[\"class-1\"]}",
+        "{\"new_refs\":[\"item-1\"],\"operation\":\"replace\",\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer event.deinit();
     var matching = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true,\"prior_refs\":[]}",
+        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer matching.deinit();
@@ -9754,7 +9754,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var stale = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-2\",\"mutation_allowed\":true,\"prior_refs\":[]}",
+        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":true,\"stream_id\":\"stream-2\"}",
         .{},
     );
     defer stale.deinit();
@@ -9772,7 +9772,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var denied = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":false,\"prior_refs\":[]}",
+        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":false,\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer denied.deinit();
@@ -9790,7 +9790,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var debt = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"blocked\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true,\"prior_refs\":[\"class-0\"]}",
+        "{\"existing_refs\":[\"item-0\"],\"phase\":\"closed\",\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer debt.deinit();
@@ -9808,7 +9808,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var empty_replacement = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\",\"replacement_refs\":[]}",
+        "{\"new_refs\":[],\"operation\":\"replace\",\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer empty_replacement.deinit();
@@ -9826,7 +9826,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var inspection = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"effect\":\"inspect\",\"goal_id\":\"goal-1\"}",
+        "{\"operation\":\"inspect\",\"stream_id\":\"stream-1\"}",
         .{},
     );
     defer inspection.deinit();

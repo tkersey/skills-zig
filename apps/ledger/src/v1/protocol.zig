@@ -4573,13 +4573,13 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         \\  "operations":{"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{
         \\    "mode":"plain",
         \\    "body_input_field":"note",
-        \\    "field_order":["v","source","event","syn_id","captured_at","kind","logical_kind","operation","note"],
+        \\    "field_order":["v","source","event","record_id","captured_at","kind","logical_kind","operation","note"],
         \\    "body_order":["id","captured_at","logical_kind","kind","operation","summary","details","fingerprint"],
         \\    "fields":[
         \\      {"field":"v","literal":1},
-        \\      {"field":"source","literal":"synesthesia"},
-        \\      {"field":"event","literal":"synesthesia.capture"},
-        \\      {"field":"syn_id","derived":"syn_id"},
+        \\      {"field":"source","literal":"example"},
+        \\      {"field":"event","literal":"example.capture"},
+        \\      {"field":"record_id","derived":"record_id"},
         \\      {"field":"captured_at","derived":"captured_at"},
         \\      {"field":"kind","input_field":"physical_kind"},
         \\      {"field":"logical_kind","input_field":"logical_kind"},
@@ -4591,22 +4591,22 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         \\      {"name":"operation","op":"input-text","pointer":"/note/operation"},
         \\      {"name":"captured_at","op":"utc-timestamp","format":"rfc3339-seconds"},
         \\      {"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[
-        \\        {"literal":"synesthesia\n"},
+        \\        {"literal":"example\n"},
         \\        {"input_text":"/physical_kind"},
         \\        {"literal":"\n"},
         \\        {"input_text":"/logical_kind"},
         \\        {"literal":"\n"},
         \\        {"input_json":"/note"}
         \\      ],"max_bytes":4096},
-        \\      {"name":"syn_id","op":"concat","fragments":[
-        \\        {"literal":"SYN-"},
+        \\      {"name":"record_id","op":"concat","fragments":[
+        \\        {"literal":"EVT-"},
         \\        {"derived":"captured_at","transform":"compact-utc"},
         \\        {"literal":"-"},
         \\        {"derived":"fingerprint","prefix_bytes":16}
         \\      ],"max_bytes":64}
         \\    ],
         \\    "body_fields":[
-        \\      {"field":"id","derived":"syn_id"},
+        \\      {"field":"id","derived":"record_id"},
         \\      {"field":"captured_at","derived":"captured_at"},
         \\      {"field":"logical_kind","derived":"logical_kind"},
         \\      {"field":"kind","derived":"physical_kind"},
@@ -4654,10 +4654,10 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     try storage.validateCachePlan(&cached, &definition_plan);
     const materialization = &cached.operations[0].effects[0].event.?;
     const request =
-        \\{"logical_kind":"mapping-endorsement","note":{"details":{"z":"last","a":"first"},"operation":"assert","summary":"hello"},"physical_kind":"mapping-endorsement"}
+        \\{"logical_kind":"assertion","note":{"details":{"z":"last","a":"first"},"operation":"create","summary":"hello"},"physical_kind":"stored-assertion"}
     ;
     const normalized_request =
-        \\{"logical_kind":"mapping-endorsement","note":{"operation":"assert","summary":"hello","details":{"z":"last","a":"first"}},"physical_kind":"mapping-endorsement"}
+        \\{"logical_kind":"assertion","note":{"operation":"create","summary":"hello","details":{"z":"last","a":"first"}},"physical_kind":"stored-assertion"}
     ;
     var parsed_request = try std.json.parseFromSlice(
         std.json.Value,
@@ -4677,7 +4677,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     );
     defer materialized.deinit(std.testing.allocator);
     const expected =
-        \\{"v":1,"source":"synesthesia","event":"synesthesia.capture","syn_id":"SYN-20260630T123456Z-59797a91f1077869","captured_at":"2026-06-30T12:34:56Z","kind":"mapping-endorsement","logical_kind":"mapping-endorsement","operation":"assert","note":{"id":"SYN-20260630T123456Z-59797a91f1077869","captured_at":"2026-06-30T12:34:56Z","logical_kind":"mapping-endorsement","kind":"mapping-endorsement","operation":"assert","summary":"hello","details":{"z":"last","a":"first"},"fingerprint":"59797a91f107786963782607f84a529d446f747c9658d98fec2f80b36b8a590e"}}
+        \\{"v":1,"source":"example","event":"example.capture","record_id":"EVT-20260630T123456Z-05ca5d4775e018b7","captured_at":"2026-06-30T12:34:56Z","kind":"stored-assertion","logical_kind":"assertion","operation":"create","note":{"id":"EVT-20260630T123456Z-05ca5d4775e018b7","captured_at":"2026-06-30T12:34:56Z","logical_kind":"assertion","kind":"stored-assertion","operation":"create","summary":"hello","details":{"z":"last","a":"first"},"fingerprint":"05ca5d4775e018b752104bc965b93536d64e7344522b63298785b985e423b21f"}}
     ;
     try std.testing.expectEqualStrings(expected, materialized.content);
     try std.testing.expectEqual(@as(usize, 6), materialized.generated_outputs.len);
@@ -4701,7 +4701,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         u8,
         std.testing.allocator,
         materialized.content,
-        "59797a91f107786963782607f84a529d446f747c9658d98fec2f80b36b8a590e",
+        "05ca5d4775e018b752104bc965b93536d64e7344522b63298785b985e423b21f",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
     defer std.testing.allocator.free(tampered);

@@ -103,16 +103,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "canonical_json", .module = canonical_json_release_fast },
         },
     });
-    const execution_policy_core = b.createModule(.{
-        .root_source_file = b.path("libs/execution_policy_core/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const seq_bundle = b.createModule(.{
-        .root_source_file = b.path("apps/seq/src/bundle.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const seq_v1_core = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/v1/root.zig"),
         .target = target,
@@ -151,20 +141,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "seq_v1_core", .module = seq_v1_core },
         },
     });
-    const seq_perf_cli = b.createModule(.{
-        .root_source_file = b.path("apps/seq/src/perf_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_path", .module = core_path },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "definition_core", .module = definition_core },
-            .{ .name = "trace_core", .module = trace_core },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
     const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
@@ -182,18 +158,6 @@ pub fn build(b: *std.Build) void {
     });
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
     const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
-    const ledger_actuation_core = b.createModule(.{
-        .root_source_file = b.path("apps/ledger/scripts/actuation.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "app_meta", .module = ledger_meta },
-        },
-    });
-    seq_perf_cli.addImport("ledger_actuation_core", ledger_actuation_core);
     const img_atlas = b.createModule(.{
         .root_source_file = b.path("apps/img/assets/atlas.zig"),
         .target = target,
@@ -218,15 +182,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const seq_perf_root = b.createModule(.{
-        .root_source_file = b.path("apps/seq/src/perf_harness.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = seq_meta },
-        },
-    });
     const lift_bench_root = b.createModule(.{
         .root_source_file = b.path("apps/lift/scripts/bench_stats.zig"),
         .target = target,
@@ -385,40 +340,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cron_meta },
         },
     });
-    const append_learning_root = b.createModule(.{
-        .root_source_file = b.path("apps/learnings/scripts/append_learning.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_delegate", .module = core_delegate },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = ledger_meta },
-        },
-    });
-    const learnings_root = b.createModule(.{
-        .root_source_file = b.path("apps/learnings/scripts/learnings.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "append_learning_cli", .module = append_learning_root },
-            .{ .name = "core_delegate", .module = core_delegate },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = ledger_meta },
-            .{ .name = "seq_bundle", .module = seq_bundle },
-        },
-    });
-    const synesthesia_root = b.createModule(.{
-        .root_source_file = b.path("apps/synesthesia/scripts/synesthesia.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = ledger_meta },
-        },
-    });
     const memory_note_root = b.createModule(.{
         .root_source_file = b.path("apps/memory-note/scripts/memory_note.zig"),
         .target = target,
@@ -437,7 +358,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "core_perf", .module = core_perf },
             .{ .name = "perf_contract", .module = core_perf_contract },
-            .{ .name = "seq_perf_cli", .module = seq_perf_cli },
             .{ .name = "cron_cli", .module = cron_root },
         },
     });
@@ -451,7 +371,6 @@ pub fn build(b: *std.Build) void {
     });
 
     const seq = addExecutable(b, "seq", seq_root);
-    const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
     const lift_bench_perf = addExecutable(b, "lift-perf-bench-stats", lift_bench_perf_root);
@@ -477,7 +396,6 @@ pub fn build(b: *std.Build) void {
     const durable_store_perf = addExecutable(b, "durable-store-perf", durable_store_perf_root);
 
     const seq_install = addInstallStep(b, seq);
-    const seq_perf_install = addInstallStep(b, seq_perf);
     const bench_stats_install = addInstallStep(b, bench_stats);
     const perf_report_install = addInstallStep(b, perf_report);
     const lift_bench_perf_install = addInstallStep(b, lift_bench_perf);
@@ -498,7 +416,6 @@ pub fn build(b: *std.Build) void {
 
     const install_all = b.getInstallStep();
     install_all.dependOn(&seq_install.step);
-    install_all.dependOn(&seq_perf_install.step);
     install_all.dependOn(&bench_stats_install.step);
     install_all.dependOn(&perf_report_install.step);
     install_all.dependOn(&lift_bench_perf_install.step);
@@ -669,24 +586,6 @@ pub fn build(b: *std.Build) void {
         },
     );
 
-    const run_learnings_tests = addTestStep(
-        b,
-        learnings_root,
-        "test-learnings",
-        "Run learnings tests",
-    );
-    const run_append_learning_tests = addTestStep(
-        b,
-        append_learning_root,
-        "test-append-learning",
-        "Run append_learning tests",
-    );
-    const run_synesthesia_tests = addTestStep(
-        b,
-        synesthesia_root,
-        "test-synesthesia",
-        "Run internal ledger synesthesia-source tests",
-    );
     const run_ledger_tests = addTestStep(
         b,
         ledger_root,
@@ -784,12 +683,6 @@ pub fn build(b: *std.Build) void {
         "Run Ledger 1.0 definition, validation, and materialization smoke tests",
     );
     run_ledger_cli_smoke.dependOn(&ledger_cli_smoke_cmd.step);
-    const run_execution_policy_core_tests = addTestStep(
-        b,
-        execution_policy_core,
-        "test-execution-policy-core",
-        "Run execution_policy_core tests",
-    );
     const run_jsonl_large_tests = addTestStep(
         b,
         jsonl_large_tests_root,
@@ -810,15 +703,12 @@ pub fn build(b: *std.Build) void {
 
     const cas_build_deps: []const *std.Build.Step =
         &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step };
-    const ledger_test_deps: []const *std.Build.Step =
-        &.{ &run_ledger_tests.step, &run_synesthesia_tests.step };
-
     const app_surfaces = [_]AppSurface{
         .{
             .path = b.path("apps/seq"),
             .build_step_name = "build-seq",
-            .build_description = "Build seq binaries",
-            .build_deps = &.{ &seq_install.step, &seq_perf_install.step },
+            .build_description = "Build seq binary",
+            .build_deps = &.{&seq_install.step},
             .test_deps = &.{&run_seq_tests.step},
         },
         .{
@@ -843,25 +733,11 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{&run_cron_tests.step},
         },
         .{
-            .path = b.path("apps/learnings"),
-            .build_step_name = "build-learnings",
-            .build_description = "Run internal ledger learnings-source tests",
-            .build_deps = &.{},
-            .test_deps = &.{ &run_learnings_tests.step, &run_append_learning_tests.step },
-        },
-        .{
-            .path = b.path("apps/synesthesia"),
-            .build_step_name = "build-synesthesia",
-            .build_description = "Run internal ledger synesthesia-source tests",
-            .build_deps = &.{},
-            .test_deps = &.{&run_synesthesia_tests.step},
-        },
-        .{
             .path = b.path("apps/ledger"),
             .build_step_name = "build-ledger",
             .build_description = "Build ledger binary",
             .build_deps = &.{&ledger_install.step},
-            .test_deps = ledger_test_deps,
+            .test_deps = &.{&run_ledger_tests.step},
         },
         .{
             .path = b.path("apps/memory-note"),
@@ -898,7 +774,6 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(run_seq_cli_smoke);
     test_all.dependOn(&run_ledger_core_tests.step);
     test_all.dependOn(run_ledger_cli_smoke);
-    test_all.dependOn(&run_execution_policy_core_tests.step);
 
     const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
     test_full.dependOn(test_all);

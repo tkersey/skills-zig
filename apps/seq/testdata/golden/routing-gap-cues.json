@@ -1,8 +1,0 @@
-{
-  "cues": [
-    {
-      "name": "mesh_request",
-      "pattern": "$mesh"
-    }
-  ]
-}

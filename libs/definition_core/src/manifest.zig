@@ -60,8 +60,7 @@ fn parseReferences(
     value: ?std.json.Value,
     required_prefix: []const u8,
 ) ![]Reference {
-    const items = if (value) |present| try json.array(present) else
-        return allocator.alloc(Reference, 0);
+    const items = if (value) |present| try json.array(present) else return allocator.alloc(Reference, 0);
     var out: std.ArrayList(Reference) = .empty;
     errdefer {
         for (out.items) |*reference| reference.deinit(allocator);
@@ -115,7 +114,7 @@ test "manifest contains only explicit passive definition references" {
         std.json.Value,
         std.testing.allocator,
         \\{"schema":"skill-definition-set/v1","skill":"example","seq":[{"id":"example/observation","path":"seq/observation.json"}],"ledger":[{"id":"example/artifact","path":"ledger/artifact.json"}]}
-        ,
+    ,
         .{},
     );
     defer parsed.deinit();
@@ -128,7 +127,7 @@ test "manifest contains only explicit passive definition references" {
         std.json.Value,
         std.testing.allocator,
         \\{"schema":"skill-definition-set/v1","skill":"example","seq":[],"ledger":[],"hook":"run"}
-        ,
+    ,
         .{},
     );
     defer executable.deinit();
@@ -136,4 +135,25 @@ test "manifest contains only explicit passive definition references" {
         error.UnknownField,
         parseAlloc(std.testing.allocator, executable.value),
     );
+}
+
+fn fuzzManifestTarget(_: void, smith: *std.testing.Smith) !void {
+    var storage: [4096]u8 = undefined;
+    for (&storage) |*byte| byte.* = smith.value(u8);
+    const bytes = storage[0 .. smith.value(usize) % (storage.len + 1)];
+
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        bytes,
+        .{},
+    ) catch return;
+    defer parsed.deinit();
+
+    var value = parseAlloc(std.testing.allocator, parsed.value) catch return;
+    defer value.deinit(std.testing.allocator);
+}
+
+test "fuzz passive manifest parsing" {
+    try std.testing.fuzz({}, fuzzManifestTarget, .{});
 }
