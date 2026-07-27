@@ -391,8 +391,51 @@ fn validateEventEpoch(
     protocol_required: bool,
     observer: anytype,
 ) !HistoryResult {
+    const records = try eventRecordsAlloc(allocator, content);
+    defer allocator.free(records);
+    if (current_max_records) |limit| {
+        if (records.len > limit) {
+            return error.CurrentStoreRecordBoundsExceeded;
+        }
+    }
+    var expected_start: usize = 0;
+    var protocol_state: ?protocol.ReplayState = null;
+    errdefer if (protocol_state) |*state| state.deinit(allocator);
+    for (rows, 0..) |row, index| {
+        expected_start = try validateEventRow(
+            allocator,
+            cache,
+            current_slot,
+            row,
+            index,
+            expected_start,
+            records,
+            content,
+            content_revision,
+            parameters,
+            protocol_required,
+            &protocol_state,
+            observer,
+        );
+    }
+    if (expected_start != records.len) {
+        return error.StoreBindingRecordCountMismatch;
+    }
+    if (protocol_required and protocol_state == null) {
+        return error.HistoricalProtocolBindingMismatch;
+    }
+    return .{
+        .records_validated = records.len,
+        .protocol_state = protocol_state,
+    };
+}
+
+fn eventRecordsAlloc(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+) ![][]const u8 {
     var records: std.ArrayList([]const u8) = .empty;
-    defer records.deinit(allocator);
+    errdefer records.deinit(allocator);
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
@@ -403,102 +446,142 @@ fn validateEventEpoch(
         try records.append(allocator, line);
     }
     if (records.items.len == 0) return error.HistoricalArtifactInvalid;
-    if (current_max_records) |limit| {
-        if (records.items.len > limit) {
-            return error.CurrentStoreRecordBoundsExceeded;
-        }
-    }
-    var expected_start: usize = 0;
-    var protocol_state: ?protocol.ReplayState = null;
-    errdefer if (protocol_state) |*state| state.deinit(allocator);
-    for (rows, 0..) |row, index| {
-        const record_start = row.record_start orelse
-            return error.StoreBindingRecordRangeMissing;
-        const record_end = row.record_end orelse
-            return error.StoreBindingRecordRangeMissing;
-        if (record_start != expected_start or
-            record_end > records.items.len)
-        {
-            return error.StoreBindingRecordCountMismatch;
-        }
-        try validateBoundExtent(
-            allocator,
-            row,
-            content,
-            content_revision,
-        );
-        const resolved = try resolveEffect(cache, current_slot, row);
-        if (record_end > resolved.archived.definition_plan.bounds.max_records) {
-            return error.HistoricalRecordBoundsExceeded;
-        }
-        switch (row.kind) {
-            .existing_store_binding => {
-                if (index != 0 or resolved.effect.kind != .bind_existing) {
-                    return error.HistoricalEffectKindMismatch;
-                }
-                for (records.items[record_start..record_end]) |record| {
-                    try validateEventInput(
-                        allocator,
-                        &protocol_state,
-                        protocol_required,
-                        resolved,
-                        record,
-                        parameters,
-                        false,
-                        observer,
-                    );
-                }
-            },
-            .admission => switch (resolved.effect.kind) {
-                .compare_append => {
-                    if (record_end != record_start + 1) {
-                        return error.StoreBindingRecordCountMismatch;
-                    }
-                    try validateEventInput(
-                        allocator,
-                        &protocol_state,
-                        protocol_required,
-                        resolved,
-                        content[row.extent_start..row.extent_end],
-                        parameters,
-                        true,
-                        observer,
-                    );
-                },
-                .create_new, .compare_replace => {
-                    if (index != 0 or record_start != 0 or
-                        record_end != records.items.len or
-                        row.extent_start != 0 or
-                        row.extent_end != content.len)
-                    {
-                        return error.StoreBindingExtentMismatch;
-                    }
-                    try validateInput(
-                        allocator,
-                        resolved.archived,
-                        resolved.effect,
-                        content,
-                        true,
-                    );
-                    if (protocol_required) {
-                        return error.ProtocolHistoryMustBeAppendOnly;
-                    }
-                },
-                .bind_existing => return error.HistoricalEffectKindMismatch,
-            },
-        }
-        expected_start = record_end;
-    }
-    if (expected_start != records.items.len) {
+    return records.toOwnedSlice(allocator);
+}
+
+fn validateEventRow(
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    current_slot: storage.ResolvedSlot,
+    row: custody.BindingRow,
+    index: usize,
+    expected_start: usize,
+    records: []const []const u8,
+    content: []const u8,
+    content_revision: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    protocol_state: *?protocol.ReplayState,
+    observer: anytype,
+) !usize {
+    const record_start = row.record_start orelse
+        return error.StoreBindingRecordRangeMissing;
+    const record_end = row.record_end orelse
+        return error.StoreBindingRecordRangeMissing;
+    if (record_start != expected_start or record_end > records.len) {
         return error.StoreBindingRecordCountMismatch;
     }
-    if (protocol_required and protocol_state == null) {
-        return error.HistoricalProtocolBindingMismatch;
+    try validateBoundExtent(allocator, row, content, content_revision);
+    const resolved = try resolveEffect(cache, current_slot, row);
+    if (record_end > resolved.archived.definition_plan.bounds.max_records) {
+        return error.HistoricalRecordBoundsExceeded;
     }
-    return .{
-        .records_validated = records.items.len,
-        .protocol_state = protocol_state,
-    };
+    switch (row.kind) {
+        .existing_store_binding => try validateExistingEvents(
+            allocator,
+            resolved,
+            index,
+            records[record_start..record_end],
+            parameters,
+            protocol_required,
+            protocol_state,
+            observer,
+        ),
+        .admission => try validateAdmittedEvents(
+            allocator,
+            resolved,
+            row,
+            index,
+            record_start,
+            record_end,
+            records.len,
+            content,
+            parameters,
+            protocol_required,
+            protocol_state,
+            observer,
+        ),
+    }
+    return record_end;
+}
+
+fn validateExistingEvents(
+    allocator: std.mem.Allocator,
+    resolved: ResolvedEffect,
+    index: usize,
+    records: []const []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    protocol_state: *?protocol.ReplayState,
+    observer: anytype,
+) !void {
+    if (index != 0 or resolved.effect.kind != .bind_existing) {
+        return error.HistoricalEffectKindMismatch;
+    }
+    for (records) |record| {
+        try validateEventInput(
+            allocator,
+            protocol_state,
+            protocol_required,
+            resolved,
+            record,
+            parameters,
+            false,
+            observer,
+        );
+    }
+}
+
+fn validateAdmittedEvents(
+    allocator: std.mem.Allocator,
+    resolved: ResolvedEffect,
+    row: custody.BindingRow,
+    index: usize,
+    record_start: usize,
+    record_end: usize,
+    record_count: usize,
+    content: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    protocol_state: *?protocol.ReplayState,
+    observer: anytype,
+) !void {
+    switch (resolved.effect.kind) {
+        .compare_append => {
+            if (record_end != record_start + 1) {
+                return error.StoreBindingRecordCountMismatch;
+            }
+            try validateEventInput(
+                allocator,
+                protocol_state,
+                protocol_required,
+                resolved,
+                content[row.extent_start..row.extent_end],
+                parameters,
+                true,
+                observer,
+            );
+        },
+        .create_new, .compare_replace => {
+            if (index != 0 or record_start != 0 or
+                record_end != record_count or
+                row.extent_start != 0 or row.extent_end != content.len)
+            {
+                return error.StoreBindingExtentMismatch;
+            }
+            try validateInput(
+                allocator,
+                resolved.archived,
+                resolved.effect,
+                content,
+                true,
+            );
+            if (protocol_required) {
+                return error.ProtocolHistoryMustBeAppendOnly;
+            }
+        },
+        .bind_existing => return error.HistoricalEffectKindMismatch,
+    }
 }
 
 fn validateBoundExtent(
@@ -574,102 +657,179 @@ fn validateEventInput(
 ) !void {
     const input =
         resolved.archived.definition_plan.inputs[resolved.effect.input_index];
-    const historical_plan = if (resolved.archived.protocol_plan) |*plan|
-        if (plan.target_slot_index == resolved.effect.slot_index)
-            plan
-        else
-            null
-    else
-        null;
+    const historical_plan = historicalProtocolPlan(resolved);
     if ((historical_plan != null) != protocol_required) {
         return error.HistoricalProtocolBindingMismatch;
     }
     if (resolved.effect.event) |*event_materialization| {
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
+        return validateMaterializedEvent(
             allocator,
+            protocol_state,
+            historical_plan,
+            resolved,
+            input,
+            event_materialization,
             bytes,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
+            parameters,
+            observer,
         );
-        defer parsed.deinit();
-        const canonical_event = switch (event_materialization.mode) {
-            .chained => try definition_core.canonical_json.canonicalJsonAlloc(
+    }
+    try validateRawEvent(
+        allocator,
+        protocol_state,
+        historical_plan,
+        resolved,
+        input,
+        bytes,
+        parameters,
+        require_canonical,
+        observer,
+    );
+}
+
+fn historicalProtocolPlan(
+    resolved: ResolvedEffect,
+) ?*const protocol.Plan {
+    const plan = if (resolved.archived.protocol_plan) |*value| value else return null;
+    if (plan.target_slot_index != resolved.effect.slot_index) return null;
+    return plan;
+}
+
+fn validateMaterializedEvent(
+    allocator: std.mem.Allocator,
+    protocol_state: *?protocol.ReplayState,
+    historical_plan: ?*const protocol.Plan,
+    resolved: ResolvedEffect,
+    input: definition.Input,
+    materialization_plan: *const storage.EventMaterialization,
+    bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    observer: anytype,
+) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const canonical_event = try canonicalStoredEventAlloc(
+        allocator,
+        materialization_plan,
+        parsed.value,
+    );
+    defer allocator.free(canonical_event);
+    if (!std.mem.eql(u8, canonical_event, bytes)) {
+        return error.HistoricalArtifactNotCanonical;
+    }
+    const reconstructed = try reconstructStoredEventAlloc(
+        allocator,
+        protocol_state,
+        historical_plan,
+        materialization_plan,
+        parsed.value,
+    );
+    defer allocator.free(reconstructed);
+    var execution = try validation.execute(
+        allocator,
+        &resolved.archived.validation_plan,
+        &.{.{ .name = input.name, .bytes = reconstructed }},
+    );
+    defer execution.deinit();
+    if (!execution.isValid()) return error.HistoricalArtifactInvalid;
+    if (historical_plan) |plan| {
+        try protocol.applyValueBound(
+            allocator,
+            plan,
+            &protocol_state.*.?,
+            parsed.value,
+            parameters,
+        );
+    }
+    try notifyObserver(
+        observer,
+        parsed.value,
+        bytes,
+        if (protocol_state.*) |*state| state else null,
+    );
+}
+
+fn canonicalStoredEventAlloc(
+    allocator: std.mem.Allocator,
+    materialization_plan: *const storage.EventMaterialization,
+    value: std.json.Value,
+) ![]u8 {
+    return switch (materialization_plan.mode) {
+        .chained => definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            value,
+        ),
+        .plain => protocol.canonicalPlainStoredEventAlloc(
+            allocator,
+            materialization_plan,
+            value,
+        ),
+    };
+}
+
+fn reconstructStoredEventAlloc(
+    allocator: std.mem.Allocator,
+    protocol_state: *?protocol.ReplayState,
+    historical_plan: ?*const protocol.Plan,
+    materialization_plan: *const storage.EventMaterialization,
+    value: std.json.Value,
+) ![]u8 {
+    return switch (materialization_plan.mode) {
+        .chained => chained: {
+            const plan = historical_plan orelse
+                return error.HistoricalProtocolBindingMismatch;
+            if (plan.mode != .chained) {
+                return error.HistoricalProtocolBindingMismatch;
+            }
+            if (protocol_state.* == null) {
+                protocol_state.* = protocol.ReplayState.init(plan);
+            }
+            break :chained protocol.reconstructInputAlloc(
                 allocator,
-                parsed.value,
-            ),
-            .plain => try protocol.canonicalPlainStoredEventAlloc(
-                allocator,
-                event_materialization,
-                parsed.value,
-            ),
-        };
-        defer allocator.free(canonical_event);
-        if (!std.mem.eql(u8, canonical_event, bytes)) {
-            return error.HistoricalArtifactNotCanonical;
-        }
-        const reconstructed = switch (event_materialization.mode) {
-            .chained => chained: {
-                const plan = historical_plan orelse
-                    return error.HistoricalProtocolBindingMismatch;
-                if (plan.mode != .chained) {
+                plan,
+                &protocol_state.*.?,
+                materialization_plan,
+                value,
+            );
+        },
+        .plain => plain: {
+            if (historical_plan) |plan| {
+                if (plan.mode != .plain) {
                     return error.HistoricalProtocolBindingMismatch;
                 }
                 if (protocol_state.* == null) {
                     protocol_state.* = protocol.ReplayState.init(plan);
                 }
-                break :chained try protocol.reconstructInputAlloc(
-                    allocator,
-                    plan,
-                    &protocol_state.*.?,
-                    event_materialization,
-                    parsed.value,
-                );
-            },
-            .plain => plain: {
-                if (historical_plan) |plan| {
-                    if (plan.mode != .plain) {
-                        return error.HistoricalProtocolBindingMismatch;
-                    }
-                    if (protocol_state.* == null) {
-                        protocol_state.* = protocol.ReplayState.init(plan);
-                    }
-                }
-                break :plain try protocol.reconstructPlainInputAlloc(
-                    allocator,
-                    if (protocol_state.*) |*state| state else null,
-                    event_materialization,
-                    parsed.value,
-                );
-            },
-        };
-        defer allocator.free(reconstructed);
-        var execution = try validation.execute(
-            allocator,
-            &resolved.archived.validation_plan,
-            &.{.{ .name = input.name, .bytes = reconstructed }},
-        );
-        defer execution.deinit();
-        if (!execution.isValid()) return error.HistoricalArtifactInvalid;
-        if (historical_plan) |plan| {
-            try protocol.applyValueBound(
+            }
+            break :plain protocol.reconstructPlainInputAlloc(
                 allocator,
-                plan,
-                &protocol_state.*.?,
-                parsed.value,
-                parameters,
+                if (protocol_state.*) |*state| state else null,
+                materialization_plan,
+                value,
             );
-        }
-        try notifyObserver(
-            observer,
-            parsed.value,
-            bytes,
-            if (protocol_state.*) |*state| state else null,
-        );
-        return;
-    }
+        },
+    };
+}
+
+fn validateRawEvent(
+    allocator: std.mem.Allocator,
+    protocol_state: *?protocol.ReplayState,
+    historical_plan: ?*const protocol.Plan,
+    resolved: ResolvedEffect,
+    input: definition.Input,
+    bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    require_canonical: bool,
+    observer: anytype,
+) !void {
     var execution = try validation.execute(
         allocator,
         &resolved.archived.validation_plan,
