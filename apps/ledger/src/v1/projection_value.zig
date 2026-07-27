@@ -49,7 +49,7 @@ const ChoiceCase = struct {
     value: Value,
 
     fn deinit(self: *ChoiceCase, allocator: std.mem.Allocator) void {
-        allocator.free(self.equals);
+        if (self.equals.len > 0) allocator.free(self.equals);
         self.value.deinit(allocator);
         self.* = undefined;
     }
@@ -75,7 +75,7 @@ const Field = struct {
     value: Value,
 
     fn deinit(self: *Field, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
+        if (self.name.len > 0) allocator.free(self.name);
         self.value.deinit(allocator);
         self.* = undefined;
     }
@@ -88,6 +88,7 @@ pub const Value = union(enum) {
     object: []Field,
     array: []Value,
     choice: Choice,
+    pending,
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -103,6 +104,7 @@ pub const Value = union(enum) {
                 allocator.free(items);
             },
             .choice => |*choice| choice.deinit(allocator),
+            .pending => {},
         }
         self.* = undefined;
     }
@@ -128,248 +130,317 @@ pub fn compile(
     max_output_bytes: usize,
 ) !Value {
     var state: CompileState = .{ .max_output_bytes = max_output_bytes };
-    return compileValue(allocator, source, &state, 0);
+    var result: Value = .pending;
+    errdefer result.deinit(allocator);
+    var tasks: [max_nodes]CompileTask = undefined;
+    var task_count: usize = 0;
+    try pushCompileTask(
+        &tasks,
+        &task_count,
+        .{ .source = source, .target = &result, .depth = 0 },
+    );
+    while (task_count > 0) {
+        task_count -= 1;
+        const task = tasks[task_count];
+        try state.enter(task.depth);
+        try compileOne(allocator, task, &state, &tasks, &task_count);
+    }
+    return result;
 }
 
-fn compileValue(
-    allocator: std.mem.Allocator,
+const CompileTask = struct {
     source: std.json.Value,
-    state: *CompileState,
+    target: *Value,
     depth: usize,
-) !Value {
-    try state.enter(depth);
-    const object = try definition_core.json.object(source);
-    const has_literal = object.contains("literal");
-    const has_path = object.contains("path");
-    const has_concat = object.contains("concat");
-    const has_object = object.contains("object");
-    const has_array = object.contains("array");
-    const has_switch = object.contains("switch");
-    const source_count =
-        @as(usize, @intFromBool(has_literal)) +
-        @as(usize, @intFromBool(has_path)) +
-        @as(usize, @intFromBool(has_concat)) +
-        @as(usize, @intFromBool(has_object)) +
-        @as(usize, @intFromBool(has_array)) +
-        @as(usize, @intFromBool(has_switch));
-    if (source_count != 1) return error.InvalidProjectionValueSource;
+};
 
-    if (has_literal) {
-        try definition_core.json.requireExactKeys(object, &.{"literal"});
-        const bytes = try definition_core.canonical_json.canonicalJsonAlloc(
+fn pushCompileTask(
+    tasks: *[max_nodes]CompileTask,
+    count: *usize,
+    task: CompileTask,
+) !void {
+    if (count.* == tasks.len) return error.ProjectionValueNodesExceeded;
+    tasks[count.*] = task;
+    count.* += 1;
+}
+
+const SourceKind = enum {
+    literal,
+    pointer,
+    concat,
+    object,
+    array,
+    choice,
+};
+
+fn sourceKind(object: std.json.ObjectMap) !SourceKind {
+    const kinds = [_]struct { name: []const u8, kind: SourceKind }{
+        .{ .name = "literal", .kind = .literal },
+        .{ .name = "path", .kind = .pointer },
+        .{ .name = "concat", .kind = .concat },
+        .{ .name = "object", .kind = .object },
+        .{ .name = "array", .kind = .array },
+        .{ .name = "switch", .kind = .choice },
+    };
+    var selected: ?SourceKind = null;
+    for (kinds) |candidate| {
+        if (!object.contains(candidate.name)) continue;
+        if (selected != null) return error.InvalidProjectionValueSource;
+        selected = candidate.kind;
+    }
+    return selected orelse error.InvalidProjectionValueSource;
+}
+
+fn compileOne(
+    allocator: std.mem.Allocator,
+    task: CompileTask,
+    state: *CompileState,
+    tasks: *[max_nodes]CompileTask,
+    task_count: *usize,
+) !void {
+    const object = try definition_core.json.object(task.source);
+    switch (try sourceKind(object)) {
+        .literal => try compileLiteral(allocator, object, state, task.target),
+        .pointer => try compilePointer(allocator, object, state, task.target),
+        .concat => try compileConcat(
             allocator,
-            object.get("literal").?,
-        );
-        errdefer allocator.free(bytes);
+            object,
+            state,
+            task.depth,
+            task.target,
+        ),
+        .object => try compileObject(
+            allocator,
+            object,
+            task,
+            tasks,
+            task_count,
+        ),
+        .array => try compileArray(allocator, object, task, tasks, task_count),
+        .choice => try compileChoice(allocator, object, task, tasks, task_count),
+    }
+}
+
+fn compileLiteral(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    state: *const CompileState,
+    target: *Value,
+) !void {
+    try definition_core.json.requireExactKeys(object, &.{"literal"});
+    const bytes = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        object.get("literal").?,
+    );
+    errdefer allocator.free(bytes);
+    if (bytes.len > state.max_output_bytes) {
+        return error.ProjectionValueLiteralBoundsExceeded;
+    }
+    target.* = .{ .literal = bytes };
+}
+
+fn compilePointer(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    state: *const CompileState,
+    target: *Value,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "default", "fallback_path", "path" },
+    );
+    const raw = try definition_core.json.string(object.get("path").?);
+    if (raw.len > max_pointer_bytes) {
+        return error.ProjectionValuePointerBoundsExceeded;
+    }
+    var pointer = try definition_core.json_pointer.compile(allocator, raw);
+    errdefer pointer.deinit(allocator);
+    var fallback_pointer = if (object.get("fallback_path")) |value|
+        try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.string(value),
+        )
+    else
+        null;
+    errdefer if (fallback_pointer) |*compiled| compiled.deinit(allocator);
+    const fallback = if (object.get("default")) |value|
+        try definition_core.canonical_json.canonicalJsonAlloc(allocator, value)
+    else
+        null;
+    errdefer if (fallback) |bytes| allocator.free(bytes);
+    if (fallback) |bytes| {
         if (bytes.len > state.max_output_bytes) {
             return error.ProjectionValueLiteralBoundsExceeded;
         }
-        return .{ .literal = bytes };
     }
-    if (has_path) {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "default", "fallback_path", "path" },
-        );
-        const raw_pointer = try definition_core.json.string(
-            object.get("path").?,
-        );
-        if (raw_pointer.len > max_pointer_bytes) {
-            return error.ProjectionValuePointerBoundsExceeded;
-        }
-        var pointer = try definition_core.json_pointer.compile(
+    target.* = .{ .pointer = .{
+        .pointer = pointer,
+        .fallback_pointer = fallback_pointer,
+        .fallback = fallback,
+    } };
+}
+
+fn compileConcat(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    state: *CompileState,
+    depth: usize,
+    target: *Value,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "concat", "max_bytes" },
+    );
+    const max_bytes = try definition_core.json.unsigned(
+        try definition_core.json.field(object, "max_bytes"),
+    );
+    if (max_bytes == 0 or max_bytes > state.max_output_bytes) {
+        return error.ProjectionValueConcatBoundsInvalid;
+    }
+    const raw = try definition_core.json.array(object.get("concat").?);
+    if (raw.items.len == 0 or raw.items.len > max_collection_items) {
+        return error.ProjectionValueFragmentsInvalid;
+    }
+    const fragments = try allocator.alloc(Fragment, raw.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| fragment.deinit(allocator);
+        allocator.free(fragments);
+    }
+    for (raw.items) |source| {
+        try state.enter(depth + 1);
+        fragments[initialized] = try compileFragment(
             allocator,
-            raw_pointer,
+            source,
+            max_bytes,
         );
-        errdefer pointer.deinit(allocator);
-        var fallback_pointer =
-            if (object.get("fallback_path")) |value|
-                try definition_core.json_pointer.compile(
-                    allocator,
-                    try definition_core.json.string(value),
-                )
-            else
-                null;
-        errdefer if (fallback_pointer) |*compiled| {
-            compiled.deinit(allocator);
+        initialized += 1;
+    }
+    target.* = .{ .concat = .{
+        .fragments = fragments,
+        .max_bytes = max_bytes,
+    } };
+}
+
+fn compileFragment(
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    max_bytes: usize,
+) !Fragment {
+    const object = try definition_core.json.object(source);
+    const literal = object.get("literal");
+    const path = object.get("path");
+    if ((literal == null) == (path == null)) {
+        return error.InvalidProjectionValueFragment;
+    }
+    if (literal) |value| {
+        try definition_core.json.requireExactKeys(object, &.{"literal"});
+        const text = try definition_core.json.string(value);
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            return error.InvalidProjectionValueFragment;
+        }
+        if (text.len > max_bytes) {
+            return error.ProjectionValueConcatBoundsExceeded;
+        }
+        return .{ .literal = try allocator.dupe(u8, text) };
+    }
+    try definition_core.json.requireExactKeys(object, &.{"path"});
+    const raw = try definition_core.json.string(path.?);
+    if (raw.len > max_pointer_bytes) {
+        return error.ProjectionValuePointerBoundsExceeded;
+    }
+    return .{
+        .pointer = try definition_core.json_pointer.compile(allocator, raw),
+    };
+}
+
+fn compileObject(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    task: CompileTask,
+    tasks: *[max_nodes]CompileTask,
+    task_count: *usize,
+) !void {
+    try definition_core.json.requireExactKeys(object, &.{"object"});
+    const raw = try definition_core.json.array(object.get("object").?);
+    if (raw.items.len == 0 or raw.items.len > max_collection_items) {
+        return error.ProjectionValueFieldsInvalid;
+    }
+    const fields = try allocator.alloc(Field, raw.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (raw.items) |source| {
+        const field = try definition_core.json.object(source);
+        try definition_core.json.requireExactKeys(field, &.{ "name", "value" });
+        try definition_core.json.requireFields(field, &.{ "name", "value" });
+        const name = try definition_core.json.requiredString(field, "name");
+        if (name.len == 0 or name.len > max_field_name_bytes) {
+            return error.ProjectionValueFieldNameInvalid;
+        }
+        for (fields[0..initialized]) |prior| {
+            if (std.mem.eql(u8, prior.name, name)) {
+                return error.ProjectionValueFieldsNotUnique;
+            }
+        }
+        fields[initialized] = .{
+            .name = try allocator.dupe(u8, name),
+            .value = .pending,
         };
-        const fallback = if (object.get("default")) |value|
-            try definition_core.canonical_json.canonicalJsonAlloc(
-                allocator,
-                value,
-            )
-        else
-            null;
-        errdefer if (fallback) |bytes| allocator.free(bytes);
-        if (fallback) |bytes| {
-            if (bytes.len > state.max_output_bytes) {
-                return error.ProjectionValueLiteralBoundsExceeded;
-            }
-        }
-        return .{ .pointer = .{
-            .pointer = pointer,
-            .fallback_pointer = fallback_pointer,
-            .fallback = fallback,
-        } };
+        initialized += 1;
     }
-    if (has_concat) {
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "concat", "max_bytes" },
-        );
-        const max_bytes = try definition_core.json.unsigned(
-            try definition_core.json.field(object, "max_bytes"),
-        );
-        if (max_bytes == 0 or max_bytes > state.max_output_bytes) {
-            return error.ProjectionValueConcatBoundsInvalid;
-        }
-        const raw_fragments = try definition_core.json.array(
-            object.get("concat").?,
-        );
-        if (raw_fragments.items.len == 0 or
-            raw_fragments.items.len > max_collection_items)
-        {
-            return error.ProjectionValueFragmentsInvalid;
-        }
-        const fragments = try allocator.alloc(
-            Fragment,
-            raw_fragments.items.len,
-        );
-        var initialized: usize = 0;
-        errdefer {
-            for (fragments[0..initialized]) |*fragment| {
-                fragment.deinit(allocator);
-            }
-            allocator.free(fragments);
-        }
-        for (raw_fragments.items) |raw_fragment| {
-            try state.enter(depth + 1);
-            const fragment = try definition_core.json.object(raw_fragment);
-            const literal = fragment.get("literal");
-            const path = fragment.get("path");
-            if ((literal == null) == (path == null)) {
-                return error.InvalidProjectionValueFragment;
-            }
-            if (literal) |value| {
-                try definition_core.json.requireExactKeys(
-                    fragment,
-                    &.{"literal"},
-                );
-                const text = try definition_core.json.string(value);
-                if (!std.unicode.utf8ValidateSlice(text)) {
-                    return error.InvalidProjectionValueFragment;
-                }
-                if (text.len > max_bytes) {
-                    return error.ProjectionValueConcatBoundsExceeded;
-                }
-                fragments[initialized] = .{
-                    .literal = try allocator.dupe(u8, text),
-                };
-            } else {
-                try definition_core.json.requireExactKeys(
-                    fragment,
-                    &.{"path"},
-                );
-                const raw_pointer = try definition_core.json.string(path.?);
-                if (raw_pointer.len > max_pointer_bytes) {
-                    return error.ProjectionValuePointerBoundsExceeded;
-                }
-                fragments[initialized] = .{
-                    .pointer = try definition_core.json_pointer.compile(
-                        allocator,
-                        raw_pointer,
-                    ),
-                };
-            }
-            initialized += 1;
-        }
-        return .{ .concat = .{
-            .fragments = fragments,
-            .max_bytes = max_bytes,
-        } };
+    var index = raw.items.len;
+    while (index > 0) {
+        index -= 1;
+        const field = try definition_core.json.object(raw.items[index]);
+        try pushCompileTask(tasks, task_count, .{
+            .source = try definition_core.json.field(field, "value"),
+            .target = &fields[index].value,
+            .depth = task.depth + 1,
+        });
     }
-    if (has_object) {
-        try definition_core.json.requireExactKeys(object, &.{"object"});
-        const raw_fields = try definition_core.json.array(
-            object.get("object").?,
-        );
-        if (raw_fields.items.len == 0 or
-            raw_fields.items.len > max_collection_items)
-        {
-            return error.ProjectionValueFieldsInvalid;
-        }
-        const fields = try allocator.alloc(Field, raw_fields.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (fields[0..initialized]) |*field| field.deinit(allocator);
-            allocator.free(fields);
-        }
-        for (raw_fields.items) |raw_field| {
-            const field = try definition_core.json.object(raw_field);
-            try definition_core.json.requireExactKeys(
-                field,
-                &.{ "name", "value" },
-            );
-            try definition_core.json.requireFields(
-                field,
-                &.{ "name", "value" },
-            );
-            const name = try definition_core.json.requiredString(
-                field,
-                "name",
-            );
-            if (name.len == 0 or name.len > max_field_name_bytes) {
-                return error.ProjectionValueFieldNameInvalid;
-            }
-            for (fields[0..initialized]) |prior| {
-                if (std.mem.eql(u8, prior.name, name)) {
-                    return error.ProjectionValueFieldsNotUnique;
-                }
-            }
-            const owned_name = try allocator.dupe(u8, name);
-            errdefer allocator.free(owned_name);
-            var compiled_value = try compileValue(
-                allocator,
-                try definition_core.json.field(field, "value"),
-                state,
-                depth + 1,
-            );
-            errdefer compiled_value.deinit(allocator);
-            fields[initialized] = .{
-                .name = owned_name,
-                .value = compiled_value,
-            };
-            initialized += 1;
-        }
-        return .{ .object = fields };
-    }
+    task.target.* = .{ .object = fields };
+}
 
-    if (has_array) {
-        try definition_core.json.requireExactKeys(object, &.{"array"});
-        const raw_items = try definition_core.json.array(
-            object.get("array").?,
-        );
-        if (raw_items.items.len > max_collection_items) {
-            return error.ProjectionValueItemsInvalid;
-        }
-        const items = try allocator.alloc(Value, raw_items.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (items[0..initialized]) |*item| item.deinit(allocator);
-            allocator.free(items);
-        }
-        for (raw_items.items) |raw_item| {
-            items[initialized] = try compileValue(
-                allocator,
-                raw_item,
-                state,
-                depth + 1,
-            );
-            initialized += 1;
-        }
-        return .{ .array = items };
+fn compileArray(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    task: CompileTask,
+    tasks: *[max_nodes]CompileTask,
+    task_count: *usize,
+) !void {
+    try definition_core.json.requireExactKeys(object, &.{"array"});
+    const raw = try definition_core.json.array(object.get("array").?);
+    if (raw.items.len > max_collection_items) {
+        return error.ProjectionValueItemsInvalid;
     }
+    const items = try allocator.alloc(Value, raw.items.len);
+    for (items) |*item| item.* = .pending;
+    errdefer {
+        for (items) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    var index = raw.items.len;
+    while (index > 0) {
+        index -= 1;
+        try pushCompileTask(tasks, task_count, .{
+            .source = raw.items[index],
+            .target = &items[index],
+            .depth = task.depth + 1,
+        });
+    }
+    task.target.* = .{ .array = items };
+}
 
+fn compileChoice(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    task: CompileTask,
+    tasks: *[max_nodes]CompileTask,
+    task_count: *usize,
+) !void {
     try definition_core.json.requireExactKeys(object, &.{"switch"});
     const choice_object = try definition_core.json.object(
         object.get("switch").?,
@@ -387,6 +458,34 @@ fn compileValue(
         try definition_core.json.requiredString(choice_object, "path"),
     );
     errdefer pointer.deinit(allocator);
+    const cases = try compileChoiceCases(allocator, choice_object);
+    errdefer {
+        for (cases) |*case| case.deinit(allocator);
+        allocator.free(cases);
+    }
+    const fallback = try allocator.create(Value);
+    errdefer allocator.destroy(fallback);
+    fallback.* = .pending;
+    errdefer fallback.deinit(allocator);
+    try scheduleCompileChoice(
+        choice_object,
+        task,
+        cases,
+        fallback,
+        tasks,
+        task_count,
+    );
+    task.target.* = .{ .choice = .{
+        .pointer = pointer,
+        .cases = cases,
+        .fallback = fallback,
+    } };
+}
+
+fn compileChoiceCases(
+    allocator: std.mem.Allocator,
+    choice_object: std.json.ObjectMap,
+) ![]ChoiceCase {
     const raw_cases = try definition_core.json.array(
         try definition_core.json.field(choice_object, "cases"),
     );
@@ -423,38 +522,88 @@ fn compileValue(
                 return error.ProjectionValueChoiceCasesNotUnique;
             }
         }
-        var value = try compileValue(
-            allocator,
-            try definition_core.json.field(case_object, "value"),
-            state,
-            depth + 1,
-        );
-        errdefer value.deinit(allocator);
         cases[cases_initialized] = .{
             .equals = equals,
-            .value = value,
+            .value = .pending,
         };
         cases_initialized += 1;
     }
-    const fallback = try allocator.create(Value);
-    errdefer allocator.destroy(fallback);
-    fallback.* = try compileValue(
-        allocator,
-        try definition_core.json.field(choice_object, "default"),
-        state,
-        depth + 1,
+    return cases;
+}
+
+fn scheduleCompileChoice(
+    choice_object: std.json.ObjectMap,
+    task: CompileTask,
+    cases: []ChoiceCase,
+    fallback: *Value,
+    tasks: *[max_nodes]CompileTask,
+    task_count: *usize,
+) !void {
+    try pushCompileTask(tasks, task_count, .{
+        .source = try definition_core.json.field(choice_object, "default"),
+        .target = fallback,
+        .depth = task.depth + 1,
+    });
+    const raw_cases = try definition_core.json.array(
+        try definition_core.json.field(choice_object, "cases"),
     );
-    errdefer fallback.deinit(allocator);
-    return .{ .choice = .{
-        .pointer = pointer,
-        .cases = cases,
-        .fallback = fallback,
-    } };
+    var index = cases.len;
+    while (index > 0) {
+        index -= 1;
+        const case_object = try definition_core.json.object(
+            raw_cases.items[index],
+        );
+        try pushCompileTask(tasks, task_count, .{
+            .source = try definition_core.json.field(case_object, "value"),
+            .target = &cases[index].value,
+            .depth = task.depth + 1,
+        });
+    }
 }
 
 pub fn encodeCache(
     value: Value,
     encoder: *definition_core.cache.Encoder,
+) !void {
+    var tasks: [max_nodes * 2 + 1]EncodeTask = undefined;
+    var task_count: usize = 0;
+    try pushEncodeTask(&tasks, &task_count, .{ .value = value });
+    var nodes: usize = 0;
+    while (task_count > 0) {
+        task_count -= 1;
+        switch (tasks[task_count]) {
+            .bytes => |bytes| try encoder.writeBytes(bytes),
+            .value => |current| {
+                nodes += 1;
+                if (nodes > max_nodes) {
+                    return error.ProjectionValueNodesExceeded;
+                }
+                try encodeOne(current, encoder, &tasks, &task_count);
+            },
+        }
+    }
+}
+
+const EncodeTask = union(enum) {
+    value: Value,
+    bytes: []const u8,
+};
+
+fn pushEncodeTask(
+    tasks: *[max_nodes * 2 + 1]EncodeTask,
+    count: *usize,
+    task: EncodeTask,
+) !void {
+    if (count.* == tasks.len) return error.ProjectionValueNodesExceeded;
+    tasks[count.*] = task;
+    count.* += 1;
+}
+
+fn encodeOne(
+    value: Value,
+    encoder: *definition_core.cache.Encoder,
+    tasks: *[max_nodes * 2 + 1]EncodeTask,
+    task_count: *usize,
 ) !void {
     switch (value) {
         .literal => |bytes| {
@@ -472,44 +621,105 @@ pub fn encodeCache(
             );
             try encoder.writeOptionalBytes(pointer.fallback);
         },
-        .concat => |concat| {
-            try encoder.writeByte(2);
-            try encoder.writeUsize(concat.max_bytes);
-            try encoder.writeCount(concat.fragments.len);
-            for (concat.fragments) |fragment| switch (fragment) {
-                .literal => |text| {
-                    try encoder.writeByte(0);
-                    try encoder.writeBytes(text);
-                },
-                .pointer => |pointer| {
-                    try encoder.writeByte(1);
-                    try encoder.writeBytes(pointer.raw);
-                },
-            };
+        .concat => |concat| try encodeConcat(concat, encoder),
+        .object => |fields| try encodeObject(
+            fields,
+            encoder,
+            tasks,
+            task_count,
+        ),
+        .array => |items| try encodeArray(items, encoder, tasks, task_count),
+        .choice => |choice| try encodeChoice(
+            choice,
+            encoder,
+            tasks,
+            task_count,
+        ),
+        .pending => return error.ProjectionValuePending,
+    }
+}
+
+fn encodeConcat(
+    concat: Concat,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeByte(2);
+    try encoder.writeUsize(concat.max_bytes);
+    try encoder.writeCount(concat.fragments.len);
+    for (concat.fragments) |fragment| switch (fragment) {
+        .literal => |text| {
+            try encoder.writeByte(0);
+            try encoder.writeBytes(text);
         },
-        .object => |fields| {
-            try encoder.writeByte(3);
-            try encoder.writeCount(fields.len);
-            for (fields) |field| {
-                try encoder.writeBytes(field.name);
-                try encodeCache(field.value, encoder);
-            }
+        .pointer => |pointer| {
+            try encoder.writeByte(1);
+            try encoder.writeBytes(pointer.raw);
         },
-        .array => |items| {
-            try encoder.writeByte(4);
-            try encoder.writeCount(items.len);
-            for (items) |item| try encodeCache(item, encoder);
-        },
-        .choice => |choice| {
-            try encoder.writeByte(5);
-            try encoder.writeBytes(choice.pointer.raw);
-            try encoder.writeCount(choice.cases.len);
-            for (choice.cases) |case| {
-                try encoder.writeBytes(case.equals);
-                try encodeCache(case.value, encoder);
-            }
-            try encodeCache(choice.fallback.*, encoder);
-        },
+    };
+}
+
+fn encodeObject(
+    fields: []const Field,
+    encoder: *definition_core.cache.Encoder,
+    tasks: *[max_nodes * 2 + 1]EncodeTask,
+    task_count: *usize,
+) !void {
+    try encoder.writeByte(3);
+    try encoder.writeCount(fields.len);
+    var index = fields.len;
+    while (index > 0) {
+        index -= 1;
+        try pushEncodeTask(
+            tasks,
+            task_count,
+            .{ .value = fields[index].value },
+        );
+        try pushEncodeTask(
+            tasks,
+            task_count,
+            .{ .bytes = fields[index].name },
+        );
+    }
+}
+
+fn encodeArray(
+    items: []const Value,
+    encoder: *definition_core.cache.Encoder,
+    tasks: *[max_nodes * 2 + 1]EncodeTask,
+    task_count: *usize,
+) !void {
+    try encoder.writeByte(4);
+    try encoder.writeCount(items.len);
+    var index = items.len;
+    while (index > 0) {
+        index -= 1;
+        try pushEncodeTask(tasks, task_count, .{ .value = items[index] });
+    }
+}
+
+fn encodeChoice(
+    choice: Choice,
+    encoder: *definition_core.cache.Encoder,
+    tasks: *[max_nodes * 2 + 1]EncodeTask,
+    task_count: *usize,
+) !void {
+    try encoder.writeByte(5);
+    try encoder.writeBytes(choice.pointer.raw);
+    try encoder.writeCount(choice.cases.len);
+    try pushEncodeTask(tasks, task_count, .{ .value = choice.fallback.* });
+    var index = choice.cases.len;
+    while (index > 0) {
+        index -= 1;
+        try pushEncodeTask(
+            tasks,
+            task_count,
+            .{ .value = choice.cases[index].value },
+        );
+        try pushEncodeTask(
+            tasks,
+            task_count,
+            .{ .bytes = choice.cases[index].equals },
+        );
     }
 }
 
@@ -535,237 +745,376 @@ pub fn decodeCache(
     max_output_bytes: usize,
 ) !Value {
     var state: DecodeState = .{ .max_output_bytes = max_output_bytes };
-    return decodeValue(allocator, decoder, &state, 0);
+    var result: Value = .pending;
+    errdefer result.deinit(allocator);
+    var tasks: [max_nodes * 2 + 1]DecodeTask = undefined;
+    var task_count: usize = 0;
+    try pushDecodeTask(
+        &tasks,
+        &task_count,
+        .{ .value = .{ .target = &result, .depth = 0 } },
+    );
+    while (task_count > 0) {
+        task_count -= 1;
+        switch (tasks[task_count]) {
+            .value => |task| {
+                try state.enter(task.depth);
+                try decodeOne(
+                    allocator,
+                    decoder,
+                    &state,
+                    task,
+                    &tasks,
+                    &task_count,
+                );
+            },
+            .object_field => |task| try decodeObjectField(
+                allocator,
+                decoder,
+                task,
+                &tasks,
+                &task_count,
+            ),
+            .choice_case => |task| try decodeChoiceCase(
+                allocator,
+                decoder,
+                &state,
+                task,
+                &tasks,
+                &task_count,
+            ),
+        }
+    }
+    return result;
 }
 
-fn decodeValue(
+const DecodeValueTask = struct {
+    target: *Value,
+    depth: usize,
+};
+
+const DecodeObjectFieldTask = struct {
+    fields: []Field,
+    index: usize,
+    depth: usize,
+};
+
+const DecodeChoiceCaseTask = struct {
+    cases: []ChoiceCase,
+    index: usize,
+    depth: usize,
+};
+
+const DecodeTask = union(enum) {
+    value: DecodeValueTask,
+    object_field: DecodeObjectFieldTask,
+    choice_case: DecodeChoiceCaseTask,
+};
+
+fn pushDecodeTask(
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    count: *usize,
+    task: DecodeTask,
+) !void {
+    if (count.* == tasks.len) {
+        return error.CacheProjectionValueNodesExceeded;
+    }
+    tasks[count.*] = task;
+    count.* += 1;
+}
+
+fn decodeOne(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    state: *DecodeState,
+    task: DecodeValueTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    switch (try decoder.readByte()) {
+        0 => try decodeLiteral(allocator, decoder, state, task.target),
+        1 => try decodePointer(allocator, decoder, state, task.target),
+        2 => try decodeConcat(
+            allocator,
+            decoder,
+            state,
+            task.depth,
+            task.target,
+        ),
+        3 => try decodeObject(allocator, decoder, task, tasks, task_count),
+        4 => try decodeArray(allocator, decoder, task, tasks, task_count),
+        5 => try decodeChoice(allocator, decoder, task, tasks, task_count),
+        else => return error.CacheProjectionValueTagInvalid,
+    }
+}
+
+fn decodeLiteral(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    state: *const DecodeState,
+    target: *Value,
+) !void {
+    const bytes = try decoder.readBytesAlloc(
+        allocator,
+        state.max_output_bytes,
+    );
+    errdefer allocator.free(bytes);
+    try validateCanonicalJson(allocator, bytes);
+    target.* = .{ .literal = bytes };
+}
+
+fn decodePointer(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    state: *const DecodeState,
+    target: *Value,
+) !void {
+    const raw = try decoder.readBytesAlloc(allocator, max_pointer_bytes);
+    defer allocator.free(raw);
+    var pointer = try definition_core.json_pointer.compile(allocator, raw);
+    errdefer pointer.deinit(allocator);
+    const fallback_raw = try decoder.readOptionalBytesAlloc(
+        allocator,
+        max_pointer_bytes,
+    );
+    defer if (fallback_raw) |bytes| allocator.free(bytes);
+    var fallback_pointer = if (fallback_raw) |bytes|
+        try definition_core.json_pointer.compile(allocator, bytes)
+    else
+        null;
+    errdefer if (fallback_pointer) |*compiled| compiled.deinit(allocator);
+    const fallback = try decoder.readOptionalBytesAlloc(
+        allocator,
+        state.max_output_bytes,
+    );
+    errdefer if (fallback) |bytes| allocator.free(bytes);
+    if (fallback) |bytes| try validateCanonicalJson(allocator, bytes);
+    target.* = .{ .pointer = .{
+        .pointer = pointer,
+        .fallback_pointer = fallback_pointer,
+        .fallback = fallback,
+    } };
+}
+
+fn decodeConcat(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
     state: *DecodeState,
     depth: usize,
-) !Value {
-    try state.enter(depth);
-    return switch (try decoder.readByte()) {
-        0 => literal: {
-            const bytes = try decoder.readBytesAlloc(
-                allocator,
-                state.max_output_bytes,
-            );
-            errdefer allocator.free(bytes);
-            try validateCanonicalJson(allocator, bytes);
-            break :literal .{ .literal = bytes };
-        },
-        1 => pointer: {
+    target: *Value,
+) !void {
+    const max_bytes = try decoder.readUsize();
+    if (max_bytes == 0 or max_bytes > state.max_output_bytes) {
+        return error.CacheProjectionValueConcatBoundsInvalid;
+    }
+    const count = try decoder.readCount(max_collection_items);
+    if (count == 0) return error.CacheProjectionValueFragmentsInvalid;
+    const fragments = try allocator.alloc(Fragment, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| fragment.deinit(allocator);
+        allocator.free(fragments);
+    }
+    for (fragments) |*fragment| {
+        try state.enter(depth + 1);
+        fragment.* = try decodeFragment(allocator, decoder, max_bytes);
+        initialized += 1;
+    }
+    target.* = .{ .concat = .{
+        .fragments = fragments,
+        .max_bytes = max_bytes,
+    } };
+}
+
+fn decodeFragment(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    max_bytes: usize,
+) !Fragment {
+    const fragment: Fragment = switch (try decoder.readByte()) {
+        0 => .{ .literal = try decoder.readBytesAlloc(allocator, max_bytes) },
+        1 => compiled: {
             const raw = try decoder.readBytesAlloc(
                 allocator,
                 max_pointer_bytes,
             );
             defer allocator.free(raw);
-            var compiled = try definition_core.json_pointer.compile(
-                allocator,
-                raw,
-            );
-            errdefer compiled.deinit(allocator);
-            const fallback_raw = try decoder.readOptionalBytesAlloc(
-                allocator,
-                max_pointer_bytes,
-            );
-            defer if (fallback_raw) |bytes| allocator.free(bytes);
-            var fallback_pointer = if (fallback_raw) |bytes|
-                try definition_core.json_pointer.compile(allocator, bytes)
-            else
-                null;
-            errdefer if (fallback_pointer) |*pointer| {
-                pointer.deinit(allocator);
+            break :compiled .{
+                .pointer = try definition_core.json_pointer.compile(
+                    allocator,
+                    raw,
+                ),
             };
-            const fallback = try decoder.readOptionalBytesAlloc(
-                allocator,
-                state.max_output_bytes,
-            );
-            errdefer if (fallback) |bytes| allocator.free(bytes);
-            if (fallback) |bytes| try validateCanonicalJson(allocator, bytes);
-            break :pointer .{ .pointer = .{
-                .pointer = compiled,
-                .fallback_pointer = fallback_pointer,
-                .fallback = fallback,
-            } };
         },
-        2 => concat: {
-            const max_bytes = try decoder.readUsize();
-            if (max_bytes == 0 or max_bytes > state.max_output_bytes) {
-                return error.CacheProjectionValueConcatBoundsInvalid;
-            }
-            const count = try decoder.readCount(max_collection_items);
-            if (count == 0) {
-                return error.CacheProjectionValueFragmentsInvalid;
-            }
-            const fragments = try allocator.alloc(Fragment, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (fragments[0..initialized]) |*fragment| {
-                    fragment.deinit(allocator);
-                }
-                allocator.free(fragments);
-            }
-            for (fragments) |*fragment| {
-                try state.enter(depth + 1);
-                fragment.* = switch (try decoder.readByte()) {
-                    0 => .{ .literal = try decoder.readBytesAlloc(
-                        allocator,
-                        max_bytes,
-                    ) },
-                    1 => compiled: {
-                        const raw = try decoder.readBytesAlloc(
-                            allocator,
-                            max_pointer_bytes,
-                        );
-                        defer allocator.free(raw);
-                        break :compiled .{
-                            .pointer = try definition_core.json_pointer.compile(
-                                allocator,
-                                raw,
-                            ),
-                        };
-                    },
-                    else => return error.CacheProjectionValueFragmentInvalid,
-                };
-                initialized += 1;
-                if (fragment.* == .literal and
-                    !std.unicode.utf8ValidateSlice(fragment.literal))
-                {
-                    return error.CacheProjectionValueFragmentInvalid;
-                }
-                if (fragment.* == .literal and
-                    fragment.literal.len > max_bytes)
-                {
-                    return error.CacheProjectionValueConcatBoundsInvalid;
-                }
-            }
-            break :concat .{ .concat = .{
-                .fragments = fragments,
-                .max_bytes = max_bytes,
-            } };
-        },
-        3 => object: {
-            const count = try decoder.readCount(max_collection_items);
-            if (count == 0) return error.CacheProjectionValueFieldsInvalid;
-            const fields = try allocator.alloc(Field, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (fields[0..initialized]) |*field| {
-                    field.deinit(allocator);
-                }
-                allocator.free(fields);
-            }
-            for (fields) |*field| {
-                const name = try decoder.readBytesAlloc(
-                    allocator,
-                    max_field_name_bytes,
-                );
-                errdefer allocator.free(name);
-                if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) {
-                    return error.CacheProjectionValueFieldNameInvalid;
-                }
-                for (fields[0..initialized]) |prior| {
-                    if (std.mem.eql(u8, prior.name, name)) {
-                        return error.CacheProjectionValueFieldsNotUnique;
-                    }
-                }
-                field.* = .{
-                    .name = name,
-                    .value = try decodeValue(
-                        allocator,
-                        decoder,
-                        state,
-                        depth + 1,
-                    ),
-                };
-                initialized += 1;
-            }
-            break :object .{ .object = fields };
-        },
-        4 => array: {
-            const count = try decoder.readCount(max_collection_items);
-            const items = try allocator.alloc(Value, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (items[0..initialized]) |*item| item.deinit(allocator);
-                allocator.free(items);
-            }
-            for (items) |*item| {
-                item.* = try decodeValue(
-                    allocator,
-                    decoder,
-                    state,
-                    depth + 1,
-                );
-                initialized += 1;
-            }
-            break :array .{ .array = items };
-        },
-        5 => choice: {
-            const raw_pointer = try decoder.readBytesAlloc(
-                allocator,
-                max_pointer_bytes,
-            );
-            defer allocator.free(raw_pointer);
-            var pointer = try definition_core.json_pointer.compile(
-                allocator,
-                raw_pointer,
-            );
-            errdefer pointer.deinit(allocator);
-            const count = try decoder.readCount(max_collection_items);
-            if (count == 0) {
-                return error.CacheProjectionValueChoiceCasesInvalid;
-            }
-            const cases = try allocator.alloc(ChoiceCase, count);
-            var initialized: usize = 0;
-            errdefer {
-                for (cases[0..initialized]) |*case| {
-                    case.deinit(allocator);
-                }
-                allocator.free(cases);
-            }
-            for (cases) |*case| {
-                const equals = try decoder.readBytesAlloc(
-                    allocator,
-                    state.max_output_bytes,
-                );
-                errdefer allocator.free(equals);
-                try validateCanonicalJson(allocator, equals);
-                for (cases[0..initialized]) |prior| {
-                    if (std.mem.eql(u8, prior.equals, equals)) {
-                        return error.CacheProjectionValueChoiceCasesNotUnique;
-                    }
-                }
-                case.* = .{
-                    .equals = equals,
-                    .value = try decodeValue(
-                        allocator,
-                        decoder,
-                        state,
-                        depth + 1,
-                    ),
-                };
-                initialized += 1;
-            }
-            const fallback = try allocator.create(Value);
-            errdefer allocator.destroy(fallback);
-            fallback.* = try decodeValue(
-                allocator,
-                decoder,
-                state,
-                depth + 1,
-            );
-            errdefer fallback.deinit(allocator);
-            break :choice .{ .choice = .{
-                .pointer = pointer,
-                .cases = cases,
-                .fallback = fallback,
-            } };
-        },
-        else => error.CacheProjectionValueTagInvalid,
+        else => return error.CacheProjectionValueFragmentInvalid,
     };
+    errdefer {
+        var owned = fragment;
+        owned.deinit(allocator);
+    }
+    if (fragment == .literal and
+        !std.unicode.utf8ValidateSlice(fragment.literal))
+    {
+        return error.CacheProjectionValueFragmentInvalid;
+    }
+    if (fragment == .literal and fragment.literal.len > max_bytes) {
+        return error.CacheProjectionValueConcatBoundsInvalid;
+    }
+    return fragment;
+}
+
+fn decodeObject(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    task: DecodeValueTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    const count = try decoder.readCount(max_collection_items);
+    if (count == 0) return error.CacheProjectionValueFieldsInvalid;
+    const fields = try allocator.alloc(Field, count);
+    for (fields) |*field| field.* = .{ .name = &.{}, .value = .pending };
+    errdefer {
+        for (fields) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    var index = fields.len;
+    while (index > 0) {
+        index -= 1;
+        try pushDecodeTask(tasks, task_count, .{
+            .object_field = .{
+                .fields = fields,
+                .index = index,
+                .depth = task.depth + 1,
+            },
+        });
+    }
+    task.target.* = .{ .object = fields };
+}
+
+fn decodeObjectField(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    task: DecodeObjectFieldTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    const name = try decoder.readBytesAlloc(allocator, max_field_name_bytes);
+    errdefer allocator.free(name);
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name)) {
+        return error.CacheProjectionValueFieldNameInvalid;
+    }
+    for (task.fields[0..task.index]) |prior| {
+        if (std.mem.eql(u8, prior.name, name)) {
+            return error.CacheProjectionValueFieldsNotUnique;
+        }
+    }
+    task.fields[task.index].name = name;
+    try pushDecodeTask(tasks, task_count, .{
+        .value = .{
+            .target = &task.fields[task.index].value,
+            .depth = task.depth,
+        },
+    });
+}
+
+fn decodeArray(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    task: DecodeValueTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    const count = try decoder.readCount(max_collection_items);
+    const items = try allocator.alloc(Value, count);
+    for (items) |*item| item.* = .pending;
+    errdefer {
+        for (items) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    var index = items.len;
+    while (index > 0) {
+        index -= 1;
+        try pushDecodeTask(tasks, task_count, .{
+            .value = .{
+                .target = &items[index],
+                .depth = task.depth + 1,
+            },
+        });
+    }
+    task.target.* = .{ .array = items };
+}
+
+fn decodeChoice(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    task: DecodeValueTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    const raw = try decoder.readBytesAlloc(allocator, max_pointer_bytes);
+    defer allocator.free(raw);
+    var pointer = try definition_core.json_pointer.compile(allocator, raw);
+    errdefer pointer.deinit(allocator);
+    const count = try decoder.readCount(max_collection_items);
+    if (count == 0) return error.CacheProjectionValueChoiceCasesInvalid;
+    const cases = try allocator.alloc(ChoiceCase, count);
+    for (cases) |*case| case.* = .{ .equals = &.{}, .value = .pending };
+    errdefer {
+        for (cases) |*case| case.deinit(allocator);
+        allocator.free(cases);
+    }
+    const fallback = try allocator.create(Value);
+    errdefer allocator.destroy(fallback);
+    fallback.* = .pending;
+    errdefer fallback.deinit(allocator);
+    try pushDecodeTask(tasks, task_count, .{
+        .value = .{ .target = fallback, .depth = task.depth + 1 },
+    });
+    var index = cases.len;
+    while (index > 0) {
+        index -= 1;
+        try pushDecodeTask(tasks, task_count, .{
+            .choice_case = .{
+                .cases = cases,
+                .index = index,
+                .depth = task.depth + 1,
+            },
+        });
+    }
+    task.target.* = .{ .choice = .{
+        .pointer = pointer,
+        .cases = cases,
+        .fallback = fallback,
+    } };
+}
+
+fn decodeChoiceCase(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    state: *const DecodeState,
+    task: DecodeChoiceCaseTask,
+    tasks: *[max_nodes * 2 + 1]DecodeTask,
+    task_count: *usize,
+) !void {
+    const equals = try decoder.readBytesAlloc(
+        allocator,
+        state.max_output_bytes,
+    );
+    errdefer allocator.free(equals);
+    try validateCanonicalJson(allocator, equals);
+    for (task.cases[0..task.index]) |prior| {
+        if (std.mem.eql(u8, prior.equals, equals)) {
+            return error.CacheProjectionValueChoiceCasesNotUnique;
+        }
+    }
+    task.cases[task.index].equals = equals;
+    try pushDecodeTask(tasks, task_count, .{
+        .value = .{
+            .target = &task.cases[task.index].value,
+            .depth = task.depth,
+        },
+    });
 }
 
 fn validateCanonicalJson(
@@ -799,105 +1148,216 @@ pub fn write(
     plan: Value,
     source: std.json.Value,
 ) !void {
-    switch (plan) {
-        .literal => |bytes| try writer.writeAll(bytes),
-        .pointer => |pointer| {
-            if (definition_core.json_pointer.lookup(
-                source,
-                pointer.pointer,
-            )) |selected| {
-                try definition_core.canonical_json.writeCanonicalJson(
-                    allocator,
-                    writer,
-                    selected,
-                );
-            } else if (pointer.fallback_pointer) |fallback_pointer| {
-                if (definition_core.json_pointer.lookup(
-                    source,
-                    fallback_pointer,
-                )) |selected| {
-                    try definition_core.canonical_json.writeCanonicalJson(
-                        allocator,
-                        writer,
-                        selected,
-                    );
-                } else if (pointer.fallback) |fallback| {
-                    try writer.writeAll(fallback);
-                } else {
-                    return error.ProjectionValuePathMissing;
-                }
-            } else if (pointer.fallback) |fallback| {
-                try writer.writeAll(fallback);
-            } else {
-                return error.ProjectionValuePathMissing;
-            }
-        },
-        .concat => |concat| {
-            var text: std.Io.Writer.Allocating = .init(allocator);
-            defer text.deinit();
-            for (concat.fragments) |fragment| {
-                switch (fragment) {
-                    .literal => |literal| {
-                        try text.writer.writeAll(literal);
-                    },
-                    .pointer => |pointer| {
-                        const selected = definition_core.json_pointer.lookup(
-                            source,
-                            pointer,
-                        ) orelse return error.ProjectionValuePathMissing;
-                        try text.writer.writeAll(
-                            try definition_core.json.string(selected),
-                        );
-                    },
-                }
-                if (text.written().len > concat.max_bytes) {
-                    return error.ProjectionValueConcatBoundsExceeded;
-                }
-            }
-            try definition_core.canonical_json.writeCanonicalString(
-                writer,
-                text.written(),
-            );
-        },
-        .object => |fields| {
-            try writer.writeByte('{');
-            for (fields, 0..) |field, index| {
-                if (index != 0) try writer.writeByte(',');
+    var tasks: [max_nodes * 4 + 16]WriteTask = undefined;
+    var task_count: usize = 0;
+    try pushWriteTask(&tasks, &task_count, .{ .value = plan });
+    var nodes: usize = 0;
+    while (task_count > 0) {
+        task_count -= 1;
+        switch (tasks[task_count]) {
+            .byte => |byte| try writer.writeByte(byte),
+            .canonical_string => |text| {
                 try definition_core.canonical_json.writeCanonicalString(
                     writer,
-                    field.name,
+                    text,
                 );
-                try writer.writeByte(':');
-                try write(allocator, writer, field.value, source);
-            }
-            try writer.writeByte('}');
-        },
-        .array => |items| {
-            try writer.writeByte('[');
-            for (items, 0..) |item, index| {
-                if (index != 0) try writer.writeByte(',');
-                try write(allocator, writer, item, source);
-            }
-            try writer.writeByte(']');
-        },
-        .choice => |choice| {
-            const selected = definition_core.json_pointer.lookup(
-                source,
-                choice.pointer,
-            ) orelse return error.ProjectionValuePathMissing;
-            const canonical =
-                try definition_core.canonical_json.canonicalJsonAlloc(
+            },
+            .value => |value| {
+                nodes += 1;
+                if (nodes > max_nodes) {
+                    return error.ProjectionValueNodesExceeded;
+                }
+                try writeOne(
                     allocator,
-                    selected,
+                    writer,
+                    value,
+                    source,
+                    &tasks,
+                    &task_count,
                 );
-            defer allocator.free(canonical);
-            for (choice.cases) |case| {
-                if (!std.mem.eql(u8, case.equals, canonical)) continue;
-                return write(allocator, writer, case.value, source);
-            }
-            try write(allocator, writer, choice.fallback.*, source);
-        },
+            },
+        }
     }
+}
+
+const WriteTask = union(enum) {
+    value: Value,
+    byte: u8,
+    canonical_string: []const u8,
+};
+
+fn pushWriteTask(
+    tasks: *[max_nodes * 4 + 16]WriteTask,
+    count: *usize,
+    task: WriteTask,
+) !void {
+    if (count.* == tasks.len) return error.ProjectionValueNodesExceeded;
+    tasks[count.*] = task;
+    count.* += 1;
+}
+
+fn writeOne(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    plan: Value,
+    source: std.json.Value,
+    tasks: *[max_nodes * 4 + 16]WriteTask,
+    task_count: *usize,
+) !void {
+    switch (plan) {
+        .literal => |bytes| try writer.writeAll(bytes),
+        .pointer => |pointer| try writePointer(
+            allocator,
+            writer,
+            pointer,
+            source,
+        ),
+        .concat => |concat| try writeConcat(allocator, writer, concat, source),
+        .object => |fields| try scheduleObject(
+            writer,
+            fields,
+            tasks,
+            task_count,
+        ),
+        .array => |items| try scheduleArray(writer, items, tasks, task_count),
+        .choice => |choice| try scheduleChoice(
+            allocator,
+            choice,
+            source,
+            tasks,
+            task_count,
+        ),
+        .pending => return error.ProjectionValuePending,
+    }
+}
+
+fn writePointer(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    pointer: Pointer,
+    source: std.json.Value,
+) !void {
+    if (definition_core.json_pointer.lookup(
+        source,
+        pointer.pointer,
+    )) |selected| {
+        return definition_core.canonical_json.writeCanonicalJson(
+            allocator,
+            writer,
+            selected,
+        );
+    }
+    if (pointer.fallback_pointer) |fallback_pointer| {
+        if (definition_core.json_pointer.lookup(
+            source,
+            fallback_pointer,
+        )) |selected| {
+            return definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                writer,
+                selected,
+            );
+        }
+    }
+    if (pointer.fallback) |fallback| return writer.writeAll(fallback);
+    return error.ProjectionValuePathMissing;
+}
+
+fn writeConcat(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    concat: Concat,
+    source: std.json.Value,
+) !void {
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    for (concat.fragments) |fragment| {
+        switch (fragment) {
+            .literal => |literal| try text.writer.writeAll(literal),
+            .pointer => |pointer| {
+                const selected = definition_core.json_pointer.lookup(
+                    source,
+                    pointer,
+                ) orelse return error.ProjectionValuePathMissing;
+                try text.writer.writeAll(
+                    try definition_core.json.string(selected),
+                );
+            },
+        }
+        if (text.written().len > concat.max_bytes) {
+            return error.ProjectionValueConcatBoundsExceeded;
+        }
+    }
+    try definition_core.canonical_json.writeCanonicalString(
+        writer,
+        text.written(),
+    );
+}
+
+fn scheduleObject(
+    writer: *std.Io.Writer,
+    fields: []const Field,
+    tasks: *[max_nodes * 4 + 16]WriteTask,
+    task_count: *usize,
+) !void {
+    try writer.writeByte('{');
+    try pushWriteTask(tasks, task_count, .{ .byte = '}' });
+    var index = fields.len;
+    while (index > 0) {
+        index -= 1;
+        try pushWriteTask(tasks, task_count, .{
+            .value = fields[index].value,
+        });
+        try pushWriteTask(tasks, task_count, .{ .byte = ':' });
+        try pushWriteTask(tasks, task_count, .{
+            .canonical_string = fields[index].name,
+        });
+        if (index != 0) {
+            try pushWriteTask(tasks, task_count, .{ .byte = ',' });
+        }
+    }
+}
+
+fn scheduleArray(
+    writer: *std.Io.Writer,
+    items: []const Value,
+    tasks: *[max_nodes * 4 + 16]WriteTask,
+    task_count: *usize,
+) !void {
+    try writer.writeByte('[');
+    try pushWriteTask(tasks, task_count, .{ .byte = ']' });
+    var index = items.len;
+    while (index > 0) {
+        index -= 1;
+        try pushWriteTask(tasks, task_count, .{ .value = items[index] });
+        if (index != 0) {
+            try pushWriteTask(tasks, task_count, .{ .byte = ',' });
+        }
+    }
+}
+
+fn scheduleChoice(
+    allocator: std.mem.Allocator,
+    choice: Choice,
+    source: std.json.Value,
+    tasks: *[max_nodes * 4 + 16]WriteTask,
+    task_count: *usize,
+) !void {
+    const selected = definition_core.json_pointer.lookup(
+        source,
+        choice.pointer,
+    ) orelse return error.ProjectionValuePathMissing;
+    const canonical =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            selected,
+        );
+    defer allocator.free(canonical);
+    for (choice.cases) |case| {
+        if (!std.mem.eql(u8, case.equals, canonical)) continue;
+        return pushWriteTask(tasks, task_count, .{ .value = case.value });
+    }
+    try pushWriteTask(tasks, task_count, .{ .value = choice.fallback.* });
 }
 
 test "bounded projection value compiles caches and writes one document" {
