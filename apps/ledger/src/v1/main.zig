@@ -108,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
     defer runtime_io = null;
     ledger.transaction.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const code = runWithArgv(init.gpa, argv) catch |err| blk: {
+    const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
         emitCommandError(err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
             return write_err;
@@ -120,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
 
 pub fn runWithArgv(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     if (argv.len < 2 or isHelp(argv[1])) {
@@ -137,39 +138,41 @@ pub fn runWithArgv(
     if (std.mem.eql(u8, argv[1], "definition")) {
         if (argv.len < 3) return error.MissingDefinitionAction;
         if (std.mem.eql(u8, argv[2], "check")) {
-            return runDefinitionCheck(allocator, argv[3..]);
+            return runDefinitionCheck(allocator, environment, argv[3..]);
         }
         if (std.mem.eql(u8, argv[2], "describe")) {
-            return runDefinitionDescribe(allocator, argv[3..]);
+            return runDefinitionDescribe(allocator, environment, argv[3..]);
         }
         return error.UnknownDefinitionAction;
     }
     if (std.mem.eql(u8, argv[1], "validate")) {
-        return runValidate(allocator, argv[2..]);
+        return runValidate(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "materialize")) {
-        return runMaterialize(allocator, argv[2..]);
+        return runMaterialize(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "transact")) {
-        return runTransact(allocator, argv[2..]);
+        return runTransact(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "project")) {
-        return runProject(allocator, argv[2..]);
+        return runProject(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "doctor")) {
-        return runDoctor(allocator, argv[2..]);
+        return runDoctor(allocator, environment, argv[2..]);
     }
     return error.UnknownCommand;
 }
 
 fn runTransact(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseTransactionArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.common.definition_path,
         .{ .kind = .transact, .name = args.operation },
     );
@@ -226,12 +229,14 @@ fn runTransact(
 
 fn runDoctor(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseDoctorArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .doctor },
     );
@@ -264,12 +269,14 @@ fn runDoctor(
 
 fn runProject(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseProjectionArgs(allocator, argv);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .project, .name = args.projection },
     );
@@ -324,12 +331,14 @@ fn runProject(
 
 fn runDefinitionCheck(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .definition_check },
     );
@@ -380,12 +389,14 @@ fn runDefinitionCheck(
 
 fn runDefinitionDescribe(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, false);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .definition },
     );
@@ -420,12 +431,14 @@ fn runDefinitionDescribe(
 
 fn runValidate(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .validation },
     );
@@ -458,12 +471,14 @@ fn runValidate(
 
 fn runMaterialize(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseCommonArgs(allocator, argv, true);
     defer args.deinit(allocator);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .kind = .materialization },
     );
@@ -746,6 +761,7 @@ fn parseDoctorArgs(
 
 fn loadDefinition(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     path: []const u8,
     route: ledger.compiled_plan.Route,
 ) !DefinitionContext {
@@ -764,7 +780,7 @@ fn loadDefinition(
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
         try definition_core.closure.admittedLocation(absolute, cwd.?);
-    const cache_dir = try ledgerCacheDirAlloc(allocator);
+    const cache_dir = try ledgerCacheDirAlloc(allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
         allocator,
@@ -794,16 +810,17 @@ fn absoluteDefinitionPathAlloc(
 
 fn ledgerCacheDirAlloc(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
 ) !?[]u8 {
     var base: []const u8 = undefined;
     var suffix: []const u8 = undefined;
-    if (environmentValue("LEDGER_CACHE_DIR")) |value| {
+    if (environmentValue(environment, "LEDGER_CACHE_DIR")) |value| {
         base = value;
         suffix = "definitions";
-    } else if (environmentValue("XDG_CACHE_HOME")) |value| {
+    } else if (environmentValue(environment, "XDG_CACHE_HOME")) |value| {
         base = value;
         suffix = "ledger/definitions";
-    } else if (environmentValue("HOME")) |value| {
+    } else if (environmentValue(environment, "HOME")) |value| {
         base = value;
         suffix = ".cache/ledger/definitions";
     } else {
@@ -823,10 +840,12 @@ fn ledgerCacheDirAlloc(
     return try std.fs.path.resolve(allocator, &.{ cwd, joined });
 }
 
-fn environmentValue(comptime key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    const bytes = std.mem.span(value);
-    return if (bytes.len == 0) null else bytes;
+fn environmentValue(
+    environment: *const std.process.Environ.Map,
+    key: []const u8,
+) ?[]const u8 {
+    const value = environment.get(key) orelse return null;
+    return if (value.len == 0) null else value;
 }
 
 fn readDocuments(

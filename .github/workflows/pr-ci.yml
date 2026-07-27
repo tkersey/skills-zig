@@ -191,7 +191,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Fuzz passive definition parsing (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "
+        run: .github/scripts/linux_fuzz_gate.sh -- zig test -Mroot=libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "
 
   lift:
     needs: changes

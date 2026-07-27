@@ -70,16 +70,19 @@ pub const Options = struct {
     once: bool = false,
     limit: usize = 0,
     format: Format = .json,
+    environment: ?*const std.process.Environ.Map = null,
 };
 
 pub fn run(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     command: Command,
     argv: []const []const u8,
     writer: *std.Io.Writer,
     io: std.Io,
 ) !u8 {
-    const options = try parseOptions(command, argv);
+    var options = try parseOptions(command, argv);
+    options.environment = environment;
     switch (command) {
         .sessions => try runRelation(
             allocator,
@@ -994,7 +997,11 @@ fn runIndex(
     options: Options,
 ) !void {
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    const root = try resolveRootAlloc(allocator, options.root);
+    const root = try resolveRootAlloc(
+        allocator,
+        options.environment,
+        options.root,
+    );
     defer allocator.free(root);
     const index_path = try std.fs.path.join(
         allocator,
@@ -1069,10 +1076,17 @@ pub fn resolveTargetPaths(
     if (options.path) |path| {
         var paths: std.ArrayList([]u8) = .empty;
         errdefer freePaths(allocator, &paths);
-        try paths.append(allocator, try absolutePathAlloc(allocator, path));
+        try paths.append(
+            allocator,
+            try absolutePathAlloc(allocator, options.environment, path),
+        );
         return paths;
     }
-    const root = try resolveRootAlloc(allocator, options.root);
+    const root = try resolveRootAlloc(
+        allocator,
+        options.environment,
+        options.root,
+    );
     defer allocator.free(root);
     var paths = try collectJsonlPaths(allocator, io, root);
     errdefer freePaths(allocator, &paths);
@@ -1200,23 +1214,27 @@ pub fn freePaths(
 
 fn resolveRootAlloc(
     allocator: std.mem.Allocator,
+    environment: ?*const std.process.Environ.Map,
     root: ?[]const u8,
 ) ![]u8 {
-    if (root) |explicit| return absolutePathAlloc(allocator, explicit);
-    if (environmentValue("CODEX_HOME")) |codex_home| {
+    if (root) |explicit| {
+        return absolutePathAlloc(allocator, environment, explicit);
+    }
+    if (environmentValue(environment, "CODEX_HOME")) |codex_home| {
         return std.fs.path.join(allocator, &.{ codex_home, "sessions" });
     }
-    const home = environmentValue("HOME") orelse
+    const home = environmentValue(environment, "HOME") orelse
         return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
 }
 
 fn absolutePathAlloc(
     allocator: std.mem.Allocator,
+    environment: ?*const std.process.Environ.Map,
     path: []const u8,
 ) ![]u8 {
     if (std.mem.startsWith(u8, path, "~/")) {
-        const home = environmentValue("HOME") orelse
+        const home = environmentValue(environment, "HOME") orelse
             return error.EnvironmentVariableNotFound;
         return std.fs.path.resolve(allocator, &.{ home, path[2..] });
     }
@@ -1316,10 +1334,13 @@ fn traceOptions(relation: physical.Relation) trace_core.TraceParseOptions {
     };
 }
 
-fn environmentValue(comptime key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    const bytes = std.mem.span(value);
-    return if (bytes.len == 0) null else bytes;
+fn environmentValue(
+    environment: ?*const std.process.Environ.Map,
+    key: []const u8,
+) ?[]const u8 {
+    const map = environment orelse return null;
+    const value = map.get(key) orelse return null;
+    return if (value.len == 0) null else value;
 }
 
 test "final native command registry is physical only" {

@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     defer runtime_io = null;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    const code = runWithArgv(init.gpa, argv) catch |err| blk: {
+    const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
         emitCommandError(err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
             return write_err;
@@ -85,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
 
 pub fn runWithArgv(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     if (argv.len < 2 or isHelp(argv[1])) {
@@ -102,23 +103,24 @@ pub fn runWithArgv(
     if (std.mem.eql(u8, argv[1], "definition")) {
         if (argv.len < 3) return error.MissingDefinitionAction;
         if (std.mem.eql(u8, argv[2], "check")) {
-            return runDefinitionCheck(allocator, argv[3..]);
+            return runDefinitionCheck(allocator, environment, argv[3..]);
         }
         if (std.mem.eql(u8, argv[2], "describe")) {
-            return runDefinitionDescribe(allocator, argv[3..]);
+            return runDefinitionDescribe(allocator, environment, argv[3..]);
         }
         return error.UnknownDefinitionAction;
     }
     if (std.mem.eql(u8, argv[1], "observe")) {
-        return runObserve(allocator, argv[2..]);
+        return runObserve(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "explain")) {
-        return runExplain(allocator, argv[2..]);
+        return runExplain(allocator, environment, argv[2..]);
     }
     if (seq.native.Command.parse(argv[1])) |command| {
         var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
         return seq.native.run(
             allocator,
+            environment,
             command,
             argv[2..],
             &stdout_writer.interface,
@@ -130,16 +132,19 @@ pub fn runWithArgv(
 
 fn runExplain(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseObserveArgs(allocator, argv);
     defer args.deinit(allocator);
+    args.selectors.environment = environment;
     if (hasPhysicalSelector(args.selectors) or args.input_specs.len != 0) {
         return error.ExplainDoesNotReadCorpus;
     }
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .projection_names = &projection_names },
     );
@@ -243,11 +248,13 @@ fn runExplain(
 
 fn runDefinitionCheck(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     const args = try parseDefinitionArgs(argv);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{},
     );
@@ -292,11 +299,13 @@ fn runDefinitionCheck(
 
 fn runDefinitionDescribe(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     const args = try parseDefinitionArgs(argv);
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{},
     );
@@ -363,14 +372,17 @@ fn runDefinitionDescribe(
 
 fn runObserve(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
     var args = try parseObserveArgs(allocator, argv);
     defer args.deinit(allocator);
+    args.selectors.environment = environment;
     if (args.format != .json) return error.UnsupportedObservationRenderer;
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
         allocator,
+        environment,
         args.definition_path,
         .{ .projection_names = &projection_names },
     );
@@ -801,6 +813,7 @@ const CorpusSetHasher = struct {
 
 fn loadDefinition(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
     path: []const u8,
     request: seq.compiled_plan.Request,
 ) !seq.compiled_plan.PlanSet {
@@ -819,7 +832,7 @@ fn loadDefinition(
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
         try definition_core.closure.admittedLocation(absolute, cwd.?);
-    const cache_dir = try seqCacheDirAlloc(allocator);
+    const cache_dir = try seqCacheDirAlloc(allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return seq.compiled_plan.load(
         allocator,
@@ -850,16 +863,17 @@ fn absoluteDefinitionPathAlloc(
 
 fn seqCacheDirAlloc(
     allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
 ) !?[]u8 {
     var base: []const u8 = undefined;
     var suffix: []const u8 = undefined;
-    if (environmentValue("SEQ_CACHE_DIR")) |value| {
+    if (environmentValue(environment, "SEQ_CACHE_DIR")) |value| {
         base = value;
         suffix = "definitions";
-    } else if (environmentValue("XDG_CACHE_HOME")) |value| {
+    } else if (environmentValue(environment, "XDG_CACHE_HOME")) |value| {
         base = value;
         suffix = "seq/definitions";
-    } else if (environmentValue("HOME")) |value| {
+    } else if (environmentValue(environment, "HOME")) |value| {
         base = value;
         suffix = ".cache/seq/definitions";
     } else {
@@ -1049,10 +1063,12 @@ fn writeString(writer: *std.Io.Writer, value: []const u8) !void {
     try definition_core.canonical_json.writeCanonicalString(writer, value);
 }
 
-fn environmentValue(comptime key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    const bytes = std.mem.span(value);
-    return if (bytes.len == 0) null else bytes;
+fn environmentValue(
+    environment: *const std.process.Environ.Map,
+    key: []const u8,
+) ?[]const u8 {
+    const value = environment.get(key) orelse return null;
+    return if (value.len == 0) null else value;
 }
 
 fn monotonicNanoseconds() i128 {
