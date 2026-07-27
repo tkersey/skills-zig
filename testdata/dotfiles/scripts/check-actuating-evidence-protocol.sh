@@ -7,6 +7,7 @@ source "$script_dir/lib/definition-cases.sh"
 
 dotfiles_root=${DOTFILES_ROOT:-"$HOME/.dotfiles"}
 dotfiles_root=$(git -C "$dotfiles_root" rev-parse --show-toplevel)
+seq_bin=${SEQ_BIN:-seq}
 ledger_bin=${LEDGER_BIN:-ledger}
 fixture_sets="$skills_zig_root/testdata/dotfiles/skill-definitions"
 scenarios=$(
@@ -17,8 +18,10 @@ protocol_definition=$(
   jq -r '.protocol_definition' "$scenarios"
 )
 protocol_definition="$dotfiles_root/$protocol_definition"
+artifact_kernel_definition="$dotfiles_root/codex/skills/actuating/definitions/seq/artifact-kernel.json"
 
 command -v jq >/dev/null
+command -v "$seq_bin" >/dev/null
 command -v "$ledger_bin" >/dev/null
 
 jq -e \
@@ -182,6 +185,7 @@ check_structural_facts() {
   local repo_root=$2
   local result="$case_tmp/structural-facts.json"
   local payload="$case_tmp/structural-facts-payload.json"
+  local observation="$case_tmp/artifact-kernel-observation.json"
   local expected_head
 
   "$ledger_bin" project \
@@ -201,19 +205,21 @@ check_structural_facts() {
       .schema == "ledger-projection-result/v1" and
       .definition.id == "actuating/evidence-protocol" and
       .projection == "structural-facts" and
-      .data.construction_ref ==
+      .data.schema == "actuating-structural-facts/v1" and
+      (.data.rows | length) == 1 and
+      .data.rows[0].construction_ref ==
         $context[0].construction_artifact_id and
-      .data.counterexample_class_count == 1 and
-      .data.event_count == 3 and
-      .data.event_kinds.construction_contract_registered == 1 and
-      .data.event_kinds.counterexample_set_registered == 1 and
-      .data.event_kinds.goal_contract_registered == 1 and
-      ([.data.event_kinds[]] | add) == 3 and
-      .data.goal_contract_ref == $context[0].goal_artifact_id and
-      .data.goal_id == "goal-1" and
-      .data.head_digest == $head and
-      .data.pending_operation == null and
-      .data.subject_digest == $context[0].subject_digest and
+      .data.rows[0].counterexample_class_count == 1 and
+      .data.rows[0].event_count == 3 and
+      .data.rows[0].event_kinds.construction_contract_registered == 1 and
+      .data.rows[0].event_kinds.counterexample_set_registered == 1 and
+      .data.rows[0].event_kinds.goal_contract_registered == 1 and
+      ([.data.rows[0].event_kinds[]] | add) == 3 and
+      .data.rows[0].goal_contract_ref == $context[0].goal_artifact_id and
+      .data.rows[0].goal_id == "goal-1" and
+      .data.rows[0].head_digest == $head and
+      .data.rows[0].pending_operation == null and
+      .data.rows[0].subject_digest == $context[0].subject_digest and
       .authority_granted == false and
       .storage_mutated == false
     ' \
@@ -226,7 +232,36 @@ check_structural_facts() {
     --param goal=goal-1 \
     --payload-only \
     --format json >"$payload"
-  jq -S -c '.data' "$result" | cmp -s - "$payload"
+  jq -c '.data' "$result" | cmp -s - "$payload"
+
+  "$seq_bin" observe \
+    --definition "$artifact_kernel_definition" \
+    --input "facts=$payload" \
+    --projection structural-facts \
+    --format json >"$observation"
+  jq -e \
+    --arg head "$expected_head" \
+    --slurpfile context "$case_tmp/context.json" \
+    '
+      .schema == "seq-observation-result/v1" and
+      .definition.id == "actuating/artifact-kernel" and
+      .corpus.adapter == "immutable-relation-json/v1" and
+      .corpus.contaminated == false and
+      .projection == "structural-facts" and
+      .data.schema == "actuating-artifact-kernel-observation/v1" and
+      (.data.rows | length) == 1 and
+      .data.rows[0].construction_ref ==
+        $context[0].construction_artifact_id and
+      .data.rows[0].counterexample_class_count == 1 and
+      .data.rows[0].event_count == 3 and
+      .data.rows[0].goal_contract_ref == $context[0].goal_artifact_id and
+      .data.rows[0].goal_id == "goal-1" and
+      .data.rows[0].head_digest == $head and
+      .data.rows[0].pending_operation == null and
+      .data.rows[0].subject_digest == $context[0].subject_digest and
+      .authority_granted == false
+    ' \
+    "$observation" >/dev/null
 }
 
 setup_review() {

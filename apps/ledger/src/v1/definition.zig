@@ -192,7 +192,7 @@ pub const Operator = enum {
             .filter => 2,
             .id_lookup, .latest => 2,
             .relevance => 3,
-            .@"export" => 5,
+            .@"export" => 6,
             .sort => 1,
             else => 1,
         };

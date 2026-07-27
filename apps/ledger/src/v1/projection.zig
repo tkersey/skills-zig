@@ -1263,9 +1263,15 @@ pub fn validateCachePlan(
                             return error.CacheProjectionPlanMismatch;
                     if (projection.limit != null or
                         projection.predicates.len != 0 or
-                        projection.constructed_value != null or
+                        projection.raw or projection.single or
+                        projection.require_match or
                         retained.fields.len == 0 or
                         retained.fields.len > 256)
+                    {
+                        return error.CacheProjectionPlanMismatch;
+                    }
+                    if (projection.constructed_value != null and
+                        !definition_plan.requires(.@"export"))
                     {
                         return error.CacheProjectionPlanMismatch;
                     }
@@ -2259,13 +2265,17 @@ fn compileProjection(
                 limit = try compileLimit(allocator, definition_plan, step);
             },
             .@"export" => {
-                if (selection_seen or limit != null or
-                    (fold != null and
-                        (fold.? != .keyed or !single or
-                            predicates.items.len != 1)))
-                {
+                if (selection_seen or limit != null) {
                     return error.InvalidProjectionOperatorOrder;
                 }
+                if (fold) |compiled_fold| switch (compiled_fold) {
+                    .keyed => if (!single or predicates.items.len != 1) {
+                        return error.InvalidProjectionOperatorOrder;
+                    },
+                    .retained => if (single or predicates.items.len != 0) {
+                        return error.InvalidProjectionOperatorOrder;
+                    },
+                };
                 if (fold != null and step.get("value") == null) {
                     return error.FoldExportRequiresConstructedValue;
                 }
@@ -2350,35 +2360,44 @@ fn compileProjection(
         }
     }
     if (fold != null) {
-        if (fold.? != .keyed and
-            (predicates.items.len != 0 or constructed_value != null))
-        {
+        if (fold.? != .keyed and predicates.items.len != 0) {
             return error.InvalidFoldProjectionComposition;
         }
         if (constructed_value != null) {
-            if (predicates.items.len != 1 or
-                !single or !require_match or
-                fields.len != 0 or value_path != null or raw_export or
-                limit != null)
-            {
-                return error.InvalidFoldProjectionComposition;
-            }
-            const keyed = fold.?.keyed;
-            if (predicates.items[0] != .one) {
-                return error.FoldLookupRequiresSinglePredicate;
-            }
-            const predicate = predicates.items[0].one;
-            if (predicate.operand != .parameter) {
-                return error.FoldLookupRequiresParameter;
-            }
-            var expected_path: [130]u8 = undefined;
-            const path = try std.fmt.bufPrint(
-                &expected_path,
-                "/{s}",
-                .{keyed.key_field},
-            );
-            if (!std.mem.eql(u8, predicate.pointer.raw, path)) {
-                return error.FoldLookupMustUseKeyField;
+            switch (fold.?) {
+                .keyed => |keyed| {
+                    if (predicates.items.len != 1 or
+                        !single or !require_match or
+                        fields.len != 0 or value_path != null or
+                        raw_export or limit != null)
+                    {
+                        return error.InvalidFoldProjectionComposition;
+                    }
+                    if (predicates.items[0] != .one) {
+                        return error.FoldLookupRequiresSinglePredicate;
+                    }
+                    const predicate = predicates.items[0].one;
+                    if (predicate.operand != .parameter) {
+                        return error.FoldLookupRequiresParameter;
+                    }
+                    var expected_path: [130]u8 = undefined;
+                    const path = try std.fmt.bufPrint(
+                        &expected_path,
+                        "/{s}",
+                        .{keyed.key_field},
+                    );
+                    if (!std.mem.eql(u8, predicate.pointer.raw, path)) {
+                        return error.FoldLookupMustUseKeyField;
+                    }
+                },
+                .retained => {
+                    if (predicates.items.len != 0 or single or
+                        require_match or fields.len != 0 or
+                        value_path != null or raw_export or limit != null)
+                    {
+                        return error.InvalidFoldProjectionComposition;
+                    }
+                },
             }
         } else if (fields.len != 0 or value_path != null or raw_export) {
             return error.InvalidFoldProjectionComposition;
@@ -3967,13 +3986,15 @@ pub fn execute(
                         value
                     else
                         return error.FoldRetainedPlanMissing;
-                try writeRetainedProjection(
+                try writeRetainedProjectionOutput(
                     allocator,
                     &output.writer,
+                    compiled,
                     event_plan,
                     retained_plan,
                     replay_state,
                     retained.fields,
+                    plan.max_output_bytes,
                 );
                 stats.records_matched = 1;
                 stats.records_emitted = 1;
@@ -4872,6 +4893,54 @@ fn writeRetainedProjection(
     try writer.writeByte('}');
 }
 
+fn writeRetainedProjectionOutput(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    projection: *const Projection,
+    event_plan: *const protocol.Plan,
+    retained_plan: *const state_reducer.Plan,
+    replay_state: *const protocol.ReplayState,
+    fields: []const RetainedField,
+    max_output_bytes: usize,
+) !void {
+    const constructed = projection.constructed_value orelse {
+        return writeRetainedProjection(
+            allocator,
+            writer,
+            event_plan,
+            retained_plan,
+            replay_state,
+            fields,
+        );
+    };
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    try writeRetainedProjection(
+        allocator,
+        &source.writer,
+        event_plan,
+        retained_plan,
+        replay_state,
+        fields,
+    );
+    if (source.written().len > max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source.written(),
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    try projection_value.write(
+        allocator,
+        writer,
+        constructed,
+        parsed.value,
+    );
+}
+
 fn retainedValueCount(value: std.json.Value) !usize {
     return switch (value) {
         .array => |items| items.items.len,
@@ -5484,6 +5553,104 @@ test "projection plan round trips through the bounded cache codec" {
     try std.testing.expectEqual(
         plan.projections[0].fields.len,
         cached.projections[0].fields.len,
+    );
+}
+
+test "retained fold exports one bounded constructed relation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["append-only-log","compare-and-append","event-kinds","export","fold","reducer","replay"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"append-only-log","input":"event"},{"op":"event-kinds","values":["created"]},{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]}]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{"facts":{"slot":"events","pipeline":[{"op":"fold","fields":{"current_id":{"register":"current","path":"/id"},"event_count":{"meta":"record-count"}}},{"op":"export","value":{"object":[{"name":"schema","value":{"literal":"example-facts/v1"}},{"name":"rows","value":{"array":[{"object":[{"name":"current_id","value":{"path":"/current_id"}},{"name":"event_count","value":{"path":"/event_count"}}]}]}}]}}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+        &protocol_plan,
+    );
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(
+        &cached,
+        &definition_plan,
+        &storage_plan,
+        &protocol_plan,
+    );
+    const facts = cached.find("facts").?;
+    try std.testing.expect(facts.constructed_value != null);
+    const retained = switch (facts.fold.?) {
+        .retained => |value| value,
+        .keyed => return error.TestExpectedRetainedFold,
+    };
+    var replay_state = protocol.ReplayState.init(&protocol_plan);
+    defer replay_state.deinit(std.testing.allocator);
+    var event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"kind\":\"created\",\"body\":{\"id\":\"item-1\"}}",
+        .{},
+    );
+    defer event.deinit();
+    try protocol.applyValue(
+        std.testing.allocator,
+        &protocol_plan,
+        &replay_state,
+        event.value,
+    );
+    var output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer output.deinit();
+    try writeRetainedProjectionOutput(
+        std.testing.allocator,
+        &output.writer,
+        facts,
+        &protocol_plan,
+        &protocol_plan.state_reducer_plan.?,
+        &replay_state,
+        retained.fields,
+        4096,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"example-facts/v1\",\"rows\":[{\"current_id\":\"item-1\",\"event_count\":1}]}",
+        output.written(),
     );
 }
 
