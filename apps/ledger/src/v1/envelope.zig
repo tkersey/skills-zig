@@ -317,8 +317,9 @@ pub fn writeProjectionJson(
     try writer.writeAll(",\"data\":");
     try writer.writeAll(result.payload);
     try writer.print(
-        ",\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"compile_stats\":",
+        ",\"exit_code\":{d},\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"compile_stats\":",
         .{
+            result.exit_code,
             result.stats.records_scanned,
             result.stats.records_matched,
             result.stats.records_emitted,

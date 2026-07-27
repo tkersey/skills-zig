@@ -64,6 +64,32 @@ const Predicate = struct {
     }
 };
 
+const PredicateSet = struct {
+    predicates: []Predicate,
+
+    fn deinit(self: *PredicateSet, allocator: std.mem.Allocator) void {
+        for (self.predicates) |*predicate| predicate.deinit(allocator);
+        allocator.free(self.predicates);
+        self.* = undefined;
+    }
+};
+
+const PredicateGroup = union(enum) {
+    one: Predicate,
+    any: []PredicateSet,
+
+    fn deinit(self: *PredicateGroup, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .one => |*predicate| predicate.deinit(allocator),
+            .any => |sets| {
+                for (sets) |*set| set.deinit(allocator);
+                allocator.free(sets);
+            },
+        }
+        self.* = undefined;
+    }
+};
+
 const Field = struct {
     name: []u8,
     pointer: definition_core.json_pointer.Pointer,
@@ -556,10 +582,22 @@ const Fold = union(enum) {
     }
 };
 
+pub const ExitPolicy = struct {
+    matched: u8 = 0,
+    unmatched: u8 = 0,
+    failure: ?u8 = null,
+
+    fn active(self: ExitPolicy) bool {
+        return self.matched != 0 or self.unmatched != 0 or
+            self.failure != null;
+    }
+};
+
 pub const Projection = struct {
     name: []u8,
     slot_index: u16,
-    predicates: []Predicate,
+    required_parameters: [][]u8,
+    predicates: []PredicateGroup,
     fields: []Field,
     preserve_field_order: bool,
     raw: bool,
@@ -572,9 +610,12 @@ pub const Projection = struct {
     latest: ?definition_core.json_pointer.Pointer,
     limit: ?Limit,
     fold: ?Fold,
+    exit_policy: ExitPolicy,
 
     fn deinit(self: *Projection, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
+        for (self.required_parameters) |name| allocator.free(name);
+        allocator.free(self.required_parameters);
         for (self.predicates) |*predicate| predicate.deinit(allocator);
         allocator.free(self.predicates);
         for (self.fields) |*field| field.deinit(allocator);
@@ -632,6 +673,7 @@ pub const Result = struct {
     payload: []u8,
     stats: Stats,
     limitations: [][]u8,
+    exit_code: u8,
     authority_granted: bool = false,
     storage_mutated: bool = false,
 
@@ -912,24 +954,33 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(10);
+    try encoder.writeU16(13);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
         try encoder.writeU16(projection.slot_index);
+        try encoder.writeCount(projection.required_parameters.len);
+        for (projection.required_parameters) |name| {
+            try encoder.writeBytes(name);
+        }
         try encoder.writeCount(projection.predicates.len);
-        for (projection.predicates) |predicate| {
-            try encoder.writeBytes(predicate.pointer.raw);
-            switch (predicate.operand) {
-                .constant => |value| {
+        for (projection.predicates) |group| {
+            switch (group) {
+                .one => |predicate| {
                     try encoder.writeByte(0);
-                    try encodeCacheScalar(encoder, value);
+                    try encodeCachePredicate(encoder, predicate);
                 },
-                .parameter => |name| {
+                .any => |sets| {
                     try encoder.writeByte(1);
-                    try encoder.writeBytes(name);
+                    try encoder.writeCount(sets.len);
+                    for (sets) |set| {
+                        try encoder.writeCount(set.predicates.len);
+                        for (set.predicates) |predicate| {
+                            try encodeCachePredicate(encoder, predicate);
+                        }
+                    }
                 },
             }
         }
@@ -945,6 +996,12 @@ pub fn encodeCache(
         }
         try encoder.writeBool(projection.single);
         try encoder.writeBool(projection.require_match);
+        try encoder.writeByte(projection.exit_policy.matched);
+        try encoder.writeByte(projection.exit_policy.unmatched);
+        try encoder.writeBool(projection.exit_policy.failure != null);
+        if (projection.exit_policy.failure) |failure| {
+            try encoder.writeByte(failure);
+        }
         try encoder.writeCount(projection.sort_keys.len);
         for (projection.sort_keys) |key| {
             switch (key.source) {
@@ -1036,7 +1093,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 10) {
+    if (try decoder.readU16() != 13) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const max_records = try decoder.readUsize();
@@ -1098,6 +1155,11 @@ pub fn validateCachePlan(
         if (projection.slot_index >= storage_plan.slots.len) {
             return error.CacheProjectionPlanMismatch;
         }
+        for (projection.required_parameters) |name| {
+            if (definition_plan.parameter_declarations.find(name) == null) {
+                return error.CacheProjectionPlanMismatch;
+            }
+        }
         if (projection.fold) |fold| {
             if (projection.fields.len != 0 or
                 projection.value_path != null or
@@ -1137,9 +1199,8 @@ pub fn validateCachePlan(
                     const composed =
                         projection.predicates.len != 0 or
                         projection.constructed_value != null;
-                    if (composed) {
+                    if (projection.constructed_value != null) {
                         if (projection.predicates.len != 1 or
-                            projection.constructed_value == null or
                             !projection.single or
                             !projection.require_match or
                             projection.raw or
@@ -1147,7 +1208,10 @@ pub fn validateCachePlan(
                         {
                             return error.CacheProjectionPlanMismatch;
                         }
-                        const predicate = projection.predicates[0];
+                        if (projection.predicates[0] != .one) {
+                            return error.CacheProjectionPlanMismatch;
+                        }
+                        const predicate = projection.predicates[0].one;
                         if (predicate.operand != .parameter) {
                             return error.CacheProjectionPlanMismatch;
                         }
@@ -1164,6 +1228,12 @@ pub fn validateCachePlan(
                         )) {
                             return error.CacheProjectionPlanMismatch;
                         }
+                    } else if (composed and
+                        (projection.raw or
+                            projection.value_path != null or
+                            projection.fields.len != 0))
+                    {
+                        return error.CacheProjectionPlanMismatch;
                     }
                 },
                 .retained => |retained| {
@@ -1208,13 +1278,30 @@ pub fn validateCachePlan(
                 },
             }
         }
-        for (projection.predicates) |predicate| {
-            if (predicate.operand == .parameter and
-                definition_plan.parameter_declarations.find(
-                    predicate.operand.parameter,
-                ) == null)
-            {
-                return error.CacheProjectionPlanMismatch;
+        for (projection.predicates) |group| {
+            switch (group) {
+                .one => |predicate| try validateCachedPredicate(
+                    predicate,
+                    definition_plan,
+                ),
+                .any => |sets| {
+                    if (sets.len == 0 or sets.len > 64) {
+                        return error.CacheProjectionPlanMismatch;
+                    }
+                    for (sets) |set| {
+                        if (set.predicates.len == 0 or
+                            set.predicates.len > 64)
+                        {
+                            return error.CacheProjectionPlanMismatch;
+                        }
+                        for (set.predicates) |predicate| {
+                            try validateCachedPredicate(
+                                predicate,
+                                definition_plan,
+                            );
+                        }
+                    }
+                },
             }
         }
         if (projection.limit) |limit| switch (limit) {
@@ -1234,6 +1321,7 @@ pub fn validateCachePlan(
         if (projection.require_match and !projection.single) {
             return error.CacheProjectionPlanMismatch;
         }
+        try validateExitPolicy(projection.exit_policy);
         if (projection.single and projection.sort_keys.len != 0) {
             return error.CacheProjectionPlanMismatch;
         }
@@ -1330,8 +1418,32 @@ fn decodeCacheProjection(
     errdefer allocator.free(name);
     try definition_core.json.safeIdentifier(name, 128);
     const slot_index = try decoder.readU16();
+    const required_parameter_count = try decoder.readCount(64);
+    const required_parameters = try allocator.alloc(
+        []u8,
+        required_parameter_count,
+    );
+    var required_parameters_initialized: usize = 0;
+    errdefer {
+        for (required_parameters[0..required_parameters_initialized]) |parameter_name| {
+            allocator.free(parameter_name);
+        }
+        allocator.free(required_parameters);
+    }
+    for (required_parameters, 0..) |*parameter_name, index| {
+        parameter_name.* = try decoder.readBytesAlloc(allocator, 128);
+        try definition_core.json.safeIdentifier(parameter_name.*, 128);
+        if (index != 0 and std.mem.order(
+            u8,
+            required_parameters[index - 1],
+            parameter_name.*,
+        ) != .lt) {
+            return error.CacheProjectionParametersNotSorted;
+        }
+        required_parameters_initialized += 1;
+    }
     const predicate_count = try decoder.readCount(64);
-    const predicates = try allocator.alloc(Predicate, predicate_count);
+    const predicates = try allocator.alloc(PredicateGroup, predicate_count);
     var predicate_initialized: usize = 0;
     errdefer {
         for (predicates[0..predicate_initialized]) |*predicate| {
@@ -1339,29 +1451,54 @@ fn decodeCacheProjection(
         }
         allocator.free(predicates);
     }
-    for (predicates) |*predicate| {
-        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
-        defer allocator.free(raw_pointer);
-        var pointer = try definition_core.json_pointer.compile(
-            allocator,
-            raw_pointer,
-        );
-        errdefer pointer.deinit(allocator);
-        var operand: Operand = switch (try decoder.readByte()) {
-            0 => .{ .constant = try decodeCacheScalar(allocator, decoder) },
-            1 => .{ .parameter = try decoder.readBytesAlloc(
+    for (predicates) |*group| {
+        group.* = switch (try decoder.readByte()) {
+            0 => .{ .one = try decodeCachePredicate(
                 allocator,
-                128,
+                decoder,
             ) },
-            else => return error.CacheProjectionOperandInvalid,
-        };
-        errdefer operand.deinit(allocator);
-        if (operand == .parameter) {
-            try definition_core.json.safeIdentifier(operand.parameter, 128);
-        }
-        predicate.* = .{
-            .pointer = pointer,
-            .operand = operand,
+            1 => any: {
+                const count = try decoder.readCount(64);
+                if (count == 0) {
+                    return error.CacheProjectionPredicatesInvalid;
+                }
+                const sets = try allocator.alloc(PredicateSet, count);
+                var initialized: usize = 0;
+                errdefer {
+                    for (sets[0..initialized]) |*set| {
+                        set.deinit(allocator);
+                    }
+                    allocator.free(sets);
+                }
+                for (sets) |*set| {
+                    const set_predicate_count = try decoder.readCount(64);
+                    if (set_predicate_count == 0) {
+                        return error.CacheProjectionPredicatesInvalid;
+                    }
+                    const set_predicates = try allocator.alloc(
+                        Predicate,
+                        set_predicate_count,
+                    );
+                    var predicates_initialized: usize = 0;
+                    errdefer {
+                        for (set_predicates[0..predicates_initialized]) |*predicate| {
+                            predicate.deinit(allocator);
+                        }
+                        allocator.free(set_predicates);
+                    }
+                    for (set_predicates) |*predicate| {
+                        predicate.* = try decodeCachePredicate(
+                            allocator,
+                            decoder,
+                        );
+                        predicates_initialized += 1;
+                    }
+                    set.* = .{ .predicates = set_predicates };
+                    initialized += 1;
+                }
+                break :any .{ .any = sets };
+            },
+            else => return error.CacheProjectionPredicateGroupInvalid,
         };
         predicate_initialized += 1;
     }
@@ -1388,6 +1525,15 @@ fn decodeCacheProjection(
     }
     const single = try decoder.readBool();
     const require_match = try decoder.readBool();
+    const exit_policy = ExitPolicy{
+        .matched = try decoder.readByte(),
+        .unmatched = try decoder.readByte(),
+        .failure = if (try decoder.readBool())
+            try decoder.readByte()
+        else
+            null,
+    };
+    try validateExitPolicy(exit_policy);
     const sort_key_count = try decoder.readCount(8);
     const sort_keys = try allocator.alloc(SortKey, sort_key_count);
     var sort_keys_initialized: usize = 0;
@@ -1639,6 +1785,7 @@ fn decodeCacheProjection(
     return .{
         .name = name,
         .slot_index = slot_index,
+        .required_parameters = required_parameters,
         .predicates = predicates,
         .fields = fields,
         .preserve_field_order = preserve_field_order,
@@ -1652,7 +1799,20 @@ fn decodeCacheProjection(
         .latest = latest,
         .limit = limit,
         .fold = fold,
+        .exit_policy = exit_policy,
     };
+}
+
+fn validateExitPolicy(policy: ExitPolicy) !void {
+    if (!policy.active()) return;
+    if (policy.failure == null or policy.matched > 125 or
+        policy.unmatched > 125 or policy.failure.? > 125 or
+        policy.matched == policy.unmatched or
+        policy.failure.? == policy.matched or
+        policy.failure.? == policy.unmatched)
+    {
+        return error.CacheProjectionExitPolicyInvalid;
+    }
 }
 
 fn encodeCacheScalar(
@@ -1677,6 +1837,65 @@ fn encodeCacheScalar(
             try encoder.writeBool(flag);
         },
         .null => try encoder.writeByte(4),
+    }
+}
+
+fn encodeCachePredicate(
+    encoder: *definition_core.cache.Encoder,
+    predicate: Predicate,
+) !void {
+    try encoder.writeBytes(predicate.pointer.raw);
+    switch (predicate.operand) {
+        .constant => |value| {
+            try encoder.writeByte(0);
+            try encodeCacheScalar(encoder, value);
+        },
+        .parameter => |name| {
+            try encoder.writeByte(1);
+            try encoder.writeBytes(name);
+        },
+    }
+}
+
+fn decodeCachePredicate(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Predicate {
+    const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+    defer allocator.free(raw_pointer);
+    var pointer = try definition_core.json_pointer.compile(
+        allocator,
+        raw_pointer,
+    );
+    errdefer pointer.deinit(allocator);
+    var operand: Operand = switch (try decoder.readByte()) {
+        0 => .{ .constant = try decodeCacheScalar(allocator, decoder) },
+        1 => .{ .parameter = try decoder.readBytesAlloc(
+            allocator,
+            128,
+        ) },
+        else => return error.CacheProjectionOperandInvalid,
+    };
+    errdefer operand.deinit(allocator);
+    if (operand == .parameter) {
+        try definition_core.json.safeIdentifier(operand.parameter, 128);
+    }
+    return .{
+        .pointer = pointer,
+        .operand = operand,
+    };
+}
+
+fn validateCachedPredicate(
+    predicate: Predicate,
+    definition_plan: *const definition.Plan,
+) !void {
+    if (predicate.operand == .parameter and
+        definition_plan.parameter_declarations.find(
+            predicate.operand.parameter,
+        ) == null)
+    {
+        return error.CacheProjectionPlanMismatch;
     }
 }
 
@@ -1719,18 +1938,30 @@ fn compileProjection(
     );
     defer parsed.deinit();
     const object = try definition_core.json.object(parsed.value);
-    try definition_core.json.requireExactKeys(object, &.{ "slot", "pipeline" });
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "slot", "pipeline", "exit", "required_parameters" },
+    );
     try definition_core.json.requireFields(object, &.{ "slot", "pipeline" });
     const slot_index = storage_plan.findSlot(
         try definition_core.json.requiredString(object, "slot"),
     ) orelse return error.UnknownProjectionSlot;
+    const required_parameters = try compileRequiredProjectionParameters(
+        allocator,
+        definition_plan,
+        object.get("required_parameters"),
+    );
+    errdefer {
+        for (required_parameters) |name| allocator.free(name);
+        allocator.free(required_parameters);
+    }
     const steps = try definition_core.json.array(
         try definition_core.json.field(object, "pipeline"),
     );
     if (steps.items.len == 0 or steps.items.len > 64) {
         return error.InvalidProjectionPipeline;
     }
-    var predicates: std.ArrayList(Predicate) = .empty;
+    var predicates: std.ArrayList(PredicateGroup) = .empty;
     errdefer {
         for (predicates.items) |*predicate| predicate.deinit(allocator);
         predicates.deinit(allocator);
@@ -1762,6 +1993,7 @@ fn compileProjection(
     errdefer if (constructed_value) |*value| value.deinit(allocator);
     var single = false;
     var require_match = false;
+    const exit_policy = try compileExitPolicy(object.get("exit"));
     for (steps.items) |step_value| {
         const step = try definition_core.json.object(step_value);
         const operator = try definition.Operator.parse(
@@ -1773,11 +2005,11 @@ fn compileProjection(
         switch (operator) {
             .filter, .id_lookup => {
                 if (fold != null) {
-                    if (operator != .id_lookup or selection_seen or
-                        latest != null or limit != null or
-                        sort_keys.len != 0 or relevance != null or
-                        predicates.items.len != 0 or
-                        fold.? != .keyed)
+                    if (selection_seen or latest != null or
+                        limit != null or sort_keys.len != 0 or
+                        relevance != null or fold.? != .keyed or
+                        (operator == .id_lookup and
+                            predicates.items.len != 0))
                     {
                         return error.InvalidProjectionOperatorOrder;
                     }
@@ -1786,7 +2018,7 @@ fn compileProjection(
                 {
                     return error.InvalidProjectionOperatorOrder;
                 }
-                var predicate = try compilePredicate(
+                var predicate = try compilePredicateGroup(
                     allocator,
                     definition_plan,
                     operator,
@@ -2080,33 +2312,45 @@ fn compileProjection(
             return error.RelevanceSortRequiresRelevanceOperator;
         }
     }
-    if (fold != null and
-        (predicates.items.len != 0 or constructed_value != null))
-    {
-        if (fold.? != .keyed or predicates.items.len != 1 or
-            !single or !require_match or constructed_value == null or
-            fields.len != 0 or value_path != null or raw_export)
+    if (fold != null) {
+        if (fold.? != .keyed and
+            (predicates.items.len != 0 or constructed_value != null))
         {
             return error.InvalidFoldProjectionComposition;
         }
-        const keyed = fold.?.keyed;
-        const predicate = predicates.items[0];
-        if (predicate.operand != .parameter) {
-            return error.FoldLookupRequiresParameter;
-        }
-        var expected_path: [130]u8 = undefined;
-        const path = try std.fmt.bufPrint(
-            &expected_path,
-            "/{s}",
-            .{keyed.key_field},
-        );
-        if (!std.mem.eql(u8, predicate.pointer.raw, path)) {
-            return error.FoldLookupMustUseKeyField;
+        if (constructed_value != null) {
+            if (predicates.items.len != 1 or
+                !single or !require_match or
+                fields.len != 0 or value_path != null or raw_export or
+                limit != null)
+            {
+                return error.InvalidFoldProjectionComposition;
+            }
+            const keyed = fold.?.keyed;
+            if (predicates.items[0] != .one) {
+                return error.FoldLookupRequiresSinglePredicate;
+            }
+            const predicate = predicates.items[0].one;
+            if (predicate.operand != .parameter) {
+                return error.FoldLookupRequiresParameter;
+            }
+            var expected_path: [130]u8 = undefined;
+            const path = try std.fmt.bufPrint(
+                &expected_path,
+                "/{s}",
+                .{keyed.key_field},
+            );
+            if (!std.mem.eql(u8, predicate.pointer.raw, path)) {
+                return error.FoldLookupMustUseKeyField;
+            }
+        } else if (fields.len != 0 or value_path != null or raw_export) {
+            return error.InvalidFoldProjectionComposition;
         }
     }
     return .{
         .name = try allocator.dupe(u8, source.name),
         .slot_index = @intCast(slot_index),
+        .required_parameters = required_parameters,
         .predicates = try predicates.toOwnedSlice(allocator),
         .fields = fields,
         .preserve_field_order = preserve_field_order,
@@ -2120,14 +2364,180 @@ fn compileProjection(
         .latest = latest,
         .limit = limit,
         .fold = fold,
+        .exit_policy = exit_policy,
     };
 }
 
-fn compilePredicate(
+fn compileExitPolicy(raw: ?std.json.Value) !ExitPolicy {
+    const value = raw orelse return .{};
+    const object = try definition_core.json.object(value);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "matched", "unmatched", "failure" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "matched", "unmatched", "failure" },
+    );
+    const matched = try projectionExitCode(
+        try definition_core.json.unsigned(object.get("matched").?),
+    );
+    const unmatched = try projectionExitCode(
+        try definition_core.json.unsigned(object.get("unmatched").?),
+    );
+    const failure = try projectionExitCode(
+        try definition_core.json.unsigned(object.get("failure").?),
+    );
+    if (matched == unmatched or failure == matched or failure == unmatched) {
+        return error.ProjectionExitCodesMustBeDistinct;
+    }
+    return .{
+        .matched = matched,
+        .unmatched = unmatched,
+        .failure = failure,
+    };
+}
+
+fn compileRequiredProjectionParameters(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: ?std.json.Value,
+) ![][]u8 {
+    const value = raw orelse return allocator.alloc([]u8, 0);
+    const items = try definition_core.json.array(value);
+    if (items.items.len > 64) {
+        return error.ProjectionRequiredParametersInvalid;
+    }
+    const names = try allocator.alloc([]u8, items.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (items.items) |item| {
+        const name = try definition_core.json.string(item);
+        if (definition_plan.parameter_declarations.find(name) == null) {
+            return error.UnknownProjectionParameter;
+        }
+        names[initialized] = try allocator.dupe(u8, name);
+        initialized += 1;
+    }
+    std.mem.sort([]u8, names, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    for (names[1..], 1..) |name, index| {
+        if (std.mem.eql(u8, names[index - 1], name)) {
+            return error.ProjectionRequiredParametersNotUnique;
+        }
+    }
+    return names;
+}
+
+fn projectionExitCode(value: usize) !u8 {
+    if (value > 125) return error.ProjectionExitCodeInvalid;
+    return @intCast(value);
+}
+
+fn compilePredicateGroup(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     operator: definition.Operator,
     object: std.json.ObjectMap,
+) !PredicateGroup {
+    if (operator == .filter and object.get("any") != null) {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "any" },
+        );
+        const values = try definition_core.json.array(object.get("any").?);
+        if (values.items.len == 0 or values.items.len > 64) {
+            return error.InvalidProjectionPredicateGroup;
+        }
+        const sets = try allocator.alloc(PredicateSet, values.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (sets[0..initialized]) |*set| {
+                set.deinit(allocator);
+            }
+            allocator.free(sets);
+        }
+        for (values.items) |value| {
+            const branch = try definition_core.json.object(value);
+            if (branch.get("all")) |raw_all| {
+                try definition_core.json.requireExactKeys(
+                    branch,
+                    &.{"all"},
+                );
+                sets[initialized] = .{
+                    .predicates = try compilePredicateSet(
+                        allocator,
+                        definition_plan,
+                        try definition_core.json.array(raw_all),
+                    ),
+                };
+            } else {
+                var predicate = try compileScalarPredicate(
+                    allocator,
+                    definition_plan,
+                    .filter,
+                    branch,
+                    false,
+                );
+                errdefer predicate.deinit(allocator);
+                const singleton = try allocator.alloc(Predicate, 1);
+                singleton[0] = predicate;
+                sets[initialized] = .{ .predicates = singleton };
+            }
+            initialized += 1;
+        }
+        return .{ .any = sets };
+    }
+    return .{ .one = try compileScalarPredicate(
+        allocator,
+        definition_plan,
+        operator,
+        object,
+        true,
+    ) };
+}
+
+fn compilePredicateSet(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    values: std.json.Array,
+) ![]Predicate {
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidProjectionPredicateGroup;
+    }
+    const predicates = try allocator.alloc(Predicate, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |*predicate| {
+            predicate.deinit(allocator);
+        }
+        allocator.free(predicates);
+    }
+    for (values.items) |value| {
+        predicates[initialized] = try compileScalarPredicate(
+            allocator,
+            definition_plan,
+            .filter,
+            try definition_core.json.object(value),
+            false,
+        );
+        initialized += 1;
+    }
+    return predicates;
+}
+
+fn compileScalarPredicate(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    operator: definition.Operator,
+    object: std.json.ObjectMap,
+    has_operator: bool,
 ) !Predicate {
     const pointer = try definition_core.json_pointer.compile(
         allocator,
@@ -2141,7 +2551,10 @@ fn compilePredicate(
         .filter => blk: {
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "op", "path", "equals", "param" },
+                if (has_operator)
+                    &.{ "op", "path", "equals", "param" }
+                else
+                    &.{ "path", "equals", "param" },
             );
             const fixed = object.get("equals");
             const parameter = object.get("param");
@@ -2160,6 +2573,7 @@ fn compilePredicate(
             break :blk .{ .parameter = try allocator.dupe(u8, name) };
         },
         .id_lookup => blk: {
+            if (!has_operator) return error.InvalidProjectionPredicate;
             try definition_core.json.requireExactKeys(
                 object,
                 &.{ "op", "path", "param", "required" },
@@ -3323,6 +3737,11 @@ pub fn execute(
 ) !Result {
     const compiled = plan.find(projection_name) orelse
         return error.UnknownProjection;
+    for (compiled.required_parameters) |name| {
+        if (parameters.find(name) == null) {
+            return error.MissingProjectionParameter;
+        }
+    }
     var resolved_storage = try storage.resolve(
         allocator,
         storage_plan,
@@ -3442,6 +3861,20 @@ pub fn execute(
                             plan.max_output_bytes,
                         );
                     stats.records_matched = stats.records_emitted;
+                } else if (compiled.predicates.len != 0) {
+                    const filtered = try writeFilteredKeyedFold(
+                        allocator,
+                        &output,
+                        compiled,
+                        &keyed,
+                        &replay_state.reducer_state,
+                        if (fold_history) |*value| value else null,
+                        parameters,
+                        effective_limit,
+                        plan.max_output_bytes,
+                    );
+                    stats.records_matched = filtered.matched;
+                    stats.records_emitted = filtered.emitted;
                 } else {
                     stats.records_matched =
                         replay_state.reducer_state.count();
@@ -3580,6 +4013,10 @@ pub fn execute(
         .payload = payload,
         .stats = stats,
         .limitations = limitations,
+        .exit_code = if (stats.records_matched != 0)
+            compiled.exit_policy.matched
+        else
+            compiled.exit_policy.unmatched,
     };
 }
 
@@ -3612,11 +4049,12 @@ fn writeConstructedKeyedFold(
     const constructed = projection.constructed_value orelse
         return error.FoldConstructedValueMissing;
     if (projection.predicates.len != 1 or
-        projection.predicates[0].operand != .parameter)
+        projection.predicates[0] != .one or
+        projection.predicates[0].one.operand != .parameter)
     {
         return error.FoldLookupRequiresParameter;
     }
-    const operand = projection.predicates[0].operand.parameter;
+    const operand = projection.predicates[0].one.operand.parameter;
     const bound = scalarFromBinding(parameters, operand) orelse
         return error.MissingParameter;
     const key = switch (bound) {
@@ -3654,6 +4092,258 @@ fn writeConstructedKeyedFold(
     return 1;
 }
 
+const FilteredFoldCounts = struct {
+    matched: usize,
+    emitted: usize,
+};
+
+fn writeFilteredKeyedFold(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    projection: *const Projection,
+    keyed: *const KeyedFold,
+    reducer_state: *reducer.State,
+    accumulator: ?*const FoldHistoryAccumulator,
+    parameters: *const definition_core.parameters.Bindings,
+    limit: usize,
+    max_output_bytes: usize,
+) !FilteredFoldCounts {
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    const fields = keyedHistoryFields(&field_storage, keyed);
+    const views = try reducer_state.sortedViewsAlloc(allocator);
+    defer allocator.free(views);
+    var matched: usize = 0;
+    var emitted: usize = 0;
+    try output.writer.writeByte('[');
+    for (views) |view| {
+        const history = if (accumulator) |configured|
+            configured.get(view.key) orelse
+                return error.FoldHistoryReducerStateMismatch
+        else
+            null;
+        if (!try matchesKeyedFold(
+            allocator,
+            projection,
+            fields,
+            view,
+            history,
+            parameters,
+        )) continue;
+        matched += 1;
+        if (emitted == limit) continue;
+        if (emitted != 0) try output.writer.writeByte(',');
+        try writeKeyedHistoryRow(
+            &output.writer,
+            fields,
+            view,
+            history,
+        );
+        emitted += 1;
+        if (output.written().len > max_output_bytes) {
+            return error.ProjectionOutputBoundsExceeded;
+        }
+    }
+    try output.writer.writeByte(']');
+    if (output.written().len > max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
+    return .{ .matched = matched, .emitted = emitted };
+}
+
+fn matchesKeyedFold(
+    allocator: std.mem.Allocator,
+    projection: *const Projection,
+    fields: []const KeyedHistoryField,
+    view: reducer.EntryView,
+    history: ?*const FoldHistoryEntry,
+    parameters: *const definition_core.parameters.Bindings,
+) !bool {
+    var parsed_retained: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_retained) |*parsed| parsed.deinit();
+    if (projectionReferencesRetained(projection, fields)) {
+        parsed_retained = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            view.retained orelse return false,
+            .{ .duplicate_field_behavior = .@"error" },
+        );
+    }
+    const retained = if (parsed_retained) |parsed|
+        parsed.value
+    else
+        null;
+    for (projection.predicates) |group| {
+        switch (group) {
+            .one => |predicate| {
+                if (!predicateMatchesKeyedFold(
+                    predicate,
+                    fields,
+                    view,
+                    history,
+                    retained,
+                    parameters,
+                )) return false;
+            },
+            .any => |sets| {
+                var group_matched = false;
+                for (sets) |set| {
+                    var set_matched = true;
+                    for (set.predicates) |predicate| {
+                        if (!predicateMatchesKeyedFold(
+                            predicate,
+                            fields,
+                            view,
+                            history,
+                            retained,
+                            parameters,
+                        )) {
+                            set_matched = false;
+                            break;
+                        }
+                    }
+                    if (set_matched) {
+                        group_matched = true;
+                        break;
+                    }
+                }
+                if (!group_matched) return false;
+            },
+        }
+    }
+    return true;
+}
+
+fn projectionReferencesRetained(
+    projection: *const Projection,
+    fields: []const KeyedHistoryField,
+) bool {
+    for (projection.predicates) |group| switch (group) {
+        .one => |predicate| {
+            if (predicateReferencesRetained(predicate, fields)) return true;
+        },
+        .any => |sets| for (sets) |set| {
+            for (set.predicates) |predicate| {
+                if (predicateReferencesRetained(predicate, fields)) {
+                    return true;
+                }
+            }
+        },
+    };
+    return false;
+}
+
+fn predicateReferencesRetained(
+    predicate: Predicate,
+    fields: []const KeyedHistoryField,
+) bool {
+    if (predicate.pointer.segments.len == 0) return false;
+    const field = findKeyedHistoryField(
+        fields,
+        predicate.pointer.segments[0],
+    ) orelse return false;
+    return field.source == .retained;
+}
+
+fn predicateMatchesKeyedFold(
+    predicate: Predicate,
+    fields: []const KeyedHistoryField,
+    view: reducer.EntryView,
+    history: ?*const FoldHistoryEntry,
+    retained: ?std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) bool {
+    if (predicate.pointer.segments.len == 0) return false;
+    const field = findKeyedHistoryField(
+        fields,
+        predicate.pointer.segments[0],
+    ) orelse return false;
+    const expected = switch (predicate.operand) {
+        .constant => |constant| constant,
+        .parameter => |name| scalarFromBinding(parameters, name) orelse
+            return false,
+    };
+    const tail = predicate.pointer.segments[1..];
+    return switch (field.source) {
+        .key => tail.len == 0 and scalarEqualsText(expected, view.key),
+        .state => tail.len == 0 and scalarEqualsText(expected, view.state),
+        .retained => blk: {
+            const root = retained orelse break :blk false;
+            const actual = lookupJsonSegments(root, tail) orelse
+                break :blk false;
+            break :blk scalarEqualsJson(expected, actual);
+        },
+        .event_count => tail.len == 0 and
+            scalarEqualsCount(expected, view.event_count),
+        .event_kind_count => |index| tail.len == 0 and
+            scalarEqualsCount(
+                expected,
+                (history orelse return false).event_kind_counts[index],
+            ),
+        .event_chain => tail.len == 0 and scalarEqualsText(
+            expected,
+            &(history orelse return false).event_chain,
+        ),
+        .snapshot => tail.len == 0 and scalarEqualsText(
+            expected,
+            &(history orelse return false).snapshot,
+        ),
+        .prior_snapshot => blk: {
+            if (tail.len != 0) break :blk false;
+            const value = history orelse break :blk expected == .null;
+            if (!value.has_prior_snapshot) break :blk expected == .null;
+            break :blk scalarEqualsText(expected, &value.prior_snapshot);
+        },
+    };
+}
+
+fn findKeyedHistoryField(
+    fields: []const KeyedHistoryField,
+    name: []const u8,
+) ?KeyedHistoryField {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+fn lookupJsonSegments(
+    root: std.json.Value,
+    segments: []const []u8,
+) ?std.json.Value {
+    var current = root;
+    for (segments) |segment| {
+        current = switch (current) {
+            .object => |object| object.get(segment) orelse return null,
+            .array => |array| blk: {
+                if (segment.len == 0 or
+                    (segment.len > 1 and segment[0] == '0'))
+                {
+                    return null;
+                }
+                const index = std.fmt.parseInt(
+                    usize,
+                    segment,
+                    10,
+                ) catch return null;
+                if (index >= array.items.len) return null;
+                break :blk array.items[index];
+            },
+            else => return null,
+        };
+    }
+    return current;
+}
+
+fn scalarEqualsText(expected: Scalar, actual: []const u8) bool {
+    return expected == .string and
+        std.mem.eql(u8, expected.string, actual);
+}
+
+fn scalarEqualsCount(expected: Scalar, actual: usize) bool {
+    return expected == .integer and
+        std.math.cast(usize, expected.integer) == actual;
+}
+
 fn writeKeyedHistoryRows(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer.Allocating,
@@ -3665,70 +4355,7 @@ fn writeKeyedHistoryRows(
     only_key: ?[]const u8,
 ) !usize {
     var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
-    var field_count: usize = 0;
-    field_storage[field_count] = .{
-        .name = keyed.key_field,
-        .source = .key,
-    };
-    field_count += 1;
-    field_storage[field_count] = .{
-        .name = keyed.state_field,
-        .source = .state,
-    };
-    field_count += 1;
-    if (keyed.retained_field) |name| {
-        field_storage[field_count] = .{
-            .name = name,
-            .source = .retained,
-        };
-        field_count += 1;
-    }
-    if (keyed.event_count_field) |name| {
-        field_storage[field_count] = .{
-            .name = name,
-            .source = .event_count,
-        };
-        field_count += 1;
-    }
-    for (
-        keyed.history.event_kind_counts,
-        0..,
-    ) |count, index| {
-        field_storage[field_count] = .{
-            .name = count.field,
-            .source = .{ .event_kind_count = index },
-        };
-        field_count += 1;
-    }
-    if (keyed.history.event_chain) |chain| {
-        field_storage[field_count] = .{
-            .name = chain.field,
-            .source = .event_chain,
-        };
-        field_count += 1;
-    }
-    if (keyed.history.snapshot) |snapshot| {
-        field_storage[field_count] = .{
-            .name = snapshot.field,
-            .source = .snapshot,
-        };
-        field_count += 1;
-        field_storage[field_count] = .{
-            .name = snapshot.prior_field,
-            .source = .prior_snapshot,
-        };
-        field_count += 1;
-    }
-    const fields = field_storage[0..field_count];
-    std.mem.sort(KeyedHistoryField, fields, {}, struct {
-        fn lessThan(
-            _: void,
-            left: KeyedHistoryField,
-            right: KeyedHistoryField,
-        ) bool {
-            return std.mem.lessThan(u8, left.name, right.name);
-        }
-    }.lessThan);
+    const fields = keyedHistoryFields(&field_storage, keyed);
     var one_view: [1]reducer.EntryView = undefined;
     var allocated_views: ?[]reducer.EntryView = null;
     defer if (allocated_views) |views| allocator.free(views);
@@ -3751,67 +4378,12 @@ fn writeKeyedHistoryRows(
                 return error.FoldHistoryReducerStateMismatch
         else
             null;
-        try output.writer.writeByte('{');
-        for (fields, 0..) |field, field_index| {
-            if (field_index != 0) try output.writer.writeByte(',');
-            try definition_core.canonical_json.writeCanonicalString(
-                &output.writer,
-                field.name,
-            );
-            try output.writer.writeByte(':');
-            switch (field.source) {
-                .key => try definition_core.canonical_json
-                    .writeCanonicalString(&output.writer, view.key),
-                .state => try definition_core.canonical_json
-                    .writeCanonicalString(&output.writer, view.state),
-                .retained => try output.writer.writeAll(
-                    view.retained orelse
-                        return error.ReducerRetainedValueMissing,
-                ),
-                .event_count => try output.writer.print(
-                    "{d}",
-                    .{view.event_count},
-                ),
-                .event_kind_count => |index| try output.writer.print(
-                    "{d}",
-                    .{(history orelse
-                        return error.FoldHistoryAccumulatorMissing)
-                        .event_kind_counts[index]},
-                ),
-                .event_chain => {
-                    const value = history orelse
-                        return error.FoldHistoryAccumulatorMissing;
-                    if (!value.has_event_chain) {
-                        return error.FoldHistoryEventChainMissing;
-                    }
-                    try definition_core.canonical_json.writeCanonicalString(
-                        &output.writer,
-                        &value.event_chain,
-                    );
-                },
-                .snapshot => {
-                    const value = history orelse
-                        return error.FoldHistoryAccumulatorMissing;
-                    if (!value.has_snapshot) {
-                        return error.FoldHistorySnapshotMissing;
-                    }
-                    try definition_core.canonical_json.writeCanonicalString(
-                        &output.writer,
-                        &value.snapshot,
-                    );
-                },
-                .prior_snapshot => if ((history orelse
-                    return error.FoldHistoryAccumulatorMissing)
-                    .has_prior_snapshot)
-                    try definition_core.canonical_json.writeCanonicalString(
-                        &output.writer,
-                        &(history.?).prior_snapshot,
-                    )
-                else
-                    try output.writer.writeAll("null"),
-            }
-        }
-        try output.writer.writeByte('}');
+        try writeKeyedHistoryRow(
+            &output.writer,
+            fields,
+            view,
+            history,
+        );
         if (output.written().len > max_output_bytes) {
             return error.ProjectionOutputBoundsExceeded;
         }
@@ -3821,6 +4393,140 @@ fn writeKeyedHistoryRows(
         return error.ProjectionOutputBoundsExceeded;
     }
     return emitted;
+}
+
+fn keyedHistoryFields(
+    storage_buffer: *[4 + max_fold_event_kind_counts + 3]KeyedHistoryField,
+    keyed: *const KeyedFold,
+) []KeyedHistoryField {
+    var field_count: usize = 0;
+    storage_buffer[field_count] = .{
+        .name = keyed.key_field,
+        .source = .key,
+    };
+    field_count += 1;
+    storage_buffer[field_count] = .{
+        .name = keyed.state_field,
+        .source = .state,
+    };
+    field_count += 1;
+    if (keyed.retained_field) |name| {
+        storage_buffer[field_count] = .{
+            .name = name,
+            .source = .retained,
+        };
+        field_count += 1;
+    }
+    if (keyed.event_count_field) |name| {
+        storage_buffer[field_count] = .{
+            .name = name,
+            .source = .event_count,
+        };
+        field_count += 1;
+    }
+    for (keyed.history.event_kind_counts, 0..) |count, index| {
+        storage_buffer[field_count] = .{
+            .name = count.field,
+            .source = .{ .event_kind_count = index },
+        };
+        field_count += 1;
+    }
+    if (keyed.history.event_chain) |chain| {
+        storage_buffer[field_count] = .{
+            .name = chain.field,
+            .source = .event_chain,
+        };
+        field_count += 1;
+    }
+    if (keyed.history.snapshot) |snapshot| {
+        storage_buffer[field_count] = .{
+            .name = snapshot.field,
+            .source = .snapshot,
+        };
+        field_count += 1;
+        storage_buffer[field_count] = .{
+            .name = snapshot.prior_field,
+            .source = .prior_snapshot,
+        };
+        field_count += 1;
+    }
+    const fields = storage_buffer[0..field_count];
+    std.mem.sort(KeyedHistoryField, fields, {}, struct {
+        fn lessThan(
+            _: void,
+            left: KeyedHistoryField,
+            right: KeyedHistoryField,
+        ) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
+    return fields;
+}
+
+fn writeKeyedHistoryRow(
+    writer: *std.Io.Writer,
+    fields: []const KeyedHistoryField,
+    view: reducer.EntryView,
+    history: ?*const FoldHistoryEntry,
+) !void {
+    try writer.writeByte('{');
+    for (fields, 0..) |field, field_index| {
+        if (field_index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            field.name,
+        );
+        try writer.writeByte(':');
+        switch (field.source) {
+            .key => try definition_core.canonical_json
+                .writeCanonicalString(writer, view.key),
+            .state => try definition_core.canonical_json
+                .writeCanonicalString(writer, view.state),
+            .retained => try writer.writeAll(
+                view.retained orelse
+                    return error.ReducerRetainedValueMissing,
+            ),
+            .event_count => try writer.print("{d}", .{view.event_count}),
+            .event_kind_count => |index| try writer.print(
+                "{d}",
+                .{(history orelse
+                    return error.FoldHistoryAccumulatorMissing)
+                    .event_kind_counts[index]},
+            ),
+            .event_chain => {
+                const value = history orelse
+                    return error.FoldHistoryAccumulatorMissing;
+                if (!value.has_event_chain) {
+                    return error.FoldHistoryEventChainMissing;
+                }
+                try definition_core.canonical_json.writeCanonicalString(
+                    writer,
+                    &value.event_chain,
+                );
+            },
+            .snapshot => {
+                const value = history orelse
+                    return error.FoldHistoryAccumulatorMissing;
+                if (!value.has_snapshot) {
+                    return error.FoldHistorySnapshotMissing;
+                }
+                try definition_core.canonical_json.writeCanonicalString(
+                    writer,
+                    &value.snapshot,
+                );
+            },
+            .prior_snapshot => if ((history orelse
+                return error.FoldHistoryAccumulatorMissing)
+                .has_prior_snapshot)
+                try definition_core.canonical_json.writeCanonicalString(
+                    writer,
+                    &(history.?).prior_snapshot,
+                )
+            else
+                try writer.writeAll("null"),
+        }
+    }
+    try writer.writeByte('}');
 }
 
 fn writeRetainedProjection(
@@ -4108,19 +4814,54 @@ fn matches(
     value: std.json.Value,
     parameters: *const definition_core.parameters.Bindings,
 ) bool {
-    for (projection.predicates) |predicate| {
-        const actual = definition_core.json_pointer.lookup(
-            value,
-            predicate.pointer,
-        ) orelse return false;
-        const expected = switch (predicate.operand) {
-            .constant => |constant| constant,
-            .parameter => |name| scalarFromBinding(parameters, name) orelse
-                return false,
-        };
-        if (!scalarEqualsJson(expected, actual)) return false;
+    for (projection.predicates) |group| {
+        switch (group) {
+            .one => |predicate| {
+                if (!predicateMatches(predicate, value, parameters)) {
+                    return false;
+                }
+            },
+            .any => |sets| {
+                var matched = false;
+                for (sets) |set| {
+                    var set_matched = true;
+                    for (set.predicates) |predicate| {
+                        if (!predicateMatches(
+                            predicate,
+                            value,
+                            parameters,
+                        )) {
+                            set_matched = false;
+                            break;
+                        }
+                    }
+                    if (set_matched) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            },
+        }
     }
     return true;
+}
+
+fn predicateMatches(
+    predicate: Predicate,
+    value: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) bool {
+    const actual = definition_core.json_pointer.lookup(
+        value,
+        predicate.pointer,
+    ) orelse return false;
+    const expected = switch (predicate.operand) {
+        .constant => |constant| constant,
+        .parameter => |name| scalarFromBinding(parameters, name) orelse
+            return false,
+    };
+    return scalarEqualsJson(expected, actual);
 }
 
 fn writeProjectedValue(
@@ -4612,6 +5353,239 @@ test "keyed fold history compiles once and preserves exact replay digests" {
     );
     try std.testing.expectEqualStrings(
         "[{\"capture_count\":1,\"chain\":\"cc525ecd681ac944bbf7de0baaedf9c2f206f1212b19770187a8cd54d26fb1a7\",\"event_count\":2,\"id\":\"case-a\",\"prior_snapshot\":\"8cb3c1bb975df1ad3b58df5846687dc0c28563dd834f8ab6420632190f21851a\",\"record\":{\"repository_id\":\"repo/example\",\"x\":1},\"snapshot\":\"5c7891af5a74353974cd09a86ec4eec7cba9b3e80aef802199947cb60c1632f7\",\"status\":\"inactive\",\"status_count\":1}]",
+        output.written(),
+    );
+}
+
+test "keyed fold filters bounded disjunctions and declares exit semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{
+        \\  "schema": "ledger-artifact-definition/v1",
+        \\  "id": "example/gate",
+        \\  "owner": "example",
+        \\  "requires": {
+        \\    "abi": "ledger-artifact-abi/v1",
+        \\    "operators": [
+        \\      "append-only-log",
+        \\      "compare-and-append",
+        \\      "event-kinds",
+        \\      "filter",
+        \\      "fold",
+        \\      "limit",
+        \\      "reducer",
+        \\      "replay",
+        \\      "transition-table"
+        \\    ]
+        \\  },
+        \\  "parameters": {
+        \\    "artifact": {"type": "string", "required": true},
+        \\    "identity": {"type": "string", "required": true}
+        \\  },
+        \\  "inputs": {"event": {"codec": "json", "max_bytes": 4096}},
+        \\  "canonicalization": {},
+        \\  "shape": {},
+        \\  "constraints": [
+        \\    {"op": "append-only-log", "input": "event"},
+        \\    {"op": "event-kinds", "values": ["capture"]},
+        \\    {
+        \\      "op": "reducer",
+        \\      "key": "/id",
+        \\      "on": "/status",
+        \\      "event_kind": "/kind",
+        \\      "retain_once": "/record"
+        \\    },
+        \\    {
+        \\      "op": "transition-table",
+        \\      "states": ["active"],
+        \\      "transitions": [{"from": null, "on": "active", "to": "active"}]
+        \\    }
+        \\  ],
+        \\  "identity": {},
+        \\  "storage": {
+        \\    "kind": "event-log",
+        \\    "slots": {
+        \\      "events": {
+        \\        "path": "example/events.jsonl",
+        \\        "kind": "event-log",
+        \\        "codec": "jsonl",
+        \\        "max_bytes": 65536
+        \\      }
+        \\    }
+        \\  },
+        \\  "operations": {
+        \\    "append": {
+        \\      "effects": [
+        \\        {
+        \\          "op": "compare-and-append",
+        \\          "slot": "events",
+        \\          "input": "event"
+        \\        }
+        \\      ]
+        \\    }
+        \\  },
+        \\  "projections": {
+        \\    "gate": {
+        \\      "slot": "events",
+        \\      "required_parameters": ["artifact", "identity"],
+        \\      "pipeline": [
+        \\        {
+        \\          "op": "fold",
+        \\          "key_field": "id",
+        \\          "state_field": "status",
+        \\          "retained_field": "record"
+        \\        },
+        \\        {"op": "filter", "path": "/status", "equals": "active"},
+        \\        {
+        \\          "op": "filter",
+        \\          "path": "/record/artifact",
+        \\          "param": "artifact"
+        \\        },
+        \\        {
+        \\          "op": "filter",
+        \\          "any": [
+        \\            {
+        \\              "all": [
+        \\                {
+        \\                  "path": "/record/scope",
+        \\                  "equals": "route"
+        \\                },
+        \\                {
+        \\                  "path": "/record/route",
+        \\                  "param": "identity"
+        \\                }
+        \\              ]
+        \\            },
+        \\            {
+        \\              "all": [
+        \\                {
+        \\                  "path": "/record/scope",
+        \\                  "equals": "cluster"
+        \\                },
+        \\                {
+        \\                  "path": "/record/cluster",
+        \\                  "param": "identity"
+        \\                }
+        \\              ]
+        \\            }
+        \\          ]
+        \\        },
+        \\        {"op": "limit", "count": 1}
+        \\      ],
+        \\      "exit": {"matched": 2, "unmatched": 0, "failure": 3}
+        \\    }
+        \\  },
+        \\  "bounds": {
+        \\    "max_input_bytes": 4096,
+        \\    "max_store_bytes": 65536,
+        \\    "max_records": 4,
+        \\    "max_output_bytes": 4096,
+        \\    "max_diagnostics": 8,
+        \\    "max_reducer_states": 4
+        \\  }
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+        &protocol_plan,
+    );
+    defer plan.deinit(std.testing.allocator);
+    const gate = plan.find("gate").?;
+    try std.testing.expectEqual(@as(u8, 2), gate.exit_policy.matched);
+    try std.testing.expectEqual(@as(u8, 0), gate.exit_policy.unmatched);
+    try std.testing.expectEqual(@as(?u8, 3), gate.exit_policy.failure);
+    try std.testing.expectEqual(@as(usize, 3), gate.predicates.len);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        gate.required_parameters.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        gate.predicates[2].any.len,
+    );
+
+    var replay_state = protocol.ReplayState.init(&protocol_plan);
+    defer replay_state.deinit(std.testing.allocator);
+    const raw_events = [_][]const u8{
+        "{\"kind\":\"capture\",\"id\":\"case-a\",\"status\":\"active\",\"record\":{\"artifact\":\"sha256:a\",\"cluster\":\"cluster-a\",\"route\":\"route-a\",\"scope\":\"route\"}}",
+        "{\"kind\":\"capture\",\"id\":\"case-b\",\"status\":\"active\",\"record\":{\"artifact\":\"sha256:a\",\"cluster\":\"cluster-a\",\"route\":\"route-a\",\"scope\":\"cluster\"}}",
+    };
+    for (raw_events) |raw| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            raw,
+            .{ .duplicate_field_behavior = .@"error" },
+        );
+        defer parsed.deinit();
+        try protocol.applyValue(
+            std.testing.allocator,
+            &protocol_plan,
+            &replay_state,
+            parsed.value,
+        );
+    }
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{
+            .{ .name = "artifact", .raw_value = "sha256:a" },
+            .{ .name = "identity", .raw_value = "route-a" },
+        },
+    );
+    defer bindings.deinit(std.testing.allocator);
+    const keyed = switch (gate.fold.?) {
+        .keyed => |value| value,
+        .retained => return error.TestExpectedKeyedFold,
+    };
+    var output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer output.deinit();
+    const counts = try writeFilteredKeyedFold(
+        std.testing.allocator,
+        &output,
+        gate,
+        &keyed,
+        &replay_state.reducer_state,
+        null,
+        &bindings,
+        1,
+        4096,
+    );
+    try std.testing.expectEqual(@as(usize, 1), counts.matched);
+    try std.testing.expectEqual(@as(usize, 1), counts.emitted);
+    try std.testing.expectEqualStrings(
+        "[{\"id\":\"case-a\",\"record\":{\"artifact\":\"sha256:a\",\"cluster\":\"cluster-a\",\"route\":\"route-a\",\"scope\":\"route\"},\"status\":\"active\"}]",
         output.written(),
     );
 }

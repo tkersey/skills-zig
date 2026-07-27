@@ -148,4 +148,103 @@ jq -e \
    any(.slots[]; .name == "events" and .status == "invalid")' \
   "$scratch/doctor-invalid.json" >/dev/null
 
-printf 'negative-ledger protocol conformance passed: generated=2 invalid=2 bindings=1 transactions=1 projections=1\n'
+gate_repo="$scratch/gate-repo"
+mkdir -p "$gate_repo/.ledger/negative-ledger"
+gate_repo=$(cd "$gate_repo" && pwd -P)
+artifact="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+jq -nc \
+  --arg artifact "$artifact" \
+  '{
+    v: 3,
+    event: "capture",
+    event_id: "NLE-cccccccccccccccccccccccc",
+    timestamp: "2026-07-26T00:00:02Z",
+    neg_id: "NEG-000002",
+    status: "active",
+    record: {
+      record_version: "NER-v2",
+      kind: "realization_route",
+      hypothesis: "The selected route preserves the observed signal.",
+      route_id: "route-a",
+      artifact_state_id: $artifact,
+      artifact_state_label: "fixture",
+      repository_id: "owner/repo",
+      attempted_change: "Apply route A.",
+      observed_outcome: "The measured signal regressed.",
+      exclusion_scope: "route",
+      exclusion_rule: "Do not apply route A to this exact artifact.",
+      failure_class: "local-regression",
+      confidence: "high",
+      source_refs: [
+        {
+          kind: "test",
+          ref: "generated:negative-ledger-route-gate"
+        }
+      ],
+      applicability_conditions: ["The artifact digest is unchanged."],
+      reopening_criteria: [
+        {
+          id: "artifact-changed",
+          condition: "The artifact digest changes."
+        }
+      ],
+      next_search_hint: "Select a route outside the excluded family."
+    }
+  }' >"$scratch/gate-event.json"
+jq -c . "$scratch/gate-event.json" \
+  >"$gate_repo/.ledger/negative-ledger/events.jsonl"
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation bind-existing \
+  --repo "$gate_repo" \
+  --format json >"$scratch/gate-bind.json"
+
+set +e
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection route-gate \
+  --repo "$gate_repo" \
+  --param "artifact=$artifact" \
+  --param "identity=route-a" \
+  --format json >"$scratch/gate-hit.json"
+gate_hit_exit=$?
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection route-gate \
+  --repo "$gate_repo" \
+  --param "artifact=$artifact" \
+  --param "identity=route-b" \
+  --format json >"$scratch/gate-miss.json"
+gate_miss_exit=$?
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection route-gate \
+  --repo "$gate_repo" \
+  --param "artifact=$artifact" \
+  --format json >"$scratch/gate-invalid.json"
+gate_invalid_exit=$?
+set -e
+[[ "$gate_hit_exit" -eq 2 ]]
+[[ "$gate_miss_exit" -eq 0 ]]
+[[ "$gate_invalid_exit" -eq 3 ]]
+jq -e \
+  '.exit_code == 2 and
+   .stats.records_scanned == 1 and
+   .stats.records_matched == 1 and
+   .data[0].neg_id == "NEG-000002"' \
+  "$scratch/gate-hit.json" >/dev/null
+jq -e \
+  '.exit_code == 0 and
+   .stats.records_scanned == 1 and
+   .stats.records_matched == 0 and
+   .data == []' \
+  "$scratch/gate-miss.json" >/dev/null
+jq -e \
+  '.schema == "ledger-projection-error/v1" and
+   .code == "MissingProjectionParameter" and
+   .exit_code == 3 and
+   .authority_granted == false and
+   .storage_mutated == false' \
+  "$scratch/gate-invalid.json" >/dev/null
+
+printf 'negative-ledger protocol conformance passed: generated=3 invalid=3 bindings=2 transactions=1 projections=3 route_cases=3\n'

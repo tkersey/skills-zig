@@ -287,7 +287,10 @@ fn runProject(
         allocator,
     );
     defer allocator.free(repo_root);
-    var result = try ledger.projection.execute(
+    const compiled_projection = context.projection_plan.?.find(
+        args.projection,
+    ) orelse return error.UnknownProjection;
+    var result = ledger.projection.execute(
         allocator,
         &context.definition_plan,
         &context.storage_plan.?,
@@ -296,7 +299,18 @@ fn runProject(
         args.projection,
         repo_root,
         &bindings,
-    );
+    ) catch |err| {
+        if (compiled_projection.exit_policy.failure) |exit_code| {
+            try emitProjectionError(
+                err,
+                &context.definition_plan,
+                args.projection,
+                exit_code,
+            );
+            return exit_code;
+        }
+        return err;
+    };
     defer result.deinit(allocator);
     try emitProjection(
         allocator,
@@ -305,7 +319,7 @@ fn runProject(
         &result,
         context.stats,
     );
-    return 0;
+    return result.exit_code;
 }
 
 fn runDefinitionCheck(
@@ -1013,6 +1027,43 @@ fn emitProjection(
             try stdout_writer.interface.writeByte('\n');
         },
     }
+}
+
+fn emitProjectionError(
+    err: anyerror,
+    definition_plan: *const ledger.definition.Plan,
+    projection: []const u8,
+    exit_code: u8,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(
+        "{\"schema\":\"ledger-projection-error/v1\",\"definition\":{\"id\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        &stdout_writer.interface,
+        definition_plan.id,
+    );
+    try stdout_writer.interface.writeAll(",\"digest\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &stdout_writer.interface,
+        &definition_plan.closure_digest,
+    );
+    try stdout_writer.interface.writeAll(",\"abi\":\"");
+    try stdout_writer.interface.writeAll(ledger.definition.abi);
+    try stdout_writer.interface.writeAll("\"},\"projection\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &stdout_writer.interface,
+        projection,
+    );
+    try stdout_writer.interface.writeAll(",\"code\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &stdout_writer.interface,
+        @errorName(err),
+    );
+    try stdout_writer.interface.print(
+        ",\"exit_code\":{d},\"authority_granted\":false,\"storage_mutated\":false}}\n",
+        .{exit_code},
+    );
 }
 
 fn emitDoctor(
