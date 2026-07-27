@@ -13,6 +13,13 @@ pub const panic = if (builtin.is_test)
 else
     std.debug.simple_panic;
 
+pub const std_options: std.Options = .{
+    .signal_stack_size = switch (builtin.mode) {
+        .ReleaseFast, .ReleaseSmall => null,
+        .Debug, .ReleaseSafe => 1 << 18,
+    },
+};
+
 const Help =
     \\ledger
     \\
@@ -112,8 +119,10 @@ const OwnedDocument = struct {
 pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     defer runtime_io = null;
-    ledger.transaction.installRuntimeIo(init.io);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (requiresDurableIo(argv)) {
+        ledger.transaction.installRuntimeIo(init.io);
+    }
     const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
         emitCommandError(err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
@@ -122,6 +131,13 @@ pub fn main(init: std.process.Init) !void {
         break :blk @as(u8, 2);
     };
     if (code != 0) std.process.exit(code);
+}
+
+fn requiresDurableIo(argv: []const []const u8) bool {
+    if (argv.len < 2) return false;
+    return std.mem.eql(u8, argv[1], "transact") or
+        std.mem.eql(u8, argv[1], "project") or
+        std.mem.eql(u8, argv[1], "doctor");
 }
 
 pub fn runWithArgv(
@@ -1296,6 +1312,17 @@ test "final command surface excludes source and positional contract routing" {
     try std.testing.expect(std.mem.indexOf(u8, Help, "capture") == null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "definition check") != null);
     try std.testing.expect(std.mem.indexOf(u8, Help, "materialize") != null);
+}
+
+test "only store-backed commands install durable runtime IO" {
+    try std.testing.expect(!requiresDurableIo(&.{}));
+    try std.testing.expect(!requiresDurableIo(&.{"ledger"}));
+    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "validate" }));
+    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "materialize" }));
+    try std.testing.expect(!requiresDurableIo(&.{ "ledger", "definition" }));
+    try std.testing.expect(requiresDurableIo(&.{ "ledger", "transact" }));
+    try std.testing.expect(requiresDurableIo(&.{ "ledger", "project" }));
+    try std.testing.expect(requiresDurableIo(&.{ "ledger", "doctor" }));
 }
 
 test "common parser accepts named inputs and parameters only on artifact commands" {
