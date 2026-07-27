@@ -7,6 +7,8 @@ const max_pointer_bytes: usize = 1024;
 const max_parameter_bytes: usize = 128;
 const max_token_bytes: usize = 128;
 const max_theme_bytes: usize = 1024;
+const max_value_depth: usize = 64;
+const max_value_walk_steps: usize = 4096;
 
 const Suffix = struct {
     value: []u8,
@@ -160,12 +162,26 @@ pub const Prepared = struct {
     }
 };
 
-pub fn compile(
-    allocator: std.mem.Allocator,
-    source: std.json.Value,
-    declarations: *const definition_core.parameters.Declarations,
-) !Plan {
-    const object = try definition_core.json.object(source);
+const OptionalComponents = struct {
+    path_match: ?PathMatch,
+    recency: ?Recency,
+    presence: ?Presence,
+    enum_boost: ?EnumBoost,
+    exclude_referenced: ?ExcludeReferenced,
+    diversity: ?Diversity,
+
+    fn deinit(self: *OptionalComponents, allocator: std.mem.Allocator) void {
+        if (self.path_match) |*value| value.deinit(allocator);
+        if (self.recency) |*value| value.deinit(allocator);
+        if (self.presence) |*value| value.deinit(allocator);
+        if (self.enum_boost) |*value| value.deinit(allocator);
+        if (self.exclude_referenced) |*value| value.deinit(allocator);
+        if (self.diversity) |*value| value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn validateDefinitionObject(object: std.json.ObjectMap) !void {
     try definition_core.json.requireExactKeys(
         object,
         &.{
@@ -184,7 +200,15 @@ pub fn compile(
         object,
         &.{ "tokenizer", "weights" },
     );
+}
 
+pub fn compile(
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    declarations: *const definition_core.parameters.Declarations,
+) !Plan {
+    const object = try definition_core.json.object(source);
+    try validateDefinitionObject(object);
     var tokenizer = try compileTokenizer(
         allocator,
         try definition_core.json.field(object, "tokenizer"),
@@ -198,55 +222,67 @@ pub fn compile(
     else
         try allocator.alloc([]u8, 0);
     errdefer freeStrings(allocator, token_group);
-    var path_match = if (object.get("path_match")) |value|
-        try compilePathMatch(allocator, value, declarations)
-    else
-        null;
-    errdefer if (path_match) |*value| value.deinit(allocator);
-    var recency = if (object.get("recency")) |value|
-        try compileRecency(allocator, value, declarations)
-    else
-        null;
-    errdefer if (recency) |*value| value.deinit(allocator);
-    var presence = if (object.get("presence")) |value|
-        try compilePresence(allocator, value)
-    else
-        null;
-    errdefer if (presence) |*value| value.deinit(allocator);
-    var enum_boost = if (object.get("enum_boost")) |value|
-        try compileEnumBoost(allocator, value)
-    else
-        null;
-    errdefer if (enum_boost) |*value| value.deinit(allocator);
-    var exclude_referenced = if (object.get("exclude_referenced")) |value|
-        try compileExcludeReferenced(allocator, value, declarations)
-    else
-        null;
-    errdefer if (exclude_referenced) |*value| value.deinit(allocator);
-    var diversity = if (object.get("diversity")) |value|
-        try compileDiversity(allocator, value)
-    else
-        null;
-    errdefer if (diversity) |*value| value.deinit(allocator);
-
+    var components = try compileOptionalComponents(
+        allocator,
+        object,
+        declarations,
+    );
+    errdefer components.deinit(allocator);
     try validateComponentWeights(
         weights,
         token_group.len != 0,
-        path_match != null,
-        recency != null,
-        presence != null,
+        components.path_match != null,
+        components.recency != null,
+        components.presence != null,
     );
     return .{
         .tokenizer = tokenizer,
         .weights = weights,
         .token_group = token_group,
-        .path_match = path_match,
-        .recency = recency,
-        .presence = presence,
-        .enum_boost = enum_boost,
-        .exclude_referenced = exclude_referenced,
-        .diversity = diversity,
+        .path_match = components.path_match,
+        .recency = components.recency,
+        .presence = components.presence,
+        .enum_boost = components.enum_boost,
+        .exclude_referenced = components.exclude_referenced,
+        .diversity = components.diversity,
     };
+}
+
+fn compileOptionalComponents(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    declarations: *const definition_core.parameters.Declarations,
+) !OptionalComponents {
+    var result: OptionalComponents = .{
+        .path_match = null,
+        .recency = null,
+        .presence = null,
+        .enum_boost = null,
+        .exclude_referenced = null,
+        .diversity = null,
+    };
+    errdefer result.deinit(allocator);
+    if (object.get("path_match")) |value| {
+        result.path_match =
+            try compilePathMatch(allocator, value, declarations);
+    }
+    if (object.get("recency")) |value| {
+        result.recency = try compileRecency(allocator, value, declarations);
+    }
+    if (object.get("presence")) |value| {
+        result.presence = try compilePresence(allocator, value);
+    }
+    if (object.get("enum_boost")) |value| {
+        result.enum_boost = try compileEnumBoost(allocator, value);
+    }
+    if (object.get("exclude_referenced")) |value| {
+        result.exclude_referenced =
+            try compileExcludeReferenced(allocator, value, declarations);
+    }
+    if (object.get("diversity")) |value| {
+        result.diversity = try compileDiversity(allocator, value);
+    }
+    return result;
 }
 
 pub fn encodeCache(
@@ -311,6 +347,43 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
+    var tokenizer = try decodeTokenizer(allocator, decoder);
+    errdefer tokenizer.deinit(allocator);
+    const weights: Weights = .{
+        .jaccard = try readWeight(decoder, false),
+        .token_group = try readWeight(decoder, false),
+        .path_match = try readWeight(decoder, false),
+        .recency = try readWeight(decoder, false),
+        .presence = try readWeight(decoder, false),
+    };
+    const token_group = try decodeStrings(allocator, decoder, true);
+    errdefer freeStrings(allocator, token_group);
+    var components = try decodeOptionalComponents(allocator, decoder);
+    errdefer components.deinit(allocator);
+    try validateComponentWeights(
+        weights,
+        token_group.len != 0,
+        components.path_match != null,
+        components.recency != null,
+        components.presence != null,
+    );
+    return .{
+        .tokenizer = tokenizer,
+        .weights = weights,
+        .token_group = token_group,
+        .path_match = components.path_match,
+        .recency = components.recency,
+        .presence = components.presence,
+        .enum_boost = components.enum_boost,
+        .exclude_referenced = components.exclude_referenced,
+        .diversity = components.diversity,
+    };
+}
+
+fn decodeTokenizer(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Tokenizer {
     const minimum_length = try decoder.readUsize();
     if (minimum_length == 0 or minimum_length > max_token_bytes) {
         return error.CacheRankedTokenizerInvalid;
@@ -337,73 +410,51 @@ pub fn decodeCache(
         };
         suffix_initialized += 1;
     }
-    const tokenizer: Tokenizer = .{
+    return .{
         .minimum_length = minimum_length,
         .stopwords = stopwords,
         .suffixes = suffixes,
     };
-    errdefer {
-        var owned = tokenizer;
-        owned.deinit(allocator);
-    }
+}
 
-    const weights: Weights = .{
-        .jaccard = try readWeight(decoder, false),
-        .token_group = try readWeight(decoder, false),
-        .path_match = try readWeight(decoder, false),
-        .recency = try readWeight(decoder, false),
-        .presence = try readWeight(decoder, false),
+fn decodeOptionalComponents(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !OptionalComponents {
+    var result: OptionalComponents = .{
+        .path_match = null,
+        .recency = null,
+        .presence = null,
+        .enum_boost = null,
+        .exclude_referenced = null,
+        .diversity = null,
     };
-    const token_group = try decodeStrings(allocator, decoder, true);
-    errdefer freeStrings(allocator, token_group);
-    var path_match = if (try decoder.readBool())
+    errdefer result.deinit(allocator);
+    result.path_match = if (try decoder.readBool())
         try decodePathMatch(allocator, decoder)
     else
         null;
-    errdefer if (path_match) |*value| value.deinit(allocator);
-    var recency = if (try decoder.readBool())
+    result.recency = if (try decoder.readBool())
         try decodeRecency(allocator, decoder)
     else
         null;
-    errdefer if (recency) |*value| value.deinit(allocator);
-    var presence = if (try decoder.readBool())
+    result.presence = if (try decoder.readBool())
         try decodePresence(allocator, decoder)
     else
         null;
-    errdefer if (presence) |*value| value.deinit(allocator);
-    var enum_boost = if (try decoder.readBool())
+    result.enum_boost = if (try decoder.readBool())
         try decodeEnumBoost(allocator, decoder)
     else
         null;
-    errdefer if (enum_boost) |*value| value.deinit(allocator);
-    var exclude_referenced = if (try decoder.readBool())
+    result.exclude_referenced = if (try decoder.readBool())
         try decodeExcludeReferenced(allocator, decoder)
     else
         null;
-    errdefer if (exclude_referenced) |*value| value.deinit(allocator);
-    var diversity = if (try decoder.readBool())
+    result.diversity = if (try decoder.readBool())
         try decodeDiversity(allocator, decoder)
     else
         null;
-    errdefer if (diversity) |*value| value.deinit(allocator);
-    try validateComponentWeights(
-        weights,
-        token_group.len != 0,
-        path_match != null,
-        recency != null,
-        presence != null,
-    );
-    return .{
-        .tokenizer = tokenizer,
-        .weights = weights,
-        .token_group = token_group,
-        .path_match = path_match,
-        .recency = recency,
-        .presence = presence,
-        .enum_boost = enum_boost,
-        .exclude_referenced = exclude_referenced,
-        .diversity = diversity,
-    };
+    return result;
 }
 
 pub fn validateCache(
@@ -485,21 +536,69 @@ pub fn score(
 ) !?f64 {
     var search_text: std.Io.Writer.Allocating = .init(allocator);
     defer search_text.deinit();
-    for (text_paths) |path| {
-        const selected = definition_core.json_pointer.lookup(
-            value,
-            path,
-        ) orelse continue;
-        try appendTextValue(allocator, &search_text.writer, selected);
-        try search_text.writer.writeByte(' ');
-    }
+    try appendSelectedText(
+        allocator,
+        &search_text.writer,
+        text_paths,
+        value,
+    );
     var record_tokens = try tokenizeSet(
         allocator,
         plan.tokenizer,
         search_text.written(),
     );
     defer deinitOwnedStringSet(allocator, &record_tokens);
-    const overlap = intersectionCount(&prepared.tokens, &record_tokens);
+    const lexical = try lexicalScores(
+        plan,
+        prepared,
+        &record_tokens,
+        value,
+    );
+    if (!lexical.matched) return null;
+    const recency = recencyScore(plan, prepared, value);
+    const presence = try presenceScore(plan, value);
+    const enum_boost = if (plan.enum_boost) |boost|
+        enumBoostScore(value, boost)
+    else
+        0.0;
+    return (plan.weights.jaccard * lexical.jaccard) +
+        (plan.weights.token_group * lexical.token_group) +
+        (plan.weights.path_match * lexical.path_match) +
+        (plan.weights.recency * recency) +
+        (plan.weights.presence * presence) +
+        enum_boost;
+}
+
+fn appendSelectedText(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    text_paths: []const definition_core.json_pointer.Pointer,
+    value: std.json.Value,
+) !void {
+    for (text_paths) |path| {
+        const selected = definition_core.json_pointer.lookup(
+            value,
+            path,
+        ) orelse continue;
+        try appendTextValue(allocator, writer, selected);
+        try writer.writeByte(' ');
+    }
+}
+
+const LexicalScores = struct {
+    jaccard: f64,
+    token_group: f64,
+    path_match: f64,
+    matched: bool,
+};
+
+fn lexicalScores(
+    plan: Plan,
+    prepared: *const Prepared,
+    record_tokens: *const std.StringHashMap(void),
+    value: std.json.Value,
+) !LexicalScores {
+    const overlap = intersectionCount(&prepared.tokens, record_tokens);
     const union_count =
         prepared.tokens.count() + record_tokens.count() - overlap;
     const jaccard = if (union_count == 0)
@@ -510,57 +609,56 @@ pub fn score(
     const token_group_match: f64 = if (hasTokenGroupIntersection(
         plan.token_group,
         &prepared.tokens,
-        &record_tokens,
+        record_tokens,
     )) 1.0 else 0.0;
     const path_match: f64 = if (plan.path_match) |path_plan|
-        if (containsAnyHint(
+        if (try containsAnyHint(
             value,
             path_plan.paths,
             prepared.path_hints,
         )) 1.0 else 0.0
     else
         0.0;
-    if (overlap == 0 and token_group_match == 0.0 and path_match == 0.0) {
-        return null;
-    }
-    const recency: f64 = if (plan.recency) |recency_plan| recency: {
-        const selected = definition_core.json_pointer.lookup(
-            value,
-            recency_plan.path,
-        ) orelse break :recency 0.0;
-        const timestamp = switch (selected) {
-            .string => |text| text,
-            else => break :recency 0.0,
-        };
-        const captured = parseIsoTimestampSeconds(timestamp) orelse
-            break :recency 0.0;
-        const now = prepared.now_seconds orelse break :recency 0.0;
-        const age = @as(f64, @floatFromInt(@max(now - captured, 0)));
-        break :recency std.math.exp(-(age / recency_plan.decay_seconds));
-    } else 0.0;
-    const presence: f64 = if (plan.presence) |presence_plan|
-        if (definition_core.json_pointer.lookup(
-            value,
-            presence_plan.path,
-        )) |selected|
-            if (valuePresent(selected, presence_plan.absent_strings))
-                1.0
-            else
-                0.0
-        else
-            0.0
+    return .{
+        .jaccard = jaccard,
+        .token_group = token_group_match,
+        .path_match = path_match,
+        .matched = overlap != 0 or
+            token_group_match != 0.0 or
+            path_match != 0.0,
+    };
+}
+
+fn recencyScore(
+    plan: Plan,
+    prepared: *const Prepared,
+    value: std.json.Value,
+) f64 {
+    const recency_plan = plan.recency orelse return 0.0;
+    const selected = definition_core.json_pointer.lookup(
+        value,
+        recency_plan.path,
+    ) orelse return 0.0;
+    const timestamp = switch (selected) {
+        .string => |text| text,
+        else => return 0.0,
+    };
+    const captured = parseIsoTimestampSeconds(timestamp) orelse return 0.0;
+    const now = prepared.now_seconds orelse return 0.0;
+    const age = @as(f64, @floatFromInt(@max(now - captured, 0)));
+    return std.math.exp(-(age / recency_plan.decay_seconds));
+}
+
+fn presenceScore(plan: Plan, value: std.json.Value) !f64 {
+    const presence_plan = plan.presence orelse return 0.0;
+    const selected = definition_core.json_pointer.lookup(
+        value,
+        presence_plan.path,
+    ) orelse return 0.0;
+    return if (try valuePresent(selected, presence_plan.absent_strings))
+        1.0
     else
         0.0;
-    const enum_boost: f64 = if (plan.enum_boost) |boost|
-        enumBoostScore(value, boost)
-    else
-        0.0;
-    return (plan.weights.jaccard * jaccard) +
-        (plan.weights.token_group * token_group_match) +
-        (plan.weights.path_match * path_match) +
-        (plan.weights.recency * recency) +
-        (plan.weights.presence * presence) +
-        enum_boost;
 }
 
 pub fn referencedId(plan: Plan, value: std.json.Value) ?[]const u8 {
@@ -1367,23 +1465,74 @@ fn flushToken(
     try output.put(owned, {});
 }
 
+const ArrayFrame = struct {
+    items: []const std.json.Value,
+    next_index: usize,
+};
+
+const ValueWalker = struct {
+    current: ?std.json.Value,
+    frames: [max_value_depth]ArrayFrame = undefined,
+    depth: usize = 0,
+
+    fn init(value: std.json.Value) ValueWalker {
+        return .{ .current = value };
+    }
+
+    fn next(self: *ValueWalker) !?std.json.Value {
+        var steps: usize = 0;
+        while (steps < max_value_walk_steps) : (steps += 1) {
+            if (self.current) |value| {
+                self.current = null;
+                switch (value) {
+                    .array => |array| {
+                        if (array.items.len != 0) {
+                            if (self.depth == self.frames.len) {
+                                return error.RankedValueDepthExceeded;
+                            }
+                            self.frames[self.depth] = .{
+                                .items = array.items,
+                                .next_index = 1,
+                            };
+                            self.depth += 1;
+                            self.current = array.items[0];
+                        }
+                    },
+                    else => return value,
+                }
+            }
+            while (self.current == null and self.depth != 0) {
+                var frame = &self.frames[self.depth - 1];
+                if (frame.next_index < frame.items.len) {
+                    self.current = frame.items[frame.next_index];
+                    frame.next_index += 1;
+                } else {
+                    self.depth -= 1;
+                }
+            }
+            if (self.current == null and self.depth == 0) return null;
+        }
+        return error.RankedValueNodesExceeded;
+    }
+};
+
 fn appendTextValue(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     value: std.json.Value,
 ) !void {
-    switch (value) {
-        .string => |text| try writer.writeAll(text),
-        .array => |array| for (array.items) |item| {
-            try appendTextValue(allocator, writer, item);
-            try writer.writeByte(' ');
-        },
-        .null => {},
-        else => try definition_core.canonical_json.writeCanonicalJson(
-            allocator,
-            writer,
-            value,
-        ),
+    var walker = ValueWalker.init(value);
+    while (try walker.next()) |item| {
+        switch (item) {
+            .string => |text| try writer.writeAll(text),
+            .null => {},
+            else => try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                writer,
+                item,
+            ),
+        }
+        if (walker.depth != 0) try writer.writeByte(' ');
     }
 }
 
@@ -1476,53 +1625,45 @@ fn containsAnyHint(
     value: std.json.Value,
     paths: []const definition_core.json_pointer.Pointer,
     hints: []const []u8,
-) bool {
+) !bool {
     if (hints.len == 0) return false;
     for (paths) |path| {
         const selected = definition_core.json_pointer.lookup(
             value,
             path,
         ) orelse continue;
-        if (valueContainsHint(selected, hints)) return true;
+        if (try valueContainsHint(selected, hints)) return true;
     }
     return false;
 }
 
-fn valueContainsHint(value: std.json.Value, hints: []const []u8) bool {
-    return switch (value) {
-        .string => |text| contains: {
-            for (hints) |hint| {
-                if (std.mem.indexOf(u8, text, hint) != null) {
-                    break :contains true;
-                }
-            }
-            break :contains false;
-        },
-        .array => |array| contains: {
-            for (array.items) |item| {
-                if (valueContainsHint(item, hints)) break :contains true;
-            }
-            break :contains false;
-        },
-        else => false,
-    };
+fn valueContainsHint(value: std.json.Value, hints: []const []u8) !bool {
+    var walker = ValueWalker.init(value);
+    while (try walker.next()) |item| {
+        const text = switch (item) {
+            .string => |text| text,
+            else => continue,
+        };
+        for (hints) |hint| {
+            if (std.mem.indexOf(u8, text, hint) != null) return true;
+        }
+    }
+    return false;
 }
 
-fn valuePresent(value: std.json.Value, absent_strings: []const []u8) bool {
-    return switch (value) {
-        .null => false,
-        .string => |text| text.len != 0 and
-            !stringListContains(absent_strings, text),
-        .array => |array| present: {
-            if (array.items.len == 0) break :present false;
-            for (array.items) |item| {
-                if (valuePresent(item, absent_strings)) break :present true;
-            }
-            break :present false;
-        },
-        .object => |object| object.count() != 0,
-        else => true,
-    };
+fn valuePresent(value: std.json.Value, absent_strings: []const []u8) !bool {
+    var walker = ValueWalker.init(value);
+    while (try walker.next()) |item| {
+        const present = switch (item) {
+            .null => false,
+            .string => |text| text.len != 0 and
+                !stringListContains(absent_strings, text),
+            .object => |object| object.count() != 0,
+            else => true,
+        };
+        if (present) return true;
+    }
+    return false;
 }
 
 fn enumBoostScore(value: std.json.Value, boost: EnumBoost) f64 {
@@ -1665,80 +1806,104 @@ test "ranked tokenizer preserves exact query terms" {
     try std.testing.expect(!tokens.contains("ci"));
 }
 
-test "ranked plan cache preserves bounded scoring metadata" {
-    var parameter_json = try std.json.parseFromSlice(
+const ranked_parameter_json =
+    \\{
+    \\  "paths":{"type":"string","required":false,"default":""},
+    \\  "now":{"type":"string","required":false},
+    \\  "drop":{"type":"boolean","required":false,"default":false}
+    \\}
+;
+
+const ranked_plan_json =
+    \\{
+    \\  "tokenizer":{
+    \\    "minimum_length":3,
+    \\    "stopwords":["the"],
+    \\    "suffixes":[{"value":"s","minimum_length":4}]
+    \\  },
+    \\  "weights":{
+    \\    "jaccard":3,
+    \\    "token_group":1,
+    \\    "path_match":1.5,
+    \\    "recency":1,
+    \\    "presence":0.25
+    \\  },
+    \\  "token_group":["git"],
+    \\  "path_match":{
+    \\    "paths":["/record/context/paths"],
+    \\    "param":"paths",
+    \\    "extract_from_query":true
+    \\  },
+    \\  "recency":{
+    \\    "path":"/record/captured_at",
+    \\    "now_param":"now",
+    \\    "decay_seconds":3888000
+    \\  },
+    \\  "presence":{
+    \\    "path":"/record/evidence",
+    \\    "absent_strings":["none_provided"]
+    \\  },
+    \\  "enum_boost":{
+    \\    "path":"/record/status",
+    \\    "values":[{"value":"do_more","score":0.15}]
+    \\  },
+    \\  "exclude_referenced":{
+    \\    "enabled_param":"drop",
+    \\    "id_path":"/record/id",
+    \\    "reference_path":"/record/supersedes_id"
+    \\  },
+    \\  "diversity":{
+    \\    "paths":["/record/tags","/record/learning"],
+    \\    "token_limit":6,
+    \\    "max_per_key":2
+    \\  }
+    \\}
+;
+
+const ranked_record_json =
+    \\{"record":{
+    \\  "id":"r2",
+    \\  "supersedes_id":"r1",
+    \\  "captured_at":"2026-07-05T00:00:00Z",
+    \\  "status":"do_more",
+    \\  "learning":"Preserve the git cache.",
+    \\  "evidence":["proof"],
+    \\  "tags":["same"],
+    \\  "context":{"paths":["src/ledger.zig"]}
+    \\}}
+;
+
+fn compileRankedTestDeclarations() !definition_core.parameters.Declarations {
+    var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{
-        \\  "paths":{"type":"string","required":false,"default":""},
-        \\  "now":{"type":"string","required":false},
-        \\  "drop":{"type":"boolean","required":false,"default":false}
-        \\}
-    ,
+        ranked_parameter_json,
         .{},
     );
-    defer parameter_json.deinit();
-    var declarations = try definition_core.parameters.compile(
+    defer parsed.deinit();
+    return definition_core.parameters.compile(
         std.testing.allocator,
-        parameter_json.value,
+        parsed.value,
     );
-    defer declarations.deinit(std.testing.allocator);
-    var ranking_json = try std.json.parseFromSlice(
+}
+
+fn compileRankedTestPlan(
+    declarations: *const definition_core.parameters.Declarations,
+) !Plan {
+    var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{
-        \\  "tokenizer":{
-        \\    "minimum_length":3,
-        \\    "stopwords":["the"],
-        \\    "suffixes":[{"value":"s","minimum_length":4}]
-        \\  },
-        \\  "weights":{
-        \\    "jaccard":3,
-        \\    "token_group":1,
-        \\    "path_match":1.5,
-        \\    "recency":1,
-        \\    "presence":0.25
-        \\  },
-        \\  "token_group":["git"],
-        \\  "path_match":{
-        \\    "paths":["/record/context/paths"],
-        \\    "param":"paths",
-        \\    "extract_from_query":true
-        \\  },
-        \\  "recency":{
-        \\    "path":"/record/captured_at",
-        \\    "now_param":"now",
-        \\    "decay_seconds":3888000
-        \\  },
-        \\  "presence":{
-        \\    "path":"/record/evidence",
-        \\    "absent_strings":["none_provided"]
-        \\  },
-        \\  "enum_boost":{
-        \\    "path":"/record/status",
-        \\    "values":[{"value":"do_more","score":0.15}]
-        \\  },
-        \\  "exclude_referenced":{
-        \\    "enabled_param":"drop",
-        \\    "id_path":"/record/id",
-        \\    "reference_path":"/record/supersedes_id"
-        \\  },
-        \\  "diversity":{
-        \\    "paths":["/record/tags","/record/learning"],
-        \\    "token_limit":6,
-        \\    "max_per_key":2
-        \\  }
-        \\}
-    ,
+        ranked_plan_json,
         .{},
     );
-    defer ranking_json.deinit();
-    var plan = try compile(
-        std.testing.allocator,
-        ranking_json.value,
-        &declarations,
-    );
-    defer plan.deinit(std.testing.allocator);
+    defer parsed.deinit();
+    return compile(std.testing.allocator, parsed.value, declarations);
+}
+
+fn roundTripRankedTestPlan(
+    plan: Plan,
+    declarations: *const definition_core.parameters.Declarations,
+) !Plan {
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
         64 * 1024,
@@ -1749,43 +1914,34 @@ test "ranked plan cache preserves bounded scoring metadata" {
     defer std.testing.allocator.free(payload);
     var decoder = definition_core.cache.Decoder.init(payload);
     var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
+    errdefer cached.deinit(std.testing.allocator);
     try decoder.finish();
-    try validateCache(cached, &declarations);
-    var bindings = try definition_core.parameters.bind(
+    try validateCache(cached, declarations);
+    return cached;
+}
+
+fn bindRankedTestParameters(
+    declarations: *const definition_core.parameters.Declarations,
+) !definition_core.parameters.Bindings {
+    return definition_core.parameters.bind(
         std.testing.allocator,
-        &declarations,
+        declarations,
         &.{
             .{ .name = "paths", .raw_value = "" },
             .{ .name = "now", .raw_value = "2026-07-06T00:00:00Z" },
             .{ .name = "drop", .raw_value = "true" },
         },
     );
-    defer bindings.deinit(std.testing.allocator);
-    var prepared = try prepare(
-        std.testing.allocator,
-        cached,
-        "git cache src/ledger.zig",
-        &bindings,
-    );
-    defer prepared.deinit(std.testing.allocator);
-    var record_json = try std.json.parseFromSlice(
+}
+
+fn expectRankedRecord(plan: Plan, prepared: *const Prepared) !void {
+    var record = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"record":{
-        \\  "id":"r2",
-        \\  "supersedes_id":"r1",
-        \\  "captured_at":"2026-07-05T00:00:00Z",
-        \\  "status":"do_more",
-        \\  "learning":"Preserve the git cache.",
-        \\  "evidence":["proof"],
-        \\  "tags":["same"],
-        \\  "context":{"paths":["src/ledger.zig"]}
-        \\}}
-    ,
+        ranked_record_json,
         .{},
     );
-    defer record_json.deinit();
+    defer record.deinit();
     var text_paths: [1]definition_core.json_pointer.Pointer = .{
         try definition_core.json_pointer.compile(
             std.testing.allocator,
@@ -1795,28 +1951,47 @@ test "ranked plan cache preserves bounded scoring metadata" {
     defer text_paths[0].deinit(std.testing.allocator);
     const ranked_score = (try score(
         std.testing.allocator,
-        cached,
-        &prepared,
+        plan,
+        prepared,
         &text_paths,
-        record_json.value,
+        record.value,
     )).?;
     try std.testing.expect(ranked_score > 3.0);
     try std.testing.expectEqualStrings(
         "r1",
-        referencedId(cached, record_json.value).?,
+        referencedId(plan, record.value).?,
     );
     try std.testing.expectEqualStrings(
         "r2",
-        rowId(cached, record_json.value).?,
+        rowId(plan, record.value).?,
     );
     const theme = (try themeAlloc(
         std.testing.allocator,
-        cached,
-        record_json.value,
+        plan,
+        record.value,
     )).?;
     defer std.testing.allocator.free(theme);
     try std.testing.expectEqualStrings("cache git preserve same", theme);
-    try std.testing.expectEqual(@as(?usize, 2), maxPerTheme(cached));
+    try std.testing.expectEqual(@as(?usize, 2), maxPerTheme(plan));
+}
+
+test "ranked plan cache preserves bounded scoring metadata" {
+    var declarations = try compileRankedTestDeclarations();
+    defer declarations.deinit(std.testing.allocator);
+    var plan = try compileRankedTestPlan(&declarations);
+    defer plan.deinit(std.testing.allocator);
+    var cached = try roundTripRankedTestPlan(plan, &declarations);
+    defer cached.deinit(std.testing.allocator);
+    var bindings = try bindRankedTestParameters(&declarations);
+    defer bindings.deinit(std.testing.allocator);
+    var prepared = try prepare(
+        std.testing.allocator,
+        cached,
+        "git cache src/ledger.zig",
+        &bindings,
+    );
+    defer prepared.deinit(std.testing.allocator);
+    try expectRankedRecord(cached, &prepared);
 }
 
 test "ranked plan rejects undeclared execution-shaped fields" {
