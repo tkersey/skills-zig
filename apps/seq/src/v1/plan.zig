@@ -379,212 +379,387 @@ fn compileStage(
     );
     defer parsed.deinit();
     const object = try definition_core.json.object(parsed.value);
-    var operation: Operation = undefined;
-    var schema: Schema = undefined;
-    var source_ref: ?SourceRef = null;
-    switch (source.operator) {
-        .scan => {
-            const relation = try physical.Relation.parse(
-                try definition_core.json.requiredString(object, "relation"),
-            );
-            const requirement = findRelation(
-                definition_plan.relations,
-                relation,
-            ) orelse return error.UndeclaredPhysicalRelation;
-            const field_indices = try allocator.dupe(
-                u16,
-                requirement.fields,
-            );
-            errdefer allocator.free(field_indices);
-            schema = try schemaFromPhysical(
-                allocator,
-                relation,
-                field_indices,
-            );
-            operation = .{ .scan = .{
-                .relation = relation,
-                .field_indices = field_indices,
-            } };
-        },
-        .filter => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            errdefer schema.deinit(allocator);
-            const predicates = try compilePredicates(
-                allocator,
-                definition_plan,
-                &schema,
-                try definition_core.json.array(
-                    try definition_core.json.field(object, "where"),
-                ),
-            );
-            errdefer {
-                for (predicates) |*predicate| predicate.deinit(allocator);
-                allocator.free(predicates);
-            }
-            operation = .{ .filter = .{ .predicates = predicates } };
-        },
-        .project => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            var input_schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            defer input_schema.deinit(allocator);
-            const field_indices = try compileFieldSelection(
-                allocator,
-                &input_schema,
-                try definition_core.json.array(
-                    try definition_core.json.field(object, "fields"),
-                ),
-            );
-            errdefer allocator.free(field_indices);
-            schema = try projectSchema(
-                allocator,
-                &input_schema,
-                field_indices,
-            );
-            operation = .{ .project = .{
-                .input_field_indices = field_indices,
-            } };
-        },
-        .aggregate => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            var input_schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            defer input_schema.deinit(allocator);
-            var compiled = try compileAggregate(
-                allocator,
-                &input_schema,
-                object,
-            );
-            errdefer compiled.deinit(allocator);
-            operation = .{ .aggregate = compiled.aggregate };
-            schema = compiled.schema;
-            compiled = undefined;
-        },
-        .named_relation, .result_projection => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            operation = .alias;
-        },
-        .limit => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            operation = .{ .limit = try compileLimit(
-                definition_plan,
-                object,
-            ) };
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-        },
-        .sort => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            errdefer schema.deinit(allocator);
-            operation = .{ .sort = try compileSort(
-                allocator,
-                &schema,
-                object,
-            ) };
-        },
-        .top_k => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            errdefer schema.deinit(allocator);
-            var sort = try compileSort(allocator, &schema, object);
-            errdefer sort.deinit(allocator);
-            operation = .{ .top_k = .{
-                .keys = sort.keys,
-                .limit = try compileLimit(definition_plan, object),
-            } };
-            sort = undefined;
-        },
-        .distinct => {
-            source_ref = try resolveSource(
-                definition_plan,
-                prior_stages,
-                source.input_names[0],
-            );
-            schema = try cloneSourceSchema(
-                allocator,
-                definition_plan,
-                prior_stages,
-                source_ref.?,
-            );
-            errdefer schema.deinit(allocator);
-            operation = .{ .distinct = try compileDistinct(
-                allocator,
-                &schema,
-                object,
-            ) };
-        },
-        else => return error.ObservationOperatorPlanNotCompiled,
-    }
-    errdefer operation.deinit(allocator);
-    errdefer schema.deinit(allocator);
+    var body = try compileStageBody(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+        object,
+    );
+    errdefer body.deinit(allocator);
     return .{
         .name = try allocator.dupe(u8, output_name),
+        .source = body.source,
+        .operation = body.operation,
+        .schema = body.schema,
+    };
+}
+
+fn compileStageBody(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    return switch (source.operator) {
+        .scan => try compileScanStage(allocator, definition_plan, object),
+        .filter => try compileFilterStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        .project => try compileProjectStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        .aggregate => try compileAggregateStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        else => try compilePassThroughStageBody(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+    };
+}
+
+fn compilePassThroughStageBody(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    return switch (source.operator) {
+        .named_relation,
+        .result_projection,
+        => try compileAliasStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+        ),
+        .limit => try compileLimitStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        .sort => try compileSortStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        .top_k => try compileTopKStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        .distinct => try compileDistinctStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
+        else => error.ObservationOperatorPlanNotCompiled,
+    };
+}
+
+const StageBody = struct {
+    source: ?SourceRef,
+    operation: Operation,
+    schema: Schema,
+
+    fn deinit(self: *StageBody, allocator: std.mem.Allocator) void {
+        self.operation.deinit(allocator);
+        self.schema.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const InputStage = struct {
+    source: SourceRef,
+    schema: Schema,
+
+    fn deinit(self: *InputStage, allocator: std.mem.Allocator) void {
+        self.schema.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileInputStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+) !InputStage {
+    const source_ref = try resolveSource(
+        definition_plan,
+        prior_stages,
+        source.input_names[0],
+    );
+    return .{
         .source = source_ref,
-        .operation = operation,
-        .schema = schema,
+        .schema = try cloneSourceSchema(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source_ref,
+        ),
+    };
+}
+
+fn compileScanStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !StageBody {
+    const relation = try physical.Relation.parse(
+        try definition_core.json.requiredString(object, "relation"),
+    );
+    const requirement = findRelation(
+        definition_plan.relations,
+        relation,
+    ) orelse return error.UndeclaredPhysicalRelation;
+    const field_indices = try allocator.dupe(u16, requirement.fields);
+    errdefer allocator.free(field_indices);
+    return .{
+        .source = null,
+        .operation = .{ .scan = .{
+            .relation = relation,
+            .field_indices = field_indices,
+        } },
+        .schema = try schemaFromPhysical(
+            allocator,
+            relation,
+            field_indices,
+        ),
+    };
+}
+
+fn compileFilterStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    errdefer input.deinit(allocator);
+    const predicates = try compilePredicates(
+        allocator,
+        definition_plan,
+        &input.schema,
+        try definition_core.json.array(
+            try definition_core.json.field(object, "where"),
+        ),
+    );
+    return .{
+        .source = input.source,
+        .operation = .{ .filter = .{ .predicates = predicates } },
+        .schema = input.schema,
+    };
+}
+
+fn compileProjectStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    defer input.deinit(allocator);
+    const field_indices = try compileFieldSelection(
+        allocator,
+        &input.schema,
+        try definition_core.json.array(
+            try definition_core.json.field(object, "fields"),
+        ),
+    );
+    errdefer allocator.free(field_indices);
+    return .{
+        .source = input.source,
+        .operation = .{ .project = .{
+            .input_field_indices = field_indices,
+        } },
+        .schema = try projectSchema(
+            allocator,
+            &input.schema,
+            field_indices,
+        ),
+    };
+}
+
+fn compileAggregateStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    defer input.deinit(allocator);
+    const compiled = try compileAggregate(
+        allocator,
+        &input.schema,
+        object,
+    );
+    return .{
+        .source = input.source,
+        .operation = .{ .aggregate = compiled.aggregate },
+        .schema = compiled.schema,
+    };
+}
+
+fn compileAliasStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+) !StageBody {
+    const input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    return .{
+        .source = input.source,
+        .operation = .alias,
+        .schema = input.schema,
+    };
+}
+
+fn compileLimitStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    errdefer input.deinit(allocator);
+    const limit = try compileLimit(definition_plan, object);
+    return .{
+        .source = input.source,
+        .operation = .{ .limit = limit },
+        .schema = input.schema,
+    };
+}
+
+fn compileSortStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    errdefer input.deinit(allocator);
+    return .{
+        .source = input.source,
+        .operation = .{ .sort = try compileSort(
+            allocator,
+            &input.schema,
+            object,
+        ) },
+        .schema = input.schema,
+    };
+}
+
+fn compileTopKStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    errdefer input.deinit(allocator);
+    var sort = try compileSort(allocator, &input.schema, object);
+    errdefer sort.deinit(allocator);
+    const limit = try compileLimit(definition_plan, object);
+    return .{
+        .source = input.source,
+        .operation = .{ .top_k = .{
+            .keys = sort.keys,
+            .limit = limit,
+        } },
+        .schema = input.schema,
+    };
+}
+
+fn compileDistinctStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    errdefer input.deinit(allocator);
+    return .{
+        .source = input.source,
+        .operation = .{ .distinct = try compileDistinct(
+            allocator,
+            &input.schema,
+            object,
+        ) },
+        .schema = input.schema,
     };
 }
 
@@ -619,61 +794,81 @@ fn compileAggregate(
         allocator.free(columns);
     }
     for (values.items, 0..) |value, index| {
-        const metric = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            metric,
-            &.{ "name", "op", "field" },
+        const compiled = try compileAggregateMetric(
+            allocator,
+            input_schema,
+            columns[0..index],
+            value,
         );
-        try definition_core.json.requireFields(metric, &.{ "name", "op" });
-        const name = try definition_core.json.requiredString(metric, "name");
-        try definition_core.json.safeIdentifier(name, 128);
-        for (columns[0..index]) |prior| {
-            if (std.mem.eql(u8, prior.name, name)) {
-                return error.DuplicateObservationAggregateName;
-            }
-        }
-        const function = try AggregateFunction.parse(
-            try definition_core.json.requiredString(metric, "op"),
-        );
-        const field_index = if (metric.get("field")) |raw|
-            input_schema.find(try definition_core.json.string(raw)) orelse
-                return error.UnknownObservationAggregateField
-        else
-            null;
-        if (function != .count and field_index == null) {
-            return error.ObservationAggregateFieldRequired;
-        }
-        const input_kind = if (field_index) |field|
-            input_schema.columns[field].kind
-        else
-            .integer;
-        if (field_index != null and
-            input_kind != .integer and
-            input_kind != .float)
-        {
-            return error.ObservationAggregateFieldMustBeNumeric;
-        }
-        const output_kind: ColumnKind = switch (function) {
-            .count => .integer,
-            .average => .float,
-            .sum, .min, .max => input_kind,
-        };
-        metrics[index] = .{
-            .function = function,
-            .field_index = field_index,
-        };
-        columns[index] = .{
-            .name = try allocator.dupe(u8, name),
-            .kind = output_kind,
-            .nullable = function == .average or
-                function == .min or
-                function == .max,
-        };
+        metrics[index] = compiled.metric;
+        columns[index] = compiled.column;
         initialized += 1;
     }
     return .{
         .aggregate = .{ .metrics = metrics },
         .schema = .{ .columns = columns },
+    };
+}
+
+const AggregateMetricCompilation = struct {
+    metric: AggregateMetric,
+    column: Column,
+};
+
+fn compileAggregateMetric(
+    allocator: std.mem.Allocator,
+    input_schema: *const Schema,
+    prior_columns: []const Column,
+    value: std.json.Value,
+) !AggregateMetricCompilation {
+    const object = try definition_core.json.object(value);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "name", "op", "field" },
+    );
+    try definition_core.json.requireFields(object, &.{ "name", "op" });
+    const name = try definition_core.json.requiredString(object, "name");
+    try definition_core.json.safeIdentifier(name, 128);
+    for (prior_columns) |prior| {
+        if (std.mem.eql(u8, prior.name, name)) {
+            return error.DuplicateObservationAggregateName;
+        }
+    }
+    const function = try AggregateFunction.parse(
+        try definition_core.json.requiredString(object, "op"),
+    );
+    const field_index = if (object.get("field")) |raw|
+        input_schema.find(try definition_core.json.string(raw)) orelse
+            return error.UnknownObservationAggregateField
+    else
+        null;
+    if (function != .count and field_index == null) {
+        return error.ObservationAggregateFieldRequired;
+    }
+    const input_kind = if (field_index) |field|
+        input_schema.columns[field].kind
+    else
+        .integer;
+    if (field_index != null and
+        input_kind != .integer and
+        input_kind != .float)
+    {
+        return error.ObservationAggregateFieldMustBeNumeric;
+    }
+    const output_kind: ColumnKind = switch (function) {
+        .count => .integer,
+        .average => .float,
+        .sum, .min, .max => input_kind,
+    };
+    return .{
+        .metric = .{ .function = function, .field_index = field_index },
+        .column = .{
+            .name = try allocator.dupe(u8, name),
+            .kind = output_kind,
+            .nullable = function == .average or
+                function == .min or
+                function == .max,
+        },
     };
 }
 
@@ -1185,15 +1380,43 @@ pub fn decodeCache(
     if (try decoder.readU16() != 4) {
         return error.SeqNativePlanCacheVersionMismatch;
     }
+    const stages = try decodeCacheStages(allocator, decoder);
+    var stages_transferred = false;
+    errdefer if (!stages_transferred) deinitStages(allocator, stages);
+    const projections = try decodeCacheProjections(
+        allocator,
+        decoder,
+        stages,
+    );
+    var projections_transferred = false;
+    errdefer if (!projections_transferred) {
+        deinitProjections(allocator, projections);
+    };
+    var result = Plan{
+        .stages = stages,
+        .projections = projections,
+        .max_rows = try decoder.readUsize(),
+        .max_output_bytes = try decoder.readUsize(),
+    };
+    stages_transferred = true;
+    projections_transferred = true;
+    errdefer result.deinit(allocator);
+    try validateCachePlan(&result, definition_plan);
+    return result;
+}
+
+fn decodeCacheStages(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Stage {
     const stage_count = try decoder.readCount(256);
     if (stage_count == 0) return error.InvalidPipelineLength;
     const stages = try allocator.alloc(Stage, stage_count);
     var initialized: usize = 0;
-    var stages_transferred = false;
-    errdefer if (!stages_transferred) {
+    errdefer {
         for (stages[0..initialized]) |*stage| stage.deinit(allocator);
         allocator.free(stages);
-    };
+    }
     for (stages, 0..) |*stage, index| {
         const name = try decoder.readBytesAlloc(allocator, 128);
         errdefer allocator.free(name);
@@ -1223,17 +1446,24 @@ pub fn decodeCache(
         };
         initialized += 1;
     }
+    return stages;
+}
+
+fn decodeCacheProjections(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    stages: []const Stage,
+) ![]Projection {
     const projection_count = try decoder.readCount(64);
     if (projection_count == 0) return error.InvalidProjectionCount;
     const projections = try allocator.alloc(Projection, projection_count);
-    var projections_initialized: usize = 0;
-    var projections_transferred = false;
-    errdefer if (!projections_transferred) {
-        for (projections[0..projections_initialized]) |*projection| {
+    var initialized: usize = 0;
+    errdefer {
+        for (projections[0..initialized]) |*projection| {
             projection.deinit(allocator);
         }
         allocator.free(projections);
-    };
+    }
     for (projections) |*projection| {
         const definition_index = try decoder.readU16();
         const stage_index = try decoder.readU16();
@@ -1260,19 +1490,22 @@ pub fn decodeCache(
             .stage_index = stage_index,
             .field_indices = fields,
         };
-        projections_initialized += 1;
+        initialized += 1;
     }
-    var result: Plan = .{
-        .stages = stages,
-        .projections = projections,
-        .max_rows = try decoder.readUsize(),
-        .max_output_bytes = try decoder.readUsize(),
-    };
-    stages_transferred = true;
-    projections_transferred = true;
-    errdefer result.deinit(allocator);
-    try validateCachePlan(&result, definition_plan);
-    return result;
+    return projections;
+}
+
+fn deinitStages(allocator: std.mem.Allocator, stages: []Stage) void {
+    for (stages) |*stage| stage.deinit(allocator);
+    allocator.free(stages);
+}
+
+fn deinitProjections(
+    allocator: std.mem.Allocator,
+    projections: []Projection,
+) void {
+    for (projections) |*projection| projection.deinit(allocator);
+    allocator.free(projections);
 }
 
 pub fn validateCachePlan(
@@ -1291,208 +1524,241 @@ pub fn validateCachePlan(
         definition_plan.steps,
         0..,
     ) |stage, step, index| {
-        if (!std.mem.eql(
-            u8,
-            stage.name,
-            step.output_name orelse
-                return error.PipelineStageOutputMissing,
-        )) return error.CacheObservationStageNameMismatch;
-        const expected_source = if (step.operator == .scan)
-            null
-        else
-            try expectedSource(
-                native_plan.stages[0..index],
-                definition_plan.inputs,
-                step.input_names[0],
+        try validateCacheStage(
+            native_plan,
+            definition_plan,
+            stage,
+            step,
+            index,
+        );
+    }
+    try validateCacheProjections(native_plan, definition_plan);
+}
+
+fn validateCacheStage(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+    step: definition.Step,
+    index: usize,
+) !void {
+    const expected_name = step.output_name orelse
+        return error.PipelineStageOutputMissing;
+    if (!std.mem.eql(u8, stage.name, expected_name)) {
+        return error.CacheObservationStageNameMismatch;
+    }
+    const expected_source = if (step.operator == .scan)
+        null
+    else
+        try expectedSource(
+            native_plan.stages[0..index],
+            definition_plan.inputs,
+            step.input_names[0],
+        );
+    if (!sourcesEqual(stage.source, expected_source)) {
+        return error.CacheObservationSourceMismatch;
+    }
+    const source_schema = if (expected_source) |source|
+        sourceSchema(
+            native_plan.stages[0..index],
+            definition_plan.inputs,
+            source,
+        )
+    else
+        null;
+    switch (step.operator) {
+        .scan => try validateCachedScan(definition_plan, stage),
+        .filter => try validateCachedFilter(
+            definition_plan,
+            stage,
+            source_schema.?,
+        ),
+        .project => try validateCachedProject(stage, source_schema.?),
+        .aggregate => {
+            const aggregate = switch (stage.operation) {
+                .aggregate => |value| value,
+                else => return error.CacheObservationOperationMismatch,
+            };
+            try validateAggregate(
+                aggregate,
+                &stage.schema,
+                source_schema.?,
             );
-        if (!sourcesEqual(stage.source, expected_source)) {
-            return error.CacheObservationSourceMismatch;
+        },
+        .named_relation, .result_projection => {
+            try validateCachedAlias(stage, source_schema.?);
+        },
+        .limit => try validateCachedLimit(
+            native_plan,
+            definition_plan,
+            stage,
+            source_schema.?,
+        ),
+        .sort => try validateCachedSort(stage, source_schema.?),
+        .top_k => try validateCachedTopK(
+            native_plan,
+            definition_plan,
+            stage,
+            source_schema.?,
+        ),
+        .distinct => try validateCachedDistinct(stage, source_schema.?),
+        else => return error.ObservationOperatorPlanNotCompiled,
+    }
+}
+
+fn validateCachedScan(
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+) !void {
+    const scan = switch (stage.operation) {
+        .scan => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    const requirement = findRelation(
+        definition_plan.relations,
+        scan.relation,
+    ) orelse return error.UndeclaredPhysicalRelation;
+    if (!std.mem.eql(u16, scan.field_indices, requirement.fields)) {
+        return error.CachePhysicalFieldsMismatch;
+    }
+    try validatePhysicalSchema(
+        &stage.schema,
+        scan.relation,
+        scan.field_indices,
+    );
+}
+
+fn validateCachedFilter(
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+    source_schema: SourceSchema,
+) !void {
+    const filter = switch (stage.operation) {
+        .filter => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    try validateSameSchema(&stage.schema, source_schema);
+    for (filter.predicates) |predicate| {
+        if (predicate.field_index >= source_schema.columnCount()) {
+            return error.CachePredicateFieldInvalid;
         }
-        const source_schema = if (expected_source) |source|
-            sourceSchema(
-                native_plan.stages[0..index],
-                definition_plan.inputs,
-                source,
-            )
-        else
-            null;
-        switch (step.operator) {
-            .scan => {
-                const scan = switch (stage.operation) {
-                    .scan => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                const requirement = findRelation(
-                    definition_plan.relations,
-                    scan.relation,
-                ) orelse return error.UndeclaredPhysicalRelation;
-                if (!std.mem.eql(
-                    u16,
-                    scan.field_indices,
-                    requirement.fields,
-                )) return error.CachePhysicalFieldsMismatch;
-                try validatePhysicalSchema(
-                    &stage.schema,
-                    scan.relation,
-                    scan.field_indices,
-                );
-            },
-            .filter => {
-                const filter = switch (stage.operation) {
-                    .filter => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateSameSchema(&stage.schema, source_schema.?);
-                for (filter.predicates) |predicate| {
-                    if (predicate.field_index >=
-                        source_schema.?.columnCount())
-                    {
-                        return error.CachePredicateFieldInvalid;
-                    }
-                    if (predicate.operand == .parameter and
-                        predicate.operand.parameter >=
-                            definition_plan.parameter_declarations.items.len)
-                    {
-                        return error.ObservationParameterIndexInvalid;
-                    }
-                    try validatePredicateTypes(
-                        definition_plan,
-                        source_schema.?.column(predicate.field_index),
-                        predicate.operator,
-                        predicate.operand,
-                        predicate.case_insensitive,
-                    );
-                }
-            },
-            .project => {
-                const project = switch (stage.operation) {
-                    .project => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                if (project.input_field_indices.len !=
-                    stage.schema.columns.len)
-                {
-                    return error.CacheProjectionSchemaMismatch;
-                }
-                for (
-                    project.input_field_indices,
-                    stage.schema.columns,
-                ) |field_index, column| {
-                    if (field_index >= source_schema.?.columnCount()) {
-                        return error.CacheProjectionFieldInvalid;
-                    }
-                    try validateColumn(
-                        column,
-                        source_schema.?.column(field_index),
-                    );
-                }
-            },
-            .aggregate => {
-                const aggregate = switch (stage.operation) {
-                    .aggregate => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateAggregate(
-                    aggregate,
-                    &stage.schema,
-                    source_schema.?,
-                );
-            },
-            .named_relation, .result_projection => {
-                if (stage.operation != .alias) {
-                    return error.CacheObservationOperationMismatch;
-                }
-                try validateSameSchema(&stage.schema, source_schema.?);
-            },
-            .limit => {
-                const limit = switch (stage.operation) {
-                    .limit => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateSameSchema(&stage.schema, source_schema.?);
-                switch (limit) {
-                    .fixed => |count| if (count == 0 or
-                        count > native_plan.max_rows)
-                    {
-                        return error.InvalidObservationLimit;
-                    },
-                    .parameter => |parameter| {
-                        if (parameter >=
-                            definition_plan.parameter_declarations.items.len or
-                            definition_plan.parameter_declarations
-                                .items[parameter].kind != .integer)
-                        {
-                            return error.ObservationLimitParameterMustBeInteger;
-                        }
-                    },
-                }
-            },
-            .sort => {
-                const sort = switch (stage.operation) {
-                    .sort => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateSameSchema(&stage.schema, source_schema.?);
-                if (sort.keys.len == 0 or sort.keys.len > 64) {
-                    return error.InvalidObservationSortKeyCount;
-                }
-                for (sort.keys, 0..) |key, key_index| {
-                    if (key.field_index >= source_schema.?.columnCount()) {
-                        return error.CacheObservationSortFieldInvalid;
-                    }
-                    for (sort.keys[0..key_index]) |prior| {
-                        if (prior.field_index == key.field_index) {
-                            return error.DuplicateObservationSortField;
-                        }
-                    }
-                }
-            },
-            .top_k => {
-                const top_k = switch (stage.operation) {
-                    .top_k => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateSameSchema(&stage.schema, source_schema.?);
-                try validateSortKeys(
-                    top_k.keys,
-                    source_schema.?,
-                );
-                try validateLimit(
-                    top_k.limit,
-                    definition_plan,
-                    native_plan.max_rows,
-                );
-            },
-            .distinct => {
-                const distinct = switch (stage.operation) {
-                    .distinct => |value| value,
-                    else => return error.CacheObservationOperationMismatch,
-                };
-                try validateSameSchema(&stage.schema, source_schema.?);
-                if (distinct.field_indices.len == 0 or
-                    distinct.field_indices.len > 64)
-                {
-                    return error.InvalidObservationDistinctKeyCount;
-                }
-                for (
-                    distinct.field_indices,
-                    0..,
-                ) |field_index, distinct_index| {
-                    if (field_index >= source_schema.?.columnCount()) {
-                        return error.CacheObservationDistinctFieldInvalid;
-                    }
-                    for (
-                        distinct.field_indices[0..distinct_index],
-                    ) |prior| {
-                        if (prior == field_index) {
-                            return error.DuplicateObservationDistinctField;
-                        }
-                    }
-                }
-            },
-            else => return error.ObservationOperatorPlanNotCompiled,
+        if (predicate.operand == .parameter and
+            predicate.operand.parameter >=
+                definition_plan.parameter_declarations.items.len)
+        {
+            return error.ObservationParameterIndexInvalid;
+        }
+        try validatePredicateTypes(
+            definition_plan,
+            source_schema.column(predicate.field_index),
+            predicate.operator,
+            predicate.operand,
+            predicate.case_insensitive,
+        );
+    }
+}
+
+fn validateCachedProject(
+    stage: Stage,
+    source_schema: SourceSchema,
+) !void {
+    const project = switch (stage.operation) {
+        .project => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    if (project.input_field_indices.len != stage.schema.columns.len) {
+        return error.CacheProjectionSchemaMismatch;
+    }
+    for (
+        project.input_field_indices,
+        stage.schema.columns,
+    ) |field_index, column| {
+        if (field_index >= source_schema.columnCount()) {
+            return error.CacheProjectionFieldInvalid;
+        }
+        try validateColumn(column, source_schema.column(field_index));
+    }
+}
+
+fn validateCachedAlias(stage: Stage, source_schema: SourceSchema) !void {
+    if (stage.operation != .alias) {
+        return error.CacheObservationOperationMismatch;
+    }
+    try validateSameSchema(&stage.schema, source_schema);
+}
+
+fn validateCachedLimit(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+    source_schema: SourceSchema,
+) !void {
+    const limit = switch (stage.operation) {
+        .limit => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    try validateSameSchema(&stage.schema, source_schema);
+    try validateLimit(limit, definition_plan, native_plan.max_rows);
+}
+
+fn validateCachedSort(stage: Stage, source_schema: SourceSchema) !void {
+    const sort = switch (stage.operation) {
+        .sort => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    try validateSameSchema(&stage.schema, source_schema);
+    try validateSortKeys(sort.keys, source_schema);
+}
+
+fn validateCachedTopK(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+    stage: Stage,
+    source_schema: SourceSchema,
+) !void {
+    const top_k = switch (stage.operation) {
+        .top_k => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    try validateSameSchema(&stage.schema, source_schema);
+    try validateSortKeys(top_k.keys, source_schema);
+    try validateLimit(
+        top_k.limit,
+        definition_plan,
+        native_plan.max_rows,
+    );
+}
+
+fn validateCachedDistinct(
+    stage: Stage,
+    source_schema: SourceSchema,
+) !void {
+    const distinct = switch (stage.operation) {
+        .distinct => |value| value,
+        else => return error.CacheObservationOperationMismatch,
+    };
+    try validateSameSchema(&stage.schema, source_schema);
+    if (distinct.field_indices.len == 0 or
+        distinct.field_indices.len > 64)
+    {
+        return error.InvalidObservationDistinctKeyCount;
+    }
+    for (distinct.field_indices, 0..) |field_index, distinct_index| {
+        if (field_index >= source_schema.columnCount()) {
+            return error.CacheObservationDistinctFieldInvalid;
+        }
+        for (distinct.field_indices[0..distinct_index]) |prior| {
+            if (prior == field_index) {
+                return error.DuplicateObservationDistinctField;
+            }
         }
     }
+}
+
+fn validateCacheProjections(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
     for (
         native_plan.projections,
         definition_plan.projections,
@@ -1769,28 +2035,7 @@ fn encodeOperation(
             try encoder.writeCount(scan.field_indices.len);
             for (scan.field_indices) |field| try encoder.writeU16(field);
         },
-        .filter => |filter| {
-            try encoder.writeCount(filter.predicates.len);
-            for (filter.predicates) |predicate| {
-                try encoder.writeU16(predicate.field_index);
-                try encoder.writeEnum(predicate.operator);
-                try encoder.writeEnum(std.meta.activeTag(predicate.operand));
-                switch (predicate.operand) {
-                    .parameter => |index| try encoder.writeU16(index),
-                    .constant => |constant| {
-                        try encoder.writeEnum(std.meta.activeTag(constant));
-                        switch (constant) {
-                            .string => |text| try encoder.writeBytes(text),
-                            .integer => |number| try encoder.writeI64(number),
-                            .float => |number| try encoder.writeF64(number),
-                            .boolean => |flag| try encoder.writeBool(flag),
-                            .null => {},
-                        }
-                    },
-                }
-                try encoder.writeBool(predicate.case_insensitive);
-            }
-        },
+        .filter => |filter| try encodeFilter(filter, encoder),
         .project => |project| {
             try encoder.writeCount(project.input_field_indices.len);
             for (project.input_field_indices) |field| {
@@ -1813,14 +2058,7 @@ fn encodeOperation(
                 .parameter => |index| try encoder.writeU16(index),
             }
         },
-        .sort => |sort| {
-            try encoder.writeCount(sort.keys.len);
-            for (sort.keys) |key| {
-                try encoder.writeU16(key.field_index);
-                try encoder.writeEnum(key.direction);
-                try encoder.writeEnum(key.nulls);
-            }
-        },
+        .sort => |sort| try encodeSortKeys(sort.keys, encoder),
         .top_k => |top_k| {
             try encodeSortKeys(top_k.keys, encoder);
             try encodeLimit(top_k.limit, encoder);
@@ -1831,6 +2069,32 @@ fn encodeOperation(
                 try encoder.writeU16(field_index);
             }
         },
+    }
+}
+
+fn encodeFilter(
+    filter: Filter,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(filter.predicates.len);
+    for (filter.predicates) |predicate| {
+        try encoder.writeU16(predicate.field_index);
+        try encoder.writeEnum(predicate.operator);
+        try encoder.writeEnum(std.meta.activeTag(predicate.operand));
+        switch (predicate.operand) {
+            .parameter => |index| try encoder.writeU16(index),
+            .constant => |constant| {
+                try encoder.writeEnum(std.meta.activeTag(constant));
+                switch (constant) {
+                    .string => |text| try encoder.writeBytes(text),
+                    .integer => |number| try encoder.writeI64(number),
+                    .float => |number| try encoder.writeF64(number),
+                    .boolean => |flag| try encoder.writeBool(flag),
+                    .null => {},
+                }
+            },
+        }
+        try encoder.writeBool(predicate.case_insensitive);
     }
 }
 
@@ -2138,14 +2402,220 @@ fn decodeCacheForAllocationFailure(
     try decoder.finish();
 }
 
+const plan_filter_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/messages",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["scan","filter","project","limit"]
+    \\  },
+    \\  "parameters":{"needle":{"type":"string","required":true}},
+    \\  "selectors":["path"],
+    \\  "relations":[{
+    \\    "name":"messages","fields":["session_id","role","text"]
+    \\  }],
+    \\  "inputs":[],
+    \\  "pipeline":[
+    \\    {"op":"scan","relation":"messages","as":"source"},
+    \\    {
+    \\      "op":"filter","input":"source","as":"matched",
+    \\      "where":[{"field":"text","op":"contains","param":"needle"}]
+    \\    },
+    \\    {
+    \\      "op":"project","input":"matched","as":"rows",
+    \\      "fields":["session_id","role","text"]
+    \\    },
+    \\    {"op":"limit","input":"rows","as":"bounded","limit":5}
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"bounded","schema":"example-message-rows/v1",
+    \\    "fields":["session_id","role","text"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":100,"max_output_bytes":4096,"max_fold_states":8
+    \\  }
+    \\}
+;
+
+const external_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/external",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["filter","project"]
+    \\  },
+    \\  "parameters":{},"selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"score","type":"integer","nullable":false}
+    \\    ],
+    \\    "max_rows":10,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {
+    \\      "op":"filter","input":"facts","as":"matched",
+    \\      "where":[{"field":"score","op":"exact","value":1}]
+    \\    },
+    \\    {
+    \\      "op":"project","input":"matched","as":"rows","fields":["id"]
+    \\    }
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-rows/v1",
+    \\    "fields":["id"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":10,"max_output_bytes":4096,"max_fold_states":2
+    \\  }
+    \\}
+;
+
+const order_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/order",
+    \\  "requires":{
+    \\    "abi":"seq-observation-abi/v1",
+    \\    "operators":["sort","distinct","top-k"]
+    \\  },
+    \\  "parameters":{},"selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"group","type":"string","nullable":false},
+    \\      {"name":"score","type":"integer","nullable":true}
+    \\    ],
+    \\    "max_rows":10,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {
+    \\      "op":"sort","input":"facts","as":"ranked",
+    \\      "by":[
+    \\        {
+    \\          "field":"score","direction":"desc","nulls":"first"
+    \\        },
+    \\        {"field":"id"}
+    \\      ]
+    \\    },
+    \\    {
+    \\      "op":"distinct","input":"ranked","as":"unique",
+    \\      "keys":["group"]
+    \\    },
+    \\    {
+    \\      "op":"top-k","input":"unique","as":"rows",
+    \\      "by":[{"field":"id"}],"limit":2
+    \\    }
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-order/v1",
+    \\    "fields":["id","group","score"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{
+    \\    "max_rows":10,"max_output_bytes":4096,"max_fold_states":2
+    \\  }
+    \\}
+;
+
+fn expectPlanCacheRoundTrip(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(native_plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(
+        std.testing.allocator,
+        &decoder,
+        definition_plan,
+    );
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(
+        native_plan.stages.len,
+        cached.stages.len,
+    );
+    try std.testing.expectEqualSlices(
+        u16,
+        native_plan.stages[0].operation.scan.field_indices,
+        cached.stages[0].operation.scan.field_indices,
+    );
+    const expected_field =
+        native_plan.stages[1].operation.filter.predicates[0].field_index;
+    try std.testing.expectEqual(
+        expected_field,
+        cached.stages[1].operation.filter.predicates[0].field_index,
+    );
+    const mismatched = try std.testing.allocator.dupe(u8, payload);
+    defer std.testing.allocator.free(mismatched);
+    mismatched[mismatched.len - 1] ^= 1;
+    var mismatch_decoder = definition_core.cache.Decoder.init(mismatched);
+    try std.testing.expectError(
+        error.CacheObservationPlanShapeMismatch,
+        decodeCache(
+            std.testing.allocator,
+            &mismatch_decoder,
+            definition_plan,
+        ),
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        decodeCacheForAllocationFailure,
+        .{ payload, definition_plan },
+    );
+}
+
+fn expectOrderCacheRoundTrip(
+    native_plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(native_plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(
+        std.testing.allocator,
+        &decoder,
+        definition_plan,
+    );
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expectEqual(
+        native_plan.stages[0].operation.sort.keys[0],
+        cached.stages[0].operation.sort.keys[0],
+    );
+    try std.testing.expectEqualSlices(
+        u16,
+        native_plan.stages[1].operation.distinct.field_indices,
+        cached.stages[1].operation.distinct.field_indices,
+    );
+    try std.testing.expectEqual(
+        native_plan.stages[2].operation.top_k.keys[0],
+        cached.stages[2].operation.top_k.keys[0],
+    );
+}
+
 test "observation steps compile field names and parameters to native indices" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/messages","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project","limit"]},"parameters":{"needle":{"type":"string","required":true}},"selectors":["path"],"relations":[{"name":"messages","fields":["session_id","role","text"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"messages","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"text","op":"contains","param":"needle"}]},{"op":"project","input":"matched","as":"rows","fields":["session_id","role","text"]},{"op":"limit","input":"rows","as":"bounded","limit":5}],"projections":{"rows":{"relation":"bounded","schema":"example-message-rows/v1","fields":["session_id","role","text"],"renderers":["json"]}},"bounds":{"max_rows":100,"max_output_bytes":4096,"max_fold_states":8}}
-        ,
+        .data = plan_filter_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -2168,63 +2638,29 @@ test "observation steps compile field names and parameters to native indices" {
         physical.Relation.messages,
         plan.stages[0].operation.scan.relation,
     );
-    try std.testing.expectEqual(@as(u16, 2), plan.stages[1].operation.filter.predicates[0].field_index);
+    try std.testing.expectEqual(
+        @as(u16, 2),
+        plan.stages[1].operation.filter.predicates[0].field_index,
+    );
     try std.testing.expectEqual(
         @as(u16, 0),
         plan.stages[1].operation.filter.predicates[0].operand.parameter,
     );
-    try std.testing.expectEqual(@as(usize, 3), plan.stages[2].schema.columns.len);
-    try std.testing.expectEqual(@as(usize, 5), plan.stages[3].operation.limit.fixed);
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        plan.stages[2].schema.columns.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        plan.stages[3].operation.limit.fixed,
+    );
     try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
         .{&definition_plan},
     );
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(
-        std.testing.allocator,
-        &decoder,
-        &definition_plan,
-    );
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try std.testing.expectEqual(plan.stages.len, cached.stages.len);
-    try std.testing.expectEqualSlices(
-        u16,
-        plan.stages[0].operation.scan.field_indices,
-        cached.stages[0].operation.scan.field_indices,
-    );
-    try std.testing.expectEqual(
-        plan.stages[1].operation.filter.predicates[0].field_index,
-        cached.stages[1].operation.filter.predicates[0].field_index,
-    );
-    const mismatched = try std.testing.allocator.dupe(u8, payload);
-    defer std.testing.allocator.free(mismatched);
-    mismatched[mismatched.len - 1] ^= 1;
-    var mismatch_decoder = definition_core.cache.Decoder.init(mismatched);
-    try std.testing.expectError(
-        error.CacheObservationPlanShapeMismatch,
-        decodeCache(
-            std.testing.allocator,
-            &mismatch_decoder,
-            &definition_plan,
-        ),
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        decodeCacheForAllocationFailure,
-        .{ payload, &definition_plan },
-    );
+    try expectPlanCacheRoundTrip(&plan, &definition_plan);
 }
 
 test "external relations compile to the same typed native stage schema" {
@@ -2232,9 +2668,7 @@ test "external relations compile to the same typed native stage schema" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/external","requires":{"abi":"seq-observation-abi/v1","operators":["filter","project"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"score","type":"integer","nullable":false}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"filter","input":"facts","as":"matched","where":[{"field":"score","op":"exact","value":1}]},{"op":"project","input":"matched","as":"rows","fields":["id"]}],"projections":{"rows":{"relation":"rows","schema":"example-rows/v1","fields":["id"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
+        .data = external_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -2271,9 +2705,7 @@ test "sort and distinct plans cache compiled field indices" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/order","requires":{"abi":"seq-observation-abi/v1","operators":["sort","distinct","top-k"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"id","type":"string","nullable":false},{"name":"group","type":"string","nullable":false},{"name":"score","type":"integer","nullable":true}],"max_rows":10,"max_bytes":4096}],"pipeline":[{"op":"sort","input":"facts","as":"ranked","by":[{"field":"score","direction":"desc","nulls":"first"},{"field":"id"}]},{"op":"distinct","input":"ranked","as":"unique","keys":["group"]},{"op":"top-k","input":"unique","as":"rows","by":[{"field":"id"}],"limit":2}],"projections":{"rows":{"relation":"rows","schema":"example-order/v1","fields":["id","group","score"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
+        .data = order_test_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -2294,40 +2726,29 @@ test "sort and distinct plans cache compiled field indices" {
     );
     defer native_plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 2), native_plan.stages[0].operation.sort.keys[0].field_index);
-    try std.testing.expectEqual(SortDirection.descending, native_plan.stages[0].operation.sort.keys[0].direction);
-    try std.testing.expectEqual(NullOrder.first, native_plan.stages[0].operation.sort.keys[0].nulls);
-    try std.testing.expectEqual(@as(u16, 1), native_plan.stages[1].operation.distinct.field_indices[0]);
-    try std.testing.expectEqual(@as(u16, 0), native_plan.stages[2].operation.top_k.keys[0].field_index);
-    try std.testing.expectEqual(@as(usize, 2), native_plan.stages[2].operation.top_k.limit.fixed);
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&native_plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(
-        std.testing.allocator,
-        &decoder,
-        &definition_plan,
-    );
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
     try std.testing.expectEqual(
-        native_plan.stages[0].operation.sort.keys[0],
-        cached.stages[0].operation.sort.keys[0],
-    );
-    try std.testing.expectEqualSlices(
-        u16,
-        native_plan.stages[1].operation.distinct.field_indices,
-        cached.stages[1].operation.distinct.field_indices,
+        @as(u16, 2),
+        native_plan.stages[0].operation.sort.keys[0].field_index,
     );
     try std.testing.expectEqual(
-        native_plan.stages[2].operation.top_k.keys[0],
-        cached.stages[2].operation.top_k.keys[0],
+        SortDirection.descending,
+        native_plan.stages[0].operation.sort.keys[0].direction,
     );
+    try std.testing.expectEqual(
+        NullOrder.first,
+        native_plan.stages[0].operation.sort.keys[0].nulls,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        native_plan.stages[1].operation.distinct.field_indices[0],
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        native_plan.stages[2].operation.top_k.keys[0].field_index,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        native_plan.stages[2].operation.top_k.limit.fixed,
+    );
+    try expectOrderCacheRoundTrip(&native_plan, &definition_plan);
 }
