@@ -710,6 +710,7 @@ const Builder = struct {
                         "input",
                         "if",
                         "equals",
+                        "empty",
                         "nonempty",
                         "then",
                         "then_input",
@@ -754,12 +755,17 @@ const Builder = struct {
                     );
                 }
                 const condition_equals = object.get("equals");
+                const condition_empty =
+                    try optionalBoolean(object, "empty") orelse false;
                 const condition_nonempty =
                     try optionalBoolean(object, "nonempty") orelse false;
                 const consequent_equals = object.get("then_equals");
                 rule.then_nonempty =
                     try optionalBoolean(object, "then_nonempty") orelse false;
-                if (condition_nonempty and condition_equals != null) {
+                if (@as(usize, @intFromBool(condition_equals != null)) +
+                    @as(usize, @intFromBool(condition_empty)) +
+                    @as(usize, @intFromBool(condition_nonempty)) > 1)
+                {
                     return error.ConflictingImplicationPredicates;
                 }
                 if (consequent_equals != null and rule.then_nonempty) {
@@ -769,7 +775,9 @@ const Builder = struct {
                     return error.ConditionalRulesHaveScalarConsequence;
                 }
                 if (consequent_equals != null and
-                    condition_equals == null and !condition_nonempty)
+                    condition_equals == null and
+                    !condition_empty and
+                    !condition_nonempty)
                 {
                     return error.ImplicationConsequenceRequiresPredicate;
                 }
@@ -805,11 +813,9 @@ const Builder = struct {
                     rule.values = values;
                 }
                 if (condition_nonempty) {
-                    if (condition_equals != null) {
-                        return error.ConflictingImplicationPredicates;
-                    }
                     rule.min_count = 1;
                 }
+                if (condition_empty) rule.max_count = 0;
             },
             .total_partition => {
                 try definition_core.json.requireExactKeys(
@@ -2477,7 +2483,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(30);
+    try encoder.writeU16(31);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -2509,7 +2515,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 30) {
+    if (try decoder.readU16() != 31) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -3706,12 +3712,17 @@ fn validateCachedRule(
                 (!scalar_mode and !conditional_mode) or
                 rule.values.len > max_values or
                 (rule.min_count != null and rule.min_count.? != 1) or
+                (rule.max_count != null and rule.max_count.? != 0) or
+                (rule.min_count != null and rule.max_count != null) or
                 (rule.min_count != null and
+                    rule.values.len > max_values_with_nonempty) or
+                (rule.max_count != null and
                     rule.values.len > max_values_with_nonempty) or
                 (rule.then_nonempty and
                     (!scalar_mode or
                         rule.values.len == 2 or
-                        (rule.min_count != null and rule.values.len == 1))))
+                        ((rule.min_count != null or rule.max_count != null) and
+                            rule.values.len == 1))))
             {
                 return error.CacheRuleConfigurationInvalid;
             }
@@ -5143,7 +5154,8 @@ fn implicationHolds(
         consequent_root,
         plan.pointers[rule.other_pointer_id.?],
     ) orelse return false;
-    const expected_consequent = if (rule.min_count != null)
+    const expected_consequent = if (rule.min_count != null or
+        rule.max_count != null)
         if (rule.values.len == 1) rule.values[0] else null
     else if (rule.values.len == 2)
         rule.values[1]
@@ -5169,7 +5181,9 @@ fn implicationPredicateHolds(
     {
         return false;
     }
-    return rule.min_count == null or valueNonempty(condition);
+    if (rule.min_count != null) return valueNonempty(condition);
+    if (rule.max_count != null) return !valueNonempty(condition);
+    return true;
 }
 
 fn valueNonempty(value: std.json.Value) bool {
@@ -9047,7 +9061,7 @@ test "embedded validation compares borrowed event and retained state values" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -9069,7 +9083,8 @@ test "embedded validation compares borrowed event and retained state values" {
         \\[
         \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"},
         \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","then_input":"state","then":"/mutation_allowed","then_equals":true},
-        \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","rules":[{"op":"enum","input":"state","path":"/debt_state","values":["clear"]}]}
+        \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","rules":[{"op":"enum","input":"state","path":"/debt_state","values":["clear"]}]},
+        \\  {"op":"implies","input":"state","if":"/prior_refs","empty":true,"rules":[{"op":"bounded-array","input":"event","path":"/replacement_refs","min":1}]}
         \\]
     ,
         .{},
@@ -9101,14 +9116,14 @@ test "embedded validation compares borrowed event and retained state values" {
     var event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\"}",
+        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\",\"replacement_refs\":[\"class-1\"]}",
         .{},
     );
     defer event.deinit();
     var matching = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true}",
+        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true,\"prior_refs\":[]}",
         .{},
     );
     defer matching.deinit();
@@ -9126,7 +9141,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var stale = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-2\",\"mutation_allowed\":true}",
+        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-2\",\"mutation_allowed\":true,\"prior_refs\":[]}",
         .{},
     );
     defer stale.deinit();
@@ -9144,7 +9159,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var denied = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":false}",
+        "{\"debt_state\":\"clear\",\"goal_id\":\"goal-1\",\"mutation_allowed\":false,\"prior_refs\":[]}",
         .{},
     );
     defer denied.deinit();
@@ -9162,7 +9177,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var debt = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"debt_state\":\"blocked\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true}",
+        "{\"debt_state\":\"blocked\",\"goal_id\":\"goal-1\",\"mutation_allowed\":true,\"prior_refs\":[\"class-0\"]}",
         .{},
     );
     defer debt.deinit();
@@ -9176,6 +9191,24 @@ test "embedded validation compares borrowed event and retained state values" {
     );
     defer blocked_edit.deinit();
     try std.testing.expect(!blocked_edit.isValid());
+
+    var empty_replacement = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\",\"replacement_refs\":[]}",
+        .{},
+    );
+    defer empty_replacement.deinit();
+    var missing_replacement = try executeValues(
+        std.testing.allocator,
+        &cached,
+        &.{
+            .{ .name = "event", .value = empty_replacement.value },
+            .{ .name = "state", .value = matching.value },
+        },
+    );
+    defer missing_replacement.deinit();
+    try std.testing.expect(!missing_replacement.isValid());
 
     var inspection = try std.json.parseFromSlice(
         std.json.Value,
