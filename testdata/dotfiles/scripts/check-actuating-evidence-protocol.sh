@@ -337,6 +337,114 @@ setup_review() {
     }' >"$case_tmp/context.json"
 }
 
+check_existing_binding() {
+  local binding_tmp="$scenario_tmp/existing-binding"
+  local source_tmp="$binding_tmp/source"
+  local source_repo="$source_tmp/repo"
+  local target_repo="$binding_tmp/target-repo"
+  local invalid_repo="$binding_tmp/invalid-repo"
+  local source_log
+  local target_log
+  local invalid_log
+  local before_digest
+  local after_digest
+  local unbound_rc
+  local duplicate_rc
+  local invalid_rc
+
+  mkdir -p \
+    "$source_repo" \
+    "$target_repo/.ledger/actuation/goal-1" \
+    "$invalid_repo/.ledger/actuation/goal-1"
+  source_repo=$(cd "$source_repo" && pwd -P)
+  target_repo=$(cd "$target_repo" && pwd -P)
+  invalid_repo=$(cd "$invalid_repo" && pwd -P)
+  setup_review "$source_tmp" "$source_repo" accepted
+  source_log="$source_repo/.ledger/actuation/goal-1/evidence.jsonl"
+  target_log="$target_repo/.ledger/actuation/goal-1/evidence.jsonl"
+  invalid_log="$invalid_repo/.ledger/actuation/goal-1/evidence.jsonl"
+  cp "$source_log" "$target_log"
+  jq -c \
+    'if .sequence == 1 then .recorded_at = "invalid" else . end' \
+    "$source_log" >"$invalid_log"
+  before_digest=$(shasum -a 256 "$target_log" | awk '{print $1}')
+
+  set +e
+  "$ledger_bin" doctor \
+    --definition "$protocol_definition" \
+    --repo "$target_repo" \
+    --param goal=goal-1 \
+    --format json >"$binding_tmp/unbound-doctor.json"
+  unbound_rc=$?
+  set -e
+  [[ "$unbound_rc" -eq 2 ]]
+  jq -e \
+    '.schema == "ledger-doctor-result/v1" and
+     .healthy == false and
+     ([.. | objects | .error_code? // empty] |
+       index("InvalidStoreBinding") != null)' \
+    "$binding_tmp/unbound-doctor.json" >/dev/null
+
+  "$ledger_bin" transact \
+    --definition "$protocol_definition" \
+    --operation bind-existing \
+    --repo "$target_repo" \
+    --param goal=goal-1 \
+    --format json >"$binding_tmp/binding.json"
+  jq -e \
+    '.schema == "ledger-transaction-result/v1" and
+     .valid == true and
+     .operation == "bind-existing" and
+     (.effects | length) == 1 and
+     .effects[0].slot == "events" and
+     .effects[0].logical_ref == "actuation/goal-1/evidence.jsonl" and
+     .effects[0].result == "bound" and
+     .effects[0].revision_before == .effects[0].revision_after and
+     .semantic_authority_granted == false and
+     .storage_mutated == true' \
+    "$binding_tmp/binding.json" >/dev/null
+  after_digest=$(shasum -a 256 "$target_log" | awk '{print $1}')
+  [[ "$before_digest" == "$after_digest" ]]
+  check_structural_facts "$source_tmp" "$target_repo"
+
+  set +e
+  "$ledger_bin" transact \
+    --definition "$protocol_definition" \
+    --operation bind-existing \
+    --repo "$target_repo" \
+    --param goal=goal-1 \
+    --format json >"$binding_tmp/duplicate-binding.json"
+  duplicate_rc=$?
+  set -e
+  [[ "$duplicate_rc" -eq 2 ]]
+  jq -e \
+    '.schema == "ledger-transaction-error/v1" and
+     .code == "StoreAlreadyBound" and
+     .semantic_authority_granted == false and
+     .storage_mutated == false' \
+    "$binding_tmp/duplicate-binding.json" >/dev/null
+  [[ "$before_digest" == "$(shasum -a 256 "$target_log" | awk '{print $1}')" ]]
+
+  set +e
+  "$ledger_bin" transact \
+    --definition "$protocol_definition" \
+    --operation bind-existing \
+    --repo "$invalid_repo" \
+    --param goal=goal-1 \
+    --format json >"$binding_tmp/invalid-binding.json"
+  invalid_rc=$?
+  set -e
+  [[ "$invalid_rc" -eq 2 ]]
+  jq -e \
+    '.schema == "ledger-transaction-error/v1" and
+     .code == "InvalidEventUnixTimestamp" and
+     .semantic_authority_granted == false and
+     .storage_mutated == false' \
+    "$binding_tmp/invalid-binding.json" >/dev/null
+  [[ ! -d "$invalid_repo/.ledger/.bindings" ]] ||
+    [[ -z "$(find "$invalid_repo/.ledger/.bindings" -type f -print -quit)" ]]
+}
+
 prepare_candidate() {
   local case_id=$1
   local candidate_kind=$2
@@ -507,4 +615,8 @@ done < <(
     "$scenarios"
 )
 
-printf 'actuating Evidence protocol scenarios passed: cases=%d\n' "$case_count"
+check_existing_binding
+
+printf \
+  'actuating Evidence protocol scenarios passed: cases=%d bindings=1\n' \
+  "$case_count"
