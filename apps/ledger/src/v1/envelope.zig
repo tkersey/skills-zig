@@ -376,6 +376,11 @@ pub fn writeDoctorJson(
             writer,
             slot.logical_ref,
         );
+        try writer.writeAll(",\"status\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            slot.state.id(),
+        );
         try writer.writeAll(",\"revision\":");
         try writeOptionalString(writer, slot.revision);
         try writer.print(

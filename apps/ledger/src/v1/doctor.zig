@@ -7,9 +7,20 @@ const protocol = @import("protocol.zig");
 const replay = @import("replay.zig");
 const storage = @import("storage.zig");
 
+pub const SlotState = enum {
+    missing,
+    current,
+    invalid,
+
+    pub fn id(self: SlotState) []const u8 {
+        return @tagName(self);
+    }
+};
+
 pub const SlotStatus = struct {
     name: []u8,
     logical_ref: []u8,
+    state: SlotState,
     revision: ?[]u8,
     binding_rows: usize,
     healthy: bool,
@@ -84,7 +95,10 @@ pub fn execute(
             parameters,
             event_protocol != null and
                 event_protocol.?.target_slot_index == index,
-        ) catch |err| try unhealthySlot(allocator, slot, err);
+        ) catch |err| if (err == error.FileNotFound)
+            try missingSlot(allocator, slot)
+        else
+            try unhealthySlot(allocator, slot, err);
         initialized += 1;
         if (!slots[index].healthy) healthy = false;
     }
@@ -131,8 +145,27 @@ fn inspectSlot(
     return .{
         .name = name,
         .logical_ref = logical_ref,
+        .state = .current,
         .revision = revision,
         .binding_rows = snapshot.binding.rows.len,
+        .healthy = true,
+        .error_code = null,
+    };
+}
+
+fn missingSlot(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+) !SlotStatus {
+    const name = try allocator.dupe(u8, slot.name);
+    errdefer allocator.free(name);
+    const logical_ref = try allocator.dupe(u8, slot.relative_path);
+    return .{
+        .name = name,
+        .logical_ref = logical_ref,
+        .state = .missing,
+        .revision = null,
+        .binding_rows = 0,
         .healthy = true,
         .error_code = null,
     };
@@ -151,9 +184,68 @@ fn unhealthySlot(
     return .{
         .name = name,
         .logical_ref = logical_ref,
+        .state = .invalid,
         .revision = null,
         .binding_rows = 0,
         .healthy = false,
         .error_code = error_code,
     };
+}
+
+test "missing declared storage is a healthy initial state" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/doctor","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    var result = try execute(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+        null,
+        repo_root,
+        &parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.healthy);
+    try std.testing.expectEqual(@as(usize, 1), result.slots.len);
+    try std.testing.expectEqual(SlotState.missing, result.slots[0].state);
+    try std.testing.expect(result.slots[0].healthy);
+    try std.testing.expect(result.slots[0].revision == null);
+    try std.testing.expect(result.slots[0].error_code == null);
 }
