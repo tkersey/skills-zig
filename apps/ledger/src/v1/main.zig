@@ -749,15 +749,22 @@ fn loadDefinition(
     path: []const u8,
     route: ledger.compiled_plan.Route,
 ) !DefinitionContext {
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), ".", allocator);
-    defer allocator.free(cwd);
-    const absolute = try std.fs.path.resolve(allocator, &.{ cwd, path });
+    const absolute = try absoluteDefinitionPathAlloc(allocator, path);
     defer allocator.free(absolute);
-    const location = try definition_core.closure.admittedLocation(
-        absolute,
-        cwd,
-    );
-    const cache_dir = try ledgerCacheDirAlloc(allocator, cwd);
+    const package_location =
+        try definition_core.closure.admittedPackageLocation(absolute);
+    const cwd = if (package_location == null)
+        try std.Io.Dir.cwd().realPathFileAlloc(
+            defaultIo(),
+            ".",
+            allocator,
+        )
+    else
+        null;
+    defer if (cwd) |owned| allocator.free(owned);
+    const location = package_location orelse
+        try definition_core.closure.admittedLocation(absolute, cwd.?);
+    const cache_dir = try ledgerCacheDirAlloc(allocator);
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
         allocator,
@@ -769,9 +776,24 @@ fn loadDefinition(
     );
 }
 
+fn absoluteDefinitionPathAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
+}
+
 fn ledgerCacheDirAlloc(
     allocator: std.mem.Allocator,
-    cwd: []const u8,
 ) !?[]u8 {
     var base: []const u8 = undefined;
     var suffix: []const u8 = undefined;
@@ -789,6 +811,15 @@ fn ledgerCacheDirAlloc(
     }
     const joined = try std.fs.path.join(allocator, &.{ base, suffix });
     defer allocator.free(joined);
+    if (std.fs.path.isAbsolute(joined)) {
+        return try allocator.dupe(u8, joined);
+    }
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(cwd);
     return try std.fs.path.resolve(allocator, &.{ cwd, joined });
 }
 

@@ -45,6 +45,19 @@ pub fn admittedLocation(
     };
 }
 
+pub fn admittedPackageLocation(
+    absolute_path: []const u8,
+) !?AdmittedLocation {
+    if (!std.fs.path.isAbsolute(absolute_path)) {
+        return error.DefinitionRootNotAbsolute;
+    }
+    const root = canonicalPackageRoot(absolute_path) orelse return null;
+    return .{
+        .root = root,
+        .entry = relativeWithin(absolute_path, root),
+    };
+}
+
 fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
     var cursor = std.fs.path.dirname(absolute_path) orelse return null;
     while (true) {
@@ -757,6 +770,11 @@ test "canonical definition packages admit cross-package imports" {
         "first/definitions/ledger/record.json",
         external.entry,
     );
+    const package_only = (try admittedPackageLocation(
+        "/opt/config/packages/first/definitions/ledger/record.json",
+    )).?;
+    try std.testing.expectEqualStrings(external.root, package_only.root);
+    try std.testing.expectEqualStrings(external.entry, package_only.entry);
     const containing_cwd = try admittedLocation(
         "/opt/config/packages/first/definitions/ledger/record.json",
         "/opt/config",

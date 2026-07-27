@@ -60,6 +60,17 @@ pub fn decodeAlloc(
     entry: []const u8,
     limits: Limits,
 ) ![]u8 {
+    return allocator.dupe(
+        u8,
+        try decode(expected_key, entry, limits),
+    );
+}
+
+pub fn decode(
+    expected_key: [32]u8,
+    entry: []const u8,
+    limits: Limits,
+) ![]const u8 {
     if (entry.len < header_bytes) return error.CacheEntryTruncated;
     if (entry.len > limits.max_entry_bytes) return error.CacheEntryTooLarge;
     if (!std.mem.eql(u8, entry[0..8], magic)) return error.CacheMagicMismatch;
@@ -84,7 +95,7 @@ pub fn decodeAlloc(
     if (!std.mem.eql(u8, entry[50..82], &computed_payload_digest)) {
         return error.CachePayloadChecksumMismatch;
     }
-    return allocator.dupe(u8, payload);
+    return payload;
 }
 
 pub const Encoder = struct {

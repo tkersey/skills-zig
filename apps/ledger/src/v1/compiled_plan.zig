@@ -58,8 +58,20 @@ pub const PlanSet = struct {
     protocol_plan: ?protocol.Plan = null,
     projection_plan: ?projection.Plan = null,
     stats: definition_core.result.CompileStats,
+    cache_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: *PlanSet, allocator: std.mem.Allocator) void {
+        if (self.cache_arena) |arena_value| {
+            var arena = arena_value;
+            self.deinitPlans(arena.allocator());
+            arena.deinit();
+        } else {
+            self.deinitPlans(allocator);
+        }
+        self.* = undefined;
+    }
+
+    fn deinitPlans(self: *PlanSet, allocator: std.mem.Allocator) void {
         if (self.projection_plan) |*plan| plan.deinit(allocator);
         if (self.protocol_plan) |*plan| plan.deinit(allocator);
         if (self.storage_plan) |*plan| plan.deinit(allocator);
@@ -68,7 +80,6 @@ pub const PlanSet = struct {
         self.definition_plan.deinit(allocator);
         allocator.free(self.entry_path);
         self.closure.deinit(allocator);
-        self.* = undefined;
     }
 };
 
@@ -315,13 +326,11 @@ fn tryLoadCache(
         else => return err,
     };
     defer allocator.free(locator_entry);
-    const locator_payload = try definition_core.cache.decodeAlloc(
-        allocator,
+    const locator_payload = try definition_core.cache.decode(
         locator_key,
         locator_entry,
         locator_limits,
     );
-    defer allocator.free(locator_payload);
     var locator = try decodeLocator(allocator, locator_payload);
     defer locator.deinit(allocator);
     _ = try definition_core.closure.verifySourceManifest(
@@ -344,13 +353,11 @@ fn tryLoadCache(
         cache_limits.max_entry_bytes,
     );
     defer allocator.free(plan_entry);
-    const plan_payload = try definition_core.cache.decodeAlloc(
-        allocator,
+    const plan_payload = try definition_core.cache.decode(
         locator.plan_key,
         plan_entry,
         cache_limits,
     );
-    defer allocator.free(plan_payload);
     var result = try decodePlanSet(
         allocator,
         plan_payload,
@@ -501,34 +508,38 @@ fn decodePlanSet(
     expected_entry_path: []const u8,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    var cache_arena_owned = true;
+    errdefer if (cache_arena_owned) cache_arena.deinit();
+    const cache_allocator = cache_arena.allocator();
     var decoder = definition_core.cache.Decoder.init(payload);
     if (try decoder.readU16() != payload_version) {
         return error.LedgerCompiledPlanCacheVersionMismatch;
     }
-    const route = try decodeRoute(allocator, &decoder);
-    defer if (route.name) |name| allocator.free(@constCast(name));
+    const route = try decodeRoute(cache_allocator, &decoder);
+    defer if (route.name) |name| cache_allocator.free(@constCast(name));
     if (!routesEqual(route, expected_route)) return error.CacheRouteMismatch;
     var result: PlanSet = result: {
         const entry_path = try decoder.readBytesAlloc(
-            allocator,
+            cache_allocator,
             4 * 1024 * 1024,
         );
-        errdefer allocator.free(entry_path);
+        errdefer cache_allocator.free(entry_path);
         if (!std.mem.eql(u8, entry_path, expected_entry_path)) {
             return error.CacheEntryPathMismatch;
         }
         var closure = try decodeClosure(
-            allocator,
+            cache_allocator,
             &decoder,
             entry_path,
             closure_limits,
         );
-        errdefer closure.deinit(allocator);
+        errdefer closure.deinit(cache_allocator);
         var definition_plan = try definition.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
-        errdefer definition_plan.deinit(allocator);
+        errdefer definition_plan.deinit(cache_allocator);
         if (!std.mem.eql(
             u8,
             &definition_plan.closure_digest,
@@ -545,36 +556,41 @@ fn decodePlanSet(
             },
         };
     };
-    errdefer result.deinit(allocator);
+    errdefer result.deinit(cache_allocator);
     if (try decoder.readBool()) {
         result.validation_plan = try validation.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
     }
     if (try decoder.readBool()) {
         result.materialization_plan = try materialization.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
     }
     if (try decoder.readBool()) {
-        result.storage_plan = try storage.decodeCache(allocator, &decoder);
+        result.storage_plan = try storage.decodeCache(
+            cache_allocator,
+            &decoder,
+        );
     }
     if (try decoder.readBool()) {
         result.protocol_plan = try protocol.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
     }
     if (try decoder.readBool()) {
         result.projection_plan = try projection.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
     }
     try decoder.finish();
     try validatePlanSet(&result, route);
+    result.cache_arena = cache_arena;
+    cache_arena_owned = false;
     return result;
 }
 

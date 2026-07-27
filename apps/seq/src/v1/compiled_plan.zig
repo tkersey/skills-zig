@@ -47,12 +47,23 @@ pub const PlanSet = struct {
     definition_plan: definition.Plan,
     native_plan: plan.Plan,
     stats: definition_core.result.CompileStats,
+    cache_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: *PlanSet, allocator: std.mem.Allocator) void {
-        self.native_plan.deinit(allocator);
-        self.definition_plan.deinit(allocator);
-        allocator.free(self.entry_path);
-        self.closure.deinit(allocator);
+        if (self.cache_arena) |arena_value| {
+            var arena = arena_value;
+            const cache_allocator = arena.allocator();
+            self.native_plan.deinit(cache_allocator);
+            self.definition_plan.deinit(cache_allocator);
+            cache_allocator.free(self.entry_path);
+            self.closure.deinit(cache_allocator);
+            arena.deinit();
+        } else {
+            self.native_plan.deinit(allocator);
+            self.definition_plan.deinit(allocator);
+            allocator.free(self.entry_path);
+            self.closure.deinit(allocator);
+        }
         self.* = undefined;
     }
 };
@@ -214,13 +225,11 @@ fn tryLoadCache(
         else => return err,
     };
     defer allocator.free(locator_entry);
-    const locator_payload = try definition_core.cache.decodeAlloc(
-        allocator,
+    const locator_payload = try definition_core.cache.decode(
         locator_key,
         locator_entry,
         locator_limits,
     );
-    defer allocator.free(locator_payload);
     var locator = try decodeLocator(allocator, locator_payload);
     defer locator.deinit(allocator);
     _ = try definition_core.closure.verifySourceManifest(
@@ -243,13 +252,11 @@ fn tryLoadCache(
         cache_limits.max_entry_bytes,
     );
     defer allocator.free(plan_entry);
-    const plan_payload = try definition_core.cache.decodeAlloc(
-        allocator,
+    const plan_payload = try definition_core.cache.decode(
         locator.plan_key,
         plan_entry,
         cache_limits,
     );
-    defer allocator.free(plan_payload);
     var result = try decodePlanSet(
         allocator,
         plan_payload,
@@ -383,31 +390,35 @@ fn decodePlanSet(
     request: Request,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
+    var cache_arena = std.heap.ArenaAllocator.init(allocator);
+    var cache_arena_owned = true;
+    errdefer if (cache_arena_owned) cache_arena.deinit();
+    const cache_allocator = cache_arena.allocator();
     var decoder = definition_core.cache.Decoder.init(payload);
     if (try decoder.readU16() != payload_version) {
         return error.SeqCompiledPlanCacheVersionMismatch;
     }
     var result: PlanSet = result: {
         const entry_path = try decoder.readBytesAlloc(
-            allocator,
+            cache_allocator,
             4 * 1024 * 1024,
         );
-        errdefer allocator.free(entry_path);
+        errdefer cache_allocator.free(entry_path);
         if (!std.mem.eql(u8, entry_path, expected_entry_path)) {
             return error.CacheEntryPathMismatch;
         }
         var closure = try decodeClosure(
-            allocator,
+            cache_allocator,
             &decoder,
             entry_path,
             closure_limits,
         );
-        errdefer closure.deinit(allocator);
+        errdefer closure.deinit(cache_allocator);
         var definition_plan = try definition.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
         );
-        errdefer definition_plan.deinit(allocator);
+        errdefer definition_plan.deinit(cache_allocator);
         if (!std.mem.eql(
             u8,
             &definition_plan.closure_digest,
@@ -415,11 +426,11 @@ fn decodePlanSet(
         )) return error.CacheClosureDigestMismatch;
         try validateRequest(&definition_plan, request);
         var native_plan = try plan.decodeCache(
-            allocator,
+            cache_allocator,
             &decoder,
             &definition_plan,
         );
-        errdefer native_plan.deinit(allocator);
+        errdefer native_plan.deinit(cache_allocator);
         break :result .{
             .closure = closure,
             .entry_path = entry_path,
@@ -432,9 +443,11 @@ fn decodePlanSet(
             },
         };
     };
-    errdefer result.deinit(allocator);
+    errdefer result.deinit(cache_allocator);
     try decoder.finish();
     try validatePlanSet(&result, request);
+    result.cache_arena = cache_arena;
+    cache_arena_owned = false;
     return result;
 }
 

@@ -69,17 +69,6 @@ const ObserveArgs = struct {
     }
 };
 
-const DefinitionLocation = struct {
-    root: []u8,
-    entry: []u8,
-
-    fn deinit(self: *DefinitionLocation, allocator: std.mem.Allocator) void {
-        allocator.free(self.root);
-        allocator.free(self.entry);
-        self.* = undefined;
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     defer runtime_io = null;
@@ -815,15 +804,22 @@ fn loadDefinition(
     path: []const u8,
     request: seq.compiled_plan.Request,
 ) !seq.compiled_plan.PlanSet {
-    var location = try definitionLocation(allocator, path);
-    defer location.deinit(allocator);
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
-        defaultIo(),
-        ".",
-        allocator,
-    );
-    defer allocator.free(cwd);
-    const cache_dir = try seqCacheDirAlloc(allocator, cwd);
+    const absolute = try absoluteDefinitionPathAlloc(allocator, path);
+    defer allocator.free(absolute);
+    const package_location =
+        try definition_core.closure.admittedPackageLocation(absolute);
+    const cwd = if (package_location == null)
+        try std.Io.Dir.cwd().realPathFileAlloc(
+            defaultIo(),
+            ".",
+            allocator,
+        )
+    else
+        null;
+    defer if (cwd) |owned| allocator.free(owned);
+    const location = package_location orelse
+        try definition_core.closure.admittedLocation(absolute, cwd.?);
+    const cache_dir = try seqCacheDirAlloc(allocator);
     defer if (cache_dir) |owned| allocator.free(owned);
     return seq.compiled_plan.load(
         allocator,
@@ -836,31 +832,24 @@ fn loadDefinition(
     );
 }
 
-fn definitionLocation(
+fn absoluteDefinitionPathAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
-) !DefinitionLocation {
+) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
         defaultIo(),
         ".",
         allocator,
     );
     defer allocator.free(cwd);
-    const absolute = try std.fs.path.resolve(allocator, &.{ cwd, path });
-    defer allocator.free(absolute);
-    const location = try definition_core.closure.admittedLocation(
-        absolute,
-        cwd,
-    );
-    const root = try allocator.dupe(u8, location.root);
-    errdefer allocator.free(root);
-    const entry = try allocator.dupe(u8, location.entry);
-    return .{ .root = root, .entry = entry };
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
 fn seqCacheDirAlloc(
     allocator: std.mem.Allocator,
-    cwd: []const u8,
 ) !?[]u8 {
     var base: []const u8 = undefined;
     var suffix: []const u8 = undefined;
@@ -878,6 +867,15 @@ fn seqCacheDirAlloc(
     }
     const joined = try std.fs.path.join(allocator, &.{ base, suffix });
     defer allocator.free(joined);
+    if (std.fs.path.isAbsolute(joined)) {
+        return try allocator.dupe(u8, joined);
+    }
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        defaultIo(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(cwd);
     return try std.fs.path.resolve(allocator, &.{ cwd, joined });
 }
 

@@ -5082,15 +5082,24 @@ fn itemRuleHolds(
                 null)
         else
             false,
-        .keyed_unique => if (target) |value|
-            try keyedUnique(
-                allocator,
-                value,
-                plan.pointers[rule.other_pointer_id.?],
-                plan.max_records,
-            )
+        .keyed_unique => if (rule.reference_sources.len == 0)
+            if (target) |value|
+                try keyedUnique(
+                    allocator,
+                    value,
+                    plan.pointers[rule.other_pointer_id.?],
+                    plan.max_records,
+                )
+            else
+                false
         else
-            false,
+            try keyedUniqueSources(allocator, plan, root, rule),
+        .keyed_join => try selectedKeyedJoin(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
         .declared_field_values => if (target) |value|
             try declaredFieldValuesHold(
                 allocator,
@@ -5126,6 +5135,12 @@ fn itemRuleHolds(
             rule,
         ),
         .total_mapping => try totalMapping(
+            allocator,
+            plan,
+            root,
+            rule,
+        ),
+        .predecessor_successor => try predecessorSuccessorHolds(
             allocator,
             plan,
             root,
@@ -5189,16 +5204,7 @@ fn importedPlanHolds(
     root: std.json.Value,
 ) anyerror!bool {
     if (plan.inputs.len != 1) return error.ImportedDefinitionNotReusable;
-    var execution = try executeValues(
-        allocator,
-        plan,
-        &.{.{
-            .name = plan.inputs[0].name,
-            .value = root,
-        }},
-    );
-    defer execution.deinit();
-    return execution.isValid();
+    return itemRulesHold(allocator, plan, plan.rules, root);
 }
 
 fn compareRule(
