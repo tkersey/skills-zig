@@ -82,10 +82,11 @@ grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"
 grep -Fq '"id":"scan","version":1' <<<"$capabilities"
 grep -Fq '"id":"filter","version":1' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
+grep -Fq '"id":"aggregate","version":1' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"
 grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
-if grep -Eq '"id":"(join|aggregate|ordered-fold|reachability)"' \
+if grep -Eq '"id":"(join|ordered-fold|reachability)"' \
   <<<"$capabilities"
 then
   exit 1

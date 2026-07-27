@@ -8,6 +8,7 @@ pub fn supports(operator: definition.Operator) bool {
         .scan,
         .filter,
         .project,
+        .aggregate,
         .limit,
         .sort,
         .top_k,
@@ -156,6 +157,38 @@ pub const Project = struct {
     }
 };
 
+pub const AggregateFunction = enum {
+    count,
+    sum,
+    min,
+    max,
+    average,
+
+    fn parse(raw: []const u8) !AggregateFunction {
+        inline for (@typeInfo(AggregateFunction).@"enum".fields) |field| {
+            if (std.mem.eql(u8, raw, field.name)) {
+                return @enumFromInt(field.value);
+            }
+        }
+        if (std.mem.eql(u8, raw, "avg")) return .average;
+        return error.UnsupportedObservationAggregate;
+    }
+};
+
+pub const AggregateMetric = struct {
+    function: AggregateFunction,
+    field_index: ?u16,
+};
+
+pub const Aggregate = struct {
+    metrics: []AggregateMetric,
+
+    fn deinit(self: *Aggregate, allocator: std.mem.Allocator) void {
+        allocator.free(self.metrics);
+        self.* = undefined;
+    }
+};
+
 pub const Limit = union(enum) {
     fixed: usize,
     parameter: u16,
@@ -221,6 +254,7 @@ pub const Operation = union(enum) {
     scan: Scan,
     filter: Filter,
     project: Project,
+    aggregate: Aggregate,
     alias,
     limit: Limit,
     sort: Sort,
@@ -232,6 +266,7 @@ pub const Operation = union(enum) {
             .scan => |*value| value.deinit(allocator),
             .filter => |*value| value.deinit(allocator),
             .project => |*value| value.deinit(allocator),
+            .aggregate => |*value| value.deinit(allocator),
             .sort => |*value| value.deinit(allocator),
             .top_k => |*value| value.deinit(allocator),
             .distinct => |*value| value.deinit(allocator),
@@ -428,6 +463,29 @@ fn compileStage(
                 .input_field_indices = field_indices,
             } };
         },
+        .aggregate => {
+            source_ref = try resolveSource(
+                definition_plan,
+                prior_stages,
+                source.input_names[0],
+            );
+            var input_schema = try cloneSourceSchema(
+                allocator,
+                definition_plan,
+                prior_stages,
+                source_ref.?,
+            );
+            defer input_schema.deinit(allocator);
+            var compiled = try compileAggregate(
+                allocator,
+                &input_schema,
+                object,
+            );
+            errdefer compiled.deinit(allocator);
+            operation = .{ .aggregate = compiled.aggregate };
+            schema = compiled.schema;
+            compiled = undefined;
+        },
         .named_relation, .result_projection => {
             source_ref = try resolveSource(
                 definition_plan,
@@ -527,6 +585,95 @@ fn compileStage(
         .source = source_ref,
         .operation = operation,
         .schema = schema,
+    };
+}
+
+const AggregateCompilation = struct {
+    aggregate: Aggregate,
+    schema: Schema,
+
+    fn deinit(self: *AggregateCompilation, allocator: std.mem.Allocator) void {
+        self.aggregate.deinit(allocator);
+        self.schema.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileAggregate(
+    allocator: std.mem.Allocator,
+    input_schema: *const Schema,
+    object: std.json.ObjectMap,
+) !AggregateCompilation {
+    const values = try definition_core.json.array(
+        try definition_core.json.field(object, "metrics"),
+    );
+    if (values.items.len == 0 or values.items.len > 64) {
+        return error.InvalidObservationAggregateMetricCount;
+    }
+    const metrics = try allocator.alloc(AggregateMetric, values.items.len);
+    errdefer allocator.free(metrics);
+    const columns = try allocator.alloc(Column, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |*column| column.deinit(allocator);
+        allocator.free(columns);
+    }
+    for (values.items, 0..) |value, index| {
+        const metric = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            metric,
+            &.{ "name", "op", "field" },
+        );
+        try definition_core.json.requireFields(metric, &.{ "name", "op" });
+        const name = try definition_core.json.requiredString(metric, "name");
+        try definition_core.json.safeIdentifier(name, 128);
+        for (columns[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, name)) {
+                return error.DuplicateObservationAggregateName;
+            }
+        }
+        const function = try AggregateFunction.parse(
+            try definition_core.json.requiredString(metric, "op"),
+        );
+        const field_index = if (metric.get("field")) |raw|
+            input_schema.find(try definition_core.json.string(raw)) orelse
+                return error.UnknownObservationAggregateField
+        else
+            null;
+        if (function != .count and field_index == null) {
+            return error.ObservationAggregateFieldRequired;
+        }
+        const input_kind = if (field_index) |field|
+            input_schema.columns[field].kind
+        else
+            .integer;
+        if (field_index != null and
+            input_kind != .integer and
+            input_kind != .float)
+        {
+            return error.ObservationAggregateFieldMustBeNumeric;
+        }
+        const output_kind: ColumnKind = switch (function) {
+            .count => .integer,
+            .average => .float,
+            .sum, .min, .max => input_kind,
+        };
+        metrics[index] = .{
+            .function = function,
+            .field_index = field_index,
+        };
+        columns[index] = .{
+            .name = try allocator.dupe(u8, name),
+            .kind = output_kind,
+            .nullable = function == .average or
+                function == .min or
+                function == .max,
+        };
+        initialized += 1;
+    }
+    return .{
+        .aggregate = .{ .metrics = metrics },
+        .schema = .{ .columns = columns },
     };
 }
 
@@ -999,7 +1146,7 @@ pub fn encodeCache(
     native_plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeCount(native_plan.stages.len);
     for (native_plan.stages) |stage| {
         try encoder.writeBytes(stage.name);
@@ -1030,7 +1177,7 @@ pub fn decodeCache(
     decoder: *definition_core.cache.Decoder,
     definition_plan: *const definition.Plan,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.SeqNativePlanCacheVersionMismatch;
     }
     const stage_count = try decoder.readCount(256);
@@ -1235,6 +1382,17 @@ pub fn validateCachePlan(
                     );
                 }
             },
+            .aggregate => {
+                const aggregate = switch (stage.operation) {
+                    .aggregate => |value| value,
+                    else => return error.CacheObservationOperationMismatch,
+                };
+                try validateAggregate(
+                    aggregate,
+                    &stage.schema,
+                    source_schema.?,
+                );
+            },
             .named_relation, .result_projection => {
                 if (stage.operation != .alias) {
                     return error.CacheObservationOperationMismatch;
@@ -1361,6 +1519,50 @@ pub fn validateCachePlan(
             {
                 return error.CacheObservationProjectionMismatch;
             }
+        }
+    }
+}
+
+fn validateAggregate(
+    aggregate: Aggregate,
+    output_schema: *const Schema,
+    input_schema: SourceSchema,
+) !void {
+    if (aggregate.metrics.len == 0 or
+        aggregate.metrics.len > 64 or
+        aggregate.metrics.len != output_schema.columns.len)
+    {
+        return error.InvalidObservationAggregateMetricCount;
+    }
+    for (
+        aggregate.metrics,
+        output_schema.columns,
+    ) |metric, output_column| {
+        if (metric.function != .count and metric.field_index == null) {
+            return error.ObservationAggregateFieldRequired;
+        }
+        const input_kind: ColumnKind = if (metric.field_index) |field| kind: {
+            if (field >= input_schema.columnCount()) {
+                return error.CacheObservationAggregateFieldInvalid;
+            }
+            const kind = input_schema.column(field).kind;
+            if (kind != .integer and kind != .float) {
+                return error.ObservationAggregateFieldMustBeNumeric;
+            }
+            break :kind kind;
+        } else .integer;
+        const expected_kind: ColumnKind = switch (metric.function) {
+            .count => .integer,
+            .average => .float,
+            .sum, .min, .max => input_kind,
+        };
+        const expected_nullable = metric.function == .average or
+            metric.function == .min or
+            metric.function == .max;
+        if (output_column.kind != expected_kind or
+            output_column.nullable != expected_nullable)
+        {
+            return error.CacheObservationAggregateSchemaMismatch;
         }
     }
 }
@@ -1590,6 +1792,14 @@ fn encodeOperation(
                 try encoder.writeU16(field);
             }
         },
+        .aggregate => |aggregate| {
+            try encoder.writeCount(aggregate.metrics.len);
+            for (aggregate.metrics) |metric| {
+                try encoder.writeEnum(metric.function);
+                try encoder.writeBool(metric.field_index != null);
+                if (metric.field_index) |field| try encoder.writeU16(field);
+            }
+        },
         .alias => {},
         .limit => |limit| {
             try encoder.writeEnum(std.meta.activeTag(limit));
@@ -1656,6 +1866,11 @@ fn decodeOperation(
             schema,
         ) },
         .project => .{ .project = try decodeProject(allocator, decoder) },
+        .aggregate => .{ .aggregate = try decodeAggregate(
+            allocator,
+            decoder,
+            schema,
+        ) },
         .alias => .alias,
         .limit => .{ .limit = try decodeLimit(decoder) },
         .sort => .{ .sort = try decodeSort(
@@ -1788,6 +2003,29 @@ fn decodeProject(
         }
     }
     return .{ .input_field_indices = fields };
+}
+
+fn decodeAggregate(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    schema: *const Schema,
+) !Aggregate {
+    const count = try decoder.readCount(64);
+    if (count == 0 or count != schema.columns.len) {
+        return error.InvalidObservationAggregateMetricCount;
+    }
+    const metrics = try allocator.alloc(AggregateMetric, count);
+    errdefer allocator.free(metrics);
+    for (metrics) |*metric| {
+        metric.* = .{
+            .function = try decoder.readEnum(AggregateFunction),
+            .field_index = if (try decoder.readBool())
+                try decoder.readU16()
+            else
+                null,
+        };
+    }
+    return .{ .metrics = metrics };
 }
 
 fn decodeLimit(

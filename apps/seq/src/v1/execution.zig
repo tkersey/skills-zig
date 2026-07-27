@@ -72,6 +72,12 @@ const FieldRange = struct {
     len: u16,
 };
 
+const RuntimeAggregateMetric = struct {
+    function: plan.AggregateFunction,
+    field_index: ?u16,
+    output_kind: plan.ColumnKind,
+};
+
 const RuntimeOperation = union(enum) {
     filter: PredicateRange,
     limit: struct {
@@ -84,6 +90,7 @@ const RuntimeOperation = union(enum) {
         count: usize,
     },
     distinct: FieldRange,
+    aggregate: FieldRange,
 };
 
 pub const Program = struct {
@@ -95,6 +102,7 @@ pub const Program = struct {
     predicates: []RuntimePredicate,
     sort_keys: []RuntimeSortKey,
     distinct_fields: []u16,
+    aggregate_metrics: []RuntimeAggregateMetric,
     output_field_indices: []u16,
     limit_state_count: u16,
     first_blocking_operation: ?u16,
@@ -106,6 +114,7 @@ pub const Program = struct {
         allocator.free(self.predicates);
         allocator.free(self.sort_keys);
         allocator.free(self.distinct_fields);
+        allocator.free(self.aggregate_metrics);
         allocator.free(self.output_field_indices);
         self.* = undefined;
     }
@@ -186,8 +195,11 @@ pub fn compile(
     errdefer sort_keys.deinit(allocator);
     var distinct_fields: std.ArrayList(u16) = .empty;
     errdefer distinct_fields.deinit(allocator);
+    var aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty;
+    errdefer aggregate_metrics.deinit(allocator);
     var limit_state_count: u16 = 0;
     var first_blocking_operation: ?u16 = null;
+    var aggregate_seen = false;
 
     var path_index = stage_count;
     while (path_index > 0) {
@@ -196,6 +208,7 @@ pub fn compile(
         switch (stage.operation) {
             .scan, .alias => {},
             .filter => |filter| {
+                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
                 const start = predicates.items.len;
                 for (filter.predicates) |predicate| {
                     if (predicate.field_index >= field_count) {
@@ -234,6 +247,7 @@ pub fn compile(
                 @memcpy(field_map[0..field_count], projected[0..field_count]);
             },
             .limit => |limit| {
+                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
                 if (limit_state_count == 256) {
                     return error.TooManyObservationLimits;
                 }
@@ -251,6 +265,7 @@ pub fn compile(
                 limit_state_count += 1;
             },
             .sort => |sort| {
+                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
                 if (first_blocking_operation == null) {
                     first_blocking_operation = @intCast(operations.items.len);
                 }
@@ -273,6 +288,7 @@ pub fn compile(
                 });
             },
             .top_k => |top_k| {
+                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
                 if (first_blocking_operation == null) {
                     first_blocking_operation = @intCast(operations.items.len);
                 }
@@ -303,6 +319,7 @@ pub fn compile(
                 });
             },
             .distinct => |distinct| {
+                if (aggregate_seen) return error.ObservationAggregateMustBeTerminal;
                 if (first_blocking_operation == null) {
                     first_blocking_operation = @intCast(operations.items.len);
                 }
@@ -324,6 +341,41 @@ pub fn compile(
                         ),
                     },
                 });
+            },
+            .aggregate => |aggregate| {
+                if (aggregate_seen) {
+                    return error.ObservationAggregateMustBeTerminal;
+                }
+                if (first_blocking_operation != null) {
+                    return error.ObservationAggregateRequiresStreamingPrefix;
+                }
+                const start = aggregate_metrics.items.len;
+                for (aggregate.metrics, 0..) |metric, metric_index| {
+                    if (metric.field_index) |field_index| {
+                        if (field_index >= field_count) {
+                            return error.ObservationFieldIndexInvalid;
+                        }
+                    }
+                    try aggregate_metrics.append(allocator, .{
+                        .function = metric.function,
+                        .field_index = if (metric.field_index) |field_index|
+                            field_map[field_index]
+                        else
+                            null,
+                        .output_kind = stage.schema.columns[metric_index].kind,
+                    });
+                }
+                try operations.append(allocator, .{
+                    .aggregate = .{
+                        .start = @intCast(start),
+                        .len = @intCast(aggregate_metrics.items.len - start),
+                    },
+                });
+                field_count = aggregate.metrics.len;
+                for (field_map[0..field_count], 0..) |*field, index| {
+                    field.* = @intCast(index);
+                }
+                aggregate_seen = true;
             },
         }
     }
@@ -348,6 +400,9 @@ pub fn compile(
     const distinct_field_slice =
         try distinct_fields.toOwnedSlice(allocator);
     errdefer allocator.free(distinct_field_slice);
+    const aggregate_metric_slice =
+        try aggregate_metrics.toOwnedSlice(allocator);
+    errdefer allocator.free(aggregate_metric_slice);
 
     return .{
         .source = source,
@@ -358,6 +413,7 @@ pub fn compile(
         .predicates = predicate_slice,
         .sort_keys = sort_key_slice,
         .distinct_fields = distinct_field_slice,
+        .aggregate_metrics = aggregate_metric_slice,
         .output_field_indices = output_fields,
         .limit_state_count = limit_state_count,
         .first_blocking_operation = first_blocking_operation,
@@ -377,6 +433,13 @@ const RowRef = struct {
     ordinal: usize,
 };
 
+const AggregateState = struct {
+    count: u64 = 0,
+    integer: i64 = 0,
+    float: f64 = 0,
+    seen: bool = false,
+};
+
 pub const Runner = struct {
     program: *const Program,
     output: []Value,
@@ -386,6 +449,8 @@ pub const Runner = struct {
     auxiliary_refs: []RowRef = &.{},
     duplicate_marks: []bool = &.{},
     limit_states: [256]usize = undefined,
+    aggregate_states: [64]AggregateState = undefined,
+    aggregate_row: [64]Value = undefined,
     source_row_count: usize = 0,
     materialized_row_count: usize = 0,
     output_row_count: usize = 0,
@@ -402,6 +467,9 @@ pub const Runner = struct {
             .output = output,
         };
         @memset(runner.limit_states[0..program.limit_state_count], 0);
+        for (
+            runner.aggregate_states[0..program.aggregate_metrics.len],
+        ) |*state| state.* = .{};
         return runner;
     }
 
@@ -449,6 +517,9 @@ pub const Runner = struct {
             .duplicate_marks = duplicate_marks,
         };
         @memset(runner.limit_states[0..program.limit_state_count], 0);
+        for (
+            runner.aggregate_states[0..program.aggregate_metrics.len],
+        ) |*state| state.* = .{};
         return runner;
     }
 
@@ -518,12 +589,18 @@ pub const Runner = struct {
                         active_count,
                         range,
                     ),
+                    .aggregate => return error.ObservationAggregateAfterBlocking,
                 };
                 resetOrdinals(self.row_refs[0..active_count]);
             }
             for (self.row_refs[0..active_count]) |ref| {
                 try self.append(self.materializedRow(ref.row_index));
             }
+        } else if (self.program.aggregate_metrics.len != 0) {
+            try self.finalizeAggregates();
+            try self.append(
+                self.aggregate_row[0..self.program.aggregate_metrics.len],
+            );
         }
         self.finalized = true;
         return self.currentResult();
@@ -574,6 +651,11 @@ pub const Runner = struct {
                 .sort, .top_k, .distinct => {
                     return error.ObservationBlockingOperatorInStreamingPrefix;
                 },
+                .aggregate => |range| {
+                    try self.accumulateAggregates(row, range);
+                    accepted = false;
+                    break;
+                },
             }
         }
         return .{
@@ -604,6 +686,96 @@ pub const Runner = struct {
             row,
         );
         self.materialized_row_count += 1;
+    }
+
+    fn accumulateAggregates(
+        self: *Runner,
+        row: []const Value,
+        range: FieldRange,
+    ) !void {
+        const end = @as(usize, range.start) + range.len;
+        for (
+            self.program.aggregate_metrics[range.start..end],
+            self.aggregate_states[range.start..end],
+        ) |metric, *state| {
+            const value = if (metric.field_index) |field| value: {
+                if (row[field] == .null) continue;
+                break :value row[field];
+            } else {
+                if (metric.function != .count) {
+                    return error.ObservationAggregateFieldRequired;
+                }
+                state.count = std.math.add(
+                    u64,
+                    state.count,
+                    1,
+                ) catch return error.ObservationAggregateOverflow;
+                continue;
+            };
+            switch (metric.function) {
+                .count => {
+                    state.count = std.math.add(
+                        u64,
+                        state.count,
+                        1,
+                    ) catch return error.ObservationAggregateOverflow;
+                },
+                .sum => try accumulateSum(metric, state, value),
+                .average => {
+                    try accumulateFloat(state, value);
+                    state.count = std.math.add(
+                        u64,
+                        state.count,
+                        1,
+                    ) catch return error.ObservationAggregateOverflow;
+                },
+                .min => try accumulateExtremum(
+                    metric,
+                    state,
+                    value,
+                    .min,
+                ),
+                .max => try accumulateExtremum(
+                    metric,
+                    state,
+                    value,
+                    .max,
+                ),
+            }
+        }
+    }
+
+    fn finalizeAggregates(self: *Runner) !void {
+        for (
+            self.program.aggregate_metrics,
+            self.aggregate_states[0..self.program.aggregate_metrics.len],
+            0..,
+        ) |metric, state, index| {
+            self.aggregate_row[index] = switch (metric.function) {
+                .count => .{ .integer = std.math.cast(
+                    i64,
+                    state.count,
+                ) orelse return error.ObservationAggregateOverflow },
+                .sum => switch (metric.output_kind) {
+                    .integer => .{ .integer = state.integer },
+                    .float => .{ .float = state.float },
+                    else => return error.ObservationAggregateTypeMismatch,
+                },
+                .average => if (state.count == 0)
+                    .null
+                else
+                    .{ .float = state.float / @as(f64, @floatFromInt(
+                        state.count,
+                    )) },
+                .min, .max => if (!state.seen)
+                    .null
+                else switch (metric.output_kind) {
+                    .integer => .{ .integer = state.integer },
+                    .float => .{ .float = state.float },
+                    else => return error.ObservationAggregateTypeMismatch,
+                },
+            };
+        }
     }
 
     fn materializedRow(
@@ -712,6 +884,81 @@ pub const Runner = struct {
         self.output_row_count += 1;
     }
 };
+
+fn accumulateSum(
+    metric: RuntimeAggregateMetric,
+    state: *AggregateState,
+    value: Value,
+) !void {
+    switch (metric.output_kind) {
+        .integer => {
+            const integer = switch (value) {
+                .integer => |number| number,
+                else => return error.ObservationAggregateTypeMismatch,
+            };
+            state.integer = std.math.add(
+                i64,
+                state.integer,
+                integer,
+            ) catch return error.ObservationAggregateOverflow;
+        },
+        .float => try accumulateFloat(state, value),
+        else => return error.ObservationAggregateTypeMismatch,
+    }
+}
+
+fn accumulateFloat(state: *AggregateState, value: Value) !void {
+    const number: f64 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => return error.ObservationAggregateTypeMismatch,
+    };
+    const sum = state.float + number;
+    if (!std.math.isFinite(sum)) return error.ObservationAggregateOverflow;
+    state.float = sum;
+}
+
+const Extremum = enum { min, max };
+
+fn accumulateExtremum(
+    metric: RuntimeAggregateMetric,
+    state: *AggregateState,
+    value: Value,
+    extremum: Extremum,
+) !void {
+    switch (metric.output_kind) {
+        .integer => {
+            const number = switch (value) {
+                .integer => |integer| integer,
+                else => return error.ObservationAggregateTypeMismatch,
+            };
+            if (!state.seen or
+                (extremum == .min and number < state.integer) or
+                (extremum == .max and number > state.integer))
+            {
+                state.integer = number;
+            }
+        },
+        .float => {
+            const number: f64 = switch (value) {
+                .integer => |integer| @floatFromInt(integer),
+                .float => |float| float,
+                else => return error.ObservationAggregateTypeMismatch,
+            };
+            if (!std.math.isFinite(number)) {
+                return error.ObservationAggregateTypeMismatch;
+            }
+            if (!state.seen or
+                (extremum == .min and number < state.float) or
+                (extremum == .max and number > state.float))
+            {
+                state.float = number;
+            }
+        },
+        else => return error.ObservationAggregateTypeMismatch,
+    }
+    state.seen = true;
+}
 
 fn validateRunnerInputs(program: *const Program) !void {
     if (program.source_width == 0) {
@@ -1447,5 +1694,96 @@ test "compiled top-k binds its count once before execution" {
     try std.testing.expectEqualStrings(
         "c",
         result.rows().row(1)[0].string,
+    );
+}
+
+test "compiled aggregate streams bounded numeric summaries in one pass" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data =
+        \\{"schema":"seq-observation-definition/v1","id":"example/aggregate","requires":{"abi":"seq-observation-abi/v1","operators":["aggregate"]},"parameters":{},"selectors":[],"relations":[],"inputs":[{"name":"facts","schema":"example-facts/v1","fields":[{"name":"amount","type":"integer","nullable":true},{"name":"score","type":"float","nullable":true}],"max_rows":3,"max_bytes":4096}],"pipeline":[{"op":"aggregate","input":"facts","as":"summary","metrics":[{"name":"row_count","op":"count"},{"name":"observed_amount","op":"count","field":"amount"},{"name":"sum_amount","op":"sum","field":"amount"},{"name":"min_amount","op":"min","field":"amount"},{"name":"max_amount","op":"max","field":"amount"},{"name":"avg_amount","op":"average","field":"amount"},{"name":"sum_score","op":"sum","field":"score"}]}],"projections":{"summary":{"relation":"summary","schema":"example-summary/v1","fields":["row_count","observed_amount","sum_amount","min_amount","max_amount","avg_amount","sum_score"],"renderers":["json"]}},"bounds":{"max_rows":3,"max_output_bytes":4096,"max_fold_states":8}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "observation.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var native_plan = try plan.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer native_plan.deinit(std.testing.allocator);
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    var program = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &native_plan,
+        &bindings,
+        "summary",
+    );
+    defer program.deinit(std.testing.allocator);
+
+    const source = [_]Value{
+        .{ .integer = 5 }, .{ .float = 1.5 },
+        .null,             .{ .float = 2.5 },
+        .{ .integer = 7 }, .null,
+    };
+    var output: [7]Value = undefined;
+    const result = try execute(
+        &program,
+        .{ .values = &source, .width = 2 },
+        &output,
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(usize, 3), result.source_row_count);
+    try std.testing.expectEqual(@as(usize, 0), result.materialized_row_count);
+    const summary = result.rows().row(0);
+    try std.testing.expectEqual(@as(i64, 3), summary[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), summary[1].integer);
+    try std.testing.expectEqual(@as(i64, 12), summary[2].integer);
+    try std.testing.expectEqual(@as(i64, 5), summary[3].integer);
+    try std.testing.expectEqual(@as(i64, 7), summary[4].integer);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 6),
+        summary[5].float,
+        0.000001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 4),
+        summary[6].float,
+        0.000001,
+    );
+
+    var empty_output: [7]Value = undefined;
+    var runner = try Runner.init(&program, &empty_output);
+    defer runner.deinit();
+    const empty = try runner.finish();
+    const empty_summary = empty.rows().row(0);
+    try std.testing.expectEqual(@as(i64, 0), empty_summary[0].integer);
+    try std.testing.expectEqual(@as(i64, 0), empty_summary[1].integer);
+    try std.testing.expectEqual(@as(i64, 0), empty_summary[2].integer);
+    try std.testing.expect(empty_summary[3] == .null);
+    try std.testing.expect(empty_summary[4] == .null);
+    try std.testing.expect(empty_summary[5] == .null);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 0),
+        empty_summary[6].float,
+        0.000001,
     );
 }
