@@ -184,6 +184,7 @@ pub const Operator = enum {
             .cross_input_equal => 2,
             .fold => 2,
             .id_lookup, .latest, .@"export" => 2,
+            .sort => 1,
             else => 1,
         };
     }
@@ -264,6 +265,7 @@ pub const Operator = enum {
             .replay,
             .filter,
             .select,
+            .sort,
             .limit,
             .id_lookup,
             .latest,
