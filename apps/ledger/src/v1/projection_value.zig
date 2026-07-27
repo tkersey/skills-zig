@@ -9,10 +9,12 @@ const max_field_name_bytes: usize = 128;
 
 const Pointer = struct {
     pointer: definition_core.json_pointer.Pointer,
+    fallback_pointer: ?definition_core.json_pointer.Pointer,
     fallback: ?[]u8,
 
     fn deinit(self: *Pointer, allocator: std.mem.Allocator) void {
         self.pointer.deinit(allocator);
+        if (self.fallback_pointer) |*pointer| pointer.deinit(allocator);
         if (self.fallback) |bytes| allocator.free(bytes);
         self.* = undefined;
     }
@@ -42,6 +44,32 @@ const Concat = struct {
     }
 };
 
+const ChoiceCase = struct {
+    equals: []u8,
+    value: Value,
+
+    fn deinit(self: *ChoiceCase, allocator: std.mem.Allocator) void {
+        allocator.free(self.equals);
+        self.value.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const Choice = struct {
+    pointer: definition_core.json_pointer.Pointer,
+    cases: []ChoiceCase,
+    fallback: *Value,
+
+    fn deinit(self: *Choice, allocator: std.mem.Allocator) void {
+        self.pointer.deinit(allocator);
+        for (self.cases) |*case| case.deinit(allocator);
+        allocator.free(self.cases);
+        self.fallback.deinit(allocator);
+        allocator.destroy(self.fallback);
+        self.* = undefined;
+    }
+};
+
 const Field = struct {
     name: []u8,
     value: Value,
@@ -59,6 +87,7 @@ pub const Value = union(enum) {
     concat: Concat,
     object: []Field,
     array: []Value,
+    choice: Choice,
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -73,6 +102,7 @@ pub const Value = union(enum) {
                 for (items) |*item| item.deinit(allocator);
                 allocator.free(items);
             },
+            .choice => |*choice| choice.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -114,12 +144,14 @@ fn compileValue(
     const has_concat = object.contains("concat");
     const has_object = object.contains("object");
     const has_array = object.contains("array");
+    const has_switch = object.contains("switch");
     const source_count =
         @as(usize, @intFromBool(has_literal)) +
         @as(usize, @intFromBool(has_path)) +
         @as(usize, @intFromBool(has_concat)) +
         @as(usize, @intFromBool(has_object)) +
-        @as(usize, @intFromBool(has_array));
+        @as(usize, @intFromBool(has_array)) +
+        @as(usize, @intFromBool(has_switch));
     if (source_count != 1) return error.InvalidProjectionValueSource;
 
     if (has_literal) {
@@ -137,7 +169,7 @@ fn compileValue(
     if (has_path) {
         try definition_core.json.requireExactKeys(
             object,
-            &.{ "default", "path" },
+            &.{ "default", "fallback_path", "path" },
         );
         const raw_pointer = try definition_core.json.string(
             object.get("path").?,
@@ -150,6 +182,17 @@ fn compileValue(
             raw_pointer,
         );
         errdefer pointer.deinit(allocator);
+        var fallback_pointer =
+            if (object.get("fallback_path")) |value|
+                try definition_core.json_pointer.compile(
+                    allocator,
+                    try definition_core.json.string(value),
+                )
+            else
+                null;
+        errdefer if (fallback_pointer) |*compiled| {
+            compiled.deinit(allocator);
+        };
         const fallback = if (object.get("default")) |value|
             try definition_core.canonical_json.canonicalJsonAlloc(
                 allocator,
@@ -165,6 +208,7 @@ fn compileValue(
         }
         return .{ .pointer = .{
             .pointer = pointer,
+            .fallback_pointer = fallback_pointer,
             .fallback = fallback,
         } };
     }
@@ -300,27 +344,112 @@ fn compileValue(
         return .{ .object = fields };
     }
 
-    try definition_core.json.requireExactKeys(object, &.{"array"});
-    const raw_items = try definition_core.json.array(object.get("array").?);
-    if (raw_items.items.len > max_collection_items) {
-        return error.ProjectionValueItemsInvalid;
+    if (has_array) {
+        try definition_core.json.requireExactKeys(object, &.{"array"});
+        const raw_items = try definition_core.json.array(
+            object.get("array").?,
+        );
+        if (raw_items.items.len > max_collection_items) {
+            return error.ProjectionValueItemsInvalid;
+        }
+        const items = try allocator.alloc(Value, raw_items.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| item.deinit(allocator);
+            allocator.free(items);
+        }
+        for (raw_items.items) |raw_item| {
+            items[initialized] = try compileValue(
+                allocator,
+                raw_item,
+                state,
+                depth + 1,
+            );
+            initialized += 1;
+        }
+        return .{ .array = items };
     }
-    const items = try allocator.alloc(Value, raw_items.items.len);
-    var initialized: usize = 0;
+
+    try definition_core.json.requireExactKeys(object, &.{"switch"});
+    const choice_object = try definition_core.json.object(
+        object.get("switch").?,
+    );
+    try definition_core.json.requireExactKeys(
+        choice_object,
+        &.{ "path", "cases", "default" },
+    );
+    try definition_core.json.requireFields(
+        choice_object,
+        &.{ "path", "cases", "default" },
+    );
+    var pointer = try definition_core.json_pointer.compile(
+        allocator,
+        try definition_core.json.requiredString(choice_object, "path"),
+    );
+    errdefer pointer.deinit(allocator);
+    const raw_cases = try definition_core.json.array(
+        try definition_core.json.field(choice_object, "cases"),
+    );
+    if (raw_cases.items.len == 0 or
+        raw_cases.items.len > max_collection_items)
+    {
+        return error.ProjectionValueChoiceCasesInvalid;
+    }
+    const cases = try allocator.alloc(ChoiceCase, raw_cases.items.len);
+    var cases_initialized: usize = 0;
     errdefer {
-        for (items[0..initialized]) |*item| item.deinit(allocator);
-        allocator.free(items);
+        for (cases[0..cases_initialized]) |*case| {
+            case.deinit(allocator);
+        }
+        allocator.free(cases);
     }
-    for (raw_items.items) |raw_item| {
-        items[initialized] = try compileValue(
+    for (raw_cases.items) |raw_case| {
+        const case_object = try definition_core.json.object(raw_case);
+        try definition_core.json.requireExactKeys(
+            case_object,
+            &.{ "equals", "value" },
+        );
+        try definition_core.json.requireFields(
+            case_object,
+            &.{ "equals", "value" },
+        );
+        const equals = try definition_core.canonical_json.canonicalJsonAlloc(
             allocator,
-            raw_item,
+            try definition_core.json.field(case_object, "equals"),
+        );
+        errdefer allocator.free(equals);
+        for (cases[0..cases_initialized]) |prior| {
+            if (std.mem.eql(u8, prior.equals, equals)) {
+                return error.ProjectionValueChoiceCasesNotUnique;
+            }
+        }
+        var value = try compileValue(
+            allocator,
+            try definition_core.json.field(case_object, "value"),
             state,
             depth + 1,
         );
-        initialized += 1;
+        errdefer value.deinit(allocator);
+        cases[cases_initialized] = .{
+            .equals = equals,
+            .value = value,
+        };
+        cases_initialized += 1;
     }
-    return .{ .array = items };
+    const fallback = try allocator.create(Value);
+    errdefer allocator.destroy(fallback);
+    fallback.* = try compileValue(
+        allocator,
+        try definition_core.json.field(choice_object, "default"),
+        state,
+        depth + 1,
+    );
+    errdefer fallback.deinit(allocator);
+    return .{ .choice = .{
+        .pointer = pointer,
+        .cases = cases,
+        .fallback = fallback,
+    } };
 }
 
 pub fn encodeCache(
@@ -335,6 +464,12 @@ pub fn encodeCache(
         .pointer => |pointer| {
             try encoder.writeByte(1);
             try encoder.writeBytes(pointer.pointer.raw);
+            try encoder.writeOptionalBytes(
+                if (pointer.fallback_pointer) |fallback|
+                    fallback.raw
+                else
+                    null,
+            );
             try encoder.writeOptionalBytes(pointer.fallback);
         },
         .concat => |concat| {
@@ -364,6 +499,16 @@ pub fn encodeCache(
             try encoder.writeByte(4);
             try encoder.writeCount(items.len);
             for (items) |item| try encodeCache(item, encoder);
+        },
+        .choice => |choice| {
+            try encoder.writeByte(5);
+            try encoder.writeBytes(choice.pointer.raw);
+            try encoder.writeCount(choice.cases.len);
+            for (choice.cases) |case| {
+                try encoder.writeBytes(case.equals);
+                try encodeCache(case.value, encoder);
+            }
+            try encodeCache(choice.fallback.*, encoder);
         },
     }
 }
@@ -421,6 +566,18 @@ fn decodeValue(
                 raw,
             );
             errdefer compiled.deinit(allocator);
+            const fallback_raw = try decoder.readOptionalBytesAlloc(
+                allocator,
+                max_pointer_bytes,
+            );
+            defer if (fallback_raw) |bytes| allocator.free(bytes);
+            var fallback_pointer = if (fallback_raw) |bytes|
+                try definition_core.json_pointer.compile(allocator, bytes)
+            else
+                null;
+            errdefer if (fallback_pointer) |*pointer| {
+                pointer.deinit(allocator);
+            };
             const fallback = try decoder.readOptionalBytesAlloc(
                 allocator,
                 state.max_output_bytes,
@@ -429,6 +586,7 @@ fn decodeValue(
             if (fallback) |bytes| try validateCanonicalJson(allocator, bytes);
             break :pointer .{ .pointer = .{
                 .pointer = compiled,
+                .fallback_pointer = fallback_pointer,
                 .fallback = fallback,
             } };
         },
@@ -545,6 +703,67 @@ fn decodeValue(
             }
             break :array .{ .array = items };
         },
+        5 => choice: {
+            const raw_pointer = try decoder.readBytesAlloc(
+                allocator,
+                max_pointer_bytes,
+            );
+            defer allocator.free(raw_pointer);
+            var pointer = try definition_core.json_pointer.compile(
+                allocator,
+                raw_pointer,
+            );
+            errdefer pointer.deinit(allocator);
+            const count = try decoder.readCount(max_collection_items);
+            if (count == 0) {
+                return error.CacheProjectionValueChoiceCasesInvalid;
+            }
+            const cases = try allocator.alloc(ChoiceCase, count);
+            var initialized: usize = 0;
+            errdefer {
+                for (cases[0..initialized]) |*case| {
+                    case.deinit(allocator);
+                }
+                allocator.free(cases);
+            }
+            for (cases) |*case| {
+                const equals = try decoder.readBytesAlloc(
+                    allocator,
+                    state.max_output_bytes,
+                );
+                errdefer allocator.free(equals);
+                try validateCanonicalJson(allocator, equals);
+                for (cases[0..initialized]) |prior| {
+                    if (std.mem.eql(u8, prior.equals, equals)) {
+                        return error.CacheProjectionValueChoiceCasesNotUnique;
+                    }
+                }
+                case.* = .{
+                    .equals = equals,
+                    .value = try decodeValue(
+                        allocator,
+                        decoder,
+                        state,
+                        depth + 1,
+                    ),
+                };
+                initialized += 1;
+            }
+            const fallback = try allocator.create(Value);
+            errdefer allocator.destroy(fallback);
+            fallback.* = try decodeValue(
+                allocator,
+                decoder,
+                state,
+                depth + 1,
+            );
+            errdefer fallback.deinit(allocator);
+            break :choice .{ .choice = .{
+                .pointer = pointer,
+                .cases = cases,
+                .fallback = fallback,
+            } };
+        },
         else => error.CacheProjectionValueTagInvalid,
     };
 }
@@ -592,6 +811,21 @@ pub fn write(
                     writer,
                     selected,
                 );
+            } else if (pointer.fallback_pointer) |fallback_pointer| {
+                if (definition_core.json_pointer.lookup(
+                    source,
+                    fallback_pointer,
+                )) |selected| {
+                    try definition_core.canonical_json.writeCanonicalJson(
+                        allocator,
+                        writer,
+                        selected,
+                    );
+                } else if (pointer.fallback) |fallback| {
+                    try writer.writeAll(fallback);
+                } else {
+                    return error.ProjectionValuePathMissing;
+                }
             } else if (pointer.fallback) |fallback| {
                 try writer.writeAll(fallback);
             } else {
@@ -645,6 +879,23 @@ pub fn write(
                 try write(allocator, writer, item, source);
             }
             try writer.writeByte(']');
+        },
+        .choice => |choice| {
+            const selected = definition_core.json_pointer.lookup(
+                source,
+                choice.pointer,
+            ) orelse return error.ProjectionValuePathMissing;
+            const canonical =
+                try definition_core.canonical_json.canonicalJsonAlloc(
+                    allocator,
+                    selected,
+                );
+            defer allocator.free(canonical);
+            for (choice.cases) |case| {
+                if (!std.mem.eql(u8, case.equals, canonical)) continue;
+                return write(allocator, writer, case.value, source);
+            }
+            try write(allocator, writer, choice.fallback.*, source);
         },
     }
 }

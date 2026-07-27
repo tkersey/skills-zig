@@ -186,10 +186,10 @@ pub const Operator = enum {
             .compare_append, .bind_existing => 2,
             .event_envelope => 4,
             .cross_input_equal => 2,
-            .fold => 4,
+            .fold => 5,
             .id_lookup, .latest => 2,
             .relevance => 3,
-            .@"export" => 4,
+            .@"export" => 5,
             .sort => 1,
             else => 1,
         };

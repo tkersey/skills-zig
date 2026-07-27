@@ -1099,10 +1099,8 @@ pub fn validateCachePlan(
             return error.CacheProjectionPlanMismatch;
         }
         if (projection.fold) |fold| {
-            if (projection.predicates.len != 0 or
-                projection.fields.len != 0 or
+            if (projection.fields.len != 0 or
                 projection.value_path != null or
-                projection.constructed_value != null or
                 projection.latest != null or
                 !definition_plan.requires(.fold) or
                 event_protocol == null or
@@ -1136,6 +1134,37 @@ pub fn validateCachePlan(
                         event_protocol.?,
                         error.CacheProjectionPlanMismatch,
                     );
+                    const composed =
+                        projection.predicates.len != 0 or
+                        projection.constructed_value != null;
+                    if (composed) {
+                        if (projection.predicates.len != 1 or
+                            projection.constructed_value == null or
+                            !projection.single or
+                            !projection.require_match or
+                            projection.raw or
+                            projection.limit != null)
+                        {
+                            return error.CacheProjectionPlanMismatch;
+                        }
+                        const predicate = projection.predicates[0];
+                        if (predicate.operand != .parameter) {
+                            return error.CacheProjectionPlanMismatch;
+                        }
+                        var expected_path: [130]u8 = undefined;
+                        const path = try std.fmt.bufPrint(
+                            &expected_path,
+                            "/{s}",
+                            .{keyed.key_field},
+                        );
+                        if (!std.mem.eql(
+                            u8,
+                            predicate.pointer.raw,
+                            path,
+                        )) {
+                            return error.CacheProjectionPlanMismatch;
+                        }
+                    }
                 },
                 .retained => |retained| {
                     const retained_plan =
@@ -1144,6 +1173,8 @@ pub fn validateCachePlan(
                         else
                             return error.CacheProjectionPlanMismatch;
                     if (projection.limit != null or
+                        projection.predicates.len != 0 or
+                        projection.constructed_value != null or
                         retained.fields.len == 0 or
                         retained.fields.len > 256)
                     {
@@ -1741,8 +1772,17 @@ fn compileProjection(
         }
         switch (operator) {
             .filter, .id_lookup => {
-                if (selection_seen or latest != null or limit != null or
-                    fold != null or sort_keys.len != 0 or relevance != null)
+                if (fold != null) {
+                    if (operator != .id_lookup or selection_seen or
+                        latest != null or limit != null or
+                        sort_keys.len != 0 or relevance != null or
+                        predicates.items.len != 0 or
+                        fold.? != .keyed)
+                    {
+                        return error.InvalidProjectionOperatorOrder;
+                    }
+                } else if (selection_seen or latest != null or
+                    limit != null or sort_keys.len != 0 or relevance != null)
                 {
                     return error.InvalidProjectionOperatorOrder;
                 }
@@ -1960,8 +2000,15 @@ fn compileProjection(
                 limit = try compileLimit(allocator, definition_plan, step);
             },
             .@"export" => {
-                if (selection_seen or limit != null or fold != null) {
+                if (selection_seen or limit != null or
+                    (fold != null and
+                        (fold.? != .keyed or !single or
+                            predicates.items.len != 1)))
+                {
                     return error.InvalidProjectionOperatorOrder;
+                }
+                if (fold != null and step.get("value") == null) {
+                    return error.FoldExportRequiresConstructedValue;
                 }
                 if (step.get("fields")) |field_values| {
                     try definition_core.json.requireExactKeys(
@@ -2031,6 +2078,30 @@ fn compileProjection(
     for (sort_keys) |key| {
         if (key.source == .relevance_score and relevance == null) {
             return error.RelevanceSortRequiresRelevanceOperator;
+        }
+    }
+    if (fold != null and
+        (predicates.items.len != 0 or constructed_value != null))
+    {
+        if (fold.? != .keyed or predicates.items.len != 1 or
+            !single or !require_match or constructed_value == null or
+            fields.len != 0 or value_path != null or raw_export)
+        {
+            return error.InvalidFoldProjectionComposition;
+        }
+        const keyed = fold.?.keyed;
+        const predicate = predicates.items[0];
+        if (predicate.operand != .parameter) {
+            return error.FoldLookupRequiresParameter;
+        }
+        var expected_path: [130]u8 = undefined;
+        const path = try std.fmt.bufPrint(
+            &expected_path,
+            "/{s}",
+            .{keyed.key_field},
+        );
+        if (!std.mem.eql(u8, predicate.pointer.raw, path)) {
+            return error.FoldLookupMustUseKeyField;
         }
     }
     return .{
@@ -3358,37 +3429,53 @@ pub fn execute(
         stats.records_scanned = replay_stats.records_validated;
         switch (fold) {
             .keyed => |keyed| {
-                stats.records_matched =
-                    replay_state.reducer_state.count();
-                stats.records_emitted = if (keyed.history.active()) history: {
-                    const accumulator = if (fold_history) |*value|
-                        value
-                    else
-                        return error.FoldHistoryAccumulatorMissing;
-                    if (accumulator.records_seen !=
-                        replay_stats.records_validated)
-                    {
-                        return error.FoldHistoryRecordCountMismatch;
-                    }
-                    break :history try writeKeyedHistoryRows(
+                if (compiled.constructed_value != null) {
+                    stats.records_emitted =
+                        try writeConstructedKeyedFold(
+                            allocator,
+                            &output.writer,
+                            compiled,
+                            &keyed,
+                            &replay_state.reducer_state,
+                            if (fold_history) |*value| value else null,
+                            parameters,
+                            plan.max_output_bytes,
+                        );
+                    stats.records_matched = stats.records_emitted;
+                } else {
+                    stats.records_matched =
+                        replay_state.reducer_state.count();
+                    stats.records_emitted = if (keyed.history.active()) history: {
+                        const accumulator = if (fold_history) |*value|
+                            value
+                        else
+                            return error.FoldHistoryAccumulatorMissing;
+                        if (accumulator.records_seen !=
+                            replay_stats.records_validated)
+                        {
+                            return error.FoldHistoryRecordCountMismatch;
+                        }
+                        break :history try writeKeyedHistoryRows(
+                            allocator,
+                            &output,
+                            &replay_state.reducer_state,
+                            accumulator,
+                            &keyed,
+                            effective_limit,
+                            plan.max_output_bytes,
+                            null,
+                        );
+                    } else try replay_state.reducer_state.writeCanonicalRows(
                         allocator,
                         &output,
-                        &replay_state.reducer_state,
-                        accumulator,
-                        &keyed,
+                        keyed.key_field,
+                        keyed.state_field,
+                        keyed.retained_field,
+                        keyed.event_count_field,
                         effective_limit,
                         plan.max_output_bytes,
                     );
-                } else try replay_state.reducer_state.writeCanonicalRows(
-                    allocator,
-                    &output,
-                    keyed.key_field,
-                    keyed.state_field,
-                    keyed.retained_field,
-                    keyed.event_count_field,
-                    effective_limit,
-                    plan.max_output_bytes,
-                );
+                }
             },
             .retained => |retained| {
                 const retained_plan =
@@ -3512,14 +3599,70 @@ const KeyedHistoryField = struct {
     source: KeyedHistoryFieldSource,
 };
 
+fn writeConstructedKeyedFold(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    projection: *const Projection,
+    keyed: *const KeyedFold,
+    reducer_state: *reducer.State,
+    accumulator: ?*const FoldHistoryAccumulator,
+    parameters: *const definition_core.parameters.Bindings,
+    max_output_bytes: usize,
+) !usize {
+    const constructed = projection.constructed_value orelse
+        return error.FoldConstructedValueMissing;
+    if (projection.predicates.len != 1 or
+        projection.predicates[0].operand != .parameter)
+    {
+        return error.FoldLookupRequiresParameter;
+    }
+    const operand = projection.predicates[0].operand.parameter;
+    const bound = scalarFromBinding(parameters, operand) orelse
+        return error.MissingParameter;
+    const key = switch (bound) {
+        .string => |value| value,
+        else => return error.FoldLookupParameterMustBeString,
+    };
+    var row_array: std.Io.Writer.Allocating = .init(allocator);
+    defer row_array.deinit();
+    const emitted = try writeKeyedHistoryRows(
+        allocator,
+        &row_array,
+        reducer_state,
+        accumulator,
+        keyed,
+        1,
+        max_output_bytes,
+        key,
+    );
+    if (emitted == 0) return error.ProjectionNotFound;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        row_array.written(),
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const rows = try definition_core.json.array(parsed.value);
+    if (rows.items.len != 1) return error.FoldLookupCardinalityMismatch;
+    try projection_value.write(
+        allocator,
+        writer,
+        constructed,
+        rows.items[0],
+    );
+    return 1;
+}
+
 fn writeKeyedHistoryRows(
     allocator: std.mem.Allocator,
     output: *std.Io.Writer.Allocating,
     reducer_state: *reducer.State,
-    accumulator: *const FoldHistoryAccumulator,
+    accumulator: ?*const FoldHistoryAccumulator,
     keyed: *const KeyedFold,
     limit: usize,
     max_output_bytes: usize,
+    only_key: ?[]const u8,
 ) !usize {
     var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
     var field_count: usize = 0;
@@ -3586,14 +3729,28 @@ fn writeKeyedHistoryRows(
             return std.mem.lessThan(u8, left.name, right.name);
         }
     }.lessThan);
-    const views = try reducer_state.sortedViewsAlloc(allocator);
-    defer allocator.free(views);
+    var one_view: [1]reducer.EntryView = undefined;
+    var allocated_views: ?[]reducer.EntryView = null;
+    defer if (allocated_views) |views| allocator.free(views);
+    const views: []reducer.EntryView = if (only_key) |key| selected: {
+        one_view[0] = reducer_state.get(key) orelse {
+            try output.writer.writeAll("[]");
+            return 0;
+        };
+        break :selected &one_view;
+    } else all: {
+        allocated_views = try reducer_state.sortedViewsAlloc(allocator);
+        break :all allocated_views.?;
+    };
     const emitted = @min(limit, views.len);
     try output.writer.writeByte('[');
     for (views[0..emitted], 0..) |view, row_index| {
         if (row_index != 0) try output.writer.writeByte(',');
-        const history = accumulator.get(view.key) orelse
-            return error.FoldHistoryReducerStateMismatch;
+        const history = if (accumulator) |configured|
+            configured.get(view.key) orelse
+                return error.FoldHistoryReducerStateMismatch
+        else
+            null;
         try output.writer.writeByte('{');
         for (fields, 0..) |field, field_index| {
             if (field_index != 0) try output.writer.writeByte(',');
@@ -3617,30 +3774,38 @@ fn writeKeyedHistoryRows(
                 ),
                 .event_kind_count => |index| try output.writer.print(
                     "{d}",
-                    .{history.event_kind_counts[index]},
+                    .{(history orelse
+                        return error.FoldHistoryAccumulatorMissing)
+                        .event_kind_counts[index]},
                 ),
                 .event_chain => {
-                    if (!history.has_event_chain) {
+                    const value = history orelse
+                        return error.FoldHistoryAccumulatorMissing;
+                    if (!value.has_event_chain) {
                         return error.FoldHistoryEventChainMissing;
                     }
                     try definition_core.canonical_json.writeCanonicalString(
                         &output.writer,
-                        &history.event_chain,
+                        &value.event_chain,
                     );
                 },
                 .snapshot => {
-                    if (!history.has_snapshot) {
+                    const value = history orelse
+                        return error.FoldHistoryAccumulatorMissing;
+                    if (!value.has_snapshot) {
                         return error.FoldHistorySnapshotMissing;
                     }
                     try definition_core.canonical_json.writeCanonicalString(
                         &output.writer,
-                        &history.snapshot,
+                        &value.snapshot,
                     );
                 },
-                .prior_snapshot => if (history.has_prior_snapshot)
+                .prior_snapshot => if ((history orelse
+                    return error.FoldHistoryAccumulatorMissing)
+                    .has_prior_snapshot)
                     try definition_core.canonical_json.writeCanonicalString(
                         &output.writer,
-                        &history.prior_snapshot,
+                        &(history.?).prior_snapshot,
                     )
                 else
                     try output.writer.writeAll("null"),
@@ -4442,6 +4607,7 @@ test "keyed fold history compiles once and preserves exact replay digests" {
             &keyed,
             4,
             4096,
+            null,
         ),
     );
     try std.testing.expectEqualStrings(
