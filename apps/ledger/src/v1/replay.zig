@@ -110,6 +110,20 @@ const IgnoreRecords = struct {
     pub fn observe(_: *@This(), _: std.json.Value) !void {}
 };
 
+fn notifyObserver(
+    observer: anytype,
+    value: std.json.Value,
+    raw: []const u8,
+    replay_state: ?*const protocol.ReplayState,
+) !void {
+    const Observer = @TypeOf(observer.*);
+    if (@hasDecl(Observer, "observeReplay")) {
+        try observer.observeReplay(value, raw, replay_state);
+    } else {
+        try observer.observe(value);
+    }
+}
+
 pub fn validateSlot(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
@@ -647,7 +661,12 @@ fn validateEventInput(
                 parameters,
             );
         }
-        try observer.observe(parsed.value);
+        try notifyObserver(
+            observer,
+            parsed.value,
+            bytes,
+            if (protocol_state.*) |*state| state else null,
+        );
         return;
     }
     var execution = try validation.execute(
@@ -682,9 +701,14 @@ fn validateEventInput(
             event,
             parameters,
         );
-        try observer.observe(event);
+        try notifyObserver(
+            observer,
+            event,
+            bytes,
+            if (protocol_state.*) |*state| state else null,
+        );
     } else if (execution.inputJson(resolved.effect.input_index)) |event| {
-        try observer.observe(event);
+        try notifyObserver(observer, event, bytes, null);
     }
 }
 

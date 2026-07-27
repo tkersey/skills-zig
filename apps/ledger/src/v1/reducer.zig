@@ -107,6 +107,13 @@ const ProjectionField = struct {
     kind: ProjectionFieldKind,
 };
 
+pub const EntryView = struct {
+    key: []const u8,
+    state: []const u8,
+    retained: ?[]const u8,
+    event_count: usize,
+};
+
 pub const State = struct {
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
     retained_bytes: usize = 0,
@@ -120,6 +127,38 @@ pub const State = struct {
 
     pub fn count(self: *const State) usize {
         return self.entries.count();
+    }
+
+    pub fn get(self: *const State, key: []const u8) ?EntryView {
+        var key_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
+        const entry = self.entries.getPtr(key_digest) orelse return null;
+        if (!std.mem.eql(u8, entry.key(), key)) return null;
+        return .{
+            .key = entry.key(),
+            .state = entry.state(),
+            .retained = entry.retained,
+            .event_count = entry.event_count,
+        };
+    }
+
+    pub fn sortedViewsAlloc(
+        self: *State,
+        allocator: std.mem.Allocator,
+    ) ![]EntryView {
+        const views = try allocator.alloc(EntryView, self.entries.count());
+        var iterator = self.entries.valueIterator();
+        var index: usize = 0;
+        while (iterator.next()) |entry| : (index += 1) {
+            views[index] = .{
+                .key = entry.key(),
+                .state = entry.state(),
+                .retained = entry.retained,
+                .event_count = entry.event_count,
+            };
+        }
+        std.mem.sort(EntryView, views, {}, entryViewLessThan);
+        return views;
     }
 
     pub fn writeCanonicalRows(
@@ -168,14 +207,8 @@ pub const State = struct {
                 return error.ReducerProjectionFieldsConflict;
             }
         }
-        const values = try allocator.alloc(*const Entry, self.entries.count());
+        const values = try self.sortedViewsAlloc(allocator);
         defer allocator.free(values);
-        var iterator = self.entries.valueIterator();
-        var index: usize = 0;
-        while (iterator.next()) |entry| : (index += 1) {
-            values[index] = entry;
-        }
-        std.mem.sort(*const Entry, values, {}, entryLessThan);
         const emitted = @min(limit, values.len);
         try output.writer.writeByte('[');
         for (values[0..emitted], 0..) |entry, row_index| {
@@ -188,12 +221,12 @@ pub const State = struct {
                     .key => try definition_core.canonical_json
                         .writeCanonicalString(
                         &output.writer,
-                        entry.key(),
+                        entry.key,
                     ),
                     .state => try definition_core.canonical_json
                         .writeCanonicalString(
                         &output.writer,
-                        entry.state(),
+                        entry.state,
                     ),
                     .retained => try output.writer.writeAll(
                         entry.retained orelse
@@ -920,8 +953,8 @@ fn stringLessThan(_: void, left: []u8, right: []u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
 
-fn entryLessThan(_: void, left: *const Entry, right: *const Entry) bool {
-    return std.mem.lessThan(u8, left.key(), right.key());
+fn entryViewLessThan(_: void, left: EntryView, right: EntryView) bool {
+    return std.mem.lessThan(u8, left.key, right.key);
 }
 
 fn projectionFieldLessThan(

@@ -5,6 +5,7 @@ const definition = @import("definition.zig");
 const projection_value = @import("projection_value.zig");
 const protocol = @import("protocol.zig");
 const ranked_relevance = @import("ranked_relevance.zig");
+const reducer = @import("reducer.zig");
 const replay = @import("replay.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
@@ -146,18 +147,348 @@ const PreparedRelevance = union(enum) {
     }
 };
 
+const max_fold_digest_fragments: usize = 32;
+const max_fold_digest_literal_bytes: usize = 4096;
+const max_fold_event_kind_counts: usize = 32;
+
+const FoldDigestSource = enum {
+    previous_event_chain,
+    event_bytes,
+    key,
+    state,
+    retained,
+    event_chain,
+};
+
+const FoldDigestFragment = union(enum) {
+    literal: []u8,
+    source: FoldDigestSource,
+    retained_text: definition_core.json_pointer.Pointer,
+
+    fn deinit(
+        self: *FoldDigestFragment,
+        allocator: std.mem.Allocator,
+    ) void {
+        switch (self.*) {
+            .literal => |bytes| allocator.free(bytes),
+            .retained_text => |*pointer| pointer.deinit(allocator),
+            .source => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const FoldDigest = struct {
+    fragments: []FoldDigestFragment,
+
+    fn deinit(self: *FoldDigest, allocator: std.mem.Allocator) void {
+        for (self.fragments) |*fragment| fragment.deinit(allocator);
+        allocator.free(self.fragments);
+        self.* = undefined;
+    }
+};
+
+const FoldEventKindCount = struct {
+    kind: []u8,
+    field: []u8,
+
+    fn deinit(
+        self: *FoldEventKindCount,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.kind);
+        allocator.free(self.field);
+        self.* = undefined;
+    }
+};
+
+const FoldEventChain = struct {
+    field: []u8,
+    digest: FoldDigest,
+
+    fn deinit(self: *FoldEventChain, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        self.digest.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const FoldSnapshot = struct {
+    field: []u8,
+    prior_field: []u8,
+    prior_on: [][]u8,
+    digest: FoldDigest,
+
+    fn deinit(self: *FoldSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        allocator.free(self.prior_field);
+        for (self.prior_on) |kind| allocator.free(kind);
+        allocator.free(self.prior_on);
+        self.digest.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const KeyedHistory = struct {
+    event_kind_counts: []FoldEventKindCount,
+    event_chain: ?FoldEventChain,
+    snapshot: ?FoldSnapshot,
+
+    fn deinit(self: *KeyedHistory, allocator: std.mem.Allocator) void {
+        for (self.event_kind_counts) |*count| count.deinit(allocator);
+        allocator.free(self.event_kind_counts);
+        if (self.event_chain) |*chain| chain.deinit(allocator);
+        if (self.snapshot) |*snapshot| snapshot.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn active(self: *const KeyedHistory) bool {
+        return self.event_kind_counts.len != 0 or
+            self.event_chain != null or
+            self.snapshot != null;
+    }
+};
+
 const KeyedFold = struct {
     key_field: []u8,
     state_field: []u8,
     retained_field: ?[]u8,
     event_count_field: ?[]u8,
+    history: KeyedHistory,
 
     fn deinit(self: *KeyedFold, allocator: std.mem.Allocator) void {
         allocator.free(self.key_field);
         allocator.free(self.state_field);
         if (self.retained_field) |field| allocator.free(field);
         if (self.event_count_field) |field| allocator.free(field);
+        self.history.deinit(allocator);
         self.* = undefined;
+    }
+};
+
+const FoldHistoryEntry = struct {
+    key_bytes: [256]u8 = undefined,
+    key_len: u16,
+    event_kind_counts: [max_fold_event_kind_counts]usize =
+        [_]usize{0} ** max_fold_event_kind_counts,
+    event_chain: [64]u8 = undefined,
+    has_event_chain: bool = false,
+    snapshot: [64]u8 = undefined,
+    has_snapshot: bool = false,
+    prior_snapshot: [64]u8 = undefined,
+    has_prior_snapshot: bool = false,
+    retained_text: []?[]u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        keyed: *const KeyedFold,
+        view: reducer.EntryView,
+    ) !FoldHistoryEntry {
+        if (view.key.len == 0 or view.key.len > 256) {
+            return error.FoldHistoryKeyBoundsExceeded;
+        }
+        const fragment_count = if (keyed.history.snapshot) |snapshot|
+            snapshot.digest.fragments.len
+        else
+            0;
+        const retained_text = try allocator.alloc(?[]u8, fragment_count);
+        @memset(retained_text, null);
+        errdefer {
+            for (retained_text) |value| {
+                if (value) |bytes| allocator.free(bytes);
+            }
+            allocator.free(retained_text);
+        }
+        if (keyed.history.snapshot) |snapshot| {
+            var needs_retained = false;
+            for (snapshot.digest.fragments) |fragment| {
+                if (fragment == .retained_text) {
+                    needs_retained = true;
+                    break;
+                }
+            }
+            if (needs_retained) {
+                const retained = view.retained orelse
+                    return error.FoldHistoryRetainedValueMissing;
+                var parsed = try std.json.parseFromSlice(
+                    std.json.Value,
+                    allocator,
+                    retained,
+                    .{ .duplicate_field_behavior = .@"error" },
+                );
+                defer parsed.deinit();
+                for (snapshot.digest.fragments, 0..) |fragment, index| {
+                    if (fragment != .retained_text) continue;
+                    const selected = definition_core.json_pointer.lookup(
+                        parsed.value,
+                        fragment.retained_text,
+                    ) orelse return error.FoldHistoryRetainedValueMissing;
+                    retained_text[index] = try allocator.dupe(
+                        u8,
+                        try definition_core.json.string(selected),
+                    );
+                }
+            }
+        }
+        var result: FoldHistoryEntry = .{
+            .key_len = @intCast(view.key.len),
+            .retained_text = retained_text,
+        };
+        @memcpy(result.key_bytes[0..view.key.len], view.key);
+        return result;
+    }
+
+    fn deinit(
+        self: *FoldHistoryEntry,
+        allocator: std.mem.Allocator,
+    ) void {
+        for (self.retained_text) |value| {
+            if (value) |bytes| allocator.free(bytes);
+        }
+        allocator.free(self.retained_text);
+        self.* = undefined;
+    }
+
+    fn key(self: *const FoldHistoryEntry) []const u8 {
+        return self.key_bytes[0..self.key_len];
+    }
+};
+
+const FoldHistoryAccumulator = struct {
+    allocator: std.mem.Allocator,
+    keyed: *const KeyedFold,
+    reducer_plan: *const reducer.Plan,
+    entries: std.AutoHashMapUnmanaged([32]u8, FoldHistoryEntry) = .empty,
+    records_seen: usize = 0,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        keyed: *const KeyedFold,
+        reducer_plan: *const reducer.Plan,
+    ) FoldHistoryAccumulator {
+        return .{
+            .allocator = allocator,
+            .keyed = keyed,
+            .reducer_plan = reducer_plan,
+        };
+    }
+
+    fn deinit(self: *FoldHistoryAccumulator) void {
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| {
+            entry.deinit(self.allocator);
+        }
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn observeReplay(
+        self: *FoldHistoryAccumulator,
+        event: std.json.Value,
+        raw: []const u8,
+        replay_state: ?*const protocol.ReplayState,
+    ) !void {
+        const state = replay_state orelse
+            return error.FoldHistoryReplayStateMissing;
+        const key = try definition_core.json.string(
+            definition_core.json_pointer.lookup(
+                event,
+                self.reducer_plan.key,
+            ) orelse return error.FoldHistoryKeyMissing,
+        );
+        const event_kind_pointer = self.reducer_plan.event_kind orelse
+            return error.FoldHistoryEventKindMissing;
+        const event_kind = try definition_core.json.string(
+            definition_core.json_pointer.lookup(
+                event,
+                event_kind_pointer,
+            ) orelse return error.FoldHistoryEventKindMissing,
+        );
+        const view = state.reducer_state.get(key) orelse
+            return error.FoldHistoryReducerStateMissing;
+        var key_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
+        var entry = self.entries.getPtr(key_digest);
+        if (entry) |existing| {
+            if (!std.mem.eql(u8, existing.key(), key)) {
+                return error.FoldHistoryKeyDigestCollision;
+            }
+        } else {
+            var initialized = try FoldHistoryEntry.init(
+                self.allocator,
+                self.keyed,
+                view,
+            );
+            var owned = true;
+            defer if (owned) initialized.deinit(self.allocator);
+            const result = try self.entries.getOrPut(
+                self.allocator,
+                key_digest,
+            );
+            if (result.found_existing) {
+                return error.FoldHistoryKeyDigestCollision;
+            }
+            result.value_ptr.* = initialized;
+            owned = false;
+            entry = result.value_ptr;
+        }
+        const history_entry = entry.?;
+        if (self.keyed.history.snapshot) |snapshot| {
+            if (containsSortedBytes(snapshot.prior_on, event_kind)) {
+                if (!history_entry.has_snapshot) {
+                    return error.FoldHistoryPriorSnapshotMissing;
+                }
+                @memcpy(
+                    &history_entry.prior_snapshot,
+                    &history_entry.snapshot,
+                );
+                history_entry.has_prior_snapshot = true;
+            }
+        }
+        for (
+            self.keyed.history.event_kind_counts,
+            0..,
+        ) |count, index| {
+            if (std.mem.eql(u8, count.kind, event_kind)) {
+                if (history_entry.event_kind_counts[index] ==
+                    std.math.maxInt(usize))
+                {
+                    return error.FoldHistoryEventCountOverflow;
+                }
+                history_entry.event_kind_counts[index] += 1;
+            }
+        }
+        if (self.keyed.history.event_chain) |chain| {
+            history_entry.event_chain = digestFoldEventChain(
+                chain.digest,
+                history_entry,
+                raw,
+            );
+            history_entry.has_event_chain = true;
+        }
+        if (self.keyed.history.snapshot) |snapshot| {
+            history_entry.snapshot = try digestFoldSnapshot(
+                snapshot.digest,
+                history_entry,
+                view,
+            );
+            history_entry.has_snapshot = true;
+        }
+        if (self.records_seen == std.math.maxInt(usize)) {
+            return error.FoldHistoryRecordCountOverflow;
+        }
+        self.records_seen += 1;
+    }
+
+    fn get(
+        self: *const FoldHistoryAccumulator,
+        key: []const u8,
+    ) ?*const FoldHistoryEntry {
+        var key_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
+        const entry = self.entries.getPtr(key_digest) orelse return null;
+        if (!std.mem.eql(u8, entry.key(), key)) return null;
+        return entry;
     }
 };
 
@@ -581,7 +912,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(9);
+    try encoder.writeU16(10);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
@@ -673,6 +1004,7 @@ pub fn encodeCache(
                     try encoder.writeBytes(keyed.state_field);
                     try encoder.writeOptionalBytes(keyed.retained_field);
                     try encoder.writeOptionalBytes(keyed.event_count_field);
+                    try encodeKeyedHistory(&keyed.history, encoder);
                 },
                 .retained => |retained| {
                     try encoder.writeByte(1);
@@ -704,7 +1036,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 9) {
+    if (try decoder.readU16() != 10) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const max_records = try decoder.readUsize();
@@ -795,6 +1127,13 @@ pub fn validateCachePlan(
                         keyed.state_field,
                         keyed.retained_field,
                         keyed.event_count_field,
+                        &keyed.history,
+                        error.CacheProjectionPlanMismatch,
+                    );
+                    try validateKeyedHistory(
+                        &keyed.history,
+                        definition_plan,
+                        event_protocol.?,
                         error.CacheProjectionPlanMismatch,
                     );
                 },
@@ -1176,11 +1515,14 @@ fn decodeCacheProjection(
                 const event_count_field =
                     try decoder.readOptionalBytesAlloc(allocator, 128);
                 errdefer if (event_count_field) |field| allocator.free(field);
+                var history = try decodeKeyedHistory(allocator, decoder);
+                errdefer history.deinit(allocator);
                 try validateKeyedFoldFields(
                     key_field,
                     state_field,
                     retained_field,
                     event_count_field,
+                    &history,
                     error.CacheProjectionFieldsConflict,
                 );
                 break :keyed .{ .keyed = .{
@@ -1188,6 +1530,7 @@ fn decodeCacheProjection(
                     .state_field = state_field,
                     .retained_field = retained_field,
                     .event_count_field = event_count_field,
+                    .history = history,
                 } };
             },
             1 => retained: {
@@ -1523,6 +1866,9 @@ fn compileProjection(
                             "state_field",
                             "retained_field",
                             "event_count_field",
+                            "event_kind_counts",
+                            "event_chain",
+                            "snapshot",
                         },
                     );
                     try definition_core.json.requireFields(
@@ -1568,6 +1914,7 @@ fn compileProjection(
                         state_field,
                         retained_field,
                         event_count_field,
+                        null,
                         error.ProjectionFieldsConflict,
                     );
                     if (retained_field != null and
@@ -1575,6 +1922,21 @@ fn compileProjection(
                     {
                         return error.FoldRetainedFieldRequiresRetainedValue;
                     }
+                    var history = try compileKeyedHistory(
+                        allocator,
+                        definition_plan,
+                        event_protocol.?,
+                        step,
+                    );
+                    errdefer history.deinit(allocator);
+                    try validateKeyedFoldFields(
+                        key_field,
+                        state_field,
+                        retained_field,
+                        event_count_field,
+                        &history,
+                        error.ProjectionFieldsConflict,
+                    );
                     fold = fold: {
                         const owned_key =
                             try allocator.dupe(u8, key_field);
@@ -1586,6 +1948,7 @@ fn compileProjection(
                             .state_field = owned_state,
                             .retained_field = retained_field,
                             .event_count_field = event_count_field,
+                            .history = history,
                         } };
                     };
                 }
@@ -1903,14 +2266,730 @@ fn compileOptionalFieldName(
     return try allocator.dupe(u8, name);
 }
 
+const FoldDigestContext = enum {
+    event_chain,
+    snapshot,
+};
+
+fn compileKeyedHistory(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: *const protocol.Plan,
+    step: std.json.ObjectMap,
+) !KeyedHistory {
+    const event_kind_counts =
+        if (step.get("event_kind_counts")) |raw|
+            try compileFoldEventKindCounts(
+                allocator,
+                event_protocol,
+                raw,
+            )
+        else
+            try allocator.alloc(FoldEventKindCount, 0);
+    errdefer {
+        for (event_kind_counts) |*count| count.deinit(allocator);
+        allocator.free(event_kind_counts);
+    }
+    var event_chain = if (step.get("event_chain")) |raw| blk: {
+        if (!definition_plan.requires(.sha256)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        break :blk try compileFoldEventChain(allocator, raw);
+    } else null;
+    errdefer if (event_chain) |*chain| chain.deinit(allocator);
+    var snapshot = if (step.get("snapshot")) |raw| blk: {
+        if (!definition_plan.requires(.sha256)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        break :blk try compileFoldSnapshot(
+            allocator,
+            event_protocol,
+            raw,
+        );
+    } else null;
+    errdefer if (snapshot) |*compiled| compiled.deinit(allocator);
+    if (snapshot != null and event_chain == null) {
+        return error.FoldSnapshotRequiresEventChain;
+    }
+    const result: KeyedHistory = .{
+        .event_kind_counts = event_kind_counts,
+        .event_chain = event_chain,
+        .snapshot = snapshot,
+    };
+    if (result.active()) {
+        const reducer_plan = event_protocol.reducer_plan orelse
+            return error.FoldHistoryRequiresKeyedReducer;
+        if (reducer_plan.event_kind == null) {
+            return error.FoldHistoryRequiresEventKind;
+        }
+    }
+    return result;
+}
+
+fn compileFoldEventKindCounts(
+    allocator: std.mem.Allocator,
+    event_protocol: *const protocol.Plan,
+    raw: std.json.Value,
+) ![]FoldEventKindCount {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or
+        values.items.len > max_fold_event_kind_counts)
+    {
+        return error.InvalidFoldEventKindCounts;
+    }
+    const counts = try allocator.alloc(
+        FoldEventKindCount,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (counts[0..initialized]) |*count| count.deinit(allocator);
+        allocator.free(counts);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "kind", "field" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "kind", "field" },
+        );
+        const kind = try definition_core.json.requiredString(
+            object,
+            "kind",
+        );
+        if (!containsEventKind(event_protocol.event_kinds, kind)) {
+            return error.UnknownFoldEventKind;
+        }
+        const field = try definition_core.json.requiredString(
+            object,
+            "field",
+        );
+        try definition_core.json.safeIdentifier(field, 128);
+        const owned_kind = try allocator.dupe(u8, kind);
+        errdefer allocator.free(owned_kind);
+        const owned_field = try allocator.dupe(u8, field);
+        errdefer allocator.free(owned_field);
+        counts[index] = .{
+            .kind = owned_kind,
+            .field = owned_field,
+        };
+        initialized += 1;
+    }
+    std.mem.sort(FoldEventKindCount, counts, {}, struct {
+        fn lessThan(
+            _: void,
+            left: FoldEventKindCount,
+            right: FoldEventKindCount,
+        ) bool {
+            return std.mem.lessThan(u8, left.kind, right.kind);
+        }
+    }.lessThan);
+    for (counts[1..], 1..) |count, index| {
+        if (std.mem.eql(u8, counts[index - 1].kind, count.kind)) {
+            return error.DuplicateFoldEventKind;
+        }
+    }
+    return counts;
+}
+
+fn compileFoldEventChain(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !FoldEventChain {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "field", "fragments" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "field", "fragments" },
+    );
+    const field = try definition_core.json.requiredString(object, "field");
+    try definition_core.json.safeIdentifier(field, 128);
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    return .{
+        .field = owned_field,
+        .digest = try compileFoldDigest(
+            allocator,
+            try definition_core.json.field(object, "fragments"),
+            .event_chain,
+        ),
+    };
+}
+
+fn compileFoldSnapshot(
+    allocator: std.mem.Allocator,
+    event_protocol: *const protocol.Plan,
+    raw: std.json.Value,
+) !FoldSnapshot {
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "field", "prior_field", "prior_on", "fragments" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "field", "prior_field", "prior_on", "fragments" },
+    );
+    const field = try definition_core.json.requiredString(object, "field");
+    const prior_field = try definition_core.json.requiredString(
+        object,
+        "prior_field",
+    );
+    try definition_core.json.safeIdentifier(field, 128);
+    try definition_core.json.safeIdentifier(prior_field, 128);
+    if (std.mem.eql(u8, field, prior_field)) {
+        return error.ProjectionFieldsConflict;
+    }
+    const owned_field = try allocator.dupe(u8, field);
+    errdefer allocator.free(owned_field);
+    const owned_prior_field = try allocator.dupe(u8, prior_field);
+    errdefer allocator.free(owned_prior_field);
+    const prior_on = try compileFoldEventKindSet(
+        allocator,
+        event_protocol,
+        try definition_core.json.field(object, "prior_on"),
+    );
+    errdefer {
+        for (prior_on) |kind| allocator.free(kind);
+        allocator.free(prior_on);
+    }
+    return .{
+        .field = owned_field,
+        .prior_field = owned_prior_field,
+        .prior_on = prior_on,
+        .digest = try compileFoldDigest(
+            allocator,
+            try definition_core.json.field(object, "fragments"),
+            .snapshot,
+        ),
+    };
+}
+
+fn compileFoldEventKindSet(
+    allocator: std.mem.Allocator,
+    event_protocol: *const protocol.Plan,
+    raw: std.json.Value,
+) ![][]u8 {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or
+        values.items.len > max_fold_event_kind_counts)
+    {
+        return error.InvalidFoldEventKindSet;
+    }
+    const result = try allocator.alloc([]u8, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |value| allocator.free(value);
+        allocator.free(result);
+    }
+    for (values.items, 0..) |value, index| {
+        const kind = try definition_core.json.string(value);
+        if (!containsEventKind(event_protocol.event_kinds, kind)) {
+            return error.UnknownFoldEventKind;
+        }
+        result[index] = try allocator.dupe(u8, kind);
+        initialized += 1;
+    }
+    std.mem.sort([]u8, result, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    for (result[1..], 1..) |value, index| {
+        if (std.mem.eql(u8, result[index - 1], value)) {
+            return error.DuplicateFoldEventKind;
+        }
+    }
+    return result;
+}
+
+fn compileFoldDigest(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    context: FoldDigestContext,
+) !FoldDigest {
+    const values = try definition_core.json.array(raw);
+    if (values.items.len == 0 or
+        values.items.len > max_fold_digest_fragments)
+    {
+        return error.InvalidFoldDigestFragments;
+    }
+    const fragments = try allocator.alloc(
+        FoldDigestFragment,
+        values.items.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| {
+            fragment.deinit(allocator);
+        }
+        allocator.free(fragments);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "literal", "source", "retained_text" },
+        );
+        const source_count =
+            @as(usize, @intFromBool(object.get("literal") != null)) +
+            @as(usize, @intFromBool(object.get("source") != null)) +
+            @as(usize, @intFromBool(object.get("retained_text") != null));
+        if (source_count != 1) return error.InvalidFoldDigestFragment;
+        if (object.get("literal")) |literal_value| {
+            const literal = try definition_core.json.string(literal_value);
+            if (literal.len > max_fold_digest_literal_bytes or
+                !std.unicode.utf8ValidateSlice(literal))
+            {
+                return error.InvalidFoldDigestLiteral;
+            }
+            fragments[index] = .{
+                .literal = try allocator.dupe(u8, literal),
+            };
+        } else if (object.get("source")) |source_value| {
+            const source = try parseFoldDigestSource(
+                try definition_core.json.string(source_value),
+            );
+            if (!foldDigestSourceAllowed(context, source)) {
+                return error.FoldDigestSourceNotAllowed;
+            }
+            fragments[index] = .{ .source = source };
+        } else {
+            if (context != .snapshot) {
+                return error.FoldDigestSourceNotAllowed;
+            }
+            fragments[index] = .{
+                .retained_text = try definition_core.json_pointer.compile(
+                    allocator,
+                    try definition_core.json.string(
+                        object.get("retained_text").?,
+                    ),
+                ),
+            };
+        }
+        initialized += 1;
+    }
+    return .{ .fragments = fragments };
+}
+
+fn parseFoldDigestSource(raw: []const u8) !FoldDigestSource {
+    if (std.mem.eql(u8, raw, "previous-event-chain")) {
+        return .previous_event_chain;
+    }
+    if (std.mem.eql(u8, raw, "event-bytes")) return .event_bytes;
+    if (std.mem.eql(u8, raw, "key")) return .key;
+    if (std.mem.eql(u8, raw, "state")) return .state;
+    if (std.mem.eql(u8, raw, "retained")) return .retained;
+    if (std.mem.eql(u8, raw, "event-chain")) return .event_chain;
+    return error.UnknownFoldDigestSource;
+}
+
+fn foldDigestSourceAllowed(
+    context: FoldDigestContext,
+    source: FoldDigestSource,
+) bool {
+    return switch (context) {
+        .event_chain => source == .previous_event_chain or
+            source == .event_bytes,
+        .snapshot => source == .key or source == .state or
+            source == .retained or source == .event_chain,
+    };
+}
+
+fn containsEventKind(
+    kinds: []const []u8,
+    expected: []const u8,
+) bool {
+    for (kinds) |kind| {
+        if (std.mem.eql(u8, kind, expected)) return true;
+    }
+    return false;
+}
+
+fn containsSortedBytes(
+    values: []const []u8,
+    expected: []const u8,
+) bool {
+    var low: usize = 0;
+    var high = values.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        switch (std.mem.order(u8, values[middle], expected)) {
+            .lt => low = middle + 1,
+            .gt => high = middle,
+            .eq => return true,
+        }
+    }
+    return false;
+}
+
+fn digestFoldEventChain(
+    digest: FoldDigest,
+    entry: *const FoldHistoryEntry,
+    raw: []const u8,
+) [64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (digest.fragments) |fragment| switch (fragment) {
+        .literal => |literal| hasher.update(literal),
+        .source => |source| switch (source) {
+            .previous_event_chain => if (entry.has_event_chain) {
+                hasher.update(&entry.event_chain);
+            },
+            .event_bytes => hasher.update(raw),
+            else => unreachable,
+        },
+        .retained_text => unreachable,
+    };
+    var bytes: [32]u8 = undefined;
+    hasher.final(&bytes);
+    return std.fmt.bytesToHex(bytes, .lower);
+}
+
+fn digestFoldSnapshot(
+    digest: FoldDigest,
+    entry: *const FoldHistoryEntry,
+    view: reducer.EntryView,
+) ![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (digest.fragments, 0..) |fragment, index| switch (fragment) {
+        .literal => |literal| hasher.update(literal),
+        .source => |source| switch (source) {
+            .key => hasher.update(view.key),
+            .state => hasher.update(view.state),
+            .retained => hasher.update(
+                view.retained orelse
+                    return error.FoldHistoryRetainedValueMissing,
+            ),
+            .event_chain => {
+                if (!entry.has_event_chain) {
+                    return error.FoldHistoryEventChainMissing;
+                }
+                hasher.update(&entry.event_chain);
+            },
+            else => unreachable,
+        },
+        .retained_text => {
+            hasher.update(
+                entry.retained_text[index] orelse
+                    return error.FoldHistoryRetainedValueMissing,
+            );
+        },
+    };
+    var bytes: [32]u8 = undefined;
+    hasher.final(&bytes);
+    return std.fmt.bytesToHex(bytes, .lower);
+}
+
+fn encodeKeyedHistory(
+    history: *const KeyedHistory,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(history.event_kind_counts.len);
+    for (history.event_kind_counts) |count| {
+        try encoder.writeBytes(count.kind);
+        try encoder.writeBytes(count.field);
+    }
+    try encoder.writeBool(history.event_chain != null);
+    if (history.event_chain) |chain| {
+        try encoder.writeBytes(chain.field);
+        try encodeFoldDigest(chain.digest, encoder);
+    }
+    try encoder.writeBool(history.snapshot != null);
+    if (history.snapshot) |snapshot| {
+        try encoder.writeBytes(snapshot.field);
+        try encoder.writeBytes(snapshot.prior_field);
+        try encoder.writeCount(snapshot.prior_on.len);
+        for (snapshot.prior_on) |kind| try encoder.writeBytes(kind);
+        try encodeFoldDigest(snapshot.digest, encoder);
+    }
+}
+
+fn encodeFoldDigest(
+    digest: FoldDigest,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeCount(digest.fragments.len);
+    for (digest.fragments) |fragment| switch (fragment) {
+        .literal => |literal| {
+            try encoder.writeByte(0);
+            try encoder.writeBytes(literal);
+        },
+        .source => |source| {
+            try encoder.writeByte(1);
+            try encoder.writeEnum(source);
+        },
+        .retained_text => |pointer| {
+            try encoder.writeByte(2);
+            try encoder.writeBytes(pointer.raw);
+        },
+    };
+}
+
+fn decodeKeyedHistory(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !KeyedHistory {
+    const count = try decoder.readCount(max_fold_event_kind_counts);
+    const event_kind_counts = try allocator.alloc(
+        FoldEventKindCount,
+        count,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (event_kind_counts[0..initialized]) |*item| {
+            item.deinit(allocator);
+        }
+        allocator.free(event_kind_counts);
+    }
+    for (event_kind_counts, 0..) |*item, index| {
+        const kind = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(kind);
+        try definition_core.json.safeIdentifier(kind, 128);
+        if (index != 0 and std.mem.order(
+            u8,
+            event_kind_counts[index - 1].kind,
+            kind,
+        ) != .lt) {
+            return error.CacheFoldEventKindsNotSorted;
+        }
+        const field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(field);
+        try definition_core.json.safeIdentifier(field, 128);
+        item.* = .{ .kind = kind, .field = field };
+        initialized += 1;
+    }
+    var event_chain = if (try decoder.readBool()) chain: {
+        const field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(field);
+        try definition_core.json.safeIdentifier(field, 128);
+        break :chain FoldEventChain{
+            .field = field,
+            .digest = try decodeFoldDigest(
+                allocator,
+                decoder,
+                .event_chain,
+            ),
+        };
+    } else null;
+    errdefer if (event_chain) |*chain| chain.deinit(allocator);
+    var snapshot = if (try decoder.readBool()) snapshot: {
+        const field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(field);
+        try definition_core.json.safeIdentifier(field, 128);
+        const prior_field = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(prior_field);
+        try definition_core.json.safeIdentifier(prior_field, 128);
+        if (std.mem.eql(u8, field, prior_field)) {
+            return error.CacheProjectionFieldsConflict;
+        }
+        const prior_count =
+            try decoder.readCount(max_fold_event_kind_counts);
+        if (prior_count == 0) return error.CacheFoldPriorKindsInvalid;
+        const prior_on = try allocator.alloc([]u8, prior_count);
+        var prior_initialized: usize = 0;
+        errdefer {
+            for (prior_on[0..prior_initialized]) |kind| {
+                allocator.free(kind);
+            }
+            allocator.free(prior_on);
+        }
+        for (prior_on, 0..) |*kind, index| {
+            kind.* = try decoder.readBytesAlloc(allocator, 128);
+            prior_initialized += 1;
+            try definition_core.json.safeIdentifier(kind.*, 128);
+            if (index != 0 and std.mem.order(
+                u8,
+                prior_on[index - 1],
+                kind.*,
+            ) != .lt) {
+                return error.CacheFoldPriorKindsNotSorted;
+            }
+        }
+        break :snapshot FoldSnapshot{
+            .field = field,
+            .prior_field = prior_field,
+            .prior_on = prior_on,
+            .digest = try decodeFoldDigest(
+                allocator,
+                decoder,
+                .snapshot,
+            ),
+        };
+    } else null;
+    errdefer if (snapshot) |*compiled| compiled.deinit(allocator);
+    if (snapshot != null and event_chain == null) {
+        return error.CacheFoldSnapshotRequiresEventChain;
+    }
+    return .{
+        .event_kind_counts = event_kind_counts,
+        .event_chain = event_chain,
+        .snapshot = snapshot,
+    };
+}
+
+fn decodeFoldDigest(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    context: FoldDigestContext,
+) !FoldDigest {
+    const count = try decoder.readCount(max_fold_digest_fragments);
+    if (count == 0) return error.CacheFoldDigestFragmentsInvalid;
+    const fragments = try allocator.alloc(FoldDigestFragment, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (fragments[0..initialized]) |*fragment| {
+            fragment.deinit(allocator);
+        }
+        allocator.free(fragments);
+    }
+    for (fragments) |*fragment| {
+        fragment.* = switch (try decoder.readByte()) {
+            0 => literal: {
+                const literal = try decoder.readBytesAlloc(
+                    allocator,
+                    max_fold_digest_literal_bytes,
+                );
+                errdefer allocator.free(literal);
+                if (!std.unicode.utf8ValidateSlice(literal)) {
+                    return error.CacheFoldDigestLiteralInvalid;
+                }
+                break :literal .{ .literal = literal };
+            },
+            1 => source: {
+                const source = try decoder.readEnum(FoldDigestSource);
+                if (!foldDigestSourceAllowed(context, source)) {
+                    return error.CacheFoldDigestSourceInvalid;
+                }
+                break :source .{ .source = source };
+            },
+            2 => pointer: {
+                if (context != .snapshot) {
+                    return error.CacheFoldDigestSourceInvalid;
+                }
+                const raw = try decoder.readBytesAlloc(allocator, 1024);
+                defer allocator.free(raw);
+                break :pointer .{
+                    .retained_text = try definition_core.json_pointer.compile(
+                        allocator,
+                        raw,
+                    ),
+                };
+            },
+            else => return error.CacheFoldDigestFragmentInvalid,
+        };
+        initialized += 1;
+    }
+    return .{ .fragments = fragments };
+}
+
+fn validateKeyedHistory(
+    history: *const KeyedHistory,
+    definition_plan: *const definition.Plan,
+    event_protocol: *const protocol.Plan,
+    comptime invalid: anyerror,
+) !void {
+    if ((history.event_chain != null or history.snapshot != null) and
+        !definition_plan.requires(.sha256))
+    {
+        return invalid;
+    }
+    if (history.event_kind_counts.len > max_fold_event_kind_counts) {
+        return invalid;
+    }
+    for (history.event_kind_counts, 0..) |count, index| {
+        if (!containsEventKind(event_protocol.event_kinds, count.kind)) {
+            return invalid;
+        }
+        try definition_core.json.safeIdentifier(count.field, 128);
+        if (index != 0 and std.mem.order(
+            u8,
+            history.event_kind_counts[index - 1].kind,
+            count.kind,
+        ) != .lt) return invalid;
+    }
+    if (history.event_chain) |chain| {
+        try definition_core.json.safeIdentifier(chain.field, 128);
+        try validateFoldDigest(
+            chain.digest,
+            .event_chain,
+            invalid,
+        );
+    }
+    if (history.snapshot) |snapshot| {
+        if (history.event_chain == null or snapshot.prior_on.len == 0 or
+            snapshot.prior_on.len > max_fold_event_kind_counts)
+        {
+            return invalid;
+        }
+        try definition_core.json.safeIdentifier(snapshot.field, 128);
+        try definition_core.json.safeIdentifier(
+            snapshot.prior_field,
+            128,
+        );
+        if (std.mem.eql(u8, snapshot.field, snapshot.prior_field)) {
+            return invalid;
+        }
+        for (snapshot.prior_on, 0..) |kind, index| {
+            if (!containsEventKind(event_protocol.event_kinds, kind)) {
+                return invalid;
+            }
+            if (index != 0 and std.mem.order(
+                u8,
+                snapshot.prior_on[index - 1],
+                kind,
+            ) != .lt) return invalid;
+        }
+        try validateFoldDigest(snapshot.digest, .snapshot, invalid);
+    }
+}
+
+fn validateFoldDigest(
+    digest: FoldDigest,
+    context: FoldDigestContext,
+    comptime invalid: anyerror,
+) !void {
+    if (digest.fragments.len == 0 or
+        digest.fragments.len > max_fold_digest_fragments)
+    {
+        return invalid;
+    }
+    for (digest.fragments) |fragment| switch (fragment) {
+        .literal => |literal| {
+            if (literal.len > max_fold_digest_literal_bytes or
+                !std.unicode.utf8ValidateSlice(literal))
+            {
+                return invalid;
+            }
+        },
+        .source => |source| {
+            if (!foldDigestSourceAllowed(context, source)) return invalid;
+        },
+        .retained_text => |pointer| {
+            if (context != .snapshot or
+                pointer.raw.len > 1024)
+            {
+                return invalid;
+            }
+        },
+    };
+}
+
 fn validateKeyedFoldFields(
     key_field: []const u8,
     state_field: []const u8,
     retained_field: ?[]const u8,
     event_count_field: ?[]const u8,
+    history: ?*const KeyedHistory,
     comptime conflict: anyerror,
 ) !void {
-    var fields: [4][]const u8 = undefined;
+    var fields: [4 + max_fold_event_kind_counts + 3][]const u8 =
+        undefined;
     var count: usize = 0;
     fields[count] = key_field;
     count += 1;
@@ -1923,6 +3002,22 @@ fn validateKeyedFoldFields(
     if (event_count_field) |field| {
         fields[count] = field;
         count += 1;
+    }
+    if (history) |configured| {
+        for (configured.event_kind_counts) |item| {
+            fields[count] = item.field;
+            count += 1;
+        }
+        if (configured.event_chain) |chain| {
+            fields[count] = chain.field;
+            count += 1;
+        }
+        if (configured.snapshot) |snapshot| {
+            fields[count] = snapshot.field;
+            count += 1;
+            fields[count] = snapshot.prior_field;
+            count += 1;
+        }
     }
     for (fields[0..count], 0..) |field, index| {
         try definition_core.json.safeIdentifier(field, 128);
@@ -2184,9 +3279,39 @@ pub fn execute(
         else
             null;
     defer if (fused_sorted) |*accumulator| accumulator.deinit();
+    var fold_history: ?FoldHistoryAccumulator = null;
+    if (compiled.fold) |*fold| switch (fold.*) {
+        .keyed => |*keyed| if (keyed.history.active()) {
+            const event_plan = event_protocol orelse
+                return error.FoldReplayPlanMissing;
+            const reducer_plan = if (event_plan.reducer_plan) |*value|
+                value
+            else
+                return error.FoldReducerPlanMissing;
+            fold_history = FoldHistoryAccumulator.init(
+                allocator,
+                keyed,
+                reducer_plan,
+            );
+        },
+        .retained => {},
+    };
+    defer if (fold_history) |*accumulator| accumulator.deinit();
     const protocol_required = event_protocol != null and
         event_protocol.?.target_slot_index == compiled.slot_index;
-    var replay_stats = if (fused_sorted) |*accumulator|
+    var replay_stats = if (fold_history) |*accumulator|
+        try replay.validateSlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            accumulator,
+        )
+    else if (fused_sorted) |*accumulator|
         try replay.validateSlotObserved(
             allocator,
             repo_root,
@@ -2235,17 +3360,35 @@ pub fn execute(
             .keyed => |keyed| {
                 stats.records_matched =
                     replay_state.reducer_state.count();
-                stats.records_emitted =
-                    try replay_state.reducer_state.writeCanonicalRows(
+                stats.records_emitted = if (keyed.history.active()) history: {
+                    const accumulator = if (fold_history) |*value|
+                        value
+                    else
+                        return error.FoldHistoryAccumulatorMissing;
+                    if (accumulator.records_seen !=
+                        replay_stats.records_validated)
+                    {
+                        return error.FoldHistoryRecordCountMismatch;
+                    }
+                    break :history try writeKeyedHistoryRows(
                         allocator,
                         &output,
-                        keyed.key_field,
-                        keyed.state_field,
-                        keyed.retained_field,
-                        keyed.event_count_field,
+                        &replay_state.reducer_state,
+                        accumulator,
+                        &keyed,
                         effective_limit,
                         plan.max_output_bytes,
                     );
+                } else try replay_state.reducer_state.writeCanonicalRows(
+                    allocator,
+                    &output,
+                    keyed.key_field,
+                    keyed.state_field,
+                    keyed.retained_field,
+                    keyed.event_count_field,
+                    effective_limit,
+                    plan.max_output_bytes,
+                );
             },
             .retained => |retained| {
                 const retained_plan =
@@ -2351,6 +3494,168 @@ pub fn execute(
         .stats = stats,
         .limitations = limitations,
     };
+}
+
+const KeyedHistoryFieldSource = union(enum) {
+    key,
+    state,
+    retained,
+    event_count,
+    event_kind_count: usize,
+    event_chain,
+    snapshot,
+    prior_snapshot,
+};
+
+const KeyedHistoryField = struct {
+    name: []const u8,
+    source: KeyedHistoryFieldSource,
+};
+
+fn writeKeyedHistoryRows(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    reducer_state: *reducer.State,
+    accumulator: *const FoldHistoryAccumulator,
+    keyed: *const KeyedFold,
+    limit: usize,
+    max_output_bytes: usize,
+) !usize {
+    var field_storage: [4 + max_fold_event_kind_counts + 3]KeyedHistoryField = undefined;
+    var field_count: usize = 0;
+    field_storage[field_count] = .{
+        .name = keyed.key_field,
+        .source = .key,
+    };
+    field_count += 1;
+    field_storage[field_count] = .{
+        .name = keyed.state_field,
+        .source = .state,
+    };
+    field_count += 1;
+    if (keyed.retained_field) |name| {
+        field_storage[field_count] = .{
+            .name = name,
+            .source = .retained,
+        };
+        field_count += 1;
+    }
+    if (keyed.event_count_field) |name| {
+        field_storage[field_count] = .{
+            .name = name,
+            .source = .event_count,
+        };
+        field_count += 1;
+    }
+    for (
+        keyed.history.event_kind_counts,
+        0..,
+    ) |count, index| {
+        field_storage[field_count] = .{
+            .name = count.field,
+            .source = .{ .event_kind_count = index },
+        };
+        field_count += 1;
+    }
+    if (keyed.history.event_chain) |chain| {
+        field_storage[field_count] = .{
+            .name = chain.field,
+            .source = .event_chain,
+        };
+        field_count += 1;
+    }
+    if (keyed.history.snapshot) |snapshot| {
+        field_storage[field_count] = .{
+            .name = snapshot.field,
+            .source = .snapshot,
+        };
+        field_count += 1;
+        field_storage[field_count] = .{
+            .name = snapshot.prior_field,
+            .source = .prior_snapshot,
+        };
+        field_count += 1;
+    }
+    const fields = field_storage[0..field_count];
+    std.mem.sort(KeyedHistoryField, fields, {}, struct {
+        fn lessThan(
+            _: void,
+            left: KeyedHistoryField,
+            right: KeyedHistoryField,
+        ) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
+    const views = try reducer_state.sortedViewsAlloc(allocator);
+    defer allocator.free(views);
+    const emitted = @min(limit, views.len);
+    try output.writer.writeByte('[');
+    for (views[0..emitted], 0..) |view, row_index| {
+        if (row_index != 0) try output.writer.writeByte(',');
+        const history = accumulator.get(view.key) orelse
+            return error.FoldHistoryReducerStateMismatch;
+        try output.writer.writeByte('{');
+        for (fields, 0..) |field, field_index| {
+            if (field_index != 0) try output.writer.writeByte(',');
+            try definition_core.canonical_json.writeCanonicalString(
+                &output.writer,
+                field.name,
+            );
+            try output.writer.writeByte(':');
+            switch (field.source) {
+                .key => try definition_core.canonical_json
+                    .writeCanonicalString(&output.writer, view.key),
+                .state => try definition_core.canonical_json
+                    .writeCanonicalString(&output.writer, view.state),
+                .retained => try output.writer.writeAll(
+                    view.retained orelse
+                        return error.ReducerRetainedValueMissing,
+                ),
+                .event_count => try output.writer.print(
+                    "{d}",
+                    .{view.event_count},
+                ),
+                .event_kind_count => |index| try output.writer.print(
+                    "{d}",
+                    .{history.event_kind_counts[index]},
+                ),
+                .event_chain => {
+                    if (!history.has_event_chain) {
+                        return error.FoldHistoryEventChainMissing;
+                    }
+                    try definition_core.canonical_json.writeCanonicalString(
+                        &output.writer,
+                        &history.event_chain,
+                    );
+                },
+                .snapshot => {
+                    if (!history.has_snapshot) {
+                        return error.FoldHistorySnapshotMissing;
+                    }
+                    try definition_core.canonical_json.writeCanonicalString(
+                        &output.writer,
+                        &history.snapshot,
+                    );
+                },
+                .prior_snapshot => if (history.has_prior_snapshot)
+                    try definition_core.canonical_json.writeCanonicalString(
+                        &output.writer,
+                        &history.prior_snapshot,
+                    )
+                else
+                    try output.writer.writeAll("null"),
+            }
+        }
+        try output.writer.writeByte('}');
+        if (output.written().len > max_output_bytes) {
+            return error.ProjectionOutputBoundsExceeded;
+        }
+    }
+    try output.writer.writeByte(']');
+    if (output.written().len > max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
+    return emitted;
 }
 
 fn writeRetainedProjection(
@@ -3011,6 +4316,137 @@ test "projection plan round trips through the bounded cache codec" {
     try std.testing.expectEqual(
         plan.projections[0].fields.len,
         cached.projections[0].fields.len,
+    );
+}
+
+test "keyed fold history compiles once and preserves exact replay digests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/history","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["append-only-log","compare-and-append","event-kinds","fold","reducer","replay","sha256","transition-table"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[{"op":"append-only-log","input":"event"},{"op":"event-kinds","values":["capture","status"]},{"op":"reducer","key":"/id","on":"/status","event_kind":"/kind","retain_once":"/record"},{"op":"transition-table","states":["active","inactive"],"transitions":[{"from":null,"on":"active","to":"active"},{"from":"active","on":"inactive","to":"inactive"}]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{"current":{"slot":"events","pipeline":[{"op":"fold","key_field":"id","state_field":"status","retained_field":"record","event_count_field":"event_count","event_kind_counts":[{"kind":"capture","field":"capture_count"},{"kind":"status","field":"status_count"}],"event_chain":{"field":"chain","fragments":[{"literal":"generic-chain/v1\n"},{"source":"previous-event-chain"},{"literal":"\n"},{"source":"event-bytes"}]},"snapshot":{"field":"snapshot","prior_field":"prior_snapshot","prior_on":["status"],"fragments":[{"literal":"generic-snapshot/v1\n"},{"source":"key"},{"literal":"\n"},{"source":"state"},{"literal":"\n"},{"source":"retained"},{"literal":"\n"},{"retained_text":"/repository_id"},{"literal":"\n"},{"source":"event-chain"}]}}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var protocol_plan = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer protocol_plan.deinit(std.testing.allocator);
+    var plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+        &protocol_plan,
+    );
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    const projection_plan = cached.find("current").?;
+    const keyed = switch (projection_plan.fold.?) {
+        .keyed => |value| value,
+        .retained => return error.TestExpectedKeyedFold,
+    };
+    try std.testing.expect(keyed.history.active());
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        keyed.history.event_kind_counts.len,
+    );
+    const reducer_plan = &protocol_plan.reducer_plan.?;
+    var accumulator = FoldHistoryAccumulator.init(
+        std.testing.allocator,
+        &keyed,
+        reducer_plan,
+    );
+    defer accumulator.deinit();
+    var replay_state = protocol.ReplayState.init(&protocol_plan);
+    defer replay_state.deinit(std.testing.allocator);
+    const raw_events = [_][]const u8{
+        "{\"kind\":\"capture\",\"id\":\"case-a\",\"status\":\"active\",\"record\":{\"repository_id\":\"repo/example\",\"x\":1}}",
+        "{\"kind\":\"status\",\"id\":\"case-a\",\"status\":\"inactive\"}",
+    };
+    for (raw_events) |raw| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            raw,
+            .{ .duplicate_field_behavior = .@"error" },
+        );
+        defer parsed.deinit();
+        try protocol.applyValue(
+            std.testing.allocator,
+            &protocol_plan,
+            &replay_state,
+            parsed.value,
+        );
+        try accumulator.observeReplay(
+            parsed.value,
+            raw,
+            &replay_state,
+        );
+    }
+    const history = accumulator.get("case-a").?;
+    try std.testing.expectEqual(@as(usize, 1), history.event_kind_counts[0]);
+    try std.testing.expectEqual(@as(usize, 1), history.event_kind_counts[1]);
+    try std.testing.expectEqualStrings(
+        "cc525ecd681ac944bbf7de0baaedf9c2f206f1212b19770187a8cd54d26fb1a7",
+        &history.event_chain,
+    );
+    try std.testing.expectEqualStrings(
+        "8cb3c1bb975df1ad3b58df5846687dc0c28563dd834f8ab6420632190f21851a",
+        &history.prior_snapshot,
+    );
+    try std.testing.expectEqualStrings(
+        "5c7891af5a74353974cd09a86ec4eec7cba9b3e80aef802199947cb60c1632f7",
+        &history.snapshot,
+    );
+    var output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try writeKeyedHistoryRows(
+            std.testing.allocator,
+            &output,
+            &replay_state.reducer_state,
+            &accumulator,
+            &keyed,
+            4,
+            4096,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "[{\"capture_count\":1,\"chain\":\"cc525ecd681ac944bbf7de0baaedf9c2f206f1212b19770187a8cd54d26fb1a7\",\"event_count\":2,\"id\":\"case-a\",\"prior_snapshot\":\"8cb3c1bb975df1ad3b58df5846687dc0c28563dd834f8ab6420632190f21851a\",\"record\":{\"repository_id\":\"repo/example\",\"x\":1},\"snapshot\":\"5c7891af5a74353974cd09a86ec4eec7cba9b3e80aef802199947cb60c1632f7\",\"status\":\"inactive\",\"status_count\":1}]",
+        output.written(),
     );
 }
 
