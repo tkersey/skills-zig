@@ -395,6 +395,12 @@ if [[ -f codex/skills/memory-source-notes/definitions/ledger/synesthesia-memory-
     "$script_dir/check-memory-source-notes.sh"
 fi
 
+if [[ -f codex/skills/negative-ledger/definitions/ledger/negative-evidence-protocol.json ]]; then
+  DOTFILES_ROOT="$dotfiles_root" \
+    LEDGER_BIN="$ledger_bin" \
+    "$script_dir/check-negative-ledger-protocol.sh"
+fi
+
 printf \
   'definition conformance passed: manifests=%d seq=%d ledger=%d fixtures=%d materializations=%d transactions=%d contracts=%d\n' \
   "$manifest_count" \
