@@ -210,16 +210,9 @@ const ProtocolRules = struct {
     reducer: ?definition.Rule = null,
 };
 
-pub fn compile(
-    allocator: std.mem.Allocator,
+fn collectProtocolRules(
     definition_plan: *const definition.Plan,
-    storage_plan: *const storage.Plan,
-) !?Plan {
-    const present_mask = definition_plan.operator_mask & protocol_operator_mask;
-    if (present_mask == 0) return null;
-    if (definition_plan.storage_kind != .event_log) {
-        return error.ProtocolRequiresEventLogStorage;
-    }
+) !ProtocolRules {
     var rules: ProtocolRules = .{};
     for (definition_plan.rules) |rule| switch (rule.operator) {
         .append_only_log => try setRule(&rules.append_only_log, rule),
@@ -233,56 +226,147 @@ pub fn compile(
         .reducer => try setRule(&rules.reducer, rule),
         else => {},
     };
-    if (rules.append_only_log != null or
-        definition_plan.requires(.append_only_log))
-    {
-        return try compilePlain(
-            allocator,
-            definition_plan,
-            storage_plan,
-            rules,
-        );
-    }
+    return rules;
+}
+
+fn validateChainedRules(
+    definition_plan: *const definition.Plan,
+    rules: ProtocolRules,
+) !void {
     if ((definition_plan.operator_mask & chained_required_operator_mask) !=
         chained_required_operator_mask)
     {
         return error.IncompleteEventProtocolOperators;
     }
-    if (rules.envelope == null or
-        rules.sequence == null or
-        rules.previous_digest == null or
-        rules.body_digest == null or
-        rules.event_digest == null or
-        rules.event_kinds == null)
+    if (rules.envelope == null or rules.sequence == null or
+        rules.previous_digest == null or rules.body_digest == null or
+        rules.event_digest == null or rules.event_kinds == null)
     {
         return error.IncompleteEventProtocolRules;
     }
+}
 
+fn compileChainedMarkers(
+    allocator: std.mem.Allocator,
+    rules: ProtocolRules,
+) !void {
+    try compileMarkerRule(allocator, rules.body_digest.?, .body_digest);
+    try compileMarkerRule(allocator, rules.event_digest.?, .event_digest);
+}
+
+const ReducerPlans = struct {
+    keyed: ?reducer.Plan = null,
+    retained: ?state_reducer.Plan = null,
+
+    fn deinit(self: *ReducerPlans, allocator: std.mem.Allocator) void {
+        if (self.keyed) |*plan| plan.deinit(allocator);
+        if (self.retained) |*plan| plan.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn compileReducerPlans(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rules: ProtocolRules,
+    event_kinds: []const []u8,
+    mode: Mode,
+) !ReducerPlans {
+    const reducer_rule = rules.reducer orelse {
+        if (rules.transition_table != null or
+            definition_plan.requires(.transition_table) or
+            definition_plan.requires(.reducer))
+        {
+            return error.IncompleteReducerRules;
+        }
+        return .{};
+    };
+    if (!definition_plan.requires(.reducer)) {
+        return error.UndeclaredReducerRule;
+    }
+    if (try state_reducer.isRetainedRule(allocator, reducer_rule)) {
+        return compileRetainedReducer(
+            allocator,
+            definition_plan,
+            rules,
+            reducer_rule,
+            event_kinds,
+        );
+    }
+    if (!definition_plan.requires(.transition_table) or
+        rules.transition_table == null)
+    {
+        return error.IncompleteReducerRules;
+    }
+    var keyed = try reducer.compile(
+        allocator,
+        rules.transition_table.?,
+        reducer_rule,
+        definition_plan.bounds,
+    );
+    errdefer keyed.deinit(allocator);
+    if (mode == .plain and keyed.event_kind == null) {
+        return error.PlainKeyedReducerRequiresEventKind;
+    }
+    if (mode == .chained and keyed.event_kind != null) {
+        return error.ChainedProtocolRejectsReducerEventKind;
+    }
+    return .{ .keyed = keyed };
+}
+
+fn compileRetainedReducer(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    rules: ProtocolRules,
+    reducer_rule: definition.Rule,
+    event_kinds: []const []u8,
+) !ReducerPlans {
+    if (definition_plan.requires(.transition_table) or
+        rules.transition_table != null)
+    {
+        return error.RetainedReducerRejectsTransitionTable;
+    }
+    var retained = try state_reducer.compile(
+        allocator,
+        definition_plan,
+        reducer_rule,
+        definition_plan.bounds.max_input_bytes,
+    );
+    errdefer retained.deinit(allocator);
+    try state_reducer.validateEventKinds(&retained, event_kinds);
+    return .{ .retained = retained };
+}
+
+pub fn compile(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+) !?Plan {
+    const present_mask = definition_plan.operator_mask & protocol_operator_mask;
+    if (present_mask == 0) return null;
+    if (definition_plan.storage_kind != .event_log) {
+        return error.ProtocolRequiresEventLogStorage;
+    }
+    const rules = try collectProtocolRules(definition_plan);
+    if (rules.append_only_log != null or
+        definition_plan.requires(.append_only_log))
+    {
+        return try compilePlain(allocator, definition_plan, storage_plan, rules);
+    }
+    try validateChainedRules(definition_plan, rules);
     var envelope = try compileEnvelope(
         allocator,
         definition_plan,
         rules.envelope.?,
     );
     errdefer envelope.deinit(allocator);
-    const sequence_start = try compileSequence(
-        allocator,
-        rules.sequence.?,
-    );
+    const sequence_start = try compileSequence(allocator, rules.sequence.?);
     var genesis = try compileGenesis(
         allocator,
         rules.previous_digest.?,
     );
     errdefer genesis.deinit(allocator);
-    try compileMarkerRule(
-        allocator,
-        rules.body_digest.?,
-        .body_digest,
-    );
-    try compileMarkerRule(
-        allocator,
-        rules.event_digest.?,
-        .event_digest,
-    );
+    try compileChainedMarkers(allocator, rules);
     const event_kinds = try compileEventKinds(
         allocator,
         rules.event_kinds.?,
@@ -295,52 +379,14 @@ pub fn compile(
         storage_plan,
         envelope.input_index,
     );
-    var reducer_plan: ?reducer.Plan = null;
-    errdefer if (reducer_plan) |*plan| plan.deinit(allocator);
-    var state_reducer_plan: ?state_reducer.Plan = null;
-    errdefer if (state_reducer_plan) |*plan| plan.deinit(allocator);
-    if (rules.reducer) |reducer_rule| {
-        if (!definition_plan.requires(.reducer)) {
-            return error.UndeclaredReducerRule;
-        }
-        if (try state_reducer.isRetainedRule(allocator, reducer_rule)) {
-            if (definition_plan.requires(.transition_table) or
-                rules.transition_table != null)
-            {
-                return error.RetainedReducerRejectsTransitionTable;
-            }
-            state_reducer_plan = try state_reducer.compile(
-                allocator,
-                definition_plan,
-                reducer_rule,
-                definition_plan.bounds.max_input_bytes,
-            );
-            try state_reducer.validateEventKinds(
-                &state_reducer_plan.?,
-                event_kinds,
-            );
-        } else {
-            if (!definition_plan.requires(.transition_table) or
-                rules.transition_table == null)
-            {
-                return error.IncompleteReducerRules;
-            }
-            reducer_plan = try reducer.compile(
-                allocator,
-                rules.transition_table.?,
-                reducer_rule,
-                definition_plan.bounds,
-            );
-            if (reducer_plan.?.event_kind != null) {
-                return error.ChainedProtocolRejectsReducerEventKind;
-            }
-        }
-    } else if (rules.transition_table != null or
-        definition_plan.requires(.transition_table) or
-        definition_plan.requires(.reducer))
-    {
-        return error.IncompleteReducerRules;
-    }
+    var reducers = try compileReducerPlans(
+        allocator,
+        definition_plan,
+        rules,
+        event_kinds,
+        .chained,
+    );
+    errdefer reducers.deinit(allocator);
     const result: Plan = .{
         .mode = .chained,
         .envelope = envelope,
@@ -349,8 +395,8 @@ pub fn compile(
         .event_kinds = event_kinds,
         .max_records = definition_plan.bounds.max_records,
         .target_slot_index = target_slot_index,
-        .reducer_plan = reducer_plan,
-        .state_reducer_plan = state_reducer_plan,
+        .reducer_plan = reducers.keyed,
+        .state_reducer_plan = reducers.retained,
     };
     try validateStorageMaterializations(&result, storage_plan);
     return result;
@@ -380,8 +426,7 @@ fn compilePlain(
         return error.IncompleteEventProtocolRules;
     const event_kinds_rule = rules.event_kinds orelse
         return error.IncompleteEventProtocolRules;
-    const reducer_rule = rules.reducer orelse
-        return error.IncompleteReducerRules;
+    if (rules.reducer == null) return error.IncompleteReducerRules;
     var envelope = try compilePlainEnvelope(
         allocator,
         definition_plan,
@@ -393,42 +438,14 @@ fn compilePlain(
         event_kinds_rule,
     );
     errdefer deinitStringSet(allocator, event_kinds);
-    var reducer_plan: ?reducer.Plan = null;
-    errdefer if (reducer_plan) |*plan| plan.deinit(allocator);
-    var state_reducer_plan: ?state_reducer.Plan = null;
-    errdefer if (state_reducer_plan) |*plan| plan.deinit(allocator);
-    if (try state_reducer.isRetainedRule(allocator, reducer_rule)) {
-        if (definition_plan.requires(.transition_table) or
-            rules.transition_table != null)
-        {
-            return error.RetainedReducerRejectsTransitionTable;
-        }
-        state_reducer_plan = try state_reducer.compile(
-            allocator,
-            definition_plan,
-            reducer_rule,
-            definition_plan.bounds.max_input_bytes,
-        );
-        try state_reducer.validateEventKinds(
-            &state_reducer_plan.?,
-            event_kinds,
-        );
-    } else {
-        if (!definition_plan.requires(.transition_table) or
-            rules.transition_table == null)
-        {
-            return error.IncompleteReducerRules;
-        }
-        reducer_plan = try reducer.compile(
-            allocator,
-            rules.transition_table.?,
-            reducer_rule,
-            definition_plan.bounds,
-        );
-        if (reducer_plan.?.event_kind == null) {
-            return error.PlainKeyedReducerRequiresEventKind;
-        }
-    }
+    var reducers = try compileReducerPlans(
+        allocator,
+        definition_plan,
+        rules,
+        event_kinds,
+        .plain,
+    );
+    errdefer reducers.deinit(allocator);
     const target_slot_index = try compileTargetSlot(
         storage_plan,
         envelope.input_index,
@@ -441,8 +458,8 @@ fn compilePlain(
         .event_kinds = event_kinds,
         .max_records = definition_plan.bounds.max_records,
         .target_slot_index = target_slot_index,
-        .reducer_plan = reducer_plan,
-        .state_reducer_plan = state_reducer_plan,
+        .reducer_plan = reducers.keyed,
+        .state_reducer_plan = reducers.retained,
     };
     try validatePlan(&result);
     try validateStorageMaterializations(&result, storage_plan);
@@ -494,101 +511,136 @@ pub fn decodeCache(
     if (try decoder.readU16() != 7) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
-    var plan: Plan = plan: {
-        const mode = try decoder.readEnum(Mode);
-        const input_index = try decoder.readU16();
-        const keys = try decodeStringSet(
-            allocator,
-            decoder,
-            64,
-            mode == .plain,
-        );
-        errdefer deinitStringSet(allocator, keys);
-        var field_keys: [6][]u8 = undefined;
-        var initialized: usize = 0;
-        errdefer for (field_keys[0..initialized]) |key| allocator.free(key);
-        for (&field_keys) |*field_key| {
-            field_key.* = try decoder.readBytesAlloc(allocator, 256);
-            initialized += 1;
-            if (mode == .plain) {
-                if (field_key.*.len != 0) {
-                    return error.CachePlainProtocolEnvelopeInvalid;
-                }
-            } else {
-                try definition_core.json.safeIdentifier(field_key.*, 256);
-            }
-        }
-        const partition_bindings = try decodePartitionBindings(
-            allocator,
-            decoder,
-        );
-        errdefer {
-            for (partition_bindings) |*binding| {
-                binding.deinit(allocator);
-            }
-            allocator.free(partition_bindings);
-        }
-        const sequence_start = try decoder.readU64();
-        const raw_genesis = try decoder.readOptionalBytesAlloc(
-            allocator,
-            71,
-        );
-        var genesis: Genesis = if (raw_genesis) |digest| digest: {
-            errdefer allocator.free(digest);
-            try definition_core.json.digest(digest);
-            break :digest .{ .digest = digest };
-        } else .null;
-        errdefer genesis.deinit(allocator);
-        const event_kinds = try decodeStringSet(
-            allocator,
-            decoder,
-            256,
-            false,
-        );
-        errdefer deinitStringSet(allocator, event_kinds);
-        var reducer_plan: ?reducer.Plan = null;
-        errdefer if (reducer_plan) |*compiled| compiled.deinit(allocator);
-        var state_reducer_plan: ?state_reducer.Plan = null;
-        errdefer if (state_reducer_plan) |*compiled| {
-            compiled.deinit(allocator);
-        };
-        const max_records = try decoder.readUsize();
-        const target_slot_index = try decoder.readU16();
-        if (try decoder.readBool()) {
-            reducer_plan = try reducer.decodeCache(allocator, decoder);
-        }
-        if (try decoder.readBool()) {
-            state_reducer_plan = try state_reducer.decodeCache(
-                allocator,
-                decoder,
-            );
-        }
-        break :plan .{
-            .mode = mode,
-            .envelope = .{
-                .input_index = std.math.cast(u8, input_index) orelse
-                    return error.CacheProtocolInputIndexInvalid,
-                .keys = keys,
-                .sequence_key = field_keys[0],
-                .kind_key = field_keys[1],
-                .previous_digest_key = field_keys[2],
-                .body_key = field_keys[3],
-                .body_digest_key = field_keys[4],
-                .event_digest_key = field_keys[5],
-                .partition_bindings = partition_bindings,
-            },
-            .sequence_start = sequence_start,
-            .genesis = genesis,
-            .event_kinds = event_kinds,
-            .max_records = max_records,
-            .target_slot_index = target_slot_index,
-            .reducer_plan = reducer_plan,
-            .state_reducer_plan = state_reducer_plan,
-        };
+    const mode = try decoder.readEnum(Mode);
+    var envelope = try decodeCacheEnvelope(allocator, decoder, mode);
+    var envelope_owned = true;
+    errdefer if (envelope_owned) envelope.deinit(allocator);
+    const sequence_start = try decoder.readU64();
+    var genesis = try decodeCacheGenesis(allocator, decoder);
+    var genesis_owned = true;
+    errdefer if (genesis_owned) genesis.deinit(allocator);
+    const event_kinds = try decodeStringSet(
+        allocator,
+        decoder,
+        256,
+        false,
+    );
+    var event_kinds_owned = true;
+    errdefer if (event_kinds_owned) {
+        deinitStringSet(allocator, event_kinds);
     };
+    const max_records = try decoder.readUsize();
+    const target_slot_index = try decoder.readU16();
+    var reducers = try decodeCacheReducers(allocator, decoder);
+    var reducers_owned = true;
+    errdefer if (reducers_owned) reducers.deinit(allocator);
+    var plan: Plan = .{
+        .mode = mode,
+        .envelope = envelope,
+        .sequence_start = sequence_start,
+        .genesis = genesis,
+        .event_kinds = event_kinds,
+        .max_records = max_records,
+        .target_slot_index = target_slot_index,
+        .reducer_plan = reducers.keyed,
+        .state_reducer_plan = reducers.retained,
+    };
+    envelope_owned = false;
+    genesis_owned = false;
+    event_kinds_owned = false;
+    reducers_owned = false;
     errdefer plan.deinit(allocator);
     try validatePlan(&plan);
     return plan;
+}
+
+fn decodeCacheEnvelope(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    mode: Mode,
+) !Envelope {
+    const input_index = try decoder.readU16();
+    const keys = try decodeStringSet(
+        allocator,
+        decoder,
+        64,
+        mode == .plain,
+    );
+    errdefer deinitStringSet(allocator, keys);
+    const field_keys = try decodeCacheEnvelopeFields(
+        allocator,
+        decoder,
+        mode,
+    );
+    errdefer for (field_keys) |key| allocator.free(key);
+    const partition_bindings = try decodePartitionBindings(
+        allocator,
+        decoder,
+    );
+    errdefer {
+        for (partition_bindings) |*binding| binding.deinit(allocator);
+        allocator.free(partition_bindings);
+    }
+    return .{
+        .input_index = std.math.cast(u8, input_index) orelse
+            return error.CacheProtocolInputIndexInvalid,
+        .keys = keys,
+        .sequence_key = field_keys[0],
+        .kind_key = field_keys[1],
+        .previous_digest_key = field_keys[2],
+        .body_key = field_keys[3],
+        .body_digest_key = field_keys[4],
+        .event_digest_key = field_keys[5],
+        .partition_bindings = partition_bindings,
+    };
+}
+
+fn decodeCacheEnvelopeFields(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    mode: Mode,
+) ![6][]u8 {
+    var fields: [6][]u8 = undefined;
+    var initialized: usize = 0;
+    errdefer for (fields[0..initialized]) |key| allocator.free(key);
+    for (&fields) |*field| {
+        field.* = try decoder.readBytesAlloc(allocator, 256);
+        initialized += 1;
+        if (mode == .plain) {
+            if (field.*.len != 0) {
+                return error.CachePlainProtocolEnvelopeInvalid;
+            }
+        } else {
+            try definition_core.json.safeIdentifier(field.*, 256);
+        }
+    }
+    return fields;
+}
+
+fn decodeCacheGenesis(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !Genesis {
+    const raw = try decoder.readOptionalBytesAlloc(allocator, 71);
+    const digest = raw orelse return .null;
+    errdefer allocator.free(digest);
+    try definition_core.json.digest(digest);
+    return .{ .digest = digest };
+}
+
+fn decodeCacheReducers(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !ReducerPlans {
+    var plans: ReducerPlans = .{};
+    errdefer plans.deinit(allocator);
+    if (try decoder.readBool()) {
+        plans.keyed = try reducer.decodeCache(allocator, decoder);
+    }
+    if (try decoder.readBool()) {
+        plans.retained = try state_reducer.decodeCache(allocator, decoder);
+    }
+    return plans;
 }
 
 pub fn validateCachePlan(
@@ -759,45 +811,51 @@ fn applyValueWithParameters(
         return error.ProtocolRecordBoundsExceeded;
     }
     if (plan.mode == .plain) {
-        const event_kind_pointer =
-            if (plan.state_reducer_plan) |*compiled|
-                compiled.event_kind
-            else if (plan.reducer_plan) |*compiled|
-                compiled.event_kind orelse
-                    return error.PlainKeyedReducerRequiresEventKind
-            else
-                return error.PlainProtocolRequiresReducer;
-        const kind = try definition_core.json.string(
-            definition_core.json_pointer.lookup(
-                event,
-                event_kind_pointer,
-            ) orelse return error.EventEnvelopeFieldMissing,
-        );
-        const kind_index = findSortedIndex(
-            plan.event_kinds,
-            kind,
-        ) orelse return error.UnknownEventKind;
-        if (plan.state_reducer_plan) |*compiled| {
-            try state_reducer.apply(
-                allocator,
-                compiled,
-                &state.state_reducer_state,
-                event,
-            );
-        } else if (plan.reducer_plan) |*compiled| {
-            try reducer.apply(
-                allocator,
-                compiled,
-                &state.reducer_state,
-                event,
-            );
-        } else {
-            return error.PlainProtocolRequiresReducer;
-        }
-        state.kind_counts[kind_index] += 1;
-        state.records += 1;
-        return;
+        return applyPlainValue(allocator, plan, state, event);
     }
+    return applyChainedValue(
+        allocator,
+        plan,
+        state,
+        event,
+        parameters,
+    );
+}
+
+fn applyPlainValue(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+) !void {
+    const event_kind_pointer =
+        if (plan.state_reducer_plan) |*compiled|
+            compiled.event_kind
+        else if (plan.reducer_plan) |*compiled|
+            compiled.event_kind orelse
+                return error.PlainKeyedReducerRequiresEventKind
+        else
+            return error.PlainProtocolRequiresReducer;
+    const kind = try definition_core.json.string(
+        definition_core.json_pointer.lookup(
+            event,
+            event_kind_pointer,
+        ) orelse return error.EventEnvelopeFieldMissing,
+    );
+    const kind_index = findSortedIndex(plan.event_kinds, kind) orelse
+        return error.UnknownEventKind;
+    try applyReducers(allocator, plan, state, event);
+    state.kind_counts[kind_index] += 1;
+    state.records += 1;
+}
+
+fn applyChainedValue(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+    parameters: ?*const definition_core.parameters.Bindings,
+) !void {
     const object = try definition_core.json.object(event);
     try validateEnvelopeKeys(object, plan.envelope.keys);
     try validatePartitionValues(
@@ -806,73 +864,43 @@ fn applyValueWithParameters(
         parameters,
     );
 
-    const sequence_value = object.get(plan.envelope.sequence_key) orelse
-        return error.EventEnvelopeFieldMissing;
-    const sequence = switch (sequence_value) {
-        .integer => |value| if (value >= 0)
-            @as(u64, @intCast(value))
-        else
-            return error.InvalidEventSequence,
-        else => return error.InvalidEventSequence,
-    };
-    if (sequence != state.next_sequence) {
-        return error.EventSequenceMismatch;
-    }
-
+    try validateChainedSequence(plan, state, object);
     const kind = try definition_core.json.string(
         object.get(plan.envelope.kind_key) orelse
             return error.EventEnvelopeFieldMissing,
     );
-    const kind_index = findSortedIndex(
-        plan.event_kinds,
-        kind,
-    ) orelse return error.UnknownEventKind;
-
+    const kind_index = findSortedIndex(plan.event_kinds, kind) orelse
+        return error.UnknownEventKind;
     const claimed_previous = object.get(
         plan.envelope.previous_digest_key,
     ) orelse return error.EventEnvelopeFieldMissing;
     try validatePreviousDigest(plan, state, claimed_previous);
-
     const body = object.get(plan.envelope.body_key) orelse
         return error.EventEnvelopeFieldMissing;
-    const claimed_body_digest = try definition_core.json.string(
-        object.get(plan.envelope.body_digest_key) orelse
-            return error.EventEnvelopeFieldMissing,
+    try validateChainedBodyDigest(allocator, plan, object, body);
+    const claimed_event_digest = try validateChainedEventDigest(
+        allocator,
+        plan,
+        object,
+        event,
     );
-    try definition_core.json.digest(claimed_body_digest);
-    const computed_body_digest =
-        try definition_core.canonical_json.digestValueAlloc(
-            allocator,
-            body,
-        );
-    defer allocator.free(computed_body_digest);
-    if (!std.mem.eql(
-        u8,
-        claimed_body_digest,
-        computed_body_digest,
-    )) return error.EventBodyDigestMismatch;
-
-    const claimed_event_digest = try definition_core.json.string(
-        object.get(plan.envelope.event_digest_key) orelse
-            return error.EventEnvelopeFieldMissing,
-    );
-    try definition_core.json.digest(claimed_event_digest);
-    const computed_event_digest =
-        try definition_core.canonical_json.fingerprintObjectOmittingAlloc(
-            allocator,
-            event,
-            plan.envelope.event_digest_key,
-        );
-    defer allocator.free(computed_event_digest);
-    if (!std.mem.eql(
-        u8,
-        claimed_event_digest,
-        computed_event_digest,
-    )) return error.EventDigestMismatch;
-
     if (state.next_sequence == std.math.maxInt(u64)) {
         return error.EventSequenceOverflow;
     }
+    try applyReducers(allocator, plan, state, event);
+    @memcpy(&state.previous_digest, claimed_event_digest);
+    state.has_previous_digest = true;
+    state.kind_counts[kind_index] += 1;
+    state.next_sequence += 1;
+    state.records += 1;
+}
+
+fn applyReducers(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+) !void {
     if (plan.reducer_plan) |*compiled| {
         try reducer.apply(
             allocator,
@@ -889,11 +917,75 @@ fn applyValueWithParameters(
             event,
         );
     }
-    @memcpy(&state.previous_digest, claimed_event_digest);
-    state.has_previous_digest = true;
-    state.kind_counts[kind_index] += 1;
-    state.next_sequence += 1;
-    state.records += 1;
+    if (plan.reducer_plan == null and plan.state_reducer_plan == null and
+        plan.mode == .plain)
+    {
+        return error.PlainProtocolRequiresReducer;
+    }
+}
+
+fn validateChainedSequence(
+    plan: *const Plan,
+    state: *const ReplayState,
+    object: std.json.ObjectMap,
+) !void {
+    const value = object.get(plan.envelope.sequence_key) orelse
+        return error.EventEnvelopeFieldMissing;
+    const sequence = switch (value) {
+        .integer => |number| if (number >= 0)
+            @as(u64, @intCast(number))
+        else
+            return error.InvalidEventSequence,
+        else => return error.InvalidEventSequence,
+    };
+    if (sequence != state.next_sequence) {
+        return error.EventSequenceMismatch;
+    }
+}
+
+fn validateChainedBodyDigest(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    object: std.json.ObjectMap,
+    body: std.json.Value,
+) !void {
+    const claimed = try definition_core.json.string(
+        object.get(plan.envelope.body_digest_key) orelse
+            return error.EventEnvelopeFieldMissing,
+    );
+    try definition_core.json.digest(claimed);
+    const computed = try definition_core.canonical_json.digestValueAlloc(
+        allocator,
+        body,
+    );
+    defer allocator.free(computed);
+    if (!std.mem.eql(u8, claimed, computed)) {
+        return error.EventBodyDigestMismatch;
+    }
+}
+
+fn validateChainedEventDigest(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    object: std.json.ObjectMap,
+    event: std.json.Value,
+) ![]const u8 {
+    const claimed = try definition_core.json.string(
+        object.get(plan.envelope.event_digest_key) orelse
+            return error.EventEnvelopeFieldMissing,
+    );
+    try definition_core.json.digest(claimed);
+    const computed =
+        try definition_core.canonical_json.fingerprintObjectOmittingAlloc(
+            allocator,
+            event,
+            plan.envelope.event_digest_key,
+        );
+    defer allocator.free(computed);
+    if (!std.mem.eql(u8, claimed, computed)) {
+        return error.EventDigestMismatch;
+    }
+    return claimed;
 }
 
 fn validatePartitionValues(
@@ -976,93 +1068,44 @@ pub fn materializeEvent(
     }
     if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
     try validateEventMaterialization(plan, materialization);
-    try validateForbiddenParameters(materialization, parameters);
-    const request_object = try definition_core.json.object(request);
-    try validateRequestKeys(
-        allocator,
-        request_object,
-        materialization,
-    );
-    const body = request_object.get(
-        materialization.body_input_field,
-    ) orelse return error.EventBodyInputMissing;
-    const generated_outputs = try generateOutputsAlloc(
-        allocator,
-        materialization,
-        materialization.generate,
-        materialization.derive,
-        state,
-        request,
-        unix_seconds,
-        io,
-    );
-    errdefer deinitGeneratedOutputs(allocator, generated_outputs);
-    const canonical_body = try materializedBodyAlloc(
+    const prepared = try prepareMaterializedEvent(
         allocator,
         plan,
-        state,
         materialization,
-        request_object,
-        body,
-        generated_outputs,
+        state,
+        request,
         parameters,
+        unix_seconds,
+        io,
         null,
     );
-    defer allocator.free(canonical_body);
+    defer allocator.free(prepared.body);
+    errdefer deinitGeneratedOutputs(allocator, prepared.generated_outputs);
     const body_digest =
         try definition_core.canonical_json.digestBytesAlloc(
             allocator,
-            canonical_body,
+            prepared.body,
         );
     defer allocator.free(body_digest);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
-    try output.writer.writeByte('{');
-    for (plan.envelope.keys, 0..) |key, index| {
-        if (index != 0) try output.writer.writeByte(',');
-        try definition_core.canonical_json.writeCanonicalString(
-            &output.writer,
-            key,
-        );
-        try output.writer.writeByte(':');
-        if (std.mem.eql(u8, key, plan.envelope.sequence_key)) {
-            try output.writer.print("{d}", .{state.next_sequence});
-        } else if (std.mem.eql(u8, key, plan.envelope.previous_digest_key)) {
-            try writePreviousDigest(&output.writer, plan, state);
-        } else if (std.mem.eql(u8, key, plan.envelope.body_key)) {
-            try output.writer.writeAll(canonical_body);
-        } else if (std.mem.eql(u8, key, plan.envelope.body_digest_key)) {
-            try definition_core.canonical_json.writeCanonicalString(
-                &output.writer,
-                body_digest,
-            );
-        } else if (std.mem.eql(u8, key, plan.envelope.event_digest_key)) {
-            try output.writer.writeAll("\"\"");
-        } else {
-            const field = findEventField(
-                materialization.fields,
-                key,
-            ) orelse return error.EventMaterializationFieldCoverageMismatch;
-            try writeMaterializedField(
-                allocator,
-                &output.writer,
-                materialization,
-                field.source,
-                request_object,
-                state.next_sequence,
-                unix_seconds,
-                generated_outputs,
-            );
-        }
-    }
-    try output.writer.writeByte('}');
+    try writeChainedMaterializedEvent(
+        allocator,
+        &output.writer,
+        plan,
+        state,
+        materialization,
+        prepared,
+        body_digest,
+        unix_seconds,
+    );
     return .{
         .content = try definition_core.canonical_json.finalizeFingerprintAlloc(
             allocator,
             output.written(),
             plan.envelope.event_digest_key,
         ),
-        .generated_outputs = generated_outputs,
+        .generated_outputs = prepared.generated_outputs,
     };
 }
 
@@ -1079,13 +1122,57 @@ pub fn materializePlainEvent(
         return error.EventMaterializationModeMismatch;
     }
     if (unix_seconds < 0) return error.InvalidEventUnixTimestamp;
+    const prepared = try prepareMaterializedEvent(
+        allocator,
+        null,
+        materialization,
+        state,
+        request,
+        parameters,
+        unix_seconds,
+        io,
+        if (materialization.body_order.len == 0)
+            null
+        else
+            materialization.body_order,
+    );
+    defer allocator.free(prepared.body);
+    errdefer deinitGeneratedOutputs(allocator, prepared.generated_outputs);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try writePlainMaterializedEvent(
+        allocator,
+        &output.writer,
+        materialization,
+        prepared,
+        unix_seconds,
+    );
+    return .{
+        .content = try output.toOwnedSlice(),
+        .generated_outputs = prepared.generated_outputs,
+    };
+}
+
+const PreparedMaterializedEvent = struct {
+    request_object: std.json.ObjectMap,
+    body: []u8,
+    generated_outputs: []GeneratedOutput,
+};
+
+fn prepareMaterializedEvent(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    materialization: *const storage.EventMaterialization,
+    state: ?*const ReplayState,
+    request: std.json.Value,
+    parameters: ?*const definition_core.parameters.Bindings,
+    unix_seconds: i64,
+    io: std.Io,
+    body_order: ?[]const []u8,
+) !PreparedMaterializedEvent {
     try validateForbiddenParameters(materialization, parameters);
     const request_object = try definition_core.json.object(request);
-    try validateRequestKeys(
-        allocator,
-        request_object,
-        materialization,
-    );
+    try validateRequestKeys(allocator, request_object, materialization);
     const body = request_object.get(
         materialization.body_input_field,
     ) orelse return error.EventBodyInputMissing;
@@ -1100,59 +1187,116 @@ pub fn materializePlainEvent(
         io,
     );
     errdefer deinitGeneratedOutputs(allocator, generated_outputs);
-    const materialized_body = try materializedBodyAlloc(
-        allocator,
-        null,
-        null,
-        materialization,
-        request_object,
-        body,
-        generated_outputs,
-        parameters,
-        if (materialization.body_order.len == 0)
-            null
-        else
-            materialization.body_order,
-    );
-    defer allocator.free(materialized_body);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try output.writer.writeByte('{');
-    for (materialization.field_order, 0..) |key, index| {
-        if (index != 0) try output.writer.writeByte(',');
-        try definition_core.canonical_json.writeCanonicalString(
-            &output.writer,
-            key,
-        );
-        try output.writer.writeByte(':');
-        if (std.mem.eql(
-            u8,
-            key,
-            materialization.body_input_field,
-        )) {
-            try output.writer.writeAll(materialized_body);
+    return .{
+        .request_object = request_object,
+        .body = try materializedBodyAlloc(
+            allocator,
+            plan,
+            state,
+            materialization,
+            request_object,
+            body,
+            generated_outputs,
+            parameters,
+            body_order,
+        ),
+        .generated_outputs = generated_outputs,
+    };
+}
+
+fn writeChainedMaterializedEvent(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    plan: *const Plan,
+    state: *const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    prepared: PreparedMaterializedEvent,
+    body_digest: []const u8,
+    unix_seconds: i64,
+) !void {
+    try writer.writeByte('{');
+    for (plan.envelope.keys, 0..) |key, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, key);
+        try writer.writeByte(':');
+        if (std.mem.eql(u8, key, plan.envelope.sequence_key)) {
+            try writer.print("{d}", .{state.next_sequence});
+        } else if (std.mem.eql(u8, key, plan.envelope.previous_digest_key)) {
+            try writePreviousDigest(writer, plan, state);
+        } else if (std.mem.eql(u8, key, plan.envelope.body_key)) {
+            try writer.writeAll(prepared.body);
+        } else if (std.mem.eql(u8, key, plan.envelope.body_digest_key)) {
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                body_digest,
+            );
+        } else if (std.mem.eql(u8, key, plan.envelope.event_digest_key)) {
+            try writer.writeAll("\"\"");
         } else {
-            const field = findEventField(
-                materialization.fields,
-                key,
-            ) orelse return error.EventMaterializationFieldCoverageMismatch;
-            try writeMaterializedField(
+            try writeChainedMaterializedField(
                 allocator,
-                &output.writer,
+                writer,
                 materialization,
-                field.source,
-                request_object,
-                0,
+                prepared,
+                key,
+                state.next_sequence,
                 unix_seconds,
-                generated_outputs,
             );
         }
     }
-    try output.writer.writeByte('}');
-    return .{
-        .content = try output.toOwnedSlice(),
-        .generated_outputs = generated_outputs,
-    };
+    try writer.writeByte('}');
+}
+
+fn writeChainedMaterializedField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    prepared: PreparedMaterializedEvent,
+    key: []const u8,
+    sequence: u64,
+    unix_seconds: i64,
+) !void {
+    const field = findEventField(materialization.fields, key) orelse
+        return error.EventMaterializationFieldCoverageMismatch;
+    try writeMaterializedField(
+        allocator,
+        writer,
+        materialization,
+        field.source,
+        prepared.request_object,
+        sequence,
+        unix_seconds,
+        prepared.generated_outputs,
+    );
+}
+
+fn writePlainMaterializedEvent(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    prepared: PreparedMaterializedEvent,
+    unix_seconds: i64,
+) !void {
+    try writer.writeByte('{');
+    for (materialization.field_order, 0..) |key, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, key);
+        try writer.writeByte(':');
+        if (std.mem.eql(u8, key, materialization.body_input_field)) {
+            try writer.writeAll(prepared.body);
+        } else {
+            try writeChainedMaterializedField(
+                allocator,
+                writer,
+                materialization,
+                prepared,
+                key,
+                0,
+                unix_seconds,
+            );
+        }
+    }
+    try writer.writeByte('}');
 }
 
 pub fn derivePlainIdempotencyKeyAlloc(
@@ -1356,48 +1500,73 @@ fn validateStoredEventDerivations(
         allocator.free(outputs);
     }
     for (materialization.derive) |item| {
-        const stored = try storedEventDerivedValue(
+        outputs[initialized] = try validateStoredEventDerivation(
+            allocator,
+            state,
             materialization,
             event,
             body,
-            item.name,
+            item,
+            parsed.value,
+            outputs[0..initialized],
         );
-        const expected = switch (item.source) {
-            .utc_timestamp => |format| blk: {
-                const text = stored orelse
-                    return error.EventDerivedOutputMissing;
-                try validateStoredEventTimestamp(
-                    allocator,
-                    text,
-                    format,
-                );
-                break :blk try allocator.dupe(u8, text);
-            },
-            else => try deriveEventValueAlloc(
-                allocator,
-                materialization,
-                item,
-                state,
-                parsed.value,
-                0,
-                outputs[0..initialized],
-            ),
-        };
-        errdefer {
-            @memset(expected, 0);
-            allocator.free(expected);
-        }
-        if (stored) |actual| {
-            if (!std.mem.eql(u8, expected, actual)) {
-                return error.EventDerivedValueMismatch;
-            }
-        }
-        outputs[initialized] = .{
-            .name = try allocator.dupe(u8, item.name),
-            .value = expected,
-        };
         initialized += 1;
     }
+}
+
+fn validateStoredEventDerivation(
+    allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+    body: ?std.json.ObjectMap,
+    item: storage.EventDerivation,
+    reconstructed: std.json.Value,
+    outputs: []const GeneratedOutput,
+) !GeneratedOutput {
+    const stored = try storedEventDerivedValue(
+        materialization,
+        event,
+        body,
+        item.name,
+    );
+    const expected = switch (item.source) {
+        .utc_timestamp => |format| try storedTimestampAlloc(
+            allocator,
+            stored,
+            format,
+        ),
+        else => try deriveEventValueAlloc(
+            allocator,
+            materialization,
+            item,
+            state,
+            reconstructed,
+            0,
+            outputs,
+        ),
+    };
+    errdefer {
+        @memset(expected, 0);
+        allocator.free(expected);
+    }
+    if (stored) |actual| {
+        if (!std.mem.eql(u8, expected, actual)) {
+            return error.EventDerivedValueMismatch;
+        }
+    }
+    const name = try allocator.dupe(u8, item.name);
+    return .{ .name = name, .value = expected };
+}
+
+fn storedTimestampAlloc(
+    allocator: std.mem.Allocator,
+    stored: ?[]const u8,
+    format: storage.EventTimestampFormat,
+) ![]u8 {
+    const text = stored orelse return error.EventDerivedOutputMissing;
+    try validateStoredEventTimestamp(allocator, text, format);
+    return allocator.dupe(u8, text);
 }
 
 fn storedEventDerivedValue(
@@ -1470,15 +1639,6 @@ fn reconstructInputWithLayoutAlloc(
     event_object: std.json.ObjectMap,
     body_key: []const u8,
 ) ![]u8 {
-    const Mapping = struct {
-        key: []const u8,
-        value: union(enum) {
-            json: std.json.Value,
-            literal: []const u8,
-        },
-    };
-    var mappings: [129]Mapping = undefined;
-    var count: usize = 0;
     const reconstructed_body = try reconstructedBodyAlloc(
         allocator,
         plan,
@@ -1499,79 +1659,178 @@ fn reconstructInputWithLayoutAlloc(
         },
     );
     defer parsed_body.deinit();
+    var mappings: [129]ReconstructedMapping = undefined;
+    const count = try collectReconstructedMappings(
+        allocator,
+        state,
+        materialization,
+        event_object,
+        parsed_body.value,
+        &mappings,
+    );
+    sortReconstructedMappings(mappings[0..count]);
+    try validateReconstructedMappings(mappings[0..count]);
+    return writeReconstructedMappingsAlloc(
+        allocator,
+        materialization,
+        mappings[0..count],
+    );
+}
+
+const ReconstructedMapping = struct {
+    key: []const u8,
+    value: union(enum) {
+        json: std.json.Value,
+        literal: []const u8,
+    },
+};
+
+fn collectReconstructedMappings(
+    allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event_object: std.json.ObjectMap,
+    reconstructed_body: std.json.Value,
+    mappings: *[129]ReconstructedMapping,
+) !usize {
+    var count: usize = 0;
     mappings[count] = .{
         .key = materialization.body_input_field,
-        .value = .{ .json = parsed_body.value },
+        .value = .{ .json = reconstructed_body },
     };
     count += 1;
     for (materialization.fields) |field| {
         const value = event_object.get(field.field) orelse
             return error.EventEnvelopeFieldMissing;
-        switch (field.source) {
-            .input_field => |input_field| {
-                mappings[count] = .{
-                    .key = input_field,
-                    .value = .{ .json = value },
-                };
-                count += 1;
-            },
-            .literal => |literal| {
-                const canonical =
-                    try definition_core.canonical_json.canonicalJsonAlloc(
-                        allocator,
-                        value,
-                    );
-                defer allocator.free(canonical);
-                if (!std.mem.eql(u8, canonical, literal)) {
-                    return error.EventLiteralMismatch;
-                }
-            },
-            .sequence_text_prefix => |prefix| {
-                const replay_state = state orelse
-                    return error.PlainEventRequiresProtocolState;
-                const actual = try definition_core.json.string(value);
-                const expected = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}{d}",
-                    .{ prefix, replay_state.next_sequence },
-                );
-                defer allocator.free(expected);
-                if (!std.mem.eql(u8, actual, expected)) {
-                    return error.EventSequenceTextMismatch;
-                }
-            },
-            .unix_seconds => switch (value) {
-                .integer => |timestamp| {
-                    if (timestamp < 0) return error.InvalidEventUnixTimestamp;
-                },
-                else => return error.InvalidEventUnixTimestamp,
-            },
-            .derived => {
-                if (value != .string) return error.EventDerivedValueInvalid;
-            },
-        }
+        try collectReconstructedField(
+            allocator,
+            state,
+            field.source,
+            value,
+            mappings,
+            &count,
+        );
     }
     for (materialization.request_literals) |literal| {
+        if (count >= mappings.len) return error.EventInputFieldBoundsExceeded;
         mappings[count] = .{
             .key = literal.field,
             .value = .{ .literal = literal.literal },
         };
         count += 1;
     }
-    std.sort.heap(Mapping, mappings[0..count], {}, struct {
-        fn lessThan(_: void, left: Mapping, right: Mapping) bool {
+    return count;
+}
+
+fn collectReconstructedField(
+    allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
+    source: storage.EventFieldSource,
+    value: std.json.Value,
+    mappings: *[129]ReconstructedMapping,
+    count: *usize,
+) !void {
+    switch (source) {
+        .input_field => |input_field| {
+            if (count.* >= mappings.len) {
+                return error.EventInputFieldBoundsExceeded;
+            }
+            mappings[count.*] = .{
+                .key = input_field,
+                .value = .{ .json = value },
+            };
+            count.* += 1;
+        },
+        .literal => |literal| try validateReconstructedLiteral(
+            allocator,
+            value,
+            literal,
+        ),
+        .sequence_text_prefix => |prefix| try validateSequenceText(
+            allocator,
+            state,
+            value,
+            prefix,
+        ),
+        .unix_seconds => switch (value) {
+            .integer => |timestamp| {
+                if (timestamp < 0) return error.InvalidEventUnixTimestamp;
+            },
+            else => return error.InvalidEventUnixTimestamp,
+        },
+        .derived => {
+            if (value != .string) return error.EventDerivedValueInvalid;
+        },
+    }
+}
+
+fn validateReconstructedLiteral(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    literal: []const u8,
+) !void {
+    const canonical =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            value,
+        );
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, literal)) {
+        return error.EventLiteralMismatch;
+    }
+}
+
+fn validateSequenceText(
+    allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
+    value: std.json.Value,
+    prefix: []const u8,
+) !void {
+    const replay_state = state orelse
+        return error.PlainEventRequiresProtocolState;
+    const actual = try definition_core.json.string(value);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "{s}{d}",
+        .{ prefix, replay_state.next_sequence },
+    );
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, actual, expected)) {
+        return error.EventSequenceTextMismatch;
+    }
+}
+
+fn sortReconstructedMappings(mappings: []ReconstructedMapping) void {
+    std.sort.heap(ReconstructedMapping, mappings, {}, struct {
+        fn lessThan(
+            _: void,
+            left: ReconstructedMapping,
+            right: ReconstructedMapping,
+        ) bool {
             return std.mem.lessThan(u8, left.key, right.key);
         }
     }.lessThan);
-    for (mappings[1..count], 1..) |mapping, index| {
+}
+
+fn validateReconstructedMappings(
+    mappings: []const ReconstructedMapping,
+) !void {
+    for (mappings[1..], 1..) |mapping, index| {
         if (std.mem.eql(u8, mappings[index - 1].key, mapping.key)) {
             return error.DuplicateEventInputField;
         }
     }
+}
+
+fn writeReconstructedMappingsAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    mappings: []const ReconstructedMapping,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('{');
-    for (mappings[0..count], 0..) |mapping, index| {
+    for (mappings, 0..) |mapping, index| {
         if (index != 0) try output.writer.writeByte(',');
         try definition_core.canonical_json.writeCanonicalString(
             &output.writer,
@@ -1639,27 +1898,11 @@ fn generateOutputsAlloc(
         allocator.free(outputs);
     }
     for (definitions, 0..) |item, index| {
-        var random: [64]u8 = undefined;
-        defer @memset(&random, 0);
-        try std.Io.randomSecure(io, random[0..item.byte_count]);
-        const value_len = std.math.add(
-            usize,
-            item.prefix.len,
-            2 * @as(usize, item.byte_count),
-        ) catch return error.SecureTokenOutputTooLarge;
-        const value = try allocator.alloc(u8, value_len);
-        errdefer allocator.free(value);
-        @memcpy(value[0..item.prefix.len], item.prefix);
-        const hex = "0123456789abcdef";
-        for (random[0..item.byte_count], 0..) |byte, byte_index| {
-            const offset = item.prefix.len + byte_index * 2;
-            value[offset] = hex[byte >> 4];
-            value[offset + 1] = hex[byte & 0x0f];
-        }
-        outputs[index] = .{
-            .name = try allocator.dupe(u8, item.name),
-            .value = value,
-        };
+        outputs[index] = try generateSecureOutputAlloc(
+            allocator,
+            item,
+            io,
+        );
         initialized += 1;
     }
     for (derivations) |item| {
@@ -1692,6 +1935,37 @@ fn generateOutputsAlloc(
         }
     }.lessThan);
     return outputs;
+}
+
+fn generateSecureOutputAlloc(
+    allocator: std.mem.Allocator,
+    item: storage.SecureTokenGeneration,
+    io: std.Io,
+) !GeneratedOutput {
+    var random: [64]u8 = undefined;
+    defer @memset(&random, 0);
+    try std.Io.randomSecure(io, random[0..item.byte_count]);
+    const value_len = std.math.add(
+        usize,
+        item.prefix.len,
+        2 * @as(usize, item.byte_count),
+    ) catch return error.SecureTokenOutputTooLarge;
+    const value = try allocator.alloc(u8, value_len);
+    errdefer {
+        @memset(value, 0);
+        allocator.free(value);
+    }
+    @memcpy(value[0..item.prefix.len], item.prefix);
+    const hex = "0123456789abcdef";
+    for (random[0..item.byte_count], 0..) |byte, byte_index| {
+        const offset = item.prefix.len + byte_index * 2;
+        value[offset] = hex[byte >> 4];
+        value[offset + 1] = hex[byte & 0x0f];
+    }
+    return .{
+        .name = try allocator.dupe(u8, item.name),
+        .value = value,
+    };
 }
 
 fn deriveEventValueAlloc(
@@ -1897,47 +2171,17 @@ fn eventDerivationFragmentAlloc(
 ) ![]u8 {
     return switch (fragment) {
         .literal => |value| allocator.dupe(u8, value),
-        .input_text => |source| blk: {
-            const value = definition_core.json_pointer.lookup(
-                request,
-                source.pointer,
-            ) orelse return error.EventDerivationInputMissing;
-            const text = try definition_core.json.string(value);
-            break :blk switch (source.transform) {
-                .none => try allocator.dupe(u8, text),
-                .ascii_lower => lower: {
-                    const lowered = try allocator.alloc(u8, text.len);
-                    for (text, 0..) |byte, index| {
-                        lowered[index] = std.ascii.toLower(byte);
-                    }
-                    break :lower lowered;
-                },
-            };
-        },
-        .input_json => |pointer| blk: {
-            const value = definition_core.json_pointer.lookup(
-                request,
-                pointer,
-            ) orelse return error.EventDerivationInputMissing;
-            if (materialization.body_order.len != 0 and
-                pointer.segments.len == 1 and
-                std.mem.eql(
-                    u8,
-                    pointer.segments[0],
-                    materialization.body_input_field,
-                ))
-            {
-                break :blk try orderedInputBodyAlloc(
-                    allocator,
-                    materialization,
-                    value,
-                );
-            }
-            var output: std.Io.Writer.Allocating = .init(allocator);
-            errdefer output.deinit();
-            try std.json.Stringify.value(value, .{}, &output.writer);
-            break :blk try output.toOwnedSlice();
-        },
+        .input_text => |source| eventInputTextAlloc(
+            allocator,
+            request,
+            source,
+        ),
+        .input_json => |pointer| eventInputJsonAlloc(
+            allocator,
+            materialization,
+            request,
+            pointer,
+        ),
         .canonical_input => |pointer| blk: {
             const value = definition_core.json_pointer.lookup(
                 request,
@@ -1948,35 +2192,84 @@ fn eventDerivationFragmentAlloc(
                 value,
             );
         },
-        .derived => |reference| blk: {
-            const output = findGeneratedOutputLinear(
-                prior,
-                reference.name,
-            ) orelse return error.EventDerivedOutputMissing;
-            const transformed = switch (reference.transform) {
-                .none => try allocator.dupe(u8, output.value),
-                .compact_utc => try compactUtcTimestampAlloc(
-                    allocator,
-                    output.value,
-                ),
-            };
-            errdefer allocator.free(transformed);
-            if (reference.prefix_bytes) |count| {
-                if (count > transformed.len or
-                    !std.unicode.utf8ValidateSlice(transformed[0..count]))
-                {
-                    return error.EventDerivedPrefixInvalid;
-                }
-                const prefix = try allocator.dupe(
-                    u8,
-                    transformed[0..count],
-                );
-                allocator.free(transformed);
-                break :blk prefix;
-            }
-            break :blk transformed;
-        },
+        .derived => |reference| eventDerivedFragmentAlloc(
+            allocator,
+            prior,
+            reference,
+        ),
     };
+}
+
+fn eventInputTextAlloc(
+    allocator: std.mem.Allocator,
+    request: std.json.Value,
+    source: storage.EventInputTextFragment,
+) ![]u8 {
+    const value = definition_core.json_pointer.lookup(
+        request,
+        source.pointer,
+    ) orelse return error.EventDerivationInputMissing;
+    const text = try definition_core.json.string(value);
+    if (source.transform == .none) return allocator.dupe(u8, text);
+    const lowered = try allocator.alloc(u8, text.len);
+    for (text, 0..) |byte, index| {
+        lowered[index] = std.ascii.toLower(byte);
+    }
+    return lowered;
+}
+
+fn eventInputJsonAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    request: std.json.Value,
+    pointer: definition_core.json_pointer.Pointer,
+) ![]u8 {
+    const value = definition_core.json_pointer.lookup(
+        request,
+        pointer,
+    ) orelse return error.EventDerivationInputMissing;
+    if (materialization.body_order.len != 0 and
+        pointer.segments.len == 1 and
+        std.mem.eql(
+            u8,
+            pointer.segments[0],
+            materialization.body_input_field,
+        ))
+    {
+        return orderedInputBodyAlloc(allocator, materialization, value);
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try std.json.Stringify.value(value, .{}, &output.writer);
+    return output.toOwnedSlice();
+}
+
+fn eventDerivedFragmentAlloc(
+    allocator: std.mem.Allocator,
+    prior: []const GeneratedOutput,
+    reference: storage.EventDerivedReference,
+) ![]u8 {
+    const output = findGeneratedOutputLinear(
+        prior,
+        reference.name,
+    ) orelse return error.EventDerivedOutputMissing;
+    const transformed = switch (reference.transform) {
+        .none => try allocator.dupe(u8, output.value),
+        .compact_utc => try compactUtcTimestampAlloc(
+            allocator,
+            output.value,
+        ),
+    };
+    errdefer allocator.free(transformed);
+    const count = reference.prefix_bytes orelse return transformed;
+    if (count > transformed.len or
+        !std.unicode.utf8ValidateSlice(transformed[0..count]))
+    {
+        return error.EventDerivedPrefixInvalid;
+    }
+    const prefix = try allocator.dupe(u8, transformed[0..count]);
+    allocator.free(transformed);
+    return prefix;
 }
 
 fn orderedInputBodyAlloc(
@@ -2179,6 +2472,26 @@ const EventJsonPath = struct {
     }
 };
 
+const EventJsonArrayFrame = struct {
+    items: []const std.json.Value,
+    next_index: usize = 0,
+};
+
+const EventJsonObjectFrame = struct {
+    object: std.json.ObjectMap,
+    keys: [][]const u8,
+    next_index: usize = 0,
+};
+
+const EventJsonFrame = union(enum) {
+    value: std.json.Value,
+    array: EventJsonArrayFrame,
+    object: EventJsonObjectFrame,
+    pop_path,
+};
+
+const max_event_json_frames: usize = 512;
+
 fn writeEventJsonValue(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -2186,7 +2499,52 @@ fn writeEventJsonValue(
     value: std.json.Value,
     path: *EventJsonPath,
 ) !void {
-    switch (value) {
+    var frame_storage: [max_event_json_frames]EventJsonFrame = undefined;
+    const frames = frame_storage[0..];
+    var frame_count: usize = 1;
+    frames[0] = .{ .value = value };
+    errdefer deinitEventJsonFrames(allocator, frames[0..frame_count]);
+    while (frame_count != 0) {
+        switch (frames[frame_count - 1]) {
+            .value => try advanceEventJsonValue(
+                allocator,
+                writer,
+                materialization,
+                path,
+                frames,
+                &frame_count,
+            ),
+            .array => try advanceEventJsonArray(
+                writer,
+                frames,
+                &frame_count,
+            ),
+            .object => try advanceEventJsonObject(
+                allocator,
+                writer,
+                materialization,
+                path,
+                frames,
+                &frame_count,
+            ),
+            .pop_path => {
+                path.pop();
+                frame_count -= 1;
+            },
+        }
+    }
+}
+
+fn advanceEventJsonValue(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    path: *const EventJsonPath,
+    frames: []EventJsonFrame,
+    frame_count: *usize,
+) !void {
+    const frame = &frames[frame_count.* - 1];
+    switch (frame.value) {
         .null => try writer.writeAll("null"),
         .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
         .integer => |number| try writer.print("{d}", .{number}),
@@ -2204,66 +2562,140 @@ fn writeEventJsonValue(
         ),
         .array => |items| {
             try writer.writeByte('[');
-            for (items.items, 0..) |item, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeEventJsonValue(
-                    allocator,
-                    writer,
-                    materialization,
-                    item,
-                    path,
-                );
-            }
-            try writer.writeByte(']');
+            frame.* = .{ .array = .{ .items = items.items } };
+            return;
         },
         .object => |object| {
-            const declared = findEventObjectOrder(
-                materialization.object_orders,
-                path.slice(),
+            const keys = try eventObjectKeysAtPathAlloc(
+                allocator,
+                materialization,
+                object,
+                path,
             );
-            var keys: std.ArrayList([]const u8) = .empty;
-            defer keys.deinit(allocator);
-            if (declared) |order| {
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    if (!containsDeclaredName(
-                        order.fields,
-                        entry.key_ptr.*,
-                    )) return error.EventObjectFieldCoverageMismatch;
-                }
-                for (order.fields) |field| {
-                    if (object.get(field) != null) {
-                        try keys.append(allocator, field);
-                    }
-                }
-            } else {
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    try keys.append(allocator, entry.key_ptr.*);
-                }
-            }
+            errdefer allocator.free(keys);
             try writer.writeByte('{');
-            for (keys.items, 0..) |key, index| {
-                if (index != 0) try writer.writeByte(',');
-                try writeEventJsonString(
-                    writer,
-                    key,
-                    materialization.escape_non_ascii,
-                );
-                try writer.writeByte(':');
-                try path.push(key);
-                try writeEventJsonValue(
-                    allocator,
-                    writer,
-                    materialization,
-                    object.get(key).?,
-                    path,
-                );
-                path.pop();
-            }
-            try writer.writeByte('}');
+            frame.* = .{ .object = .{
+                .object = object,
+                .keys = keys,
+            } };
+            return;
         },
     }
+    frame_count.* -= 1;
+}
+
+fn advanceEventJsonArray(
+    writer: *std.Io.Writer,
+    frames: []EventJsonFrame,
+    frame_count: *usize,
+) !void {
+    const frame = &frames[frame_count.* - 1].array;
+    if (frame.next_index == frame.items.len) {
+        try writer.writeByte(']');
+        frame_count.* -= 1;
+        return;
+    }
+    if (frame.next_index != 0) try writer.writeByte(',');
+    try ensureEventJsonFrameCapacity(frame_count.*, 1);
+    const value = frame.items[frame.next_index];
+    frame.next_index += 1;
+    frames[frame_count.*] = .{ .value = value };
+    frame_count.* += 1;
+}
+
+fn advanceEventJsonObject(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    path: *EventJsonPath,
+    frames: []EventJsonFrame,
+    frame_count: *usize,
+) !void {
+    const frame = &frames[frame_count.* - 1].object;
+    if (frame.next_index == frame.keys.len) {
+        try writer.writeByte('}');
+        allocator.free(frame.keys);
+        frame_count.* -= 1;
+        return;
+    }
+    if (frame.next_index != 0) try writer.writeByte(',');
+    try ensureEventJsonFrameCapacity(frame_count.*, 2);
+    const key = frame.keys[frame.next_index];
+    try writeEventJsonString(
+        writer,
+        key,
+        materialization.escape_non_ascii,
+    );
+    try writer.writeByte(':');
+    try path.push(key);
+    frame.next_index += 1;
+    frames[frame_count.*] = .pop_path;
+    frames[frame_count.* + 1] = .{
+        .value = frame.object.get(key).?,
+    };
+    frame_count.* += 2;
+}
+
+fn ensureEventJsonFrameCapacity(
+    frame_count: usize,
+    additional: usize,
+) !void {
+    const required = std.math.add(
+        usize,
+        frame_count,
+        additional,
+    ) catch return error.EventJsonDepthExceeded;
+    if (required > max_event_json_frames) {
+        return error.EventJsonDepthExceeded;
+    }
+}
+
+fn deinitEventJsonFrames(
+    allocator: std.mem.Allocator,
+    frames: []EventJsonFrame,
+) void {
+    for (frames) |frame| switch (frame) {
+        .object => |object| allocator.free(object.keys),
+        else => {},
+    };
+}
+
+fn eventObjectKeysAtPathAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+    path: *const EventJsonPath,
+) ![][]const u8 {
+    const declared = findEventObjectOrder(
+        materialization.object_orders,
+        path.slice(),
+    );
+    const keys = try allocator.alloc([]const u8, object.count());
+    errdefer allocator.free(keys);
+    var key_count: usize = 0;
+    if (declared) |order| {
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            if (!containsDeclaredName(
+                order.fields,
+                entry.key_ptr.*,
+            )) return error.EventObjectFieldCoverageMismatch;
+        }
+        for (order.fields) |field| {
+            if (object.get(field) != null) {
+                keys[key_count] = field;
+                key_count += 1;
+            }
+        }
+    } else {
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            keys[key_count] = entry.key_ptr.*;
+            key_count += 1;
+        }
+    }
+    std.debug.assert(key_count == keys.len);
+    return keys;
 }
 
 fn findEventObjectOrder(
@@ -2375,6 +2807,41 @@ fn materializedBodyAlloc(
         );
     }
     const object = try definition_core.json.object(body);
+    try validateMaterializedBodyFields(
+        allocator,
+        materialization,
+        request,
+        object,
+    );
+    if (declared_order) |order| {
+        return materializedBodyInDeclaredOrderAlloc(
+            allocator,
+            plan,
+            state,
+            materialization,
+            object,
+            generated_outputs,
+            parameters,
+            order,
+        );
+    }
+    return materializedBodySortedAlloc(
+        allocator,
+        plan,
+        state,
+        materialization,
+        object,
+        generated_outputs,
+        parameters,
+    );
+}
+
+fn validateMaterializedBodyFields(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    request: std.json.ObjectMap,
+    object: std.json.ObjectMap,
+) !void {
     for (materialization.body_fields) |field| {
         const actual = object.get(field.field);
         switch (field.source) {
@@ -2407,18 +2874,17 @@ fn materializedBodyAlloc(
             },
         }
     }
-    if (declared_order) |order| {
-        return materializedBodyInDeclaredOrderAlloc(
-            allocator,
-            plan,
-            state,
-            materialization,
-            object,
-            generated_outputs,
-            parameters,
-            order,
-        );
-    }
+}
+
+fn materializedBodySortedAlloc(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+    generated_outputs: []const GeneratedOutput,
+    parameters: ?*const definition_core.parameters.Bindings,
+) ![]u8 {
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(allocator);
     var iterator = object.iterator();
@@ -2430,13 +2896,35 @@ fn materializedBodyAlloc(
         try keys.append(allocator, entry.key_ptr.*);
     }
     sortStrings(keys.items);
+    return writeMaterializedBodySortedAlloc(
+        allocator,
+        plan,
+        state,
+        materialization,
+        object,
+        generated_outputs,
+        parameters,
+        keys.items,
+    );
+}
+
+fn writeMaterializedBodySortedAlloc(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+    generated_outputs: []const GeneratedOutput,
+    parameters: ?*const definition_core.parameters.Bindings,
+    keys: []const []const u8,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('{');
     var key_index: usize = 0;
     var field_index: usize = 0;
     var written: usize = 0;
-    while (key_index < keys.items.len or
+    while (key_index < keys.len or
         field_index < materialization.body_fields.len)
     {
         while (field_index < materialization.body_fields.len and
@@ -2444,14 +2932,14 @@ fn materializedBodyAlloc(
         {
             field_index += 1;
         }
-        if (key_index == keys.items.len and
+        if (key_index == keys.len and
             field_index == materialization.body_fields.len) break;
         const use_field = field_index < materialization.body_fields.len and
-            (key_index == keys.items.len or
+            (key_index == keys.len or
                 std.mem.order(
                     u8,
                     materialization.body_fields[field_index].field,
-                    keys.items[key_index],
+                    keys[key_index],
                 ) == .lt);
         if (written != 0) try output.writer.writeByte(',');
         if (use_field) {
@@ -2473,20 +2961,12 @@ fn materializedBodyAlloc(
             );
             field_index += 1;
         } else {
-            const key = keys.items[key_index];
-            try definition_core.canonical_json.writeCanonicalString(
-                &output.writer,
-                key,
-            );
-            try output.writer.writeByte(':');
-            var path = EventJsonPath{};
-            try path.push(key);
-            try writeEventJsonValue(
+            try writeExistingMaterializedBodyField(
                 allocator,
                 &output.writer,
                 materialization,
-                object.get(key).?,
-                &path,
+                object,
+                keys[key_index],
             );
             key_index += 1;
         }
@@ -2494,6 +2974,26 @@ fn materializedBodyAlloc(
     }
     try output.writer.writeByte('}');
     return output.toOwnedSlice();
+}
+
+fn writeExistingMaterializedBodyField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) !void {
+    try definition_core.canonical_json.writeCanonicalString(writer, key);
+    try writer.writeByte(':');
+    var path = EventJsonPath{};
+    try path.push(key);
+    try writeEventJsonValue(
+        allocator,
+        writer,
+        materialization,
+        object.get(key).?,
+        &path,
+    );
 }
 
 fn materializedBodyInDeclaredOrderAlloc(
@@ -2629,75 +3129,30 @@ fn writeMaterializedBodyField(
     parameters: ?*const definition_core.parameters.Bindings,
 ) !void {
     switch (source) {
-        .generated_sha256 => |name| {
-            const generated = findGeneratedOutput(
-                generated_outputs,
-                name,
-            ) orelse return error.EventGeneratedOutputMissing;
-            const digest =
-                try definition_core.canonical_json.digestBytesAlloc(
-                    allocator,
-                    generated.value,
-                );
-            defer allocator.free(digest);
-            try writeEventJsonString(
-                writer,
-                digest,
-                materialization.escape_non_ascii,
-            );
-        },
-        .parameter_sha256 => |config| {
-            const bound = parameters orelse
-                return error.EventParametersMissing;
-            const parameter = bound.find(config.parameter) orelse
-                return error.EventParameterMissing;
-            const text = scalarText(parameter.value) orelse
-                return error.EventParameterMustBeText;
-            const digest =
-                try definition_core.canonical_json.digestBytesAlloc(
-                    allocator,
-                    text,
-                );
-            defer allocator.free(digest);
-            const protocol_plan = plan orelse
-                return error.PlainEventRequiresProtocolState;
-            const protocol_state = state orelse
-                return error.PlainEventRequiresProtocolState;
-            const expected = try stateSourceValue(
-                protocol_plan,
-                protocol_state,
-                config.expected_state,
-            );
-            if (expected != .string or
-                !timingSafeDigestEqual(digest, expected.string))
-            {
-                return error.EventCapabilityMismatch;
-            }
-            try writeEventJsonString(
-                writer,
-                digest,
-                materialization.escape_non_ascii,
-            );
-        },
-        .state_value => |config| {
-            const protocol_plan = plan orelse
-                return error.PlainEventRequiresProtocolState;
-            const protocol_state = state orelse
-                return error.PlainEventRequiresProtocolState;
-            const value = try stateSourceValue(
-                protocol_plan,
-                protocol_state,
-                config,
-            );
-            var path = EventJsonPath{};
-            try writeEventJsonValue(
-                allocator,
-                writer,
-                materialization,
-                value,
-                &path,
-            );
-        },
+        .generated_sha256 => |name| try writeGeneratedBodyDigest(
+            allocator,
+            writer,
+            materialization,
+            generated_outputs,
+            name,
+        ),
+        .parameter_sha256 => |config| try writeParameterBodyDigest(
+            allocator,
+            writer,
+            materialization,
+            plan,
+            state,
+            parameters,
+            config,
+        ),
+        .state_value => |config| try writeStateBodyValue(
+            allocator,
+            writer,
+            materialization,
+            plan,
+            state,
+            config,
+        ),
         .literal_mapping => |mapping| {
             try writer.writeAll(mapping.stored_literal);
         },
@@ -2716,6 +3171,98 @@ fn writeMaterializedBodyField(
     }
 }
 
+fn writeGeneratedBodyDigest(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    generated_outputs: []const GeneratedOutput,
+    name: []const u8,
+) !void {
+    const generated = findGeneratedOutput(
+        generated_outputs,
+        name,
+    ) orelse return error.EventGeneratedOutputMissing;
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        generated.value,
+    );
+    defer allocator.free(digest);
+    try writeEventJsonString(
+        writer,
+        digest,
+        materialization.escape_non_ascii,
+    );
+}
+
+fn writeParameterBodyDigest(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    parameters: ?*const definition_core.parameters.Bindings,
+    config: storage.ParameterSha256Source,
+) !void {
+    const bound = parameters orelse return error.EventParametersMissing;
+    const parameter = bound.find(config.parameter) orelse
+        return error.EventParameterMissing;
+    const text = scalarText(parameter.value) orelse
+        return error.EventParameterMustBeText;
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        text,
+    );
+    defer allocator.free(digest);
+    const expected = try stateSourceValue(
+        plan orelse return error.PlainEventRequiresProtocolState,
+        state orelse return error.PlainEventRequiresProtocolState,
+        config.expected_state,
+    );
+    if (expected != .string or
+        !timingSafeDigestEqual(digest, expected.string))
+    {
+        return error.EventCapabilityMismatch;
+    }
+    try writeEventJsonString(
+        writer,
+        digest,
+        materialization.escape_non_ascii,
+    );
+}
+
+fn writeStateBodyValue(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    materialization: *const storage.EventMaterialization,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    config: storage.StateValueSource,
+) !void {
+    const value = try stateSourceValue(
+        plan orelse return error.PlainEventRequiresProtocolState,
+        state orelse return error.PlainEventRequiresProtocolState,
+        config,
+    );
+    var path = EventJsonPath{};
+    try writeEventJsonValue(
+        allocator,
+        writer,
+        materialization,
+        value,
+        &path,
+    );
+}
+
+const ReconstructedBodyValue = union(enum) {
+    json: std.json.Value,
+    literal: []const u8,
+};
+
+const ReconstructedBodyMapping = struct {
+    key: []const u8,
+    value: ReconstructedBodyValue,
+};
+
 fn reconstructedBodyAlloc(
     allocator: std.mem.Allocator,
     plan: ?*const Plan,
@@ -2731,6 +3278,41 @@ fn reconstructedBodyAlloc(
         );
     }
     const object = try definition_core.json.object(body);
+    try validateReconstructedBodyFields(
+        allocator,
+        plan,
+        state,
+        materialization,
+        object,
+    );
+    var mappings: std.ArrayList(ReconstructedBodyMapping) = .empty;
+    defer mappings.deinit(allocator);
+    try appendStoredBodyMappings(
+        allocator,
+        &mappings,
+        materialization,
+        object,
+    );
+    try appendDerivedBodyMappings(
+        allocator,
+        &mappings,
+        materialization,
+        event,
+    );
+    return writeReconstructedBodyAlloc(
+        allocator,
+        materialization,
+        mappings.items,
+    );
+}
+
+fn validateReconstructedBodyFields(
+    allocator: std.mem.Allocator,
+    plan: ?*const Plan,
+    state: ?*const ReplayState,
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+) !void {
     for (materialization.body_fields) |field| {
         switch (field.source) {
             .request_input => {
@@ -2751,15 +3333,14 @@ fn reconstructedBodyAlloc(
             },
         }
     }
-    const Mapping = struct {
-        key: []const u8,
-        value: union(enum) {
-            json: std.json.Value,
-            literal: []const u8,
-        },
-    };
-    var mappings: std.ArrayList(Mapping) = .empty;
-    defer mappings.deinit(allocator);
+}
+
+fn appendStoredBodyMappings(
+    allocator: std.mem.Allocator,
+    mappings: *std.ArrayList(ReconstructedBodyMapping),
+    materialization: *const storage.EventMaterialization,
+    object: std.json.ObjectMap,
+) !void {
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         if (findEventBodyField(
@@ -2770,6 +3351,14 @@ fn reconstructedBodyAlloc(
             .value = .{ .json = entry.value_ptr.* },
         });
     }
+}
+
+fn appendDerivedBodyMappings(
+    allocator: std.mem.Allocator,
+    mappings: *std.ArrayList(ReconstructedBodyMapping),
+    materialization: *const storage.EventMaterialization,
+    event: std.json.ObjectMap,
+) !void {
     for (materialization.body_fields) |field| switch (field.source) {
         .request_input => |input_name| {
             try mappings.append(allocator, .{
@@ -2793,10 +3382,17 @@ fn reconstructedBodyAlloc(
         .derived,
         => {},
     };
+}
+
+fn writeReconstructedBodyAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    mappings: []const ReconstructedBodyMapping,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('{');
-    for (mappings.items, 0..) |mapping, index| {
+    for (mappings, 0..) |mapping, index| {
         if (index != 0) try output.writer.writeByte(',');
         try definition_core.canonical_json.writeCanonicalString(
             &output.writer,
@@ -3224,6 +3820,45 @@ fn compileEnvelope(
     var parsed = try parseRule(allocator, rule);
     defer parsed.deinit();
     const object = parsed.value.object;
+    try validateEnvelopeDefinition(object);
+    const input_index = try compileProtocolInputIndex(
+        definition_plan,
+        object,
+    );
+    const keys = try parseStringSet(
+        allocator,
+        try definition_core.json.field(object, "keys"),
+        64,
+    );
+    errdefer deinitStringSet(allocator, keys);
+    const field_keys = try compileEnvelopeFieldKeys(
+        allocator,
+        object,
+        keys,
+    );
+    errdefer deinitEnvelopeFieldKeys(allocator, field_keys);
+    const partition_bindings = if (object.get("partition_bindings")) |raw|
+        try compilePartitionBindings(allocator, definition_plan, raw)
+    else
+        try allocator.alloc(PartitionBinding, 0);
+    errdefer {
+        for (partition_bindings) |*binding| binding.deinit(allocator);
+        allocator.free(partition_bindings);
+    }
+    return .{
+        .input_index = input_index,
+        .keys = keys,
+        .sequence_key = field_keys[0],
+        .kind_key = field_keys[1],
+        .previous_digest_key = field_keys[2],
+        .body_key = field_keys[3],
+        .body_digest_key = field_keys[4],
+        .event_digest_key = field_keys[5],
+        .partition_bindings = partition_bindings,
+    };
+}
+
+fn validateEnvelopeDefinition(object: std.json.ObjectMap) !void {
     try definition_core.json.requireExactKeys(object, &.{
         "op",
         "input",
@@ -3248,6 +3883,12 @@ fn compileEnvelope(
         "event_digest",
     });
     try requireOperator(object, .event_envelope);
+}
+
+fn compileProtocolInputIndex(
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !u8 {
     const input_index = findInput(
         definition_plan.inputs,
         try definition_core.json.requiredString(object, "input"),
@@ -3255,26 +3896,27 @@ fn compileEnvelope(
     if (definition_plan.inputs[input_index].codec != .json) {
         return error.ProtocolInputMustBeJson;
     }
-    const keys = try parseStringSet(
-        allocator,
-        try definition_core.json.field(object, "keys"),
-        64,
-    );
-    errdefer {
-        for (keys) |key| allocator.free(key);
-        allocator.free(keys);
-    }
+    return @intCast(input_index);
+}
+
+const envelope_field_names = [_][]const u8{
+    "sequence",
+    "kind",
+    "previous_digest",
+    "body",
+    "body_digest",
+    "event_digest",
+};
+
+fn compileEnvelopeFieldKeys(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    keys: []const []u8,
+) ![envelope_field_names.len][]u8 {
     var field_keys: [6][]u8 = undefined;
     var initialized: usize = 0;
     errdefer for (field_keys[0..initialized]) |key| allocator.free(key);
-    inline for (.{
-        "sequence",
-        "kind",
-        "previous_digest",
-        "body",
-        "body_digest",
-        "event_digest",
-    }, 0..) |name, index| {
+    inline for (envelope_field_names, 0..) |name, index| {
         field_keys[index] = try rootKeyFromPointer(
             allocator,
             try definition_core.json.requiredString(object, name),
@@ -3289,29 +3931,14 @@ fn compileEnvelope(
             }
         }
     }
-    const partition_bindings = if (object.get("partition_bindings")) |raw|
-        try compilePartitionBindings(
-            allocator,
-            definition_plan,
-            raw,
-        )
-    else
-        try allocator.alloc(PartitionBinding, 0);
-    errdefer {
-        for (partition_bindings) |*binding| binding.deinit(allocator);
-        allocator.free(partition_bindings);
-    }
-    return .{
-        .input_index = @intCast(input_index),
-        .keys = keys,
-        .sequence_key = field_keys[0],
-        .kind_key = field_keys[1],
-        .previous_digest_key = field_keys[2],
-        .body_key = field_keys[3],
-        .body_digest_key = field_keys[4],
-        .event_digest_key = field_keys[5],
-        .partition_bindings = partition_bindings,
-    };
+    return field_keys;
+}
+
+fn deinitEnvelopeFieldKeys(
+    allocator: std.mem.Allocator,
+    field_keys: [envelope_field_names.len][]u8,
+) void {
+    for (field_keys) |key| allocator.free(key);
 }
 
 fn compilePartitionBindings(
@@ -3335,34 +3962,11 @@ fn compilePartitionBindings(
         allocator.free(bindings);
     }
     for (values.items, 0..) |value, index| {
-        const object = try definition_core.json.object(value);
-        try definition_core.json.requireExactKeys(
-            object,
-            &.{ "parameter", "event_value" },
+        bindings[index] = try compilePartitionBinding(
+            allocator,
+            definition_plan,
+            value,
         );
-        try definition_core.json.requireFields(
-            object,
-            &.{ "parameter", "event_value" },
-        );
-        const parameter = try definition_core.json.requiredString(
-            object,
-            "parameter",
-        );
-        try definition_core.json.safeIdentifier(parameter, 128);
-        const declaration =
-            definition_plan.parameter_declarations.find(parameter) orelse
-            return error.UnknownProtocolPartitionParameter;
-        bindings[index] = .{
-            .parameter = try allocator.dupe(u8, parameter),
-            .kind = declaration.kind,
-            .event_value = try definition_core.json_pointer.compile(
-                allocator,
-                try definition_core.json.requiredString(
-                    object,
-                    "event_value",
-                ),
-            ),
-        };
         initialized += 1;
     }
     std.sort.heap(PartitionBinding, bindings, {}, struct {
@@ -3378,6 +3982,45 @@ fn compilePartitionBindings(
             );
         }
     }.lessThan);
+    try validatePartitionBindingOrder(bindings);
+    return bindings;
+}
+
+fn compilePartitionBinding(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    value: std.json.Value,
+) !PartitionBinding {
+    const object = try definition_core.json.object(value);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "parameter", "event_value" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "parameter", "event_value" },
+    );
+    const parameter = try definition_core.json.requiredString(
+        object,
+        "parameter",
+    );
+    try definition_core.json.safeIdentifier(parameter, 128);
+    const declaration =
+        definition_plan.parameter_declarations.find(parameter) orelse
+        return error.UnknownProtocolPartitionParameter;
+    const owned_parameter = try allocator.dupe(u8, parameter);
+    errdefer allocator.free(owned_parameter);
+    return .{
+        .parameter = owned_parameter,
+        .kind = declaration.kind,
+        .event_value = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.requiredString(object, "event_value"),
+        ),
+    };
+}
+
+fn validatePartitionBindingOrder(bindings: []const PartitionBinding) !void {
     for (bindings[1..], 1..) |binding, index| {
         if (std.mem.eql(
             u8,
@@ -3385,7 +4028,6 @@ fn compilePartitionBindings(
             binding.parameter,
         )) return error.DuplicateProtocolPartitionParameter;
     }
-    return bindings;
 }
 
 fn compileSequence(
@@ -3630,79 +4272,91 @@ fn validatePlan(plan: *const Plan) !void {
     }
     try validateSortedStringSet(plan.event_kinds);
     switch (plan.mode) {
-        .plain => {
-            if (plan.envelope.keys.len != 0 or
-                plan.envelope.partition_bindings.len != 0 or
-                plan.envelope.sequence_key.len != 0 or
-                plan.envelope.kind_key.len != 0 or
-                plan.envelope.previous_digest_key.len != 0 or
-                plan.envelope.body_key.len != 0 or
-                plan.envelope.body_digest_key.len != 0 or
-                plan.envelope.event_digest_key.len != 0 or
-                plan.sequence_start != 0 or
-                !switch (plan.genesis) {
-                    .null => true,
-                    .digest => false,
-                } or
-                (plan.reducer_plan == null) ==
-                    (plan.state_reducer_plan == null) or
-                (plan.reducer_plan != null and
-                    plan.reducer_plan.?.event_kind == null))
-            {
-                return error.InvalidPlainProtocolPlan;
-            }
-        },
-        .chained => {
-            if (plan.envelope.keys.len == 0 or
-                plan.envelope.keys.len > 64 or
-                plan.sequence_start > std.math.maxInt(i64))
-            {
-                return error.InvalidProtocolPlan;
-            }
-            try validateSortedStringSet(plan.envelope.keys);
-            if (plan.envelope.partition_bindings.len > 32) {
-                return error.InvalidProtocolPartitionBindings;
-            }
-            for (plan.envelope.partition_bindings, 0..) |binding, index| {
-                try definition_core.json.safeIdentifier(binding.parameter, 128);
-                if (index != 0 and
-                    std.mem.order(
-                        u8,
-                        plan.envelope.partition_bindings[index - 1].parameter,
-                        binding.parameter,
-                    ) != .lt)
-                {
-                    return error.InvalidProtocolPartitionBindings;
-                }
-            }
-            const fields = [_][]const u8{
-                plan.envelope.sequence_key,
-                plan.envelope.kind_key,
-                plan.envelope.previous_digest_key,
-                plan.envelope.body_key,
-                plan.envelope.body_digest_key,
-                plan.envelope.event_digest_key,
-            };
-            for (fields, 0..) |field, index| {
-                try definition_core.json.safeIdentifier(field, 256);
-                if (!containsSorted(plan.envelope.keys, field)) {
-                    return error.EventEnvelopeFieldNotDeclared;
-                }
-                for (fields[0..index]) |prior| {
-                    if (std.mem.eql(u8, prior, field)) {
-                        return error.DuplicateEventEnvelopeField;
-                    }
-                }
-            }
-            switch (plan.genesis) {
-                .null => {},
-                .digest => |digest| try definition_core.json.digest(digest),
-            }
-        },
+        .plain => try validatePlainPlan(plan),
+        .chained => try validateChainedPlan(plan),
     }
     if (plan.reducer_plan) |*compiled| try reducer.validatePlan(compiled);
     if (plan.reducer_plan != null and plan.state_reducer_plan != null) {
         return error.MultipleProtocolReducers;
+    }
+}
+
+fn validatePlainPlan(plan: *const Plan) !void {
+    if (plan.envelope.keys.len != 0 or
+        plan.envelope.partition_bindings.len != 0 or
+        plan.envelope.sequence_key.len != 0 or
+        plan.envelope.kind_key.len != 0 or
+        plan.envelope.previous_digest_key.len != 0 or
+        plan.envelope.body_key.len != 0 or
+        plan.envelope.body_digest_key.len != 0 or
+        plan.envelope.event_digest_key.len != 0 or
+        plan.sequence_start != 0 or
+        plan.genesis != .null or
+        (plan.reducer_plan == null) == (plan.state_reducer_plan == null) or
+        (plan.reducer_plan != null and
+            plan.reducer_plan.?.event_kind == null))
+    {
+        return error.InvalidPlainProtocolPlan;
+    }
+}
+
+fn validateChainedPlan(plan: *const Plan) !void {
+    if (plan.envelope.keys.len == 0 or
+        plan.envelope.keys.len > 64 or
+        plan.sequence_start > std.math.maxInt(i64))
+    {
+        return error.InvalidProtocolPlan;
+    }
+    try validateSortedStringSet(plan.envelope.keys);
+    try validateChainedPartitionBindings(
+        plan.envelope.partition_bindings,
+    );
+    try validateChainedEnvelopeFields(&plan.envelope);
+    switch (plan.genesis) {
+        .null => {},
+        .digest => |digest| try definition_core.json.digest(digest),
+    }
+}
+
+fn validateChainedPartitionBindings(
+    bindings: []const PartitionBinding,
+) !void {
+    if (bindings.len > 32) {
+        return error.InvalidProtocolPartitionBindings;
+    }
+    for (bindings, 0..) |binding, index| {
+        try definition_core.json.safeIdentifier(binding.parameter, 128);
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                bindings[index - 1].parameter,
+                binding.parameter,
+            ) != .lt)
+        {
+            return error.InvalidProtocolPartitionBindings;
+        }
+    }
+}
+
+fn validateChainedEnvelopeFields(envelope: *const Envelope) !void {
+    const fields = [_][]const u8{
+        envelope.sequence_key,
+        envelope.kind_key,
+        envelope.previous_digest_key,
+        envelope.body_key,
+        envelope.body_digest_key,
+        envelope.event_digest_key,
+    };
+    for (fields, 0..) |field, index| {
+        try definition_core.json.safeIdentifier(field, 256);
+        if (!containsSorted(envelope.keys, field)) {
+            return error.EventEnvelopeFieldNotDeclared;
+        }
+        for (fields[0..index]) |prior| {
+            if (std.mem.eql(u8, prior, field)) {
+                return error.DuplicateEventEnvelopeField;
+            }
+        }
     }
 }
 
@@ -4024,52 +4678,570 @@ fn eventAlloc(
     );
 }
 
+const protocol_test_schema =
+    "\"schema\":\"ledger-artifact-definition/v1\",";
+const protocol_test_owner = "\"owner\":\"example\",";
+const protocol_test_event_input =
+    "\"parameters\":{},\"inputs\":{\"event\":{\"codec\":\"json\"," ++
+    "\"max_bytes\":4096}},\"canonicalization\":{},";
+const protocol_test_envelope_shape =
+    "\"shape\":{\"rules\":[{\"op\":\"event-envelope\",\"input\":\"event\"," ++
+    "\"keys\":[\"body\",\"body_digest\",\"event_digest\",\"kind\"," ++
+    "\"previous_digest\",\"sequence\"],\"sequence\":\"/sequence\"," ++
+    "\"kind\":\"/kind\",\"previous_digest\":\"/previous_digest\"," ++
+    "\"body\":\"/body\",\"body_digest\":\"/body_digest\"," ++
+    "\"event_digest\":\"/event_digest\"}]},";
+const protocol_test_append_operation =
+    "\"operations\":{\"append\":{\"effects\":[{\"op\":\"compare-and-append\"," ++
+    "\"slot\":\"events\",\"input\":\"event\"}]}},";
+const protocol_test_bounds_2 =
+    "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":65536," ++
+    "\"max_records\":2,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":4}}";
+const protocol_test_bounds_4 =
+    "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":65536," ++
+    "\"max_records\":4,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":4}}";
+
+const chained_protocol_definition =
+    "{" ++ protocol_test_schema ++
+    "\"id\":\"example/protocol\"," ++ protocol_test_owner ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"body-digest\",\"compare-and-append\",\"event-digest\"," ++
+    "\"event-envelope\",\"event-kinds\",\"previous-digest\",\"replay\"," ++
+    "\"sequence\"]}," ++ protocol_test_event_input ++
+    protocol_test_envelope_shape ++
+    "\"constraints\":[{\"op\":\"sequence\",\"start\":1}," ++
+    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
+    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
+    "\"values\":[\"created\",\"updated\"]}],\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"example/events.jsonl\",\"kind\":\"event-log\"," ++
+    "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
+    protocol_test_append_operation ++ "\"projections\":{}," ++
+    protocol_test_bounds_2;
+
+const retained_protocol_definition =
+    "{" ++ protocol_test_schema ++
+    "\"id\":\"example/retained-protocol\"," ++ protocol_test_owner ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"body-digest\",\"compare-and-append\",\"cross-input-equal\"," ++
+    "\"event-digest\",\"event-envelope\",\"event-kinds\"," ++
+    "\"previous-digest\",\"reducer\",\"replay\",\"sequence\"]}," ++
+    protocol_test_event_input ++ protocol_test_envelope_shape ++
+    "\"constraints\":[{\"op\":\"sequence\",\"start\":1}," ++
+    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
+    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
+    "\"values\":[\"created\",\"updated\"]},{\"op\":\"reducer\"," ++
+    "\"mode\":\"retained\",\"event_kind\":\"/kind\"," ++
+    "\"registers\":[{\"name\":\"current\",\"max_bytes\":4096}]," ++
+    "\"admissions\":[{\"on\":\"created\",\"requires\":[]," ++
+    "\"forbids\":[\"current\"],\"rules\":[],\"actions\":[{\"op\":\"set\"," ++
+    "\"register\":\"current\",\"input\":\"event\",\"path\":\"/body\"}]}," ++
+    "{\"on\":\"updated\",\"requires\":[\"current\"],\"forbids\":[]," ++
+    "\"rules\":[{\"op\":\"cross-input-equal\",\"input\":\"event\"," ++
+    "\"left_input\":\"event\",\"left\":\"/body/id\"," ++
+    "\"right_input\":\"current\",\"right\":\"/id\"}]," ++
+    "\"actions\":[{\"op\":\"set\",\"register\":\"current\"," ++
+    "\"input\":\"event\",\"path\":\"/body\"}]}]}],\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"example/retained.jsonl\",\"kind\":\"event-log\"," ++
+    "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
+    protocol_test_append_operation ++ "\"projections\":{}," ++
+    protocol_test_bounds_4;
+
+const invalid_protocol_definition =
+    "{" ++ protocol_test_schema ++
+    "\"id\":\"example/protocol-errors\"," ++ protocol_test_owner ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"body-digest\",\"compare-and-append\",\"event-digest\"," ++
+    "\"event-envelope\",\"event-kinds\",\"previous-digest\",\"replay\"," ++
+    "\"sequence\"]}," ++ protocol_test_event_input ++
+    protocol_test_envelope_shape ++
+    "\"constraints\":[{\"op\":\"sequence\",\"start\":0}," ++
+    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
+    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
+    "\"values\":[\"accepted\"]}],\"identity\":{}," ++
+    "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
+    "\"path\":\"example/errors.jsonl\",\"kind\":\"event-log\"," ++
+    "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
+    protocol_test_append_operation ++ "\"projections\":{}," ++
+    protocol_test_bounds_4;
+
+const request_literals_definition =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/request-literals",
+    \\  "owner":"example",
+    \\  "requires":{
+    \\    "abi":"ledger-artifact-abi/v1",
+    \\    "operators":[
+    \\      "body-digest",
+    \\      "compare-and-append",
+    \\      "enum",
+    \\      "event-digest",
+    \\      "event-envelope",
+    \\      "event-kinds",
+    \\      "event-materialization",
+    \\      "exact-object",
+    \\      "path-format",
+    \\      "previous-digest",
+    \\      "replay",
+    \\      "sequence"
+    \\    ]
+    \\  },
+    \\  "parameters":{
+    \\    "stream":{"type":"safe_identifier","required":true}
+    \\  },
+    \\  "inputs":{
+    \\    "alternate":{"codec":"json","max_bytes":4096},
+    \\    "request":{"codec":"json","max_bytes":4096}
+    \\  },
+    \\  "canonicalization":{},
+    \\  "shape":{"rules":[
+    \\    {
+    \\      "op":"exact-object",
+    \\      "input":"alternate",
+    \\      "path":"",
+    \\      "keys":["body","kind","schema","stream_id"]
+    \\    },
+    \\    {
+    \\      "op":"enum",
+    \\      "input":"alternate",
+    \\      "path":"/schema",
+    \\      "values":["example-alternate/v1"]
+    \\    },
+    \\    {
+    \\      "op":"exact-object",
+    \\      "input":"request",
+    \\      "path":"",
+    \\      "keys":["body","kind","schema","stream_id"]
+    \\    },
+    \\    {
+    \\      "op":"enum",
+    \\      "input":"request",
+    \\      "path":"/schema",
+    \\      "values":["example-request/v1"]
+    \\    },
+    \\    {
+    \\      "op":"event-envelope",
+    \\      "input":"request",
+    \\      "keys":[
+    \\        "body",
+    \\        "body_digest",
+    \\        "event_digest",
+    \\        "kind",
+    \\        "previous_digest",
+    \\        "schema",
+    \\        "sequence",
+    \\        "stream_id"
+    \\      ],
+    \\      "sequence":"/sequence",
+    \\      "kind":"/kind",
+    \\      "previous_digest":"/previous_digest",
+    \\      "body":"/body",
+    \\      "body_digest":"/body_digest",
+    \\      "event_digest":"/event_digest",
+    \\      "partition_bindings":[
+    \\        {"parameter":"stream","event_value":"/stream_id"}
+    \\      ]
+    \\    }
+    \\  ]},
+    \\  "constraints":[
+    \\    {"op":"sequence","start":1},
+    \\    {"op":"previous-digest","genesis":null},
+    \\    {"op":"body-digest"},
+    \\    {"op":"event-digest"},
+    \\    {"op":"event-kinds","values":["created"]}
+    \\  ],
+    \\  "identity":{},
+    \\  "storage":{
+    \\    "kind":"event-log",
+    \\    "slots":{
+    \\      "events":{
+    \\        "path":"example/{stream}/request-literals.jsonl",
+    \\        "kind":"event-log",
+    \\        "codec":"jsonl",
+    \\        "max_bytes":65536
+    \\      }
+    \\    }
+    \\  },
+    \\  "operations":{
+    \\    "append":{"effects":[{
+    \\      "op":"compare-and-append",
+    \\      "slot":"events",
+    \\      "input":"request",
+    \\      "event":{
+    \\        "mode":"chained",
+    \\        "body_input_field":"body",
+    \\        "fields":[
+    \\          {"field":"kind","input_field":"kind"},
+    \\          {"field":"schema","literal":"example-event/v1"},
+    \\          {"field":"stream_id","input_field":"stream_id"}
+    \\        ],
+    \\        "request_literals":[
+    \\          {"field":"schema","literal":"example-request/v1"}
+    \\        ],
+    \\        "body_fields":[
+    \\          {
+    \\            "field":"schema",
+    \\            "literal_mapping":{
+    \\              "request":"example-body-request/v1",
+    \\              "stored":"example-body-event/v1"
+    \\            }
+    \\          },
+    \\          {"field":"stream_id","request_input":"stream_id"}
+    \\        ]
+    \\      }
+    \\    }]},
+    \\    "append-alternate":{"effects":[{
+    \\      "op":"compare-and-append",
+    \\      "slot":"events",
+    \\      "input":"alternate",
+    \\      "event":{
+    \\        "mode":"chained",
+    \\        "body_input_field":"body",
+    \\        "fields":[
+    \\          {"field":"kind","input_field":"kind"},
+    \\          {"field":"schema","literal":"example-event/v1"},
+    \\          {"field":"stream_id","input_field":"stream_id"}
+    \\        ],
+    \\        "request_literals":[
+    \\          {"field":"schema","literal":"example-alternate/v1"}
+    \\        ]
+    \\      }
+    \\    }]}
+    \\  },
+    \\  "projections":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":4096,
+    \\    "max_store_bytes":65536,
+    \\    "max_records":4,
+    \\    "max_output_bytes":4096,
+    \\    "max_diagnostics":8,
+    \\    "max_reducer_states":4
+    \\  }
+    \\}
+;
+
+const plain_derivation_definition =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/derived-events",
+    \\  "owner":"example",
+    \\  "requires":{
+    \\    "abi":"ledger-artifact-abi/v1",
+    \\    "operators":[
+    \\      "compare-and-append",
+    \\      "composite-identity",
+    \\      "event-materialization",
+    \\      "exact-object",
+    \\      "sha256",
+    \\      "timestamp"
+    \\    ]
+    \\  },
+    \\  "parameters":{},
+    \\  "inputs":{
+    \\    "submission":{"codec":"json","max_bytes":4096}
+    \\  },
+    \\  "canonicalization":{},
+    \\  "shape":{"rules":[
+    \\    {
+    \\      "op":"exact-object",
+    \\      "input":"submission",
+    \\      "path":"",
+    \\      "keys":["logical_kind","note","physical_kind"]
+    \\    },
+    \\    {
+    \\      "op":"exact-object",
+    \\      "input":"submission",
+    \\      "path":"/note",
+    \\      "keys":["operation","summary","details"]
+    \\    },
+    \\    {
+    \\      "op":"exact-object",
+    \\      "input":"submission",
+    \\      "path":"/note/details",
+    \\      "keys":["z","a"]
+    \\    }
+    \\  ]},
+    \\  "constraints":[],
+    \\  "identity":{},
+    \\  "storage":{
+    \\    "kind":"event-log",
+    \\    "slots":{
+    \\      "events":{
+    \\        "path":"example/derived-events.jsonl",
+    \\        "kind":"event-log",
+    \\        "codec":"jsonl",
+    \\        "max_bytes":65536
+    \\      }
+    \\    }
+    \\  },
+    \\  "operations":{"capture":{"effects":[{
+    \\    "op":"compare-and-append",
+    \\    "slot":"events",
+    \\    "input":"submission",
+    \\    "event":{
+    \\      "mode":"plain",
+    \\      "body_input_field":"note",
+    \\      "field_order":[
+    \\        "v",
+    \\        "source",
+    \\        "event",
+    \\        "record_id",
+    \\        "captured_at",
+    \\        "kind",
+    \\        "logical_kind",
+    \\        "operation",
+    \\        "note"
+    \\      ],
+    \\      "body_order":[
+    \\        "id",
+    \\        "captured_at",
+    \\        "logical_kind",
+    \\        "kind",
+    \\        "operation",
+    \\        "summary",
+    \\        "details",
+    \\        "fingerprint"
+    \\      ],
+    \\      "fields":[
+    \\        {"field":"v","literal":1},
+    \\        {"field":"source","literal":"example"},
+    \\        {"field":"event","literal":"example.capture"},
+    \\        {"field":"record_id","derived":"record_id"},
+    \\        {"field":"captured_at","derived":"captured_at"},
+    \\        {"field":"kind","input_field":"physical_kind"},
+    \\        {"field":"logical_kind","input_field":"logical_kind"},
+    \\        {"field":"operation","derived":"operation"}
+    \\      ],
+    \\      "derive":[
+    \\        {
+    \\          "name":"physical_kind",
+    \\          "op":"input-text",
+    \\          "pointer":"/physical_kind"
+    \\        },
+    \\        {
+    \\          "name":"logical_kind",
+    \\          "op":"input-text",
+    \\          "pointer":"/logical_kind"
+    \\        },
+    \\        {
+    \\          "name":"operation",
+    \\          "op":"input-text",
+    \\          "pointer":"/note/operation"
+    \\        },
+    \\        {
+    \\          "name":"captured_at",
+    \\          "op":"utc-timestamp",
+    \\          "format":"rfc3339-seconds"
+    \\        },
+    \\        {
+    \\          "name":"fingerprint",
+    \\          "op":"sha256",
+    \\          "encoding":"hex",
+    \\          "fragments":[
+    \\            {"literal":"example\n"},
+    \\            {"input_text":"/physical_kind"},
+    \\            {"literal":"\n"},
+    \\            {"input_text":"/logical_kind"},
+    \\            {"literal":"\n"},
+    \\            {"input_json":"/note"}
+    \\          ],
+    \\          "max_bytes":4096
+    \\        },
+    \\        {
+    \\          "name":"record_id",
+    \\          "op":"concat",
+    \\          "fragments":[
+    \\            {"literal":"EVT-"},
+    \\            {
+    \\              "derived":"captured_at",
+    \\              "transform":"compact-utc"
+    \\            },
+    \\            {"literal":"-"},
+    \\            {"derived":"fingerprint","prefix_bytes":16}
+    \\          ],
+    \\          "max_bytes":64
+    \\        }
+    \\      ],
+    \\      "body_fields":[
+    \\        {"field":"id","derived":"record_id"},
+    \\        {"field":"captured_at","derived":"captured_at"},
+    \\        {"field":"logical_kind","derived":"logical_kind"},
+    \\        {"field":"kind","derived":"physical_kind"},
+    \\        {"field":"fingerprint","derived":"fingerprint"}
+    \\      ]
+    \\    }
+    \\  }]}},
+    \\  "projections":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":4096,
+    \\    "max_store_bytes":65536,
+    \\    "max_records":4,
+    \\    "max_output_bytes":4096,
+    \\    "max_diagnostics":8,
+    \\    "max_reducer_states":1
+    \\  }
+    \\}
+;
+
+const request_literal_input =
+    "{\"schema\":\"example-request/v1\",\"kind\":\"created\"," ++
+    "\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"," ++
+    "\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-1\"}}";
+const request_literal_reconstructed =
+    "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\"," ++
+    "\"stream_id\":\"stream-1\"},\"kind\":\"created\"," ++
+    "\"schema\":\"example-request/v1\",\"stream_id\":\"stream-1\"}";
+const request_literal_tampered_event =
+    "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-wrong/v1\"}," ++
+    "\"body_digest\":\"\",\"event_digest\":\"\",\"kind\":\"created\"," ++
+    "\"previous_digest\":null,\"schema\":\"example-event/v1\"," ++
+    "\"sequence\":1,\"stream_id\":\"stream-1\"}";
+const request_literal_invalid_input =
+    "{\"schema\":\"wrong/v1\",\"kind\":\"created\"," ++
+    "\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"}}";
+const request_literal_mismatched_body =
+    "{\"schema\":\"example-request/v1\",\"kind\":\"created\"," ++
+    "\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"," ++
+    "\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-2\"}}";
+
+const plain_derivation_request =
+    "{\"logical_kind\":\"assertion\",\"note\":{\"details\":{" ++
+    "\"z\":\"last\",\"a\":\"first\"},\"operation\":\"create\"," ++
+    "\"summary\":\"hello\"},\"physical_kind\":\"stored-assertion\"}";
+const plain_derivation_normalized_request =
+    "{\"logical_kind\":\"assertion\",\"note\":{\"operation\":\"create\"," ++
+    "\"summary\":\"hello\",\"details\":{\"z\":\"last\",\"a\":\"first\"}}," ++
+    "\"physical_kind\":\"stored-assertion\"}";
+const plain_derivation_fingerprint =
+    "05ca5d4775e018b752104bc965b93536d64e7344522b63298785b985e423b21f";
+const plain_derivation_event =
+    "{\"v\":1,\"source\":\"example\",\"event\":\"example.capture\"," ++
+    "\"record_id\":\"EVT-20260630T123456Z-05ca5d4775e018b7\"," ++
+    "\"captured_at\":\"2026-06-30T12:34:56Z\"," ++
+    "\"kind\":\"stored-assertion\",\"logical_kind\":\"assertion\"," ++
+    "\"operation\":\"create\",\"note\":{" ++
+    "\"id\":\"EVT-20260630T123456Z-05ca5d4775e018b7\"," ++
+    "\"captured_at\":\"2026-06-30T12:34:56Z\"," ++
+    "\"logical_kind\":\"assertion\",\"kind\":\"stored-assertion\"," ++
+    "\"operation\":\"create\",\"summary\":\"hello\"," ++
+    "\"details\":{\"z\":\"last\",\"a\":\"first\"}," ++
+    "\"fingerprint\":\"" ++ plain_derivation_fingerprint ++ "\"}}";
+
+const ProtocolTestPlans = struct {
+    tmp: std.testing.TmpDir,
+    closure: definition_core.closure.Closure,
+    definition_plan: definition.Plan,
+    storage_plan: storage.Plan,
+    plan: ?Plan,
+
+    fn init(source: []const u8) !ProtocolTestPlans {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "protocol.json",
+            .data = source,
+        });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            &tmp.dir,
+            "protocol.json",
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            "protocol.json",
+        );
+        errdefer definition_plan.deinit(std.testing.allocator);
+        var storage_plan = try storage.compile(
+            std.testing.allocator,
+            &definition_plan,
+        );
+        errdefer storage_plan.deinit(std.testing.allocator);
+        var plan = try compile(
+            std.testing.allocator,
+            &definition_plan,
+            &storage_plan,
+        );
+        errdefer if (plan) |*compiled| {
+            compiled.deinit(std.testing.allocator);
+        };
+        return .{
+            .tmp = tmp,
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .storage_plan = storage_plan,
+            .plan = plan,
+        };
+    }
+
+    fn deinit(self: *ProtocolTestPlans) void {
+        if (self.plan) |*plan| plan.deinit(std.testing.allocator);
+        self.storage_plan.deinit(std.testing.allocator);
+        self.definition_plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.tmp.cleanup();
+        self.* = undefined;
+    }
+
+    fn protocol(self: *const ProtocolTestPlans) *const Plan {
+        return &self.plan.?;
+    }
+
+    fn cacheProtocol(self: *const ProtocolTestPlans) !Plan {
+        const plan = self.protocol();
+        var encoder = definition_core.cache.Encoder.init(
+            std.testing.allocator,
+            256 * 1024,
+        );
+        defer encoder.deinit();
+        try encodeCache(plan, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        defer std.testing.allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var cached = try decodeCache(std.testing.allocator, &decoder);
+        errdefer cached.deinit(std.testing.allocator);
+        try decoder.finish();
+        try validateCachePlan(
+            &cached,
+            &self.definition_plan,
+            &self.storage_plan,
+        );
+        return cached;
+    }
+
+    fn cacheStorage(self: *const ProtocolTestPlans) !storage.Plan {
+        var encoder = definition_core.cache.Encoder.init(
+            std.testing.allocator,
+            256 * 1024,
+        );
+        defer encoder.deinit();
+        try storage.encodeCache(&self.storage_plan, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        defer std.testing.allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var cached = try storage.decodeCache(
+            std.testing.allocator,
+            &decoder,
+        );
+        errdefer cached.deinit(std.testing.allocator);
+        try decoder.finish();
+        try storage.validateCachePlan(&cached, &self.definition_plan);
+        return cached;
+    }
+};
+
 test "compiled event protocol validates exact chained envelopes" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":2,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer storage_plan.deinit(std.testing.allocator);
-    var plan = (try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
-    )).?;
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
+    var plans = try ProtocolTestPlans.init(chained_protocol_definition);
+    defer plans.deinit();
+    const plan = plans.protocol();
+    var cached = try plans.cacheProtocol();
     defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan, &storage_plan);
     try std.testing.expectEqualStrings(
         plan.envelope.event_digest_key,
         cached.envelope.event_digest_key,
@@ -4078,7 +5250,7 @@ test "compiled event protocol validates exact chained envelopes" {
         plan.event_kinds[1],
         cached.event_kinds[1],
     );
-    var state = ReplayState.init(&plan);
+    var state = ReplayState.init(plan);
     defer state.deinit(std.testing.allocator);
     const first = try eventAlloc(
         std.testing.allocator,
@@ -4088,11 +5260,11 @@ test "compiled event protocol validates exact chained envelopes" {
         "{\"id\":\"item-1\",\"status\":\"open\"}",
     );
     defer std.testing.allocator.free(first);
-    try apply(std.testing.allocator, &plan, &state, first);
+    try apply(std.testing.allocator, plan, &state, first);
     try std.testing.expectEqual(@as(usize, 1), state.records);
     try std.testing.expectError(
         error.EventSequenceMismatch,
-        apply(std.testing.allocator, &plan, &state, first),
+        apply(std.testing.allocator, plan, &state, first),
     );
     const second = try eventAlloc(
         std.testing.allocator,
@@ -4102,7 +5274,7 @@ test "compiled event protocol validates exact chained envelopes" {
         "{\"id\":\"item-1\",\"status\":\"closed\"}",
     );
     defer std.testing.allocator.free(second);
-    try apply(std.testing.allocator, &plan, &state, second);
+    try apply(std.testing.allocator, plan, &state, second);
     try std.testing.expectEqual(@as(usize, 2), state.records);
     const third = try eventAlloc(
         std.testing.allocator,
@@ -4114,58 +5286,18 @@ test "compiled event protocol validates exact chained envelopes" {
     defer std.testing.allocator.free(third);
     try std.testing.expectError(
         error.ProtocolRecordBoundsExceeded,
-        apply(std.testing.allocator, &plan, &state, third),
+        apply(std.testing.allocator, plan, &state, third),
     );
 }
 
 test "retained reducer validates events against compiled current state" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/retained-protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","cross-input-equal","event-digest","event-envelope","event-kinds","previous-digest","reducer","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":1},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["created","updated"]},{"op":"reducer","mode":"retained","event_kind":"/kind","registers":[{"name":"current","max_bytes":4096}],"admissions":[{"on":"created","requires":[],"forbids":["current"],"rules":[],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]},{"on":"updated","requires":["current"],"forbids":[],"rules":[{"op":"cross-input-equal","input":"event","left_input":"event","left":"/body/id","right_input":"current","right":"/id"}],"actions":[{"op":"set","register":"current","input":"event","path":"/body"}]}]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/retained.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer storage_plan.deinit(std.testing.allocator);
-    var plan = (try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
-    )).?;
-    defer plan.deinit(std.testing.allocator);
+    var plans = try ProtocolTestPlans.init(retained_protocol_definition);
+    defer plans.deinit();
+    const plan = plans.protocol();
     try std.testing.expect(plan.reducer_plan == null);
     try std.testing.expect(plan.state_reducer_plan != null);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
+    var cached = try plans.cacheProtocol();
     defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan, &storage_plan);
 
     var state = ReplayState.init(&cached);
     defer state.deinit(std.testing.allocator);
@@ -4219,104 +5351,13 @@ test "retained reducer validates events against compiled current state" {
 }
 
 test "event materialization reconstructs validated request literals" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{
-        \\  "schema":"ledger-artifact-definition/v1",
-        \\  "id":"example/request-literals",
-        \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","event-materialization","exact-object","path-format","previous-digest","replay","sequence"]},
-        \\  "parameters":{"stream":{"type":"safe_identifier","required":true}},
-        \\  "inputs":{
-        \\    "alternate":{"codec":"json","max_bytes":4096},
-        \\    "request":{"codec":"json","max_bytes":4096}
-        \\  },
-        \\  "canonicalization":{},
-        \\  "shape":{"rules":[
-        \\    {"op":"exact-object","input":"alternate","path":"","keys":["body","kind","schema","stream_id"]},
-        \\    {"op":"enum","input":"alternate","path":"/schema","values":["example-alternate/v1"]},
-        \\    {"op":"exact-object","input":"request","path":"","keys":["body","kind","schema","stream_id"]},
-        \\    {"op":"enum","input":"request","path":"/schema","values":["example-request/v1"]},
-        \\    {"op":"event-envelope","input":"request","keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}
-        \\  ]},
-        \\  "constraints":[
-        \\    {"op":"sequence","start":1},
-        \\    {"op":"previous-digest","genesis":null},
-        \\    {"op":"body-digest"},
-        \\    {"op":"event-digest"},
-        \\    {"op":"event-kinds","values":["created"]}
-        \\  ],
-        \\  "identity":{},
-        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
-        \\  "operations":{
-        \\    "append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{"mode":"chained",
-        \\      "body_input_field":"body",
-        \\      "fields":[
-        \\        {"field":"kind","input_field":"kind"},
-        \\        {"field":"schema","literal":"example-event/v1"},
-        \\        {"field":"stream_id","input_field":"stream_id"}
-        \\      ],
-        \\      "request_literals":[{"field":"schema","literal":"example-request/v1"}],
-        \\      "body_fields":[
-        \\        {"field":"schema","literal_mapping":{"request":"example-body-request/v1","stored":"example-body-event/v1"}},
-        \\        {"field":"stream_id","request_input":"stream_id"}
-        \\      ]
-        \\    }}]},
-        \\    "append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{"mode":"chained",
-        \\      "body_input_field":"body",
-        \\      "fields":[
-        \\        {"field":"kind","input_field":"kind"},
-        \\        {"field":"schema","literal":"example-event/v1"},
-        \\        {"field":"stream_id","input_field":"stream_id"}
-        \\      ],
-        \\      "request_literals":[{"field":"schema","literal":"example-alternate/v1"}]
-        \\    }}]}
-        \\  },
-        \\  "projections":{},
-        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}
-        \\}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer storage_plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try storage.encodeCache(&storage_plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached_storage = try storage.decodeCache(
-        std.testing.allocator,
-        &decoder,
-    );
+    var plans = try ProtocolTestPlans.init(request_literals_definition);
+    defer plans.deinit();
+    var cached_storage = try plans.cacheStorage();
     defer cached_storage.deinit(std.testing.allocator);
-    try decoder.finish();
-    try storage.validateCachePlan(&cached_storage, &definition_plan);
     var plan = (try compile(
         std.testing.allocator,
-        &definition_plan,
+        &plans.definition_plan,
         &cached_storage,
     )).?;
     defer plan.deinit(std.testing.allocator);
@@ -4326,25 +5367,48 @@ test "event materialization reconstructs validated request literals" {
         @as(usize, 1),
         materialization.request_literals.len,
     );
-
     var state = ReplayState.init(&plan);
     defer state.deinit(std.testing.allocator);
+    const event = try verifyMaterializedRequestRoundTrip(
+        &plan,
+        &state,
+        materialization,
+    );
+    defer std.testing.allocator.free(event);
+    try verifyMaterializedPartitionBinding(
+        &plans.definition_plan,
+        &plan,
+        &state,
+        event,
+    );
+    try verifyMaterializedRequestRejections(
+        &plan,
+        &state,
+        materialization,
+    );
+}
+
+fn verifyMaterializedRequestRoundTrip(
+    plan: *const Plan,
+    state: *ReplayState,
+    materialization: *const storage.EventMaterialization,
+) ![]u8 {
     var request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-1\"}}",
+        request_literal_input,
         .{ .allocate = .alloc_always },
     );
     defer request.deinit();
     const event = try materializeEventAlloc(
         std.testing.allocator,
-        &plan,
-        &state,
+        plan,
+        state,
         materialization,
         request.value,
         7,
     );
-    defer std.testing.allocator.free(event);
+    errdefer std.testing.allocator.free(event);
     try std.testing.expect(
         std.mem.indexOf(
             u8,
@@ -4359,6 +5423,21 @@ test "event materialization reconstructs validated request literals" {
             "\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-event/v1\"}",
         ) != null,
     );
+    try verifyReconstructedRequestLiterals(
+        plan,
+        state,
+        materialization,
+        event,
+    );
+    return event;
+}
+
+fn verifyReconstructedRequestLiterals(
+    plan: *const Plan,
+    state: *ReplayState,
+    materialization: *const storage.EventMaterialization,
+    event: []const u8,
+) !void {
     var parsed_event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -4368,20 +5447,20 @@ test "event materialization reconstructs validated request literals" {
     defer parsed_event.deinit();
     const reconstructed = try reconstructInputAlloc(
         std.testing.allocator,
-        &plan,
-        &state,
+        plan,
+        state,
         materialization,
         parsed_event.value,
     );
     defer std.testing.allocator.free(reconstructed);
     try std.testing.expectEqualStrings(
-        "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-1\"},\"kind\":\"created\",\"schema\":\"example-request/v1\",\"stream_id\":\"stream-1\"}",
+        request_literal_reconstructed,
         reconstructed,
     );
     var tampered_event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-wrong/v1\"},\"body_digest\":\"\",\"event_digest\":\"\",\"kind\":\"created\",\"previous_digest\":null,\"schema\":\"example-event/v1\",\"sequence\":1,\"stream_id\":\"stream-1\"}",
+        request_literal_tampered_event,
         .{ .allocate = .alloc_always },
     );
     defer tampered_event.deinit();
@@ -4389,12 +5468,20 @@ test "event materialization reconstructs validated request literals" {
         error.EventLiteralMismatch,
         reconstructInputAlloc(
             std.testing.allocator,
-            &plan,
-            &state,
+            plan,
+            state,
             materialization,
             tampered_event.value,
         ),
     );
+}
+
+fn verifyMaterializedPartitionBinding(
+    definition_plan: *const definition.Plan,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: []const u8,
+) !void {
     var parameters = try definition_core.parameters.bind(
         std.testing.allocator,
         &definition_plan.parameter_declarations,
@@ -4403,8 +5490,8 @@ test "event materialization reconstructs validated request literals" {
     defer parameters.deinit(std.testing.allocator);
     try applyBound(
         std.testing.allocator,
-        &plan,
-        &state,
+        plan,
+        state,
         event,
         &parameters,
     );
@@ -4414,13 +5501,13 @@ test "event materialization reconstructs validated request literals" {
         &.{.{ .name = "stream", .raw_value = "stream-2" }},
     );
     defer wrong_parameters.deinit(std.testing.allocator);
-    var wrong_state = ReplayState.init(&plan);
+    var wrong_state = ReplayState.init(plan);
     defer wrong_state.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.EventPartitionValueMismatch,
         applyBound(
             std.testing.allocator,
-            &plan,
+            plan,
             &wrong_state,
             event,
             &wrong_parameters,
@@ -4430,16 +5517,22 @@ test "event materialization reconstructs validated request literals" {
         error.ProtocolPartitionParametersMissing,
         apply(
             std.testing.allocator,
-            &plan,
+            plan,
             &wrong_state,
             event,
         ),
     );
+}
 
+fn verifyMaterializedRequestRejections(
+    plan: *const Plan,
+    state: *ReplayState,
+    materialization: *const storage.EventMaterialization,
+) !void {
     var invalid_request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"wrong/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\"}}",
+        request_literal_invalid_input,
         .{ .allocate = .alloc_always },
     );
     defer invalid_request.deinit();
@@ -4447,8 +5540,8 @@ test "event materialization reconstructs validated request literals" {
         error.EventRequestLiteralMismatch,
         materializeEventAlloc(
             std.testing.allocator,
-            &plan,
-            &state,
+            plan,
+            state,
             materialization,
             invalid_request.value,
             7,
@@ -4457,7 +5550,7 @@ test "event materialization reconstructs validated request literals" {
     var mismatched_body_input = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"schema\":\"example-request/v1\",\"kind\":\"created\",\"stream_id\":\"stream-1\",\"body\":{\"id\":\"item-1\",\"schema\":\"example-body-request/v1\",\"stream_id\":\"stream-2\"}}",
+        request_literal_mismatched_body,
         .{ .allocate = .alloc_always },
     );
     defer mismatched_body_input.deinit();
@@ -4465,8 +5558,8 @@ test "event materialization reconstructs validated request literals" {
         error.EventBodyRequestInputMismatch,
         materializeEventAlloc(
             std.testing.allocator,
-            &plan,
-            &state,
+            plan,
+            state,
             materialization,
             mismatched_body_input.value,
             7,
@@ -4475,40 +5568,11 @@ test "event materialization reconstructs validated request literals" {
 }
 
 test "event protocol rejects unknown kinds and broken digest links" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/protocol-errors","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","previous-digest","replay","sequence"]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"event-envelope","input":"event","keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest"}]},"constraints":[{"op":"sequence","start":0},{"op":"previous-digest","genesis":null},{"op":"body-digest"},{"op":"event-digest"},{"op":"event-kinds","values":["accepted"]}],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/errors.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer storage_plan.deinit(std.testing.allocator);
-    var plan = (try compile(
-        std.testing.allocator,
-        &definition_plan,
-        &storage_plan,
-    )).?;
-    defer plan.deinit(std.testing.allocator);
+    var plans = try ProtocolTestPlans.init(invalid_protocol_definition);
+    defer plans.deinit();
+    const plan = plans.protocol();
 
-    var unknown_state = ReplayState.init(&plan);
+    var unknown_state = ReplayState.init(plan);
     defer unknown_state.deinit(std.testing.allocator);
     const unknown = try eventAlloc(
         std.testing.allocator,
@@ -4520,10 +5584,10 @@ test "event protocol rejects unknown kinds and broken digest links" {
     defer std.testing.allocator.free(unknown);
     try std.testing.expectError(
         error.UnknownEventKind,
-        apply(std.testing.allocator, &plan, &unknown_state, unknown),
+        apply(std.testing.allocator, plan, &unknown_state, unknown),
     );
 
-    var linked_state = ReplayState.init(&plan);
+    var linked_state = ReplayState.init(plan);
     defer linked_state.deinit(std.testing.allocator);
     const first = try eventAlloc(
         std.testing.allocator,
@@ -4533,7 +5597,7 @@ test "event protocol rejects unknown kinds and broken digest links" {
         "{\"id\":\"item-1\"}",
     );
     defer std.testing.allocator.free(first);
-    try apply(std.testing.allocator, &plan, &linked_state, first);
+    try apply(std.testing.allocator, plan, &linked_state, first);
     const broken = try eventAlloc(
         std.testing.allocator,
         1,
@@ -4544,125 +5608,20 @@ test "event protocol rejects unknown kinds and broken digest links" {
     defer std.testing.allocator.free(broken);
     try std.testing.expectError(
         error.EventPreviousDigestMismatch,
-        apply(std.testing.allocator, &plan, &linked_state, broken),
+        apply(std.testing.allocator, plan, &linked_state, broken),
     );
 }
 
 test "plain event derivations preserve timestamp fingerprint and identity" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "protocol.json",
-        .data =
-        \\{
-        \\  "schema":"ledger-artifact-definition/v1",
-        \\  "id":"example/derived-events",
-        \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","composite-identity","event-materialization","exact-object","sha256","timestamp"]},
-        \\  "parameters":{},
-        \\  "inputs":{"submission":{"codec":"json","max_bytes":4096}},
-        \\  "canonicalization":{},
-        \\  "shape":{"rules":[
-        \\    {"op":"exact-object","input":"submission","path":"","keys":["logical_kind","note","physical_kind"]},
-        \\    {"op":"exact-object","input":"submission","path":"/note","keys":["operation","summary","details"]},
-        \\    {"op":"exact-object","input":"submission","path":"/note/details","keys":["z","a"]}
-        \\  ]},
-        \\  "constraints":[],
-        \\  "identity":{},
-        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/derived-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
-        \\  "operations":{"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{
-        \\    "mode":"plain",
-        \\    "body_input_field":"note",
-        \\    "field_order":["v","source","event","record_id","captured_at","kind","logical_kind","operation","note"],
-        \\    "body_order":["id","captured_at","logical_kind","kind","operation","summary","details","fingerprint"],
-        \\    "fields":[
-        \\      {"field":"v","literal":1},
-        \\      {"field":"source","literal":"example"},
-        \\      {"field":"event","literal":"example.capture"},
-        \\      {"field":"record_id","derived":"record_id"},
-        \\      {"field":"captured_at","derived":"captured_at"},
-        \\      {"field":"kind","input_field":"physical_kind"},
-        \\      {"field":"logical_kind","input_field":"logical_kind"},
-        \\      {"field":"operation","derived":"operation"}
-        \\    ],
-        \\    "derive":[
-        \\      {"name":"physical_kind","op":"input-text","pointer":"/physical_kind"},
-        \\      {"name":"logical_kind","op":"input-text","pointer":"/logical_kind"},
-        \\      {"name":"operation","op":"input-text","pointer":"/note/operation"},
-        \\      {"name":"captured_at","op":"utc-timestamp","format":"rfc3339-seconds"},
-        \\      {"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[
-        \\        {"literal":"example\n"},
-        \\        {"input_text":"/physical_kind"},
-        \\        {"literal":"\n"},
-        \\        {"input_text":"/logical_kind"},
-        \\        {"literal":"\n"},
-        \\        {"input_json":"/note"}
-        \\      ],"max_bytes":4096},
-        \\      {"name":"record_id","op":"concat","fragments":[
-        \\        {"literal":"EVT-"},
-        \\        {"derived":"captured_at","transform":"compact-utc"},
-        \\        {"literal":"-"},
-        \\        {"derived":"fingerprint","prefix_bytes":16}
-        \\      ],"max_bytes":64}
-        \\    ],
-        \\    "body_fields":[
-        \\      {"field":"id","derived":"record_id"},
-        \\      {"field":"captured_at","derived":"captured_at"},
-        \\      {"field":"logical_kind","derived":"logical_kind"},
-        \\      {"field":"kind","derived":"physical_kind"},
-        \\      {"field":"fingerprint","derived":"fingerprint"}
-        \\    ]
-        \\  }}]}},
-        \\  "projections":{},
-        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}
-        \\}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "protocol.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "protocol.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var storage_plan = try storage.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer storage_plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try storage.encodeCache(&storage_plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try storage.decodeCache(
-        std.testing.allocator,
-        &decoder,
-    );
+    var plans = try ProtocolTestPlans.init(plain_derivation_definition);
+    defer plans.deinit();
+    var cached = try plans.cacheStorage();
     defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try storage.validateCachePlan(&cached, &definition_plan);
     const materialization = &cached.operations[0].effects[0].event.?;
-    const request =
-        \\{"logical_kind":"assertion","note":{"details":{"z":"last","a":"first"},"operation":"create","summary":"hello"},"physical_kind":"stored-assertion"}
-    ;
-    const normalized_request =
-        \\{"logical_kind":"assertion","note":{"operation":"create","summary":"hello","details":{"z":"last","a":"first"}},"physical_kind":"stored-assertion"}
-    ;
     var parsed_request = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        request,
+        plain_derivation_request,
         .{ .allocate = .alloc_always },
     );
     defer parsed_request.deinit();
@@ -4676,11 +5635,14 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         std.testing.io,
     );
     defer materialized.deinit(std.testing.allocator);
-    const expected =
-        \\{"v":1,"source":"example","event":"example.capture","record_id":"EVT-20260630T123456Z-05ca5d4775e018b7","captured_at":"2026-06-30T12:34:56Z","kind":"stored-assertion","logical_kind":"assertion","operation":"create","note":{"id":"EVT-20260630T123456Z-05ca5d4775e018b7","captured_at":"2026-06-30T12:34:56Z","logical_kind":"assertion","kind":"stored-assertion","operation":"create","summary":"hello","details":{"z":"last","a":"first"},"fingerprint":"05ca5d4775e018b752104bc965b93536d64e7344522b63298785b985e423b21f"}}
-    ;
-    try std.testing.expectEqualStrings(expected, materialized.content);
-    try std.testing.expectEqual(@as(usize, 6), materialized.generated_outputs.len);
+    try std.testing.expectEqualStrings(
+        plain_derivation_event,
+        materialized.content,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 6),
+        materialized.generated_outputs.len,
+    );
     var parsed_event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -4695,13 +5657,25 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         parsed_event.value,
     );
     defer std.testing.allocator.free(reconstructed);
-    try std.testing.expectEqualStrings(normalized_request, reconstructed);
+    try std.testing.expectEqualStrings(
+        plain_derivation_normalized_request,
+        reconstructed,
+    );
+    try verifyPlainDerivationTampering(
+        materialization,
+        materialized.content,
+    );
+}
 
+fn verifyPlainDerivationTampering(
+    materialization: *const storage.EventMaterialization,
+    content: []const u8,
+) !void {
     const tampered = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
-        materialized.content,
-        "05ca5d4775e018b752104bc965b93536d64e7344522b63298785b985e423b21f",
+        content,
+        plain_derivation_fingerprint,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
     defer std.testing.allocator.free(tampered);
