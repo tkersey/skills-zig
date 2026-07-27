@@ -744,6 +744,7 @@ fn validateExistingEvent(
                 }
                 break :plain try protocol.reconstructPlainInputAlloc(
                     allocator,
+                    protocol_state,
                     &materialized,
                     parsed.value,
                 );
@@ -1106,6 +1107,7 @@ fn prepareEffect(
                 }
                 break :plain try protocol.materializePlainEvent(
                     allocator,
+                    if (protocol_state) |*state| state else null,
                     event_materialization,
                     execution.inputJson(effect.input_index) orelse
                         return error.ProtocolInputMustBeJson,

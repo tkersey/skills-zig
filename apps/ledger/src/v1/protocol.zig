@@ -991,6 +991,7 @@ pub fn materializeEvent(
         materialization,
         materialization.generate,
         materialization.derive,
+        state,
         request,
         unix_seconds,
         io,
@@ -1067,6 +1068,7 @@ pub fn materializeEvent(
 
 pub fn materializePlainEvent(
     allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
     materialization: *const storage.EventMaterialization,
     request: std.json.Value,
     parameters: ?*const definition_core.parameters.Bindings,
@@ -1092,6 +1094,7 @@ pub fn materializePlainEvent(
         materialization,
         materialization.generate,
         materialization.derive,
+        state,
         request,
         unix_seconds,
         io,
@@ -1106,7 +1109,10 @@ pub fn materializePlainEvent(
         body,
         generated_outputs,
         parameters,
-        materialization.body_order,
+        if (materialization.body_order.len == 0)
+            null
+        else
+            materialization.body_order,
     );
     defer allocator.free(materialized_body);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -1166,6 +1172,7 @@ pub fn derivePlainIdempotencyKeyAlloc(
         allocator,
         materialization,
         derivation.*,
+        null,
         request,
         0,
         &.{},
@@ -1184,10 +1191,13 @@ pub fn storedPlainDerivedValue(
         return error.EventMaterializationModeMismatch;
     }
     const event_object = try definition_core.json.object(event);
-    const body = try definition_core.json.object(
-        event_object.get(materialization.body_input_field) orelse
-            return error.EventEnvelopeFieldMissing,
-    );
+    const body_value = event_object.get(
+        materialization.body_input_field,
+    ) orelse return error.EventEnvelopeFieldMissing;
+    const body = switch (body_value) {
+        .object => |object| object,
+        else => null,
+    };
     return storedEventDerivedValue(
         materialization,
         event_object,
@@ -1272,6 +1282,7 @@ pub fn reconstructInputAlloc(
     errdefer allocator.free(reconstructed);
     try validateStoredEventDerivations(
         allocator,
+        state,
         materialization,
         event_object,
         plan.envelope.body_key,
@@ -1282,6 +1293,7 @@ pub fn reconstructInputAlloc(
 
 pub fn reconstructPlainInputAlloc(
     allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
     materialization: *const storage.EventMaterialization,
     event: std.json.Value,
 ) ![]u8 {
@@ -1300,6 +1312,7 @@ pub fn reconstructPlainInputAlloc(
     errdefer allocator.free(reconstructed);
     try validateStoredEventDerivations(
         allocator,
+        state,
         materialization,
         event_object,
         materialization.body_input_field,
@@ -1310,6 +1323,7 @@ pub fn reconstructPlainInputAlloc(
 
 fn validateStoredEventDerivations(
     allocator: std.mem.Allocator,
+    state: ?*const ReplayState,
     materialization: *const storage.EventMaterialization,
     event: std.json.ObjectMap,
     body_key: []const u8,
@@ -1326,9 +1340,12 @@ fn validateStoredEventDerivations(
         },
     );
     defer parsed.deinit();
-    const body = try definition_core.json.object(
-        event.get(body_key) orelse return error.EventEnvelopeFieldMissing,
-    );
+    const body_value = event.get(body_key) orelse
+        return error.EventEnvelopeFieldMissing;
+    const body = switch (body_value) {
+        .object => |object| object,
+        else => null,
+    };
     const outputs = try allocator.alloc(
         GeneratedOutput,
         materialization.derive.len,
@@ -1360,6 +1377,7 @@ fn validateStoredEventDerivations(
                 allocator,
                 materialization,
                 item,
+                state,
                 parsed.value,
                 0,
                 outputs[0..initialized],
@@ -1385,7 +1403,7 @@ fn validateStoredEventDerivations(
 fn storedEventDerivedValue(
     materialization: *const storage.EventMaterialization,
     event: std.json.ObjectMap,
-    body: std.json.ObjectMap,
+    body: ?std.json.ObjectMap,
     name: []const u8,
 ) !?[]const u8 {
     var found: ?[]const u8 = null;
@@ -1405,10 +1423,14 @@ fn storedEventDerivedValue(
         },
         else => {},
     };
+    const body_object = if (materialization.body_fields.len == 0)
+        null
+    else
+        body orelse return error.ExpectedObject;
     for (materialization.body_fields) |field| switch (field.source) {
         .derived => |candidate| {
             if (!std.mem.eql(u8, candidate, name)) continue;
-            const value = body.get(field.field) orelse
+            const value = body_object.?.get(field.field) orelse
                 return error.EventBodyFieldMissing;
             const text = try definition_core.json.string(value);
             if (found) |prior| {
@@ -1600,6 +1622,7 @@ fn generateOutputsAlloc(
     materialization: *const storage.EventMaterialization,
     definitions: []const storage.SecureTokenGeneration,
     derivations: []const storage.EventDerivation,
+    state: ?*const ReplayState,
     request: std.json.Value,
     unix_seconds: i64,
     io: std.Io,
@@ -1644,6 +1667,7 @@ fn generateOutputsAlloc(
             allocator,
             materialization,
             item,
+            state,
             request,
             unix_seconds,
             outputs[0..initialized],
@@ -1674,6 +1698,7 @@ fn deriveEventValueAlloc(
     allocator: std.mem.Allocator,
     materialization: *const storage.EventMaterialization,
     item: storage.EventDerivation,
+    state: ?*const ReplayState,
     request: std.json.Value,
     unix_seconds: i64,
     prior: []const GeneratedOutput,
@@ -1713,7 +1738,33 @@ fn deriveEventValueAlloc(
             prior,
             config,
         ),
+        .monotonic_identity => |config| deriveMonotonicIdentityAlloc(
+            allocator,
+            state orelse return error.EventProtocolStateMissing,
+            config,
+        ),
     };
+}
+
+fn deriveMonotonicIdentityAlloc(
+    allocator: std.mem.Allocator,
+    state: *const ReplayState,
+    config: storage.EventMonotonicIdentityDerivation,
+) ![]u8 {
+    const suffix = try state.reducer_state.nextMonotonicSuffix(
+        config.prefix,
+    );
+    var digits_buffer: [32]u8 = undefined;
+    const digits = try std.fmt.bufPrint(&digits_buffer, "{d}", .{suffix});
+    const width = @max(@as(usize, config.width), digits.len);
+    const result = try allocator.alloc(u8, config.prefix.len + width);
+    @memcpy(result[0..config.prefix.len], config.prefix);
+    @memset(
+        result[config.prefix.len .. config.prefix.len + width - digits.len],
+        '0',
+    );
+    @memcpy(result[result.len - digits.len ..], digits);
+    return result;
 }
 
 fn deriveEventSha1Alloc(
@@ -2516,6 +2567,12 @@ fn canonicalPlainStoredBodyAlloc(
     materialization: *const storage.EventMaterialization,
     body: std.json.Value,
 ) ![]u8 {
+    if (materialization.body_order.len == 0) {
+        return definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            body,
+        );
+    }
     const object = try definition_core.json.object(body);
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
@@ -4611,6 +4668,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     defer parsed_request.deinit();
     var materialized = try materializePlainEvent(
         std.testing.allocator,
+        null,
         materialization,
         parsed_request.value,
         null,
@@ -4632,6 +4690,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     defer parsed_event.deinit();
     const reconstructed = try reconstructPlainInputAlloc(
         std.testing.allocator,
+        null,
         materialization,
         parsed_event.value,
     );
@@ -4657,6 +4716,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         error.EventDerivedValueMismatch,
         reconstructPlainInputAlloc(
             std.testing.allocator,
+            null,
             materialization,
             parsed_tampered.value,
         ),

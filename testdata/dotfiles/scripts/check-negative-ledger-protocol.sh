@@ -14,7 +14,7 @@ command -v jq >/dev/null
 command -v "$ledger_bin" >/dev/null
 [[ -f "$definition" && ! -L "$definition" ]]
 
-scratch=$(mktemp -d)
+scratch=$(mktemp -d /private/tmp/ledger-negative-conformance.XXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 repo="$scratch/repo"
 mkdir -p "$repo/.ledger/negative-ledger"
@@ -127,6 +127,74 @@ jq -e --slurpfile capture "$scratch/capture.json" \
    .[0].source_event_count == 2 and
    .[0].record == $capture[0].record' \
   "$scratch/current-states.json" >/dev/null
+
+transaction_repo="$scratch/transaction-repo"
+mkdir -p "$transaction_repo"
+transaction_repo=$(cd "$transaction_repo" && pwd -P)
+jq -nc \
+  '{
+    record: {
+      record_version: "NER-v2",
+      kind: "realization_route",
+      route_id: "route-a",
+      hypothesis: "The bounded route did not work.",
+      source_refs: [{kind: "test", ref: "generated:capture"}],
+      status: "need-evidence",
+      artifact_state_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      artifact_state_label: "fixture",
+      repository_id: "owner/repo"
+    }
+  }' >"$scratch/capture-request.json"
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation capture \
+  --repo "$transaction_repo" \
+  --input "capture=$scratch/capture-request.json" \
+  --format json >"$scratch/capture-result-1.json"
+jq \
+  '.record.route_id = "route-b" |
+   .record.hypothesis = "A second bounded route did not work."' \
+  "$scratch/capture-request.json" >"$scratch/capture-request-2.json"
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation capture \
+  --repo "$transaction_repo" \
+  --input "capture=$scratch/capture-request-2.json" \
+  --format json >"$scratch/capture-result-2.json"
+jq -e \
+  '.operation == "capture" and
+   .generated_outputs.neg_id == "NEG-000001" and
+   (.generated_outputs.event_id | test("^NLE-[a-f0-9]{24}$"))' \
+  "$scratch/capture-result-1.json" >/dev/null
+jq -e \
+  '.operation == "capture" and
+   .generated_outputs.neg_id == "NEG-000002"' \
+  "$scratch/capture-result-2.json" >/dev/null
+
+jq -nc \
+  '{
+    neg_id: "NEG-000001",
+    from: "need-evidence",
+    to: "stale",
+    reason: "The fixture artifact changed.",
+    criterion_ids: [],
+    criterion_changes: [],
+    source_refs: [{kind: "test", ref: "generated:transition"}]
+  }' >"$scratch/transition-request.json"
+"$ledger_bin" transact \
+  --definition "$definition" \
+  --operation transition \
+  --repo "$transaction_repo" \
+  --input "transition=$scratch/transition-request.json" \
+  --format json >"$scratch/transition-result.json"
+jq -e \
+  '.operation == "transition" and
+   (.returned_content | fromjson |
+    .from == "need-evidence" and .to == "stale" and .status == "stale")' \
+  "$scratch/transition-result.json" >/dev/null
+assert_ledger_doctor_slot_state \
+  "$ledger_bin" "$definition" "$transaction_repo" events \
+  current true 0 "$scratch/doctor-transaction.json"
 
 jq -c \
   '.event_id = "NLE-cccccccccccccccccccccccc" |
@@ -247,4 +315,4 @@ jq -e \
    .storage_mutated == false' \
   "$scratch/gate-invalid.json" >/dev/null
 
-printf 'negative-ledger protocol conformance passed: generated=3 invalid=3 bindings=2 transactions=1 projections=3 route_cases=3\n'
+printf 'negative-ledger protocol conformance passed: generated=3 invalid=3 bindings=2 transactions=4 projections=3 route_cases=3\n'

@@ -262,12 +262,26 @@ pub const EventConcatDerivation = struct {
     }
 };
 
+pub const EventMonotonicIdentityDerivation = struct {
+    prefix: []u8,
+    width: u8,
+
+    fn deinit(
+        self: *EventMonotonicIdentityDerivation,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.prefix);
+        self.* = undefined;
+    }
+};
+
 pub const EventDerivationSource = union(enum) {
     input_text: definition_core.json_pointer.Pointer,
     utc_timestamp: EventTimestampFormat,
     sha1: EventDigestDerivation,
     sha256: EventDigestDerivation,
     concat: EventConcatDerivation,
+    monotonic_identity: EventMonotonicIdentityDerivation,
 
     fn deinit(
         self: *EventDerivationSource,
@@ -278,6 +292,7 @@ pub const EventDerivationSource = union(enum) {
             .utc_timestamp => {},
             .sha1, .sha256 => |*config| config.deinit(allocator),
             .concat => |*config| config.deinit(allocator),
+            .monotonic_identity => |*config| config.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -627,7 +642,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(10);
+    try encoder.writeU16(11);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -741,7 +756,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 10) {
+    if (try decoder.readU16() != 11) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -1265,6 +1280,10 @@ fn encodeEventDerivations(
                     encoder,
                 );
             },
+            .monotonic_identity => |config| {
+                try encoder.writeBytes(config.prefix);
+                try encoder.writeByte(config.width);
+            },
         }
     }
 }
@@ -1353,6 +1372,10 @@ fn decodeEventDerivations(
                     allocator,
                     decoder,
                 ),
+            } },
+            .monotonic_identity => .{ .monotonic_identity = .{
+                .prefix = try decoder.readBytesAlloc(allocator, 64),
+                .width = try decoder.readByte(),
             } },
         };
         errdefer if (source) |*value| value.deinit(allocator);
@@ -2525,6 +2548,31 @@ fn compileEventDerivation(
             ),
             .max_bytes = try compileEventDerivationBound(object),
         } };
+    } else if (std.mem.eql(u8, op, "monotonic-identity")) blk: {
+        if (!definition_plan.requires(.monotonic_identity) or
+            !definition_plan.requires(.reducer))
+        {
+            return error.UndeclaredArtifactOperator;
+        }
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "op", "prefix", "width" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "op", "prefix", "width" },
+        );
+        const width = try definition_core.json.unsigned(
+            object.get("width").?,
+        );
+        break :blk .{ .monotonic_identity = .{
+            .prefix = try allocator.dupe(
+                u8,
+                try definition_core.json.requiredString(object, "prefix"),
+            ),
+            .width = std.math.cast(u8, width) orelse
+                return error.InvalidEventMonotonicIdentity,
+        } };
     } else return error.UnsupportedEventDerivation;
     errdefer source.deinit(allocator);
     return .{ .name = name, .source = source };
@@ -2739,7 +2787,7 @@ fn validateEventDerivationReferences(
     const fragments = switch (item.source) {
         .sha1, .sha256 => |config| config.fragments,
         .concat => |config| config.fragments,
-        .input_text, .utc_timestamp => return,
+        .input_text, .utc_timestamp, .monotonic_identity => return,
     };
     for (fragments) |fragment| switch (fragment) {
         .derived => |reference| {
@@ -3313,9 +3361,7 @@ fn validateEventMaterializationLayout(
             }
         },
         .plain => {
-            if (event.field_order.len != event.fields.len + 1 or
-                event.body_order.len == 0)
-            {
+            if (event.field_order.len != event.fields.len + 1) {
                 return error.EventMaterializationFieldCoverageMismatch;
             }
             var body_count: usize = 0;
@@ -3509,6 +3555,13 @@ fn validateEventMaterializationAgainstDefinition(
                 return error.UndeclaredArtifactOperator;
             }
         },
+        .monotonic_identity => {
+            if (!definition_plan.requires(.monotonic_identity) or
+                !definition_plan.requires(.reducer))
+            {
+                return error.UndeclaredArtifactOperator;
+            }
+        },
     };
     for (event.fields) |field| switch (field.source) {
         .derived => |name| {
@@ -3628,6 +3681,15 @@ fn validateEventDerivation(item: *const EventDerivation) !void {
                 return error.InvalidEventDerivation;
             }
             try validateEventDerivationFragments(config.fragments);
+        },
+        .monotonic_identity => |config| {
+            if (config.prefix.len == 0 or config.prefix.len > 64 or
+                config.width == 0 or config.width > 18 or
+                !std.unicode.utf8ValidateSlice(config.prefix) or
+                std.mem.indexOfScalar(u8, config.prefix, 0) != null)
+            {
+                return error.InvalidEventMonotonicIdentity;
+            }
         },
     }
 }

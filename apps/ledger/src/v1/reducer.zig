@@ -129,6 +129,30 @@ pub const State = struct {
         return self.entries.count();
     }
 
+    pub fn nextMonotonicSuffix(
+        self: *const State,
+        prefix: []const u8,
+    ) !usize {
+        var maximum: usize = 0;
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| {
+            const key = entry.key();
+            if (!std.mem.startsWith(u8, key, prefix) or
+                key.len == prefix.len)
+            {
+                continue;
+            }
+            const suffix = std.fmt.parseInt(
+                usize,
+                key[prefix.len..],
+                10,
+            ) catch continue;
+            if (suffix > maximum) maximum = suffix;
+        }
+        return std.math.add(usize, maximum, 1) catch
+            error.MonotonicIdentityOverflow;
+    }
+
     pub fn get(self: *const State, key: []const u8) ?EntryView {
         var key_digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
@@ -1073,6 +1097,10 @@ test "compiled reducer admits deterministic keyed transitions" {
     try std.testing.expectEqualStrings(
         "[{\"id\":\"item-1\",\"status\":\"closed\"},{\"id\":\"item-2\",\"status\":\"open\"}]",
         projection.written(),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        try state.nextMonotonicSuffix("item-"),
     );
     var third_key = try std.json.parseFromSlice(
         std.json.Value,

@@ -639,6 +639,7 @@ fn validateEventInput(
                 }
                 break :plain try protocol.reconstructPlainInputAlloc(
                     allocator,
+                    if (protocol_state.*) |*state| state else null,
                     event_materialization,
                     parsed.value,
                 );

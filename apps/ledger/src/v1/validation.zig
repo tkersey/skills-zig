@@ -281,6 +281,7 @@ const Builder = struct {
     rules: std.ArrayList(CompiledRule) = .empty,
     item_rule_count: usize = 0,
     conditional_depth: usize = 0,
+    inherited_input_index: ?u8 = null,
 
     fn deinit(self: *Builder) void {
         for (self.pointers.items) |*pointer| pointer.deinit(self.allocator);
@@ -353,6 +354,7 @@ const Builder = struct {
     fn compileConditionalRules(
         self: *Builder,
         raw: std.json.Value,
+        input_index: u8,
     ) anyerror![]CompiledRule {
         const values = try definition_core.json.array(raw);
         if (values.items.len == 0 or values.items.len > 64 or
@@ -369,6 +371,9 @@ const Builder = struct {
         }
         self.conditional_depth += 1;
         defer self.conditional_depth -= 1;
+        const previous_input_index = self.inherited_input_index;
+        self.inherited_input_index = input_index;
+        defer self.inherited_input_index = previous_input_index;
         for (values.items) |value| try self.compileRawRule(value);
         const count = self.rules.items.len - start;
         if (count != values.items.len) {
@@ -395,6 +400,8 @@ const Builder = struct {
         const object = try definition_core.json.object(parsed.value);
         const input_index = if (object.get("input")) |raw_input|
             try self.inputIndex(try definition_core.json.string(raw_input))
+        else if (self.inherited_input_index) |inherited|
+            inherited
         else if (self.inputs.len == 1)
             0
         else
@@ -759,6 +766,7 @@ const Builder = struct {
                     }
                     rule.children = try self.compileConditionalRules(
                         conditional_rules.?,
+                        input_index,
                     );
                 }
                 const condition_equals = object.get("equals");
