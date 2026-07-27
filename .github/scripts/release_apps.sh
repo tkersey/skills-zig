@@ -27,6 +27,7 @@ case "$mode" in
   affected|ci-affected)
     declare -A affected=()
     build_changed=0
+    package_changed=0
 
     mark_app() {
       affected["$1"]=1
@@ -61,7 +62,10 @@ case "$mode" in
         build.zig)
           build_changed=1
           ;;
-        build.zig.zon|libs/core/*)
+        build.zig.zon)
+          package_changed=1
+          ;;
+        libs/core/*)
           mark_all
           ;;
         libs/definition_core/*)
@@ -116,7 +120,19 @@ case "$mode" in
     done < <(git diff --name-only "$base" "$head")
 
     if [[ "$build_changed" -eq 1 ]]; then
-      build_diff=$(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig)
+      build_diff=$(
+        git diff -U0 --no-ext-diff "$base" "$head" -- build.zig |
+          awk '
+            /^\+\+\+|^---|^@@/ { next }
+            /^\+/ { delta[substr($0, 2)] += 1; next }
+            /^-/ { delta[substr($0, 2)] -= 1; next }
+            END {
+              for (line in delta) {
+                if (delta[line] != 0) print line
+              }
+            }
+          '
+      )
       build_matched=0
       for app in "${apps[@]}"; do
         token=${app//-/_}
@@ -137,9 +153,56 @@ case "$mode" in
         mark_store_consumers
         build_matched=1
       fi
-      if [[ "$build_matched" -eq 0 ]]; then
+      if [[ -n "$build_diff" && "$build_matched" -eq 0 ]]; then
         mark_all
       fi
+    fi
+
+    if [[ "$package_changed" -eq 1 ]]; then
+      while IFS= read -r line; do
+        case "$line" in
+          "+++"*|"---"*|"@@"*) continue ;;
+          "+"*|"-"*) ;;
+          *) continue ;;
+        esac
+        raw=${line:1}
+        case "$raw" in
+          *'"apps/learnings/'*|*'"apps/synesthesia/'*)
+            mark_app ledger
+            ;;
+          *'"apps/'*)
+            matched=0
+            for app in "${apps[@]}"; do
+              if [[ "$raw" == *"\"apps/$app/"* ]]; then
+                mark_app "$app"
+                matched=1
+              fi
+            done
+            if [[ "$matched" -eq 0 ]]; then
+              mark_all
+            fi
+            ;;
+          *'"libs/definition_core/'*)
+            mark_definition_consumers
+            ;;
+          *'"libs/trace_core/'*)
+            mark_trace_consumers
+            ;;
+          *'"libs/durable_store/'*|*'"libs/jsonl_core/'*)
+            mark_store_consumers
+            ;;
+          *'"libs/core/'*)
+            mark_all
+            ;;
+          *'"build.zig"'*|*'"build.zig.zon"'*)
+            ;;
+          ".{}")
+            ;;
+          *)
+            mark_all
+            ;;
+        esac
+      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig.zon)
     fi
 
     if [[ "$mode" == "ci-affected" ]] &&

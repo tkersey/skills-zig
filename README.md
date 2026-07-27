@@ -104,9 +104,9 @@ Per-app VERSION files are the source of truth:
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
 The check is conservative: app-local changes count for that app; `build.zig`
-changes are classified by their affected app or shared-library context and fail
-closed to every shipped CLI when ownership is ambiguous; broad shared shipped
-surfaces such as `build.zig.zon` and `libs/core/**` count for every shipped CLI;
+and `build.zig.zon` changes are classified by their affected app or
+shared-library context and fail closed to every shipped CLI when ownership is
+ambiguous; broad shared shipped surfaces such as `libs/core/**` count for every shipped CLI;
 `libs/definition_core/**` counts for `seq` and `ledger`;
 `libs/durable_store/**` counts for `seq`, `cas`, `ledger`, and `memory-note`; and
 `libs/trace_core/**` counts for `seq` and `cas`.

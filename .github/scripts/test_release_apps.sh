@@ -17,7 +17,7 @@ for app in "${apps[@]}"; do
   printf '1.0.0\n' >"apps/$app/VERSION"
   printf '# %s\n' "$app" >"apps/$app/README.md"
 done
-printf 'pub fn build() void {}\n' >build.zig
+printf 'const img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 printf '.{}\n' >build.zig.zon
 git add .
 git commit -qm base
@@ -59,11 +59,23 @@ write_store_core() {
 }
 
 write_build_only() {
-  printf 'pub fn build() void { @panic("changed"); }\n' >build.zig
+  printf 'const img_meta = "apps/img/VERSION";\npub fn build() void { @panic("changed"); }\n' >build.zig
 }
 
 write_seq_build() {
-  printf 'const seq_root = "apps/seq/src/v1/main.zig";\n' >build.zig
+  printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+move_build_line() {
+  printf 'pub fn build() void {}\nconst img_meta = "apps/img/VERSION";\n' >build.zig
+}
+
+write_definition_package_path() {
+  printf '.{ .paths = .{"libs/definition_core/src"}, }\n' >build.zig.zon
+}
+
+write_unknown_package_change() {
+  printf '.{ .dependencies = .{ .unknown = .{} }, }\n' >build.zig.zon
 }
 
 write_unknown_app() {
@@ -80,6 +92,9 @@ assert_affected seq,ledger write_definition_core
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq write_seq_build
+assert_affected "" move_build_line
+assert_affected seq,ledger write_definition_package_path
+assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_change
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
 assert_affected "" write_readme
