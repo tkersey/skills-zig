@@ -414,6 +414,21 @@ pub fn materialize(
             );
             break :materialized;
         }
+        if (materialization_plan.identity == .content_address and
+            materialization_plan.identity.content_address.exclude_key != null and
+            materialization_plan.identity.content_address.claimed != null)
+        {
+            try materializeExcludedContentAddress(
+                allocator,
+                &execution,
+                materialization_plan,
+                materialization_plan.identity.content_address,
+                &canonical_content,
+                &canonical_digest,
+                &artifact_id,
+            );
+            break :materialized;
+        }
         canonical_content = try canonicalize(
             allocator,
             &execution,
@@ -617,6 +632,27 @@ fn validateClaimedIdentity(
             }
 
             const root_value = root.*;
+            const claimed = definition_core.json_pointer.lookup(
+                root_value,
+                claimed_pointer,
+            );
+            if (claimed == null) {
+                try execution.addDiagnostic(
+                    "content-address",
+                    claimed_pointer.raw,
+                    "declared identity field is missing",
+                );
+                return;
+            }
+            if (claimed.? == .null) return;
+            if (claimed.? != .string) {
+                try execution.addDiagnostic(
+                    "content-address",
+                    claimed_pointer.raw,
+                    "draft identity must be null or the matching content address",
+                );
+                return;
+            }
             const derived = if (config.exclude_key) |exclude_key|
                 try contentAddressOmittingAlloc(
                     allocator,
@@ -641,13 +677,7 @@ fn validateClaimedIdentity(
                 );
             };
             defer allocator.free(derived);
-            const claimed = definition_core.json_pointer.lookup(
-                root_value,
-                claimed_pointer,
-            );
-            if (claimed == null or claimed.? != .string or
-                !std.mem.eql(u8, claimed.?.string, derived))
-            {
+            if (!std.mem.eql(u8, claimed.?.string, derived)) {
                 try execution.addDiagnostic(
                     "content-address",
                     claimed_pointer.raw,
@@ -699,6 +729,68 @@ fn validateClaimedIdentity(
             }
         },
     }
+}
+
+fn materializeExcludedContentAddress(
+    allocator: std.mem.Allocator,
+    execution: *validation.Execution,
+    plan: *const Plan,
+    config: @FieldType(Identity, "content_address"),
+    canonical_content: *?[]u8,
+    canonical_digest: *?[]u8,
+    artifact_id: *?[]u8,
+) !void {
+    const excluded_key = config.exclude_key orelse
+        return error.ContentAddressExclusionMissing;
+    const claimed_pointer = config.claimed orelse
+        return error.ContentAddressFieldMissing;
+    const root = execution.inputJsonPtr(plan.input_index) orelse
+        return error.MaterializationInputInvalid;
+    const field = definition_core.json_pointer.lookupPtr(
+        root,
+        claimed_pointer,
+    ) orelse {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "declared identity field is missing",
+        );
+        return;
+    };
+    const supplied = field.*;
+    if (supplied != .null and supplied != .string) {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "draft identity must be null or the matching content address",
+        );
+        return;
+    }
+    artifact_id.* = try contentAddressOmittingAlloc(
+        allocator,
+        root.*,
+        excluded_key,
+        config.exclude_recursive,
+        config.prefix,
+    );
+    if (supplied == .string and
+        !std.mem.eql(u8, supplied.string, artifact_id.*.?))
+    {
+        try execution.addDiagnostic(
+            "content-address",
+            claimed_pointer.raw,
+            "claimed artifact identity does not match canonical content",
+        );
+        allocator.free(artifact_id.*.?);
+        artifact_id.* = null;
+        return;
+    }
+    if (supplied == .null) field.* = .{ .string = artifact_id.*.? };
+    canonical_content.* = try canonicalize(allocator, execution, plan);
+    canonical_digest.* = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        canonical_content.*.?,
+    );
 }
 
 fn materializeDraftContentAddress(
@@ -1546,23 +1638,30 @@ test "content address supports bounded recursive omission and a static prefix" {
         .{digest["sha256:".len..]},
     );
     defer std.testing.allocator.free(expected_id);
-    const input = try std.fmt.allocPrint(
+    const expected_canonical = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"envelope\":{{\"record_id\":\"{s}\",\"value\":1}}}}",
         .{expected_id},
     );
-    defer std.testing.allocator.free(input);
+    defer std.testing.allocator.free(expected_canonical);
 
     var result = try materialize(
         std.testing.allocator,
         &definition_plan,
         &validation_plan,
         &cached,
-        &.{.{ .name = "record", .bytes = input }},
+        &.{.{
+            .name = "record",
+            .bytes = "{\"envelope\":{\"record_id\":null,\"value\":1}}",
+        }},
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.validation_result.valid);
     try std.testing.expectEqualStrings(expected_id, result.artifact_id.?);
+    try std.testing.expectEqualStrings(
+        expected_canonical,
+        result.canonical_content.?,
+    );
 }
 
 test "nested draft content address materializes and verifies canonical identity" {
