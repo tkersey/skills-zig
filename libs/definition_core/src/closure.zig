@@ -158,30 +158,65 @@ const Builder = struct {
     fn visit(self: *Builder, relative_path: []u8, depth: usize) !void {
         var path_owned = true;
         errdefer if (path_owned) self.allocator.free(relative_path);
-        if (depth > self.limits.max_import_depth) return error.ImportDepthExceeded;
-        if (self.states.get(relative_path)) |state| {
-            if (state == .visiting) return error.ImportCycle;
+        if (try self.visitComplete(relative_path, depth)) {
             self.allocator.free(relative_path);
             path_owned = false;
             return;
         }
+        var loaded = try self.loadDefinition(relative_path);
+        defer loaded.deinit(self.allocator);
+
+        try self.states.put(self.allocator, relative_path, .visiting);
+        errdefer _ = self.states.remove(relative_path);
+        try self.files.append(self.allocator, .{
+            .path = relative_path,
+            .canonical_json = loaded.canonical_json,
+            .source_digest = loaded.source_digest,
+            .source_bytes = loaded.source_bytes,
+        });
+        path_owned = false;
+        loaded.canonical_owned = false;
+        self.total_definition_bytes = loaded.next_total;
+        std.mem.sort([]u8, loaded.imports.items, {}, lessThanPath);
+        for (loaded.imports.items) |*import_path| {
+            const owned = import_path.*;
+            import_path.* = try self.allocator.dupe(u8, "");
+            try self.visit(owned, depth + 1);
+        }
+        self.states.getPtr(relative_path).?.* = .complete;
+    }
+
+    fn visitComplete(
+        self: *Builder,
+        relative_path: []const u8,
+        depth: usize,
+    ) !bool {
+        if (depth > self.limits.max_import_depth) {
+            return error.ImportDepthExceeded;
+        }
+        if (self.states.get(relative_path)) |state| {
+            if (state == .visiting) return error.ImportCycle;
+            return true;
+        }
         if (self.files.items.len == self.limits.max_files) {
             return error.TooManyDefinitionFiles;
         }
+        return false;
+    }
 
-        try rejectSymlinkComponents(self.root, relative_path);
-        const stat = try self.root.statFile(defaultIo(), relative_path, .{
-            .follow_symlinks = false,
-        });
-        if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
-        if (stat.kind != .file) return error.DefinitionNotRegularFile;
-        if (stat.size > self.limits.max_file_bytes) return error.DefinitionFileTooLarge;
-        const file_bytes: usize = std.math.cast(usize, stat.size) orelse
-            return error.DefinitionFileTooLarge;
-        const next_total = std.math.add(usize, self.total_definition_bytes, file_bytes) catch
+    fn loadDefinition(
+        self: *Builder,
+        relative_path: []const u8,
+    ) !LoadedDefinition {
+        const source_bytes = try self.definitionSize(relative_path);
+        const next_total = std.math.add(
+            usize,
+            self.total_definition_bytes,
+            source_bytes,
+        ) catch return error.DefinitionClosureTooLarge;
+        if (next_total > self.limits.max_total_bytes) {
             return error.DefinitionClosureTooLarge;
-        if (next_total > self.limits.max_total_bytes) return error.DefinitionClosureTooLarge;
-
+        }
         const raw = try self.root.readFileAlloc(
             defaultIo(),
             relative_path,
@@ -189,70 +224,101 @@ const Builder = struct {
             .limited(self.limits.max_file_bytes),
         );
         defer self.allocator.free(raw);
-        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidDefinitionUtf8;
-
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
-            self.allocator,
-            raw,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
-        ) catch |err| switch (err) {
-            error.DuplicateField => return error.DuplicateDefinitionField,
-            else => return error.InvalidDefinitionJson,
-        };
+        var parsed = try parseDefinition(self.allocator, raw);
         defer parsed.deinit();
-        if (parsed.value != .object) return error.DefinitionRootNotObject;
-
-        const canonical = canonical_json.canonicalJsonAlloc(
-            self.allocator,
-            parsed.value,
-        ) catch |err| switch (err) {
-            error.NumberOutOfRange,
-            error.NonFiniteNumber,
-            error.InvalidUtf8,
-            => return error.InvalidDefinitionJson,
-            else => return err,
-        };
-        var canonical_owned = true;
-        errdefer if (canonical_owned) self.allocator.free(canonical);
-        var source_digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(raw, &source_digest, .{});
-
-        try self.states.put(self.allocator, relative_path, .visiting);
-        errdefer _ = self.states.remove(relative_path);
-        try self.files.append(self.allocator, .{
-            .path = relative_path,
-            .canonical_json = canonical,
-            .source_digest = source_digest,
+        var loaded = LoadedDefinition{
+            .canonical_json = try canonicalDefinitionAlloc(
+                self.allocator,
+                parsed.value,
+            ),
+            .source_digest = undefined,
             .source_bytes = raw.len,
-        });
-        path_owned = false;
-        canonical_owned = false;
-        self.total_definition_bytes = next_total;
-
-        var imports: std.ArrayList([]u8) = .empty;
-        defer {
-            for (imports.items) |item| self.allocator.free(item);
-            imports.deinit(self.allocator);
-        }
+            .next_total = next_total,
+        };
+        errdefer loaded.deinit(self.allocator);
+        std.crypto.hash.sha2.Sha256.hash(raw, &loaded.source_digest, .{});
         try collectImports(
             self.allocator,
             parsed.value.object,
             std.fs.path.dirname(relative_path) orelse "",
-            &imports,
+            &loaded.imports,
         );
-        std.mem.sort([]u8, imports.items, {}, lessThanPath);
-        for (imports.items) |*import_path| {
-            const owned = import_path.*;
-            import_path.* = try self.allocator.dupe(u8, "");
-            try self.visit(owned, depth + 1);
+        return loaded;
+    }
+
+    fn definitionSize(
+        self: *Builder,
+        relative_path: []const u8,
+    ) !usize {
+        try rejectSymlinkComponents(self.root, relative_path);
+        const stat = try self.root.statFile(defaultIo(), relative_path, .{
+            .follow_symlinks = false,
+        });
+        if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
+        if (stat.kind != .file) return error.DefinitionNotRegularFile;
+        if (stat.size > self.limits.max_file_bytes) {
+            return error.DefinitionFileTooLarge;
         }
-        self.states.getPtr(relative_path).?.* = .complete;
+        return std.math.cast(usize, stat.size) orelse
+            error.DefinitionFileTooLarge;
     }
 };
+
+const LoadedDefinition = struct {
+    canonical_json: []u8,
+    source_digest: [32]u8,
+    source_bytes: usize,
+    next_total: usize,
+    imports: std.ArrayList([]u8) = .empty,
+    canonical_owned: bool = true,
+
+    fn deinit(self: *LoadedDefinition, allocator: std.mem.Allocator) void {
+        if (self.canonical_owned) allocator.free(self.canonical_json);
+        for (self.imports.items) |item| allocator.free(item);
+        self.imports.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn parseDefinition(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    if (!std.unicode.utf8ValidateSlice(raw)) {
+        return error.InvalidDefinitionUtf8;
+    }
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    ) catch |err| switch (err) {
+        error.DuplicateField => return error.DuplicateDefinitionField,
+        else => return error.InvalidDefinitionJson,
+    };
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.DefinitionRootNotObject;
+    return parsed;
+}
+
+fn canonicalDefinitionAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    return canonical_json.canonicalJsonAlloc(
+        allocator,
+        value,
+    ) catch |err| switch (err) {
+        error.NumberOutOfRange,
+        error.NonFiniteNumber,
+        error.InvalidUtf8,
+        => return error.InvalidDefinitionJson,
+        else => return err,
+    };
+}
 
 pub fn load(
     allocator: std.mem.Allocator,
@@ -323,55 +389,13 @@ pub fn fromCanonicalFiles(
     }
     var total_definition_bytes: usize = 0;
     for (source_files, 0..) |source, index| {
-        const normalized = try normalizeRelativeAlloc(allocator, "", source.path);
-        defer allocator.free(normalized);
-        if (!std.mem.eql(u8, normalized, source.path)) {
-            return error.InvalidDefinitionPath;
-        }
-        if (source.canonical_json.len > limits.max_file_bytes) {
-            return error.DefinitionFileTooLarge;
-        }
-        total_definition_bytes = std.math.add(
-            usize,
+        try validateCanonicalSource(allocator, source, limits);
+        total_definition_bytes = try addDefinitionBytes(
             total_definition_bytes,
             source.canonical_json.len,
-        ) catch return error.DefinitionClosureTooLarge;
-        if (total_definition_bytes > limits.max_total_bytes) {
-            return error.DefinitionClosureTooLarge;
-        }
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            source.canonical_json,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
-        ) catch return error.InvalidDefinitionJson;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.DefinitionRootNotObject;
-        const canonical = try canonical_json.canonicalJsonAlloc(
-            allocator,
-            parsed.value,
+            limits,
         );
-        errdefer allocator.free(canonical);
-        if (!std.mem.eql(u8, canonical, source.canonical_json)) {
-            return error.NonCanonicalDefinitionArchive;
-        }
-        files[index] = .{
-            .path = try allocator.dupe(u8, source.path),
-            .canonical_json = canonical,
-            .source_digest = blk: {
-                var digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(
-                    source.canonical_json,
-                    &digest,
-                    .{},
-                );
-                break :blk digest;
-            },
-            .source_bytes = source.canonical_json.len,
-        };
+        files[index] = try cloneCanonicalFile(allocator, source);
         initialized += 1;
     }
     std.mem.sort(ClosureFile, files, {}, lessThanClosureFile);
@@ -397,6 +421,78 @@ pub fn fromCanonicalFiles(
     };
 }
 
+fn addDefinitionBytes(
+    current: usize,
+    added: usize,
+    limits: Limits,
+) !usize {
+    if (added > limits.max_file_bytes) {
+        return error.DefinitionFileTooLarge;
+    }
+    const total = std.math.add(
+        usize,
+        current,
+        added,
+    ) catch return error.DefinitionClosureTooLarge;
+    if (total > limits.max_total_bytes) {
+        return error.DefinitionClosureTooLarge;
+    }
+    return total;
+}
+
+fn validateCanonicalSource(
+    allocator: std.mem.Allocator,
+    source: ClosureFile,
+    limits: Limits,
+) !void {
+    const normalized = try normalizeRelativeAlloc(allocator, "", source.path);
+    defer allocator.free(normalized);
+    if (!std.mem.eql(u8, normalized, source.path)) {
+        return error.InvalidDefinitionPath;
+    }
+    if (source.canonical_json.len > limits.max_file_bytes) {
+        return error.DefinitionFileTooLarge;
+    }
+}
+
+fn cloneCanonicalFile(
+    allocator: std.mem.Allocator,
+    source: ClosureFile,
+) !ClosureFile {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source.canonical_json,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    ) catch return error.InvalidDefinitionJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.DefinitionRootNotObject;
+    const canonical = try canonical_json.canonicalJsonAlloc(
+        allocator,
+        parsed.value,
+    );
+    errdefer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source.canonical_json)) {
+        return error.NonCanonicalDefinitionArchive;
+    }
+    const path = try allocator.dupe(u8, source.path);
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        source.canonical_json,
+        &source_digest,
+        .{},
+    );
+    return .{
+        .path = path,
+        .canonical_json = canonical,
+        .source_digest = source_digest,
+        .source_bytes = source.canonical_json.len,
+    };
+}
+
 pub fn verifySourceManifest(
     allocator: std.mem.Allocator,
     admitted_root: []const u8,
@@ -419,59 +515,64 @@ pub fn verifySourceManifest(
     var total_bytes: usize = 0;
     var prior_path: ?[]const u8 = null;
     for (files) |file| {
-        const normalized = try normalizeRelativeAlloc(
-            allocator,
-            "",
-            file.path,
-        );
-        defer allocator.free(normalized);
-        if (!std.mem.eql(u8, normalized, file.path)) {
-            return error.InvalidDefinitionPath;
-        }
+        try validateManifestPath(allocator, file.path);
         if (prior_path) |prior| {
             if (std.mem.order(u8, prior, file.path) != .lt) {
                 return error.DefinitionManifestNotSorted;
             }
         }
         prior_path = file.path;
-        if (file.source_bytes > limits.max_file_bytes) {
-            return error.DefinitionFileTooLarge;
-        }
-        total_bytes = std.math.add(
-            usize,
+        total_bytes = try addDefinitionBytes(
             total_bytes,
             file.source_bytes,
-        ) catch return error.DefinitionClosureTooLarge;
-        if (total_bytes > limits.max_total_bytes) {
-            return error.DefinitionClosureTooLarge;
-        }
-
-        try rejectSymlinkComponents(&root, file.path);
-        const stat = try root.statFile(defaultIo(), file.path, .{
-            .follow_symlinks = false,
-        });
-        if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
-        if (stat.kind != .file) return error.DefinitionNotRegularFile;
-        if (stat.size != file.source_bytes) {
-            return error.DefinitionSourceSizeMismatch;
-        }
-        const raw = try root.readFileAlloc(
-            defaultIo(),
-            file.path,
-            allocator,
-            .limited(limits.max_file_bytes),
+            limits,
         );
-        defer allocator.free(raw);
-        if (!std.unicode.utf8ValidateSlice(raw)) {
-            return error.InvalidDefinitionUtf8;
-        }
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
-        if (!std.mem.eql(u8, &digest, &file.source_digest)) {
-            return error.DefinitionSourceDigestMismatch;
-        }
+        try verifySourceFile(allocator, &root, file, limits);
     }
     return total_bytes;
+}
+
+fn verifySourceFile(
+    allocator: std.mem.Allocator,
+    root: *std.Io.Dir,
+    file: anytype,
+    limits: Limits,
+) !void {
+    try rejectSymlinkComponents(root, file.path);
+    const stat = try root.statFile(defaultIo(), file.path, .{
+        .follow_symlinks = false,
+    });
+    if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
+    if (stat.kind != .file) return error.DefinitionNotRegularFile;
+    if (stat.size != file.source_bytes) {
+        return error.DefinitionSourceSizeMismatch;
+    }
+    const raw = try root.readFileAlloc(
+        defaultIo(),
+        file.path,
+        allocator,
+        .limited(limits.max_file_bytes),
+    );
+    defer allocator.free(raw);
+    if (!std.unicode.utf8ValidateSlice(raw)) {
+        return error.InvalidDefinitionUtf8;
+    }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &file.source_digest)) {
+        return error.DefinitionSourceDigestMismatch;
+    }
+}
+
+fn validateManifestPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    const normalized = try normalizeRelativeAlloc(allocator, "", path);
+    defer allocator.free(normalized);
+    if (!std.mem.eql(u8, normalized, path)) {
+        return error.InvalidDefinitionPath;
+    }
 }
 
 pub fn validateCached(
@@ -497,47 +598,17 @@ pub fn validateCached(
     var total_source_bytes: usize = 0;
     var total_canonical_bytes: usize = 0;
     for (cached.files, 0..) |file, index| {
-        const normalized = try normalizeRelativeAlloc(
-            allocator,
-            "",
-            file.path,
-        );
-        defer allocator.free(normalized);
-        if (!std.mem.eql(u8, normalized, file.path)) {
-            return error.InvalidDefinitionPath;
-        }
-        if (index != 0 and
-            std.mem.order(
-                u8,
-                cached.files[index - 1].path,
-                file.path,
-            ) != .lt)
-        {
-            return error.DefinitionManifestNotSorted;
-        }
-        if (file.source_bytes > limits.max_file_bytes or
-            file.canonical_json.len > limits.max_file_bytes)
-        {
-            return error.DefinitionFileTooLarge;
-        }
-        if (!std.unicode.utf8ValidateSlice(file.canonical_json)) {
-            return error.InvalidDefinitionUtf8;
-        }
-        total_source_bytes = std.math.add(
-            usize,
+        try validateCachedFile(allocator, cached, file, index, limits);
+        total_source_bytes = try addDefinitionBytes(
             total_source_bytes,
             file.source_bytes,
-        ) catch return error.DefinitionClosureTooLarge;
-        total_canonical_bytes = std.math.add(
-            usize,
+            limits,
+        );
+        total_canonical_bytes = try addDefinitionBytes(
             total_canonical_bytes,
             file.canonical_json.len,
-        ) catch return error.DefinitionClosureTooLarge;
-        if (total_source_bytes > limits.max_total_bytes or
-            total_canonical_bytes > limits.max_total_bytes)
-        {
-            return error.DefinitionClosureTooLarge;
-        }
+            limits,
+        );
     }
     if (cached.find(entry_path) == null) return error.EntryDefinitionMissing;
     if (cached.total_definition_bytes != total_source_bytes) {
@@ -546,6 +617,41 @@ pub fn validateCached(
     const digest = digestFiles(cached.files);
     if (!std.mem.eql(u8, &digest, &cached.digest)) {
         return error.DefinitionClosureDigestMismatch;
+    }
+}
+
+fn validateCachedFile(
+    allocator: std.mem.Allocator,
+    cached: *const Closure,
+    file: ClosureFile,
+    index: usize,
+    limits: Limits,
+) !void {
+    const normalized = try normalizeRelativeAlloc(
+        allocator,
+        "",
+        file.path,
+    );
+    defer allocator.free(normalized);
+    if (!std.mem.eql(u8, normalized, file.path)) {
+        return error.InvalidDefinitionPath;
+    }
+    if (index != 0 and
+        std.mem.order(
+            u8,
+            cached.files[index - 1].path,
+            file.path,
+        ) != .lt)
+    {
+        return error.DefinitionManifestNotSorted;
+    }
+    if (file.source_bytes > limits.max_file_bytes or
+        file.canonical_json.len > limits.max_file_bytes)
+    {
+        return error.DefinitionFileTooLarge;
+    }
+    if (!std.unicode.utf8ValidateSlice(file.canonical_json)) {
+        return error.InvalidDefinitionUtf8;
     }
 }
 
@@ -827,7 +933,15 @@ test "closure resolves explicit imports across admitted packages" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "first/definitions/ledger/root.json",
         .data =
-        \\{"imports":[{"id":"second/child","path":"../../../second/definitions/ledger/child.json"}],"schema":"example/v1"}
+        \\{
+        \\  "imports": [
+        \\    {
+        \\      "id": "second/child",
+        \\      "path": "../../../second/definitions/ledger/child.json"
+        \\    }
+        \\  ],
+        \\  "schema": "example/v1"
+        \\}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -875,7 +989,9 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     try std.testing.expectEqualStrings("nested/b.json", closure.files[1].path);
     try std.testing.expectEqualStrings("root.json", closure.files[2].path);
     try std.testing.expectEqualStrings(
-        "{\"a\":2,\"imports\":[{\"id\":\"b\",\"path\":\"nested/b.json\"},\"a.json\"],\"schema\":\"example/v1\",\"z\":1}",
+        "{\"a\":2,\"imports\":[{\"id\":\"b\"," ++
+            "\"path\":\"nested/b.json\"},\"a.json\"]," ++
+            "\"schema\":\"example/v1\",\"z\":1}",
         closure.files[2].canonical_json,
     );
     try std.testing.expect(canonical_json.isFingerprint(closure.digestSlice()));
