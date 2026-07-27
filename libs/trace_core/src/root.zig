@@ -1542,6 +1542,145 @@ fn messageTextPartsAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) 
     return parts.toOwnedSlice(allocator);
 }
 
+pub fn completeTraceDigest(
+    allocator: std.mem.Allocator,
+    trace: CanonicalSessionTrace,
+) ![]u8 {
+    return retainedTraceDigest(
+        allocator,
+        trace,
+        @intCast(trace.turns.items.len),
+    );
+}
+
+pub fn retainedTraceDigest(
+    allocator: std.mem.Allocator,
+    trace: CanonicalSessionTrace,
+    keep_through_turn_index: i64,
+) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.print("turns:{d}\n", .{keep_through_turn_index});
+    for (trace.turns.items) |turn| {
+        if (turn.turn_index > keep_through_turn_index) continue;
+        try writer.print(
+            "{d}|{s}|{s}|",
+            .{ turn.turn_index, turn.turn_id, @tagName(turn.status) },
+        );
+        if (turn.user_message) |value| try writeTraceContentDigest(writer, value);
+        try writer.writeByte('|');
+        if (turn.final_answer) |value| try writeTraceContentDigest(writer, value);
+        try writer.writeByte('\n');
+        for (trace.tools.items) |tool| {
+            if (tool.turn_index == null or
+                tool.turn_index.? != turn.turn_index)
+            {
+                continue;
+            }
+            try writer.writeAll("tool|");
+            if (tool.call_id) |value| try writer.writeAll(value);
+            try writer.writeByte('|');
+            if (tool.tool_name) |value| try writer.writeAll(value);
+            try writer.writeByte('|');
+            try writer.writeAll(@tagName(tool.lifecycle_status));
+            try writer.writeByte('|');
+            if (tool.arguments_json) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.input_text) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.output_text) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.command_text) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.cwd) |value| try writeTraceContentDigest(writer, value);
+            try writer.writeByte('|');
+            if (tool.patch_changes_json) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.web_query) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.web_url) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.image_prompt) |value| {
+                try writeTraceContentDigest(writer, value);
+            }
+            try writer.writeByte('|');
+            if (tool.exit_code) |value| try writer.print("{d}", .{value});
+            try writer.writeByte('\n');
+        }
+    }
+    const canonical = try writer_alloc.toOwnedSlice();
+    defer allocator.free(canonical);
+    return sha256Prefixed(allocator, canonical);
+}
+
+fn writeTraceContentDigest(writer: anytype, text: []const u8) !void {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    try writer.writeAll(hex[0..]);
+}
+
+fn sha256Prefixed(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+}
+
+test "retained trace digest changes with observed tool payload" {
+    var trace = CanonicalSessionTrace{
+        .session = try SessionRecord.init(
+            std.testing.allocator,
+            "rollout.jsonl",
+        ),
+    };
+    defer trace.deinit(std.testing.allocator);
+    try trace.turns.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "rollout.jsonl"),
+        .turn_id = try std.testing.allocator.dupe(u8, "turn-1"),
+        .turn_index = 1,
+        .status = .complete,
+    });
+    try trace.tools.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "rollout.jsonl"),
+        .turn_index = 1,
+        .call_id = try std.testing.allocator.dupe(u8, "call-1"),
+        .tool_name = try std.testing.allocator.dupe(u8, "exec_command"),
+        .arguments_json = try std.testing.allocator.dupe(
+            u8,
+            "{\"cmd\":\"zig build test\"}",
+        ),
+        .lifecycle_status = .completed,
+    });
+
+    const before = try completeTraceDigest(std.testing.allocator, trace);
+    defer std.testing.allocator.free(before);
+    std.testing.allocator.free(trace.tools.items[0].arguments_json.?);
+    trace.tools.items[0].arguments_json = try std.testing.allocator.dupe(
+        u8,
+        "{\"cmd\":\"zig build lint\"}",
+    );
+    const after = try completeTraceDigest(std.testing.allocator, trace);
+    defer std.testing.allocator.free(after);
+    try std.testing.expect(!std.mem.eql(u8, before, after));
+}
+
 test "message text-part projection preserves ordered source boundaries" {
     const split =
         "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"},{\"type\":\"input_text\",\"text\":\"b\"}]}";
@@ -1842,7 +1981,10 @@ fn testPath(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
 }
 
 test "parseSessionTrace reconstructs new complete turn" {
-    const path = try testPath(std.testing.allocator, "testdata/trace/new_044_plus.jsonl");
+    const path = try testPath(
+        std.testing.allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer std.testing.allocator.free(path);
     var trace = try parseSessionTrace(std.testing.allocator, path, .{
         .ongoing_threshold_secs = 0,
@@ -1988,7 +2130,10 @@ test "canonical trace retains state and unknown carriers for exact consumers" {
 }
 
 test "parseSessionSummaryTrace preserves session inventory fields" {
-    const path = try testPath(std.testing.allocator, "testdata/trace/new_044_plus.jsonl");
+    const path = try testPath(
+        std.testing.allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer std.testing.allocator.free(path);
     var full = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
     defer full.deinit(std.testing.allocator);
@@ -2034,7 +2179,10 @@ test "first file-owner session metadata remains authoritative" {
 }
 
 test "parseSessionTrace reconstructs old synthetic turns" {
-    const path = try testPath(std.testing.allocator, "testdata/trace/old_2025_08_root_meta.jsonl");
+    const path = try testPath(
+        std.testing.allocator,
+        "libs/trace_core/testdata/old_2025_08_root_meta.jsonl",
+    );
     defer std.testing.allocator.free(path);
     var trace = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
     defer trace.deinit(std.testing.allocator);
@@ -2045,7 +2193,10 @@ test "parseSessionTrace reconstructs old synthetic turns" {
 }
 
 test "parseSessionTrace reports lifecycle and graph edges" {
-    const path = try testPath(std.testing.allocator, "testdata/trace/tools.jsonl");
+    const path = try testPath(
+        std.testing.allocator,
+        "libs/trace_core/testdata/tools.jsonl",
+    );
     defer std.testing.allocator.free(path);
     var trace = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
     defer trace.deinit(std.testing.allocator);

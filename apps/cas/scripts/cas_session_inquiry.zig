@@ -4,13 +4,11 @@ const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
 const durable_store = @import("durable_store");
-const retrace_core = @import("retrace_core");
+const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
-const canonical_trace = retrace_core.canonical_trace;
-const decision_anchor = retrace_core.decision_anchor;
-const dcp_schema = retrace_core.dcp_schema;
+const canonical_trace = trace_core;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxInputBytes = 8 * 1024 * 1024;
@@ -1081,29 +1079,25 @@ fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
 }
 
 fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
-    var validation = try dcp_schema.validateValue(allocator, value);
-    defer validation.deinit(allocator);
-    if (!validation.valid) return error.InvalidDcp;
-
-    var source_episode_resolution = try dcp_schema.resolveSourceEpisodeIdentity(allocator, value);
-    defer source_episode_resolution.deinit(allocator);
-    const source_episode_id = switch (source_episode_resolution.state) {
-        .explicit_exact, .derived_session_turn => try allocator.dupe(u8, source_episode_resolution.source_episode_id.?),
-        .mismatch => return error.SourceEpisodeIdentityMismatch,
-        .unavailable => null,
-    };
-    errdefer if (source_episode_id) |owned| allocator.free(owned);
-
+    // Retrace owns DCP structure and validates the canonical packet through
+    // Ledger before CAS receives it. CAS parses only the carriers needed to
+    // bind its inquiry effects and independently checks their live source.
     const root = switch (value) {
         .object => |obj| obj,
         else => return error.NotObject,
     };
     const packet = rootObject(root, "decision_context_packet") orelse root;
-    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), dcp_schema.version)) return error.BadVersion;
+    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), "DCP-v2")) return error.BadVersion;
     const packet_id = try requiredString(packet, "packet_id");
     const source = rootObject(packet, "source") orelse return error.MissingSource;
     const artifact = rootObject(packet, "artifact_state") orelse return error.MissingArtifactState;
     const turns = rootObject(packet, "turns") orelse return error.MissingTurns;
+    const source_episode_id = try sourceEpisodeIdFromDcpAlloc(
+        allocator,
+        source,
+        turns,
+    );
+    errdefer if (source_episode_id) |owned| allocator.free(owned);
     const anchors_obj = rootObject(packet, "anchors") orelse return error.MissingAnchors;
     const total = try requiredU64(turns, "total_turns");
     const decision = try requiredU64(turns, "decision_turn_index");
@@ -1128,6 +1122,30 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
         .first_outcome_turn_index = optionalU64(turns, "first_outcome_turn_index"),
         .anchors = anchors,
     };
+}
+
+fn sourceEpisodeIdFromDcpAlloc(
+    allocator: std.mem.Allocator,
+    source: std.json.ObjectMap,
+    turns: std.json.ObjectMap,
+) !?[]u8 {
+    if (source.get("source_episode_id")) |value| {
+        return switch (value) {
+            .string => |text| if (text.len == 0)
+                error.SourceEpisodeIdentityMismatch
+            else
+                try allocator.dupe(u8, text),
+            else => error.SourceEpisodeIdentityMismatch,
+        };
+    }
+    const session_id = optionalString(source, "session_id") orelse return null;
+    const turn_id = optionalString(turns, "decision_turn_id") orelse return null;
+    if (session_id.len == 0 or turn_id.len == 0) return null;
+    return @as(?[]u8, try std.fmt.allocPrint(
+        allocator,
+        "session:{s}#turn:{s}",
+        .{ session_id, turn_id },
+    ));
 }
 
 fn parseAnchor(allocator: std.mem.Allocator, anchors_obj: std.json.ObjectMap, name: AnchorName, total_turns: u64) !Anchor {
@@ -1333,14 +1351,18 @@ fn resolveSourceLineage(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip) !Sourc
     defer trace.deinit(allocator);
 
     if (trace.turns.items.len != dcp.total_turns) return error.SourceStale;
-    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const source_digest = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(source_digest);
     if (!std.mem.eql(u8, source_digest, dcp.source_turn_digest)) return error.SourceDigestMismatch;
 
     for (rip.lanes) |lane| {
         const anchor = anchorForHorizon(dcp, lane.temporal_horizon) orelse return error.AnchorDigestMismatch;
         if (!anchor.available) return error.AnchorDigestMismatch;
-        const observed = try decision_anchor.digestRetained(allocator, trace, @intCast(anchor.keep_through_turn_index));
+        const observed = try trace_core.retainedTraceDigest(
+            allocator,
+            trace,
+            @intCast(anchor.keep_through_turn_index),
+        );
         defer allocator.free(observed);
         if (!std.mem.eql(u8, observed, anchor.anchor_digest orelse "")) return error.AnchorDigestMismatch;
     }
@@ -3378,7 +3400,11 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
         try trace.turns.append(allocator, record);
         try appendToolRecordsFromThreadItems(allocator, &trace, turn, @intCast(index + 1));
     }
-    const digest = try decision_anchor.digestRetained(allocator, trace, @intCast(turns.items.len));
+    const digest = try trace_core.retainedTraceDigest(
+        allocator,
+        trace,
+        @intCast(turns.items.len),
+    );
     return .{
         .count = turns.items.len,
         .digest = digest,
@@ -4320,14 +4346,17 @@ test "validateInquiryInputs rejects unavailable workspace" {
 
 test "validateInquiryInputs accepts verified rollout transcript lineage only" {
     const allocator = std.testing.allocator;
-    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    const rollout_path = try repoTestPathAlloc(
+        allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer allocator.free(rollout_path);
 
     var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
     defer trace.deinit(allocator);
-    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const source_digest = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(source_digest);
-    const post_digest = try decision_anchor.digestRetained(allocator, trace, 1);
+    const post_digest = try trace_core.retainedTraceDigest(allocator, trace, 1);
     defer allocator.free(post_digest);
 
     const dcp = Dcp{
@@ -4396,7 +4425,10 @@ test "validateInquiryInputs accepts verified rollout transcript lineage only" {
 
 test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained horizon" {
     const allocator = std.testing.allocator;
-    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    const rollout_path = try repoTestPathAlloc(
+        allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer allocator.free(rollout_path);
     const dcp = Dcp{
         .packet_id = "CAP",
@@ -4447,59 +4479,101 @@ test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained hori
     try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_historical_context") != null);
 }
 
-test "CAS admits the shared-valid Seq DCP-v2 source episode identity" {
+const test_dcp_json =
+    \\{
+    \\  "decision_context_packet": {
+    \\    "packet_version": "DCP-v2",
+    \\    "packet_id": "DCP-test",
+    \\    "source": {
+    \\      "source_episode_id": "session:dcp-basic#turn:turn-decision",
+    \\      "session_id": "dcp-basic"
+    \\    },
+    \\    "artifact_state": {"reconstructability": "head_only"},
+    \\    "turns": {
+    \\      "total_turns": 3,
+    \\      "decision_turn_index": 2,
+    \\      "decision_turn_id": "turn-decision",
+    \\      "first_outcome_turn_index": 3,
+    \\      "source_turn_digest": "sha256:source"
+    \\    },
+    \\    "anchors": {
+    \\      "pre_decision": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 1,
+    \\        "drop_last_n_turns": 2,
+    \\        "anchor_digest": "sha256:pre"
+    \\      },
+    \\      "post_decision_pre_outcome": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 2,
+    \\        "drop_last_n_turns": 1,
+    \\        "anchor_digest": "sha256:post"
+    \\      },
+    \\      "outcome_aware": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 3,
+    \\        "drop_last_n_turns": 0,
+    \\        "anchor_digest": "sha256:full"
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "CAS consumes the explicit DCP-v2 source episode identity" {
     const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/decision-capsule/valid-basic.json");
-    defer allocator.free(capsule_path);
-
-    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
-    defer allocator.free(raw);
-    var report = try dcp_schema.validateText(allocator, raw);
-    defer report.deinit(allocator);
-    try std.testing.expect(report.valid);
-
-    const dcp = try loadDcp(allocator, capsule_path);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        test_dcp_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
     try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
 }
 
-test "CAS derives identity from frozen released DCP-v2 bytes" {
+test "CAS derives DCP-v2 source episode identity from canonical locators" {
     const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(
+    const without_explicit = try std.mem.replaceOwned(
+        u8,
         allocator,
-        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+        test_dcp_json,
+        "      \"source_episode_id\": \"session:dcp-basic#turn:turn-decision\",\n",
+        "",
     );
-    defer allocator.free(capsule_path);
-
-    const dcp = try loadDcp(allocator, capsule_path);
+    defer allocator.free(without_explicit);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        without_explicit,
+        .{},
+    );
+    defer parsed.deinit();
+    const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
-    try std.testing.expectEqualStrings(
-        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
-        dcp.packet_id,
-    );
     try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
 }
 
-test "CAS preserves ordinary DCP-v2 loading when source episode identity is unavailable" {
+test "CAS accepts a validated DCP without a source episode projection" {
     const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(
+    const without_explicit = try std.mem.replaceOwned(
+        u8,
         allocator,
-        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+        test_dcp_json,
+        "      \"source_episode_id\": \"session:dcp-basic#turn:turn-decision\",\n",
+        "",
     );
-    defer allocator.free(capsule_path);
-    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
-    defer allocator.free(raw);
-
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "      \"session_id\": \"dcp-basic\",\n"));
+    defer allocator.free(without_explicit);
     const without_session = try std.mem.replaceOwned(
         u8,
         allocator,
-        raw,
-        "      \"session_id\": \"dcp-basic\",\n",
+        without_explicit,
+        "      \"session_id\": \"dcp-basic\"\n",
         "",
     );
     defer allocator.free(without_session);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, without_session, "      \"decision_turn_id\": \"turn-decision\",\n"));
     const without_identity_inputs = try std.mem.replaceOwned(
         u8,
         allocator,
@@ -4508,18 +4582,12 @@ test "CAS preserves ordinary DCP-v2 loading when source episode identity is unav
         "",
     );
     defer allocator.free(without_identity_inputs);
-    const packet_id = try dcp_schema.packetIdForTextExcludingPacketId(allocator, without_identity_inputs);
-    defer allocator.free(packet_id);
-    const rewritten = try std.mem.replaceOwned(
-        u8,
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
         allocator,
         without_identity_inputs,
-        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
-        packet_id,
+        .{},
     );
-    defer allocator.free(rewritten);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rewritten, .{});
     defer parsed.deinit();
     const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
@@ -4893,7 +4961,7 @@ test "turnDigestFromThreadRead includes live function call records" {
         .exit_code = 0,
         .lifecycle_status = .completed,
     });
-    const expected = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const expected = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(expected);
     try std.testing.expectEqual(@as(usize, 1), observed.count);
     try std.testing.expectEqualStrings(expected, observed.digest);

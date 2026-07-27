@@ -56,11 +56,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
-    const definition_core_canonical_json = b.createModule(.{
-        .root_source_file = b.path("libs/definition_core/src/canonical_json.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const definition_core = b.createModule(.{
         .root_source_file = b.path("libs/definition_core/src/root.zig"),
         .target = target,
@@ -72,16 +67,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "jsonl_core", .module = jsonl_core },
-        },
-    });
-    const retrace_core = b.createModule(.{
-        .root_source_file = b.path("libs/retrace_core/src/lib.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "jsonl_core", .module = jsonl_core },
-            .{ .name = "canonical_json", .module = definition_core_canonical_json },
-            .{ .name = "trace_core", .module = trace_core },
         },
     });
     const jsonl_stream_release_fast = b.createModule(.{
@@ -102,16 +87,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
-    const retrace_large_tests_root = b.createModule(.{
-        .root_source_file = b.path("libs/retrace_core/tests/jsonl_stream_large.zig"),
+    const jsonl_large_tests_root = b.createModule(.{
+        .root_source_file = b.path("libs/jsonl_core/tests/jsonl_stream_large.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
             .{ .name = "jsonl_stream", .module = jsonl_stream_release_fast },
         },
     });
-    const retrace_corpus_tests_root = b.createModule(.{
-        .root_source_file = b.path("libs/retrace_core/tests/canonical_json_corpus.zig"),
+    const canonical_json_corpus_tests_root = b.createModule(.{
+        .root_source_file = b.path("libs/definition_core/tests/canonical_json_corpus.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
@@ -173,7 +158,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
@@ -314,7 +298,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "core_path", .module = core_path },
-            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "trace_core", .module = trace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
         },
@@ -762,12 +746,11 @@ pub fn build(b: *std.Build) void {
         "Reject domain vocabulary in the neutral definition library",
     );
     run_definition_core_guard.dependOn(&definition_core_guard_cmd.step);
-    const run_trace_core_tests = addTestStepWithOptions(
+    const run_trace_core_tests = addTestStep(
         b,
         trace_core,
         "test-trace-core",
         "Run canonical physical trace tests",
-        .{ .cwd = b.path("apps/seq") },
     );
     const run_seq_core_tests = addTestStep(
         b,
@@ -807,29 +790,21 @@ pub fn build(b: *std.Build) void {
         "test-execution-policy-core",
         "Run execution_policy_core tests",
     );
-    const run_retrace_core_tests = addTestStepWithOptions(
+    const run_jsonl_large_tests = addTestStep(
         b,
-        retrace_core,
-        "test-retrace-core",
-        "Run Retrace core contract tests",
-        .{ .cwd = b.path("apps/seq") },
-    );
-    const run_retrace_large_tests = addTestStep(
-        b,
-        retrace_large_tests_root,
-        "test-retrace-core-large",
+        jsonl_large_tests_root,
+        "test-jsonl-core-large",
         "Run the greater-than-256-MiB streaming regression in ReleaseFast",
     );
-    run_retrace_core_tests.step.dependOn(&run_retrace_large_tests.step);
     const test_jsonl_stream_large = b.step(
         "test-jsonl-stream-large",
         "Run the greater-than-256-MiB streaming regression in ReleaseFast",
     );
-    test_jsonl_stream_large.dependOn(&run_retrace_large_tests.step);
-    const run_retrace_corpus_tests = addTestStep(
+    test_jsonl_stream_large.dependOn(&run_jsonl_large_tests.step);
+    const run_canonical_json_corpus_tests = addTestStep(
         b,
-        retrace_corpus_tests_root,
-        "test-retrace-core-corpus",
+        canonical_json_corpus_tests_root,
+        "test-canonical-json-corpus",
         "Run the broad deterministic float corpus in ReleaseFast",
     );
 
@@ -924,11 +899,10 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_ledger_core_tests.step);
     test_all.dependOn(run_ledger_cli_smoke);
     test_all.dependOn(&run_execution_policy_core_tests.step);
-    test_all.dependOn(&run_retrace_core_tests.step);
 
     const test_full = b.step("test-full", "Run routine tests and explicit slow qualification lanes");
     test_full.dependOn(test_all);
-    test_full.dependOn(&run_retrace_corpus_tests.step);
+    test_full.dependOn(&run_canonical_json_corpus_tests.step);
 
     const enable_zlinter = b.option(
         bool,
@@ -1128,7 +1102,7 @@ fn buildLintStep(
         .include = &.{
             b.path("libs/core"),
             b.path("libs/jsonl_core"),
-            b.path("libs/retrace_core"),
+            b.path("libs/trace_core"),
             b.path("build.zig"),
             b.path("tools"),
         },
