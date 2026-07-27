@@ -177,7 +177,7 @@ pub fn bind(
         }
     }
     std.mem.sort(Binding, items.items, {}, lessThanBinding);
-    const values_digest = digestBindings(items.items);
+    const values_digest = try digestBindings(items.items);
     return .{
         .items = try items.toOwnedSlice(allocator),
         .values_digest = values_digest,
@@ -302,7 +302,7 @@ fn digestDeclarations(items: []const Declaration) [71]u8 {
     return finishDigest(&hasher);
 }
 
-fn digestBindings(items: []const Binding) [71]u8 {
+fn digestBindings(items: []const Binding) ![71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("definition-parameter-values/v1\x00");
     for (items) |item| {
@@ -310,7 +310,7 @@ fn digestBindings(items: []const Binding) [71]u8 {
         updateLengthPrefixed(&hasher, @tagName(item.value.kind()));
         var out: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer out.deinit();
-        item.value.writeCanonical(&out.writer) catch unreachable;
+        try item.value.writeCanonical(&out.writer);
         updateLengthPrefixed(&hasher, out.written());
     }
     return finishDigest(&hasher);

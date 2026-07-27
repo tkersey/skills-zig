@@ -158,7 +158,10 @@ pub fn load(
             route,
             runtime_version,
             &compiled,
-        ) catch {};
+        ) catch |err| {
+            // The cache is optional; a write failure cannot invalidate the plan.
+            _ = @errorName(err);
+        };
     }
     return compiled;
 }

@@ -140,10 +140,8 @@ pub fn compile(
     var source_width: usize = undefined;
     var physical_field_indices: ?[]const u16 = null;
     var source_row_bound: ?usize = null;
-    while (true) {
-        if (stage_count == stage_path.len) {
-            return error.ObservationPipelineTooDeep;
-        }
+    var source_resolved = false;
+    while (stage_count < stage_path.len) {
         stage_path[stage_count] = current_index;
         stage_count += 1;
         const stage = &native_plan.stages[current_index];
@@ -157,6 +155,7 @@ pub fn compile(
                     source = .{ .external = index };
                     source_width = definition_plan.inputs[index].fields.len;
                     source_row_bound = definition_plan.inputs[index].max_rows;
+                    source_resolved = true;
                     break;
                 },
             }
@@ -168,8 +167,10 @@ pub fn compile(
         source = .{ .physical = scan.relation };
         source_width = scan.field_indices.len;
         physical_field_indices = scan.field_indices;
+        source_resolved = true;
         break;
     }
+    if (!source_resolved) return error.ObservationPipelineTooDeep;
 
     if (source_width == 0 or source_width > 256) {
         return error.InvalidObservationSourceWidth;

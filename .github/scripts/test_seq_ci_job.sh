@@ -86,7 +86,7 @@ expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq
 
 for token in \
   'Fuzz passive definition parsing (Linux)' \
-  'zig test libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "'; do
+  'zig test -Mroot=libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "'; do
   if ! grep -Fq -- "$token" <<<"$seq_fuzz_job"; then
     echo "Seq fuzz proof token missing: $token" >&2
     exit 1

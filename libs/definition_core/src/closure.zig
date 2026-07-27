@@ -1,6 +1,8 @@
 const std = @import("std");
 const canonical_json = @import("canonical_json.zig");
 
+const package_ancestor_count_max: usize = 256;
+
 pub const Limits = struct {
     max_files: usize = 128,
     max_total_bytes: usize = 4 * 1024 * 1024,
@@ -60,7 +62,7 @@ pub fn admittedPackageLocation(
 
 fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
     var cursor = std.fs.path.dirname(absolute_path) orelse return null;
-    while (true) {
+    for (0..package_ancestor_count_max) |_| {
         if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
             const package = std.fs.path.dirname(cursor) orelse return null;
             const collection = std.fs.path.dirname(package) orelse return null;
@@ -75,6 +77,7 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, parent, cursor)) return null;
         cursor = parent;
     }
+    return null;
 }
 
 fn pathWithin(path: []const u8, root: []const u8) bool {
