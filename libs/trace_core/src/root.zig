@@ -279,6 +279,7 @@ pub const TraceOccurrence = struct {
     payload_json: ?[]u8 = null,
     raw_json: ?[]u8 = null,
     text: ?[]u8 = null,
+    message_visible: bool = true,
     private: bool = false,
     format: TraceFormat = .unknown,
 
@@ -564,6 +565,11 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     var synthetic_turns: i64 = 0;
     var saw_task_started = false;
     var saw_primary_session_meta = false;
+    var seen_messages = std.AutoHashMap(
+        [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        void,
+    ).init(allocator);
+    defer seen_messages.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
     defer lines.deinit();
     while (try lines.next()) |record| {
@@ -598,6 +604,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 line_number,
                 line,
                 options.include_raw,
+                &seen_messages,
             )
         else
             null;
@@ -959,6 +966,10 @@ fn appendOccurrence(
     line_number: usize,
     raw_json: []const u8,
     include_raw: bool,
+    seen_messages: *std.AutoHashMap(
+        [std.crypto.hash.sha2.Sha256.digest_length]u8,
+        void,
+    ),
 ) !usize {
     const source = payload orelse root;
     const source_type = stringField(source, "type");
@@ -1002,6 +1013,33 @@ fn appendOccurrence(
             text = try allocator.dupe(u8, stringField(source, "message") orelse stringField(source, "text") orelse "");
         }
     }
+    var message_visible = false;
+    if (role) |message_role| {
+        if (text) |message_text| {
+            if (std.mem.eql(u8, message_role, "user") or
+                std.mem.eql(u8, message_role, "assistant"))
+            {
+                const selected = if (std.mem.eql(u8, message_role, "assistant"))
+                    stripEchoView(message_text)
+                else
+                    message_text;
+                const normalized = try normalizeMessageTextAlloc(
+                    allocator,
+                    selected,
+                );
+                allocator.free(message_text);
+                text = normalized;
+                if (normalized.len != 0 and
+                    !(std.mem.eql(u8, message_role, "user") and
+                        isMetaUserMessage(normalized)))
+                {
+                    const digest = messageDigest(message_role, normalized);
+                    const entry = try seen_messages.getOrPut(digest);
+                    message_visible = !entry.found_existing;
+                }
+            }
+        }
+    }
 
     var occurrence = try TraceOccurrence.init(
         allocator,
@@ -1019,9 +1057,13 @@ fn appendOccurrence(
         private,
     );
     errdefer occurrence.deinit(allocator);
+    occurrence.message_visible = message_visible;
     freeOpt(allocator, text);
     text = null;
-    occurrence.timestamp = if (timestamp) |value| try allocator.dupe(u8, value) else null;
+    occurrence.timestamp = if (timestamp) |value|
+        try normalizeTimestampAlloc(allocator, value)
+    else
+        null;
     occurrence.payload_json = if (!private) try stringifyJsonValue(allocator, if (payload != null) root.get("payload").? else std.json.Value{ .object = root }) else null;
     occurrence.raw_json = if (include_raw)
         try allocator.dupe(u8, raw_json)
@@ -1515,6 +1557,91 @@ fn messageTextAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8
     return out.toOwnedSlice(allocator);
 }
 
+fn stripEchoView(text: []const u8) []const u8 {
+    const left = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, left, "Echo:")) return text;
+
+    const newline_index = std.mem.indexOfScalar(u8, left, '\n') orelse
+        return "";
+    var rest = left[newline_index + 1 ..];
+    while (rest.len > 0 and rest[0] == '\r') rest = rest[1..];
+
+    var index: usize = 0;
+    while (index < rest.len and
+        (rest[index] == ' ' or
+            rest[index] == '\t' or
+            rest[index] == '\r')) : (index += 1)
+    {}
+    if (index < rest.len and rest[index] == '\n') {
+        rest = rest[index + 1 ..];
+    }
+    return rest;
+}
+
+fn isMetaUserMessage(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "# AGENTS.md instructions")) {
+        return true;
+    }
+    if (std.mem.startsWith(u8, trimmed, "<environment_context>")) return true;
+    if (std.mem.startsWith(u8, trimmed, "<INSTRUCTIONS>")) return true;
+    const end = @min(trimmed.len, 200);
+    return std.mem.indexOf(
+        u8,
+        trimmed[0..end],
+        "AGENTS.md instructions",
+    ) != null;
+}
+
+fn normalizeMessageTextAlloc(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < text.len) : (index += 1) {
+        if (text[index] == '\r') {
+            if (index + 1 < text.len and text[index + 1] == '\n') index += 1;
+            try output.append(allocator, '\n');
+        } else {
+            try output.append(allocator, text[index]);
+        }
+    }
+    return allocator.dupe(
+        u8,
+        std.mem.trim(u8, output.items, " \t\n"),
+    );
+}
+
+fn normalizeTimestampAlloc(
+    allocator: std.mem.Allocator,
+    timestamp: []const u8,
+) ![]u8 {
+    if (timestamp.len > 0 and timestamp[timestamp.len - 1] == 'Z') {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}+00:00",
+            .{timestamp[0 .. timestamp.len - 1]},
+        );
+    }
+    return allocator.dupe(u8, timestamp);
+}
+
+fn messageDigest(
+    role: []const u8,
+    text: []const u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(role);
+    hasher.update("\x1f");
+    hasher.update(text);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn messageTextPartsAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]MessageTextPart {
     var parts = std.ArrayList(MessageTextPart).empty;
     errdefer {
@@ -1957,6 +2084,43 @@ test "parseRawTraceEvent detects newer event_msg" {
     try std.testing.expectEqual(TraceFormat.new_044_plus, event.format);
     try std.testing.expectEqualStrings("event_msg", event.entry_type);
     try std.testing.expectEqualStrings("task_started", event.event_type.?);
+}
+
+test "canonical messages normalize and suppress repeated source carriers" {
+    const source =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"messages\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /repo\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prior\\n\\nAnswer\\r\\n\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Answer\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Hello\\r\\n\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n";
+    var trace = try parseSessionTraceBytes(
+        std.testing.allocator,
+        "/tmp/messages.jsonl",
+        source,
+        nowRealtimeNs(),
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 6), trace.occurrences.items.len);
+    try std.testing.expect(!trace.occurrences.items[1].message_visible);
+    try std.testing.expect(trace.occurrences.items[2].message_visible);
+    try std.testing.expectEqualStrings(
+        "Answer",
+        trace.occurrences.items[2].text.?,
+    );
+    try std.testing.expectEqualStrings(
+        "2026-07-13T00:00:02+00:00",
+        trace.occurrences.items[2].timestamp.?,
+    );
+    try std.testing.expect(!trace.occurrences.items[3].message_visible);
+    try std.testing.expect(trace.occurrences.items[4].message_visible);
+    try std.testing.expectEqualStrings(
+        "Hello",
+        trace.occurrences.items[4].text.?,
+    );
+    try std.testing.expect(!trace.occurrences.items[5].message_visible);
 }
 
 test "parseRawTraceEvent skips state and malformed lines" {

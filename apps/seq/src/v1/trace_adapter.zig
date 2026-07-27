@@ -192,7 +192,12 @@ pub fn feedTrace(
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
         },
         .messages => for (trace.occurrences.items) |*occurrence| {
-            if (occurrence.role == null or occurrence.text == null) continue;
+            if (!occurrence.message_visible or
+                occurrence.role == null or
+                occurrence.text == null)
+            {
+                continue;
+            }
             try fillMessage(
                 row[0..program.source_width],
                 program.source_field_indices,
@@ -315,7 +320,12 @@ pub fn writeRelationRowsJson(
             count += 1;
         },
         .messages => for (trace.occurrences.items) |*occurrence| {
-            if (occurrence.role == null or occurrence.text == null) continue;
+            if (!occurrence.message_visible or
+                occurrence.role == null or
+                occurrence.text == null)
+            {
+                continue;
+            }
             try fillMessage(
                 values[0..fields.len],
                 indices[0..fields.len],
