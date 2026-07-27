@@ -2696,11 +2696,15 @@ fn writeProjectedValue(
             value,
             field.pointer,
         ) orelse return error.ProjectionFieldMissing;
-        try definition_core.canonical_json.writeCanonicalJson(
-            allocator,
-            writer,
-            selected,
-        );
+        if (projection.preserve_field_order) {
+            try std.json.Stringify.value(selected, .{}, writer);
+        } else {
+            try definition_core.canonical_json.writeCanonicalJson(
+                allocator,
+                writer,
+                selected,
+            );
+        }
     }
     try writer.writeByte('}');
 }
@@ -3016,7 +3020,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "protocol.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["export","id-lookup","latest","limit","relevance","sort"]},"parameters":{"id":{"type":"string","required":false},"query":{"type":"string","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"latest":{"slot":"events","pipeline":[{"op":"latest","path":"/record/id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"nested":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","path":"/record"}]},"ordered":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"query":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"literal"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"raw":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","raw":true}]},"recall":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"tokens","score_field":"score"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"recent":{"slot":"events","pipeline":[{"op":"sort","keys":[{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":2}]},"required":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id","required":true},{"op":"export","raw":true}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["export","id-lookup","latest","limit","relevance","sort"]},"parameters":{"id":{"type":"string","required":false},"query":{"type":"string","required":false}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"latest":{"slot":"events","pipeline":[{"op":"latest","path":"/record/id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"nested":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","path":"/record"}]},"ordered":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"},{"name":"metadata","path":"/record/metadata"}]}]},"query":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"literal"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"raw":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","raw":true}]},"recall":{"slot":"events","pipeline":[{"op":"relevance","paths":["/record/operation","/record/authority"],"param":"query","mode":"tokens","score_field":"score"},{"op":"sort","keys":[{"meta":"relevance-score","order":"descending"},{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":10}]},"recent":{"slot":"events","pipeline":[{"op":"sort","keys":[{"meta":"record-order","order":"descending"}]},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]},{"op":"limit","count":2}]},"required":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id","required":true},{"op":"export","raw":true}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -3063,6 +3067,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try std.testing.expect(!ordered.raw);
     try std.testing.expectEqualStrings("operation", ordered.fields[0].name);
     try std.testing.expectEqualStrings("authority", ordered.fields[1].name);
+    try std.testing.expectEqualStrings("metadata", ordered.fields[2].name);
     const raw = cached.find("raw").?;
     try std.testing.expect(raw.single);
     try std.testing.expect(raw.raw);
@@ -3082,7 +3087,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
     );
     defer bindings.deinit(std.testing.allocator);
     const rows =
-        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}}\n" ++
+        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\",\"metadata\":{\"z\":\"last\",\"a\":\"first\"}}}\n" ++
         "{\"record\":{\"operation\":\"o2\",\"id\":\"r2\",\"authority\":\"a2\"},\"v\":1}\n";
 
     var ordered_output: std.Io.Writer.Allocating =
@@ -3104,7 +3109,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
         &ordered_stats,
     );
     try std.testing.expectEqualStrings(
-        "{\"operation\":\"o1\",\"authority\":\"a1\"}",
+        "{\"operation\":\"o1\",\"authority\":\"a1\",\"metadata\":{\"z\":\"last\",\"a\":\"first\"}}",
         ordered_output.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), ordered_stats.records_scanned);
@@ -3128,7 +3133,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
         &raw_stats,
     );
     try std.testing.expectEqualStrings(
-        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}}",
+        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\",\"metadata\":{\"z\":\"last\",\"a\":\"first\"}}}",
         raw_output.written(),
     );
 
@@ -3151,7 +3156,7 @@ test "exact lookup emits one definition-ordered or raw payload" {
         &nested_stats,
     );
     try std.testing.expectEqualStrings(
-        "{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}",
+        "{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\",\"metadata\":{\"z\":\"last\",\"a\":\"first\"}}",
         nested_output.written(),
     );
 

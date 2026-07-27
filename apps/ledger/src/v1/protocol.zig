@@ -988,6 +988,7 @@ pub fn materializeEvent(
     ) orelse return error.EventBodyInputMissing;
     const generated_outputs = try generateOutputsAlloc(
         allocator,
+        materialization,
         materialization.generate,
         materialization.derive,
         request,
@@ -1088,6 +1089,7 @@ pub fn materializePlainEvent(
     ) orelse return error.EventBodyInputMissing;
     const generated_outputs = try generateOutputsAlloc(
         allocator,
+        materialization,
         materialization.generate,
         materialization.derive,
         request,
@@ -1162,6 +1164,7 @@ pub fn derivePlainIdempotencyKeyAlloc(
     ) orelse return error.EventIdempotencyDerivationMissing;
     const value = try deriveEventValueAlloc(
         allocator,
+        materialization,
         derivation.*,
         request,
         0,
@@ -1355,6 +1358,7 @@ fn validateStoredEventDerivations(
             },
             else => try deriveEventValueAlloc(
                 allocator,
+                materialization,
                 item,
                 parsed.value,
                 0,
@@ -1554,10 +1558,13 @@ fn reconstructInputWithLayoutAlloc(
         try output.writer.writeByte(':');
         switch (mapping.value) {
             .json => |value| {
-                try definition_core.canonical_json.writeCanonicalJson(
+                var path = EventJsonPath{};
+                try writeEventJsonValue(
                     allocator,
                     &output.writer,
+                    materialization,
                     value,
+                    &path,
                 );
             },
             .literal => |literal| try output.writer.writeAll(literal),
@@ -1590,6 +1597,7 @@ fn validateForbiddenParameters(
 
 fn generateOutputsAlloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     definitions: []const storage.SecureTokenGeneration,
     derivations: []const storage.EventDerivation,
     request: std.json.Value,
@@ -1634,6 +1642,7 @@ fn generateOutputsAlloc(
     for (derivations) |item| {
         const value = try deriveEventValueAlloc(
             allocator,
+            materialization,
             item,
             request,
             unix_seconds,
@@ -1663,6 +1672,7 @@ fn generateOutputsAlloc(
 
 fn deriveEventValueAlloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     item: storage.EventDerivation,
     request: std.json.Value,
     unix_seconds: i64,
@@ -1684,18 +1694,21 @@ fn deriveEventValueAlloc(
         ),
         .sha1 => |config| deriveEventSha1Alloc(
             allocator,
+            materialization,
             request,
             prior,
             config,
         ),
         .sha256 => |config| deriveEventSha256Alloc(
             allocator,
+            materialization,
             request,
             prior,
             config,
         ),
         .concat => |config| deriveEventConcatAlloc(
             allocator,
+            materialization,
             request,
             prior,
             config,
@@ -1705,6 +1718,7 @@ fn deriveEventValueAlloc(
 
 fn deriveEventSha1Alloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     request: std.json.Value,
     prior: []const GeneratedOutput,
     config: storage.EventDigestDerivation,
@@ -1714,6 +1728,7 @@ fn deriveEventSha1Alloc(
     for (config.fragments) |fragment| {
         const bytes = try eventDerivationFragmentAlloc(
             allocator,
+            materialization,
             request,
             prior,
             fragment,
@@ -1741,6 +1756,7 @@ fn deriveEventSha1Alloc(
 
 fn deriveEventSha256Alloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     request: std.json.Value,
     prior: []const GeneratedOutput,
     config: storage.EventDigestDerivation,
@@ -1750,6 +1766,7 @@ fn deriveEventSha256Alloc(
     for (config.fragments) |fragment| {
         const bytes = try eventDerivationFragmentAlloc(
             allocator,
+            materialization,
             request,
             prior,
             fragment,
@@ -1791,6 +1808,7 @@ fn truncateEventDigestAlloc(
 
 fn deriveEventConcatAlloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     request: std.json.Value,
     prior: []const GeneratedOutput,
     config: storage.EventConcatDerivation,
@@ -1800,6 +1818,7 @@ fn deriveEventConcatAlloc(
     for (config.fragments) |fragment| {
         const bytes = try eventDerivationFragmentAlloc(
             allocator,
+            materialization,
             request,
             prior,
             fragment,
@@ -1820,6 +1839,7 @@ fn deriveEventConcatAlloc(
 
 fn eventDerivationFragmentAlloc(
     allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
     request: std.json.Value,
     prior: []const GeneratedOutput,
     fragment: storage.EventDerivationFragment,
@@ -1848,6 +1868,20 @@ fn eventDerivationFragmentAlloc(
                 request,
                 pointer,
             ) orelse return error.EventDerivationInputMissing;
+            if (materialization.body_order.len != 0 and
+                pointer.segments.len == 1 and
+                std.mem.eql(
+                    u8,
+                    pointer.segments[0],
+                    materialization.body_input_field,
+                ))
+            {
+                break :blk try orderedInputBodyAlloc(
+                    allocator,
+                    materialization,
+                    value,
+                );
+            }
             var output: std.Io.Writer.Allocating = .init(allocator);
             errdefer output.deinit();
             try std.json.Stringify.value(value, .{}, &output.writer);
@@ -1892,6 +1926,50 @@ fn eventDerivationFragmentAlloc(
             break :blk transformed;
         },
     };
+}
+
+fn orderedInputBodyAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    value: std.json.Value,
+) ![]u8 {
+    const object = try definition_core.json.object(value);
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        if (!containsDeclaredName(
+            materialization.body_order,
+            entry.key_ptr.*,
+        )) return error.EventBodyFieldCoverageMismatch;
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeByte('{');
+    var written: usize = 0;
+    for (materialization.body_order) |key| {
+        const selected = object.get(key) orelse continue;
+        if (written != 0) try output.writer.writeByte(',');
+        try writeEventJsonString(
+            &output.writer,
+            key,
+            materialization.escape_non_ascii,
+        );
+        try output.writer.writeByte(':');
+        var path = EventJsonPath{};
+        try path.push(key);
+        try writeEventJsonValue(
+            allocator,
+            &output.writer,
+            materialization,
+            selected,
+            &path,
+        );
+        written += 1;
+    }
+    if (written != object.count()) {
+        return error.EventBodyFieldCoverageMismatch;
+    }
+    try output.writer.writeByte('}');
+    return output.toOwnedSlice();
 }
 
 fn formatEventTimestampAlloc(
@@ -2112,7 +2190,6 @@ fn writeEventJsonValue(
                 while (iterator.next()) |entry| {
                     try keys.append(allocator, entry.key_ptr.*);
                 }
-                sortStrings(keys.items);
             }
             try writer.writeByte('{');
             for (keys.items, 0..) |key, index| {
@@ -2659,18 +2736,6 @@ fn reconstructedBodyAlloc(
         .derived,
         => {},
     };
-    std.mem.sort(Mapping, mappings.items, {}, struct {
-        fn lessThan(_: void, left: Mapping, right: Mapping) bool {
-            return std.mem.lessThan(u8, left.key, right.key);
-        }
-    }.lessThan);
-    if (mappings.items.len > 1) {
-        for (mappings.items[1..], 1..) |mapping, index| {
-            if (std.mem.eql(u8, mappings.items[index - 1].key, mapping.key)) {
-                return error.EventBodyFieldSetInvalid;
-            }
-        }
-    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.writeByte('{');
@@ -2683,10 +2748,14 @@ fn reconstructedBodyAlloc(
         try output.writer.writeByte(':');
         switch (mapping.value) {
             .json => |value| {
-                try definition_core.canonical_json.writeCanonicalJson(
+                var path = EventJsonPath{};
+                try path.push(mapping.key);
+                try writeEventJsonValue(
                     allocator,
                     &output.writer,
+                    materialization,
                     value,
+                    &path,
                 );
             },
             .literal => |literal| try output.writer.writeAll(literal),
@@ -4438,7 +4507,8 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         \\  "canonicalization":{},
         \\  "shape":{"rules":[
         \\    {"op":"exact-object","input":"submission","path":"","keys":["logical_kind","note","physical_kind"]},
-        \\    {"op":"exact-object","input":"submission","path":"/note","keys":["operation","summary"]}
+        \\    {"op":"exact-object","input":"submission","path":"/note","keys":["operation","summary","details"]},
+        \\    {"op":"exact-object","input":"submission","path":"/note/details","keys":["z","a"]}
         \\  ]},
         \\  "constraints":[],
         \\  "identity":{},
@@ -4447,7 +4517,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         \\    "mode":"plain",
         \\    "body_input_field":"note",
         \\    "field_order":["v","source","event","syn_id","captured_at","kind","logical_kind","operation","note"],
-        \\    "body_order":["id","captured_at","logical_kind","kind","operation","summary","fingerprint"],
+        \\    "body_order":["id","captured_at","logical_kind","kind","operation","summary","details","fingerprint"],
         \\    "fields":[
         \\      {"field":"v","literal":1},
         \\      {"field":"source","literal":"synesthesia"},
@@ -4527,7 +4597,10 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     try storage.validateCachePlan(&cached, &definition_plan);
     const materialization = &cached.operations[0].effects[0].event.?;
     const request =
-        \\{"logical_kind":"mapping-endorsement","note":{"operation":"assert","summary":"hello"},"physical_kind":"mapping-endorsement"}
+        \\{"logical_kind":"mapping-endorsement","note":{"details":{"z":"last","a":"first"},"operation":"assert","summary":"hello"},"physical_kind":"mapping-endorsement"}
+    ;
+    const normalized_request =
+        \\{"logical_kind":"mapping-endorsement","note":{"operation":"assert","summary":"hello","details":{"z":"last","a":"first"}},"physical_kind":"mapping-endorsement"}
     ;
     var parsed_request = try std.json.parseFromSlice(
         std.json.Value,
@@ -4546,7 +4619,7 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
     );
     defer materialized.deinit(std.testing.allocator);
     const expected =
-        \\{"v":1,"source":"synesthesia","event":"synesthesia.capture","syn_id":"SYN-20260630T123456Z-572b35ef6ea23262","captured_at":"2026-06-30T12:34:56Z","kind":"mapping-endorsement","logical_kind":"mapping-endorsement","operation":"assert","note":{"id":"SYN-20260630T123456Z-572b35ef6ea23262","captured_at":"2026-06-30T12:34:56Z","logical_kind":"mapping-endorsement","kind":"mapping-endorsement","operation":"assert","summary":"hello","fingerprint":"572b35ef6ea2326244cd17228446b62418557e2c5839db516e83a3bd4fd1504a"}}
+        \\{"v":1,"source":"synesthesia","event":"synesthesia.capture","syn_id":"SYN-20260630T123456Z-59797a91f1077869","captured_at":"2026-06-30T12:34:56Z","kind":"mapping-endorsement","logical_kind":"mapping-endorsement","operation":"assert","note":{"id":"SYN-20260630T123456Z-59797a91f1077869","captured_at":"2026-06-30T12:34:56Z","logical_kind":"mapping-endorsement","kind":"mapping-endorsement","operation":"assert","summary":"hello","details":{"z":"last","a":"first"},"fingerprint":"59797a91f107786963782607f84a529d446f747c9658d98fec2f80b36b8a590e"}}
     ;
     try std.testing.expectEqualStrings(expected, materialized.content);
     try std.testing.expectEqual(@as(usize, 6), materialized.generated_outputs.len);
@@ -4563,13 +4636,13 @@ test "plain event derivations preserve timestamp fingerprint and identity" {
         parsed_event.value,
     );
     defer std.testing.allocator.free(reconstructed);
-    try std.testing.expectEqualStrings(request, reconstructed);
+    try std.testing.expectEqualStrings(normalized_request, reconstructed);
 
     const tampered = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
         materialized.content,
-        "572b35ef6ea2326244cd17228446b62418557e2c5839db516e83a3bd4fd1504a",
+        "59797a91f107786963782607f84a529d446f747c9658d98fec2f80b36b8a590e",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
     defer std.testing.allocator.free(tampered);

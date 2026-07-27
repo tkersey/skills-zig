@@ -179,7 +179,7 @@ pub const Operator = enum {
             .keyed_unique => 2,
             .regex => 2,
             .sha256 => 4,
-            .event_materialization => 3,
+            .event_materialization => 4,
             .idempotency_key => 2,
             .reducer => 5,
             .append_only_log => 3,
@@ -189,7 +189,7 @@ pub const Operator = enum {
             .fold => 3,
             .id_lookup, .latest => 2,
             .relevance => 3,
-            .@"export" => 3,
+            .@"export" => 4,
             .sort => 1,
             else => 1,
         };

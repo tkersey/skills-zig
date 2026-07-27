@@ -258,6 +258,22 @@ jq -r '.returned_content' "$source_transaction" |
   --format json >"$scratch/actual-recent.json"
 cmp -s "$scratch/expected-recent.json" "$scratch/actual-recent.json"
 
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection reconciliation-index \
+  --repo "$projection_repo" \
+  --param limit=1 \
+  --payload-only \
+  --format json >"$scratch/reconciliation-index.json"
+jq -e \
+  --arg id "$source_id" \
+  'length == 1 and
+   .[0].syn_id == $id and
+   .[0].logical_kind == "mapping-endorsement" and
+   .[0].kind == "mapping-endorsement" and
+   (.[0].captured_at | type) == "string"' \
+  "$scratch/reconciliation-index.json" >/dev/null
+
 jq -r '.returned_content' "$source_transaction" |
   jq -c \
     '[.record |
@@ -300,6 +316,6 @@ cmp -s "$scratch/expected-recall.json" "$scratch/actual-recall.json"
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=5 doctors=5\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=6 doctors=5\n' \
   "$valid_count" \
   "$invalid_count"
