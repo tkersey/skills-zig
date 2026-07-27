@@ -105,9 +105,57 @@ while IFS=$'\t' read -r case_id expectation; do
   fi
 done < <(jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite")
 
+source_definition="$dotfiles_root/codex/skills/synesthesia/definitions/ledger/synesthesia-protocol.json"
+source_submission="$scratch/source-submission.json"
+source_transaction="$scratch/source-transaction.json"
+projection_repo="$scratch/projection-repo"
+mkdir -p "$projection_repo"
+projection_repo=$(cd "$projection_repo" && pwd -P)
+jq -S -c '.source' "$scratch/mapping-endorsement.json" >"$source_submission"
+"$ledger_bin" transact \
+  --definition "$source_definition" \
+  --operation capture \
+  --repo "$projection_repo" \
+  --input "submission=$source_submission" \
+  --format json >"$source_transaction"
+source_id=$(jq -r '.generated_outputs.syn_id' "$source_transaction")
+jq -r '.returned_content' "$source_transaction" >"$scratch/expected-record.json"
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection record \
+  --repo "$projection_repo" \
+  --param "id=$source_id" \
+  --payload-only \
+  --format json >"$scratch/actual-record.json"
+cmp -s "$scratch/expected-record.json" "$scratch/actual-record.json"
+
+jq -c \
+  '.source.record |
+   {
+     operation: .operation,
+     authority: .authority,
+     summary: .summary,
+     scope: .scope,
+     source_refs: .source_refs,
+     related_ids: .related_ids,
+     supersedes_id: .supersedes_id,
+     payload: .payload
+   }' \
+  "$scratch/mapping-endorsement.json" >"$scratch/expected-memory-note.json"
+"$ledger_bin" project \
+  --definition "$source_definition" \
+  --projection memory-note \
+  --repo "$projection_repo" \
+  --param "id=$source_id" \
+  --payload-only \
+  --format json >"$scratch/actual-memory-note.json"
+cmp -s \
+  "$scratch/expected-memory-note.json" \
+  "$scratch/actual-memory-note.json"
+
 [[ "$valid_count" -eq 9 ]]
 [[ "$invalid_count" -eq 5 ]]
 printf \
-  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1\n' \
+  'memory-source-note adapter conformance passed: valid=%d invalid=%d bases=1 projections=2\n' \
   "$valid_count" \
   "$invalid_count"
