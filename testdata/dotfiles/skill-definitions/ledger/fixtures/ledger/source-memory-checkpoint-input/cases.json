@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -8,7 +8,6 @@
       "id": "complete",
       "base": "complete",
       "patch": [],
-      "fixture_digest": "sha256:efc3b341e481488cd0a9e5a9e7fdfcd65277ec2f87adef24fb0414a4b9795ee9",
       "expect": "valid",
       "materialization": {
         "artifact_id": "sha256:7407b8b7372927a9fde83e860b79cf9cc1569279a053e8a89c4043e3cacf9fc7",
@@ -25,7 +24,6 @@
           "value": null
         }
       ],
-      "fixture_digest": "sha256:78995117c1a304d0d8b14f2b5937b0da420b4edc167bf8909a1dd11a4ccd5f74",
       "expect": "valid"
     },
     {
@@ -37,7 +35,6 @@
           "path": "/evidence/changed_paths"
         }
       ],
-      "fixture_digest": "sha256:0daf37e9066916b21d6f29ed938c53e1f6dc60ee30e62ad2689931d037d31e39",
       "expect": "invalid"
     },
     {
@@ -50,7 +47,6 @@
           "value": "/tmp/outside"
         }
       ],
-      "fixture_digest": "sha256:46cad93aaf20970c415299068d2c1bb60cccb7ca3a7c4c452ef133fbbbca979e",
       "expect": "invalid"
     },
     {
@@ -63,7 +59,6 @@
           "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }
       ],
-      "fixture_digest": "sha256:7466d0ee98a156e85b1cdbf7ffc6c139ce1a0a61097c5c29fde0da9af6f7ad64",
       "expect": "invalid"
     },
     {
@@ -78,7 +73,6 @@
           ]
         }
       ],
-      "fixture_digest": "sha256:c6ed1ab70ad4b07cb678c3538f83cdc9b7f72331670f8319f8e0e3ba8c0ec9f6",
       "expect": "invalid"
     },
     {
@@ -91,8 +85,8 @@
           "value": " "
         }
       ],
-      "fixture_digest": "sha256:08bf30d0965359ee2f48074bcbbae661fd7fc9451edbac309d2739d55bc15d18",
       "expect": "invalid"
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:347ea4f4e426a396223ffaa52bbf1eb2419a3823fd725569bd8cdf186643d78b"
 }

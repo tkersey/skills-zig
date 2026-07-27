@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
@@ -12,7 +12,6 @@
       "id": "complete-all-no-op",
       "base": "complete",
       "patch": [],
-      "fixture_digest": "sha256:e9ca23e2928dd269c5d118decf3773749e122072e214a084238fbb6848ceafd6",
       "expect": "valid",
       "materialization": {
         "artifact_id": "sha256:b028068be64931408170c944d55b4f2e4dfb23aa76ba006be55b562f9879dc61",
@@ -52,7 +51,6 @@
           "value": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         }
       ],
-      "fixture_digest": "sha256:1cda48400a5d5d7fdf8ffd600844581d0e34d92da59777ae572cf2972b1b57a7",
       "expect": "valid"
     },
     {
@@ -74,7 +72,6 @@
           "value": "blocked"
         }
       ],
-      "fixture_digest": "sha256:541db0f115527117bce9fb49d54eaa5ec667970d16433f84cced34559848dacd",
       "expect": "valid"
     },
     {
@@ -86,7 +83,6 @@
           "path": "/participants/negative-ledger"
         }
       ],
-      "fixture_digest": "sha256:85d0d7a92cfe60c4e0390aacb9275285321c733d04f2022ea8c42fc890b60609",
       "expect": "invalid"
     },
     {
@@ -104,7 +100,6 @@
           }
         }
       ],
-      "fixture_digest": "sha256:fdc62878fc4c75da166a773dba2603d6af6d29540ed4fccbb5227a692aaf966a",
       "expect": "invalid"
     },
     {
@@ -117,7 +112,6 @@
           "value": "degraded"
         }
       ],
-      "fixture_digest": "sha256:68c11e60f9468e458f05429ee6b80c279bb736280a45a95d1bfacd9d325d3fcc",
       "expect": "invalid"
     },
     {
@@ -130,7 +124,6 @@
           "value": "blocked"
         }
       ],
-      "fixture_digest": "sha256:3ac86258192c331cc81fef0a16cf178a69c7e6639d54c56af431cfb86427564d",
       "expect": "invalid"
     },
     {
@@ -148,7 +141,6 @@
           }
         }
       ],
-      "fixture_digest": "sha256:b2881857ab304ab22fa8743c082e671d33f20d7bc16ea5a758f8067ab7709f4d",
       "expect": "invalid"
     },
     {
@@ -167,8 +159,8 @@
           }
         }
       ],
-      "fixture_digest": "sha256:95764b54fe8216055b87f8bedb10b9defd63df79ad33f3f9da4be825e50dd5b0",
       "expect": "invalid"
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:7183ae2f7636531d5ec9563a2bb13f41e1128dd9fc3b5f1d5274fb89702c0649"
 }

@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "bases": {
     "accepted": "bases/accepted.json"
   },
@@ -7,14 +7,12 @@
     {
       "id": "accepted",
       "base": "accepted",
-      "expect": "valid",
-      "fixture_digest": "sha256:c15f3a58453b467e77fb230d9cfad785ce60cfa3003d7436cace9764c40f127c"
+      "expect": "valid"
     },
     {
       "id": "unknown-discrepancy",
       "base": "accepted",
       "expect": "invalid",
-      "fixture_digest": "sha256:59549994f0ec4d82b107fa25ad670ab1939118f097a484541a47e11cfaf9484e",
       "patch": [
         {
           "op": "replace",
@@ -28,5 +26,6 @@
         }
       ]
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:6eb61a5ffe6c4bd9223d68a5a0c8eea410e7d8bcbcc152be8b179a011351a1ce"
 }

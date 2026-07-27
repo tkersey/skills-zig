@@ -25,8 +25,10 @@ jq -e \
   '
     type == "object" and
     (keys | sort) ==
-      ["cases", "protocol_definition", "schema", "sources"] and
-    .schema == "actuating-evidence-protocol-cases/v1" and
+      ["cases", "protocol_definition", "reconstructed_candidates_digest", "schema", "sources"] and
+    .schema == "actuating-evidence-protocol-cases/v2" and
+    (.reconstructed_candidates_digest |
+      type == "string" and test("^sha256:[0-9a-f]{64}$")) and
     (.protocol_definition |
       type == "string" and
       startswith("/") == false and
@@ -49,14 +51,12 @@ jq -e \
     all(.cases[];
       type == "object" and
       (keys | sort) ==
-        ["candidate", "candidate_digest", "error", "expect", "id", "patch", "setup"] and
+        ["candidate", "error", "expect", "id", "patch", "setup"] and
       (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
       (.setup == "accepted-debt" or .setup == "rejected-review") and
       (.candidate == "construction-successor" or
        .candidate == "goal-successor") and
       (.expect == "valid" or .expect == "invalid") and
-      (.candidate_digest |
-        type == "string" and test("^sha256:[0-9a-f]{64}$")) and
       ((.expect == "valid" and .error == null) or
        (.expect == "invalid" and
         (.error | type == "string" and length > 0))) and
@@ -115,6 +115,16 @@ reconstruct_source() {
     "$case_id" \
     "$output"
 }
+
+source_suite_index=0
+while IFS= read -r source_fixture_root; do
+  source_suite_index=$((source_suite_index + 1))
+  source_fixture_root="$fixture_sets/$source_fixture_root"
+  verify_definition_suite_digest \
+    "$source_fixture_root" \
+    "$source_fixture_root/cases.json" \
+    "$scenario_tmp/source-suite-$source_suite_index"
+done < <(jq -r '.sources[].fixture_root' "$scenarios" | LC_ALL=C sort -u)
 
 materialize_source() {
   local source_name=$1
@@ -547,7 +557,9 @@ run_candidate() {
 }
 
 case_count=0
-while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error expected_digest; do
+candidate_digests="$scenario_tmp/reconstructed-candidate-digests.jsonl"
+: >"$candidate_digests"
+while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error; do
   case_count=$((case_count + 1))
   case_tmp="$scenario_tmp/$case_id"
   repo_root="$case_tmp/repo"
@@ -561,13 +573,10 @@ while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error 
   setup_review "$case_tmp" "$repo_root" "$review_status"
   check_structural_facts "$case_tmp" "$repo_root"
   prepare_candidate "$case_id" "$candidate_kind" "$case_tmp"
-  actual_digest="sha256:$(shasum -a 256 "$case_tmp/candidate.json" | awk '{print $1}')"
-  if [[ "$actual_digest" != "$expected_digest" ]]; then
-    echo "$case_id candidate digest: $actual_digest" >&2
-    if [[ ${REPORT_CANDIDATE_DIGESTS:-0} != 1 ]]; then
-      exit 1
-    fi
-  fi
+  append_reconstructed_digest \
+    "$case_id" \
+    "$case_tmp/candidate.json" \
+    "$candidate_digests"
   IFS=$'\t' read -r operation input_name candidate_request < <(
     run_candidate "$case_id" "$candidate_kind" "$case_tmp" "$repo_root"
   )
@@ -610,10 +619,15 @@ while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error 
 done < <(
   jq -r \
     '.cases[] |
-     [.id, .setup, .candidate, .expect, (.error // "-"), .candidate_digest] |
+     [.id, .setup, .candidate, .expect, (.error // "-")] |
      @tsv' \
     "$scenarios"
 )
+
+verify_reconstructed_digest_set \
+  "$candidate_digests" \
+  "$(jq -r '.reconstructed_candidates_digest' "$scenarios")" \
+  "$scenario_tmp/reconstructed-candidate-digest-set.json"
 
 check_existing_binding
 

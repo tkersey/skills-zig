@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "bases": {
     "minimal": "bases/minimal.json"
   },
@@ -7,14 +7,12 @@
     {
       "id": "minimal",
       "base": "minimal",
-      "expect": "valid",
-      "fixture_digest": "sha256:1d4f2c5d718d846d51d1a1c41d4791ef71e724c750120461a210d9abb6983f65"
+      "expect": "valid"
     },
     {
       "id": "unknown-route",
       "base": "minimal",
       "expect": "invalid",
-      "fixture_digest": "sha256:ed4c9154ba4e8ad89413490bbc6b52839634e0618edab48a5c7b7232de37a179",
       "patch": [
         {
           "op": "replace",
@@ -33,5 +31,6 @@
         }
       ]
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:cb289f87d2f2d1374ba5b9ede41d44a7c8450b11f696ede6a730df3709715684"
 }

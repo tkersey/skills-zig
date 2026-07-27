@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "bases": {
     "complete": "bases/complete.json"
   },
@@ -7,14 +7,12 @@
     {
       "id": "complete",
       "base": "complete",
-      "expect": "valid",
-      "fixture_digest": "sha256:04f5ab721278e059a716779bc00de8fd41b8471c4cdabaeb26059edba6bfec89"
+      "expect": "valid"
     },
     {
       "id": "gate-only",
       "base": "complete",
       "expect": "invalid",
-      "fixture_digest": "sha256:1988a31e66373d4f6b98c29e6b969700ad2df432bd181af9f1ff136e6f03ad9f",
       "patch": [
         {
           "op": "replace",
@@ -23,5 +21,6 @@
         }
       ]
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:5c12d609358bddbc5127c6c032f07245fe25cdf74ad4ea11fd4679c658cd3a77"
 }

@@ -87,8 +87,10 @@ for manifest in $manifests; do
             '
               . as $suite |
               type == "object" and
-              ((keys - ["bases", "cases", "oracle", "schema"]) | length) == 0 and
-              .schema == "ledger-definition-conformance-cases/v1" and
+              ((keys - ["bases", "cases", "oracle", "reconstructed_cases_digest", "schema"]) | length) == 0 and
+              .schema == "ledger-definition-conformance-cases/v2" and
+              (.reconstructed_cases_digest |
+                type == "string" and test("^sha256:[0-9a-f]{64}$")) and
               (.oracle == null or (
                 (.oracle | type == "object") and
                 (.oracle | keys | sort) ==
@@ -108,12 +110,10 @@ for manifest in $manifests; do
               ([.cases[].id] | unique | length) == (.cases | length) and
               all(.cases[];
                 type == "object" and
-                ((keys - ["base", "expect", "fixture_digest", "id", "materialization", "patch"]) | length) == 0 and
+                ((keys - ["base", "expect", "id", "materialization", "patch"]) | length) == 0 and
                 (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
                 (.base | type == "string") and
                 (.expect == "valid" or .expect == "invalid") and
-                (.fixture_digest |
-                  type == "string" and test("^sha256:[0-9a-f]{64}$")) and
                 (.patch == null or (
                   (.patch | type == "array") and
                   all(.patch[];
@@ -146,6 +146,8 @@ for manifest in $manifests; do
             "$fixture_suite" >/dev/null
 
           fixture_tmp=$(mktemp -d)
+          reconstructed_digests="$fixture_tmp/reconstructed-digests.jsonl"
+          : >"$reconstructed_digests"
           while IFS=$'\t' read -r case_id expectation; do
             fixture="$fixture_tmp/$case_id.json"
             reconstruct_definition_case \
@@ -153,6 +155,10 @@ for manifest in $manifests; do
               "$fixture_suite" \
               "$case_id" \
               "$fixture"
+            append_reconstructed_digest \
+              "$case_id" \
+              "$fixture" \
+              "$reconstructed_digests"
             fixture_count=$((fixture_count + 1))
 
             if [[ "$expectation" == "valid" ]]; then
@@ -237,6 +243,10 @@ for manifest in $manifests; do
           done < <(
             jq -r '.cases[] | [.id, .expect] | @tsv' "$fixture_suite"
           )
+          verify_reconstructed_digest_set \
+            "$reconstructed_digests" \
+            "$(jq -r '.reconstructed_cases_digest' "$fixture_suite")" \
+            "$fixture_tmp/reconstructed-digest-set.json"
           rm -rf -- "$fixture_tmp"
         fi
         ;;

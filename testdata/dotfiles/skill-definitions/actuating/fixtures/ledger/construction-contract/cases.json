@@ -1,5 +1,5 @@
 {
-  "schema": "ledger-definition-conformance-cases/v1",
+  "schema": "ledger-definition-conformance-cases/v2",
   "oracle": {
     "skills_zig_commit": "711ddc75408fdf25c98c26af839748c8128f78b2",
     "ledger_version": "0.13.3"
@@ -14,8 +14,7 @@
     {
       "id": "essential-expansion",
       "base": "essential-expansion",
-      "expect": "valid",
-      "fixture_digest": "sha256:4e595e530776c1a260411f7ff1da7ccfc1bb46c4ab241713400b446068fc2a4f"
+      "expect": "valid"
     },
     {
       "id": "initial",
@@ -24,26 +23,22 @@
       "materialization": {
         "artifact_id": "sha256:ec81c6d46fcd84f82fa1280ce2928def5486e532f82ef6b552d6ac83508852a7",
         "canonical_content_digest": "sha256:014b12c3942baa7a232d86d9ed9079d8c6a5a25ad487994880be924f46cfbf28"
-      },
-      "fixture_digest": "sha256:1d3d37a4714ac9ea7c3d1e09901d6ab17d3b17093b41864b0a6956c27fddc8c8"
+      }
     },
     {
       "id": "normalized",
       "base": "normalized",
-      "expect": "valid",
-      "fixture_digest": "sha256:10bd7829bb1bf4e01b6ff360813fe5567c2cde9bc72bcf6a85771090c2f1302d"
+      "expect": "valid"
     },
     {
       "id": "unchanged-realization",
       "base": "unchanged-realization",
-      "expect": "valid",
-      "fixture_digest": "sha256:47d119888b1ad8b53c3caaee8790749beb7f8bcf506e8d30c00cc7444449c462"
+      "expect": "valid"
     },
     {
       "id": "ambiguous-proof-role",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:8290eb2e34064fbb33eae08c6536e3735c370923c9a8d8775cdaa1bfd86a2e36",
       "patch": [
         {
           "op": "replace",
@@ -68,7 +63,6 @@
       "id": "candidate-family-order",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:baec9214e95d0404a91a1fcce5ab321cb227cc56d81211e471fa232aded629f6",
       "patch": [
         {
           "op": "replace",
@@ -81,7 +75,6 @@
       "id": "essential-missing-addition",
       "base": "essential-expansion",
       "expect": "invalid",
-      "fixture_digest": "sha256:50296e0dd7fbc605e71a74c160b7d680e78e6fc0df1393a05335a43ca25eb68f",
       "patch": [
         {
           "op": "replace",
@@ -94,7 +87,6 @@
       "id": "initial-with-counterexample-set",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:ff8ae7b522157b72871bbb814b8cec146ef4db6f6199f00447a660d7c9ee105e",
       "patch": [
         {
           "op": "replace",
@@ -107,7 +99,6 @@
       "id": "multiple-selected-candidates",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:a0df7fae8a12a6307ed27388e4fc5034410cbc633c1aa95084be58dd696d8870",
       "patch": [
         {
           "op": "replace",
@@ -120,7 +111,6 @@
       "id": "normalized-identity",
       "base": "unchanged-realization",
       "expect": "invalid",
-      "fixture_digest": "sha256:1381e7841d949b3a7a9acaa33d366d0255cc0b15a0de624e5328cc8dba24a73e",
       "patch": [
         {
           "op": "replace",
@@ -133,7 +123,6 @@
       "id": "reserved-proof-role",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:cf9db931826861b41d9ad00920333a3ac6c2289ca4ab12dabb25c1dbcf640526",
       "patch": [
         {
           "op": "replace",
@@ -146,7 +135,6 @@
       "id": "selected-surface-mismatch",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:188544b095be799f40a831536ea3e6026256769fbb918c77c06456e0e6d4a118",
       "patch": [
         {
           "op": "replace",
@@ -159,7 +147,6 @@
       "id": "unchanged-changed-factor",
       "base": "unchanged-realization",
       "expect": "invalid",
-      "fixture_digest": "sha256:e75257add59dbd6e5a0654f0f892a23a20e370f768cfc52b257b9badfc8976e7",
       "patch": [
         {
           "op": "replace",
@@ -177,7 +164,6 @@
       "id": "unclassified-successor",
       "base": "initial",
       "expect": "invalid",
-      "fixture_digest": "sha256:109bb3863ecbf4e21ee22371ada4bd0942cab01e5f9e3dc52649beb288ba192f",
       "patch": [
         {
           "op": "replace",
@@ -186,5 +172,6 @@
         }
       ]
     }
-  ]
+  ],
+  "reconstructed_cases_digest": "sha256:89377c46635dae24a66551262cdc9280d5dd6952b626248d11704317590f0289"
 }

@@ -1,5 +1,5 @@
 {
-  "schema": "actuating-evidence-protocol-cases/v1",
+  "schema": "actuating-evidence-protocol-cases/v2",
   "protocol_definition": "codex/skills/actuating/definitions/ledger/evidence-protocol.json",
   "sources": {
     "accepted-counterexample": {
@@ -33,7 +33,6 @@
       "setup": "accepted-debt",
       "candidate": "construction-successor",
       "patch": [],
-      "candidate_digest": "sha256:7c3807425f4c7804f2f2db83b7f614ff09cf25459d99e8e6991cecb5ad1b09d6",
       "expect": "valid",
       "error": null
     },
@@ -53,7 +52,6 @@
           "value": []
         }
       ],
-      "candidate_digest": "sha256:d689bfba02f0bfcc8cacff726081b43a4b231316773902bb967d3dada7354846",
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     },
@@ -68,7 +66,6 @@
           "value": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         }
       ],
-      "candidate_digest": "sha256:60e1799dac105304f0ef026acac3addf14bcbc2d2f965462599c7188619b5ea7",
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     },
@@ -83,7 +80,6 @@
           "value": "example-regression"
         }
       ],
-      "candidate_digest": "sha256:148cddb79c89a5df7762fe012e242c4cde3137dbec24ec7fcdf25269dd126e16",
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     },
@@ -92,7 +88,6 @@
       "setup": "accepted-debt",
       "candidate": "goal-successor",
       "patch": [],
-      "candidate_digest": "sha256:6e90956641f6c68b4710d64f22b0f4a53fb635de6a408e29d8df69734f3076b7",
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     },
@@ -112,9 +107,9 @@
           "value": []
         }
       ],
-      "candidate_digest": "sha256:740b4b7d130065b5f3a1cd12ec2f2a72e56d3a5470e2d7102b0a6f3e6fb842c6",
       "expect": "invalid",
       "error": "ProtocolAdmissionRejected"
     }
-  ]
+  ],
+  "reconstructed_candidates_digest": "sha256:fa3d9f766314702993e89cf8d4844b9fd17985215329c4d719ddf53e82449090"
 }
