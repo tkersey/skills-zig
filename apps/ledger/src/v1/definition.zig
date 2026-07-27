@@ -183,7 +183,7 @@ pub const Operator = enum {
             .event_envelope => 4,
             .cross_input_equal => 2,
             .fold => 2,
-            .id_lookup, .latest, .@"export" => 2,
+            .id_lookup, .latest, .@"export", .relevance => 2,
             .sort => 1,
             else => 1,
         };
@@ -269,6 +269,7 @@ pub const Operator = enum {
             .limit,
             .id_lookup,
             .latest,
+            .relevance,
             .fold,
             .@"export",
             => true,
