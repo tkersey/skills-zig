@@ -49,36 +49,36 @@ pub const Source = union(enum) {
     external: u16,
 };
 
-const RuntimePredicate = struct {
+pub const RuntimePredicate = struct {
     field_index: u16,
     operator: plan.PredicateOperator,
     operand: Value,
     case_insensitive: bool,
 };
 
-const PredicateRange = struct {
+pub const PredicateRange = struct {
     start: u16,
     len: u16,
 };
 
-const RuntimeSortKey = struct {
+pub const RuntimeSortKey = struct {
     field_index: u16,
     direction: plan.SortDirection,
     nulls: plan.NullOrder,
 };
 
-const FieldRange = struct {
+pub const FieldRange = struct {
     start: u16,
     len: u16,
 };
 
-const RuntimeAggregateMetric = struct {
+pub const RuntimeAggregateMetric = struct {
     function: plan.AggregateFunction,
     field_index: ?u16,
     output_kind: plan.ColumnKind,
 };
 
-const RuntimeOperation = union(enum) {
+pub const RuntimeOperation = union(enum) {
     filter: PredicateRange,
     limit: struct {
         count: usize,
@@ -444,6 +444,8 @@ pub const Runner = struct {
     program: *const Program,
     output: []Value,
     allocator: ?std.mem.Allocator = null,
+    value_allocator: ?std.mem.Allocator = null,
+    owned_values: std.ArrayList([]u8) = .empty,
     materialized: []Value = &.{},
     row_refs: []RowRef = &.{},
     auxiliary_refs: []RowRef = &.{},
@@ -523,12 +525,26 @@ pub const Runner = struct {
         return runner;
     }
 
+    pub fn initOwnedAlloc(
+        allocator: std.mem.Allocator,
+        program: *const Program,
+        output: []Value,
+    ) !Runner {
+        var runner = try initAlloc(allocator, program, output);
+        runner.value_allocator = allocator;
+        return runner;
+    }
+
     pub fn deinit(self: *Runner) void {
         if (self.allocator) |allocator| {
             allocator.free(self.materialized);
             allocator.free(self.row_refs);
             allocator.free(self.auxiliary_refs);
             allocator.free(self.duplicate_marks);
+        }
+        if (self.value_allocator) |allocator| {
+            for (self.owned_values.items) |value| allocator.free(value);
+            self.owned_values.deinit(allocator);
         }
         self.* = undefined;
     }
@@ -681,10 +697,15 @@ pub const Runner = struct {
             return error.ObservationMaterializationRowBoundExceeded;
         }
         const start = self.materialized_row_count * self.program.source_width;
-        @memcpy(
-            self.materialized[start..][0..self.program.source_width],
-            row,
-        );
+        const destination =
+            self.materialized[start..][0..self.program.source_width];
+        if (self.value_allocator != null) {
+            for (row, 0..) |value, index| {
+                destination[index] = try self.retainValue(value);
+            }
+        } else {
+            @memcpy(destination, row);
+        }
         self.materialized_row_count += 1;
     }
 
@@ -879,9 +900,38 @@ pub const Runner = struct {
             return error.ObservationOutputBufferTooSmall;
         }
         for (self.program.output_field_indices, 0..) |field_index, index| {
-            self.output[output_start + index] = row[field_index];
+            self.output[output_start + index] =
+                if (self.value_allocator != null and
+                self.program.first_blocking_operation == null)
+                    try self.retainValue(row[field_index])
+                else
+                    row[field_index];
         }
         self.output_row_count += 1;
+    }
+
+    fn retainValue(self: *Runner, value: Value) !Value {
+        const allocator = self.value_allocator orelse return value;
+        return switch (value) {
+            .string => |text| .{
+                .string = try self.retainBytes(allocator, text),
+            },
+            .json => |json| .{
+                .json = try self.retainBytes(allocator, json),
+            },
+            else => value,
+        };
+    }
+
+    fn retainBytes(
+        self: *Runner,
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+    ) ![]const u8 {
+        const copy = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(copy);
+        try self.owned_values.append(allocator, copy);
+        return copy;
     }
 };
 

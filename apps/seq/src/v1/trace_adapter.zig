@@ -1,4 +1,5 @@
 const std = @import("std");
+const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
@@ -109,16 +110,28 @@ pub fn observeTrace(
     trace: *const trace_core.CanonicalSessionTrace,
     output: []execution.Value,
 ) !execution.Result {
-    const relation = switch (program.source) {
-        .physical => |value| value,
-        .external => return error.ObservationRequiresExternalInput,
-    };
     var runner = try execution.Runner.initAlloc(
         allocator,
         program,
         output,
     );
     defer runner.deinit();
+    _ = try feedTrace(&runner, program, trace);
+    return runner.finish();
+}
+
+/// Feeds one immutable canonical trace into a caller-owned compiled runner.
+/// This lets directory-level native queries preserve one physical pass per
+/// file while applying global blocking operators exactly once.
+pub fn feedTrace(
+    runner: *execution.Runner,
+    program: *const execution.Program,
+    trace: *const trace_core.CanonicalSessionTrace,
+) !execution.Feed {
+    const relation = switch (program.source) {
+        .physical => |value| value,
+        .external => return error.ObservationRequiresExternalInput,
+    };
     var row: [256]execution.Value = undefined;
 
     switch (relation) {
@@ -128,7 +141,9 @@ pub fn observeTrace(
                 program.source_field_indices,
                 trace.session,
             );
-            _ = try runner.feed(row[0..program.source_width]);
+            if (try runner.feed(row[0..program.source_width]) == .stop) {
+                return .stop;
+            }
         },
         .source_events => for (trace.occurrences.items) |*occurrence| {
             try fillSourceEvent(
@@ -224,7 +239,181 @@ pub fn observeTrace(
         .structured_values,
         => return error.UnsupportedTracePhysicalRelation,
     }
-    return runner.finish();
+    return if (runner.stopped) .stop else .continue_scanning;
+}
+
+/// Streams one canonical physical relation as JSON objects without routing
+/// through a dynamic row map. `first` is caller-owned so multiple immutable
+/// session files can share one output array.
+pub fn writeRelationRowsJson(
+    writer: *std.Io.Writer,
+    trace: *const trace_core.CanonicalSessionTrace,
+    relation: physical.Relation,
+    first: *bool,
+) !usize {
+    if (relation == .structured_documents or
+        relation == .structured_values)
+    {
+        return error.StructuredRelationRequiresIndex;
+    }
+
+    const fields = relation.fields();
+    var indices: [256]u16 = undefined;
+    if (fields.len > indices.len) return error.PhysicalRelationTooWide;
+    for (fields, 0..) |_, index| indices[index] = @intCast(index);
+    var values: [256]execution.Value = undefined;
+    var count: usize = 0;
+
+    switch (relation) {
+        .sessions => {
+            try fillSession(values[0..fields.len], indices[0..fields.len], trace.session);
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count = 1;
+        },
+        .source_events => for (trace.occurrences.items) |*occurrence| {
+            try fillSourceEvent(
+                values[0..fields.len],
+                indices[0..fields.len],
+                trace.session,
+                occurrence,
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .turns => for (trace.turns.items) |turn| {
+            try fillTurn(values[0..fields.len], indices[0..fields.len], turn);
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .messages => for (trace.occurrences.items) |*occurrence| {
+            if (occurrence.role == null or occurrence.text == null) continue;
+            try fillMessage(
+                values[0..fields.len],
+                indices[0..fields.len],
+                trace.session,
+                occurrence,
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .tool_invocations => for (trace.tools.items) |tool| {
+            if (tool.declared_line == null) continue;
+            try fillToolInvocation(
+                values[0..fields.len],
+                indices[0..fields.len],
+                tool,
+                occurrenceAtLine(trace, tool.declared_line.?),
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .tool_results => for (trace.tools.items) |tool| {
+            if (tool.finalized_line == null) continue;
+            try fillToolResult(
+                values[0..fields.len],
+                indices[0..fields.len],
+                tool,
+                occurrenceAtLine(trace, tool.finalized_line.?),
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .tool_lifecycle => for (trace.tools.items) |tool| {
+            try fillToolLifecycle(
+                values[0..fields.len],
+                indices[0..fields.len],
+                tool,
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .session_edges => for (trace.graph_edges.items) |edge| {
+            try fillSessionEdge(
+                values[0..fields.len],
+                indices[0..fields.len],
+                edge,
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .token_events => for (trace.token_events.items) |event| {
+            if (event.occurrence_index >= trace.occurrences.items.len) {
+                return error.TokenEventOccurrenceMissing;
+            }
+            try fillTokenEvent(
+                values[0..fields.len],
+                indices[0..fields.len],
+                trace.session,
+                &trace.occurrences.items[event.occurrence_index],
+                event,
+            );
+            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
+            count += 1;
+        },
+        .structured_documents, .structured_values => unreachable,
+    }
+    return count;
+}
+
+pub fn writeTraceDetailJson(
+    writer: *std.Io.Writer,
+    trace: *const trace_core.CanonicalSessionTrace,
+) !void {
+    try writer.writeAll("{\"session\":");
+    var first = true;
+    _ = try writeRelationRowsJson(writer, trace, .sessions, &first);
+
+    try writer.writeAll(",\"turns\":[");
+    first = true;
+    _ = try writeRelationRowsJson(writer, trace, .turns, &first);
+    try writer.writeAll("],\"tools\":[");
+    first = true;
+    _ = try writeRelationRowsJson(writer, trace, .tool_lifecycle, &first);
+    try writer.writeAll("],\"graph_edges\":[");
+    first = true;
+    _ = try writeRelationRowsJson(writer, trace, .session_edges, &first);
+    try writer.writeAll("],\"warnings\":[");
+    for (trace.warnings.items, 0..) |warning, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, warning);
+    }
+    try writer.writeAll("],\"authority_granted\":false}");
+}
+
+fn writePhysicalRowJson(
+    writer: *std.Io.Writer,
+    fields: []const physical.Field,
+    values: []const execution.Value,
+    first: *bool,
+) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.writeByte('{');
+    for (fields, values, 0..) |field, value, index| {
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, field.name);
+        try writer.writeByte(':');
+        try writePhysicalValueJson(writer, value);
+    }
+    try writer.writeByte('}');
+}
+
+fn writePhysicalValueJson(
+    writer: *std.Io.Writer,
+    value: execution.Value,
+) !void {
+    switch (value) {
+        .string => |text| {
+            try definition_core.canonical_json.writeCanonicalString(writer, text);
+        },
+        .integer => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .boolean => |boolean| {
+            try writer.writeAll(if (boolean) "true" else "false");
+        },
+        .json => |json| try writer.writeAll(json),
+        .null => try writer.writeAll("null"),
+    }
 }
 
 fn supported(relation: physical.Relation) bool {
@@ -603,7 +792,6 @@ fn usizeInteger(value: usize) !execution.Value {
 }
 
 test "trace adapter scans demanded session columns in one file pass" {
-    const definition_core = @import("definition_core");
     const definition = @import("definition.zig");
     const plan = @import("plan.zig");
 

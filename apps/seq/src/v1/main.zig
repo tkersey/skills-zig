@@ -123,7 +123,133 @@ pub fn runWithArgv(
     if (std.mem.eql(u8, argv[1], "observe")) {
         return runObserve(allocator, argv[2..]);
     }
+    if (std.mem.eql(u8, argv[1], "explain")) {
+        return runExplain(allocator, argv[2..]);
+    }
+    if (seq.native.Command.parse(argv[1])) |command| {
+        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        return seq.native.run(
+            allocator,
+            command,
+            argv[2..],
+            &stdout_writer.interface,
+            defaultIo(),
+        );
+    }
     return error.UnknownCommand;
+}
+
+fn runExplain(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    var args = try parseObserveArgs(allocator, argv);
+    defer args.deinit(allocator);
+    if (args.path != null or args.input_specs.len != 0) {
+        return error.ExplainDoesNotReadCorpus;
+    }
+    const projection_names = [_][]const u8{args.projection};
+    var context = try loadDefinition(
+        allocator,
+        args.definition_path,
+        .{ .projection_names = &projection_names },
+    );
+    defer context.deinit(allocator);
+    var bindings = try bindParameters(
+        allocator,
+        &context.definition_plan.parameter_declarations,
+        args.parameter_specs,
+    );
+    defer bindings.deinit(allocator);
+    var program = try seq.execution.compile(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        &bindings,
+        args.projection,
+    );
+    defer program.deinit(allocator);
+
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    if (args.format == .text) {
+        try stdout_writer.interface.print(
+            "{s}@{s}\nprojection: {s}\nsource: {s}\nfields: {d}\nmax_rows: {d}\n",
+            .{
+                context.definition_plan.id,
+                context.definition_plan.closure_digest[0..],
+                args.projection,
+                switch (program.source) {
+                    .physical => |relation| @tagName(relation),
+                    .external => |index| context.definition_plan.inputs[index].name,
+                },
+                program.source_field_indices.len,
+                program.max_rows,
+            },
+        );
+        return 0;
+    }
+    try stdout_writer.interface.writeAll(
+        "{\"schema\":\"seq-observation-plan/v1\",\"definition\":{\"id\":",
+    );
+    try writeString(&stdout_writer.interface, context.definition_plan.id);
+    try stdout_writer.interface.writeAll(",\"digest\":");
+    try writeString(
+        &stdout_writer.interface,
+        &context.definition_plan.closure_digest,
+    );
+    try stdout_writer.interface.writeAll(",\"abi\":\"");
+    try stdout_writer.interface.writeAll(seq.definition.abi);
+    try stdout_writer.interface.writeAll("\"},\"projection\":");
+    try writeString(&stdout_writer.interface, args.projection);
+    try stdout_writer.interface.writeAll(",\"source\":{\"kind\":");
+    switch (program.source) {
+        .physical => |relation| {
+            try stdout_writer.interface.writeAll("\"physical\",\"relation\":");
+            try writeString(&stdout_writer.interface, @tagName(relation));
+        },
+        .external => |index| {
+            try stdout_writer.interface.writeAll("\"external\",\"input\":");
+            try writeString(
+                &stdout_writer.interface,
+                context.definition_plan.inputs[index].name,
+            );
+        },
+    }
+    try stdout_writer.interface.writeAll("},\"required_fields\":[");
+    switch (program.source) {
+        .physical => |relation| {
+            for (program.source_field_indices, 0..) |field_index, index| {
+                if (index != 0) try stdout_writer.interface.writeByte(',');
+                try writeString(
+                    &stdout_writer.interface,
+                    relation.fields()[field_index].name,
+                );
+            }
+        },
+        .external => |input_index| {
+            const fields = context.definition_plan.inputs[input_index].fields;
+            for (program.source_field_indices, 0..) |field_index, index| {
+                if (index != 0) try stdout_writer.interface.writeByte(',');
+                try writeString(
+                    &stdout_writer.interface,
+                    fields[field_index].name,
+                );
+            }
+        },
+    }
+    try stdout_writer.interface.print(
+        "],\"source_width\":{d},\"output_width\":{d},\"max_rows\":{d},\"compile_stats\":",
+        .{
+            program.source_width,
+            program.output_field_indices.len,
+            program.max_rows,
+        },
+    );
+    try writeCompileStats(&stdout_writer.interface, context.stats);
+    try stdout_writer.interface.writeAll(
+        ",\"corpus_read\":false,\"authority_granted\":false}\n",
+    );
+    return 0;
 }
 
 fn runDefinitionCheck(

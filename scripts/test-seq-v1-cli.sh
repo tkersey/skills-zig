@@ -76,6 +76,71 @@ grep -Fq '"rows_scanned":5' <<<"$ranked_output"
 grep -Fq '"rows_materialized":5' <<<"$ranked_output"
 grep -Fq '"output_rows":3' <<<"$ranked_output"
 
+explain_output=$("$binary" explain \
+  --definition "$message_definition" \
+  --projection rows \
+  --param needle=failure \
+  --format json)
+grep -Fq '"schema":"seq-observation-plan/v1"' <<<"$explain_output"
+grep -Fq '"relation":"messages"' <<<"$explain_output"
+grep -Fq '"corpus_read":false' <<<"$explain_output"
+
+sessions_output=$("$binary" sessions \
+  --root apps/seq/src/v1/fixtures \
+  --format json)
+grep -Fq '"session_id":"fixture-session"' <<<"$sessions_output"
+
+turns_output=$("$binary" turns --path "$rollout" --format json)
+grep -Fq '"turn_id":"turn-1"' <<<"$turns_output"
+
+detail_output=$("$binary" session-detail --path "$rollout" --format json)
+grep -Fq '"authority_granted":false' <<<"$detail_output"
+grep -Fq '"final_answer":"Observed FAILURE evidence"' <<<"$detail_output"
+
+test "$("$binary" tool-lifecycle --path "$rollout" --format json)" = '[]'
+test "$("$binary" session-graph --path "$rollout" --format json)" = '[]'
+
+tail_output=$("$binary" tail --path "$rollout" --once --format json)
+grep -Fq '"entry_type":"session_meta"' <<<"$tail_output"
+grep -Fq '"entry_type":"event_msg"' <<<"$tail_output"
+
+find_output=$("$binary" find-session \
+  --root apps/seq/src/v1/fixtures \
+  --session-id fixture-session \
+  --format json)
+grep -Fq '"session_id":"fixture-session"' <<<"$find_output"
+
+datasets_output=$("$binary" datasets --format json)
+grep -Fq '"dataset":"structured_values"' <<<"$datasets_output"
+if grep -Eq 'actuat|universal|learnings|negative-ledger|synesthesia' \
+  <<<"$datasets_output"
+then
+  exit 1
+fi
+
+schema_output=$("$binary" dataset-schema \
+  --dataset structured_values \
+  --format json)
+grep -Fq '"field":"json_pointer"' <<<"$schema_output"
+
+query_output=$("$binary" query \
+  --root apps/seq/src/v1/fixtures \
+  --spec '{"dataset":"messages","where":[{"field":"text","op":"contains","value":"failure","case_insensitive":true}],"select":["session_id","role","text"],"limit":5,"format":"json"}')
+grep -Fq \
+  '{"session_id":"fixture-session","role":"assistant","text":"Observed FAILURE evidence"}' \
+  <<<"$query_output"
+
+mkdir -p "$cache_dir/sessions"
+cp "$rollout" "$cache_dir/sessions/rollout.jsonl"
+index_output=$("$binary" index build \
+  --root "$cache_dir/sessions" \
+  --format json)
+grep -Fq '"exists":true' <<<"$index_output"
+grep -Fq '"action":"build"' <<<"$index_output"
+grep -Fq '"schema_version":1' "$cache_dir/sessions/.seq-index.jsonl"
+"$binary" index vacuum --root "$cache_dir/sessions" --format json >/dev/null
+test ! -e "$cache_dir/sessions/.seq-index.jsonl"
+
 capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"seq-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"

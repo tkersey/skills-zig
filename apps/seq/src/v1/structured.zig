@@ -161,16 +161,25 @@ pub fn observe(
     index: *const Index,
     output: []execution.Value,
 ) !execution.Result {
-    const relation = switch (program.source) {
-        .physical => |value| value,
-        .external => return error.ObservationRequiresExternalInput,
-    };
     var runner = try execution.Runner.initAlloc(
         allocator,
         program,
         output,
     );
     defer runner.deinit();
+    _ = try feed(&runner, program, index);
+    return runner.finish();
+}
+
+pub fn feed(
+    runner: *execution.Runner,
+    program: *const execution.Program,
+    index: *const Index,
+) !execution.Feed {
+    const relation = switch (program.source) {
+        .physical => |value| value,
+        .external => return error.ObservationRequiresExternalInput,
+    };
     var row: [256]execution.Value = undefined;
     switch (relation) {
         .structured_documents => for (index.documents.items) |*document| {
@@ -195,7 +204,7 @@ pub fn observe(
         },
         else => return error.ObservationRequiresStructuredRelation,
     }
-    return runner.finish();
+    return if (runner.stopped) .stop else .continue_scanning;
 }
 
 fn fillDocument(
