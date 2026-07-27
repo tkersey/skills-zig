@@ -80,6 +80,5 @@
       "artifact_id": "sha256:b028068be64931408170c944d55b4f2e4dfb23aa76ba006be55b562f9879dc61",
       "canonical_content_digest": "sha256:b028068be64931408170c944d55b4f2e4dfb23aa76ba006be55b562f9879dc61"
     }
-  },
-  "reconstructed_cases_digest": "sha256:7183ae2f7636531d5ec9563a2bb13f41e1128dd9fc3b5f1d5274fb89702c0649"
+  }
 }

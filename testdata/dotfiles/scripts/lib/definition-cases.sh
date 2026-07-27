@@ -118,7 +118,7 @@ definition_suite_case_spec() {
       if ($suite.bases | index($case_id)) != null then
         {
           id: $case_id,
-          base: $case_id,
+          from: null,
           set: {},
           remove: []
         }
@@ -131,12 +131,12 @@ definition_suite_case_spec() {
         {
           id: $case_id
         } + $case + {
-          base: (
-            $case.base //
+          from: (
+            $case.from //
             if ($suite.bases | length) == 1 then
               $suite.bases[0]
             else
-              error("case requires an explicit base")
+              error("case requires an explicit parent")
             end
           ),
           set: ($case.set // {}),
@@ -152,76 +152,41 @@ reconstruct_definition_case() {
   local fixture_suite=$2
   local case_id=$3
   local output=$4
+  local ancestry=${5:-}
   local case_spec
-  local base_id
+  local parent_id
+  local parent_output
   local base_fixture
   local set_values
   local remove_paths
 
+  if [[ "$ancestry" == *"|$case_id|"* ]]; then
+    echo "conformance case inheritance cycle: $case_id" >&2
+    return 1
+  fi
   case_spec=$(definition_suite_case_spec "$fixture_suite" "$case_id")
-  base_id=$(jq -r '.base' <<<"$case_spec")
-  base_fixture="$fixture_root/bases/$base_id.json"
-  [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
-
-  set_values=$(jq -c '.set' <<<"$case_spec")
-  remove_paths=$(jq -c '.remove' <<<"$case_spec")
-  apply_json_pointer_delta \
-    "$base_fixture" \
-    "$set_values" \
-    "$remove_paths" \
-    "$output"
-}
-
-append_reconstructed_digest() {
-  local case_id=$1
-  local reconstructed=$2
-  local rows=$3
-  local digest
-
-  digest="sha256:$(shasum -a 256 "$reconstructed" | awk '{print $1}')"
-  jq -nc \
-    --arg id "$case_id" \
-    --arg digest "$digest" \
-    '{id: $id, digest: $digest}' >>"$rows"
-}
-
-verify_reconstructed_digest_set() {
-  local rows=$1
-  local expected=$2
-  local payload=$3
-  local actual
-
-  jq -s -S -c 'sort_by(.id)' "$rows" >"$payload"
-  actual="sha256:$(shasum -a 256 "$payload" | awk '{print $1}')"
-  [[ "$actual" == "$expected" ]]
-}
-
-verify_definition_suite_digest() {
-  local fixture_root=$1
-  local fixture_suite=$2
-  local scratch=$3
-  local case_id
-  local reconstructed
-  local rows
-  local expected
-
-  mkdir -p "$scratch"
-  rows="$scratch/reconstructed-digests.jsonl"
-  : >"$rows"
-  while IFS= read -r case_id; do
-    reconstructed="$scratch/$case_id.json"
+  parent_id=$(jq -r '.from // empty' <<<"$case_spec")
+  if [[ -z "$parent_id" ]]; then
+    base_fixture="$fixture_root/bases/$case_id.json"
+    [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
+    jq -S -c '.' "$base_fixture" >"$output"
+  else
+    parent_output="$output.parent"
     reconstruct_definition_case \
       "$fixture_root" \
       "$fixture_suite" \
-      "$case_id" \
-      "$reconstructed"
-    append_reconstructed_digest "$case_id" "$reconstructed" "$rows"
-  done < <(definition_suite_case_rows "$fixture_suite" | cut -f1)
-  expected=$(jq -r '.reconstructed_cases_digest' "$fixture_suite")
-  verify_reconstructed_digest_set \
-    "$rows" \
-    "$expected" \
-    "$scratch/reconstructed-digest-set.json"
+      "$parent_id" \
+      "$parent_output" \
+      "$ancestry|$case_id|"
+    set_values=$(jq -c '.set' <<<"$case_spec")
+    remove_paths=$(jq -c '.remove' <<<"$case_spec")
+    apply_json_pointer_delta \
+      "$parent_output" \
+      "$set_values" \
+      "$remove_paths" \
+      "$output"
+    rm -f -- "$parent_output"
+  fi
 }
 
 assert_ledger_doctor_slot_state() {

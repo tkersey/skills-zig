@@ -20,6 +20,5 @@
         "/payload/repository_id": "other/repo"
       }
     }
-  },
-  "reconstructed_cases_digest": "sha256:1d13649130e81abd9140259a630e53f3c09f863c0189b7f2fe0a1ad375bbf67a"
+  }
 }

@@ -124,6 +124,5 @@
         "/source/record/payload/secret": "redacted"
       }
     }
-  },
-  "reconstructed_cases_digest": "sha256:6903a6b563fb3f40e4a96a93a6dbd0c1de5286981355abf5d196dabad6b2721c"
+  }
 }

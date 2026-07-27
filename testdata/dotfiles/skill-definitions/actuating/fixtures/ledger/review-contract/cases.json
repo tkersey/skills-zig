@@ -5,6 +5,5 @@
         "/review_contract/contract_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     }
-  },
-  "reconstructed_cases_digest": "sha256:45854020e88016375f50fbb15d6176bc94622cdb5c54afdcc5eccf33c4374138"
+  }
 }

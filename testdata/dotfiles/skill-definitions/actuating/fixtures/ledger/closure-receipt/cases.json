@@ -1,14 +1,22 @@
 {
+  "valid": {
+    "complete-addressed": {
+      "from": "complete",
+      "set": {
+        "/receipt_id": "sha256:db03dc2b8a57357e2775a3bffbf5205483006c027c824aa6ef2e4c7ffe809e70"
+      }
+    }
+  },
   "invalid": {
     "identity-mismatch": {
-      "base": "complete-addressed",
+      "from": "complete-addressed",
       "set": {
         "/receipt_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "/cited_premise_refs": []
       }
     },
     "unknown-field": {
-      "base": "complete",
+      "from": "complete",
       "set": {
         "/cited_premise_refs": [],
         "/approved": true
@@ -20,6 +28,5 @@
       "artifact_id": "sha256:db03dc2b8a57357e2775a3bffbf5205483006c027c824aa6ef2e4c7ffe809e70",
       "canonical_content_digest": "sha256:12e4803eddaf2be6d65d19904b27b84a90e25aef632db9427330c565c202ce95"
     }
-  },
-  "reconstructed_cases_digest": "sha256:68b2c6264060b4163a17603b23b3b1a30a0e7d9dfbee369e206e2c03e4d576d9"
+  }
 }

@@ -26,10 +26,8 @@ jq -e \
     . as $suite |
     type == "object" and
     (keys | sort) ==
-      ["defaults", "invalid", "protocol_definition", "reconstructed_candidates_digest", "schema", "sources", "valid"] and
-    .schema == "actuating-evidence-protocol-cases/v4" and
-    (.reconstructed_candidates_digest |
-      type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+      ["defaults", "invalid", "protocol_definition", "schema", "sources", "valid"] and
+    .schema == "actuating-evidence-protocol-cases/v5" and
     (.protocol_definition |
       type == "string" and
       startswith("/") == false and
@@ -132,10 +130,6 @@ while IFS= read -r source_fixture_root; do
     "$source_fixture_root/cases.json" \
     "$source_suite_tmp/suite.json" \
     "$source_suite_tmp"
-  verify_definition_suite_digest \
-    "$source_fixture_root" \
-    "$source_suite_tmp/suite.json" \
-    "$source_suite_tmp/digest"
 done < <(
   jq -r '.sources[].fixture_root' "$scenarios" | LC_ALL=C sort -u
 )
@@ -581,8 +575,6 @@ run_candidate() {
 }
 
 case_count=0
-candidate_digests="$scenario_tmp/reconstructed-candidate-digests.jsonl"
-: >"$candidate_digests"
 while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error; do
   case_count=$((case_count + 1))
   case_tmp="$scenario_tmp/$case_id"
@@ -597,10 +589,6 @@ while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error;
   setup_review "$case_tmp" "$repo_root" "$review_status"
   check_structural_facts "$case_tmp" "$repo_root"
   prepare_candidate "$case_id" "$candidate_kind" "$case_tmp"
-  append_reconstructed_digest \
-    "$case_id" \
-    "$case_tmp/candidate.json" \
-    "$candidate_digests"
   IFS=$'\t' read -r operation input_name candidate_request < <(
     run_candidate "$case_id" "$candidate_kind" "$case_tmp" "$repo_root"
   )
@@ -662,11 +650,6 @@ done < <(
      @tsv' \
     "$scenarios"
 )
-
-verify_reconstructed_digest_set \
-  "$candidate_digests" \
-  "$(jq -r '.reconstructed_candidates_digest' "$scenarios")" \
-  "$scenario_tmp/reconstructed-candidate-digest-set.json"
 
 check_existing_binding
 

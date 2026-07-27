@@ -53,6 +53,5 @@
       "artifact_id": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf",
       "canonical_content_digest": "sha256:09b0ee28a42888e73ad3a7aa9dbf32ae6d5a12a3635f36ccc4a106430a0b9ecf"
     }
-  },
-  "reconstructed_cases_digest": "sha256:b35734ca4c32ff1584f35b0f2c4689f223870a48c44edc2d419ace209d6a43df"
+  }
 }

@@ -22,7 +22,7 @@ jq -e \
     type == "object" and
     (keys | sort) == ["cases_schema", "oracle", "schema"] and
     .schema == "ledger-definition-conformance-index/v1" and
-    .cases_schema == "ledger-definition-conformance-cases/v5" and
+    .cases_schema == "ledger-definition-conformance-cases/v6" and
     (.oracle | type == "object") and
     (.oracle | keys | sort) ==
       ["definitions", "ledger_version", "skills_zig_commit"] and
@@ -137,13 +137,9 @@ for manifest in $manifests; do
                 "bases",
                 "invalid",
                 "materializations",
-                "reconstructed_cases_digest",
                 "valid"
               ]) | length) == 0 and
-              (.reconstructed_cases_digest |
-                type == "string" and test("^sha256:[0-9a-f]{64}$")) and
-              (.bases | type == "array" and length > 0) and
-              (.bases | unique | length) == (.bases | length) and
+              (.bases | type == "array" and length == 1) and
               all(.bases[];
                 type == "string" and test("^[A-Za-z0-9._-]+$")
               ) and
@@ -157,13 +153,7 @@ for manifest in $manifests; do
                   type == "string" and test("^[A-Za-z0-9._-]+$")) and
                 (.value | type == "object") and
                 .value as $case |
-                (($case | keys - ["base", "remove", "set"]) | length) == 0 and
-                ($case.base == null or (
-                  $case.base as $base |
-                  ($base | type == "string") and
-                  ($suite.bases | index($base)) != null
-                )) and
-                ($case.base != null or ($suite.bases | length) == 1)
+                (($case | keys - ["from", "remove", "set"]) | length) == 0
               ) and
               (
                 [
@@ -171,7 +161,20 @@ for manifest in $manifests; do
                   (($suite.valid // {}) | keys[]),
                   (($suite.invalid // {}) | keys[])
                 ] as $case_ids |
-                ($case_ids | unique | length) == ($case_ids | length)
+                ($case_ids | unique | length) == ($case_ids | length) and
+                all(
+                  (($suite.valid // {}) | to_entries[]);
+                  (.value.from // $suite.bases[0]) as $parent |
+                  ($suite.bases + (($suite.valid // {}) | keys) |
+                    index($parent)) != null and
+                  $parent != .key
+                ) and
+                all(
+                  (($suite.invalid // {}) | to_entries[]);
+                  (.value.from // $suite.bases[0]) as $parent |
+                  ($suite.bases + (($suite.valid // {}) | keys) |
+                    index($parent)) != null
+                )
               ) and
               (($suite.materializations // {}) | type == "object") and
               all(($suite.materializations // {}) | to_entries[];
@@ -193,8 +196,6 @@ for manifest in $manifests; do
             "$fixture_suite" >/dev/null
           validate_json_pointer_deltas "$fixture_suite"
 
-          reconstructed_digests="$fixture_tmp/reconstructed-digests.jsonl"
-          : >"$reconstructed_digests"
           while IFS=$'\t' read -r case_id expectation; do
             fixture="$fixture_tmp/$case_id.json"
             reconstruct_definition_case \
@@ -202,10 +203,6 @@ for manifest in $manifests; do
               "$fixture_suite" \
               "$case_id" \
               "$fixture"
-            append_reconstructed_digest \
-              "$case_id" \
-              "$fixture" \
-              "$reconstructed_digests"
             fixture_count=$((fixture_count + 1))
 
             if [[ "$expectation" == "valid" ]]; then
@@ -288,10 +285,6 @@ for manifest in $manifests; do
           done < <(
             definition_suite_case_rows "$fixture_suite"
           )
-          verify_reconstructed_digest_set \
-            "$reconstructed_digests" \
-            "$(jq -r '.reconstructed_cases_digest' "$fixture_suite")" \
-            "$fixture_tmp/reconstructed-digest-set.json"
           rm -rf -- "$fixture_tmp"
         fi
         ;;

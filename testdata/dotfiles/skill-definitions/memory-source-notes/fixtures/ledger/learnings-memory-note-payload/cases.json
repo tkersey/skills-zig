@@ -20,6 +20,5 @@
         "/payload/secret": "redacted"
       }
     }
-  },
-  "reconstructed_cases_digest": "sha256:7838926c74f19cf06175a1b7718b205a66febfb711efdf24885f69e924727fb1"
+  }
 }

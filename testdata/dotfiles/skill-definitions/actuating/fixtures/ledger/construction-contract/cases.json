@@ -1,7 +1,147 @@
 {
+  "valid": {
+    "unchanged-realization": {
+      "from": "initial",
+      "set": {
+        "/artifact/payload/counterexample_class_refs": [
+          "class-1"
+        ],
+        "/artifact/payload/falsified_predecessor_claims": [
+          "claim failed"
+        ],
+        "/artifact/payload/mode": "architecture-repair",
+        "/artifact/payload/preserved_predecessor_claims": [
+          "law stays"
+        ],
+        "/artifact/payload/recompilation/counterexample_set_ref": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "/artifact/payload/recompilation/evaluated_class_refs": [
+          "class-1"
+        ],
+        "/artifact/payload/recompilation/trigger": "accepted-review-fold",
+        "/artifact/payload/semantic_surface/predecessor_factors": [
+          {
+            "description": "owner remains authoritative",
+            "factor_id": "factor-owner",
+            "kind": "law-owner",
+            "law_refs": [
+              "law-1"
+            ],
+            "observation_refs": [
+              "proof-1"
+            ],
+            "owner": "owner"
+          }
+        ],
+        "/artifact/payload/supersession/disposition": "unchanged-realization",
+        "/artifact/payload/supersession/introduced_factor_refs": [],
+        "/artifact/payload/supersession/preserved_factor_refs": [
+          "factor-owner"
+        ],
+        "/artifact/predecessor_refs": [
+          "sha256:ec81c6d46fcd84f82fa1280ce2928def5486e532f82ef6b552d6ac83508852a7"
+        ]
+      }
+    },
+    "normalized": {
+      "from": "unchanged-realization",
+      "set": {
+        "/artifact/payload/recompilation/candidates/0/factors/0/description": "successor owner remains authoritative",
+        "/artifact/payload/recompilation/candidates/0/factors/0/factor_id": "factor-owner-v2",
+        "/artifact/payload/semantic_surface/successor_factors/0/description": "successor owner remains authoritative",
+        "/artifact/payload/semantic_surface/successor_factors/0/factor_id": "factor-owner-v2",
+        "/artifact/payload/supersession/disposition": "normalized",
+        "/artifact/payload/supersession/preserved_factor_refs": [],
+        "/artifact/payload/supersession/replacement_relations": [
+          {
+            "predecessor_factor_refs": [
+              "factor-owner"
+            ],
+            "rationale": "normalize the authoritative representation",
+            "relation_id": "replace-owner",
+            "successor_factor_refs": [
+              "factor-owner-v2"
+            ]
+          }
+        ]
+      }
+    },
+    "essential-expansion": {
+      "from": "unchanged-realization",
+      "set": {
+        "/artifact/payload/recompilation/candidates/0/factors": [
+          {
+            "description": "owner remains authoritative",
+            "factor_id": "factor-owner",
+            "kind": "law-owner",
+            "law_refs": [
+              "law-1"
+            ],
+            "observation_refs": [
+              "proof-1"
+            ],
+            "owner": "owner"
+          },
+          {
+            "description": "essential proof path",
+            "factor_id": "factor-proof",
+            "kind": "proof-path",
+            "law_refs": [
+              "law-1"
+            ],
+            "observation_refs": [
+              "proof-1"
+            ],
+            "owner": "owner"
+          }
+        ],
+        "/artifact/payload/semantic_surface/successor_factors": [
+          {
+            "description": "owner remains authoritative",
+            "factor_id": "factor-owner",
+            "kind": "law-owner",
+            "law_refs": [
+              "law-1"
+            ],
+            "observation_refs": [
+              "proof-1"
+            ],
+            "owner": "owner"
+          },
+          {
+            "description": "essential proof path",
+            "factor_id": "factor-proof",
+            "kind": "proof-path",
+            "law_refs": [
+              "law-1"
+            ],
+            "observation_refs": [
+              "proof-1"
+            ],
+            "owner": "owner"
+          }
+        ],
+        "/artifact/payload/supersession/disposition": "essential-expansion",
+        "/artifact/payload/supersession/essential_additions": [
+          {
+            "factor_ref": "factor-proof",
+            "law_refs": [
+              "law-1"
+            ],
+            "proof_refs": [
+              "proof-1"
+            ],
+            "rationale": "the law requires an independent proof path"
+          }
+        ],
+        "/artifact/payload/supersession/introduced_factor_refs": [
+          "factor-proof"
+        ]
+      }
+    }
+  },
   "invalid": {
     "ambiguous-proof-role": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/retirements": [
           {
@@ -19,56 +159,56 @@
       }
     },
     "candidate-family-order": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/recompilation/candidates/1/family": "ablation-normalization"
       }
     },
     "essential-missing-addition": {
-      "base": "essential-expansion",
+      "from": "essential-expansion",
       "set": {
         "/artifact/payload/supersession/essential_additions": []
       }
     },
     "initial-with-counterexample-set": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/recompilation/counterexample_set_ref": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
       }
     },
     "multiple-selected-candidates": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/recompilation/candidates/1/status": "selected"
       }
     },
     "normalized-identity": {
-      "base": "unchanged-realization",
+      "from": "unchanged-realization",
       "set": {
         "/artifact/payload/supersession/disposition": "normalized"
       }
     },
     "reserved-proof-role": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/proof_obligations/0/obligation_id": "proof-1#falsifier"
       }
     },
     "selected-surface-mismatch": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/semantic_surface/successor_factors/0/description": "changed preserved value"
       }
     },
     "unchanged-changed-factor": {
-      "base": "unchanged-realization",
+      "from": "unchanged-realization",
       "set": {
         "/artifact/payload/recompilation/candidates/0/factors/0/description": "changed preserved factor",
         "/artifact/payload/semantic_surface/successor_factors/0/description": "changed preserved factor"
       }
     },
     "unclassified-successor": {
-      "base": "initial",
+      "from": "initial",
       "set": {
         "/artifact/payload/supersession/introduced_factor_refs": []
       }
@@ -79,6 +219,5 @@
       "artifact_id": "sha256:ec81c6d46fcd84f82fa1280ce2928def5486e532f82ef6b552d6ac83508852a7",
       "canonical_content_digest": "sha256:014b12c3942baa7a232d86d9ed9079d8c6a5a25ad487994880be924f46cfbf28"
     }
-  },
-  "reconstructed_cases_digest": "sha256:89377c46635dae24a66551262cdc9280d5dd6952b626248d11704317590f0289"
+  }
 }

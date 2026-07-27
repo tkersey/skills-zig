@@ -1,5 +1,5 @@
 {
-  "schema": "actuating-evidence-protocol-cases/v4",
+  "schema": "actuating-evidence-protocol-cases/v5",
   "protocol_definition": "codex/skills/actuating/definitions/ledger/evidence-protocol.json",
   "sources": {
     "accepted-counterexample": {
@@ -69,6 +69,5 @@
         "/artifact/payload/recompilation/evaluated_class_refs": []
       }
     }
-  ],
-  "reconstructed_candidates_digest": "sha256:fa3d9f766314702993e89cf8d4844b9fd17985215329c4d719ddf53e82449090"
+  ]
 }
