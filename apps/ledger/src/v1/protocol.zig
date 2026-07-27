@@ -938,6 +938,52 @@ pub fn materializePlainEvent(
     };
 }
 
+pub fn derivePlainIdempotencyKeyAlloc(
+    allocator: std.mem.Allocator,
+    materialization: *const storage.EventMaterialization,
+    request: std.json.Value,
+) !?[]u8 {
+    if (materialization.mode != .plain) {
+        return error.EventMaterializationModeMismatch;
+    }
+    const idempotency = materialization.idempotency orelse return null;
+    const derivation = findEventDerivationLinear(
+        materialization.derive,
+        idempotency.derived,
+    ) orelse return error.EventIdempotencyDerivationMissing;
+    const value = try deriveEventValueAlloc(
+        allocator,
+        derivation.*,
+        request,
+        0,
+        &.{},
+    );
+    errdefer allocator.free(value);
+    try definition_core.json.safeIdentifier(value, 128);
+    return value;
+}
+
+pub fn storedPlainDerivedValue(
+    materialization: *const storage.EventMaterialization,
+    event: std.json.Value,
+    name: []const u8,
+) !?[]const u8 {
+    if (materialization.mode != .plain) {
+        return error.EventMaterializationModeMismatch;
+    }
+    const event_object = try definition_core.json.object(event);
+    const body = try definition_core.json.object(
+        event_object.get(materialization.body_input_field) orelse
+            return error.EventEnvelopeFieldMissing,
+    );
+    return storedEventDerivedValue(
+        materialization,
+        event_object,
+        body,
+        name,
+    );
+}
+
 pub fn canonicalPlainStoredEventAlloc(
     allocator: std.mem.Allocator,
     materialization: *const storage.EventMaterialization,
@@ -2321,6 +2367,16 @@ fn findGeneratedOutputLinear(
 ) ?*const GeneratedOutput {
     for (outputs) |*output| {
         if (std.mem.eql(u8, output.name, name)) return output;
+    }
+    return null;
+}
+
+fn findEventDerivationLinear(
+    items: []const storage.EventDerivation,
+    name: []const u8,
+) ?*const storage.EventDerivation {
+    for (items) |*item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
     }
     return null;
 }

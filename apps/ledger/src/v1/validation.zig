@@ -1072,63 +1072,12 @@ const Builder = struct {
                 true,
                 &rule,
             ),
-            .definition_ref => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "definition" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "definition" },
-                );
-                const import_index = source.import_index orelse
-                    return error.ImportedDefinitionIndexMissing;
-                if (import_index >= self.definition_plan.imports.len) {
-                    return error.ImportedDefinitionIndexInvalid;
-                }
-                const imported_definition =
-                    &self.definition_plan.imports[import_index];
-                if (!std.mem.eql(
-                    u8,
-                    imported_definition.id,
-                    try definition_core.json.requiredString(
-                        object,
-                        "definition",
-                    ),
-                )) return error.ImportedDefinitionIdMismatch;
-                if (imported_definition.inputs.len != 1 or
-                    imported_definition.inputs[0].codec != .json or
-                    !imported_definition.inputs[0].required)
-                {
-                    return error.ImportedDefinitionNotReusable;
-                }
-                const imported_plan = try self.allocator.create(Plan);
-                var imported_plan_initialized = false;
-                var imported_plan_owned = true;
-                errdefer if (imported_plan_owned) {
-                    if (imported_plan_initialized) {
-                        imported_plan.deinit(self.allocator);
-                    }
-                    self.allocator.destroy(imported_plan);
-                };
-                imported_plan.* = try compile(
-                    self.allocator,
-                    imported_definition,
-                );
-                imported_plan_initialized = true;
-                for (imported_plan.rules) |imported_rule| {
-                    if (imported_rule.input_index != 0 or
-                        (imported_rule.other_input_index != null and
-                            imported_rule.other_input_index.? != 0) or
-                        !isValidationOperator(imported_rule.operator))
-                    {
-                        return error.UnsupportedImportedDefinitionRule;
-                    }
-                }
-                rule.import_index = import_index;
-                rule.imported_plan = imported_plan;
-                imported_plan_owned = false;
-            },
+            .definition_ref => try self.compileDefinitionRef(
+                object,
+                true,
+                source.import_index,
+                &rule,
+            ),
             .keyed_unique => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1693,7 +1642,7 @@ const Builder = struct {
         if (!self.definition_plan.requires(operator)) {
             return error.UndeclaredArtifactOperator;
         }
-        if (!isItemOperator(operator) or operator == .definition_ref) {
+        if (!isItemOperator(operator)) {
             return error.UnsupportedItemOperator;
         }
         if (object.contains("input")) return error.ItemRuleInputForbidden;
@@ -2122,9 +2071,94 @@ const Builder = struct {
                 false,
                 &rule,
             ),
+            .definition_ref => try self.compileDefinitionRef(
+                object,
+                false,
+                null,
+                &rule,
+            ),
             else => unreachable,
         }
         return rule;
+    }
+
+    fn compileDefinitionRef(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        allow_input: bool,
+        expected_import_index: ?u16,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (allow_input) {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "op", "input", "path", "definition" },
+            );
+        } else {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "op", "path", "definition" },
+            );
+        }
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "path", "definition" },
+        );
+        const definition_id = try definition_core.json.requiredString(
+            object,
+            "definition",
+        );
+        const import_index = try findImportedDefinition(
+            self.definition_plan,
+            definition_id,
+        );
+        if (expected_import_index) |expected| {
+            if (expected != import_index) {
+                return error.ImportedDefinitionIndexMismatch;
+            }
+        }
+        if (import_index >= self.definition_plan.imports.len) {
+            return error.ImportedDefinitionIndexInvalid;
+        }
+        const imported_definition =
+            &self.definition_plan.imports[import_index];
+        if (!std.mem.eql(
+            u8,
+            imported_definition.id,
+            definition_id,
+        )) return error.ImportedDefinitionIdMismatch;
+        if (imported_definition.inputs.len != 1 or
+            imported_definition.inputs[0].codec != .json or
+            !imported_definition.inputs[0].required)
+        {
+            return error.ImportedDefinitionNotReusable;
+        }
+        const imported_plan = try self.allocator.create(Plan);
+        var imported_plan_initialized = false;
+        var imported_plan_owned = true;
+        errdefer if (imported_plan_owned) {
+            if (imported_plan_initialized) {
+                imported_plan.deinit(self.allocator);
+            }
+            self.allocator.destroy(imported_plan);
+        };
+        imported_plan.* = try compile(
+            self.allocator,
+            imported_definition,
+        );
+        imported_plan_initialized = true;
+        for (imported_plan.rules) |imported_rule| {
+            if (imported_rule.input_index != 0 or
+                (imported_rule.other_input_index != null and
+                    imported_rule.other_input_index.? != 0) or
+                !isValidationOperator(imported_rule.operator))
+            {
+                return error.UnsupportedImportedDefinitionRule;
+            }
+        }
+        rule.import_index = import_index;
+        rule.imported_plan = imported_plan;
+        imported_plan_owned = false;
     }
 
     fn compileSha256Rule(
@@ -9263,6 +9297,67 @@ test "definition references reuse transacted validators without effects and surv
         decodeForAllocationFailure,
         .{payload},
     );
+}
+
+test "collection item rules reuse one imported scalar definition" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "identifier.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string"]},"inputs":{"value":{"codec":"json","max_bytes":16}},"canonicalization":{},"shape":{"rules":[{"op":"bounded-string","path":"","min":3,"max":3}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":16,"max_store_bytes":16,"max_records":1,"max_output_bytes":16,"max_diagnostics":4,"max_reducer_states":1}}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "list.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier-list","owner":"example","imports":[{"id":"example/identifier","path":"identifier.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["all","definition-ref"]},"inputs":{"values":{"codec":"json","max_bytes":128}},"canonicalization":{},"shape":{"rules":[{"op":"all","path":"","rules":[{"op":"definition-ref","path":"","definition":"example/identifier"}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":128,"max_store_bytes":128,"max_records":8,"max_output_bytes":128,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "list.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "list.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    try validateCachePlan(&cached, &definition_plan);
+    var valid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "values", .bytes = "[\"one\",\"two\"]" }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+    var invalid = try validate(
+        std.testing.allocator,
+        &definition_plan,
+        &cached,
+        &.{.{ .name = "values", .bytes = "[\"one\",\"four\"]" }},
+    );
+    defer invalid.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid.valid);
 }
 
 test "definition references execute imported cross-record constraints" {

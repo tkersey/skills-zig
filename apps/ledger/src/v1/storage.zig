@@ -267,6 +267,17 @@ pub const EventDerivation = struct {
     }
 };
 
+pub const EventIdempotency = struct {
+    derived: []u8,
+    bypass_parameter: ?[]u8,
+
+    fn deinit(self: *EventIdempotency, allocator: std.mem.Allocator) void {
+        allocator.free(self.derived);
+        if (self.bypass_parameter) |name| allocator.free(name);
+        self.* = undefined;
+    }
+};
+
 pub const StateValueSource = struct {
     register: []u8,
     pointer: definition_core.json_pointer.Pointer,
@@ -341,6 +352,7 @@ pub const EventMaterialization = struct {
     request_literals: []RequestLiteral,
     generate: []SecureTokenGeneration,
     derive: []EventDerivation,
+    idempotency: ?EventIdempotency,
     body_fields: []EventBodyField,
     forbidden_parameters: [][]u8,
 
@@ -356,6 +368,7 @@ pub const EventMaterialization = struct {
         allocator.free(self.generate);
         for (self.derive) |*item| item.deinit(allocator);
         allocator.free(self.derive);
+        if (self.idempotency) |*item| item.deinit(allocator);
         for (self.body_fields) |*field| field.deinit(allocator);
         allocator.free(self.body_fields);
         for (self.forbidden_parameters) |name| allocator.free(name);
@@ -572,7 +585,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(8);
+    try encoder.writeU16(9);
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.slots.len);
     for (plan.slots) |slot| {
@@ -632,6 +645,13 @@ pub fn encodeCache(
                     try encoder.writeByte(item.byte_count);
                 }
                 try encodeEventDerivations(event.derive, encoder);
+                try encoder.writeBool(event.idempotency != null);
+                if (event.idempotency) |idempotency| {
+                    try encoder.writeBytes(idempotency.derived);
+                    try encoder.writeOptionalBytes(
+                        idempotency.bypass_parameter,
+                    );
+                }
                 try encoder.writeCount(event.body_fields.len);
                 for (event.body_fields) |field| {
                     try encoder.writeBytes(field.field);
@@ -673,7 +693,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 8) {
+    if (try decoder.readU16() != 9) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -804,6 +824,11 @@ pub fn validateCachePlan(
                     event,
                     definition_plan,
                 ) catch return error.CacheStoragePlanMismatch;
+                if (effect.idempotency_parameter != null and
+                    event.idempotency != null)
+                {
+                    return error.CacheStoragePlanMismatch;
+                }
             }
         }
     }
@@ -963,6 +988,11 @@ fn decodeCacheOperations(
             {
                 return error.EventMaterializationRequiresAppend;
             }
+            if (idempotency_parameter != null and
+                event != null and event.?.idempotency != null)
+            {
+                return error.DuplicateIdempotencySource;
+            }
             effect.* = .{
                 .kind = kind,
                 .slot_index = slot_index,
@@ -1068,6 +1098,21 @@ fn decodeEventMaterialization(
         generate,
     );
     errdefer deinitEventDerivations(allocator, derive);
+    var idempotency = if (try decoder.readBool()) EventIdempotency{
+        .derived = try decoder.readBytesAlloc(allocator, 128),
+        .bypass_parameter = null,
+    } else null;
+    errdefer if (idempotency) |*item| item.deinit(allocator);
+    if (idempotency) |*item| {
+        try definition_core.json.safeIdentifier(item.derived, 128);
+        item.bypass_parameter = try decoder.readOptionalBytesAlloc(
+            allocator,
+            128,
+        );
+        if (item.bypass_parameter) |name| {
+            try definition_core.json.safeIdentifier(name, 128);
+        }
+    }
     const body_fields = try decodeEventBodyFields(
         allocator,
         decoder,
@@ -1088,10 +1133,12 @@ fn decodeEventMaterialization(
         .request_literals = request_literals,
         .generate = generate,
         .derive = derive,
+        .idempotency = idempotency,
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
     try validateEventMaterialization(allocator, &result);
+    idempotency = null;
     return result;
 }
 
@@ -1694,6 +1741,7 @@ fn compileEffect(
         "expected_revision_param",
         "idempotency_param",
         "event",
+        "event_from_operation",
     });
     try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
     const operator = try definition.Operator.parse(
@@ -1744,17 +1792,35 @@ fn compileEffect(
     {
         return error.BindingEffectHasAdmissionParameter;
     }
+    if (object.get("event") != null and
+        object.get("event_from_operation") != null)
+    {
+        return error.DuplicateEventMaterializationSource;
+    }
     var event = if (object.get("event")) |raw_event|
         try compileEventMaterialization(
             allocator,
             definition_plan,
             raw_event,
         )
+    else if (object.get("event_from_operation")) |raw_operation|
+        try compileReferencedEventMaterialization(
+            allocator,
+            definition_plan,
+            try definition_core.json.string(raw_operation),
+            try definition_core.json.requiredString(object, "slot"),
+            try definition_core.json.requiredString(object, "input"),
+        )
     else
         null;
     errdefer if (event) |*value| value.deinit(allocator);
     if (event != null and kind != .compare_append and kind != .bind_existing) {
         return error.EventMaterializationRequiresAppend;
+    }
+    if (idempotency_parameter != null and
+        event != null and event.?.idempotency != null)
+    {
+        return error.DuplicateIdempotencySource;
     }
     return .{
         .kind = kind,
@@ -1764,6 +1830,61 @@ fn compileEffect(
         .idempotency_parameter = idempotency_parameter,
         .event = event,
     };
+}
+
+fn compileReferencedEventMaterialization(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    operation_name: []const u8,
+    slot_name: []const u8,
+    input_name: []const u8,
+) !EventMaterialization {
+    try definition_core.json.safeIdentifier(operation_name, 128);
+    const source = for (definition_plan.operations) |candidate| {
+        if (std.mem.eql(u8, candidate.name, operation_name)) {
+            break candidate;
+        }
+    } else return error.EventMaterializationOperationMissing;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        source.canonical_config,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const operation = try definition_core.json.object(parsed.value);
+    const effects = try definition_core.json.array(
+        try definition_core.json.field(operation, "effects"),
+    );
+    var matched: ?std.json.Value = null;
+    for (effects.items) |raw_effect| {
+        const effect = try definition_core.json.object(raw_effect);
+        const candidate_slot =
+            try definition_core.json.requiredString(effect, "slot");
+        const candidate_input =
+            try definition_core.json.requiredString(effect, "input");
+        if (!std.mem.eql(u8, candidate_slot, slot_name) or
+            !std.mem.eql(u8, candidate_input, input_name))
+        {
+            continue;
+        }
+        if (matched != null) {
+            return error.EventMaterializationReferenceAmbiguous;
+        }
+        matched = effect.get("event") orelse
+            return error.EventMaterializationReferenceMustBeDirect;
+        if (effect.get("event_from_operation") != null) {
+            return error.EventMaterializationReferenceMustBeDirect;
+        }
+    }
+    return compileEventMaterialization(
+        allocator,
+        definition_plan,
+        matched orelse return error.EventMaterializationEffectMissing,
+    );
 }
 
 fn compileEventMaterialization(
@@ -1786,6 +1907,7 @@ fn compileEventMaterialization(
             "request_literals",
             "generate",
             "derive",
+            "idempotency",
             "body_fields",
             "forbidden_parameters",
         },
@@ -1861,6 +1983,16 @@ fn compileEventMaterialization(
     else
         try allocator.alloc(EventDerivation, 0);
     errdefer deinitEventDerivations(allocator, derive);
+    var idempotency = if (object.get("idempotency")) |raw_idempotency|
+        try compileEventIdempotency(
+            allocator,
+            definition_plan,
+            raw_idempotency,
+            derive,
+        )
+    else
+        null;
+    errdefer if (idempotency) |*item| item.deinit(allocator);
     const body_fields = if (object.get("body_fields")) |raw_body_fields|
         try compileEventBodyFields(
             allocator,
@@ -1889,6 +2021,7 @@ fn compileEventMaterialization(
         .request_literals = request_literals,
         .generate = generate,
         .derive = derive,
+        .idempotency = idempotency,
         .body_fields = body_fields,
         .forbidden_parameters = forbidden_parameters,
     };
@@ -1897,6 +2030,7 @@ fn compileEventMaterialization(
         &result,
         definition_plan,
     );
+    idempotency = null;
     return result;
 }
 
@@ -2053,6 +2187,59 @@ fn compileEventDerivations(
         );
     }
     return items;
+}
+
+fn compileEventIdempotency(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    raw: std.json.Value,
+    derivations: []const EventDerivation,
+) !EventIdempotency {
+    if (!definition_plan.requires(.idempotency_key)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    const object = try definition_core.json.object(raw);
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "derived", "bypass_param" },
+    );
+    try definition_core.json.requireFields(object, &.{"derived"});
+    const derived = try allocator.dupe(
+        u8,
+        try definition_core.json.requiredString(object, "derived"),
+    );
+    errdefer allocator.free(derived);
+    try definition_core.json.safeIdentifier(derived, 128);
+    const item = findEventDerivation(derivations, derived) orelse
+        return error.EventIdempotencyDerivationMissing;
+    switch (item.source) {
+        .sha256 => |digest| {
+            if (digest.encoding != .hex) {
+                return error.EventIdempotencyDerivationNotSafeIdentifier;
+            }
+            for (digest.fragments) |fragment| switch (fragment) {
+                .derived => {
+                    return error.EventIdempotencyDerivationNotInputBound;
+                },
+                else => {},
+            };
+        },
+        else => return error.EventIdempotencyDerivationNotDigest,
+    }
+    const bypass_parameter = if (object.get("bypass_param")) |value| blk: {
+        const name = try definition_core.json.string(value);
+        const declaration =
+            definition_plan.parameter_declarations.find(name) orelse
+            return error.UnknownOperationParameter;
+        if (declaration.kind != .boolean) {
+            return error.EventIdempotencyBypassMustBeBoolean;
+        }
+        break :blk try allocator.dupe(u8, name);
+    } else null;
+    return .{
+        .derived = derived,
+        .bypass_parameter = bypass_parameter,
+    };
 }
 
 fn compileEventDerivation(
@@ -2981,6 +3168,9 @@ fn validateEventMaterializationExtensions(
         }
         try validateEventDerivationReferences(item, event.derive[0..index]);
     }
+    if (event.idempotency) |*idempotency| {
+        try validateEventIdempotency(event, idempotency);
+    }
     for (event.body_fields, 0..) |*field, index| {
         try validateEventBodyField(field);
         if (index != 0 and
@@ -3018,6 +3208,19 @@ fn validateEventMaterializationAgainstDefinition(
         !definition_plan.requires(.secure_token))
     {
         return error.UndeclaredArtifactOperator;
+    }
+    if (event.idempotency) |idempotency| {
+        if (!definition_plan.requires(.idempotency_key)) {
+            return error.UndeclaredArtifactOperator;
+        }
+        if (idempotency.bypass_parameter) |name| {
+            const declaration =
+                definition_plan.parameter_declarations.find(name) orelse
+                return error.EventIdempotencyBypassParameterMissing;
+            if (declaration.kind != .boolean) {
+                return error.EventIdempotencyBypassMustBeBoolean;
+            }
+        }
     }
     for (event.derive) |item| switch (item.source) {
         .input_text => {},
@@ -3081,6 +3284,39 @@ fn validateEventMaterializationAgainstDefinition(
         if (definition_plan.parameter_declarations.find(name) == null) {
             return error.EventForbiddenParameterMissing;
         }
+    }
+}
+
+fn validateEventIdempotency(
+    event: *const EventMaterialization,
+    idempotency: *const EventIdempotency,
+) !void {
+    if (event.mode != .plain) {
+        return error.EventIdempotencyRequiresPlainMaterialization;
+    }
+    try definition_core.json.safeIdentifier(idempotency.derived, 128);
+    const item = findEventDerivation(
+        event.derive,
+        idempotency.derived,
+    ) orelse return error.EventIdempotencyDerivationMissing;
+    switch (item.source) {
+        .sha256 => |digest| {
+            if (digest.encoding != .hex) {
+                return error.EventIdempotencyDerivationNotSafeIdentifier;
+            }
+            for (digest.fragments) |fragment| {
+                switch (fragment) {
+                    .derived => {
+                        return error.EventIdempotencyDerivationNotInputBound;
+                    },
+                    else => {},
+                }
+            }
+        },
+        else => return error.EventIdempotencyDerivationNotDigest,
+    }
+    if (idempotency.bypass_parameter) |name| {
+        try definition_core.json.safeIdentifier(name, 128);
     }
 }
 

@@ -938,11 +938,30 @@ fn prepareEffect(
         definition_plan.inputs[effect.input_index].codec,
     );
     defer allocator.free(canonical_request);
-    const idempotency_key = if (effect.idempotency_parameter) |parameter_name|
-        parameterText(parameters, parameter_name) orelse
-            return error.MissingOperationParameter
-    else
-        null;
+    const parameter_idempotency_key =
+        if (effect.idempotency_parameter) |parameter_name|
+            parameterText(parameters, parameter_name) orelse
+                return error.MissingOperationParameter
+        else
+            null;
+    const derived_idempotency_key = if (effect.event) |*event| blk: {
+        const idempotency = event.idempotency orelse break :blk null;
+        const bypass = if (idempotency.bypass_parameter) |parameter_name|
+            parameterBoolean(parameters, parameter_name) orelse
+                return error.MissingOperationParameter
+        else
+            false;
+        if (bypass) break :blk null;
+        break :blk try protocol.derivePlainIdempotencyKeyAlloc(
+            allocator,
+            event,
+            execution.inputJson(effect.input_index) orelse
+                return error.ProtocolInputMustBeJson,
+        );
+    } else null;
+    defer if (derived_idempotency_key) |key| allocator.free(key);
+    const idempotency_key = parameter_idempotency_key orelse
+        derived_idempotency_key;
     const input_digest = execution.inputDigest(
         definition_plan.inputs[effect.input_index].name,
     ) orelse return error.InputDigestMissing;
@@ -953,7 +972,7 @@ fn prepareEffect(
         slot.name,
         slot.relative_path,
         slot_before_digest,
-        if (idempotency_key) |key| .{
+        if (parameter_idempotency_key) |key| .{
             .definition_digest = definition_plan.closure_digest[0..],
             .operation = operation_name,
             .key = key,
@@ -994,6 +1013,24 @@ fn prepareEffect(
         existing_records = 0;
     }
     defer if (protocol_state) |*state| state.deinit(allocator);
+    const derived_idempotency_match =
+        if (derived_idempotency_key) |key| match: {
+            const content = slot_before orelse break :match null;
+            const event = effect.event orelse
+                return error.EventIdempotencyRequiresMaterialization;
+            const idempotency = event.idempotency orelse
+                return error.EventIdempotencyConfigurationMissing;
+            break :match try findPlainDerivedIdempotencyMatchAlloc(
+                allocator,
+                content,
+                &event,
+                idempotency.derived,
+                key,
+            );
+        } else null;
+    defer if (derived_idempotency_match) |content| allocator.free(content);
+    const idempotency_match = binding_before.idempotency_match or
+        derived_idempotency_match != null;
     var canonical_input_storage: ?[]u8 = null;
     errdefer if (canonical_input_storage) |bytes| allocator.free(bytes);
     var generated_outputs = try allocator.alloc(
@@ -1015,6 +1052,8 @@ fn prepareEffect(
             u8,
             content[row.extent_start..row.extent_end],
         );
+    } else if (derived_idempotency_match) |content| {
+        canonical_input_storage = try allocator.dupe(u8, content);
     } else if (effect.event) |*event_materialization| {
         var materialized_event = switch (event_materialization.mode) {
             .chained => chained: {
@@ -1069,7 +1108,7 @@ fn prepareEffect(
         }
     } else {
         canonical_input_storage = try allocator.dupe(u8, canonical_request);
-        if (protocol_required and !binding_before.idempotency_match) {
+        if (protocol_required and !idempotency_match) {
             const current_protocol = event_protocol.?;
             if (protocol_state == null) {
                 protocol_state = protocol.ReplayState.init(current_protocol);
@@ -1094,7 +1133,7 @@ fn prepareEffect(
     defer allocator.free(canonical_input_digest);
 
     const slot_after: SlotAfter = slot_after: {
-        if (binding_before.idempotency_match) {
+        if (idempotency_match) {
             const prior = slot_before orelse return error.InvalidIdempotencyBinding;
             const prior_digest = slot_before_digest orelse
                 return error.InvalidIdempotencyBinding;
@@ -1162,7 +1201,7 @@ fn prepareEffect(
         );
     }
 
-    const binding_after = if (binding_before.idempotency_match)
+    const binding_after = if (idempotency_match)
         try allocator.dupe(u8, binding_before.bytes)
     else
         try custody.appendBindingRowAlloc(
@@ -1192,7 +1231,7 @@ fn prepareEffect(
         .canonical_input = canonical_input,
         .generated_outputs = generated_outputs,
         .revision_archive = revision_candidate,
-        .idempotency_match = binding_before.idempotency_match,
+        .idempotency_match = idempotency_match,
     };
 }
 
@@ -1471,6 +1510,39 @@ fn deinitGeneratedOutputs(
     allocator.free(outputs);
 }
 
+fn findPlainDerivedIdempotencyMatchAlloc(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    event_materialization: *const storage.EventMaterialization,
+    name: []const u8,
+    expected: []const u8,
+) !?[]u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_with_cr| {
+        const line = std.mem.trim(u8, line_with_cr, " \t\r");
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        );
+        defer parsed.deinit();
+        const actual = try protocol.storedPlainDerivedValue(
+            event_materialization,
+            parsed.value,
+            name,
+        ) orelse return error.EventIdempotencyStoredValueMissing;
+        if (!std.mem.eql(u8, actual, expected)) continue;
+        const match = try allocator.dupe(u8, line);
+        return match;
+    }
+    return null;
+}
+
 fn parameterText(
     bindings: *const definition_core.parameters.Bindings,
     name: []const u8,
@@ -1485,6 +1557,20 @@ fn parameterText(
             .relative_path,
             => |text| text,
             .integer, .boolean => null,
+        };
+    }
+    return null;
+}
+
+fn parameterBoolean(
+    bindings: *const definition_core.parameters.Bindings,
+    name: []const u8,
+) ?bool {
+    for (bindings.items) |binding| {
+        if (!std.mem.eql(u8, binding.name, name)) continue;
+        return switch (binding.value) {
+            .boolean => |flag| flag,
+            else => null,
         };
     }
     return null;
@@ -3027,4 +3113,268 @@ test "transaction fails closed for an unbound existing store" {
             &parameters,
         ),
     );
+}
+
+test "plain event idempotency derives a content key with an explicit bypass" {
+    var definition_tmp = std.testing.tmpDir(.{});
+    defer definition_tmp.cleanup();
+    try definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{
+        \\  "schema":"ledger-artifact-definition/v1",
+        \\  "id":"example/content-idempotency",
+        \\  "owner":"example",
+        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["bind-existing","canonical-json","compare-and-append","event-materialization","exact-object","idempotency-key","sha256"]},
+        \\  "parameters":{"allow_duplicate":{"type":"boolean","required":false,"default":false}},
+        \\  "inputs":{"submission":{"codec":"json","max_bytes":4096}},
+        \\  "canonicalization":{"steps":[{"op":"canonical-json","input":"submission"}]},
+        \\  "shape":{"rules":[
+        \\    {"op":"exact-object","input":"submission","path":"","keys":["record"]},
+        \\    {"op":"exact-object","input":"submission","path":"/record","keys":["summary"]}
+        \\  ]},
+        \\  "constraints":[],
+        \\  "identity":{},
+        \\  "storage":{"kind":"event-log","slots":{"events":{"path":"example/content-idempotency.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},
+        \\  "operations":{
+        \\    "bind":{"effects":[{"op":"bind-existing","slot":"events","input":"submission","event_from_operation":"capture"}]},
+        \\    "capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{
+        \\    "mode":"plain",
+        \\    "body_input_field":"record",
+        \\    "field_order":["event","record"],
+        \\    "body_order":["summary","fingerprint"],
+        \\    "fields":[{"field":"event","literal":"capture"}],
+        \\    "derive":[{"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[{"canonical_input":"/record"}],"max_bytes":4096}],
+        \\    "idempotency":{"derived":"fingerprint","bypass_param":"allow_duplicate"},
+        \\    "body_fields":[{"field":"fingerprint","derived":"fingerprint"}]
+        \\  }}]}
+        \\  },
+        \\  "projections":{},
+        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &definition_tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var compiled_storage = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer compiled_storage.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try storage.encodeCache(&compiled_storage, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var storage_plan = try storage.decodeCache(
+        std.testing.allocator,
+        &decoder,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    try decoder.finish();
+    try storage.validateCachePlan(&storage_plan, &definition_plan);
+    const bind_operation = storage_plan.findOperation("bind") orelse
+        return error.TestExpectedBindOperation;
+    try std.testing.expect(
+        bind_operation.effects[0].event.?.idempotency != null,
+    );
+    var ordinary = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{},
+    );
+    defer ordinary.deinit(std.testing.allocator);
+    var bypass = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "allow_duplicate", .raw_value = "true" }},
+    );
+    defer bypass.deinit(std.testing.allocator);
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    const request = "{\"record\":{\"summary\":\"same\"}}";
+    var first = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "capture",
+        repo_root,
+        &.{.{ .name = "submission", .bytes = request }},
+        &ordinary,
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(first.storage_mutated);
+    try std.testing.expectEqual(@as(usize, 1), first.generated_outputs.len);
+    try std.testing.expectEqualStrings(
+        "fingerprint",
+        first.generated_outputs[0].name,
+    );
+    var duplicate = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "capture",
+        repo_root,
+        &.{.{ .name = "submission", .bytes = request }},
+        &ordinary,
+    );
+    defer duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expectEqualStrings(
+        "idempotent",
+        duplicate.effects[0].result,
+    );
+    try std.testing.expectEqualStrings(
+        first.returned_content.?,
+        duplicate.returned_content.?,
+    );
+    var legacy_tmp = std.testing.tmpDir(.{});
+    defer legacy_tmp.cleanup();
+    const legacy_root = try legacy_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(legacy_root);
+    const legacy_event_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{
+            legacy_root,
+            ".ledger",
+            "example",
+            "content-idempotency.jsonl",
+        },
+    );
+    defer std.testing.allocator.free(legacy_event_path);
+    const legacy_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}\n",
+        .{first.returned_content.?},
+    );
+    defer std.testing.allocator.free(legacy_content);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        legacy_event_path,
+        legacy_content,
+    );
+    var binding = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "bind",
+        legacy_root,
+        &.{},
+        &ordinary,
+    );
+    defer binding.deinit(std.testing.allocator);
+    try std.testing.expect(binding.storage_mutated);
+    try std.testing.expectEqualStrings("bound", binding.effects[0].result);
+    var legacy_duplicate = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "capture",
+        legacy_root,
+        &.{.{ .name = "submission", .bytes = request }},
+        &ordinary,
+    );
+    defer legacy_duplicate.deinit(std.testing.allocator);
+    try std.testing.expect(!legacy_duplicate.storage_mutated);
+    try std.testing.expectEqualStrings(
+        first.returned_content.?,
+        legacy_duplicate.returned_content.?,
+    );
+    var allowed = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "capture",
+        repo_root,
+        &.{.{ .name = "submission", .bytes = request }},
+        &bypass,
+    );
+    defer allowed.deinit(std.testing.allocator);
+    try std.testing.expect(allowed.storage_mutated);
+    var duplicate_after_bypass = try transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        "protocol.json",
+        &validation_plan,
+        &storage_plan,
+        null,
+        "capture",
+        repo_root,
+        &.{.{ .name = "submission", .bytes = request }},
+        &ordinary,
+    );
+    defer duplicate_after_bypass.deinit(std.testing.allocator);
+    try std.testing.expect(!duplicate_after_bypass.storage_mutated);
+    try std.testing.expectEqualStrings(
+        first.returned_content.?,
+        duplicate_after_bypass.returned_content.?,
+    );
+    const event_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ repo_root, ".ledger", "example", "content-idempotency.jsonl" },
+    );
+    defer std.testing.allocator.free(event_path);
+    const events = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        event_path,
+        65536,
+    );
+    defer std.testing.allocator.free(events);
+    var lines = std.mem.splitScalar(u8, events, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len != 0) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
 }
