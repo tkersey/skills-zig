@@ -60,7 +60,10 @@ fn parseReferences(
     value: ?std.json.Value,
     required_prefix: []const u8,
 ) ![]Reference {
-    const items = if (value) |present| try json.array(present) else return allocator.alloc(Reference, 0);
+    const items = if (value) |present|
+        try json.array(present)
+    else
+        return allocator.alloc(Reference, 0);
     var out: std.ArrayList(Reference) = .empty;
     errdefer {
         for (out.items) |*reference| reference.deinit(allocator);
@@ -113,7 +116,16 @@ test "manifest contains only explicit passive definition references" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"schema":"skill-definition-set/v1","skill":"example","seq":[{"id":"example/observation","path":"seq/observation.json"}],"ledger":[{"id":"example/artifact","path":"ledger/artifact.json"}]}
+        \\{
+        \\  "schema": "skill-definition-set/v1",
+        \\  "skill": "example",
+        \\  "seq": [
+        \\    {"id": "example/observation", "path": "seq/observation.json"}
+        \\  ],
+        \\  "ledger": [
+        \\    {"id": "example/artifact", "path": "ledger/artifact.json"}
+        \\  ]
+        \\}
     ,
         .{},
     );

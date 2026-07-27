@@ -345,7 +345,10 @@ test "parameter declarations and values compile to stable typed digests" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"limit":{"type":"integer","required":false,"default":10},"name":{"type":"safe_identifier","required":true}}
+        \\{
+        \\  "limit": {"type": "integer", "required": false, "default": 10},
+        \\  "name": {"type": "safe_identifier", "required": true}
+        \\}
     ,
         .{},
     );
@@ -373,7 +376,10 @@ test "parameter declarations round trip through bounded cache plans" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"limit":{"type":"integer","required":false,"default":10},"name":{"type":"safe_identifier","required":true}}
+        \\{
+        \\  "limit": {"type": "integer", "required": false, "default": 10},
+        \\  "name": {"type": "safe_identifier", "required": true}
+        \\}
     ,
         .{},
     );

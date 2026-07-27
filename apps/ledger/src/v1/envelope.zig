@@ -80,6 +80,20 @@ pub fn writeDefinitionDescriptionJson(
             .event_log => "event-log",
         },
     );
+    try writeDescriptionInputs(writer, plan);
+    try writeDescriptionOperators(writer, plan);
+    try writeDescriptionNames(writer, plan);
+    try writeDescriptionBounds(writer, plan);
+    try writeCompileStatsJson(writer, compile_stats);
+    try writer.writeAll(
+        ",\"passive\":true,\"authority_granted\":false}",
+    );
+}
+
+fn writeDescriptionInputs(
+    writer: *std.Io.Writer,
+    plan: *const definition.Plan,
+) !void {
     try writer.writeAll(",\"inputs\":[");
     for (plan.inputs, 0..) |input, index| {
         if (index != 0) try writer.writeByte(',');
@@ -94,6 +108,12 @@ pub fn writeDefinitionDescriptionJson(
         try writer.writeAll(if (input.required) "true" else "false");
         try writer.print(",\"max_bytes\":{d}}}", .{input.max_bytes});
     }
+}
+
+fn writeDescriptionOperators(
+    writer: *std.Io.Writer,
+    plan: *const definition.Plan,
+) !void {
     try writer.writeAll("],\"operators\":[");
     var first_operator = true;
     inline for (@typeInfo(definition.Operator).@"enum".fields) |field| {
@@ -106,6 +126,12 @@ pub fn writeDefinitionDescriptionJson(
             try writer.print(",\"version\":{d}}}", .{operator.version()});
         }
     }
+}
+
+fn writeDescriptionNames(
+    writer: *std.Io.Writer,
+    plan: *const definition.Plan,
+) !void {
     try writer.writeAll("],\"operations\":[");
     for (plan.operations, 0..) |operation, index| {
         if (index != 0) try writer.writeByte(',');
@@ -116,8 +142,17 @@ pub fn writeDefinitionDescriptionJson(
         if (index != 0) try writer.writeByte(',');
         try definition_core.canonical_json.writeCanonicalString(writer, projection.name);
     }
+}
+
+fn writeDescriptionBounds(
+    writer: *std.Io.Writer,
+    plan: *const definition.Plan,
+) !void {
     try writer.print(
-        "],\"bounds\":{{\"max_input_bytes\":{d},\"max_store_bytes\":{d},\"max_records\":{d},\"max_output_bytes\":{d},\"max_diagnostics\":{d},\"max_reducer_states\":{d}}},\"compile_stats\":",
+        "],\"bounds\":{{\"max_input_bytes\":{d},\"max_store_bytes\":{d}," ++
+            "\"max_records\":{d},\"max_output_bytes\":{d}," ++
+            "\"max_diagnostics\":{d},\"max_reducer_states\":{d}}}," ++
+            "\"compile_stats\":",
         .{
             plan.bounds.max_input_bytes,
             plan.bounds.max_store_bytes,
@@ -126,10 +161,6 @@ pub fn writeDefinitionDescriptionJson(
             plan.bounds.max_diagnostics,
             plan.bounds.max_reducer_states,
         },
-    );
-    try writeCompileStatsJson(writer, compile_stats);
-    try writer.writeAll(
-        ",\"passive\":true,\"authority_granted\":false}",
     );
 }
 
@@ -317,7 +348,9 @@ pub fn writeProjectionJson(
     try writer.writeAll(",\"data\":");
     try writer.writeAll(result.payload);
     try writer.print(
-        ",\"exit_code\":{d},\"stats\":{{\"records_scanned\":{d},\"records_matched\":{d},\"records_emitted\":{d}}},\"compile_stats\":",
+        ",\"exit_code\":{d},\"stats\":{{\"records_scanned\":{d}," ++
+            "\"records_matched\":{d},\"records_emitted\":{d}}}," ++
+            "\"compile_stats\":",
         .{
             result.exit_code,
             result.stats.records_scanned,
@@ -479,7 +512,10 @@ test "transaction errors report the transaction phase mutation state" {
         null,
     );
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"ledger-transaction-error/v1\",\"code\":\"TransactionRecoveryRequired\",\"semantic_authority_granted\":false,\"storage_mutated\":null,\"storage_mutation_state\":\"unknown\"}",
+        "{\"schema\":\"ledger-transaction-error/v1\"," ++
+            "\"code\":\"TransactionRecoveryRequired\"," ++
+            "\"semantic_authority_granted\":false,\"storage_mutated\":null," ++
+            "\"storage_mutation_state\":\"unknown\"}",
         output.written(),
     );
 
@@ -490,7 +526,10 @@ test "transaction errors report the transaction phase mutation state" {
         false,
     );
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"ledger-transaction-error/v1\",\"code\":\"ProtocolAdmissionRejected\",\"semantic_authority_granted\":false,\"storage_mutated\":false,\"storage_mutation_state\":\"known\"}",
+        "{\"schema\":\"ledger-transaction-error/v1\"," ++
+            "\"code\":\"ProtocolAdmissionRejected\"," ++
+            "\"semantic_authority_granted\":false,\"storage_mutated\":false," ++
+            "\"storage_mutation_state\":\"known\"}",
         output.written(),
     );
 }

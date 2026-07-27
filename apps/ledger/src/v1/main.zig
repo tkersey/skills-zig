@@ -10,7 +10,7 @@ threadlocal var runtime_io: ?std.Io = null;
 const Help =
     \\ledger
     \\
-    \\Passive artifact-definition validation, materialization, transactions, replay, and projections.
+    \\Passive definitions for validation, materialization, transactions, replay, and projections.
     \\
     \\usage: ledger <command> [options]
     \\
@@ -25,7 +25,7 @@ const Help =
     \\  capabilities
     \\  version
     \\
-    \\Definitions are passive JSON. Ledger never executes hooks, grants semantic authority, or inspects session history.
+    \\Definitions are passive JSON. Ledger grants no semantic authority and does not read sessions.
     \\
 ;
 
@@ -626,7 +626,28 @@ fn parseTransactionArgs(
         }
         return error.UnknownOption;
     }
-    const resolved_definition = definition_path orelse return error.MissingDefinition;
+    return finishTransactionArgs(
+        allocator,
+        definition_path,
+        operation,
+        repo_path,
+        format,
+        &inputs,
+        &parameters,
+    );
+}
+
+fn finishTransactionArgs(
+    allocator: std.mem.Allocator,
+    definition_path: ?[]const u8,
+    operation: ?[]const u8,
+    repo_path: ?[]const u8,
+    format: Format,
+    inputs: *std.ArrayList([]const u8),
+    parameters: *std.ArrayList([]const u8),
+) !TransactionArgs {
+    const resolved_definition = definition_path orelse
+        return error.MissingDefinition;
     const resolved_operation = operation orelse return error.MissingOperation;
     const resolved_repo = repo_path orelse return error.MissingRepository;
     const input_specs = try inputs.toOwnedSlice(allocator);
@@ -1182,7 +1203,8 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         return 0;
     }
     try stdout_writer.interface.print(
-        "{{\"schema\":\"ledger-capabilities/v1\",\"version\":\"{s}\",\"artifact_abis\":[\"{s}\"],\"operators\":[",
+        "{{\"schema\":\"ledger-capabilities/v1\",\"version\":\"{s}\"," ++
+            "\"artifact_abis\":[\"{s}\"],\"operators\":[",
         .{ Version, ledger.definition.abi },
     );
     var first = true;
@@ -1200,9 +1222,20 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
             .{operator.version()},
         );
     }
+    try stdout_writer.interface.writeAll(
+        "],\"codecs\":[\"json\",\"jsonl\",\"text\"]," ++
+            "\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"]," ++
+            "\"cache_format\":",
+    );
     try stdout_writer.interface.print(
-        "],\"codecs\":[\"json\",\"jsonl\",\"text\"],\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"],\"cache_format\":{d},\"result_schemas\":[\"ledger-validation-result/v1\",\"ledger-materialization-result/v1\",\"ledger-transaction-result/v1\",\"ledger-projection-result/v1\"]}}\n",
+        "{d}",
         .{definition_core.cache.format_version},
+    );
+    try stdout_writer.interface.writeAll(
+        ",\"result_schemas\":[\"ledger-validation-result/v1\"," ++
+            "\"ledger-materialization-result/v1\"," ++
+            "\"ledger-transaction-result/v1\"," ++
+            "\"ledger-projection-result/v1\"]}\n",
     );
     return 0;
 }
