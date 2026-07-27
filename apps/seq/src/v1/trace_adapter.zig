@@ -1,8 +1,10 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
+const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
+const plan = @import("plan.zig");
 const structured = @import("structured.zig");
 
 pub const Options = struct {
@@ -161,120 +163,148 @@ pub fn feedTrace(
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
     };
-    var row: [256]execution.Value = undefined;
+    var row_storage: [256]execution.Value = undefined;
+    var context = FeedContext{
+        .runner = runner,
+        .program = program,
+        .trace = trace,
+        .row = row_storage[0..program.source_width],
+    };
+    return switch (relation) {
+        .sessions, .source_events, .turns, .messages => context.feedPrimary(relation),
+        .tool_invocations,
+        .tool_results,
+        .tool_lifecycle,
+        .session_edges,
+        => context.feedTools(relation),
+        .token_events => context.feedTokenEvents(),
+        .structured_documents,
+        .structured_values,
+        => error.UnsupportedTracePhysicalRelation,
+    };
+}
 
-    switch (relation) {
-        .sessions => {
-            try fillSession(
-                row[0..program.source_width],
-                program.source_field_indices,
-                trace.session,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) {
-                return .stop;
-            }
-        },
-        .source_events => for (trace.occurrences.items) |*occurrence| {
-            try fillSourceEvent(
-                row[0..program.source_width],
-                program.source_field_indices,
-                trace.session,
-                occurrence,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .turns => for (trace.turns.items) |turn| {
-            try fillTurn(
-                row[0..program.source_width],
-                program.source_field_indices,
-                turn,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .messages => for (trace.occurrences.items) |*occurrence| {
-            if (!occurrence.message_visible or
-                occurrence.role == null or
-                occurrence.text == null)
-            {
-                continue;
-            }
-            try fillMessage(
-                row[0..program.source_width],
-                program.source_field_indices,
-                trace.session,
-                occurrence,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .tool_invocations => for (trace.tools.items) |tool| {
-            if (tool.declared_line == null) continue;
-            const occurrence = if (containsField(
-                program.source_field_indices,
-                12,
-            ))
-                occurrenceAtLine(trace, tool.declared_line.?)
-            else
-                null;
-            try fillToolInvocation(
-                row[0..program.source_width],
-                program.source_field_indices,
-                tool,
-                occurrence,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .tool_results => for (trace.tools.items) |tool| {
-            if (tool.finalized_line == null) continue;
-            const occurrence = if (containsField(
-                program.source_field_indices,
-                10,
-            ))
-                occurrenceAtLine(trace, tool.finalized_line.?)
-            else
-                null;
-            try fillToolResult(
-                row[0..program.source_width],
-                program.source_field_indices,
-                tool,
-                occurrence,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .tool_lifecycle => for (trace.tools.items) |tool| {
-            try fillToolLifecycle(
-                row[0..program.source_width],
-                program.source_field_indices,
-                tool,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .session_edges => for (trace.graph_edges.items) |edge| {
-            try fillSessionEdge(
-                row[0..program.source_width],
-                program.source_field_indices,
-                edge,
-            );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .token_events => for (trace.token_events.items) |event| {
-            if (event.occurrence_index >= trace.occurrences.items.len) {
+const FeedContext = struct {
+    runner: *execution.Runner,
+    program: *const execution.Program,
+    trace: *const trace_core.CanonicalSessionTrace,
+    row: []execution.Value,
+
+    fn feed(self: *FeedContext) !bool {
+        return try self.runner.feed(self.row) == .stop;
+    }
+
+    fn result(self: FeedContext) execution.Feed {
+        return if (self.runner.stopped) .stop else .continue_scanning;
+    }
+
+    fn feedPrimary(
+        self: *FeedContext,
+        relation: physical.Relation,
+    ) !execution.Feed {
+        const fields = self.program.source_field_indices;
+        switch (relation) {
+            .sessions => {
+                try fillSession(
+                    self.row,
+                    fields,
+                    self.trace.session,
+                );
+                _ = try self.feed();
+            },
+            .source_events => for (self.trace.occurrences.items) |*occurrence| {
+                try fillSourceEvent(
+                    self.row,
+                    fields,
+                    self.trace.session,
+                    occurrence,
+                );
+                if (try self.feed()) break;
+            },
+            .turns => for (self.trace.turns.items) |turn| {
+                try fillTurn(self.row, fields, turn);
+                if (try self.feed()) break;
+            },
+            .messages => for (self.trace.occurrences.items) |*occurrence| {
+                if (!occurrence.message_visible or
+                    occurrence.role == null or
+                    occurrence.text == null)
+                {
+                    continue;
+                }
+                try fillMessage(
+                    self.row,
+                    fields,
+                    self.trace.session,
+                    occurrence,
+                );
+                if (try self.feed()) break;
+            },
+            else => unreachable,
+        }
+        return self.result();
+    }
+
+    fn feedTools(
+        self: *FeedContext,
+        relation: physical.Relation,
+    ) !execution.Feed {
+        const fields = self.program.source_field_indices;
+        switch (relation) {
+            .tool_invocations => for (self.trace.tools.items) |tool| {
+                if (tool.declared_line == null) continue;
+                const occurrence = if (containsField(
+                    fields,
+                    12,
+                ))
+                    occurrenceAtLine(self.trace, tool.declared_line.?)
+                else
+                    null;
+                try fillToolInvocation(self.row, fields, tool, occurrence);
+                if (try self.feed()) break;
+            },
+            .tool_results => for (self.trace.tools.items) |tool| {
+                if (tool.finalized_line == null) continue;
+                const occurrence = if (containsField(
+                    fields,
+                    10,
+                ))
+                    occurrenceAtLine(self.trace, tool.finalized_line.?)
+                else
+                    null;
+                try fillToolResult(self.row, fields, tool, occurrence);
+                if (try self.feed()) break;
+            },
+            .tool_lifecycle => for (self.trace.tools.items) |tool| {
+                try fillToolLifecycle(self.row, fields, tool);
+                if (try self.feed()) break;
+            },
+            .session_edges => for (self.trace.graph_edges.items) |edge| {
+                try fillSessionEdge(self.row, fields, edge);
+                if (try self.feed()) break;
+            },
+            else => unreachable,
+        }
+        return self.result();
+    }
+
+    fn feedTokenEvents(self: *FeedContext) !execution.Feed {
+        for (self.trace.token_events.items) |event| {
+            if (event.occurrence_index >= self.trace.occurrences.items.len) {
                 return error.TokenEventOccurrenceMissing;
             }
             try fillTokenEvent(
-                row[0..program.source_width],
-                program.source_field_indices,
-                trace.session,
-                &trace.occurrences.items[event.occurrence_index],
+                self.row,
+                self.program.source_field_indices,
+                self.trace.session,
+                &self.trace.occurrences.items[event.occurrence_index],
                 event,
             );
-            if (try runner.feed(row[0..program.source_width]) == .stop) break;
-        },
-        .structured_documents,
-        .structured_values,
-        => return error.UnsupportedTracePhysicalRelation,
+            if (try self.feed()) break;
+        }
+        return self.result();
     }
-    return if (runner.stopped) .stop else .continue_scanning;
-}
+};
 
 /// Streams one canonical physical relation as JSON objects without routing
 /// through a dynamic row map. `first` is caller-owned so multiple immutable
@@ -296,103 +326,142 @@ pub fn writeRelationRowsJson(
     if (fields.len > indices.len) return error.PhysicalRelationTooWide;
     for (fields, 0..) |_, index| indices[index] = @intCast(index);
     var values: [256]execution.Value = undefined;
-    var count: usize = 0;
-
+    var context = WriteContext{
+        .writer = writer,
+        .trace = trace,
+        .fields = fields,
+        .indices = indices[0..fields.len],
+        .values = values[0..fields.len],
+        .first = first,
+    };
     switch (relation) {
-        .sessions => {
-            try fillSession(values[0..fields.len], indices[0..fields.len], trace.session);
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count = 1;
+        .sessions, .source_events, .turns, .messages => {
+            try context.writePrimary(relation);
         },
-        .source_events => for (trace.occurrences.items) |*occurrence| {
-            try fillSourceEvent(
-                values[0..fields.len],
-                indices[0..fields.len],
-                trace.session,
-                occurrence,
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .turns => for (trace.turns.items) |turn| {
-            try fillTurn(values[0..fields.len], indices[0..fields.len], turn);
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .messages => for (trace.occurrences.items) |*occurrence| {
-            if (!occurrence.message_visible or
-                occurrence.role == null or
-                occurrence.text == null)
-            {
-                continue;
-            }
-            try fillMessage(
-                values[0..fields.len],
-                indices[0..fields.len],
-                trace.session,
-                occurrence,
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .tool_invocations => for (trace.tools.items) |tool| {
-            if (tool.declared_line == null) continue;
-            try fillToolInvocation(
-                values[0..fields.len],
-                indices[0..fields.len],
-                tool,
-                occurrenceAtLine(trace, tool.declared_line.?),
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .tool_results => for (trace.tools.items) |tool| {
-            if (tool.finalized_line == null) continue;
-            try fillToolResult(
-                values[0..fields.len],
-                indices[0..fields.len],
-                tool,
-                occurrenceAtLine(trace, tool.finalized_line.?),
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .tool_lifecycle => for (trace.tools.items) |tool| {
-            try fillToolLifecycle(
-                values[0..fields.len],
-                indices[0..fields.len],
-                tool,
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .session_edges => for (trace.graph_edges.items) |edge| {
-            try fillSessionEdge(
-                values[0..fields.len],
-                indices[0..fields.len],
-                edge,
-            );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .token_events => for (trace.token_events.items) |event| {
-            if (event.occurrence_index >= trace.occurrences.items.len) {
+        .tool_invocations,
+        .tool_results,
+        .tool_lifecycle,
+        .session_edges,
+        => try context.writeTools(relation),
+        .token_events => try context.writeTokenEvents(),
+        .structured_documents, .structured_values => unreachable,
+    }
+    return context.count;
+}
+
+const WriteContext = struct {
+    writer: *std.Io.Writer,
+    trace: *const trace_core.CanonicalSessionTrace,
+    fields: []const physical.Field,
+    indices: []const u16,
+    values: []execution.Value,
+    first: *bool,
+    count: usize = 0,
+
+    fn write(self: *WriteContext) !void {
+        try writePhysicalRowJson(
+            self.writer,
+            self.fields,
+            self.values,
+            self.first,
+        );
+        self.count += 1;
+    }
+
+    fn writePrimary(
+        self: *WriteContext,
+        relation: physical.Relation,
+    ) !void {
+        switch (relation) {
+            .sessions => {
+                try fillSession(self.values, self.indices, self.trace.session);
+                try self.write();
+            },
+            .source_events => for (self.trace.occurrences.items) |*occurrence| {
+                try fillSourceEvent(
+                    self.values,
+                    self.indices,
+                    self.trace.session,
+                    occurrence,
+                );
+                try self.write();
+            },
+            .turns => for (self.trace.turns.items) |turn| {
+                try fillTurn(self.values, self.indices, turn);
+                try self.write();
+            },
+            .messages => for (self.trace.occurrences.items) |*occurrence| {
+                if (!occurrence.message_visible or
+                    occurrence.role == null or
+                    occurrence.text == null)
+                {
+                    continue;
+                }
+                try fillMessage(
+                    self.values,
+                    self.indices,
+                    self.trace.session,
+                    occurrence,
+                );
+                try self.write();
+            },
+            else => unreachable,
+        }
+    }
+
+    fn writeTools(
+        self: *WriteContext,
+        relation: physical.Relation,
+    ) !void {
+        switch (relation) {
+            .tool_invocations => for (self.trace.tools.items) |tool| {
+                if (tool.declared_line == null) continue;
+                try fillToolInvocation(
+                    self.values,
+                    self.indices,
+                    tool,
+                    occurrenceAtLine(self.trace, tool.declared_line.?),
+                );
+                try self.write();
+            },
+            .tool_results => for (self.trace.tools.items) |tool| {
+                if (tool.finalized_line == null) continue;
+                try fillToolResult(
+                    self.values,
+                    self.indices,
+                    tool,
+                    occurrenceAtLine(self.trace, tool.finalized_line.?),
+                );
+                try self.write();
+            },
+            .tool_lifecycle => for (self.trace.tools.items) |tool| {
+                try fillToolLifecycle(self.values, self.indices, tool);
+                try self.write();
+            },
+            .session_edges => for (self.trace.graph_edges.items) |edge| {
+                try fillSessionEdge(self.values, self.indices, edge);
+                try self.write();
+            },
+            else => unreachable,
+        }
+    }
+
+    fn writeTokenEvents(self: *WriteContext) !void {
+        for (self.trace.token_events.items) |event| {
+            if (event.occurrence_index >= self.trace.occurrences.items.len) {
                 return error.TokenEventOccurrenceMissing;
             }
             try fillTokenEvent(
-                values[0..fields.len],
-                indices[0..fields.len],
-                trace.session,
-                &trace.occurrences.items[event.occurrence_index],
+                self.values,
+                self.indices,
+                self.trace.session,
+                &self.trace.occurrences.items[event.occurrence_index],
                 event,
             );
-            try writePhysicalRowJson(writer, fields, values[0..fields.len], first);
-            count += 1;
-        },
-        .structured_documents, .structured_values => unreachable,
+            try self.write();
+        }
     }
-    return count;
-}
+};
 
 pub fn writeTraceDetailJson(
     writer: *std.Io.Writer,
@@ -830,77 +899,150 @@ fn usizeInteger(value: usize) !execution.Value {
     };
 }
 
-test "trace adapter scans demanded session columns in one file pass" {
-    const definition = @import("definition.zig");
-    const plan = @import("plan.zig");
+const session_observation_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/sessions",
+    \\  "requires": {
+    \\    "abi": "seq-observation-abi/v1",
+    \\    "operators": ["scan", "filter", "project"]
+    \\  },
+    \\  "parameters": {},
+    \\  "selectors": ["path"],
+    \\  "relations": [
+    \\    {"name": "sessions", "fields": ["session_id", "path", "model",
+    \\                                      "turn_count"]}
+    \\  ],
+    \\  "inputs": [],
+    \\  "pipeline": [
+    \\    {"op": "scan", "relation": "sessions", "as": "source"},
+    \\    {"op": "filter", "input": "source", "as": "matched",
+    \\     "where": [{"field": "model", "op": "exact", "value": "gpt-test"}]},
+    \\    {"op": "project", "input": "matched", "as": "rows",
+    \\     "fields": ["session_id", "turn_count"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-session-rows/v1",
+    \\             "fields": ["session_id", "turn_count"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 10,
+    \\    "max_output_bytes": 4096,
+    \\    "max_fold_states": 2
+    \\  }
+    \\}
+;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/sessions","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},"parameters":{},"selectors":["path"],"relations":[{"name":"sessions","fields":["session_id","path","model","turn_count"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"sessions","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"model","op":"exact","value":"gpt-test"}]},{"op":"project","input":"matched","as":"rows","fields":["session_id","turn_count"]}],"projections":{"rows":{"relation":"rows","schema":"example-session-rows/v1","fields":["session_id","turn_count"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "rollout.jsonl",
-        .data =
-        \\{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"session-1","model":"gpt-test","cwd":"/repo"}}
-        \\{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
-        \\{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"observed"}}
-        \\{"timestamp":"2026-07-26T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
-        \\
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "observation.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
-    defer native_plan.deinit(std.testing.allocator);
-    var bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &definition_plan.parameter_declarations,
-        &.{},
-    );
-    defer bindings.deinit(std.testing.allocator);
-    var program = try execution.compile(
-        std.testing.allocator,
-        &definition_plan,
-        &native_plan,
-        &bindings,
-        "rows",
-    );
-    defer program.deinit(std.testing.allocator);
+const event_observation_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/events",
+    \\  "requires": {
+    \\    "abi": "seq-observation-abi/v1",
+    \\    "operators": ["scan", "filter", "project"]
+    \\  },
+    \\  "parameters": {},
+    \\  "selectors": ["path"],
+    \\  "relations": [{
+    \\    "name": "source_events",
+    \\    "fields": [
+    \\      "source_event_id", "event_type", "role", "text", "raw_json",
+    \\      "turn_index"
+    \\    ]
+    \\  }],
+    \\  "inputs": [],
+    \\  "pipeline": [
+    \\    {"op": "scan", "relation": "source_events", "as": "source"},
+    \\    {"op": "filter", "input": "source", "as": "matched",
+    \\     "where": [{"field": "event_type", "op": "exact",
+    \\                "value": "agent_message"}]},
+    \\    {"op": "project", "input": "matched", "as": "rows",
+    \\     "fields": ["source_event_id", "role", "text", "raw_json",
+    \\                "turn_index"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-event-rows/v1",
+    \\             "fields": ["source_event_id", "role", "text", "raw_json",
+    \\                        "turn_index"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 10,
+    \\    "max_output_bytes": 4096,
+    \\    "max_fold_states": 2
+    \\  }
+    \\}
+;
 
-    const path = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        "rollout.jsonl",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(path);
-    var output: [2]execution.Value = undefined;
-    var observation = try observeFile(
-        std.testing.allocator,
-        &program,
-        path,
-        .{ .ongoing_threshold_secs = 0 },
-        &output,
-    );
-    defer observation.deinit(std.testing.allocator);
+const trace_rollout =
+    "{\"timestamp\":\"2026-07-26T10:00:00Z\",\"type\":\"session_meta\"," ++
+    "\"payload\":{\"id\":\"session-1\",\"model\":\"gpt-test\",\"cwd\":\"/repo\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:01Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"agent_message\",\"message\":\"observed\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:03Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}\n";
 
+const TestProgram = struct {
+    closure: definition_core.closure.Closure,
+    definition_plan: definition.Plan,
+    native_plan: plan.Plan,
+    bindings: definition_core.parameters.Bindings,
+    program: execution.Program,
+
+    fn init(
+        dir: *std.Io.Dir,
+        path: []const u8,
+        source: []const u8,
+    ) !TestProgram {
+        try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = source });
+        var closure = try definition_core.closure.loadFromDir(
+            std.testing.allocator,
+            dir,
+            path,
+            .{},
+        );
+        errdefer closure.deinit(std.testing.allocator);
+        var definition_plan = try definition.compile(
+            std.testing.allocator,
+            &closure,
+            path,
+        );
+        errdefer definition_plan.deinit(std.testing.allocator);
+        var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
+        errdefer native_plan.deinit(std.testing.allocator);
+        var bindings = try definition_core.parameters.bind(
+            std.testing.allocator,
+            &definition_plan.parameter_declarations,
+            &.{},
+        );
+        errdefer bindings.deinit(std.testing.allocator);
+        return .{
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .native_plan = native_plan,
+            .bindings = bindings,
+            .program = try execution.compile(
+                std.testing.allocator,
+                &definition_plan,
+                &native_plan,
+                &bindings,
+                "rows",
+            ),
+        };
+    }
+
+    fn deinit(self: *TestProgram) void {
+        self.program.deinit(std.testing.allocator);
+        self.bindings.deinit(std.testing.allocator);
+        self.native_plan.deinit(std.testing.allocator);
+        self.definition_plan.deinit(std.testing.allocator);
+        self.closure.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+};
+
+fn expectSessionObservation(observation: *const Observation) !void {
     try std.testing.expectEqual(@as(usize, 4), observation.metrics.lines_seen);
     try std.testing.expectEqualStrings(
         "sha256:",
@@ -915,63 +1057,68 @@ test "trace adapter scans demanded session columns in one file pass" {
         @as(i64, 1),
         observation.result.rows().row(0)[1].integer,
     );
+}
 
+fn expectEventObservation(observation: *const Observation) !void {
+    const row = observation.result.rows().row(0);
+    try std.testing.expectEqual(@as(usize, 1), observation.result.row_count);
+    try std.testing.expectEqualStrings("sha256:", row[0].string[0..7]);
+    try std.testing.expectEqualStrings("assistant", row[1].string);
+    try std.testing.expectEqualStrings("observed", row[2].string);
+    try std.testing.expectEqualStrings(
+        "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\"," ++
+            "\"payload\":{\"type\":\"agent_message\",\"message\":\"observed\"}}",
+        row[3].json,
+    );
+    try std.testing.expectEqual(@as(i64, 1), row[4].integer);
+}
+
+test "trace adapter scans demanded session columns in one file pass" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "events.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/events","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},"parameters":{},"selectors":["path"],"relations":[{"name":"source_events","fields":["source_event_id","event_type","role","text","raw_json","turn_index"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"source_events","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"event_type","op":"exact","value":"agent_message"}]},{"op":"project","input":"matched","as":"rows","fields":["source_event_id","role","text","raw_json","turn_index"]}],"projections":{"rows":{"relation":"rows","schema":"example-event-rows/v1","fields":["source_event_id","role","text","raw_json","turn_index"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
+        .sub_path = "rollout.jsonl",
+        .data = trace_rollout,
     });
-    var event_closure = try definition_core.closure.loadFromDir(
+    var session_program = try TestProgram.init(
+        &tmp.dir,
+        "observation.json",
+        session_observation_definition,
+    );
+    defer session_program.deinit();
+
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
         std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    var output: [2]execution.Value = undefined;
+    var observation = try observeFile(
+        std.testing.allocator,
+        &session_program.program,
+        path,
+        .{ .ongoing_threshold_secs = 0 },
+        &output,
+    );
+    defer observation.deinit(std.testing.allocator);
+    try expectSessionObservation(&observation);
+
+    var event_program = try TestProgram.init(
         &tmp.dir,
         "events.json",
-        .{},
+        event_observation_definition,
     );
-    defer event_closure.deinit(std.testing.allocator);
-    var event_definition = try definition.compile(
-        std.testing.allocator,
-        &event_closure,
-        "events.json",
-    );
-    defer event_definition.deinit(std.testing.allocator);
-    var event_plan = try plan.compile(
-        std.testing.allocator,
-        &event_definition,
-    );
-    defer event_plan.deinit(std.testing.allocator);
-    var event_bindings = try definition_core.parameters.bind(
-        std.testing.allocator,
-        &event_definition.parameter_declarations,
-        &.{},
-    );
-    defer event_bindings.deinit(std.testing.allocator);
-    var event_program = try execution.compile(
-        std.testing.allocator,
-        &event_definition,
-        &event_plan,
-        &event_bindings,
-        "rows",
-    );
-    defer event_program.deinit(std.testing.allocator);
+    defer event_program.deinit();
 
     var event_output: [5]execution.Value = undefined;
     var events = try observeFile(
         std.testing.allocator,
-        &event_program,
+        &event_program.program,
         path,
         .{ .ongoing_threshold_secs = 0 },
         &event_output,
     );
     defer events.deinit(std.testing.allocator);
-    const event_row = events.result.rows().row(0);
-    try std.testing.expectEqual(@as(usize, 1), events.result.row_count);
-    try std.testing.expectEqualStrings("sha256:", event_row[0].string[0..7]);
-    try std.testing.expectEqualStrings("assistant", event_row[1].string);
-    try std.testing.expectEqualStrings("observed", event_row[2].string);
-    try std.testing.expectEqualStrings(
-        "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"observed\"}}",
-        event_row[3].json,
-    );
-    try std.testing.expectEqual(@as(i64, 1), event_row[4].integer);
+    try expectEventObservation(&events);
 }

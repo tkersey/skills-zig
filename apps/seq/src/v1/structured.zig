@@ -1,7 +1,9 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const trace_core = @import("trace_core");
+const definition = @import("definition.zig");
 const execution = @import("execution.zig");
+const plan = @import("plan.zig");
 
 pub const Limits = struct {
     max_documents: usize = 4_096,
@@ -88,71 +90,82 @@ pub fn build(
     errdefer index.deinit(allocator);
 
     for (trace.tools.items) |tool| {
-        const raw = std.mem.trim(u8, tool.output_text orelse continue, " \t\r\n");
-        if (raw.len == 0 or !looksLikeJson(raw)) continue;
-        if (raw.len > limits.max_document_bytes) {
-            return error.StructuredDocumentBytesExceeded;
-        }
-        const finalized_line = tool.finalized_line orelse continue;
-        const occurrence = occurrenceAtLine(trace, finalized_line) orelse
-            return error.StructuredSourceEventMissing;
-        if (index.documents.items.len == limits.max_documents) {
-            return error.StructuredDocumentCountExceeded;
-        }
-
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            raw,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => continue,
-        };
-        defer parsed.deinit();
-
-        const canonical = try canonicalJsonAlloc(
-            allocator,
-            parsed.value,
-        );
-        if (canonical.len > limits.max_document_bytes) {
-            allocator.free(canonical);
-            return error.StructuredDocumentBytesExceeded;
-        }
-        const retained_json = try index.retain(allocator, canonical, limits);
-        const document_type = try recognizeType(
+        try appendToolDocument(
             &index,
             allocator,
-            parsed.value,
+            trace,
+            tool,
+            include_values,
             limits,
         );
-        const document_index = index.documents.items.len;
-        try index.documents.append(allocator, .{
-            .document_id = documentId(retained_json),
-            .document_type = document_type,
-            .canonical_json = retained_json,
-            .source_event_id = occurrence.sourceEventId(),
-            .session_id = trace.session.session_id,
-            .turn_index = tool.turn_index,
-            .timestamp = occurrence.timestamp,
-        });
-        if (include_values) {
-            const root_pointer = try index.own(allocator, "", limits);
-            try appendValueTree(
-                &index,
-                allocator,
-                parsed.value,
-                root_pointer,
-                @intCast(document_index),
-                0,
-                limits,
-            );
-        }
     }
     return index;
+}
+
+fn appendToolDocument(
+    index: *Index,
+    allocator: std.mem.Allocator,
+    trace: *const trace_core.CanonicalSessionTrace,
+    tool: trace_core.ToolLifecycleRecord,
+    include_values: bool,
+    limits: Limits,
+) !void {
+    const raw = std.mem.trim(u8, tool.output_text orelse return, " \t\r\n");
+    if (raw.len == 0 or !looksLikeJson(raw)) return;
+    if (raw.len > limits.max_document_bytes) {
+        return error.StructuredDocumentBytesExceeded;
+    }
+    const finalized_line = tool.finalized_line orelse return;
+    const occurrence = occurrenceAtLine(trace, finalized_line) orelse
+        return error.StructuredSourceEventMissing;
+    if (index.documents.items.len == limits.max_documents) {
+        return error.StructuredDocumentCountExceeded;
+    }
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        raw,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer parsed.deinit();
+    const canonical = try canonicalJsonAlloc(allocator, parsed.value);
+    if (canonical.len > limits.max_document_bytes) {
+        allocator.free(canonical);
+        return error.StructuredDocumentBytesExceeded;
+    }
+    const retained_json = try index.retain(allocator, canonical, limits);
+    const document_type = try recognizeType(
+        index,
+        allocator,
+        parsed.value,
+        limits,
+    );
+    const document_index = index.documents.items.len;
+    try index.documents.append(allocator, .{
+        .document_id = documentId(retained_json),
+        .document_type = document_type,
+        .canonical_json = retained_json,
+        .source_event_id = occurrence.sourceEventId(),
+        .session_id = trace.session.session_id,
+        .turn_index = tool.turn_index,
+        .timestamp = occurrence.timestamp,
+    });
+    if (!include_values) return;
+    const root_pointer = try index.own(allocator, "", limits);
+    try appendValueTree(
+        index,
+        allocator,
+        parsed.value,
+        root_pointer,
+        @intCast(document_index),
+        limits,
+    );
 }
 
 pub fn observe(
@@ -253,78 +266,156 @@ fn appendValueTree(
     value: std.json.Value,
     pointer: []const u8,
     document_index: u32,
-    depth: usize,
     limits: Limits,
 ) !void {
-    if (depth > limits.max_depth) return error.StructuredDepthExceeded;
+    var stack: std.ArrayList(ValueFrame) = .empty;
+    defer stack.deinit(allocator);
+    try pushValueFrame(index, allocator, &stack, .{
+        .value = value,
+        .pointer = pointer,
+        .depth = 0,
+    }, limits);
+    while (stack.pop()) |frame| {
+        try appendValueFrame(
+            index,
+            allocator,
+            &stack,
+            frame,
+            document_index,
+            limits,
+        );
+    }
+}
+
+const ValueFrame = struct {
+    value: std.json.Value,
+    pointer: []const u8,
+    depth: usize,
+};
+
+fn appendValueFrame(
+    index: *Index,
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayList(ValueFrame),
+    frame: ValueFrame,
+    document_index: u32,
+    limits: Limits,
+) !void {
     if (index.values.items.len == limits.max_values) {
         return error.StructuredValueCountExceeded;
     }
-    const scalar = try scalarText(index, allocator, value, limits);
+    const scalar = try scalarText(index, allocator, frame.value, limits);
     try index.values.append(allocator, .{
         .document_index = document_index,
-        .json_pointer = pointer,
-        .value_kind = valueKind(value),
+        .json_pointer = frame.pointer,
+        .value_kind = valueKind(frame.value),
         .scalar_value = scalar,
     });
-
-    switch (value) {
-        .object => |object| {
-            const keys = try allocator.alloc([]const u8, object.count());
-            defer allocator.free(keys);
-            var iterator = object.iterator();
-            var key_index: usize = 0;
-            while (iterator.next()) |entry| : (key_index += 1) {
-                keys[key_index] = entry.key_ptr.*;
-            }
-            std.mem.sort([]const u8, keys, {}, struct {
-                fn lessThan(
-                    _: void,
-                    left: []const u8,
-                    right: []const u8,
-                ) bool {
-                    return std.mem.lessThan(u8, left, right);
-                }
-            }.lessThan);
-            for (keys) |key| {
-                const child_pointer = try appendPointer(
-                    index,
-                    allocator,
-                    pointer,
-                    key,
-                    limits,
-                );
-                try appendValueTree(
-                    index,
-                    allocator,
-                    object.get(key).?,
-                    child_pointer,
-                    document_index,
-                    depth + 1,
-                    limits,
-                );
-            }
-        },
-        .array => |array| for (array.items, 0..) |child, child_index| {
-            const child_pointer = try appendArrayPointer(
-                index,
-                allocator,
-                pointer,
-                child_index,
-                limits,
-            );
-            try appendValueTree(
-                index,
-                allocator,
-                child,
-                child_pointer,
-                document_index,
-                depth + 1,
-                limits,
-            );
-        },
+    switch (frame.value) {
+        .object => |object| try pushObjectChildren(
+            index,
+            allocator,
+            stack,
+            object,
+            frame,
+            limits,
+        ),
+        .array => |array| try pushArrayChildren(
+            index,
+            allocator,
+            stack,
+            array,
+            frame,
+            limits,
+        ),
         else => {},
     }
+}
+
+fn pushObjectChildren(
+    index: *Index,
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayList(ValueFrame),
+    object: std.json.ObjectMap,
+    parent: ValueFrame,
+    limits: Limits,
+) !void {
+    const keys = try allocator.alloc([]const u8, object.count());
+    defer allocator.free(keys);
+    var iterator = object.iterator();
+    var key_index: usize = 0;
+    while (iterator.next()) |entry| : (key_index += 1) {
+        keys[key_index] = entry.key_ptr.*;
+    }
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    var remaining = keys.len;
+    while (remaining > 0) {
+        remaining -= 1;
+        const key = keys[remaining];
+        const child_pointer = try appendPointer(
+            index,
+            allocator,
+            parent.pointer,
+            key,
+            limits,
+        );
+        try pushValueFrame(index, allocator, stack, .{
+            .value = object.get(key).?,
+            .pointer = child_pointer,
+            .depth = parent.depth + 1,
+        }, limits);
+    }
+}
+
+fn pushArrayChildren(
+    index: *Index,
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayList(ValueFrame),
+    array: std.json.Array,
+    parent: ValueFrame,
+    limits: Limits,
+) !void {
+    var remaining = array.items.len;
+    while (remaining > 0) {
+        remaining -= 1;
+        const child_pointer = try appendArrayPointer(
+            index,
+            allocator,
+            parent.pointer,
+            remaining,
+            limits,
+        );
+        try pushValueFrame(index, allocator, stack, .{
+            .value = array.items[remaining],
+            .pointer = child_pointer,
+            .depth = parent.depth + 1,
+        }, limits);
+    }
+}
+
+fn pushValueFrame(
+    index: *const Index,
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayList(ValueFrame),
+    frame: ValueFrame,
+    limits: Limits,
+) !void {
+    if (frame.depth > limits.max_depth) {
+        return error.StructuredDepthExceeded;
+    }
+    const pending = std.math.add(
+        usize,
+        index.values.items.len,
+        stack.items.len,
+    ) catch return error.StructuredValueCountExceeded;
+    if (pending == limits.max_values) {
+        return error.StructuredValueCountExceeded;
+    }
+    try stack.append(allocator, frame);
 }
 
 fn scalarText(
@@ -517,30 +608,60 @@ fn buildForAllocationFailure(
     defer index.deinit(allocator);
 }
 
-test "structured index canonicalizes and flattens tool result JSON" {
-    const definition = @import("definition.zig");
-    const plan = @import("plan.zig");
+const structured_trace_source =
+    "{\"timestamp\":\"2026-07-26T00:00:00Z\",\"type\":\"session_meta\"," ++
+    "\"payload\":{\"id\":\"structured-session\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T00:00:01Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T00:00:02Z\",\"type\":\"response_item\"," ++
+    "\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\"," ++
+    "\"arguments\":\"{\\\"cmd\\\":\\\"demo\\\"}\",\"call_id\":\"call-1\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T00:00:03Z\",\"type\":\"response_item\"," ++
+    "\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\"," ++
+    "\"output\":\"{\\\"nested\\\":{\\\"a/b\\\":true}," ++
+    "\\\"schema\\\":\\\"demo/v1\\\",\\\"items\\\":[3]}\"}}\n";
 
-    const source =
-        "{\"timestamp\":\"2026-07-26T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"structured-session\"}}\n" ++
-        "{\"timestamp\":\"2026-07-26T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
-        "{\"timestamp\":\"2026-07-26T00:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"demo\\\"}\",\"call_id\":\"call-1\"}}\n" ++
-        "{\"timestamp\":\"2026-07-26T00:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"{\\\"nested\\\":{\\\"a/b\\\":true},\\\"schema\\\":\\\"demo/v1\\\",\\\"items\\\":[3]}\"}}\n";
-    var trace = try trace_core.parseSessionTraceBytes(
-        std.testing.allocator,
-        "/structured.jsonl",
-        source,
-        0,
-        .{
-            .ongoing_threshold_secs = 0,
-            .include_occurrences = true,
-            .include_message_bodies = false,
-        },
-    );
-    defer trace.deinit(std.testing.allocator);
-    var index = try build(std.testing.allocator, &trace, true, .{});
-    defer index.deinit(std.testing.allocator);
+const structured_observation_definition =
+    \\{
+    \\  "schema": "seq-observation-definition/v1",
+    \\  "id": "example/structured",
+    \\  "requires": {
+    \\    "abi": "seq-observation-abi/v1",
+    \\    "operators": ["scan", "filter", "project"]
+    \\  },
+    \\  "parameters": {},
+    \\  "selectors": ["path"],
+    \\  "relations": [{
+    \\    "name": "structured_values",
+    \\    "fields": [
+    \\      "document_id", "json_pointer", "value_kind",
+    \\      "scalar_value", "source_event_id"
+    \\    ]
+    \\  }],
+    \\  "inputs": [],
+    \\  "pipeline": [
+    \\    {"op": "scan", "relation": "structured_values", "as": "source"},
+    \\    {"op": "filter", "input": "source", "as": "matched",
+    \\     "where": [{"field": "json_pointer", "op": "exact",
+    \\                "value": "/nested/a~1b"}]},
+    \\    {"op": "project", "input": "matched", "as": "rows",
+    \\     "fields": ["document_id", "value_kind", "scalar_value",
+    \\                "source_event_id"]}
+    \\  ],
+    \\  "projections": {
+    \\    "rows": {"relation": "rows", "schema": "example-structured-rows/v1",
+    \\             "fields": ["document_id", "value_kind", "scalar_value",
+    \\                        "source_event_id"], "renderers": ["json"]}
+    \\  },
+    \\  "bounds": {
+    \\    "max_rows": 10,
+    \\    "max_output_bytes": 4096,
+    \\    "max_fold_states": 2
+    \\  }
+    \\}
+;
 
+fn expectStructuredIndex(index: *const Index) !void {
     try std.testing.expectEqual(@as(usize, 1), index.documents.items.len);
     try std.testing.expectEqualStrings(
         "demo/v1",
@@ -570,14 +691,14 @@ test "structured index canonicalizes and flattens tool result JSON" {
     }
     try std.testing.expect(saw_escaped_pointer);
     try std.testing.expect(saw_array_scalar);
+}
 
+fn expectStructuredObservation(index: *const Index) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "observation.json",
-        .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/structured","requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},"parameters":{},"selectors":["path"],"relations":[{"name":"structured_values","fields":["document_id","json_pointer","value_kind","scalar_value","source_event_id"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"structured_values","as":"source"},{"op":"filter","input":"source","as":"matched","where":[{"field":"json_pointer","op":"exact","value":"/nested/a~1b"}]},{"op":"project","input":"matched","as":"rows","fields":["document_id","value_kind","scalar_value","source_event_id"]}],"projections":{"rows":{"relation":"rows","schema":"example-structured-rows/v1","fields":["document_id","value_kind","scalar_value","source_event_id"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":4096,"max_fold_states":2}}
-        ,
+        .data = structured_observation_definition,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -592,10 +713,7 @@ test "structured index canonicalizes and flattens tool result JSON" {
         "observation.json",
     );
     defer definition_plan.deinit(std.testing.allocator);
-    var native_plan = try plan.compile(
-        std.testing.allocator,
-        &definition_plan,
-    );
+    var native_plan = try plan.compile(std.testing.allocator, &definition_plan);
     defer native_plan.deinit(std.testing.allocator);
     var bindings = try definition_core.parameters.bind(
         std.testing.allocator,
@@ -615,7 +733,7 @@ test "structured index canonicalizes and flattens tool result JSON" {
     const result = try observe(
         std.testing.allocator,
         &program,
-        &index,
+        index,
         &output,
     );
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
@@ -623,15 +741,31 @@ test "structured index canonicalizes and flattens tool result JSON" {
         index.documents.items[0].id(),
         result.rows().row(0)[0].string,
     );
-    try std.testing.expectEqualStrings(
-        "boolean",
-        result.rows().row(0)[1].string,
-    );
+    try std.testing.expectEqualStrings("boolean", result.rows().row(0)[1].string);
     try std.testing.expectEqualStrings("true", result.rows().row(0)[2].string);
     try std.testing.expectEqualStrings(
         index.documents.items[0].source_event_id,
         result.rows().row(0)[3].string,
     );
+}
+
+test "structured index canonicalizes and flattens tool result JSON" {
+    var trace = try trace_core.parseSessionTraceBytes(
+        std.testing.allocator,
+        "/structured.jsonl",
+        structured_trace_source,
+        0,
+        .{
+            .ongoing_threshold_secs = 0,
+            .include_occurrences = true,
+            .include_message_bodies = false,
+        },
+    );
+    defer trace.deinit(std.testing.allocator);
+    var index = try build(std.testing.allocator, &trace, true, .{});
+    defer index.deinit(std.testing.allocator);
+    try expectStructuredIndex(&index);
+    try expectStructuredObservation(&index);
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         buildForAllocationFailure,
