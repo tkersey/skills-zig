@@ -1087,7 +1087,11 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
         else => return error.NotObject,
     };
     const packet = rootObject(root, "decision_context_packet") orelse root;
-    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), "DCP-v2")) return error.BadVersion;
+    if (!std.mem.eql(
+        u8,
+        try requiredString(packet, "packet_version"),
+        "DCP-v2",
+    )) return error.BadVersion;
     const packet_id = try requiredString(packet, "packet_id");
     const source = rootObject(packet, "source") orelse return error.MissingSource;
     const artifact = rootObject(packet, "artifact_state") orelse return error.MissingArtifactState;

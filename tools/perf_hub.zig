@@ -105,55 +105,95 @@ const DeepCase = struct {
     samples: usize = 5,
 };
 
+fn latencyCase(
+    case_id: []const u8,
+    binary: []const u8,
+    family: []const u8,
+) perf_contract.CaseDescriptor {
+    return .{
+        .case_id = case_id,
+        .binary = binary,
+        .family = family,
+        .case_kind = .subprocess,
+        .measurement_mode = .latency_only,
+    };
+}
+
+fn shallowCoverage(
+    family: []const u8,
+    reason: []const u8,
+) perf_contract.CommandCoverage {
+    return .{ .family = family, .coverage = .shallow, .reason = reason };
+}
+
+fn rootCompat(
+    descriptor: perf_contract.CaseDescriptor,
+    build_step: []const u8,
+    binary_path: []const u8,
+    setup: CompatSetup,
+) CompatCase {
+    return .{
+        .descriptor = descriptor,
+        .builder = .root,
+        .build_step = build_step,
+        .binary_path = binary_path,
+        .setup = setup,
+    };
+}
+
 const SeqCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "seq-help", .binary = "seq", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "seq-definition-check", .binary = "seq", .family = "definition", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "seq-observe", .binary = "seq", .family = "observe", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "seq-sessions", .binary = "seq", .family = "sessions", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "seq-query", .binary = "seq", .family = "query", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    latencyCase("seq-help", "seq", "help"),
+    latencyCase("seq-definition-check", "seq", "definition"),
+    latencyCase("seq-observe", "seq", "observe"),
+    latencyCase("seq-sessions", "seq", "sessions"),
+    latencyCase("seq-query", "seq", "query"),
 };
 
 const SeqCoverages = [_]perf_contract.CommandCoverage{
-    .{ .family = "definition", .coverage = .shallow, .reason = "definition compilation case" },
-    .{ .family = "observe", .coverage = .shallow, .reason = "compiled observation case" },
-    .{ .family = "explain", .coverage = .shallow, .reason = "shares definition compiler" },
-    .{ .family = "sessions", .coverage = .shallow, .reason = "physical corpus case" },
-    .{ .family = "turns", .coverage = .shallow, .reason = "physical trace case" },
-    .{ .family = "session-detail", .coverage = .shallow, .reason = "physical trace case" },
-    .{ .family = "tool-lifecycle", .coverage = .shallow, .reason = "physical trace case" },
-    .{ .family = "session-graph", .coverage = .shallow, .reason = "physical trace case" },
-    .{ .family = "tail", .coverage = .shallow, .reason = "physical trace case" },
-    .{ .family = "find-session", .coverage = .shallow, .reason = "physical corpus case" },
-    .{ .family = "datasets", .coverage = .shallow, .reason = "static physical catalog" },
-    .{ .family = "dataset-schema", .coverage = .shallow, .reason = "static physical catalog" },
-    .{ .family = "query", .coverage = .shallow, .reason = "generic query case" },
-    .{ .family = "index", .coverage = .shallow, .reason = "physical index smoke lane" },
-    .{ .family = "capabilities", .coverage = .shallow, .reason = "command-surface gate" },
-    .{ .family = "version", .coverage = .shallow, .reason = "command-surface gate" },
+    shallowCoverage("definition", "definition compilation case"),
+    shallowCoverage("observe", "compiled observation case"),
+    shallowCoverage("explain", "shares definition compiler"),
+    shallowCoverage("sessions", "physical corpus case"),
+    shallowCoverage("turns", "physical trace case"),
+    shallowCoverage("session-detail", "physical trace case"),
+    shallowCoverage("tool-lifecycle", "physical trace case"),
+    shallowCoverage("session-graph", "physical trace case"),
+    shallowCoverage("tail", "physical trace case"),
+    shallowCoverage("find-session", "physical corpus case"),
+    shallowCoverage("datasets", "static physical catalog"),
+    shallowCoverage("dataset-schema", "static physical catalog"),
+    shallowCoverage("query", "generic query case"),
+    shallowCoverage("index", "physical index smoke lane"),
+    shallowCoverage("capabilities", "command-surface gate"),
+    shallowCoverage("version", "command-surface gate"),
 };
 const SeqDatasets = [_]perf_contract.DataSurface{
     .{ .name = "sessions", .coverage = .shallow, .reason = "physical corpus case" },
     .{ .name = "turns", .coverage = .shallow, .reason = "physical trace case" },
     .{ .name = "messages", .coverage = .shallow, .reason = "compiled observation case" },
-    .{ .name = "structured_values", .coverage = .shallow, .reason = "generic structured evidence lane" },
+    .{
+        .name = "structured_values",
+        .coverage = .shallow,
+        .reason = "generic structured evidence lane",
+    },
 };
 
 const LedgerCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "ledger-help", .binary = "ledger", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "ledger-definition-check", .binary = "ledger", .family = "definition", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "ledger-validate", .binary = "ledger", .family = "validate", .case_kind = .subprocess, .measurement_mode = .latency_only },
-    .{ .case_id = "ledger-materialize", .binary = "ledger", .family = "materialize", .case_kind = .subprocess, .measurement_mode = .latency_only },
+    latencyCase("ledger-help", "ledger", "help"),
+    latencyCase("ledger-definition-check", "ledger", "definition"),
+    latencyCase("ledger-validate", "ledger", "validate"),
+    latencyCase("ledger-materialize", "ledger", "materialize"),
 };
 
 const LedgerCoverages = [_]perf_contract.CommandCoverage{
-    .{ .family = "definition", .coverage = .shallow, .reason = "definition compilation case" },
-    .{ .family = "validate", .coverage = .shallow, .reason = "compiled validation case" },
-    .{ .family = "materialize", .coverage = .shallow, .reason = "canonicalization and identity case" },
-    .{ .family = "transact", .coverage = .shallow, .reason = "durable protocol qualification lane" },
-    .{ .family = "project", .coverage = .shallow, .reason = "durable protocol qualification lane" },
-    .{ .family = "doctor", .coverage = .shallow, .reason = "durable protocol qualification lane" },
-    .{ .family = "capabilities", .coverage = .shallow, .reason = "command-surface gate" },
-    .{ .family = "version", .coverage = .shallow, .reason = "command-surface gate" },
+    shallowCoverage("definition", "definition compilation case"),
+    shallowCoverage("validate", "compiled validation case"),
+    shallowCoverage("materialize", "canonicalization and identity case"),
+    shallowCoverage("transact", "durable protocol qualification lane"),
+    shallowCoverage("project", "durable protocol qualification lane"),
+    shallowCoverage("doctor", "durable protocol qualification lane"),
+    shallowCoverage("capabilities", "command-surface gate"),
+    shallowCoverage("version", "command-surface gate"),
 };
 
 const CronCases = [_]perf_contract.CaseDescriptor{
@@ -190,15 +230,35 @@ const MiscCoverages = [_]perf_contract.CommandCoverage{
 };
 
 const CompatCases = [_]CompatCase{
-    .{ .descriptor = SeqCases[0], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_help },
-    .{ .descriptor = SeqCases[1], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_definition_check },
-    .{ .descriptor = SeqCases[2], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_observe },
-    .{ .descriptor = SeqCases[3], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_sessions },
-    .{ .descriptor = SeqCases[4], .builder = .root, .build_step = "build-seq", .binary_path = "zig-out/bin/seq", .setup = .seq_query },
-    .{ .descriptor = LedgerCases[0], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_help },
-    .{ .descriptor = LedgerCases[1], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_definition_check },
-    .{ .descriptor = LedgerCases[2], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_validate },
-    .{ .descriptor = LedgerCases[3], .builder = .root, .build_step = "build-ledger", .binary_path = "zig-out/bin/ledger", .setup = .ledger_materialize },
+    rootCompat(SeqCases[0], "build-seq", "zig-out/bin/seq", .seq_help),
+    rootCompat(
+        SeqCases[1],
+        "build-seq",
+        "zig-out/bin/seq",
+        .seq_definition_check,
+    ),
+    rootCompat(SeqCases[2], "build-seq", "zig-out/bin/seq", .seq_observe),
+    rootCompat(SeqCases[3], "build-seq", "zig-out/bin/seq", .seq_sessions),
+    rootCompat(SeqCases[4], "build-seq", "zig-out/bin/seq", .seq_query),
+    rootCompat(LedgerCases[0], "build-ledger", "zig-out/bin/ledger", .ledger_help),
+    rootCompat(
+        LedgerCases[1],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_definition_check,
+    ),
+    rootCompat(
+        LedgerCases[2],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_validate,
+    ),
+    rootCompat(
+        LedgerCases[3],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_materialize,
+    ),
     .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
@@ -853,12 +913,21 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
     }
 }
 
-fn compareLatencyMetrics(case_cfg: CompatCase, baseline: std.json.Value, metrics: Metrics) !StatusDetail {
+fn compareLatencyMetrics(
+    case_cfg: CompatCase,
+    baseline: std.json.Value,
+    metrics: Metrics,
+) !StatusDetail {
     const root = baseline.object;
     const baseline_metrics = root.get("metrics") orelse return error.InvalidData;
     const metric_obj = baseline_metrics.object;
-    if (case_cfg.descriptor.measurement_mode == .latency_alloc and baseline_metrics.object.get("p50_alloc_calls") == null) {
-        return .{ .status = "FAIL", .detail = "baseline missing allocation metrics; recapture baseline" };
+    if (case_cfg.descriptor.measurement_mode == .latency_alloc and
+        baseline_metrics.object.get("p50_alloc_calls") == null)
+    {
+        return .{
+            .status = "FAIL",
+            .detail = "baseline missing allocation metrics; recapture baseline",
+        };
     }
     const base_p50 = try jsonFieldU64(metric_obj, "p50_ns");
     const base_p95 = try jsonFieldU64(metric_obj, "p95_ns");
@@ -1009,7 +1078,11 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--root",
             "apps/seq/src/v1/fixtures",
             "--spec",
-            "{\"dataset\":\"messages\",\"where\":[{\"field\":\"text\",\"op\":\"contains\",\"value\":\"failure\",\"case_insensitive\":true}],\"select\":[\"session_id\",\"role\",\"text\"],\"limit\":5,\"format\":\"json\"}",
+            "{\"dataset\":\"messages\",\"where\":[{\"field\":\"text\"," ++
+                "\"op\":\"contains\",\"value\":\"failure\"," ++
+                "\"case_insensitive\":true}],\"select\":[" ++
+                "\"session_id\",\"role\",\"text\"],\"limit\":5," ++
+                "\"format\":\"json\"}",
         }),
         .ledger_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .ledger_definition_check => try args.appendSlice(allocator, &.{
@@ -1041,7 +1114,13 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
-        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .bench_stats_help,
+        .perf_report_help,
+        .cas_smoke_check_help,
+        .cas_instance_runner_help,
+        .cas_review_session_help,
+        .cron_help,
+        => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -1576,7 +1655,9 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
     try writer.print(
-        "{{\"native_public_ownership\":true,\"all_cases_pass\":{s},\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\",\"cron_status\":\"{s}\",\"residuals\":[",
+        "{{\"native_public_ownership\":true,\"all_cases_pass\":{s}," ++
+            "\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\"," ++
+            "\"cron_status\":\"{s}\",\"residuals\":[",
         .{
             if (all_cases_pass) "true" else "false",
             seq_status,
@@ -1726,7 +1807,10 @@ test "compareLatencyMetrics fails closed for incomplete allocation baselines" {
     });
 
     try std.testing.expectEqualStrings("FAIL", result.status);
-    try std.testing.expectEqualStrings("baseline missing allocation metrics; recapture baseline", result.detail);
+    try std.testing.expectEqualStrings(
+        "baseline missing allocation metrics; recapture baseline",
+        result.detail,
+    );
 }
 
 test "doctor counts compat and deep cases" {

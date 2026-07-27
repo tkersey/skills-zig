@@ -1208,7 +1208,7 @@ pub fn acquireLeaseLock(
     defer allocator.free(counter_path);
 
     const started_ms = clockMillis(.awake);
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by lock timeout.
         const token = try allocateFencingToken(allocator, counter_path);
         const now_ms = clockMillis(.real);
         const expires_ms = std.math.add(u64, now_ms, options.lease_ms) catch return error.TransactionRecoveryRequired;
@@ -2138,7 +2138,7 @@ fn digestRegularFileNoSymlinkAlloc(
     var reader = file.reader(Io.io(), &.{});
     var buffer: [jsonl_core.chunk_size]u8 = undefined;
     var bytes_observed: usize = 0;
-    while (true) {
+    while (true) { // tiger: event-loop -- bounded by source EOF.
         const read = try reader.interface.readSliceShort(&buffer);
         if (read == 0) break;
         bytes_observed = std.math.add(
@@ -4283,7 +4283,8 @@ test "durable transactions atomically publish bounded raw documents" {
         .path = document_path,
         .text = "{\"value\":2}\n",
         .expectation = .{
-            .expected_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            .expected_digest = "sha256:" ++
+                "0000000000000000000000000000000000000000000000000000000000000000",
             .expected_exists = true,
         },
         .content_mode = .raw,
@@ -4466,7 +4467,8 @@ test "durable transactions compare check-only participants without rewriting the
         .path = guarded_path,
         .text = "",
         .expectation = .{
-            .expected_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            .expected_digest = "sha256:" ++
+                "0000000000000000000000000000000000000000000000000000000000000000",
             .expected_exists = true,
         },
         .content_mode = .raw,

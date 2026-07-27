@@ -625,13 +625,19 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 try applyTurnContext(allocator, &trace.turns.items[idx], payload orelse root);
                 try applySessionContextFromTurn(allocator, &trace.session, trace.turns.items[idx]);
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
+                if (occurrence_index) |index| {
+                    trace.occurrences.items[index].turn_index =
+                        trace.turns.items[idx].turn_index;
+                }
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "compacted")) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
                 trace.turns.items[idx].has_compaction = true;
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
+                if (occurrence_index) |index| {
+                    trace.occurrences.items[index].turn_index =
+                        trace.turns.items[idx].turn_index;
+                }
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "event_msg")) {
@@ -690,14 +696,33 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                     }
                 }
                 if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
+                    if (occurrence_index) |index| {
+                        trace.occurrences.items[index].turn_index =
+                            trace.turns.items[idx].turn_index;
+                    }
                 }
                 continue;
             }
             if (std.mem.eql(u8, entry_type, "response_item")) {
-                if (payload) |p| try applyResponseItem(allocator, &trace, path, &current_turn_index, &synthetic_turns, saw_task_started, p, timestamp, line_number, options);
+                if (payload) |p| {
+                    try applyResponseItem(
+                        allocator,
+                        &trace,
+                        path,
+                        &current_turn_index,
+                        &synthetic_turns,
+                        saw_task_started,
+                        p,
+                        timestamp,
+                        line_number,
+                        options,
+                    );
+                }
                 if (current_turn_index) |idx| {
-                    if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
+                    if (occurrence_index) |index| {
+                        trace.occurrences.items[index].turn_index =
+                            trace.turns.items[idx].turn_index;
+                    }
                 }
                 continue;
             }
@@ -740,7 +765,10 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number, options.max_tools);
             }
             if (current_turn_index) |idx| {
-                if (occurrence_index) |index| trace.occurrences.items[index].turn_index = trace.turns.items[idx].turn_index;
+                if (occurrence_index) |index| {
+                    trace.occurrences.items[index].turn_index =
+                        trace.turns.items[idx].turn_index;
+                }
             }
         }
     }
@@ -2088,12 +2116,29 @@ test "parseRawTraceEvent detects newer event_msg" {
 
 test "canonical messages normalize and suppress repeated source carriers" {
     const source =
-        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"messages\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for /repo\"}]}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prior\\n\\nAnswer\\r\\n\"}]}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Answer\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Hello\\r\\n\"}]}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:03Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n";
+        "{\"type\":\"session_meta\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:00Z\"," ++
+        "\"payload\":{\"id\":\"messages\"}}\n" ++
+        "{\"type\":\"response_item\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:01Z\"," ++
+        "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\"," ++
+        "\"text\":\"# AGENTS.md instructions for /repo\"}]}}\n" ++
+        "{\"type\":\"response_item\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:02Z\"," ++
+        "\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[" ++
+        "{\"type\":\"output_text\"," ++
+        "\"text\":\"Echo: prior\\n\\nAnswer\\r\\n\"}]}}\n" ++
+        "{\"type\":\"event_msg\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:02Z\"," ++
+        "\"payload\":{\"type\":\"agent_message\",\"message\":\"Answer\"}}\n" ++
+        "{\"type\":\"response_item\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:03Z\"," ++
+        "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\",\"text\":\"Hello\\r\\n\"}]}}\n" ++
+        "{\"type\":\"event_msg\"," ++
+        "\"timestamp\":\"2026-07-13T00:00:03Z\"," ++
+        "\"payload\":{\"type\":\"user_message\",\"message\":\"Hello\"}}\n";
     var trace = try parseSessionTraceBytes(
         std.testing.allocator,
         "/tmp/messages.jsonl",
@@ -2206,7 +2251,10 @@ test "bytes-backed trace parsing preserves the exact assistant occurrence line" 
         trace.occurrences.items[3].sourceEventId(),
     ));
     try std.testing.expectEqualStrings(
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}",
+        "{\"type\":\"response_item\"," ++
+            "\"timestamp\":\"2026-07-13T00:00:02Z\"," ++
+            "\"payload\":{\"type\":\"message\",\"role\":\"assistant\"," ++
+            "\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}",
         trace.occurrences.items[2].raw_json.?,
     );
     try std.testing.expectEqual(
