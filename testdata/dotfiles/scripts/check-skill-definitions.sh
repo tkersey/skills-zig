@@ -371,6 +371,16 @@ then
   exit 1
 fi
 
+actuating_manifest=codex/skills/actuating/definitions/manifest.json
+if jq -e \
+  '.ledger[] | select(.id == "actuating/evidence-protocol")' \
+  "$actuating_manifest" >/dev/null
+then
+  DOTFILES_ROOT="$dotfiles_root" \
+    LEDGER_BIN="$ledger_bin" \
+    "$script_dir/check-actuating-evidence-protocol.sh"
+fi
+
 printf \
   'definition conformance passed: manifests=%d seq=%d ledger=%d fixtures=%d materializations=%d transactions=%d contracts=%d\n' \
   "$manifest_count" \

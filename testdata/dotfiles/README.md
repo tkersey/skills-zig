@@ -20,6 +20,12 @@ Each single-input artifact suite uses
   The harness reconstructs and compares the complete canonical output, so
   expected files do not duplicate it.
 
+Stateful protocol suites reuse those same named cases. Their scenario catalog
+contains only source-case references, dynamic bindings, ordered JSON Pointer
+deltas, reconstructed-candidate digests, and expected transaction outcomes.
+Shared setup is executed by the protocol runner; canonical Goal, Construction,
+and Counterexample documents are never copied into protocol fixtures.
+
 Run the exact-candidate gate with:
 
 ```bash
@@ -27,4 +33,12 @@ DOTFILES_ROOT=/path/to/dotfiles \
 SEQ_BIN=/path/to/seq-v1-candidate \
 LEDGER_BIN=/path/to/ledger-v1-candidate \
 testdata/dotfiles/scripts/check-skill-definitions.sh
+```
+
+The Actuating Evidence protocol proof is:
+
+```bash
+DOTFILES_ROOT=/path/to/dotfiles \
+LEDGER_BIN=/path/to/ledger-v1-candidate \
+testdata/dotfiles/scripts/check-actuating-evidence-protocol.sh
 ```

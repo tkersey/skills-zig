@@ -1,0 +1,100 @@
+{
+  "schema": "actuating-evidence-protocol-cases/v1",
+  "protocol_definition": "codex/skills/actuating/definitions/ledger/evidence-protocol.json",
+  "sources": {
+    "accepted-counterexample": {
+      "definition": "codex/skills/review-fold/definitions/ledger/counterexample-set.json",
+      "input": "counterexamples",
+      "fixture_root": "review-fold/fixtures/ledger/counterexample-set",
+      "case": "accepted"
+    },
+    "initial-construction": {
+      "definition": "codex/skills/actuating/definitions/ledger/construction-contract.json",
+      "input": "construction",
+      "fixture_root": "actuating/fixtures/ledger/construction-contract",
+      "case": "initial"
+    },
+    "initial-goal": {
+      "definition": "codex/skills/goal-contract/definitions/ledger/goal-contract.json",
+      "input": "contract",
+      "fixture_root": "goal-contract/fixtures/ledger/goal-contract",
+      "case": "initial-draft"
+    },
+    "successor-construction": {
+      "definition": "codex/skills/actuating/definitions/ledger/construction-contract.json",
+      "input": "construction",
+      "fixture_root": "actuating/fixtures/ledger/construction-contract",
+      "case": "essential-expansion"
+    }
+  },
+  "cases": [
+    {
+      "id": "accepted-successor",
+      "setup": "accepted-debt",
+      "candidate": "construction-successor",
+      "patch": [],
+      "candidate_digest": "sha256:7c3807425f4c7804f2f2db83b7f614ff09cf25459d99e8e6991cecb5ad1b09d6",
+      "expect": "valid",
+      "error": null
+    },
+    {
+      "id": "accepted-class-omitted",
+      "setup": "accepted-debt",
+      "candidate": "construction-successor",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/artifact/payload/counterexample_class_refs",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/artifact/payload/recompilation/evaluated_class_refs",
+          "value": []
+        }
+      ],
+      "candidate_digest": "sha256:d689bfba02f0bfcc8cacff726081b43a4b231316773902bb967d3dada7354846",
+      "expect": "invalid",
+      "error": "ProtocolAdmissionRejected"
+    },
+    {
+      "id": "stale-counterexample-set",
+      "setup": "accepted-debt",
+      "candidate": "construction-successor",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/artifact/payload/recompilation/counterexample_set_ref",
+          "value": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ],
+      "candidate_digest": "sha256:60e1799dac105304f0ef026acac3addf14bcbc2d2f965462599c7188619b5ea7",
+      "expect": "invalid",
+      "error": "ProtocolAdmissionRejected"
+    },
+    {
+      "id": "high-severity-example-only-proof",
+      "setup": "accepted-debt",
+      "candidate": "construction-successor",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/artifact/payload/proof_obligations/0/proof_mode",
+          "value": "example-regression"
+        }
+      ],
+      "candidate_digest": "sha256:148cddb79c89a5df7762fe012e242c4cde3137dbec24ec7fcdf25269dd126e16",
+      "expect": "invalid",
+      "error": "ProtocolAdmissionRejected"
+    },
+    {
+      "id": "goal-successor-with-active-debt",
+      "setup": "accepted-debt",
+      "candidate": "goal-successor",
+      "patch": [],
+      "candidate_digest": "sha256:6e90956641f6c68b4710d64f22b0f4a53fb635de6a408e29d8df69734f3076b7",
+      "expect": "invalid",
+      "error": "ProtocolAdmissionRejected"
+    }
+  ]
+}

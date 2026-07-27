@@ -1,29 +1,12 @@
 #!/usr/bin/env bash
 
-reconstruct_definition_case() {
-  local fixture_root=$1
-  local fixture_suite=$2
-  local case_id=$3
-  local output=$4
-  local base_id
-  local base_relative
-  local base_fixture
-  local expected_digest
-  local actual_digest
-
-  base_id=$(
-    jq -r \
-      --arg case_id "$case_id" \
-      '.cases[] | select(.id == $case_id) | .base' \
-      "$fixture_suite"
-  )
-  base_relative=$(jq -r --arg base "$base_id" '.bases[$base]' "$fixture_suite")
-  base_fixture="$fixture_root/$base_relative"
-  [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
+apply_json_patch_document() {
+  local input=$1
+  local patch=$2
+  local output=$3
 
   jq -S -c \
-    --arg case_id "$case_id" \
-    --slurpfile suite "$fixture_suite" \
+    --argjson patch "$patch" \
     '
       def pointer_path($pointer):
         $pointer |
@@ -38,11 +21,7 @@ reconstruct_definition_case() {
             .
           end
         );
-      reduce (
-        $suite[0].cases[] |
-        select(.id == $case_id) |
-        (.patch // [])[]
-      ) as $operation (.;
+      reduce $patch[] as $operation (.;
         (pointer_path($operation.path)) as $path |
         if $operation.op == "remove" then
           delpaths([$path])
@@ -51,7 +30,38 @@ reconstruct_definition_case() {
         end
       )
     ' \
-    "$base_fixture" >"$output"
+    "$input" >"$output"
+}
+
+reconstruct_definition_case() {
+  local fixture_root=$1
+  local fixture_suite=$2
+  local case_id=$3
+  local output=$4
+  local base_id
+  local base_relative
+  local base_fixture
+  local expected_digest
+  local actual_digest
+  local patch
+
+  base_id=$(
+    jq -r \
+      --arg case_id "$case_id" \
+      '.cases[] | select(.id == $case_id) | .base' \
+      "$fixture_suite"
+  )
+  base_relative=$(jq -r --arg base "$base_id" '.bases[$base]' "$fixture_suite")
+  base_fixture="$fixture_root/$base_relative"
+  [[ -f "$base_fixture" && ! -L "$base_fixture" ]]
+
+  patch=$(
+    jq -c \
+      --arg case_id "$case_id" \
+      '.cases[] | select(.id == $case_id) | .patch // []' \
+      "$fixture_suite"
+  )
+  apply_json_patch_document "$base_fixture" "$patch" "$output"
 
   expected_digest=$(
     jq -r \
