@@ -136,6 +136,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "trace_core", .module = trace_core },
+            .{
+                .name = "seq_time",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("apps/seq/src/time_utils.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            },
         },
     });
     const ledger_v1_core = b.createModule(.{

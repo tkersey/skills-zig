@@ -24,13 +24,23 @@ pub const Observation = struct {
     }
 };
 
-pub fn observeFile(
+pub const ParsedTrace = struct {
+    trace: trace_core.CanonicalSessionTrace,
+    metrics: trace_core.StreamMetrics,
+    corpus_digest: [71]u8,
+
+    pub fn deinit(self: *ParsedTrace, allocator: std.mem.Allocator) void {
+        self.trace.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn parseFile(
     allocator: std.mem.Allocator,
     program: *const execution.Program,
     path: []const u8,
     options: Options,
-    output: []execution.Value,
-) !Observation {
+) !ParsedTrace {
     const relation = switch (program.source) {
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
@@ -52,7 +62,7 @@ pub fn observeFile(
         options,
     );
     var corpus_hasher = CorpusHasher{};
-    var trace = if (relation == .sessions)
+    const trace = if (relation == .sessions)
         try trace_core.parseSessionSummaryTraceReaderWithVisitorMetrics(
             allocator,
             path,
@@ -74,14 +84,33 @@ pub fn observeFile(
             CorpusHasher.visit,
             &metrics,
         );
-    errdefer trace.deinit(allocator);
+    return .{
+        .trace = trace,
+        .metrics = metrics,
+        .corpus_digest = corpus_hasher.digest(),
+    };
+}
+
+pub fn observeFile(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    path: []const u8,
+    options: Options,
+    output: []execution.Value,
+) !Observation {
+    const relation = switch (program.source) {
+        .physical => |value| value,
+        .external => return error.ObservationRequiresExternalInput,
+    };
+    var parsed = try parseFile(allocator, program, path, options);
+    errdefer parsed.deinit(allocator);
     var structured_index = structured.Index{};
     errdefer structured_index.deinit(allocator);
     const observation_result = switch (relation) {
         .structured_documents, .structured_values => structured_result: {
             structured_index = try structured.build(
                 allocator,
-                &trace,
+                &parsed.trace,
                 relation == .structured_values,
                 options.structured_limits,
             );
@@ -92,15 +121,15 @@ pub fn observeFile(
                 output,
             );
         },
-        else => try observeTrace(allocator, program, &trace, output),
+        else => try observeTrace(allocator, program, &parsed.trace, output),
     };
 
     return .{
-        .trace = trace,
+        .trace = parsed.trace,
         .structured_index = structured_index,
         .result = observation_result,
-        .metrics = metrics,
-        .corpus_digest = corpus_hasher.digest(),
+        .metrics = parsed.metrics,
+        .corpus_digest = parsed.corpus_digest,
     };
 }
 

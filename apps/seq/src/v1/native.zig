@@ -4,6 +4,7 @@ const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const native_plan = @import("plan.zig");
 const physical = @import("physical.zig");
+const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
 const trace_adapter = @import("trace_adapter.zig");
 
@@ -49,7 +50,7 @@ const Format = enum {
     }
 };
 
-const Options = struct {
+pub const Options = struct {
     root: ?[]const u8 = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -58,6 +59,9 @@ const Options = struct {
     repo: ?[]const u8 = null,
     since: ?[]const u8 = null,
     until: ?[]const u8 = null,
+    last: ?[]const u8 = null,
+    since_ms: ?i64 = null,
+    until_ms: ?i64 = null,
     status: ?[]const u8 = null,
     dataset: ?[]const u8 = null,
     spec: ?[]const u8 = null,
@@ -195,14 +199,16 @@ fn parseOptions(
             options.spec = try optionValue(argv, &index);
             continue;
         }
-        if (std.mem.eql(u8, token, "--limit") or
-            std.mem.eql(u8, token, "--last"))
-        {
+        if (std.mem.eql(u8, token, "--limit")) {
             options.limit = try std.fmt.parseUnsigned(
                 usize,
                 try optionValue(argv, &index),
                 10,
             );
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--last")) {
+            options.last = try optionValue(argv, &index);
             continue;
         }
         if (std.mem.eql(u8, token, "--format")) {
@@ -219,7 +225,58 @@ fn parseOptions(
     if (options.session_id != null and options.current) {
         return error.ConflictingSessionSelectors;
     }
+    try resolveTemporalBounds(&options);
     return options;
+}
+
+pub fn resolveTemporalBounds(options: *Options) !void {
+    if (options.last != null and options.since != null) {
+        return error.ConflictingTimeSelectors;
+    }
+    const until_ms = if (options.until) |raw|
+        seq_time.parseIsoTimestampMillis(raw) orelse
+            return error.InvalidTimestampSelector
+    else
+        null;
+    options.until_ms = until_ms;
+    if (options.last) |raw| {
+        const anchor = until_ms orelse currentUnixMillis();
+        options.since_ms = std.math.sub(
+            i64,
+            anchor,
+            try parseDurationMillis(raw),
+        ) catch return error.InvalidDurationSelector;
+        options.until_ms = anchor;
+    } else if (options.since) |raw| {
+        options.since_ms = seq_time.parseIsoTimestampMillis(raw) orelse
+            return error.InvalidTimestampSelector;
+    }
+}
+
+fn parseDurationMillis(raw: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 2) return error.InvalidDurationSelector;
+    const value = try std.fmt.parseInt(
+        i64,
+        trimmed[0 .. trimmed.len - 1],
+        10,
+    );
+    if (value <= 0) return error.InvalidDurationSelector;
+    const multiplier: i64 = switch (trimmed[trimmed.len - 1]) {
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
+        else => return error.InvalidDurationSelector,
+    };
+    return std.math.mul(i64, value, multiplier) catch
+        error.InvalidDurationSelector;
+}
+
+fn currentUnixMillis() i64 {
+    return @intCast(@divFloor(
+        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        1_000_000,
+    ));
 }
 
 fn optionValue(
@@ -1003,7 +1060,7 @@ fn indexExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn resolveTargetPaths(
+pub fn resolveTargetPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
     options: Options,
@@ -1069,7 +1126,7 @@ fn retainCurrentPath(
     if (paths.items.len == 0) return;
     var best_index: ?usize = null;
     var best_time: ?[]u8 = null;
-    defer if (best_time) |time| allocator.free(time);
+    defer if (best_time) |value| allocator.free(value);
     for (paths.items, 0..) |path, index| {
         var trace = trace_core.parseSessionSummaryTrace(
             allocator,
@@ -1133,7 +1190,7 @@ fn lessThanPath(_: void, left: []u8, right: []u8) bool {
     return std.mem.order(u8, left, right) == .lt;
 }
 
-fn freePaths(
+pub fn freePaths(
     allocator: std.mem.Allocator,
     paths: *std.ArrayList([]u8),
 ) void {
@@ -1173,18 +1230,22 @@ fn absolutePathAlloc(
     return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
-fn sessionPasses(
+pub fn sessionPasses(
     session: trace_core.SessionRecord,
     options: Options,
 ) bool {
     const timestamp = session.start_time orelse session.end_time;
-    if (options.since) |since| {
-        const actual = timestamp orelse return false;
-        if (std.mem.order(u8, actual, since) == .lt) return false;
+    if (options.since_ms) |since| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual < since) return false;
     }
-    if (options.until) |until| {
-        const actual = timestamp orelse return false;
-        if (std.mem.order(u8, actual, until) != .lt) return false;
+    if (options.until_ms) |until| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual >= until) return false;
     }
     if (options.repo) |repo| {
         const cwd = session.cwd orelse return false;

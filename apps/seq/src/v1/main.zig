@@ -57,7 +57,7 @@ const DefinitionArgs = struct {
 const ObserveArgs = struct {
     definition_path: []const u8,
     projection: []const u8,
-    path: ?[]const u8,
+    selectors: seq.native.Options,
     input_specs: []const []const u8,
     parameter_specs: []const []const u8,
     format: Format,
@@ -145,7 +145,7 @@ fn runExplain(
 ) !u8 {
     var args = try parseObserveArgs(allocator, argv);
     defer args.deinit(allocator);
-    if (args.path != null or args.input_specs.len != 0) {
+    if (hasPhysicalSelector(args.selectors) or args.input_specs.len != 0) {
         return error.ExplainDoesNotReadCorpus;
     }
     const projection_names = [_][]const u8{args.projection};
@@ -425,42 +425,94 @@ fn runObserve(
     var rows: seq.execution.Rows = undefined;
     var corpus_adapter: []const u8 = undefined;
     var corpus_digest: []const u8 = undefined;
+    var corpus_digest_storage: [71]u8 = undefined;
+    var corpus_files: usize = 0;
+    var corpus_sessions: usize = 0;
     var files_opened: usize = 0;
     var bytes_read: usize = 0;
     var rows_materialized: usize = 0;
-    var physical_observation: ?seq.trace_adapter.Observation = null;
-    defer if (physical_observation) |*observation| {
-        observation.deinit(allocator);
-    };
+    var corpus_runner: ?seq.execution.Runner = null;
+    defer if (corpus_runner) |*runner| runner.deinit();
     var external_relation: ?seq.external_input.Relation = null;
     defer if (external_relation) |*relation| relation.deinit(allocator);
 
     const result = switch (program.source) {
-        .physical => physical_result: {
+        .physical => |relation| physical_result: {
             if (args.input_specs.len != 0) {
                 return error.ExternalInputNotAcceptedForPhysicalObservation;
             }
-            const path = args.path orelse return error.MissingPathSelector;
-            if (!selectorAllowed(
+            try validateSelectedSelectors(
                 &context.definition_plan,
-                .path,
-            )) return error.ObservationSelectorNotDeclared;
-            physical_observation = try seq.trace_adapter.observeFile(
+                args.selectors,
+            );
+            var paths = try seq.native.resolveTargetPaths(
+                allocator,
+                defaultIo(),
+                args.selectors,
+                false,
+            );
+            defer seq.native.freePaths(allocator, &paths);
+            corpus_runner = try seq.execution.Runner.initOwnedAlloc(
                 allocator,
                 &program,
-                path,
-                .{},
                 output,
             );
-            const observation = &physical_observation.?;
+            var digest_set = CorpusSetHasher{};
+            for (paths.items) |path| {
+                var parsed = try seq.trace_adapter.parseFile(
+                    allocator,
+                    &program,
+                    path,
+                    .{},
+                );
+                defer parsed.deinit(allocator);
+                files_opened += 1;
+                bytes_read = std.math.add(
+                    usize,
+                    bytes_read,
+                    parsed.metrics.bytes_read,
+                ) catch return error.ObservationMetricOverflow;
+                if (!seq.native.sessionPasses(
+                    parsed.trace.session,
+                    args.selectors,
+                )) continue;
+                corpus_files += 1;
+                corpus_sessions += 1;
+                digest_set.add(path, &parsed.corpus_digest);
+                const feed = switch (relation) {
+                    .structured_documents,
+                    .structured_values,
+                    => structured_feed: {
+                        var index = try seq.structured.build(
+                            allocator,
+                            &parsed.trace,
+                            relation == .structured_values,
+                            .{},
+                        );
+                        defer index.deinit(allocator);
+                        break :structured_feed try seq.structured.feed(
+                            &corpus_runner.?,
+                            &program,
+                            &index,
+                        );
+                    },
+                    else => try seq.trace_adapter.feedTrace(
+                        &corpus_runner.?,
+                        &program,
+                        &parsed.trace,
+                    ),
+                };
+                if (feed == .stop) break;
+            }
+            corpus_digest_storage = digest_set.digest();
             corpus_adapter = "codex-rollout-jsonl/v1";
-            corpus_digest = &observation.corpus_digest;
-            files_opened = 1;
-            bytes_read = observation.metrics.bytes_read;
-            break :physical_result observation.result;
+            corpus_digest = &corpus_digest_storage;
+            break :physical_result try corpus_runner.?.finish();
         },
         .external => |input_index| external_result: {
-            if (args.path != null) return error.PathSelectorNotAccepted;
+            if (hasPhysicalSelector(args.selectors)) {
+                return error.SelectorNotAcceptedForExternalInput;
+            }
             if (input_index >= context.definition_plan.inputs.len) {
                 return error.ObservationExternalInputIndexInvalid;
             }
@@ -475,6 +527,7 @@ fn runObserve(
             corpus_digest = &relation.raw_digest;
             files_opened = 1;
             bytes_read = relation.input_bytes;
+            corpus_files = 1;
             break :external_result try seq.external_input.execute(
                 allocator,
                 &program,
@@ -504,8 +557,8 @@ fn runObserve(
             .corpus = .{
                 .adapter = corpus_adapter,
                 .digest = corpus_digest,
-                .files = files_opened,
-                .sessions = if (program.source == .physical) 1 else 0,
+                .files = corpus_files,
+                .sessions = corpus_sessions,
                 .contaminated = false,
             },
             .rows = rows,
@@ -515,8 +568,9 @@ fn runObserve(
         &execution_stats,
     );
     defer allocator.free(rendered);
-    try writeStdout(rendered);
-    try writeStdout("\n");
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(rendered);
+    try stdout_writer.interface.writeByte('\n');
     return 0;
 }
 
@@ -572,7 +626,7 @@ fn parseObserveArgs(
 ) !ObserveArgs {
     var definition_path: ?[]const u8 = null;
     var projection: ?[]const u8 = null;
-    var path: ?[]const u8 = null;
+    var selectors = seq.native.Options{};
     var format: Format = .json;
     var inputs: std.ArrayList([]const u8) = .empty;
     errdefer inputs.deinit(allocator);
@@ -598,8 +652,52 @@ fn parseObserveArgs(
         if (std.mem.eql(u8, token, "--path")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
-            if (path != null) return error.DuplicatePathOption;
-            path = argv[index];
+            if (selectors.path != null) return error.DuplicatePathOption;
+            selectors.path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--root")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.root != null) return error.DuplicateRootOption;
+            selectors.root = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--session-id")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.session_id != null) {
+                return error.DuplicateSessionIdOption;
+            }
+            selectors.session_id = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--repo")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.repo != null) return error.DuplicateRepoOption;
+            selectors.repo = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--since")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.since != null) return error.DuplicateSinceOption;
+            selectors.since = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--until")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.until != null) return error.DuplicateUntilOption;
+            selectors.until = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--last")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (selectors.last != null) return error.DuplicateLastOption;
+            selectors.last = argv[index];
             continue;
         }
         if (std.mem.eql(u8, token, "--input")) {
@@ -624,16 +722,93 @@ fn parseObserveArgs(
     }
     const input_specs = try inputs.toOwnedSlice(allocator);
     errdefer allocator.free(input_specs);
+    if (selectors.path != null and
+        (selectors.root != null or selectors.session_id != null))
+    {
+        return error.ConflictingSessionSelectors;
+    }
+    try seq.native.resolveTemporalBounds(&selectors);
     return .{
         .definition_path = definition_path orelse
             return error.MissingDefinition,
         .projection = projection orelse return error.MissingProjection,
-        .path = path,
+        .selectors = selectors,
         .input_specs = input_specs,
         .parameter_specs = try parameters.toOwnedSlice(allocator),
         .format = format,
     };
 }
+
+fn hasPhysicalSelector(options: seq.native.Options) bool {
+    return options.root != null or
+        options.path != null or
+        options.session_id != null or
+        options.repo != null or
+        options.since != null or
+        options.until != null or
+        options.last != null;
+}
+
+fn validateSelectedSelectors(
+    definition_plan: *const seq.definition.Plan,
+    options: seq.native.Options,
+) !void {
+    const selected = [_]struct {
+        active: bool,
+        selector: seq.definition.Selector,
+    }{
+        .{ .active = options.root != null, .selector = .root },
+        .{ .active = options.session_id != null, .selector = .session_id },
+        .{ .active = options.path != null, .selector = .path },
+        .{ .active = options.repo != null, .selector = .repo },
+        .{ .active = options.since != null, .selector = .since },
+        .{ .active = options.until != null, .selector = .until },
+        .{ .active = options.last != null, .selector = .last },
+    };
+    for (selected) |item| {
+        if (item.active and
+            !selectorAllowed(definition_plan, item.selector))
+        {
+            return error.ObservationSelectorNotDeclared;
+        }
+    }
+    if (options.path == null and
+        !selectorAllowed(definition_plan, .root))
+    {
+        return error.MissingPathSelector;
+    }
+}
+
+const CorpusSetHasher = struct {
+    hasher: std.crypto.hash.sha2.Sha256 = init: {
+        var value = std.crypto.hash.sha2.Sha256.init(.{});
+        value.update("seq-corpus-set/v1\x00");
+        break :init value;
+    },
+
+    fn add(
+        self: *CorpusSetHasher,
+        path: []const u8,
+        file_digest: []const u8,
+    ) void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(path.len), .big);
+        self.hasher.update(&length);
+        self.hasher.update(path);
+        self.hasher.update(file_digest);
+    }
+
+    fn digest(self: CorpusSetHasher) [71]u8 {
+        var mutable = self;
+        var raw: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        mutable.hasher.final(&raw);
+        const hex = std.fmt.bytesToHex(raw, .lower);
+        var encoded: [71]u8 = undefined;
+        @memcpy(encoded[0..7], "sha256:");
+        @memcpy(encoded[7..], &hex);
+        return encoded;
+    }
+};
 
 fn loadDefinition(
     allocator: std.mem.Allocator,
@@ -936,7 +1111,7 @@ test "final command surface contains no skill or artifact commands" {
     try std.testing.expect(std.mem.indexOf(u8, Help, "observe") != null);
 }
 
-test "observe parser accepts only explicit definition inputs and parameters" {
+test "observe parser accepts explicit definition selectors and parameters" {
     var args = try parseObserveArgs(std.testing.allocator, &.{
         "--definition",
         "observation.json",
@@ -951,6 +1126,9 @@ test "observe parser accepts only explicit definition inputs and parameters" {
     });
     defer args.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("rows", args.projection);
-    try std.testing.expectEqualStrings("rollout.jsonl", args.path.?);
+    try std.testing.expectEqualStrings(
+        "rollout.jsonl",
+        args.selectors.path.?,
+    );
     try std.testing.expectEqual(@as(usize, 1), args.parameter_specs.len);
 }
