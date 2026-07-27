@@ -4260,6 +4260,11 @@ fn executeTextDocument(
         &physical.writer,
         slot.relative_path,
     );
+    try physical.writer.writeAll(",\"path\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &physical.writer,
+        snapshot.path,
+    );
     try physical.writer.writeAll(",\"revision\":");
     try definition_core.canonical_json.writeCanonicalString(
         &physical.writer,
