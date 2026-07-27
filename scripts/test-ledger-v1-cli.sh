@@ -32,12 +32,12 @@ capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"ledger-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"id":"exact-object","version":2' <<<"$capabilities"
 grep -Fq '"id":"optional-field","version":2' <<<"$capabilities"
-grep -Fq '"id":"implies","version":4' <<<"$capabilities"
-grep -Fq '"id":"regex","version":2' <<<"$capabilities"
-grep -Fq '"id":"sha256","version":3' <<<"$capabilities"
+grep -Fq '"id":"implies","version":5' <<<"$capabilities"
+grep -Fq '"id":"regex","version":3' <<<"$capabilities"
+grep -Fq '"id":"sha256","version":4' <<<"$capabilities"
 grep -Fq '"id":"sorted","version":2' <<<"$capabilities"
-grep -Fq '"id":"exactly-one","version":2' <<<"$capabilities"
-grep -Fq '"id":"at-least-one","version":2' <<<"$capabilities"
+grep -Fq '"id":"exactly-one","version":3' <<<"$capabilities"
+grep -Fq '"id":"at-least-one","version":3' <<<"$capabilities"
 grep -Fq '"id":"keyed-unique","version":2' <<<"$capabilities"
 grep -Fq '"id":"keyed-join","version":1' <<<"$capabilities"
 grep -Fq '"id":"reference-exists","version":8' <<<"$capabilities"
@@ -52,16 +52,15 @@ grep -Fq '"id":"any","version":1' <<<"$capabilities"
 grep -Fq '"id":"none","version":1' <<<"$capabilities"
 grep -Fq '"id":"composite-identity","version":1' <<<"$capabilities"
 grep -Fq '"id":"content-address","version":1' <<<"$capabilities"
-grep -Fq '"id":"reducer","version":3' <<<"$capabilities"
+grep -Fq '"id":"reducer","version":5' <<<"$capabilities"
 grep -Fq '"id":"event-envelope","version":4' <<<"$capabilities"
 grep -Fq '"id":"cross-input-equal","version":2' <<<"$capabilities"
 grep -Fq '"id":"compare-and-append","version":2' <<<"$capabilities"
 grep -Fq '"id":"bind-existing","version":2' <<<"$capabilities"
-grep -Fq '"id":"fold","version":2' <<<"$capabilities"
+grep -Fq '"id":"fold","version":6' <<<"$capabilities"
+grep -Fq '"id":"relevance","version":3' <<<"$capabilities"
 grep -Fq '"id":"tagged-union","version":1' <<<"$capabilities"
-if grep -Eq \
-  '"id":"(relevance|text-render)"' \
-  <<<"$capabilities"
+if grep -Fq '"id":"text-render"' <<<"$capabilities"
 then
   exit 1
 fi
@@ -163,7 +162,7 @@ projection_payload=$("$binary" project \
   --repo "$repo_dir" \
   --payload-only \
   --format json)
-test "$projection_payload" = '[{"kind":"one","value":1}]'
+test "$projection_payload" = '{"kind":"one","value":1}'
 
 doctor_output=$("$binary" doctor \
   --definition "$event_definition" \

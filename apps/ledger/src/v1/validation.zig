@@ -2,6 +2,10 @@ const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 
+const max_regex_patterns: usize = 32;
+const max_regex_atoms_per_pattern: usize = 255;
+const max_regex_total_atoms: usize =
+    max_regex_patterns * max_regex_atoms_per_pattern;
 const max_regex_subject_bytes: usize = 16 * 1024 * 1024;
 const max_sha256_subject_bytes: usize = 16 * 1024 * 1024;
 
@@ -114,6 +118,11 @@ const RegexQuantifier = enum {
     zero_or_one,
     zero_or_more,
     one_or_more,
+};
+
+const RegexRepetition = struct {
+    minimum: usize,
+    maximum: usize,
 };
 
 const CompiledRegexAtom = struct {
@@ -716,122 +725,13 @@ const Builder = struct {
                     ),
                 );
             },
-            .implies => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "if",
-                        "equals",
-                        "empty",
-                        "nonempty",
-                        "then",
-                        "then_input",
-                        "then_equals",
-                        "then_nonempty",
-                        "rules",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "if" },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "if"),
-                );
-                const consequent_path = object.get("then");
-                const conditional_rules = object.get("rules");
-                if ((consequent_path == null) == (conditional_rules == null)) {
-                    return error.ImplicationConsequenceAmbiguous;
-                }
-                if (consequent_path) |raw_consequent| {
-                    rule.other_pointer_id = try self.internPointer(
-                        try definition_core.json.string(raw_consequent),
-                    );
-                    rule.other_input_index = if (object.get(
-                        "then_input",
-                    )) |raw|
-                        try self.inputIndex(
-                            try definition_core.json.string(raw),
-                        )
-                    else
-                        input_index;
-                } else {
-                    if (object.get("then_input") != null or
-                        object.get("then_equals") != null or
-                        object.get("then_nonempty") != null)
-                    {
-                        return error.ConditionalRulesHaveScalarConsequence;
-                    }
-                    rule.children = try self.compileConditionalRules(
-                        conditional_rules.?,
-                        input_index,
-                    );
-                }
-                const condition_equals = object.get("equals");
-                const condition_empty =
-                    try optionalBoolean(object, "empty") orelse false;
-                const condition_nonempty =
-                    try optionalBoolean(object, "nonempty") orelse false;
-                const consequent_equals = object.get("then_equals");
-                rule.then_nonempty =
-                    try optionalBoolean(object, "then_nonempty") orelse false;
-                if (@as(usize, @intFromBool(condition_equals != null)) +
-                    @as(usize, @intFromBool(condition_empty)) +
-                    @as(usize, @intFromBool(condition_nonempty)) > 1)
-                {
-                    return error.ConflictingImplicationPredicates;
-                }
-                if (consequent_equals != null and rule.then_nonempty) {
-                    return error.ConflictingImplicationConsequences;
-                }
-                if (conditional_rules != null and consequent_equals != null) {
-                    return error.ConditionalRulesHaveScalarConsequence;
-                }
-                if (consequent_equals != null and
-                    condition_equals == null and
-                    !condition_empty and
-                    !condition_nonempty)
-                {
-                    return error.ImplicationConsequenceRequiresPredicate;
-                }
-                const value_count: usize =
-                    @as(usize, @intFromBool(condition_equals != null)) +
-                    @as(usize, @intFromBool(consequent_equals != null));
-                if (value_count != 0) {
-                    const values = try self.allocator.alloc(
-                        EnumScalar,
-                        value_count,
-                    );
-                    var value_index: usize = 0;
-                    errdefer {
-                        for (values[0..value_index]) |*value| {
-                            value.deinit(self.allocator);
-                        }
-                        self.allocator.free(values);
-                    }
-                    if (condition_equals) |value| {
-                        values[value_index] = try parseEnumScalar(
-                            self.allocator,
-                            value,
-                        );
-                        value_index += 1;
-                    }
-                    if (consequent_equals) |value| {
-                        values[value_index] = try parseEnumScalar(
-                            self.allocator,
-                            value,
-                        );
-                        value_index += 1;
-                    }
-                    rule.values = values;
-                }
-                if (condition_nonempty) {
-                    rule.min_count = 1;
-                }
-                if (condition_empty) rule.max_count = 0;
-            },
+            .implies => try self.compileImplication(
+                object,
+                input_index,
+                0,
+                false,
+                &rule,
+            ),
             .total_partition => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -1604,6 +1504,147 @@ const Builder = struct {
         return parts;
     }
 
+    fn compileImplication(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        item_mode: bool,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (item_mode) {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{
+                    "op",
+                    "if",
+                    "equals",
+                    "empty",
+                    "nonempty",
+                    "then",
+                    "then_equals",
+                    "then_nonempty",
+                    "rules",
+                },
+            );
+        } else {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{
+                    "op",
+                    "input",
+                    "if",
+                    "equals",
+                    "empty",
+                    "nonempty",
+                    "then",
+                    "then_input",
+                    "then_equals",
+                    "then_nonempty",
+                    "rules",
+                },
+            );
+        }
+        try definition_core.json.requireFields(object, &.{ "op", "if" });
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "if"),
+        );
+        const consequent_path = object.get("then");
+        const conditional_rules = object.get("rules");
+        if ((consequent_path == null) == (conditional_rules == null)) {
+            return error.ImplicationConsequenceAmbiguous;
+        }
+        if (consequent_path) |raw_consequent| {
+            rule.other_pointer_id = try self.internPointer(
+                try definition_core.json.string(raw_consequent),
+            );
+            rule.other_input_index = if (!item_mode and
+                object.get("then_input") != null)
+                try self.inputIndex(
+                    try definition_core.json.string(
+                        object.get("then_input").?,
+                    ),
+                )
+            else
+                input_index;
+        } else {
+            if (object.get("then_input") != null or
+                object.get("then_equals") != null or
+                object.get("then_nonempty") != null)
+            {
+                return error.ConditionalRulesHaveScalarConsequence;
+            }
+            rule.children = if (item_mode)
+                try self.compileItemRules(
+                    conditional_rules.?,
+                    input_index,
+                    depth + 1,
+                )
+            else
+                try self.compileConditionalRules(
+                    conditional_rules.?,
+                    input_index,
+                );
+        }
+        const condition_equals = object.get("equals");
+        const condition_empty =
+            try optionalBoolean(object, "empty") orelse false;
+        const condition_nonempty =
+            try optionalBoolean(object, "nonempty") orelse false;
+        const consequent_equals = object.get("then_equals");
+        rule.then_nonempty =
+            try optionalBoolean(object, "then_nonempty") orelse false;
+        if (@as(usize, @intFromBool(condition_equals != null)) +
+            @as(usize, @intFromBool(condition_empty)) +
+            @as(usize, @intFromBool(condition_nonempty)) > 1)
+        {
+            return error.ConflictingImplicationPredicates;
+        }
+        if (consequent_equals != null and rule.then_nonempty) {
+            return error.ConflictingImplicationConsequences;
+        }
+        if (conditional_rules != null and consequent_equals != null) {
+            return error.ConditionalRulesHaveScalarConsequence;
+        }
+        if (consequent_equals != null and
+            condition_equals == null and
+            !condition_empty and
+            !condition_nonempty)
+        {
+            return error.ImplicationConsequenceRequiresPredicate;
+        }
+        const value_count: usize =
+            @as(usize, @intFromBool(condition_equals != null)) +
+            @as(usize, @intFromBool(consequent_equals != null));
+        if (value_count != 0) {
+            const values = try self.allocator.alloc(EnumScalar, value_count);
+            var value_index: usize = 0;
+            errdefer {
+                for (values[0..value_index]) |*value| {
+                    value.deinit(self.allocator);
+                }
+                self.allocator.free(values);
+            }
+            if (condition_equals) |value| {
+                values[value_index] = try parseEnumScalar(
+                    self.allocator,
+                    value,
+                );
+                value_index += 1;
+            }
+            if (consequent_equals) |value| {
+                values[value_index] = try parseEnumScalar(
+                    self.allocator,
+                    value,
+                );
+                value_index += 1;
+            }
+            rule.values = values;
+        }
+        if (condition_nonempty) rule.min_count = 1;
+        if (condition_empty) rule.max_count = 0;
+    }
+
     fn compileItemRules(
         self: *Builder,
         raw: std.json.Value,
@@ -2019,44 +2060,13 @@ const Builder = struct {
                 rule.ignore_null_references =
                     try optionalBoolean(object, "ignore_null") orelse false;
             },
-            .implies => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "if",
-                        "equals",
-                        "nonempty",
-                        "then",
-                        "then_nonempty",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "if", "then" },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "if"),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "then"),
-                );
-                rule.other_input_index = input_index;
-                if (object.get("equals")) |value| {
-                    const values = try self.allocator.alloc(EnumScalar, 1);
-                    errdefer self.allocator.free(values);
-                    values[0] = try parseEnumScalar(self.allocator, value);
-                    rule.values = values;
-                }
-                if (try optionalBoolean(object, "nonempty") orelse false) {
-                    if (rule.values.len != 0) {
-                        return error.ConflictingImplicationPredicates;
-                    }
-                    rule.min_count = 1;
-                }
-                rule.then_nonempty =
-                    try optionalBoolean(object, "then_nonempty") orelse false;
-            },
+            .implies => try self.compileImplication(
+                object,
+                input_index,
+                depth,
+                true,
+                &rule,
+            ),
             .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
                 try definition_core.json.requireExactKeys(
                     object,
@@ -3419,7 +3429,7 @@ fn decodeCompiledRegexPatterns(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) ![]CompiledRegexPattern {
-    const count = try decoder.readCount(32);
+    const count = try decoder.readCount(max_regex_patterns);
     if (count == 0) return allocator.alloc(CompiledRegexPattern, 0);
     const patterns = try allocator.alloc(CompiledRegexPattern, count);
     var initialized: usize = 0;
@@ -3431,14 +3441,16 @@ fn decodeCompiledRegexPatterns(
         allocator.free(patterns);
     }
     for (patterns) |*pattern| {
-        const atom_count = try decoder.readCount(255);
+        const atom_count = try decoder.readCount(max_regex_atoms_per_pattern);
         if (atom_count == 0) return error.CacheRegexPatternInvalid;
         total_atoms = std.math.add(
             usize,
             total_atoms,
             atom_count,
         ) catch return error.CacheRegexPatternInvalid;
-        if (total_atoms > 256) return error.CacheRegexPatternInvalid;
+        if (total_atoms > max_regex_total_atoms) {
+            return error.CacheRegexPatternInvalid;
+        }
         const atoms = try allocator.alloc(CompiledRegexAtom, atom_count);
         errdefer allocator.free(atoms);
         for (atoms) |*atom| {
@@ -3589,13 +3601,15 @@ fn validateCachedRule(
             rule.max_count.? == 0 or
             rule.max_count.? > max_regex_subject_bytes or
             rule.regex_patterns.len == 0 or
-            rule.regex_patterns.len > 32)
+            rule.regex_patterns.len > max_regex_patterns)
         {
             return error.CacheRuleConfigurationInvalid;
         } else {
             var total_atoms: usize = 0;
             for (rule.regex_patterns) |pattern| {
-                if (pattern.atoms.len == 0 or pattern.atoms.len > 255) {
+                if (pattern.atoms.len == 0 or
+                    pattern.atoms.len > max_regex_atoms_per_pattern)
+                {
                     return error.CacheRuleConfigurationInvalid;
                 }
                 total_atoms = std.math.add(
@@ -3603,7 +3617,7 @@ fn validateCachedRule(
                     total_atoms,
                     pattern.atoms.len,
                 ) catch return error.CacheRuleConfigurationInvalid;
-                if (total_atoms > 256) {
+                if (total_atoms > max_regex_total_atoms) {
                     return error.CacheRuleConfigurationInvalid;
                 }
                 for (pattern.atoms) |atom| {
@@ -5098,7 +5112,13 @@ fn itemRuleHolds(
             )
         else
             false,
-        .implies => implicationHolds(plan, root, root, rule),
+        .implies => if (rule.children.len != 0)
+            if (implicationPredicateHolds(plan, root, rule))
+                itemRulesHold(allocator, plan, rule.children, root)
+            else
+                true
+        else
+            implicationHolds(plan, root, root, rule),
         .total_partition => try totalPartition(
             allocator,
             plan,
@@ -7477,7 +7497,7 @@ fn compileRegexPatterns(
     raw: std.json.Value,
 ) ![]CompiledRegexPattern {
     const values = try definition_core.json.array(raw);
-    if (values.items.len == 0 or values.items.len > 32) {
+    if (values.items.len == 0 or values.items.len > max_regex_patterns) {
         return error.RegexPatternCountInvalid;
     }
     const patterns = try allocator.alloc(
@@ -7503,7 +7523,9 @@ fn compileRegexPatterns(
             total_atoms,
             patterns[index].atoms.len,
         ) catch return error.RegexStateBoundExceeded;
-        if (total_atoms > 256) return error.RegexStateBoundExceeded;
+        if (total_atoms > max_regex_total_atoms) {
+            return error.RegexStateBoundExceeded;
+        }
     }
     return patterns;
 }
@@ -7551,26 +7573,118 @@ fn compileRegexPattern(
                 index += 1;
             },
         }
-        var quantifier: RegexQuantifier = .one;
-        if (index < expression.len) {
-            quantifier = switch (expression[index]) {
-                '?' => .zero_or_one,
-                '*' => .zero_or_more,
-                '+' => .one_or_more,
-                else => .one,
-            };
-            if (quantifier != .one) index += 1;
+        if (index < expression.len and expression[index] == '{') {
+            const repetition = try readRegexRepetition(expression, &index);
+            for (0..repetition.maximum) |repetition_index| {
+                if (atoms.items.len >= max_regex_atoms_per_pattern) {
+                    return error.RegexStateBoundExceeded;
+                }
+                try atoms.append(allocator, .{
+                    .bytes = bytes,
+                    .quantifier = if (repetition_index < repetition.minimum)
+                        .one
+                    else
+                        .zero_or_one,
+                });
+            }
+        } else {
+            var quantifier: RegexQuantifier = .one;
+            if (index < expression.len) {
+                quantifier = switch (expression[index]) {
+                    '?' => .zero_or_one,
+                    '*' => .zero_or_more,
+                    '+' => .one_or_more,
+                    else => .one,
+                };
+                if (quantifier != .one) index += 1;
+            }
+            if (atoms.items.len >= max_regex_atoms_per_pattern) {
+                return error.RegexStateBoundExceeded;
+            }
+            try atoms.append(allocator, .{
+                .bytes = bytes,
+                .quantifier = quantifier,
+            });
         }
-        if (atoms.items.len >= 255) {
-            return error.RegexStateBoundExceeded;
-        }
-        try atoms.append(allocator, .{
-            .bytes = bytes,
-            .quantifier = quantifier,
-        });
     }
     if (atoms.items.len == 0) return error.RegexPatternEmpty;
     return .{ .atoms = try atoms.toOwnedSlice(allocator) };
+}
+
+fn readRegexRepetition(
+    expression: []const u8,
+    index: *usize,
+) !RegexRepetition {
+    std.debug.assert(index.* < expression.len and expression[index.*] == '{');
+    index.* += 1;
+    const minimum = try readRegexRepetitionCount(expression, index);
+    var maximum = minimum;
+    if (index.* < expression.len and expression[index.*] == ',') {
+        index.* += 1;
+        maximum = try readRegexRepetitionCount(expression, index);
+    }
+    if (index.* >= expression.len or expression[index.*] != '}') {
+        return error.RegexRepetitionUnclosed;
+    }
+    index.* += 1;
+    if (minimum > maximum) return error.RegexRepetitionInvalid;
+    if (maximum > max_regex_atoms_per_pattern) {
+        return error.RegexStateBoundExceeded;
+    }
+    return .{ .minimum = minimum, .maximum = maximum };
+}
+
+fn readRegexRepetitionCount(
+    expression: []const u8,
+    index: *usize,
+) !usize {
+    const start = index.*;
+    var count: usize = 0;
+    while (index.* < expression.len and
+        std.ascii.isDigit(expression[index.*]))
+    {
+        count = std.math.mul(usize, count, 10) catch
+            return error.RegexRepetitionInvalid;
+        count = std.math.add(
+            usize,
+            count,
+            expression[index.*] - '0',
+        ) catch return error.RegexRepetitionInvalid;
+        index.* += 1;
+    }
+    if (index.* == start) return error.RegexRepetitionInvalid;
+    return count;
+}
+
+test "compiled regex expands bounded repetitions once" {
+    var exact = try compileRegexPattern(
+        std.testing.allocator,
+        "^[A-Fa-f0-9]{40}$",
+    );
+    defer exact.deinit(std.testing.allocator);
+    const forty: [40]u8 = @splat('a');
+    const thirty_nine: [39]u8 = @splat('a');
+    const forty_one: [41]u8 = @splat('a');
+    try std.testing.expect(compiledRegexMatches(&forty, exact));
+    try std.testing.expect(!compiledRegexMatches(&thirty_nine, exact));
+    try std.testing.expect(!compiledRegexMatches(&forty_one, exact));
+
+    var range = try compileRegexPattern(std.testing.allocator, "^x{2,4}$");
+    defer range.deinit(std.testing.allocator);
+    try std.testing.expect(!compiledRegexMatches("x", range));
+    try std.testing.expect(compiledRegexMatches("xx", range));
+    try std.testing.expect(compiledRegexMatches("xxx", range));
+    try std.testing.expect(compiledRegexMatches("xxxx", range));
+    try std.testing.expect(!compiledRegexMatches("xxxxx", range));
+
+    try std.testing.expectError(
+        error.RegexRepetitionInvalid,
+        compileRegexPattern(std.testing.allocator, "^x{4,2}$"),
+    );
+    try std.testing.expectError(
+        error.RegexStateBoundExceeded,
+        compileRegexPattern(std.testing.allocator, "^x{256}$"),
+    );
 }
 
 fn compileRegexClass(
@@ -9726,4 +9840,59 @@ test "embedded validation compares borrowed event and retained state values" {
     );
     defer allowed_inspection.deinit();
     try std.testing.expect(allowed_inspection.isValid());
+}
+
+test "tagged union item implications compile conditional native rules" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"tagged-union","path":"","tag":"/kind","variants":[{"value":"capture","rules":[{"op":"implies","if":"/status","equals":"active","rules":[{"op":"bounded-string","path":"/proof","trimmed_min":1,"max":128}]}]},{"value":"status","rules":[{"op":"enum","path":"/status","values":["closed"]}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "artifact.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &definition_plan);
+    defer plan.deinit(std.testing.allocator);
+
+    const cases = [_]struct { bytes: []const u8, valid: bool }{
+        .{
+            .bytes = "{\"kind\":\"capture\",\"status\":\"active\",\"proof\":\"receipt\"}",
+            .valid = true,
+        },
+        .{
+            .bytes = "{\"kind\":\"capture\",\"status\":\"active\"}",
+            .valid = false,
+        },
+        .{
+            .bytes = "{\"kind\":\"capture\",\"status\":\"pending\"}",
+            .valid = true,
+        },
+        .{
+            .bytes = "{\"kind\":\"status\",\"status\":\"closed\"}",
+            .valid = true,
+        },
+    };
+    for (cases) |case| {
+        var result = try validate(
+            std.testing.allocator,
+            &definition_plan,
+            &plan,
+            &.{.{ .name = "record", .bytes = case.bytes }},
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.valid, result.valid);
+    }
 }
