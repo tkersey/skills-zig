@@ -681,6 +681,8 @@ const Builder = struct {
                         "equals",
                         "nonempty",
                         "then",
+                        "then_input",
+                        "then_equals",
                         "then_nonempty",
                     },
                 );
@@ -694,24 +696,66 @@ const Builder = struct {
                 rule.other_pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "then"),
                 );
-                if (object.get("equals")) |value| {
-                    var expected = try parseEnumScalar(
-                        self.allocator,
-                        value,
+                rule.other_input_index = if (object.get("then_input")) |raw|
+                    try self.inputIndex(
+                        try definition_core.json.string(raw),
+                    )
+                else
+                    input_index;
+                const condition_equals = object.get("equals");
+                const condition_nonempty =
+                    try optionalBoolean(object, "nonempty") orelse false;
+                const consequent_equals = object.get("then_equals");
+                rule.then_nonempty =
+                    try optionalBoolean(object, "then_nonempty") orelse false;
+                if (condition_nonempty and condition_equals != null) {
+                    return error.ConflictingImplicationPredicates;
+                }
+                if (consequent_equals != null and rule.then_nonempty) {
+                    return error.ConflictingImplicationConsequences;
+                }
+                if (consequent_equals != null and
+                    condition_equals == null and !condition_nonempty)
+                {
+                    return error.ImplicationConsequenceRequiresPredicate;
+                }
+                const value_count: usize =
+                    @as(usize, @intFromBool(condition_equals != null)) +
+                    @as(usize, @intFromBool(consequent_equals != null));
+                if (value_count != 0) {
+                    const values = try self.allocator.alloc(
+                        EnumScalar,
+                        value_count,
                     );
-                    errdefer expected.deinit(self.allocator);
-                    const values = try self.allocator.alloc(EnumScalar, 1);
-                    values[0] = expected;
+                    var value_index: usize = 0;
+                    errdefer {
+                        for (values[0..value_index]) |*value| {
+                            value.deinit(self.allocator);
+                        }
+                        self.allocator.free(values);
+                    }
+                    if (condition_equals) |value| {
+                        values[value_index] = try parseEnumScalar(
+                            self.allocator,
+                            value,
+                        );
+                        value_index += 1;
+                    }
+                    if (consequent_equals) |value| {
+                        values[value_index] = try parseEnumScalar(
+                            self.allocator,
+                            value,
+                        );
+                        value_index += 1;
+                    }
                     rule.values = values;
                 }
-                if (try optionalBoolean(object, "nonempty") orelse false) {
-                    if (rule.values.len != 0) {
+                if (condition_nonempty) {
+                    if (condition_equals != null) {
                         return error.ConflictingImplicationPredicates;
                     }
                     rule.min_count = 1;
                 }
-                rule.then_nonempty =
-                    try optionalBoolean(object, "then_nonempty") orelse false;
             },
             .total_partition => {
                 try definition_core.json.requireExactKeys(
@@ -1957,6 +2001,7 @@ const Builder = struct {
                 rule.other_pointer_id = try self.internPointer(
                     try definition_core.json.requiredString(object, "then"),
                 );
+                rule.other_input_index = input_index;
                 if (object.get("equals")) |value| {
                     const values = try self.allocator.alloc(EnumScalar, 1);
                     errdefer self.allocator.free(values);
@@ -3588,10 +3633,14 @@ fn validateCachedRule(
             return error.CacheRuleConfigurationInvalid;
         },
         .implies => if (rule.pointer_id == null or
+            rule.other_input_index == null or
             rule.other_pointer_id == null or
-            rule.values.len > 1 or
+            rule.values.len > 2 or
             (rule.min_count != null and rule.min_count.? != 1) or
-            (rule.values.len != 0 and rule.min_count != null))
+            (rule.min_count != null and rule.values.len > 1) or
+            (rule.then_nonempty and
+                (rule.values.len == 2 or
+                    (rule.min_count != null and rule.values.len == 1))))
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -4435,7 +4484,12 @@ fn applyRule(
             )
         else
             false,
-        .implies => implicationHolds(plan, root, rule),
+        .implies => implicationHolds(
+            plan,
+            root,
+            loaded[rule.other_input_index.?].json() orelse return,
+            rule,
+        ),
         .total_partition => try totalPartition(
             allocator,
             plan,
@@ -4798,7 +4852,7 @@ fn itemRuleHolds(
             )
         else
             false,
-        .implies => implicationHolds(plan, root, rule),
+        .implies => implicationHolds(plan, root, root, rule),
         .total_partition => try totalPartition(
             allocator,
             plan,
@@ -4989,23 +5043,33 @@ fn countMatching(
 
 fn implicationHolds(
     plan: *const Plan,
-    root: std.json.Value,
+    condition_root: std.json.Value,
+    consequent_root: std.json.Value,
     rule: CompiledRule,
 ) bool {
     const condition = resolve(
-        root,
+        condition_root,
         plan.pointers[rule.pointer_id.?],
     ) orelse return true;
-    if (rule.values.len == 1 and
+    if (rule.min_count == null and rule.values.len >= 1 and
         !enumEqual(rule.values[0], condition))
     {
         return true;
     }
     if (rule.min_count != null and !valueNonempty(condition)) return true;
     const consequent = resolve(
-        root,
+        consequent_root,
         plan.pointers[rule.other_pointer_id.?],
     ) orelse return false;
+    const expected_consequent = if (rule.min_count != null)
+        if (rule.values.len == 1) rule.values[0] else null
+    else if (rule.values.len == 2)
+        rule.values[1]
+    else
+        null;
+    if (expected_consequent) |expected| {
+        return enumEqual(expected, consequent);
+    }
     return !rule.then_nonempty or valueNonempty(consequent);
 }
 
@@ -8884,7 +8948,7 @@ test "embedded validation compares borrowed event and retained state values" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
         .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["cross-input-equal"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["cross-input-equal","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
@@ -8905,7 +8969,7 @@ test "embedded validation compares borrowed event and retained state values" {
         std.testing.allocator,
         \\[
         \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/goal_id","right_input":"state","right":"/goal_id"},
-        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"","right_input":"state","right":""}
+        \\  {"op":"implies","input":"event","if":"/effect","equals":"edit","then_input":"state","then":"/mutation_allowed","then_equals":true}
         \\]
     ,
         .{},
@@ -8924,14 +8988,14 @@ test "embedded validation compares borrowed event and retained state values" {
     var event = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"goal_id\":\"goal-1\"}",
+        "{\"effect\":\"edit\",\"goal_id\":\"goal-1\"}",
         .{},
     );
     defer event.deinit();
     var matching = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"goal_id\":\"goal-1\"}",
+        "{\"goal_id\":\"goal-1\",\"mutation_allowed\":true}",
         .{},
     );
     defer matching.deinit();
@@ -8949,7 +9013,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var stale = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        "{\"goal_id\":\"goal-2\"}",
+        "{\"goal_id\":\"goal-2\",\"mutation_allowed\":true}",
         .{},
     );
     defer stale.deinit();
@@ -8963,4 +9027,40 @@ test "embedded validation compares borrowed event and retained state values" {
     );
     defer invalid.deinit();
     try std.testing.expect(!invalid.isValid());
+
+    var denied = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"goal_id\":\"goal-1\",\"mutation_allowed\":false}",
+        .{},
+    );
+    defer denied.deinit();
+    var denied_edit = try executeValues(
+        std.testing.allocator,
+        &plan,
+        &.{
+            .{ .name = "event", .value = event.value },
+            .{ .name = "state", .value = denied.value },
+        },
+    );
+    defer denied_edit.deinit();
+    try std.testing.expect(!denied_edit.isValid());
+
+    var inspection = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"effect\":\"inspect\",\"goal_id\":\"goal-1\"}",
+        .{},
+    );
+    defer inspection.deinit();
+    var allowed_inspection = try executeValues(
+        std.testing.allocator,
+        &plan,
+        &.{
+            .{ .name = "event", .value = inspection.value },
+            .{ .name = "state", .value = denied.value },
+        },
+    );
+    defer allowed_inspection.deinit();
+    try std.testing.expect(allowed_inspection.isValid());
 }
