@@ -951,7 +951,7 @@ fn compileRegisters(
         };
         initialized += 1;
     }
-    std.mem.sort(Register, registers, {}, struct {
+    std.sort.heap(Register, registers, {}, struct {
         fn lessThan(_: void, left: Register, right: Register) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -1020,7 +1020,7 @@ fn compileSets(
         };
         initialized += 1;
     }
-    std.mem.sort(RetainedSet, sets, {}, struct {
+    std.sort.heap(RetainedSet, sets, {}, struct {
         fn lessThan(
             _: void,
             left: RetainedSet,
@@ -1533,7 +1533,7 @@ fn admissionInputsAlloc(
         };
         initialized += 1;
     }
-    std.mem.sort(definition.Input, inputs, {}, struct {
+    std.sort.heap(definition.Input, inputs, {}, struct {
         fn lessThan(
             _: void,
             left: definition.Input,
@@ -1562,7 +1562,7 @@ fn compileRegisterSet(
             try definition_core.json.string(value),
         ) orelse return error.UnknownRetainedRegister);
     }
-    std.mem.sort(u16, indexes, {}, std.sort.asc(u16));
+    std.sort.heap(u16, indexes, {}, std.sort.asc(u16));
     if (indexes.len > 1) {
         for (indexes[1..], 1..) |item, index| {
             if (indexes[index - 1] == item) {

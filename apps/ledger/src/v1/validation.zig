@@ -4492,7 +4492,7 @@ pub fn execute(
             &diagnostics,
         );
     }
-    std.mem.sort(InputDigest, digests.items, {}, struct {
+    std.sort.heap(InputDigest, digests.items, {}, struct {
         fn lessThan(_: void, left: InputDigest, right: InputDigest) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -7854,7 +7854,7 @@ fn parseStringSet(
         out[index] = try allocator.dupe(u8, try definition_core.json.string(item));
         initialized += 1;
     }
-    std.mem.sort([]u8, out, {}, struct {
+    std.sort.heap([]u8, out, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }

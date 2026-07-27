@@ -602,7 +602,7 @@ pub fn themeAlloc(
     while (iterator.next()) |entry| {
         try items.append(allocator, entry.key_ptr.*);
     }
-    std.mem.sort([]const u8, items.items, {}, lessString);
+    std.sort.heap([]const u8, items.items, {}, lessString);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     const count = @min(items.items.len, diversity.token_limit);

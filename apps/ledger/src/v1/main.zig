@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const app_meta = @import("app_meta");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
@@ -6,6 +7,11 @@ const ledger = @import("ledger_v1_core");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 threadlocal var runtime_io: ?std.Io = null;
+
+pub const panic = if (builtin.is_test)
+    std.debug.FullPanic(std.debug.defaultPanic)
+else
+    std.debug.simple_panic;
 
 const Help =
     \\ledger

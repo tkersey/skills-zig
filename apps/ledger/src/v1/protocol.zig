@@ -1558,7 +1558,7 @@ fn reconstructInputWithLayoutAlloc(
         };
         count += 1;
     }
-    std.mem.sort(Mapping, mappings[0..count], {}, struct {
+    std.sort.heap(Mapping, mappings[0..count], {}, struct {
         fn lessThan(_: void, left: Mapping, right: Mapping) bool {
             return std.mem.lessThan(u8, left.key, right.key);
         }
@@ -1682,7 +1682,7 @@ fn generateOutputsAlloc(
         };
         initialized += 1;
     }
-    std.mem.sort(GeneratedOutput, outputs, {}, struct {
+    std.sort.heap(GeneratedOutput, outputs, {}, struct {
         fn lessThan(
             _: void,
             left: GeneratedOutput,
@@ -3024,7 +3024,7 @@ fn findEventBodyField(
 }
 
 fn sortStrings(items: [][]const u8) void {
-    std.mem.sort([]const u8, items, {}, struct {
+    std.sort.heap([]const u8, items, {}, struct {
         fn lessThan(
             _: void,
             left: []const u8,
@@ -3365,7 +3365,7 @@ fn compilePartitionBindings(
         };
         initialized += 1;
     }
-    std.mem.sort(PartitionBinding, bindings, {}, struct {
+    std.sort.heap(PartitionBinding, bindings, {}, struct {
         fn lessThan(
             _: void,
             left: PartitionBinding,
@@ -3524,7 +3524,7 @@ fn parseStringSet(
         out[index] = try allocator.dupe(u8, text);
         initialized += 1;
     }
-    std.mem.sort([]u8, out, {}, struct {
+    std.sort.heap([]u8, out, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }

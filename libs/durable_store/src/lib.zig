@@ -1905,7 +1905,7 @@ fn normalizeTransactionMutations(
         try rejectTransactionPath(mutation.path, reject_symlinks);
         ordered[index] = mutation;
     }
-    std.mem.sort(TransactionMutation, ordered, {}, struct {
+    std.sort.heap(TransactionMutation, ordered, {}, struct {
         fn lessThan(_: void, a: TransactionMutation, b: TransactionMutation) bool {
             return std.mem.lessThan(u8, a.path, b.path);
         }
@@ -2868,7 +2868,7 @@ pub fn listSortedRegularFilesNoSymlink(
 
         try names.append(allocator, try allocator.dupe(u8, entry.name));
     }
-    std.mem.sort([]u8, names.items, {}, struct {
+    std.sort.heap([]u8, names.items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

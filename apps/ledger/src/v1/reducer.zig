@@ -181,7 +181,7 @@ pub const State = struct {
                 .event_count = entry.event_count,
             };
         }
-        std.mem.sort(EntryView, views, {}, entryViewLessThan);
+        std.sort.heap(EntryView, views, {}, entryViewLessThan);
         return views;
     }
 
@@ -220,7 +220,7 @@ pub const State = struct {
             field_count += 1;
         }
         const fields = field_storage[0..field_count];
-        std.mem.sort(ProjectionField, fields, {}, projectionFieldLessThan);
+        std.sort.heap(ProjectionField, fields, {}, projectionFieldLessThan);
         for (fields, 0..) |field, field_index| {
             try definition_core.json.safeIdentifier(field.name, 128);
             if (field_index != 0 and std.mem.eql(
@@ -639,7 +639,7 @@ fn compileTransitions(
         transitions[initialized] = .{ .from = from, .on = on, .to = to };
         initialized += 1;
     }
-    std.mem.sort(Transition, transitions, {}, transitionLessThan);
+    std.sort.heap(Transition, transitions, {}, transitionLessThan);
     for (transitions[1..], 1..) |transition, index| {
         const prior = transitions[index - 1];
         if (optionalTextOrder(prior.from, transition.from) == .eq and
@@ -802,7 +802,7 @@ fn parseStringSet(
         out[initialized] = try allocator.dupe(u8, text);
         initialized += 1;
     }
-    std.mem.sort([]u8, out, {}, stringLessThan);
+    std.sort.heap([]u8, out, {}, stringLessThan);
     for (out[1..], 1..) |item, index| {
         if (std.mem.eql(u8, out[index - 1], item)) {
             return error.DuplicateReducerString;

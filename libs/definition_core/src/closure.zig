@@ -177,7 +177,7 @@ const Builder = struct {
         path_owned = false;
         loaded.canonical_owned = false;
         self.total_definition_bytes = loaded.next_total;
-        std.mem.sort([]u8, loaded.imports.items, {}, lessThanPath);
+        std.sort.heap([]u8, loaded.imports.items, {}, lessThanPath);
         for (loaded.imports.items) |*import_path| {
             const owned = import_path.*;
             import_path.* = try self.allocator.dupe(u8, "");
@@ -351,7 +351,7 @@ pub fn loadFromDir(
     };
     errdefer builder.deinit();
     try builder.visit(normalized_entry, 1);
-    std.mem.sort(ClosureFile, builder.files.items, {}, lessThanClosureFile);
+    std.sort.heap(ClosureFile, builder.files.items, {}, lessThanClosureFile);
     const digest = digestFiles(builder.files.items);
     const files = try builder.files.toOwnedSlice(allocator);
     builder.states.deinit(allocator);
@@ -398,7 +398,7 @@ pub fn fromCanonicalFiles(
         files[index] = try cloneCanonicalFile(allocator, source);
         initialized += 1;
     }
-    std.mem.sort(ClosureFile, files, {}, lessThanClosureFile);
+    std.sort.heap(ClosureFile, files, {}, lessThanClosureFile);
     for (files[1..], 1..) |file, index| {
         if (std.mem.eql(u8, files[index - 1].path, file.path)) {
             return error.DuplicateDefinitionPath;
@@ -695,7 +695,7 @@ const CanonicalClosureValidator = struct {
             std.fs.path.dirname(file.path) orelse "",
             &imports,
         );
-        std.mem.sort([]u8, imports.items, {}, lessThanPath);
+        std.sort.heap([]u8, imports.items, {}, lessThanPath);
         for (imports.items) |import_path| {
             try self.visit(import_path, depth + 1);
         }

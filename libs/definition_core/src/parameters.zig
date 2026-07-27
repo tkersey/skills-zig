@@ -123,7 +123,7 @@ pub fn compile(
         });
         default_value = null;
     }
-    std.mem.sort(Declaration, items.items, {}, lessThanDeclaration);
+    std.sort.heap(Declaration, items.items, {}, lessThanDeclaration);
     const shape_digest = digestDeclarations(items.items);
     return .{
         .items = try items.toOwnedSlice(allocator),
@@ -176,7 +176,7 @@ pub fn bind(
             return error.MissingParameter;
         }
     }
-    std.mem.sort(Binding, items.items, {}, lessThanBinding);
+    std.sort.heap(Binding, items.items, {}, lessThanBinding);
     const values_digest = try digestBindings(items.items);
     return .{
         .items = try items.toOwnedSlice(allocator),

@@ -841,7 +841,7 @@ fn bindingValidationResult(
         }
         initialized += 1;
     }
-    std.mem.sort(
+    std.sort.heap(
         validation.InputDigest,
         input_digests,
         {},
@@ -1556,7 +1556,7 @@ fn collectGeneratedOutputsAlloc(
             initialized += 1;
         }
     }
-    std.mem.sort(
+    std.sort.heap(
         protocol.GeneratedOutput,
         outputs,
         {},

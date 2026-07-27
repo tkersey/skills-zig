@@ -255,7 +255,7 @@ pub fn writeCanonicalString(writer: *std.Io.Writer, text: []const u8) !void {
 }
 
 fn sortKeys(keys: [][]const u8) void {
-    std.mem.sort([]const u8, keys, {}, struct {
+    std.sort.heap([]const u8, keys, {}, struct {
         fn lessThan(_: void, left: []const u8, right: []const u8) bool {
             return std.mem.lessThan(u8, left, right);
         }

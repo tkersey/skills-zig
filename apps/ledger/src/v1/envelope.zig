@@ -116,8 +116,17 @@ fn writeDescriptionOperators(
 ) !void {
     try writer.writeAll("],\"operators\":[");
     var first_operator = true;
-    inline for (@typeInfo(definition.Operator).@"enum".fields) |field| {
-        const operator: definition.Operator = @enumFromInt(field.value);
+    const operator_fields = @typeInfo(definition.Operator).@"enum".fields;
+    comptime {
+        for (operator_fields, 0..) |field, index| {
+            if (field.value != index) {
+                @compileError("Ledger operator tags must remain contiguous");
+            }
+        }
+    }
+    const operator_count = operator_fields.len;
+    for (0..operator_count) |index| {
+        const operator: definition.Operator = @enumFromInt(index);
         if (plan.requires(operator)) {
             if (!first_operator) try writer.writeByte(',');
             first_operator = false;

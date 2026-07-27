@@ -886,7 +886,7 @@ const SortedAccumulator = struct {
         limit: usize,
         stats: *Stats,
     ) !void {
-        std.mem.sort(
+        std.sort.heap(
             SortedRow,
             self.rows.items,
             self.projection.sort_keys,
@@ -2479,7 +2479,7 @@ fn compileRequiredProjectionParameters(
         names[initialized] = try allocator.dupe(u8, name);
         initialized += 1;
     }
-    std.mem.sort([]u8, names, {}, struct {
+    std.sort.heap([]u8, names, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }
@@ -2920,7 +2920,7 @@ fn compileFoldEventKindCounts(
         };
         initialized += 1;
     }
-    std.mem.sort(FoldEventKindCount, counts, {}, struct {
+    std.sort.heap(FoldEventKindCount, counts, {}, struct {
         fn lessThan(
             _: void,
             left: FoldEventKindCount,
@@ -3038,7 +3038,7 @@ fn compileFoldEventKindSet(
         result[index] = try allocator.dupe(u8, kind);
         initialized += 1;
     }
-    std.mem.sort([]u8, result, {}, struct {
+    std.sort.heap([]u8, result, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }
@@ -3595,7 +3595,7 @@ fn compileFields(
         errdefer pointer.deinit(allocator);
         try fields.append(allocator, .{ .name = name, .pointer = pointer });
     }
-    std.mem.sort(Field, fields.items, {}, struct {
+    std.sort.heap(Field, fields.items, {}, struct {
         fn lessThan(_: void, left: Field, right: Field) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -3731,7 +3731,7 @@ fn compileRetainedFields(
             .source = source,
         });
     }
-    std.mem.sort(RetainedField, fields.items, {}, struct {
+    std.sort.heap(RetainedField, fields.items, {}, struct {
         fn lessThan(
             _: void,
             left: RetainedField,
@@ -4734,7 +4734,7 @@ fn keyedHistoryFields(
         field_count += 1;
     }
     const fields = storage_buffer[0..field_count];
-    std.mem.sort(KeyedHistoryField, fields, {}, struct {
+    std.sort.heap(KeyedHistoryField, fields, {}, struct {
         fn lessThan(
             _: void,
             left: KeyedHistoryField,

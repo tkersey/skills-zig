@@ -680,13 +680,31 @@ fn compileAtDepth(
     };
 }
 
-pub fn encodeCache(plan: *const Plan, encoder: *definition_core.cache.Encoder) !void {
-    try encoder.writeU16(4);
-    try encodeCachePlan(plan, encoder, 0);
+pub const CacheDetail = enum {
+    full,
+    runtime_metadata,
+};
+
+pub fn encodeCache(
+    plan: *const Plan,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encodeCacheWithDetail(plan, .full, encoder);
+}
+
+pub fn encodeCacheWithDetail(
+    plan: *const Plan,
+    detail: CacheDetail,
+    encoder: *definition_core.cache.Encoder,
+) !void {
+    try encoder.writeU16(5);
+    try encoder.writeEnum(detail);
+    try encodeCachePlan(plan, detail, encoder, 0);
 }
 
 fn encodeCachePlan(
     plan: *const Plan,
+    detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
     depth: usize,
 ) !void {
@@ -709,43 +727,67 @@ fn encodeCachePlan(
     try encoder.writeEnum(plan.storage_kind);
     try encoder.writeCount(plan.imports.len);
     for (plan.imports) |*imported| {
-        try encodeCachePlan(imported, encoder, depth + 1);
+        try encodeCachePlan(imported, detail, encoder, depth + 1);
     }
-    try encoder.writeCount(plan.pointers.len);
-    for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
-    try encoder.writeCount(plan.rules.len);
-    for (plan.rules) |rule| {
-        try encoder.writeEnum(rule.operator);
-        try encoder.writeBool(rule.pointer_id != null);
-        if (rule.pointer_id) |pointer_id| try encoder.writeU16(pointer_id);
-        try encoder.writeBool(rule.import_index != null);
-        if (rule.import_index) |import_index| try encoder.writeU16(import_index);
-        try encoder.writeBytes(rule.canonical_config);
+    if (detail == .full) {
+        try encoder.writeCount(plan.pointers.len);
+        for (plan.pointers) |pointer| try encoder.writeBytes(pointer);
+        try encoder.writeCount(plan.rules.len);
+        for (plan.rules) |rule| {
+            try encoder.writeEnum(rule.operator);
+            try encoder.writeBool(rule.pointer_id != null);
+            if (rule.pointer_id) |pointer_id| try encoder.writeU16(pointer_id);
+            try encoder.writeBool(rule.import_index != null);
+            if (rule.import_index) |import_index| {
+                try encoder.writeU16(import_index);
+            }
+            try encoder.writeBytes(rule.canonical_config);
+        }
+        try encodeNamedPlans(plan.operations, encoder);
+        try encodeNamedPlans(plan.projections, encoder);
     }
-    try encodeNamedPlans(plan.operations, encoder);
-    try encodeNamedPlans(plan.projections, encoder);
     try encoder.writeUsize(plan.bounds.max_input_bytes);
     try encoder.writeUsize(plan.bounds.max_store_bytes);
     try encoder.writeUsize(plan.bounds.max_records);
     try encoder.writeUsize(plan.bounds.max_output_bytes);
     try encoder.writeUsize(plan.bounds.max_diagnostics);
     try encoder.writeUsize(plan.bounds.max_reducer_states);
-    try encoder.writeBytes(plan.canonicalization_json);
-    try encoder.writeBytes(plan.identity_json);
-    try encoder.writeBytes(plan.storage_json);
+    if (detail == .full) {
+        try encoder.writeBytes(plan.canonicalization_json);
+        try encoder.writeBytes(plan.identity_json);
+        try encoder.writeBytes(plan.storage_json);
+    }
 }
 
 pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 4) return error.LedgerPlanCacheVersionMismatch;
+    return decodeCacheWithDetail(allocator, .full, decoder);
+}
+
+pub fn decodeCacheWithDetail(
+    allocator: std.mem.Allocator,
+    expected_detail: CacheDetail,
+    decoder: *definition_core.cache.Decoder,
+) !Plan {
+    if (try decoder.readU16() != 5) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readEnum(CacheDetail) != expected_detail) {
+        return error.LedgerPlanCacheDetailMismatch;
+    }
     var decoded_count: usize = 0;
-    return decodeCachePlan(allocator, decoder, 0, &decoded_count);
+    return decodeCachePlan(
+        allocator,
+        expected_detail,
+        decoder,
+        0,
+        &decoded_count,
+    );
 }
 
 fn decodeCachePlan(
     allocator: std.mem.Allocator,
+    detail: CacheDetail,
     decoder: *definition_core.cache.Decoder,
     depth: usize,
     decoded_count: *usize,
@@ -797,6 +839,7 @@ fn decodeCachePlan(
     for (imports) |*imported| {
         imported.* = try decodeCachePlan(
             allocator,
+            detail,
             decoder,
             depth + 1,
             decoded_count,
@@ -804,19 +847,31 @@ fn decodeCachePlan(
         imports_initialized += 1;
     }
     try validateImportedPlans(imports);
-    const pointers = try decodePointers(allocator, decoder);
+    const pointers = if (detail == .full)
+        try decodePointers(allocator, decoder)
+    else
+        try allocator.alloc([]u8, 0);
     errdefer deinitPointers(allocator, pointers);
-    const rules = try decodeRules(
-        allocator,
-        decoder,
-        operator_mask,
-        imports.len,
-        pointers.len,
-    );
+    const rules = if (detail == .full)
+        try decodeRules(
+            allocator,
+            decoder,
+            operator_mask,
+            imports.len,
+            pointers.len,
+        )
+    else
+        try allocator.alloc(Rule, 0);
     errdefer deinitRules(allocator, rules);
-    const operations = try decodeNamedPlans(allocator, decoder, rules.len);
+    const operations = if (detail == .full)
+        try decodeNamedPlans(allocator, decoder, rules.len)
+    else
+        try allocator.alloc(NamedPlan, 0);
     errdefer deinitNamedPlans(allocator, operations);
-    const projections = try decodeNamedPlans(allocator, decoder, rules.len);
+    const projections = if (detail == .full)
+        try decodeNamedPlans(allocator, decoder, rules.len)
+    else
+        try allocator.alloc(NamedPlan, 0);
     errdefer deinitNamedPlans(allocator, projections);
     const bounds: Bounds = .{
         .max_input_bytes = try decoder.readUsize(),
@@ -827,20 +882,20 @@ fn decodeCachePlan(
         .max_reducer_states = try decoder.readUsize(),
     };
     try validateBounds(bounds);
-    const canonicalization_json = try decoder.readBytesAlloc(
-        allocator,
-        4 * 1024 * 1024,
-    );
+    const canonicalization_json = if (detail == .full)
+        try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
+    else
+        try allocator.alloc(u8, 0);
     errdefer allocator.free(canonicalization_json);
-    const identity_json = try decoder.readBytesAlloc(
-        allocator,
-        4 * 1024 * 1024,
-    );
+    const identity_json = if (detail == .full)
+        try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
+    else
+        try allocator.alloc(u8, 0);
     errdefer allocator.free(identity_json);
-    const storage_json = try decoder.readBytesAlloc(
-        allocator,
-        4 * 1024 * 1024,
-    );
+    const storage_json = if (detail == .full)
+        try decoder.readBytesAlloc(allocator, 4 * 1024 * 1024)
+    else
+        try allocator.alloc(u8, 0);
     errdefer allocator.free(storage_json);
     return .{
         .id = id,
@@ -1117,7 +1172,7 @@ fn parseImportedPlans(
             }
         }
     }
-    std.mem.sort(Plan, imports, {}, struct {
+    std.sort.heap(Plan, imports, {}, struct {
         fn lessThan(_: void, left: Plan, right: Plan) bool {
             return std.mem.lessThan(u8, left.id, right.id);
         }
@@ -1172,7 +1227,7 @@ fn parseInputs(
         errdefer input.deinit(allocator);
         try out.append(allocator, input);
     }
-    std.mem.sort(Input, out.items, {}, struct {
+    std.sort.heap(Input, out.items, {}, struct {
         fn lessThan(_: void, left: Input, right: Input) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -1215,7 +1270,7 @@ fn parseNamedPlans(
         errdefer plan.deinit(allocator);
         try out.append(allocator, plan);
     }
-    std.mem.sort(NamedPlan, out.items, {}, struct {
+    std.sort.heap(NamedPlan, out.items, {}, struct {
         fn lessThan(_: void, left: NamedPlan, right: NamedPlan) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }

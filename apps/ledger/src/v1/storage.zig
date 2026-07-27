@@ -1836,7 +1836,7 @@ fn compileSlots(
             .max_bytes = max_bytes,
         });
     }
-    std.mem.sort(Slot, slots.items, {}, struct {
+    std.sort.heap(Slot, slots.items, {}, struct {
         fn lessThan(_: void, left: Slot, right: Slot) bool {
             return std.mem.lessThan(u8, left.name, right.name);
         }
@@ -2258,7 +2258,7 @@ fn compileEventMaterialization(
         fields[index] = try compileEventField(allocator, raw_field);
         initialized += 1;
     }
-    std.mem.sort(EventField, fields, {}, struct {
+    std.sort.heap(EventField, fields, {}, struct {
         fn lessThan(_: void, left: EventField, right: EventField) bool {
             return std.mem.lessThan(u8, left.field, right.field);
         }
@@ -2411,7 +2411,7 @@ fn compileEventObjectOrders(
         orders[index] = .{ .pointer = pointer, .fields = fields };
         initialized += 1;
     }
-    std.mem.sort(EventObjectOrder, orders, {}, struct {
+    std.sort.heap(EventObjectOrder, orders, {}, struct {
         fn lessThan(
             _: void,
             left: EventObjectOrder,
@@ -2493,7 +2493,7 @@ fn compileSecureTokenGenerations(
         prefix = null;
         initialized += 1;
     }
-    std.mem.sort(
+    std.sort.heap(
         SecureTokenGeneration,
         items,
         {},
@@ -2968,7 +2968,7 @@ fn compileEventBodyFields(
         );
         initialized += 1;
     }
-    std.mem.sort(EventBodyField, fields, {}, struct {
+    std.sort.heap(EventBodyField, fields, {}, struct {
         fn lessThan(
             _: void,
             left: EventBodyField,
@@ -3166,7 +3166,7 @@ fn compileParameterNames(
         names[index] = try allocator.dupe(u8, name);
         initialized += 1;
     }
-    std.mem.sort([]u8, names, {}, struct {
+    std.sort.heap([]u8, names, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }
@@ -3296,7 +3296,7 @@ fn compileRequestLiterals(
         literals[index] = .{ .field = field, .literal = literal };
         initialized += 1;
     }
-    std.mem.sort(RequestLiteral, literals, {}, struct {
+    std.sort.heap(RequestLiteral, literals, {}, struct {
         fn lessThan(
             _: void,
             left: RequestLiteral,
@@ -4315,7 +4315,7 @@ pub fn enumerateMatchingPathsAlloc(
         max_paths,
         &paths,
     );
-    std.mem.sort([]u8, paths.items, {}, struct {
+    std.sort.heap([]u8, paths.items, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
             return std.mem.lessThan(u8, left, right);
         }

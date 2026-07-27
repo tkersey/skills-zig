@@ -93,7 +93,7 @@ fn parseReferences(
             .path = try allocator.dupe(u8, path),
         });
     }
-    std.mem.sort(Reference, out.items, {}, lessThanReference);
+    std.sort.heap(Reference, out.items, {}, lessThanReference);
     return out.toOwnedSlice(allocator);
 }
 

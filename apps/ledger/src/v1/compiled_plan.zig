@@ -8,7 +8,7 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 25;
+const payload_version: u16 = 27;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -336,12 +336,13 @@ fn tryLoadCache(
     );
     var locator = try decodeLocator(allocator, locator_payload);
     defer locator.deinit(allocator);
-    _ = try definition_core.closure.verifySourceManifest(
-        allocator,
-        admitted_root,
-        locator.files,
-        closure_limits,
-    );
+    const verified_source_bytes =
+        try definition_core.closure.verifySourceManifest(
+            allocator,
+            admitted_root,
+            locator.files,
+            closure_limits,
+        );
 
     const plan_path = try cachePathAlloc(
         allocator,
@@ -374,6 +375,11 @@ fn tryLoadCache(
         &result.closure.digest,
         &locator.closure_digest,
     )) return error.CacheClosureDigestMismatch;
+    if (result.closure.files.len != locator.files.len or
+        result.closure.total_definition_bytes != verified_source_bytes)
+    {
+        return error.CacheClosureManifestMismatch;
+    }
     const expected_plan_key = planKey(
         runtime_version,
         route,
@@ -480,8 +486,16 @@ fn encodePlanSet(
     try encoder.writeU16(payload_version);
     try encodeRoute(route, encoder);
     try encoder.writeBytes(plan_set.entry_path);
-    try encodeClosure(&plan_set.closure, encoder);
-    try definition.encodeCache(&plan_set.definition_plan, encoder);
+    try encodeClosure(
+        &plan_set.closure,
+        route.kind == .transact,
+        encoder,
+    );
+    try definition.encodeCacheWithDetail(
+        &plan_set.definition_plan,
+        definitionCacheDetail(route),
+        encoder,
+    );
     try encoder.writeBool(plan_set.validation_plan != null);
     if (plan_set.validation_plan) |*plan| {
         try validation.encodeCache(plan, encoder);
@@ -536,10 +550,12 @@ fn decodePlanSet(
             &decoder,
             entry_path,
             closure_limits,
+            route.kind == .transact,
         );
         errdefer closure.deinit(cache_allocator);
-        var definition_plan = try definition.decodeCache(
+        var definition_plan = try definition.decodeCacheWithDetail(
             cache_allocator,
+            definitionCacheDetail(route),
             &decoder,
         );
         errdefer definition_plan.deinit(cache_allocator);
@@ -599,11 +615,13 @@ fn decodePlanSet(
 
 fn encodeClosure(
     closure: *const definition_core.Closure,
+    include_sources: bool,
     encoder: *definition_core.cache.Encoder,
 ) !void {
     try encoder.writeFixed(&closure.digest);
     try encoder.writeUsize(closure.total_definition_bytes);
     try encoder.writeCount(closure.files.len);
+    if (!include_sources) return;
     for (closure.files) |file| {
         try encoder.writeBytes(file.path);
         try encoder.writeBytes(file.canonical_json);
@@ -617,12 +635,37 @@ fn decodeClosure(
     decoder: *definition_core.cache.Decoder,
     entry_path: []const u8,
     limits: definition_core.closure.Limits,
+    include_sources: bool,
 ) !definition_core.Closure {
     var digest: [71]u8 = undefined;
     @memcpy(&digest, try decoder.readFixed(digest.len));
     try definition_core.json.digest(&digest);
     const total_definition_bytes = try decoder.readUsize();
     const count = try decoder.readCount(limits.max_files);
+    if (count == 0 or total_definition_bytes == 0 or
+        total_definition_bytes > limits.max_total_bytes)
+    {
+        return error.CacheClosureManifestInvalid;
+    }
+    if (!include_sources) {
+        const files = try allocator.alloc(
+            definition_core.ClosureFile,
+            count,
+        );
+        for (files) |*file| {
+            file.* = .{
+                .path = try allocator.alloc(u8, 0),
+                .canonical_json = try allocator.alloc(u8, 0),
+                .source_digest = [_]u8{0} ** 32,
+                .source_bytes = 0,
+            };
+        }
+        return .{
+            .files = files,
+            .digest = digest,
+            .total_definition_bytes = total_definition_bytes,
+        };
+    }
     var closure: definition_core.Closure = closure: {
         const files = try allocator.alloc(definition_core.ClosureFile, count);
         var initialized: usize = 0;
@@ -743,6 +786,13 @@ fn validatePlanSet(plan_set: *const PlanSet, route: Route) !void {
         &plan_set.definition_plan.closure_digest,
         &plan_set.closure.digest,
     )) return error.CacheClosureDigestMismatch;
+    if (route.kind == .transact) {
+        for (plan_set.closure.files) |file| {
+            if (file.path.len == 0 or file.canonical_json.len == 0) {
+                return error.CacheDefinitionSourceMissing;
+            }
+        }
+    }
     const required_validation = route.kind == .definition_check or
         route.kind == .validation or
         route.kind == .materialization or
@@ -837,6 +887,13 @@ fn routesEqual(left: Route, right: Route) bool {
     }
     if (left.name) |name| return std.mem.eql(u8, name, right.name.?);
     return true;
+}
+
+fn definitionCacheDetail(route: Route) definition.CacheDetail {
+    return switch (route.kind) {
+        .validation, .materialization => .runtime_metadata,
+        else => .full,
+    };
 }
 
 fn planKey(
@@ -938,6 +995,8 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     defer cold.deinit(std.testing.allocator);
     try std.testing.expect(!cold.stats.cache_hit);
     try std.testing.expect(cold.validation_plan != null);
+    try std.testing.expect(cold.closure.files[0].canonical_json.len > 0);
+    try std.testing.expect(cold.definition_plan.rules.len > 0);
 
     var warm = try load(
         std.testing.allocator,
@@ -949,6 +1008,14 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     );
     defer warm.deinit(std.testing.allocator);
     try std.testing.expect(warm.stats.cache_hit);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        warm.closure.files[0].canonical_json.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        warm.definition_plan.rules.len,
+    );
     try std.testing.expectEqualStrings(
         cold.definition_plan.closure_digest[0..],
         warm.definition_plan.closure_digest[0..],
@@ -994,6 +1061,50 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
     );
     defer rebuilt.deinit(std.testing.allocator);
     try std.testing.expect(!rebuilt.stats.cache_hit);
+}
+
+test "transaction cache retains canonical definition archive sources" {
+    const source_root = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(source_root);
+    var cache_tmp = std.testing.tmpDir(.{});
+    defer cache_tmp.cleanup();
+    const cache_root = try cache_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(cache_root);
+    const entry = "apps/ledger/src/v1/fixtures/event-definition.json";
+    const route: Route = .{ .kind = .transact, .name = "append" };
+
+    var cold = try load(
+        std.testing.allocator,
+        source_root,
+        entry,
+        route,
+        "1.0.0-test",
+        .{ .cache_dir = cache_root },
+    );
+    defer cold.deinit(std.testing.allocator);
+    var warm = try load(
+        std.testing.allocator,
+        source_root,
+        entry,
+        route,
+        "1.0.0-test",
+        .{ .cache_dir = cache_root },
+    );
+    defer warm.deinit(std.testing.allocator);
+
+    try std.testing.expect(warm.stats.cache_hit);
+    try std.testing.expectEqualStrings(
+        cold.closure.files[0].canonical_json,
+        warm.closure.files[0].canonical_json,
+    );
 }
 
 fn decodePlanSetForAllocationFailure(
