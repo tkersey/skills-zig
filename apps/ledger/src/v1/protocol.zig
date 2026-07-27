@@ -331,6 +331,9 @@ pub fn compile(
                 reducer_rule,
                 definition_plan.bounds.max_reducer_states,
             );
+            if (reducer_plan.?.event_kind != null) {
+                return error.ChainedProtocolRejectsReducerEventKind;
+            }
         }
     } else if (rules.transition_table != null or
         definition_plan.requires(.transition_table) or
@@ -369,9 +372,7 @@ fn compilePlain(
         rules.sequence != null or
         rules.previous_digest != null or
         rules.body_digest != null or
-        rules.event_digest != null or
-        rules.transition_table != null or
-        definition_plan.requires(.transition_table))
+        rules.event_digest != null)
     {
         return error.MixedEventProtocolModes;
     }
@@ -381,10 +382,6 @@ fn compilePlain(
         return error.IncompleteEventProtocolRules;
     const reducer_rule = rules.reducer orelse
         return error.IncompleteReducerRules;
-    if (!try state_reducer.isRetainedRule(allocator, reducer_rule)) {
-        return error.PlainProtocolRequiresRetainedReducer;
-    }
-
     var envelope = try compilePlainEnvelope(
         allocator,
         definition_plan,
@@ -396,17 +393,42 @@ fn compilePlain(
         event_kinds_rule,
     );
     errdefer deinitStringSet(allocator, event_kinds);
-    var state_reducer_plan = try state_reducer.compile(
-        allocator,
-        definition_plan,
-        reducer_rule,
-        definition_plan.bounds.max_input_bytes,
-    );
-    errdefer state_reducer_plan.deinit(allocator);
-    try state_reducer.validateEventKinds(
-        &state_reducer_plan,
-        event_kinds,
-    );
+    var reducer_plan: ?reducer.Plan = null;
+    errdefer if (reducer_plan) |*plan| plan.deinit(allocator);
+    var state_reducer_plan: ?state_reducer.Plan = null;
+    errdefer if (state_reducer_plan) |*plan| plan.deinit(allocator);
+    if (try state_reducer.isRetainedRule(allocator, reducer_rule)) {
+        if (definition_plan.requires(.transition_table) or
+            rules.transition_table != null)
+        {
+            return error.RetainedReducerRejectsTransitionTable;
+        }
+        state_reducer_plan = try state_reducer.compile(
+            allocator,
+            definition_plan,
+            reducer_rule,
+            definition_plan.bounds.max_input_bytes,
+        );
+        try state_reducer.validateEventKinds(
+            &state_reducer_plan.?,
+            event_kinds,
+        );
+    } else {
+        if (!definition_plan.requires(.transition_table) or
+            rules.transition_table == null)
+        {
+            return error.IncompleteReducerRules;
+        }
+        reducer_plan = try reducer.compile(
+            allocator,
+            rules.transition_table.?,
+            reducer_rule,
+            definition_plan.bounds.max_reducer_states,
+        );
+        if (reducer_plan.?.event_kind == null) {
+            return error.PlainKeyedReducerRequiresEventKind;
+        }
+    }
     const target_slot_index = try compileTargetSlot(
         storage_plan,
         envelope.input_index,
@@ -419,7 +441,7 @@ fn compilePlain(
         .event_kinds = event_kinds,
         .max_records = definition_plan.bounds.max_records,
         .target_slot_index = target_slot_index,
-        .reducer_plan = null,
+        .reducer_plan = reducer_plan,
         .state_reducer_plan = state_reducer_plan,
     };
     try validatePlan(&result);
@@ -431,7 +453,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
     try encoder.writeEnum(plan.mode);
     try encoder.writeU16(plan.envelope.input_index);
     try encodeStringSet(plan.envelope.keys, encoder);
@@ -469,7 +491,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) {
+    if (try decoder.readU16() != 6) {
         return error.LedgerProtocolCacheVersionMismatch;
     }
     var plan: Plan = plan: {
@@ -597,7 +619,9 @@ pub fn validateCachePlan(
         reducer_declared != (legacy_reducer or retained_reducer) or
         transition_declared != legacy_reducer or
         (plan.mode == .plain and
-            (!retained_reducer or legacy_reducer or transition_declared)))
+            (legacy_reducer == retained_reducer or
+                (legacy_reducer and
+                    plan.reducer_plan.?.event_kind == null))))
     {
         return error.CacheProtocolPlanMismatch;
     }
@@ -731,26 +755,41 @@ fn applyValueWithParameters(
         return error.ProtocolRecordBoundsExceeded;
     }
     if (plan.mode == .plain) {
-        const retained = if (plan.state_reducer_plan) |*compiled|
-            compiled
-        else
-            return error.PlainProtocolRequiresRetainedReducer;
+        const event_kind_pointer =
+            if (plan.state_reducer_plan) |*compiled|
+                compiled.event_kind
+            else if (plan.reducer_plan) |*compiled|
+                compiled.event_kind orelse
+                    return error.PlainKeyedReducerRequiresEventKind
+            else
+                return error.PlainProtocolRequiresReducer;
         const kind = try definition_core.json.string(
             definition_core.json_pointer.lookup(
                 event,
-                retained.event_kind,
+                event_kind_pointer,
             ) orelse return error.EventEnvelopeFieldMissing,
         );
         const kind_index = findSortedIndex(
             plan.event_kinds,
             kind,
         ) orelse return error.UnknownEventKind;
-        try state_reducer.apply(
-            allocator,
-            retained,
-            &state.state_reducer_state,
-            event,
-        );
+        if (plan.state_reducer_plan) |*compiled| {
+            try state_reducer.apply(
+                allocator,
+                compiled,
+                &state.state_reducer_state,
+                event,
+            );
+        } else if (plan.reducer_plan) |*compiled| {
+            try reducer.apply(
+                allocator,
+                compiled,
+                &state.reducer_state,
+                event,
+            );
+        } else {
+            return error.PlainProtocolRequiresReducer;
+        }
         state.kind_counts[kind_index] += 1;
         state.records += 1;
         return;
@@ -3177,8 +3216,10 @@ fn validatePlan(plan: *const Plan) !void {
                     .null => true,
                     .digest => false,
                 } or
-                plan.reducer_plan != null or
-                plan.state_reducer_plan == null)
+                (plan.reducer_plan == null) ==
+                    (plan.state_reducer_plan == null) or
+                (plan.reducer_plan != null and
+                    plan.reducer_plan.?.event_kind == null))
             {
                 return error.InvalidPlainProtocolPlan;
             }

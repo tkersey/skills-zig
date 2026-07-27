@@ -12,7 +12,8 @@
       "exact-object",
       "fold",
       "reducer",
-      "replay"
+      "replay",
+      "transition-table"
     ]
   },
   "parameters": {},
@@ -59,46 +60,25 @@
     },
     {
       "op": "reducer",
-      "mode": "retained",
-      "event_kind": "/kind",
-      "registers": [
-        {
-          "name": "current",
-          "max_bytes": 4096
-        }
+      "key": "/value/id",
+      "on": "/kind",
+      "event_kind": "/kind"
+    },
+    {
+      "op": "transition-table",
+      "states": [
+        "current"
       ],
-      "admissions": [
+      "transitions": [
         {
+          "from": null,
           "on": "created",
-          "requires": [],
-          "forbids": [
-            "current"
-          ],
-          "rules": [],
-          "actions": [
-            {
-              "op": "set",
-              "register": "current",
-              "input": "event",
-              "path": "/value"
-            }
-          ]
+          "to": "current"
         },
         {
+          "from": "current",
           "on": "updated",
-          "requires": [
-            "current"
-          ],
-          "forbids": [],
-          "rules": [],
-          "actions": [
-            {
-              "op": "set",
-              "register": "current",
-              "input": "event",
-              "path": "/value"
-            }
-          ]
+          "to": "current"
         }
       ]
     }
@@ -141,20 +121,8 @@
       "pipeline": [
         {
           "op": "fold",
-          "fields": {
-            "current": {
-              "register": "current"
-            },
-            "event_count": {
-              "meta": "record-count"
-            },
-            "event_kinds": {
-              "meta": "event-kind-counts"
-            },
-            "head_digest": {
-              "meta": "head-digest"
-            }
-          }
+          "key_field": "id",
+          "state_field": "status"
         }
       ]
     }

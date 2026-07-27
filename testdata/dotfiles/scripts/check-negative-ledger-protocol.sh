@@ -99,7 +99,26 @@ assert_ledger_doctor_slot_state \
   "$ledger_bin" "$definition" "$repo" events \
   current true 0 "$scratch/doctor-current.json"
 
-jq -c '.event_id = "invalid"' "$scratch/capture.json" \
+"$ledger_bin" project \
+  --definition "$definition" \
+  --projection current-states \
+  --repo "$repo" \
+  --payload-only \
+  --format json >"$scratch/current-states.json"
+jq -e \
+  'length == 1 and
+   .[0] == {
+     neg_id: "NEG-000001",
+     status: "superseded"
+   }' \
+  "$scratch/current-states.json" >/dev/null
+
+jq -c \
+  '.event_id = "NLE-cccccccccccccccccccccccc" |
+   .from = "active" |
+   .to = "stale" |
+   .status = "stale"' \
+  "$scratch/status.json" \
   >>"$repo/.ledger/negative-ledger/events.jsonl"
 set +e
 "$ledger_bin" doctor \
@@ -114,4 +133,4 @@ jq -e \
    any(.slots[]; .name == "events" and .status == "invalid")' \
   "$scratch/doctor-invalid.json" >/dev/null
 
-printf 'negative-ledger protocol conformance passed: generated=2 invalid=2 bindings=1\n'
+printf 'negative-ledger protocol conformance passed: generated=2 invalid=2 bindings=1 projections=1\n'

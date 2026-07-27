@@ -95,6 +95,8 @@ test "plain protocol binds appends replays and folds without rewriting history" 
         &storage_plan,
     );
     try std.testing.expectEqual(protocol.Mode.plain, protocol_plan.mode);
+    try std.testing.expect(protocol_plan.reducer_plan != null);
+    try std.testing.expect(protocol_plan.state_reducer_plan == null);
     var projection_plan = try projection.compile(
         std.testing.allocator,
         &definition_plan,
@@ -180,7 +182,7 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     );
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(
-        "{\"current\":{\"id\":\"item-1\",\"revision\":2},\"event_count\":2,\"event_kinds\":{\"created\":1,\"updated\":1},\"head_digest\":null}",
+        "[{\"id\":\"item-1\",\"status\":\"current\"}]",
         result.payload,
     );
 }

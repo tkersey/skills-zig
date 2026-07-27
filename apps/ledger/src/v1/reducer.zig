@@ -6,6 +6,11 @@ const max_text_bytes = 256;
 const max_states = 65_536;
 const max_transitions = 65_536;
 
+const AssertionPresence = enum {
+    required,
+    when_present,
+};
+
 const Transition = struct {
     from: ?[]u8,
     on: []u8,
@@ -24,8 +29,10 @@ pub const Plan = struct {
     transitions: []Transition,
     key: definition_core.json_pointer.Pointer,
     on: definition_core.json_pointer.Pointer,
+    event_kind: ?definition_core.json_pointer.Pointer,
     assert_from: ?definition_core.json_pointer.Pointer,
     assert_to: ?definition_core.json_pointer.Pointer,
+    assertion_presence: AssertionPresence,
     max_entries: usize,
 
     pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
@@ -34,6 +41,7 @@ pub const Plan = struct {
         allocator.free(self.transitions);
         self.key.deinit(allocator);
         self.on.deinit(allocator);
+        if (self.event_kind) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         self.* = undefined;
@@ -173,7 +181,15 @@ pub fn compile(
     const reducer = reducer_parsed.value.object;
     try definition_core.json.requireExactKeys(
         reducer,
-        &.{ "op", "key", "on", "from", "to" },
+        &.{
+            "op",
+            "key",
+            "on",
+            "event_kind",
+            "from",
+            "to",
+            "assertion_presence",
+        },
     );
     try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
     try requireOperator(reducer, .reducer);
@@ -187,17 +203,26 @@ pub fn compile(
         try definition_core.json.requiredString(reducer, "on"),
     );
     errdefer on.deinit(allocator);
+    var event_kind = try compileOptionalPointer(
+        allocator,
+        reducer,
+        "event_kind",
+    );
+    errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
     var assert_from = try compileOptionalPointer(allocator, reducer, "from");
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try compileOptionalPointer(allocator, reducer, "to");
     errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
+    const assertion_presence = try compileAssertionPresence(reducer);
     const result: Plan = .{
         .states = states,
         .transitions = transitions,
         .key = key,
         .on = on,
+        .event_kind = event_kind,
         .assert_from = assert_from,
         .assert_to = assert_to,
+        .assertion_presence = assertion_presence,
         .max_entries = max_entries,
     };
     try validatePlan(&result);
@@ -208,7 +233,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(1);
+    try encoder.writeU16(2);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
@@ -218,6 +243,10 @@ pub fn encodeCache(
     }
     try encoder.writeBytes(plan.key.raw);
     try encoder.writeBytes(plan.on.raw);
+    try encoder.writeOptionalBytes(if (plan.event_kind) |pointer|
+        pointer.raw
+    else
+        null);
     try encoder.writeOptionalBytes(if (plan.assert_from) |pointer|
         pointer.raw
     else
@@ -226,6 +255,7 @@ pub fn encodeCache(
         pointer.raw
     else
         null);
+    try encoder.writeEnum(plan.assertion_presence);
     try encoder.writeUsize(plan.max_entries);
 }
 
@@ -233,7 +263,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 1) {
+    if (try decoder.readU16() != 2) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
@@ -267,6 +297,8 @@ pub fn decodeCache(
     errdefer key.deinit(allocator);
     var on = try decodePointer(allocator, decoder);
     errdefer on.deinit(allocator);
+    var event_kind = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
     var assert_from = try decodeOptionalPointer(allocator, decoder);
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try decodeOptionalPointer(allocator, decoder);
@@ -276,8 +308,10 @@ pub fn decodeCache(
         .transitions = transitions,
         .key = key,
         .on = on,
+        .event_kind = event_kind,
         .assert_from = assert_from,
         .assert_to = assert_to,
+        .assertion_presence = try decoder.readEnum(AssertionPresence),
         .max_entries = try decoder.readUsize(),
     };
     try validatePlan(&result);
@@ -315,22 +349,24 @@ pub fn apply(
     const transition = findTransition(plan.transitions, prior_state, on) orelse
         return error.IllegalReducerTransition;
     if (plan.assert_from) |pointer| {
-        const asserted = definition_core.json_pointer.lookup(
+        try validateStateAssertion(
             event,
             pointer,
-        ) orelse return error.ReducerFromAssertionMissing;
-        if (!stateAssertionMatches(prior_state, asserted)) {
-            return error.ReducerFromAssertionMismatch;
-        }
+            plan.assertion_presence,
+            prior_state,
+            error.ReducerFromAssertionMissing,
+            error.ReducerFromAssertionMismatch,
+        );
     }
     if (plan.assert_to) |pointer| {
-        const asserted = definition_core.json_pointer.lookup(
+        try validateStateAssertion(
             event,
             pointer,
-        ) orelse return error.ReducerToAssertionMissing;
-        if (!stateAssertionMatches(transition.to, asserted)) {
-            return error.ReducerToAssertionMismatch;
-        }
+            plan.assertion_presence,
+            transition.to,
+            error.ReducerToAssertionMissing,
+            error.ReducerToAssertionMismatch,
+        );
     }
     if (prior == null and state.entries.count() >= plan.max_entries) {
         return error.ReducerStateBoundsExceeded;
@@ -440,8 +476,14 @@ pub fn validatePlan(plan: *const Plan) !void {
     }
     try validatePointer(plan.key);
     try validatePointer(plan.on);
+    if (plan.event_kind) |pointer| try validatePointer(pointer);
     if (plan.assert_from) |pointer| try validatePointer(pointer);
     if (plan.assert_to) |pointer| try validatePointer(pointer);
+    if (plan.assertion_presence == .when_present and
+        plan.assert_from == null and plan.assert_to == null)
+    {
+        return error.RedundantReducerAssertionPresence;
+    }
 }
 
 fn parseRule(
@@ -495,6 +537,16 @@ fn compileOptionalPointer(
         try definition_core.json.string(value),
     );
     return pointer;
+}
+
+fn compileAssertionPresence(
+    object: std.json.ObjectMap,
+) !AssertionPresence {
+    const raw = object.get("assertion_presence") orelse return .required;
+    const value = try definition_core.json.string(raw);
+    if (std.mem.eql(u8, value, "required")) return .required;
+    if (std.mem.eql(u8, value, "when-present")) return .when_present;
+    return error.InvalidReducerAssertionPresence;
 }
 
 fn decodePointer(
@@ -631,6 +683,21 @@ fn stateAssertionMatches(
 ) bool {
     const text = expected orelse return actual == .null;
     return actual == .string and std.mem.eql(u8, text, actual.string);
+}
+
+fn validateStateAssertion(
+    event: std.json.Value,
+    pointer: definition_core.json_pointer.Pointer,
+    presence: AssertionPresence,
+    expected: ?[]const u8,
+    comptime missing: anyerror,
+    comptime mismatch: anyerror,
+) !void {
+    const asserted = definition_core.json_pointer.lookup(event, pointer) orelse {
+        if (presence == .when_present) return;
+        return missing;
+    };
+    if (!stateAssertionMatches(expected, asserted)) return mismatch;
 }
 
 fn findTransition(
@@ -831,4 +898,77 @@ test "compiled reducer admits deterministic keyed transitions" {
         error.ReducerStateBoundsExceeded,
         apply(std.testing.allocator, &plan, &state, third_key.value),
     );
+}
+
+test "keyed reducer checks transition assertions when rows carry them" {
+    const table_rule: definition.Rule = .{
+        .operator = .transition_table,
+        .pointer_id = null,
+        .canonical_config = @constCast(
+            "{\"op\":\"transition-table\",\"states\":[\"active\",\"closed\"],\"transitions\":[{\"from\":null,\"on\":\"active\",\"to\":\"active\"},{\"from\":\"active\",\"on\":\"closed\",\"to\":\"closed\"}]}",
+        ),
+    };
+    const reducer_rule: definition.Rule = .{
+        .operator = .reducer,
+        .pointer_id = null,
+        .canonical_config = @constCast(
+            "{\"assertion_presence\":\"when-present\",\"event_kind\":\"/event\",\"from\":\"/from\",\"key\":\"/id\",\"on\":\"/status\",\"op\":\"reducer\",\"to\":\"/to\"}",
+        ),
+    };
+    var compiled = try compile(
+        std.testing.allocator,
+        table_rule,
+        reducer_rule,
+        2,
+    );
+    defer compiled.deinit(std.testing.allocator);
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        4096,
+    );
+    defer encoder.deinit();
+    try encodeCache(&compiled, &encoder);
+    const payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+    var decoder = definition_core.cache.Decoder.init(payload);
+    var plan = try decodeCache(std.testing.allocator, &decoder);
+    defer plan.deinit(std.testing.allocator);
+    try decoder.finish();
+    try std.testing.expect(plan.event_kind != null);
+    try std.testing.expectEqual(
+        AssertionPresence.when_present,
+        plan.assertion_presence,
+    );
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    var captured = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"event\":\"capture\",\"id\":\"item-1\",\"status\":\"active\"}",
+        .{},
+    );
+    defer captured.deinit();
+    try apply(std.testing.allocator, &plan, &state, captured.value);
+
+    var wrong_from = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"event\":\"status\",\"from\":\"closed\",\"id\":\"item-1\",\"status\":\"closed\",\"to\":\"closed\"}",
+        .{},
+    );
+    defer wrong_from.deinit();
+    try std.testing.expectError(
+        error.ReducerFromAssertionMismatch,
+        apply(std.testing.allocator, &plan, &state, wrong_from.value),
+    );
+
+    var closed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"event\":\"status\",\"from\":\"active\",\"id\":\"item-1\",\"status\":\"closed\",\"to\":\"closed\"}",
+        .{},
+    );
+    defer closed.deinit();
+    try apply(std.testing.allocator, &plan, &state, closed.value);
 }
