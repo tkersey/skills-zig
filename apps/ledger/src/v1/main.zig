@@ -1023,7 +1023,22 @@ fn emitProjection(
         .text => {
             var stdout_writer =
                 std.Io.File.stdout().writer(defaultIo(), &.{});
-            try stdout_writer.interface.writeAll(result.payload);
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                result.payload,
+                .{ .duplicate_field_behavior = .@"error" },
+            ) catch {
+                try stdout_writer.interface.writeAll(result.payload);
+                try stdout_writer.interface.writeByte('\n');
+                return;
+            };
+            defer parsed.deinit();
+            if (parsed.value == .string) {
+                try stdout_writer.interface.writeAll(parsed.value.string);
+            } else {
+                try stdout_writer.interface.writeAll(result.payload);
+            }
             try stdout_writer.interface.writeByte('\n');
         },
     }

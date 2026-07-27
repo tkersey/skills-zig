@@ -593,9 +593,15 @@ pub const ExitPolicy = struct {
     }
 };
 
+pub const SourceScope = enum {
+    resolved,
+    matching,
+};
+
 pub const Projection = struct {
     name: []u8,
     slot_index: u16,
+    source_scope: SourceScope,
     required_parameters: [][]u8,
     predicates: []PredicateGroup,
     fields: []Field,
@@ -954,13 +960,14 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(13);
+    try encoder.writeU16(14);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_output_bytes);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
         try encoder.writeU16(projection.slot_index);
+        try encoder.writeEnum(projection.source_scope);
         try encoder.writeCount(projection.required_parameters.len);
         for (projection.required_parameters) |name| {
             try encoder.writeBytes(name);
@@ -1093,7 +1100,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 13) {
+    if (try decoder.readU16() != 14) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const max_records = try decoder.readUsize();
@@ -1157,6 +1164,18 @@ pub fn validateCachePlan(
         }
         for (projection.required_parameters) |name| {
             if (definition_plan.parameter_declarations.find(name) == null) {
+                return error.CacheProjectionPlanMismatch;
+            }
+        }
+        if (projection.source_scope == .matching) {
+            const source_slot = storage_plan.slots[projection.slot_index];
+            if (source_slot.kind != .document or
+                !storage.slotIsParameterized(source_slot) or
+                projection.latest == null or projection.fold != null or
+                projection.relevance != null or
+                projection.sort_keys.len != 0 or
+                projection.predicates.len != 0 or projection.limit != null)
+            {
                 return error.CacheProjectionPlanMismatch;
             }
         }
@@ -1418,6 +1437,7 @@ fn decodeCacheProjection(
     errdefer allocator.free(name);
     try definition_core.json.safeIdentifier(name, 128);
     const slot_index = try decoder.readU16();
+    const source_scope = try decoder.readEnum(SourceScope);
     const required_parameter_count = try decoder.readCount(64);
     const required_parameters = try allocator.alloc(
         []u8,
@@ -1785,6 +1805,7 @@ fn decodeCacheProjection(
     return .{
         .name = name,
         .slot_index = slot_index,
+        .source_scope = source_scope,
         .required_parameters = required_parameters,
         .predicates = predicates,
         .fields = fields,
@@ -1940,12 +1961,18 @@ fn compileProjection(
     const object = try definition_core.json.object(parsed.value);
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "slot", "pipeline", "exit", "required_parameters" },
+        &.{ "slot", "scope", "pipeline", "exit", "required_parameters" },
     );
     try definition_core.json.requireFields(object, &.{ "slot", "pipeline" });
     const slot_index = storage_plan.findSlot(
         try definition_core.json.requiredString(object, "slot"),
     ) orelse return error.UnknownProjectionSlot;
+    const source_scope: SourceScope = if (object.get("scope")) |raw_scope| scope: {
+        const text = try definition_core.json.string(raw_scope);
+        if (std.mem.eql(u8, text, "resolved")) break :scope .resolved;
+        if (std.mem.eql(u8, text, "matching")) break :scope .matching;
+        return error.UnsupportedProjectionSourceScope;
+    } else .resolved;
     const required_parameters = try compileRequiredProjectionParameters(
         allocator,
         definition_plan,
@@ -2290,6 +2317,16 @@ fn compileProjection(
     if (fold != null and fold.? == .retained and limit != null) {
         return error.RetainedFoldRejectsLimit;
     }
+    if (source_scope == .matching) {
+        const source_slot = storage_plan.slots[slot_index];
+        if (source_slot.kind != .document or
+            !storage.slotIsParameterized(source_slot) or latest == null or
+            fold != null or relevance != null or sort_keys.len != 0 or
+            predicates.items.len != 0 or limit != null)
+        {
+            return error.InvalidMatchingProjection;
+        }
+    }
     if (relevance != null) {
         if (sort_keys.len == 0 or raw_export or value_path != null or
             constructed_value != null)
@@ -2350,6 +2387,7 @@ fn compileProjection(
     return .{
         .name = try allocator.dupe(u8, source.name),
         .slot_index = @intCast(slot_index),
+        .source_scope = source_scope,
         .required_parameters = required_parameters,
         .predicates = try predicates.toOwnedSlice(allocator),
         .fields = fields,
@@ -3742,6 +3780,19 @@ pub fn execute(
             return error.MissingProjectionParameter;
         }
     }
+    if (compiled.source_scope == .matching) {
+        return executeMatchingDocuments(
+            allocator,
+            definition_plan,
+            storage_plan,
+            event_protocol,
+            plan,
+            compiled,
+            projection_name,
+            repo_root,
+            parameters,
+        );
+    }
     var resolved_storage = try storage.resolve(
         allocator,
         storage_plan,
@@ -3986,7 +4037,16 @@ pub fn execute(
                     &output.writer,
                     &stats,
                 ),
-            .text => return error.TextProjectionNotCompiled,
+            .text => try executeTextDocument(
+                allocator,
+                compiled,
+                slot,
+                &snapshot,
+                parameters,
+                effective_limit,
+                &output.writer,
+                &stats,
+            ),
         }
     }
     if (output.written().len > plan.max_output_bytes) {
@@ -4018,6 +4078,203 @@ pub fn execute(
         else
             compiled.exit_policy.unmatched,
     };
+}
+
+fn executeMatchingDocuments(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    storage_plan: *const storage.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) !Result {
+    if (event_protocol != null) return error.MatchingProtocolProjectionUnsupported;
+    const source_slot = storage_plan.slots[compiled.slot_index];
+    const paths = try storage.enumerateMatchingPathsAlloc(
+        allocator,
+        repo_root,
+        source_slot,
+        plan.max_records,
+    );
+    defer {
+        for (paths) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    if (paths.len == 0) {
+        if (compiled.require_match) return error.ProjectionNotFound;
+        return emptyMatchingResult(
+            allocator,
+            definition_plan,
+            compiled,
+            projection_name,
+            source_slot.relative_path,
+        );
+    }
+    const selected_path = paths[paths.len - 1];
+    const resolved_slot: storage.ResolvedSlot = .{
+        .name = source_slot.name,
+        .relative_path = selected_path,
+        .owned_path = null,
+        .kind = source_slot.kind,
+        .codec = source_slot.codec,
+        .max_bytes = source_slot.max_bytes,
+    };
+    var snapshot = try custody.readSlot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_slot,
+    );
+    defer snapshot.deinit(allocator);
+    var replay_stats = try replay.validateSlot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        resolved_slot,
+        &snapshot,
+        parameters,
+        definition_plan.bounds.max_records,
+        false,
+    );
+    defer replay_stats.deinit(allocator);
+    const effective_limit = try resolveLimit(
+        compiled.limit,
+        parameters,
+        plan.max_records,
+    );
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeTextDocument(
+        allocator,
+        compiled,
+        resolved_slot,
+        &snapshot,
+        parameters,
+        effective_limit,
+        &output.writer,
+        &stats,
+    );
+    stats.records_scanned = paths.len;
+    stats.records_matched = paths.len;
+    stats.records_emitted = 1;
+    if (output.written().len > plan.max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
+    const payload = try output.toOwnedSlice();
+    errdefer allocator.free(payload);
+    const limitations = try allocator.alloc([]u8, 0);
+    errdefer allocator.free(limitations);
+    const definition_id = try allocator.dupe(u8, definition_plan.id);
+    errdefer allocator.free(definition_id);
+    const projection_name_owned = try allocator.dupe(u8, projection_name);
+    errdefer allocator.free(projection_name_owned);
+    const logical_ref = try allocator.dupe(u8, selected_path);
+    errdefer allocator.free(logical_ref);
+    const revision = try allocator.dupe(u8, snapshot.revision);
+    errdefer allocator.free(revision);
+    return .{
+        .definition_id = definition_id,
+        .definition_digest = definition_plan.closure_digest,
+        .projection = projection_name_owned,
+        .logical_ref = logical_ref,
+        .revision = revision,
+        .payload = payload,
+        .stats = stats,
+        .limitations = limitations,
+        .exit_code = if (stats.records_matched != 0)
+            compiled.exit_policy.matched
+        else
+            compiled.exit_policy.unmatched,
+    };
+}
+
+fn emptyMatchingResult(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    logical_ref_template: []const u8,
+) !Result {
+    const definition_id = try allocator.dupe(u8, definition_plan.id);
+    errdefer allocator.free(definition_id);
+    const projection_name_owned = try allocator.dupe(u8, projection_name);
+    errdefer allocator.free(projection_name_owned);
+    const logical_ref = try allocator.dupe(u8, logical_ref_template);
+    errdefer allocator.free(logical_ref);
+    const revision = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        "",
+    );
+    errdefer allocator.free(revision);
+    const payload = try allocator.dupe(u8, "null");
+    errdefer allocator.free(payload);
+    const limitations = try allocator.alloc([]u8, 0);
+    errdefer allocator.free(limitations);
+    return .{
+        .definition_id = definition_id,
+        .definition_digest = definition_plan.closure_digest,
+        .projection = projection_name_owned,
+        .logical_ref = logical_ref,
+        .revision = revision,
+        .payload = payload,
+        .stats = .{
+            .records_scanned = 0,
+            .records_matched = 0,
+            .records_emitted = 0,
+        },
+        .limitations = limitations,
+        .exit_code = compiled.exit_policy.unmatched,
+    };
+}
+
+fn executeTextDocument(
+    allocator: std.mem.Allocator,
+    compiled: *const Projection,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    writer: *std.Io.Writer,
+    stats: *Stats,
+) !void {
+    if (!std.unicode.utf8ValidateSlice(snapshot.content)) {
+        return error.StoredDocumentNotUtf8;
+    }
+    var physical: std.Io.Writer.Allocating = .init(allocator);
+    defer physical.deinit();
+    try physical.writer.writeAll("{\"content\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &physical.writer,
+        snapshot.content,
+    );
+    try physical.writer.writeAll(",\"logical_ref\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &physical.writer,
+        slot.relative_path,
+    );
+    try physical.writer.writeAll(",\"revision\":");
+    try definition_core.canonical_json.writeCanonicalString(
+        &physical.writer,
+        snapshot.revision,
+    );
+    try physical.writer.writeByte('}');
+    try executeDocument(
+        allocator,
+        compiled,
+        physical.written(),
+        parameters,
+        effective_limit,
+        writer,
+        stats,
+    );
 }
 
 const KeyedHistoryFieldSource = union(enum) {

@@ -4216,6 +4216,10 @@ fn pathIsParameterized(segments: []const PathSegment) bool {
     return false;
 }
 
+pub fn slotIsParameterized(slot: Slot) bool {
+    return pathIsParameterized(slot.path_segments);
+}
+
 fn resolvePathAlloc(
     allocator: std.mem.Allocator,
     segments: []const PathSegment,
@@ -4280,6 +4284,177 @@ pub fn resolveSlotPathAlloc(
         parameters,
         generated,
     );
+}
+
+pub fn enumerateMatchingPathsAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    slot: Slot,
+    max_paths: usize,
+) ![][]u8 {
+    if (!std.fs.path.isAbsolute(repo_root)) {
+        return error.RepositoryRootNotAbsolute;
+    }
+    if (max_paths == 0) return error.StoragePathEnumerationBoundsExceeded;
+    const ledger_root = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger" },
+    );
+    defer allocator.free(ledger_root);
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try enumeratePathSegments(
+        allocator,
+        ledger_root,
+        "",
+        slot.path_segments,
+        0,
+        max_paths,
+        &paths,
+    );
+    std.mem.sort([]u8, paths.items, {}, struct {
+        fn lessThan(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    return paths.toOwnedSlice(allocator);
+}
+
+fn enumeratePathSegments(
+    allocator: std.mem.Allocator,
+    absolute_parent: []const u8,
+    relative_parent: []const u8,
+    segments: []const PathSegment,
+    segment_index: usize,
+    max_paths: usize,
+    paths: *std.ArrayList([]u8),
+) !void {
+    if (segment_index >= segments.len) return;
+    const segment = segments[segment_index];
+    const last = segment_index + 1 == segments.len;
+    switch (segment.kind) {
+        .literal => {
+            const absolute = try std.fs.path.join(
+                allocator,
+                &.{ absolute_parent, segment.text },
+            );
+            defer allocator.free(absolute);
+            const relative = if (relative_parent.len == 0)
+                try allocator.dupe(u8, segment.text)
+            else
+                try std.fs.path.join(
+                    allocator,
+                    &.{ relative_parent, segment.text },
+                );
+            defer allocator.free(relative);
+            if (last) {
+                const stat = std.Io.Dir.cwd().statFile(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    absolute,
+                    .{ .follow_symlinks = false },
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return,
+                    else => return err,
+                };
+                if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
+                if (stat.kind != .file) return;
+                try appendEnumeratedPath(
+                    allocator,
+                    paths,
+                    relative,
+                    max_paths,
+                );
+                return;
+            }
+            try enumeratePathSegments(
+                allocator,
+                absolute,
+                relative,
+                segments,
+                segment_index + 1,
+                max_paths,
+                paths,
+            );
+        },
+        .parameter => {
+            var directory = std.Io.Dir.openDirAbsolute(
+                std.Io.Threaded.global_single_threaded.io(),
+                absolute_parent,
+                .{ .iterate = true, .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            defer directory.close(std.Io.Threaded.global_single_threaded.io());
+            var iterator = directory.iterate();
+            while (try iterator.next(
+                std.Io.Threaded.global_single_threaded.io(),
+            )) |entry| {
+                definition_core.json.safeIdentifier(
+                    entry.name,
+                    128,
+                ) catch continue;
+                if (std.mem.indexOfScalar(u8, entry.name, '/') != null) {
+                    continue;
+                }
+                const stat = directory.statFile(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    entry.name,
+                    .{ .follow_symlinks = false },
+                ) catch continue;
+                if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
+                const absolute = try std.fs.path.join(
+                    allocator,
+                    &.{ absolute_parent, entry.name },
+                );
+                defer allocator.free(absolute);
+                const relative = if (relative_parent.len == 0)
+                    try allocator.dupe(u8, entry.name)
+                else
+                    try std.fs.path.join(
+                        allocator,
+                        &.{ relative_parent, entry.name },
+                    );
+                defer allocator.free(relative);
+                if (last) {
+                    if (stat.kind != .file) continue;
+                    try appendEnumeratedPath(
+                        allocator,
+                        paths,
+                        relative,
+                        max_paths,
+                    );
+                } else {
+                    if (stat.kind != .directory) continue;
+                    try enumeratePathSegments(
+                        allocator,
+                        absolute,
+                        relative,
+                        segments,
+                        segment_index + 1,
+                        max_paths,
+                        paths,
+                    );
+                }
+            }
+        },
+    }
+}
+
+fn appendEnumeratedPath(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]u8),
+    path: []const u8,
+    max_paths: usize,
+) !void {
+    if (paths.items.len >= max_paths) {
+        return error.StoragePathEnumerationBoundsExceeded;
+    }
+    try validateLogicalSlotPath(path);
+    try paths.append(allocator, try allocator.dupe(u8, path));
 }
 
 fn validateLogicalSlotPath(path: []const u8) !void {
