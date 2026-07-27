@@ -394,6 +394,12 @@ then
     "$script_dir/check-actuating-evidence-protocol.sh"
 fi
 
+if [[ -f codex/skills/memory-source-notes/definitions/ledger/synesthesia-memory-note-payload.json ]]; then
+  DOTFILES_ROOT="$dotfiles_root" \
+    LEDGER_BIN="$ledger_bin" \
+    "$script_dir/check-memory-source-notes.sh"
+fi
+
 printf \
   'definition conformance passed: manifests=%d seq=%d ledger=%d fixtures=%d materializations=%d transactions=%d contracts=%d\n' \
   "$manifest_count" \
