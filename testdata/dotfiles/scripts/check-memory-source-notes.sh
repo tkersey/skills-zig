@@ -44,13 +44,13 @@ while IFS=$'\t' read -r case_id expectation; do
     "$reconstructed"
   if [[ "$case_id" == "scope-anchor-priority" ]]; then
     jq -S -c \
-      '.note |
+      '.source.record |
        del(.payload.scope) |
        del(.payload.endorsement_type)' \
       "$reconstructed" >"$raw"
   elif [[ "$case_id" == "scope-global" ]]; then
     jq -S -c \
-      '.note |
+      '.source.record |
        del(.scope.repo) |
        del(.payload.scope) |
        del(.payload.scope_anchor) |
@@ -58,13 +58,13 @@ while IFS=$'\t' read -r case_id expectation; do
       "$reconstructed" >"$raw"
   else
     jq -S -c \
-      '.note |
+      '.source.record |
        del(.payload.scope) |
        del(.payload.scope_anchor) |
        del(.payload.endorsement_type)' \
       "$reconstructed" >"$raw"
   fi
-  logical_kind=$(jq -r '.logical_kind' "$reconstructed")
+  logical_kind=$(jq -r '.source.logical_kind' "$reconstructed")
 
   if [[ "$expectation" == "valid" ]]; then
     valid_count=$((valid_count + 1))
@@ -72,14 +72,14 @@ while IFS=$'\t' read -r case_id expectation; do
       uv run "$adapter" validate \
         --kind "$logical_kind" \
         --json "$raw" >"$output"
-    jq -S -c '.note' "$reconstructed" >"$scratch/$case_id.expected-note.json"
+    jq -S -c '.source.record' "$reconstructed" >"$scratch/$case_id.expected-note.json"
     jq -S -c '.normalized' "$output" >"$scratch/$case_id.actual-note.json"
     cmp -s \
       "$scratch/$case_id.expected-note.json" \
       "$scratch/$case_id.actual-note.json"
     jq -e \
       --arg logical_kind "$logical_kind" \
-      --arg physical_kind "$(jq -r '.physical_kind' "$reconstructed")" \
+      --arg physical_kind "$(jq -r '.source.physical_kind' "$reconstructed")" \
       '.valid == true and
        .logical_kind == $logical_kind and
        .physical_kind == $physical_kind and

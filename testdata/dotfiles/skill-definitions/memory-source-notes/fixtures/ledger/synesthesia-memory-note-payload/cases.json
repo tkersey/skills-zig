@@ -14,11 +14,11 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/logical_kind": "mapping-confirmation",
-        "/note/authority": "repeated-accepted-use",
-        "/note/operation": "confirm",
-        "/note/payload/endorsement_type": "repeated-accepted-use",
-        "/note/related_ids": [
+        "/source/logical_kind": "mapping-confirmation",
+        "/source/record/authority": "repeated-accepted-use",
+        "/source/record/operation": "confirm",
+        "/source/record/payload/endorsement_type": "repeated-accepted-use",
+        "/source/record/related_ids": [
           "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
         ]
       }
@@ -28,12 +28,12 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/logical_kind": "mapping-correction",
-        "/physical_kind": "mapping-correction",
-        "/note/authority": "explicit-user-correction",
-        "/note/operation": "supersede",
-        "/note/payload/endorsement_type": "explicit-user-correction",
-        "/note/supersedes_id": "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
+        "/source/logical_kind": "mapping-correction",
+        "/source/physical_kind": "mapping-correction",
+        "/source/record/authority": "explicit-user-correction",
+        "/source/record/operation": "supersede",
+        "/source/record/payload/endorsement_type": "explicit-user-correction",
+        "/source/record/supersedes_id": "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
       }
     },
     {
@@ -41,12 +41,12 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/logical_kind": "mapping-rejection",
-        "/physical_kind": "mapping-rejection",
-        "/note/authority": "explicit-user-rejection",
-        "/note/operation": "reject",
-        "/note/payload/endorsement_type": "explicit-user-rejection",
-        "/note/related_ids": [
+        "/source/logical_kind": "mapping-rejection",
+        "/source/physical_kind": "mapping-rejection",
+        "/source/record/authority": "explicit-user-rejection",
+        "/source/record/operation": "reject",
+        "/source/record/payload/endorsement_type": "explicit-user-rejection",
+        "/source/record/related_ids": [
           "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
         ]
       }
@@ -56,8 +56,8 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/logical_kind": "activation-boundary",
-        "/physical_kind": "activation-boundary"
+        "/source/logical_kind": "activation-boundary",
+        "/source/physical_kind": "activation-boundary"
       }
     },
     {
@@ -65,12 +65,12 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/logical_kind": "boundary-retraction",
-        "/physical_kind": "boundary-retraction",
-        "/note/authority": "explicit-user-rejection",
-        "/note/operation": "retract",
-        "/note/payload/endorsement_type": "explicit-user-rejection",
-        "/note/related_ids": [
+        "/source/logical_kind": "boundary-retraction",
+        "/source/physical_kind": "boundary-retraction",
+        "/source/record/authority": "explicit-user-rejection",
+        "/source/record/operation": "retract",
+        "/source/record/payload/endorsement_type": "explicit-user-rejection",
+        "/source/record/related_ids": [
           "MSN-20260727T000000Z-aaaaaaaaaaaaaaaa"
         ]
       }
@@ -80,11 +80,11 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/note/scope/kind": "global",
-        "/note/scope/paths": [],
-        "/note/scope/repo": null,
-        "/note/payload/scope": "global_default",
-        "/note/payload/scope_anchor": "global",
+        "/source/record/scope/kind": "global",
+        "/source/record/scope/paths": [],
+        "/source/record/scope/repo": null,
+        "/source/record/payload/scope": "global_default",
+        "/source/record/payload/scope_anchor": "global",
         "/scope_anchor_source": "kind"
       }
     },
@@ -93,12 +93,12 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/note/scope/kind": "path-family",
-        "/note/scope/paths": [
+        "/source/record/scope/kind": "path-family",
+        "/source/record/scope/paths": [
           " "
         ],
-        "/note/payload/scope": "path_family_scoped",
-        "/note/payload/scope_anchor": " "
+        "/source/record/payload/scope": "path_family_scoped",
+        "/source/record/payload/scope_anchor": " "
       }
     },
     {
@@ -106,9 +106,9 @@
       "base": "mapping-endorsement",
       "expect": "valid",
       "set": {
-        "/note/scope/paths": [],
-        "/note/scope/repo": " ",
-        "/note/payload/scope_anchor": " ",
+        "/source/record/scope/paths": [],
+        "/source/record/scope/repo": " ",
+        "/source/record/payload/scope_anchor": " ",
         "/scope_anchor_source": "repo"
       }
     },
@@ -117,8 +117,8 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/logical_kind": "mapping-confirmation",
-        "/note/operation": "confirm"
+        "/source/logical_kind": "mapping-confirmation",
+        "/source/record/operation": "confirm"
       }
     },
     {
@@ -126,7 +126,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/note/payload/endorsement_type": "repeated-accepted-use"
+        "/source/record/payload/endorsement_type": "repeated-accepted-use"
       }
     },
     {
@@ -134,7 +134,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/note/related_ids": [
+        "/source/record/related_ids": [
           "MSN-invalid"
         ]
       }
@@ -144,7 +144,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "remove": [
-        "/note/payload/engineering_translation"
+        "/source/record/payload/engineering_translation"
       ]
     },
     {
@@ -152,7 +152,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/physical_kind": "mapping-correction"
+        "/source/physical_kind": "mapping-correction"
       }
     },
     {
@@ -160,7 +160,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/note/payload/scope": "global_default"
+        "/source/record/payload/scope": "global_default"
       }
     },
     {
@@ -168,7 +168,7 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/note/payload/scope_anchor": "owner/repo"
+        "/source/record/payload/scope_anchor": "owner/repo"
       }
     },
     {
@@ -176,9 +176,9 @@
       "base": "mapping-endorsement",
       "expect": "invalid",
       "set": {
-        "/note/payload/secret": "redacted"
+        "/source/record/payload/secret": "redacted"
       }
     }
   ],
-  "reconstructed_cases_digest": "sha256:d78d20744575da9649b6acda5f0dca041d57f44b2c3a9fe6ed3e6704bdc0b5ac"
+  "reconstructed_cases_digest": "sha256:6903a6b563fb3f40e4a96a93a6dbd0c1de5286981355abf5d196dabad6b2721c"
 }
