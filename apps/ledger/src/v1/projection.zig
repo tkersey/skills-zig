@@ -145,6 +145,10 @@ pub const Projection = struct {
     slot_index: u16,
     predicates: []Predicate,
     fields: []Field,
+    preserve_field_order: bool,
+    raw: bool,
+    single: bool,
+    require_match: bool,
     latest: ?definition_core.json_pointer.Pointer,
     limit: ?Limit,
     fold: ?Fold,
@@ -251,7 +255,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeCount(plan.projections.len);
     for (plan.projections) |projection| {
         try encoder.writeBytes(projection.name);
@@ -270,6 +274,10 @@ pub fn encodeCache(
                 },
             }
         }
+        try encoder.writeBool(projection.preserve_field_order);
+        try encoder.writeBool(projection.raw);
+        try encoder.writeBool(projection.single);
+        try encoder.writeBool(projection.require_match);
         try encoder.writeCount(projection.fields.len);
         for (projection.fields) |field| {
             try encoder.writeBytes(field.name);
@@ -331,7 +339,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerProjectionCacheVersionMismatch;
     }
     const count = try decoder.readCount(128);
@@ -479,6 +487,31 @@ pub fn validateCachePlan(
                 }
             },
         };
+        if (projection.single and projection.limit != null) {
+            return error.CacheProjectionPlanMismatch;
+        }
+        if (projection.require_match and !projection.single) {
+            return error.CacheProjectionPlanMismatch;
+        }
+        if (projection.raw and projection.fields.len != 0) {
+            return error.CacheProjectionPlanMismatch;
+        }
+        for (projection.fields, 0..) |field, index| {
+            for (projection.fields[0..index]) |prior| {
+                if (std.mem.eql(u8, prior.name, field.name)) {
+                    return error.CacheProjectionFieldsNotUnique;
+                }
+            }
+            if (!projection.preserve_field_order and index != 0 and
+                std.mem.order(
+                    u8,
+                    projection.fields[index - 1].name,
+                    field.name,
+                ) != .lt)
+            {
+                return error.CacheProjectionFieldsNotSorted;
+            }
+        }
     }
 }
 
@@ -525,6 +558,10 @@ fn decodeCacheProjection(
         };
         predicate_initialized += 1;
     }
+    const preserve_field_order = try decoder.readBool();
+    const raw = try decoder.readBool();
+    const single = try decoder.readBool();
+    const require_match = try decoder.readBool();
     const field_count = try decoder.readCount(256);
     const fields = try allocator.alloc(Field, field_count);
     var field_initialized: usize = 0;
@@ -536,10 +573,15 @@ fn decodeCacheProjection(
         const field_name = try decoder.readBytesAlloc(allocator, 128);
         errdefer allocator.free(field_name);
         try definition_core.json.safeIdentifier(field_name, 128);
-        if (index != 0 and
+        if (!preserve_field_order and index != 0 and
             std.mem.order(u8, fields[index - 1].name, field_name) != .lt)
         {
             return error.CacheProjectionFieldsNotSorted;
+        }
+        for (fields[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, field_name)) {
+                return error.CacheProjectionFieldsNotUnique;
+            }
         }
         const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
         defer allocator.free(raw_pointer);
@@ -672,6 +714,10 @@ fn decodeCacheProjection(
         .slot_index = slot_index,
         .predicates = predicates,
         .fields = fields,
+        .preserve_field_order = preserve_field_order,
+        .raw = raw,
+        .single = single,
+        .require_match = require_match,
         .latest = latest,
         .limit = limit,
         .fold = fold,
@@ -770,6 +816,10 @@ fn compileProjection(
     var fold: ?Fold = null;
     errdefer if (fold) |*compiled| compiled.deinit(allocator);
     var selection_seen = false;
+    var preserve_field_order = false;
+    var raw_export = false;
+    var single = false;
+    var require_match = false;
     for (steps.items) |step_value| {
         const step = try definition_core.json.object(step_value);
         const operator = try definition.Operator.parse(
@@ -793,21 +843,34 @@ fn compileProjection(
                 );
                 errdefer predicate.deinit(allocator);
                 try predicates.append(allocator, predicate);
+                if (operator == .id_lookup) {
+                    if (single) return error.DuplicateProjectionCardinality;
+                    single = true;
+                    require_match = if (step.get("required")) |value|
+                        try definition_core.json.boolean(value)
+                    else
+                        false;
+                }
             },
             .latest => {
                 if (selection_seen or latest != null or limit != null or
-                    fold != null)
+                    fold != null or single)
                 {
                     return error.InvalidProjectionOperatorOrder;
                 }
                 try definition_core.json.requireExactKeys(
                     step,
-                    &.{ "op", "path" },
+                    &.{ "op", "path", "required" },
                 );
                 latest = try definition_core.json_pointer.compile(
                     allocator,
                     try definition_core.json.requiredString(step, "path"),
                 );
+                single = true;
+                require_match = if (step.get("required")) |value|
+                    try definition_core.json.boolean(value)
+                else
+                    false;
             },
             .select => {
                 if (selection_seen or limit != null or fold != null) {
@@ -899,11 +962,37 @@ fn compileProjection(
                 }
             },
             .limit => {
-                if (limit != null) return error.DuplicateProjectionLimit;
+                if (limit != null or single) {
+                    return error.InvalidProjectionOperatorOrder;
+                }
                 limit = try compileLimit(allocator, definition_plan, step);
             },
             .@"export" => {
-                try definition_core.json.requireExactKeys(step, &.{"op"});
+                if (selection_seen or limit != null or fold != null) {
+                    return error.InvalidProjectionOperatorOrder;
+                }
+                if (step.get("fields")) |field_values| {
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "fields" },
+                    );
+                    fields = try compileOrderedFields(
+                        allocator,
+                        try definition_core.json.array(field_values),
+                        step,
+                    );
+                    preserve_field_order = true;
+                } else {
+                    try definition_core.json.requireExactKeys(
+                        step,
+                        &.{ "op", "raw" },
+                    );
+                    raw_export = if (step.get("raw")) |value|
+                        try definition_core.json.boolean(value)
+                    else
+                        false;
+                }
+                selection_seen = true;
             },
             else => return error.UnsupportedProjectionOperator,
         }
@@ -916,6 +1005,10 @@ fn compileProjection(
         .slot_index = @intCast(slot_index),
         .predicates = try predicates.toOwnedSlice(allocator),
         .fields = fields,
+        .preserve_field_order = preserve_field_order,
+        .raw = raw_export,
+        .single = single,
+        .require_match = require_match,
         .latest = latest,
         .limit = limit,
         .fold = fold,
@@ -961,7 +1054,7 @@ fn compilePredicate(
         .id_lookup => blk: {
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "op", "path", "param" },
+                &.{ "op", "path", "param", "required" },
             );
             const name = try definition_core.json.requiredString(
                 object,
@@ -1012,6 +1105,54 @@ fn compileFields(
         }
     }.lessThan);
     return fields.toOwnedSlice(allocator);
+}
+
+fn compileOrderedFields(
+    allocator: std.mem.Allocator,
+    values: std.json.Array,
+    step: std.json.ObjectMap,
+) ![]Field {
+    try definition_core.json.requireExactKeys(step, &.{ "op", "fields" });
+    if (values.items.len == 0 or values.items.len > 256) {
+        return error.InvalidProjectionFields;
+    }
+    const fields = try allocator.alloc(Field, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (fields[0..initialized]) |*field| field.deinit(allocator);
+        allocator.free(fields);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "name", "path" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "name", "path" },
+        );
+        const raw_name = try definition_core.json.requiredString(
+            object,
+            "name",
+        );
+        try definition_core.json.safeIdentifier(raw_name, 128);
+        for (fields[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, raw_name)) {
+                return error.ProjectionFieldsNotUnique;
+            }
+        }
+        const name = try allocator.dupe(u8, raw_name);
+        errdefer allocator.free(name);
+        var pointer = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.requiredString(object, "path"),
+        );
+        errdefer pointer.deinit(allocator);
+        fields[index] = .{ .name = name, .pointer = pointer };
+        initialized += 1;
+    }
+    return fields;
 }
 
 fn compileRetainedFields(
@@ -1394,12 +1535,17 @@ fn executeDocument(
     defer parsed.deinit();
     stats.records_scanned = 1;
     if (limit == 0 or !matches(projection, parsed.value, parameters)) {
+        if (projection.require_match) return error.ProjectionNotFound;
         try writer.writeAll("null");
         return;
     }
     stats.records_matched = 1;
     stats.records_emitted = 1;
-    try writeProjectedValue(allocator, writer, projection, parsed.value);
+    if (projection.raw) {
+        try writer.writeAll(std.mem.trim(u8, bytes, " \t\r\n"));
+    } else {
+        try writeProjectedValue(allocator, writer, projection, parsed.value);
+    }
 }
 
 fn executeJsonl(
@@ -1416,7 +1562,7 @@ fn executeJsonl(
     defer if (latest_value) |value| allocator.free(value);
     var latest_key: ?Scalar = null;
     defer if (latest_key) |*key| key.deinit(allocator);
-    try writer.writeByte('[');
+    if (!projection.single) try writer.writeByte('[');
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line_with_cr| {
         const line = std.mem.trim(u8, line_with_cr, " \t\r");
@@ -1449,24 +1595,53 @@ fn executeJsonl(
                 latest_key = key;
                 key_owned = false;
                 if (latest_value) |prior| allocator.free(prior);
-                latest_value = try projectedValueAlloc(
+                latest_value = if (projection.raw)
+                    try allocator.dupe(u8, line)
+                else
+                    try projectedValueAlloc(
+                        allocator,
+                        projection,
+                        parsed.value,
+                    );
+            }
+            continue;
+        }
+        if (projection.single) {
+            if (projection.raw) {
+                try writer.writeAll(line);
+            } else {
+                try writeProjectedValue(
                     allocator,
+                    writer,
                     projection,
                     parsed.value,
                 );
             }
-            continue;
+            stats.records_emitted = 1;
+            return;
         }
         if (stats.records_emitted == limit) break;
         if (stats.records_emitted != 0) try writer.writeByte(',');
-        try writeProjectedValue(allocator, writer, projection, parsed.value);
+        if (projection.raw) {
+            try writer.writeAll(line);
+        } else {
+            try writeProjectedValue(
+                allocator,
+                writer,
+                projection,
+                parsed.value,
+            );
+        }
         stats.records_emitted += 1;
     }
     if (latest_value) |value| {
         try writer.writeAll(value);
         stats.records_emitted = 1;
+    } else if (projection.single) {
+        if (projection.require_match) return error.ProjectionNotFound;
+        try writer.writeAll("null");
     }
-    try writer.writeByte(']');
+    if (!projection.single) try writer.writeByte(']');
 }
 
 fn matches(
@@ -1683,4 +1858,177 @@ test "projection plan round trips through the bounded cache codec" {
         plan.projections[0].fields.len,
         cached.projections[0].fields.len,
     );
+}
+
+test "exact lookup emits one definition-ordered or raw payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "protocol.json",
+        .data =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-export","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["export","id-lookup","latest"]},"parameters":{"id":{"type":"string","required":true}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{},"projections":{"latest":{"slot":"events","pipeline":[{"op":"latest","path":"/record/id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"ordered":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","fields":[{"name":"operation","path":"/record/operation"},{"name":"authority","path":"/record/authority"}]}]},"raw":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id"},{"op":"export","raw":true}]},"required":{"slot":"events","pipeline":[{"op":"id-lookup","path":"/record/id","param":"id","required":true},{"op":"export","raw":true}]}},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":100,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":16}}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "protocol.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        "protocol.json",
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var plan = try compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+        null,
+    );
+    defer plan.deinit(std.testing.allocator);
+
+    var encoder = definition_core.cache.Encoder.init(
+        std.testing.allocator,
+        64 * 1024,
+    );
+    defer encoder.deinit();
+    try encodeCache(&plan, &encoder);
+    const cache_payload = try encoder.toOwnedSlice();
+    defer std.testing.allocator.free(cache_payload);
+    var decoder = definition_core.cache.Decoder.init(cache_payload);
+    var cached = try decodeCache(std.testing.allocator, &decoder);
+    defer cached.deinit(std.testing.allocator);
+    try decoder.finish();
+    const ordered = cached.find("ordered").?;
+    try std.testing.expect(ordered.single);
+    try std.testing.expect(ordered.preserve_field_order);
+    try std.testing.expect(!ordered.raw);
+    try std.testing.expectEqualStrings("operation", ordered.fields[0].name);
+    try std.testing.expectEqualStrings("authority", ordered.fields[1].name);
+    const raw = cached.find("raw").?;
+    try std.testing.expect(raw.single);
+    try std.testing.expect(raw.raw);
+    try std.testing.expectEqual(@as(usize, 0), raw.fields.len);
+
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "id", .raw_value = "r1" }},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    const rows =
+        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}}\n" ++
+        "{\"record\":{\"operation\":\"o2\",\"id\":\"r2\",\"authority\":\"a2\"},\"v\":1}\n";
+
+    var ordered_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer ordered_output.deinit();
+    var ordered_stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeJsonl(
+        std.testing.allocator,
+        ordered,
+        rows,
+        &bindings,
+        100,
+        100,
+        &ordered_output.writer,
+        &ordered_stats,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"operation\":\"o1\",\"authority\":\"a1\"}",
+        ordered_output.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), ordered_stats.records_scanned);
+    try std.testing.expectEqual(@as(usize, 1), ordered_stats.records_emitted);
+
+    var raw_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer raw_output.deinit();
+    var raw_stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeJsonl(
+        std.testing.allocator,
+        raw,
+        rows,
+        &bindings,
+        100,
+        100,
+        &raw_output.writer,
+        &raw_stats,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"v\":1,\"record\":{\"id\":\"r1\",\"authority\":\"a1\",\"operation\":\"o1\"}}",
+        raw_output.written(),
+    );
+
+    const latest = cached.find("latest").?;
+    try std.testing.expect(latest.single);
+    var latest_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer latest_output.deinit();
+    var latest_stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeJsonl(
+        std.testing.allocator,
+        latest,
+        rows,
+        &bindings,
+        100,
+        100,
+        &latest_output.writer,
+        &latest_stats,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"operation\":\"o2\",\"authority\":\"a2\"}",
+        latest_output.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), latest_stats.records_scanned);
+
+    var missing_bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "id", .raw_value = "missing" }},
+    );
+    defer missing_bindings.deinit(std.testing.allocator);
+    const required = cached.find("required").?;
+    try std.testing.expect(required.require_match);
+    var missing_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer missing_output.deinit();
+    var missing_stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try std.testing.expectError(
+        error.ProjectionNotFound,
+        executeJsonl(
+            std.testing.allocator,
+            required,
+            rows,
+            &missing_bindings,
+            100,
+            100,
+            &missing_output.writer,
+            &missing_stats,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), missing_stats.records_scanned);
 }
