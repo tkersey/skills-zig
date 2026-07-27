@@ -248,6 +248,106 @@ pub fn compile(
     );
     defer parsed.deinit();
     const root = try definition_core.json.object(parsed.value);
+    try validateDefinitionRoot(root);
+    const id = try definition_core.json.requiredString(root, "id");
+    try definition_core.json.safeIdentifier(id, 256);
+
+    const operator_mask = try parseRequires(try definition_core.json.object(
+        try definition_core.json.field(root, "requires"),
+    ));
+    var parameter_declarations = try definition_core.parameters.compile(
+        allocator,
+        root.get("parameters"),
+    );
+    errdefer parameter_declarations.deinit(allocator);
+    const selector_mask = try parseSelectors(try definition_core.json.array(
+        try definition_core.json.field(root, "selectors"),
+    ));
+    const structure = try compileDefinitionStructure(
+        allocator,
+        root,
+        operator_mask,
+    );
+    errdefer {
+        deinitRelations(allocator, structure.relations);
+        deinitInputs(allocator, structure.inputs);
+        deinitSteps(allocator, structure.steps);
+        deinitProjections(allocator, structure.projections);
+    }
+    return .{
+        .id = try allocator.dupe(u8, id),
+        .closure_digest = closure.digest,
+        .operator_mask = operator_mask,
+        .parameter_declarations = parameter_declarations,
+        .selector_mask = selector_mask,
+        .relations = structure.relations,
+        .inputs = structure.inputs,
+        .steps = structure.steps,
+        .projections = structure.projections,
+        .bounds = structure.bounds,
+    };
+}
+
+const DefinitionStructure = struct {
+    relations: []RelationRequirement,
+    inputs: []ExternalInput,
+    steps: []Step,
+    projections: []Projection,
+    bounds: Bounds,
+};
+
+fn compileDefinitionStructure(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    operator_mask: u32,
+) !DefinitionStructure {
+    const relations_value = try definition_core.json.field(
+        root,
+        "relations",
+    );
+    const relations = try parseRelations(
+        allocator,
+        try definition_core.json.array(relations_value),
+    );
+    errdefer deinitRelations(allocator, relations);
+    const inputs_value = try definition_core.json.field(root, "inputs");
+    const inputs = try parseInputs(
+        allocator,
+        try definition_core.json.array(inputs_value),
+    );
+    errdefer deinitInputs(allocator, inputs);
+    const pipeline_value = try definition_core.json.field(root, "pipeline");
+    const steps = try parseSteps(
+        allocator,
+        try definition_core.json.array(pipeline_value),
+        operator_mask,
+        relations,
+        inputs,
+    );
+    errdefer deinitSteps(allocator, steps);
+    const projection_value = try definition_core.json.field(
+        root,
+        "projections",
+    );
+    const projections = try parseProjections(
+        allocator,
+        try definition_core.json.object(projection_value),
+        steps,
+    );
+    errdefer deinitProjections(allocator, projections);
+    const bounds = try parseBounds(try definition_core.json.object(
+        try definition_core.json.field(root, "bounds"),
+    ));
+    return .{
+        .relations = relations,
+        .inputs = inputs,
+        .steps = steps,
+        .projections = projections,
+        .bounds = bounds,
+    };
+}
+
+fn validateDefinitionRoot(root: std.json.ObjectMap) !void {
     try definition_core.json.requireExactKeys(root, &.{
         "schema",
         "id",
@@ -272,65 +372,15 @@ pub fn compile(
         "projections",
         "bounds",
     });
+    const declared_schema = try definition_core.json.requiredString(
+        root,
+        "schema",
+    );
     if (!std.mem.eql(
         u8,
-        try definition_core.json.requiredString(root, "schema"),
+        declared_schema,
         schema,
     )) return error.InvalidObservationDefinitionSchema;
-    const id = try definition_core.json.requiredString(root, "id");
-    try definition_core.json.safeIdentifier(id, 256);
-
-    const operator_mask = try parseRequires(try definition_core.json.object(
-        try definition_core.json.field(root, "requires"),
-    ));
-    var parameter_declarations = try definition_core.parameters.compile(
-        allocator,
-        root.get("parameters"),
-    );
-    errdefer parameter_declarations.deinit(allocator);
-    const selector_mask = try parseSelectors(try definition_core.json.array(
-        try definition_core.json.field(root, "selectors"),
-    ));
-    const relations = try parseRelations(
-        allocator,
-        try definition_core.json.array(try definition_core.json.field(root, "relations")),
-    );
-    errdefer deinitRelations(allocator, relations);
-    const inputs = try parseInputs(
-        allocator,
-        try definition_core.json.array(try definition_core.json.field(root, "inputs")),
-    );
-    errdefer deinitInputs(allocator, inputs);
-    const steps = try parseSteps(
-        allocator,
-        try definition_core.json.array(try definition_core.json.field(root, "pipeline")),
-        operator_mask,
-        relations,
-        inputs,
-    );
-    errdefer deinitSteps(allocator, steps);
-    const projections = try parseProjections(
-        allocator,
-        try definition_core.json.object(try definition_core.json.field(root, "projections")),
-        steps,
-    );
-    errdefer deinitProjections(allocator, projections);
-    const bounds = try parseBounds(try definition_core.json.object(
-        try definition_core.json.field(root, "bounds"),
-    ));
-
-    return .{
-        .id = try allocator.dupe(u8, id),
-        .closure_digest = closure.digest,
-        .operator_mask = operator_mask,
-        .parameter_declarations = parameter_declarations,
-        .selector_mask = selector_mask,
-        .relations = relations,
-        .inputs = inputs,
-        .steps = steps,
-        .projections = projections,
-        .bounds = bounds,
-    };
 }
 
 fn parseRequires(object: std.json.ObjectMap) !u32 {
@@ -522,68 +572,112 @@ fn parseSteps(
         out.deinit(allocator);
     }
     for (items.items) |item| {
-        const object = try definition_core.json.object(item);
-        try definition_core.json.requireExactKeys(object, &.{
-            "op",       "input",       "inputs",  "as",     "name",            "relation", "fields",    "where",
-            "on",       "keys",        "metrics", "by",     "limit",           "depth",    "max_nodes", "state",
-            "order_by", "transitions", "emit",    "window", "classifications",
-        });
-        const operator = try Operator.parse(try definition_core.json.requiredString(object, "op"));
-        if ((operator_mask & operatorBit(operator)) == 0) {
-            return error.UndeclaredObservationOperator;
-        }
-        try validateStepShape(operator, object);
-        if (operator == .scan) {
-            const relation = try physical.Relation.parse(
-                try definition_core.json.requiredString(object, "relation"),
-            );
-            var declared = false;
-            for (relations) |requirement| if (requirement.relation == relation) {
-                declared = true;
-                break;
-            };
-            if (!declared) return error.UndeclaredPhysicalRelation;
-        }
-        const output_name = try stepOutputName(operator, object);
-        if (output_name) |name| {
-            try definition_core.json.safeIdentifier(name, 128);
-            if (relationNameExists(out.items, inputs, relations, name)) {
-                return error.DuplicatePipelineRelation;
-            }
-        }
-        const input_names = try parseStepInputs(allocator, operator, object);
-        errdefer {
-            for (input_names) |name| allocator.free(name);
-            allocator.free(input_names);
-        }
-        for (input_names) |name| {
-            if (!relationNameExists(out.items, inputs, relations, name)) {
-                return error.UnknownPipelineInput;
-            }
-        }
-        const canonical_config = try definition_core.canonical_json.canonicalJsonAlloc(
+        var step = try parseStep(
             allocator,
             item,
+            operator_mask,
+            out.items,
+            relations,
+            inputs,
         );
-        errdefer allocator.free(canonical_config);
-        try out.append(allocator, .{
-            .operator = operator,
-            .output_name = if (output_name) |name| try allocator.dupe(u8, name) else null,
-            .input_names = input_names,
-            .canonical_config = canonical_config,
-        });
+        errdefer step.deinit(allocator);
+        try out.append(allocator, step);
     }
     return out.toOwnedSlice(allocator);
 }
 
+fn parseStep(
+    allocator: std.mem.Allocator,
+    item: std.json.Value,
+    operator_mask: u32,
+    prior_steps: []const Step,
+    relations: []const RelationRequirement,
+    inputs: []const ExternalInput,
+) !Step {
+    const object = try definition_core.json.object(item);
+    try definition_core.json.requireExactKeys(object, &.{
+        "op",     "input",    "inputs",
+        "as",     "name",     "relation",
+        "fields", "where",    "on",
+        "keys",   "metrics",  "by",
+        "limit",  "depth",    "max_nodes",
+        "state",  "order_by", "transitions",
+        "emit",   "window",   "classifications",
+    });
+    const operator_name = try definition_core.json.requiredString(
+        object,
+        "op",
+    );
+    const operator = try Operator.parse(operator_name);
+    if ((operator_mask & operatorBit(operator)) == 0) {
+        return error.UndeclaredObservationOperator;
+    }
+    try validateStepShape(operator, object);
+    try validateScanRelation(operator, object, relations);
+    const output_name = try stepOutputName(operator, object);
+    if (output_name) |name| {
+        try definition_core.json.safeIdentifier(name, 128);
+        if (relationNameExists(prior_steps, inputs, relations, name)) {
+            return error.DuplicatePipelineRelation;
+        }
+    }
+    const input_names = try parseStepInputs(allocator, operator, object);
+    errdefer deinitStrings(allocator, input_names);
+    for (input_names) |name| {
+        if (!relationNameExists(prior_steps, inputs, relations, name)) {
+            return error.UnknownPipelineInput;
+        }
+    }
+    const canonical_config =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            item,
+        );
+    errdefer allocator.free(canonical_config);
+    return .{
+        .operator = operator,
+        .output_name = if (output_name) |name|
+            try allocator.dupe(u8, name)
+        else
+            null,
+        .input_names = input_names,
+        .canonical_config = canonical_config,
+    };
+}
+
+fn validateScanRelation(
+    operator: Operator,
+    object: std.json.ObjectMap,
+    relations: []const RelationRequirement,
+) !void {
+    if (operator != .scan) return;
+    const name = try definition_core.json.requiredString(
+        object,
+        "relation",
+    );
+    const relation = try physical.Relation.parse(name);
+    for (relations) |requirement| {
+        if (requirement.relation == relation) return;
+    }
+    return error.UndeclaredPhysicalRelation;
+}
+
 fn validateStepShape(operator: Operator, object: std.json.ObjectMap) !void {
     switch (operator) {
-        .scan => try definition_core.json.requireFields(object, &.{ "op", "relation", "as" }),
-        .join, .union_relations, .temporal_correlate => try definition_core.json.requireFields(
+        .scan => try definition_core.json.requireFields(
+            object,
+            &.{ "op", "relation", "as" },
+        ),
+        .join,
+        .union_relations,
+        .temporal_correlate,
+        => try definition_core.json.requireFields(
             object,
             &.{ "op", "inputs", "as" },
         ),
-        .named_relation, .result_projection => try definition_core.json.requireFields(
+        .named_relation,
+        .result_projection,
+        => try definition_core.json.requireFields(
             object,
             &.{ "op", "input", "name" },
         ),
@@ -612,7 +706,12 @@ fn validateStepShape(operator: Operator, object: std.json.ObjectMap) !void {
 
 fn stepOutputName(operator: Operator, object: std.json.ObjectMap) !?[]const u8 {
     return switch (operator) {
-        .named_relation, .result_projection => try definition_core.json.requiredString(object, "name"),
+        .named_relation, .result_projection => blk: {
+            break :blk try definition_core.json.requiredString(
+                object,
+                "name",
+            );
+        },
         .literal_match,
         .regex_match,
         .multi_literal_match,
@@ -883,27 +982,13 @@ pub fn decodeCache(
         try decoder.readFixed(closure_digest.len),
     );
     try definition_core.json.digest(&closure_digest);
-    const operator_mask = try decoder.readU32();
-    var known_operator_mask: u32 = 0;
-    inline for (@typeInfo(Operator).@"enum".fields) |field| {
-        known_operator_mask |= operatorBit(@enumFromInt(field.value));
-    }
-    if ((operator_mask & ~known_operator_mask) != 0) {
-        return error.CacheObservationOperatorInvalid;
-    }
+    const operator_mask = try decodeOperatorMask(decoder);
     var parameter_declarations = try definition_core.parameters.decodeCache(
         allocator,
         decoder,
     );
     errdefer parameter_declarations.deinit(allocator);
-    const selector_mask = try decoder.readByte();
-    var known_selector_mask: u8 = 0;
-    inline for (@typeInfo(Selector).@"enum".fields) |field| {
-        known_selector_mask |= @as(u8, 1) << @intCast(field.value);
-    }
-    if ((selector_mask & ~known_selector_mask) != 0) {
-        return error.CacheObservationSelectorInvalid;
-    }
+    const selector_mask = try decodeSelectorMask(decoder);
     const relations = try decodeCacheRelations(allocator, decoder);
     errdefer deinitRelations(allocator, relations);
     const inputs = try decodeCacheInputs(allocator, decoder);
@@ -922,16 +1007,7 @@ pub fn decodeCache(
         steps,
     );
     errdefer deinitProjections(allocator, projections);
-    const bounds: Bounds = .{
-        .max_rows = try decoder.readUsize(),
-        .max_output_bytes = try decoder.readUsize(),
-        .max_fold_states = try decoder.readUsize(),
-        .max_input_bytes = try decoder.readUsize(),
-        .max_graph_depth = try decoder.readUsize(),
-        .max_graph_nodes = try decoder.readUsize(),
-        .max_diagnostics = try decoder.readUsize(),
-    };
-    try validateBounds(bounds);
+    const bounds = try decodeBounds(decoder);
     return .{
         .id = id,
         .closure_digest = closure_digest,
@@ -944,6 +1020,50 @@ pub fn decodeCache(
         .projections = projections,
         .bounds = bounds,
     };
+}
+
+fn decodeOperatorMask(
+    decoder: *definition_core.cache.Decoder,
+) !u32 {
+    const operator_mask = try decoder.readU32();
+    var known_operator_mask: u32 = 0;
+    inline for (@typeInfo(Operator).@"enum".fields) |field| {
+        known_operator_mask |= operatorBit(@enumFromInt(field.value));
+    }
+    if ((operator_mask & ~known_operator_mask) != 0) {
+        return error.CacheObservationOperatorInvalid;
+    }
+    return operator_mask;
+}
+
+fn decodeSelectorMask(
+    decoder: *definition_core.cache.Decoder,
+) !u8 {
+    const selector_mask = try decoder.readByte();
+    var known_selector_mask: u8 = 0;
+    inline for (@typeInfo(Selector).@"enum".fields) |field| {
+        known_selector_mask |= @as(u8, 1) << @intCast(field.value);
+    }
+    if ((selector_mask & ~known_selector_mask) != 0) {
+        return error.CacheObservationSelectorInvalid;
+    }
+    return selector_mask;
+}
+
+fn decodeBounds(
+    decoder: *definition_core.cache.Decoder,
+) !Bounds {
+    const bounds = Bounds{
+        .max_rows = try decoder.readUsize(),
+        .max_output_bytes = try decoder.readUsize(),
+        .max_fold_states = try decoder.readUsize(),
+        .max_input_bytes = try decoder.readUsize(),
+        .max_graph_depth = try decoder.readUsize(),
+        .max_graph_nodes = try decoder.readUsize(),
+        .max_diagnostics = try decoder.readUsize(),
+    };
+    try validateBounds(bounds);
+    return bounds;
 }
 
 fn decodeCacheRelations(
@@ -1088,74 +1208,113 @@ fn decodeCacheSteps(
         allocator.free(steps);
     }
     for (steps) |*step| {
-        const operator = try decoder.readEnum(Operator);
-        if ((operator_mask & operatorBit(operator)) == 0 or
-            isExpressionOperator(operator))
-        {
-            return error.CacheObservationOperatorInvalid;
-        }
-        const output_name = try decoder.readOptionalBytesAlloc(
+        step.* = try decodeCacheStep(
             allocator,
-            128,
+            decoder,
+            operator_mask,
+            steps[0..initialized],
+            relations,
+            inputs,
         );
-        errdefer if (output_name) |value| allocator.free(value);
-        const output = output_name orelse
-            return error.PipelineStageOutputMissing;
-        try definition_core.json.safeIdentifier(output, 128);
-        if (relationNameExists(steps[0..initialized], inputs, relations, output)) {
-            return error.DuplicatePipelineRelation;
-        }
-        const input_count = try decoder.readCount(16);
-        const expected_input_count: usize = switch (operator) {
-            .scan => 0,
-            .join, .union_relations, .temporal_correlate => if (input_count >= 2)
-                input_count
-            else
-                return error.InvalidPipelineInputCount,
-            else => 1,
-        };
-        if (input_count != expected_input_count) {
-            return error.InvalidPipelineInputCount;
-        }
-        const input_names = try allocator.alloc([]u8, input_count);
-        var input_initialized: usize = 0;
-        errdefer {
-            for (input_names[0..input_initialized]) |name| {
-                allocator.free(name);
-            }
-            allocator.free(input_names);
-        }
-        for (input_names) |*name| {
-            name.* = try decoder.readBytesAlloc(allocator, 128);
-            errdefer allocator.free(name.*);
-            try definition_core.json.safeIdentifier(name.*, 128);
-            if (!relationNameExists(
-                steps[0..initialized],
-                inputs,
-                relations,
-                name.*,
-            )) return error.UnknownPipelineInput;
-            input_initialized += 1;
-        }
-        const canonical_config = try decoder.readBytesAlloc(
-            allocator,
-            4 * 1024 * 1024,
-        );
-        errdefer allocator.free(canonical_config);
-        if (canonical_config.len == 0 or
-            !std.unicode.utf8ValidateSlice(canonical_config))
-        {
-            return error.CacheCanonicalConfigInvalid;
-        }
-        step.* = .{
-            .operator = operator,
-            .output_name = output_name,
-            .input_names = input_names,
-            .canonical_config = canonical_config,
-        };
         initialized += 1;
     }
     return steps;
+}
+
+fn decodeCacheStep(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    operator_mask: u32,
+    prior_steps: []const Step,
+    relations: []const RelationRequirement,
+    inputs: []const ExternalInput,
+) !Step {
+    const operator = try decoder.readEnum(Operator);
+    if ((operator_mask & operatorBit(operator)) == 0 or
+        isExpressionOperator(operator))
+    {
+        return error.CacheObservationOperatorInvalid;
+    }
+    const output_name = try decoder.readOptionalBytesAlloc(
+        allocator,
+        128,
+    );
+    errdefer if (output_name) |value| allocator.free(value);
+    const output = output_name orelse
+        return error.PipelineStageOutputMissing;
+    try definition_core.json.safeIdentifier(output, 128);
+    if (relationNameExists(prior_steps, inputs, relations, output)) {
+        return error.DuplicatePipelineRelation;
+    }
+    const input_names = try decodeCacheStepInputs(
+        allocator,
+        decoder,
+        operator,
+        prior_steps,
+        relations,
+        inputs,
+    );
+    errdefer deinitStrings(allocator, input_names);
+    const canonical_config = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(canonical_config);
+    if (canonical_config.len == 0 or
+        !std.unicode.utf8ValidateSlice(canonical_config))
+    {
+        return error.CacheCanonicalConfigInvalid;
+    }
+    return .{
+        .operator = operator,
+        .output_name = output_name,
+        .input_names = input_names,
+        .canonical_config = canonical_config,
+    };
+}
+
+fn decodeCacheStepInputs(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    operator: Operator,
+    prior_steps: []const Step,
+    relations: []const RelationRequirement,
+    inputs: []const ExternalInput,
+) ![][]u8 {
+    const input_count = try decoder.readCount(16);
+    const expected_input_count: usize = switch (operator) {
+        .scan => 0,
+        .join, .union_relations, .temporal_correlate => if (input_count >= 2)
+            input_count
+        else
+            return error.InvalidPipelineInputCount,
+        else => 1,
+    };
+    if (input_count != expected_input_count) {
+        return error.InvalidPipelineInputCount;
+    }
+    const input_names = try allocator.alloc([]u8, input_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (input_names[0..initialized]) |name| allocator.free(name);
+        allocator.free(input_names);
+    }
+    for (input_names) |*name| {
+        name.* = try decoder.readBytesAlloc(
+            allocator,
+            128,
+        );
+        errdefer allocator.free(name.*);
+        try definition_core.json.safeIdentifier(name.*, 128);
+        if (!relationNameExists(
+            prior_steps,
+            inputs,
+            relations,
+            name.*,
+        )) return error.UnknownPipelineInput;
+        initialized += 1;
+    }
+    return input_names;
 }
 
 fn decodeCacheProjections(
@@ -1332,52 +1491,13 @@ fn decodeCacheForAllocationFailure(
     try decoder.finish();
 }
 
-test "observation definition compiles passive structure into an immutable plan" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "observation.json",
-        .data =
-        \\{
-        \\  "schema":"seq-observation-definition/v1",
-        \\  "id":"example/messages",
-        \\  "requires":{"abi":"seq-observation-abi/v1","operators":["scan","filter","project"]},
-        \\  "parameters":{"needle":{"type":"string","required":true}},
-        \\  "selectors":["root","session-id","since","until"],
-        \\  "relations":[{"name":"messages","fields":["session_id","turn_index","role","text","timestamp","source_event_id","path","private"]}],
-        \\  "inputs":[],
-        \\  "pipeline":[
-        \\    {"op":"scan","relation":"messages","as":"source"},
-        \\    {"op":"filter","input":"source","as":"matched","where":[{"field":"text","op":"contains","param":"needle"}]},
-        \\    {"op":"project","input":"matched","as":"rows","fields":["session_id","turn_index","role","text"]}
-        \\  ],
-        \\  "projections":{"rows":{"relation":"rows","schema":"example-message-rows/v1","fields":["session_id","turn_index","role","text"],"renderers":["json","jsonl","table"]}},
-        \\  "bounds":{"max_rows":100000,"max_output_bytes":16777216,"max_fold_states":256}
-        \\}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "observation.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &closure, "observation.json");
-    defer plan.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("example/messages", plan.id);
-    try std.testing.expect(plan.requires(.scan));
-    try std.testing.expectEqual(@as(usize, 3), plan.steps.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
-    const authority_boundary: definition_core.result.AuthorityBoundary = .{};
-    try std.testing.expect(!authority_boundary.authority_granted);
-
+fn expectDefinitionCacheRoundTrip(plan: *const Plan) !void {
     var encoder = definition_core.cache.Encoder.init(
         std.testing.allocator,
         64 * 1024,
     );
     defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
+    try encodeCache(plan, &encoder);
     const payload = try encoder.toOwnedSlice();
     defer std.testing.allocator.free(payload);
     var decoder = definition_core.cache.Decoder.init(payload);
@@ -1406,13 +1526,101 @@ test "observation definition compiles passive structure into an immutable plan" 
     );
 }
 
+test "observation definition compiles passive structure into an immutable plan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "observation.json",
+        .data =
+        \\{
+        \\  "schema":"seq-observation-definition/v1",
+        \\  "id":"example/messages",
+        \\  "requires":{
+        \\    "abi":"seq-observation-abi/v1",
+        \\    "operators":["scan","filter","project"]
+        \\  },
+        \\  "parameters":{"needle":{"type":"string","required":true}},
+        \\  "selectors":["root","session-id","since","until"],
+        \\  "relations":[{
+        \\    "name":"messages",
+        \\    "fields":[
+        \\      "session_id","turn_index","role","text",
+        \\      "timestamp","source_event_id","path","private"
+        \\    ]
+        \\  }],
+        \\  "inputs":[],
+        \\  "pipeline":[
+        \\    {"op":"scan","relation":"messages","as":"source"},
+        \\    {
+        \\      "op":"filter","input":"source","as":"matched",
+        \\      "where":[{"field":"text","op":"contains","param":"needle"}]
+        \\    },
+        \\    {
+        \\      "op":"project","input":"matched","as":"rows",
+        \\      "fields":["session_id","turn_index","role","text"]
+        \\    }
+        \\  ],
+        \\  "projections":{"rows":{
+        \\    "relation":"rows","schema":"example-message-rows/v1",
+        \\    "fields":["session_id","turn_index","role","text"],
+        \\    "renderers":["json","jsonl","table"]
+        \\  }},
+        \\  "bounds":{
+        \\    "max_rows":100000,
+        \\    "max_output_bytes":16777216,
+        \\    "max_fold_states":256
+        \\  }
+        \\}
+        ,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "observation.json",
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var plan = try compile(std.testing.allocator, &closure, "observation.json");
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("example/messages", plan.id);
+    try std.testing.expect(plan.requires(.scan));
+    try std.testing.expectEqual(@as(usize, 3), plan.steps.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.projections.len);
+    const authority_boundary: definition_core.result.AuthorityBoundary = .{};
+    try std.testing.expect(!authority_boundary.authority_granted);
+    try expectDefinitionCacheRoundTrip(&plan);
+}
+
 test "observation definition rejects undeclared operators and domain relations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "invalid.json",
         .data =
-        \\{"schema":"seq-observation-definition/v1","id":"example/invalid","requires":{"abi":"seq-observation-abi/v1","operators":["scan"]},"selectors":[],"relations":[{"name":"messages","fields":["text"]}],"inputs":[],"pipeline":[{"op":"scan","relation":"messages","as":"source"},{"op":"filter","input":"source","as":"rows","where":[]}],"projections":{"rows":{"relation":"rows","schema":"rows/v1","fields":["text"],"renderers":["json"]}},"bounds":{"max_rows":10,"max_output_bytes":1024,"max_fold_states":1}}
+        \\{
+        \\  "schema":"seq-observation-definition/v1",
+        \\  "id":"example/invalid",
+        \\  "requires":{
+        \\    "abi":"seq-observation-abi/v1",
+        \\    "operators":["scan"]
+        \\  },
+        \\  "selectors":[],
+        \\  "relations":[{"name":"messages","fields":["text"]}],
+        \\  "inputs":[],
+        \\  "pipeline":[
+        \\    {"op":"scan","relation":"messages","as":"source"},
+        \\    {"op":"filter","input":"source","as":"rows","where":[]}
+        \\  ],
+        \\  "projections":{"rows":{
+        \\    "relation":"rows","schema":"rows/v1",
+        \\    "fields":["text"],"renderers":["json"]
+        \\  }},
+        \\  "bounds":{
+        \\    "max_rows":10,
+        \\    "max_output_bytes":1024,
+        \\    "max_fold_states":1
+        \\  }
+        \\}
         ,
     });
     var closure = try definition_core.closure.loadFromDir(
