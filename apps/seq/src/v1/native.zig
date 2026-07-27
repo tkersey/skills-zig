@@ -135,10 +135,94 @@ pub fn run(
     return 0;
 }
 
-fn parseOptions(
-    command: Command,
-    argv: []const []const u8,
-) !Options {
+const NativeOption = enum {
+    current,
+    once,
+    root,
+    path,
+    session_id,
+    prompt,
+    contains,
+    repo,
+    since,
+    until,
+    status,
+    dataset,
+    spec,
+    limit,
+    last,
+    format,
+
+    fn parse(raw: []const u8) !NativeOption {
+        if (std.mem.eql(u8, raw, "--current")) return .current;
+        if (std.mem.eql(u8, raw, "--once")) return .once;
+        if (std.mem.eql(u8, raw, "--root")) return .root;
+        if (std.mem.eql(u8, raw, "--path")) return .path;
+        if (std.mem.eql(u8, raw, "--session-id")) return .session_id;
+        if (std.mem.eql(u8, raw, "--prompt")) return .prompt;
+        if (std.mem.eql(u8, raw, "--contains")) return .contains;
+        if (std.mem.eql(u8, raw, "--repo")) return .repo;
+        if (std.mem.eql(u8, raw, "--since")) return .since;
+        if (std.mem.eql(u8, raw, "--until")) return .until;
+        if (std.mem.eql(u8, raw, "--status")) return .status;
+        if (std.mem.eql(u8, raw, "--dataset")) return .dataset;
+        if (std.mem.eql(u8, raw, "--spec")) return .spec;
+        if (std.mem.eql(u8, raw, "--limit")) return .limit;
+        if (std.mem.eql(u8, raw, "--last")) return .last;
+        if (std.mem.eql(u8, raw, "--format")) return .format;
+        return error.UnknownNativeOption;
+    }
+
+    fn requiresValue(self: NativeOption) bool {
+        return self != .current and self != .once;
+    }
+};
+
+fn applyNativeOption(
+    options: *Options,
+    option: NativeOption,
+    value: ?[]const u8,
+) !void {
+    switch (option) {
+        .current => {
+            if (options.current) return error.DuplicateCurrentSelector;
+            options.current = true;
+        },
+        .once => options.once = true,
+        .root => options.root = value.?,
+        .path => options.path = value.?,
+        .session_id => options.session_id = value.?,
+        .prompt => options.prompt = value.?,
+        .contains => options.contains = value.?,
+        .repo => options.repo = value.?,
+        .since => options.since = value.?,
+        .until => options.until = value.?,
+        .status => options.status = value.?,
+        .dataset => options.dataset = value.?,
+        .spec => options.spec = value.?,
+        .limit => options.limit = try std.fmt.parseUnsigned(
+            usize,
+            value.?,
+            10,
+        ),
+        .last => options.last = value.?,
+        .format => options.format = try Format.parse(value.?),
+    }
+}
+
+fn validateNativeSelectors(options: *Options) !void {
+    if (options.path != null and
+        (options.session_id != null or options.current))
+    {
+        return error.ConflictingSessionSelectors;
+    }
+    if (options.session_id != null and options.current) {
+        return error.ConflictingSessionSelectors;
+    }
+    try resolveTemporalBounds(options);
+}
+
+fn parseOptions(command: Command, argv: []const []const u8) !Options {
     var options = Options{};
     var index: usize = 0;
     if (command == .index and argv.len > 0 and
@@ -148,87 +232,14 @@ fn parseOptions(
         index = 1;
     }
     while (index < argv.len) : (index += 1) {
-        const token = argv[index];
-        if (std.mem.eql(u8, token, "--current")) {
-            if (options.current) return error.DuplicateCurrentSelector;
-            options.current = true;
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--once")) {
-            options.once = true;
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--root")) {
-            options.root = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--path")) {
-            options.path = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--session-id")) {
-            options.session_id = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--prompt")) {
-            options.prompt = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--contains")) {
-            options.contains = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--repo")) {
-            options.repo = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--since")) {
-            options.since = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--until")) {
-            options.until = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--status")) {
-            options.status = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--dataset")) {
-            options.dataset = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--spec")) {
-            options.spec = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--limit")) {
-            options.limit = try std.fmt.parseUnsigned(
-                usize,
-                try optionValue(argv, &index),
-                10,
-            );
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--last")) {
-            options.last = try optionValue(argv, &index);
-            continue;
-        }
-        if (std.mem.eql(u8, token, "--format")) {
-            options.format = try Format.parse(try optionValue(argv, &index));
-            continue;
-        }
-        return error.UnknownNativeOption;
+        const option = try NativeOption.parse(argv[index]);
+        const value = if (option.requiresValue())
+            try optionValue(argv, &index)
+        else
+            null;
+        try applyNativeOption(&options, option, value);
     }
-    if (options.path != null and
-        (options.session_id != null or options.current))
-    {
-        return error.ConflictingSessionSelectors;
-    }
-    if (options.session_id != null and options.current) {
-        return error.ConflictingSessionSelectors;
-    }
-    try resolveTemporalBounds(&options);
+    try validateNativeSelectors(&options);
     return options;
 }
 
@@ -573,6 +584,16 @@ fn runQuery(
         .object => |value| value,
         else => return error.InvalidQuerySpec,
     };
+    return runQueryObject(allocator, writer, io, options, object);
+}
+
+fn runQueryObject(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    io: std.Io,
+    options: Options,
+    object: std.json.ObjectMap,
+) !void {
     const query_options = try queryTargetOptions(options, object);
     var compilation = try compileQuery(allocator, object);
     defer compilation.deinit(allocator);
@@ -594,7 +615,6 @@ fn runQuery(
         output,
     );
     defer runner.deinit();
-
     var paths = try resolveTargetPaths(
         allocator,
         io,
@@ -603,41 +623,13 @@ fn runQuery(
     );
     defer freePaths(allocator, &paths);
     for (paths.items) |path| {
-        var trace = if (compilation.relation == .sessions)
-            try trace_core.parseSessionSummaryTrace(
-                allocator,
-                path,
-                traceOptions(compilation.relation),
-            )
-        else
-            try trace_core.parseSessionTrace(
-                allocator,
-                path,
-                traceOptions(compilation.relation),
-            );
-        defer trace.deinit(allocator);
-        if (!sessionPasses(trace.session, query_options)) continue;
-        const feed_result = switch (compilation.relation) {
-            .structured_documents, .structured_values => result: {
-                var index = try structured.build(
-                    allocator,
-                    &trace,
-                    compilation.relation == .structured_values,
-                    .{},
-                );
-                defer index.deinit(allocator);
-                break :result try structured.feed(
-                    &runner,
-                    &compilation.program,
-                    &index,
-                );
-            },
-            else => try trace_adapter.feedTrace(
-                &runner,
-                &compilation.program,
-                &trace,
-            ),
-        };
+        const feed_result = try feedQueryPath(
+            allocator,
+            path,
+            query_options,
+            &compilation,
+            &runner,
+        );
         if (feed_result == .stop) break;
     }
     const result = try runner.finish();
@@ -647,6 +639,50 @@ fn runQuery(
         compilation.output_names,
         compilation.format,
     );
+}
+
+fn feedQueryPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    compilation: *const QueryCompilation,
+    runner: *execution.Runner,
+) !execution.Feed {
+    var trace = if (compilation.relation == .sessions)
+        try trace_core.parseSessionSummaryTrace(
+            allocator,
+            path,
+            traceOptions(compilation.relation),
+        )
+    else
+        try trace_core.parseSessionTrace(
+            allocator,
+            path,
+            traceOptions(compilation.relation),
+        );
+    defer trace.deinit(allocator);
+    if (!sessionPasses(trace.session, options)) return .continue_scanning;
+    return switch (compilation.relation) {
+        .structured_documents, .structured_values => result: {
+            var index = try structured.build(
+                allocator,
+                &trace,
+                compilation.relation == .structured_values,
+                .{},
+            );
+            defer index.deinit(allocator);
+            break :result try structured.feed(
+                runner,
+                &compilation.program,
+                &index,
+            );
+        },
+        else => try trace_adapter.feedTrace(
+            runner,
+            &compilation.program,
+            &trace,
+        ),
+    };
 }
 
 fn loadQuerySpecAlloc(
@@ -724,84 +760,22 @@ fn compileQuery(
     defer output_names.deinit(allocator);
     var output_fields: std.ArrayList(u16) = .empty;
     defer output_fields.deinit(allocator);
-    if (object.get("select")) |select_value| {
-        const select = switch (select_value) {
-            .array => |value| value,
-            else => return error.InvalidQuerySelect,
-        };
-        if (select.items.len == 0) return error.EmptyQuerySelect;
-        for (select.items) |item| {
-            const name = try jsonString(item, error.InvalidQuerySelect);
-            try output_names.append(allocator, name);
-            try output_fields.append(allocator, try demand.add(name));
-        }
-    } else {
-        for (relation.fields()) |field| {
-            try output_names.append(allocator, field.name);
-            try output_fields.append(allocator, try demand.add(field.name));
-        }
-    }
+    try appendQueryOutputFields(
+        allocator,
+        object,
+        relation,
+        &demand,
+        &output_names,
+        &output_fields,
+    );
 
     var predicates: std.ArrayList(execution.RuntimePredicate) = .empty;
     defer predicates.deinit(allocator);
-    if (object.get("where")) |where_value| {
-        const where = switch (where_value) {
-            .array => |value| value,
-            else => return error.InvalidQueryWhere,
-        };
-        if (where.items.len > 128) return error.TooManyQueryPredicates;
-        for (where.items) |item| {
-            const clause = switch (item) {
-                .object => |value| value,
-                else => return error.InvalidQueryWhere,
-            };
-            const field = try jsonString(
-                clause.get("field") orelse return error.MissingQueryField,
-                error.InvalidQueryField,
-            );
-            const operator = try queryPredicateOperator(
-                if (clause.get("op")) |value|
-                    try jsonString(value, error.InvalidQueryOperator)
-                else
-                    "eq",
-            );
-            const operand = try queryValue(
-                clause.get("value") orelse return error.MissingQueryValue,
-            );
-            const case_insensitive = if (clause.get("case_insensitive")) |value|
-                try jsonBool(value, error.InvalidQueryCaseFlag)
-            else
-                false;
-            try predicates.append(allocator, .{
-                .field_index = try demand.add(field),
-                .operator = operator,
-                .operand = operand,
-                .case_insensitive = case_insensitive,
-            });
-        }
-    }
+    try appendQueryPredicates(allocator, object, &demand, &predicates);
 
     var sort_keys: std.ArrayList(execution.RuntimeSortKey) = .empty;
     defer sort_keys.deinit(allocator);
-    if (object.get("sort")) |sort_value| {
-        const sort = switch (sort_value) {
-            .array => |value| value,
-            else => return error.InvalidQuerySort,
-        };
-        if (sort.items.len > 32) return error.TooManyQuerySortKeys;
-        for (sort.items) |item| {
-            const raw = try jsonString(item, error.InvalidQuerySort);
-            if (raw.len == 0) return error.InvalidQuerySort;
-            const descending = raw[0] == '-';
-            const name = if (descending) raw[1..] else raw;
-            if (name.len == 0) return error.InvalidQuerySort;
-            try sort_keys.append(allocator, .{
-                .field_index = try demand.add(name),
-                .direction = if (descending) .descending else .ascending,
-                .nulls = .last,
-            });
-        }
-    }
+    try appendQuerySortKeys(allocator, object, &demand, &sort_keys);
 
     const limit = if (object.get("limit")) |value|
         try queryLimit(value)
@@ -811,24 +785,141 @@ fn compileQuery(
         try queryFormat(try jsonString(value, error.InvalidQueryFormat))
     else
         .json;
-    var operations: std.ArrayList(execution.RuntimeOperation) = .empty;
-    defer operations.deinit(allocator);
-    if (predicates.items.len != 0) {
-        try operations.append(allocator, .{
-            .filter = .{
-                .start = 0,
-                .len = @intCast(predicates.items.len),
-            },
+    return finishQueryCompilation(
+        allocator,
+        relation,
+        &demand,
+        &output_names,
+        &output_fields,
+        &predicates,
+        &sort_keys,
+        limit,
+        format,
+    );
+}
+
+fn appendQueryOutputFields(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    relation: physical.Relation,
+    demand: *Demand,
+    names: *std.ArrayList([]const u8),
+    fields: *std.ArrayList(u16),
+) !void {
+    if (object.get("select")) |select_value| {
+        const select = switch (select_value) {
+            .array => |value| value,
+            else => return error.InvalidQuerySelect,
+        };
+        if (select.items.len == 0) return error.EmptyQuerySelect;
+        for (select.items) |item| {
+            const name = try jsonString(item, error.InvalidQuerySelect);
+            try names.append(allocator, name);
+            try fields.append(allocator, try demand.add(name));
+        }
+        return;
+    }
+    for (relation.fields()) |field| {
+        try names.append(allocator, field.name);
+        try fields.append(allocator, try demand.add(field.name));
+    }
+}
+
+fn appendQueryPredicates(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    demand: *Demand,
+    predicates: *std.ArrayList(execution.RuntimePredicate),
+) !void {
+    const where_value = object.get("where") orelse return;
+    const where = switch (where_value) {
+        .array => |value| value,
+        else => return error.InvalidQueryWhere,
+    };
+    if (where.items.len > 128) return error.TooManyQueryPredicates;
+    for (where.items) |item| {
+        const clause = switch (item) {
+            .object => |value| value,
+            else => return error.InvalidQueryWhere,
+        };
+        const field = try jsonString(
+            clause.get("field") orelse return error.MissingQueryField,
+            error.InvalidQueryField,
+        );
+        const operator = try queryPredicateOperator(
+            if (clause.get("op")) |value|
+                try jsonString(value, error.InvalidQueryOperator)
+            else
+                "eq",
+        );
+        const operand = try queryValue(
+            clause.get("value") orelse return error.MissingQueryValue,
+        );
+        const case_insensitive =
+            if (clause.get("case_insensitive")) |value|
+                try jsonBool(value, error.InvalidQueryCaseFlag)
+            else
+                false;
+        try predicates.append(allocator, .{
+            .field_index = try demand.add(field),
+            .operator = operator,
+            .operand = operand,
+            .case_insensitive = case_insensitive,
         });
     }
-    var first_blocking_operation: ?u16 = null;
-    if (sort_keys.items.len != 0) {
-        first_blocking_operation = @intCast(operations.items.len);
+}
+
+fn appendQuerySortKeys(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    demand: *Demand,
+    sort_keys: *std.ArrayList(execution.RuntimeSortKey),
+) !void {
+    const sort_value = object.get("sort") orelse return;
+    const sort = switch (sort_value) {
+        .array => |value| value,
+        else => return error.InvalidQuerySort,
+    };
+    if (sort.items.len > 32) return error.TooManyQuerySortKeys;
+    for (sort.items) |item| {
+        const raw = try jsonString(item, error.InvalidQuerySort);
+        if (raw.len == 0) return error.InvalidQuerySort;
+        const descending = raw[0] == '-';
+        const name = if (descending) raw[1..] else raw;
+        if (name.len == 0) return error.InvalidQuerySort;
+        try sort_keys.append(allocator, .{
+            .field_index = try demand.add(name),
+            .direction = if (descending) .descending else .ascending,
+            .nulls = .last,
+        });
+    }
+}
+
+const QueryOperations = struct {
+    items: []execution.RuntimeOperation,
+    first_blocking: ?u16,
+    limit_state_count: u16,
+    max_rows: usize,
+};
+
+fn buildQueryOperations(
+    allocator: std.mem.Allocator,
+    predicate_count: usize,
+    sort_count: usize,
+    limit: usize,
+) !QueryOperations {
+    var operations: std.ArrayList(execution.RuntimeOperation) = .empty;
+    defer operations.deinit(allocator);
+    if (predicate_count != 0) {
         try operations.append(allocator, .{
-            .sort = .{
-                .start = 0,
-                .len = @intCast(sort_keys.items.len),
-            },
+            .filter = .{ .start = 0, .len = @intCast(predicate_count) },
+        });
+    }
+    var first_blocking: ?u16 = null;
+    if (sort_count != 0) {
+        first_blocking = @intCast(operations.items.len);
+        try operations.append(allocator, .{
+            .sort = .{ .start = 0, .len = @intCast(sort_count) },
         });
     }
     if (limit != 0) {
@@ -836,18 +927,40 @@ fn compileQuery(
             .limit = .{ .count = limit, .state_index = 0 },
         });
     }
+    return .{
+        .items = try operations.toOwnedSlice(allocator),
+        .first_blocking = first_blocking,
+        .limit_state_count = if (limit == 0) 0 else 1,
+        .max_rows = if (first_blocking == null and limit != 0)
+            limit
+        else
+            100_000,
+    };
+}
 
-    const max_rows: usize = if (first_blocking_operation == null and limit != 0)
-        limit
-    else
-        100_000;
+fn finishQueryCompilation(
+    allocator: std.mem.Allocator,
+    relation: physical.Relation,
+    demand: *const Demand,
+    output_names: *std.ArrayList([]const u8),
+    output_fields: *std.ArrayList(u16),
+    predicates: *std.ArrayList(execution.RuntimePredicate),
+    sort_keys: *std.ArrayList(execution.RuntimeSortKey),
+    limit: usize,
+    format: QueryFormat,
+) !QueryCompilation {
+    const operation_set = try buildQueryOperations(
+        allocator,
+        predicates.items.len,
+        sort_keys.items.len,
+        limit,
+    );
+    errdefer allocator.free(operation_set.items);
     const source_fields = try allocator.dupe(
         u16,
         demand.physical_indices[0..demand.count],
     );
     errdefer allocator.free(source_fields);
-    const owned_operations = try operations.toOwnedSlice(allocator);
-    errdefer allocator.free(owned_operations);
     const owned_predicates = try predicates.toOwnedSlice(allocator);
     errdefer allocator.free(owned_predicates);
     const owned_sort_keys = try sort_keys.toOwnedSlice(allocator);
@@ -870,15 +983,15 @@ fn compileQuery(
             .source_width = @intCast(demand.count),
             .source_field_indices = source_fields,
             .source_row_bound = null,
-            .operations = owned_operations,
+            .operations = operation_set.items,
             .predicates = owned_predicates,
             .sort_keys = owned_sort_keys,
             .distinct_fields = distinct_fields,
             .aggregate_metrics = aggregate_metrics,
             .output_field_indices = owned_output_fields,
-            .limit_state_count = if (limit == 0) 0 else 1,
-            .first_blocking_operation = first_blocking_operation,
-            .max_rows = max_rows,
+            .limit_state_count = operation_set.limit_state_count,
+            .first_blocking_operation = operation_set.first_blocking,
+            .max_rows = operation_set.max_rows,
         },
         .output_names = owned_output_names,
         .relation = relation,
