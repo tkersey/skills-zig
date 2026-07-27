@@ -51,7 +51,7 @@ jq -e \
       (keys | sort) ==
         ["candidate", "candidate_digest", "error", "expect", "id", "patch", "setup"] and
       (.id | type == "string" and test("^[A-Za-z0-9._-]+$")) and
-      .setup == "accepted-debt" and
+      (.setup == "accepted-debt" or .setup == "rejected-review") and
       (.candidate == "construction-successor" or
        .candidate == "goal-successor") and
       (.expect == "valid" or .expect == "invalid") and
@@ -159,9 +159,10 @@ transact_success() {
     "$result" >/dev/null
 }
 
-setup_accepted_debt() {
+setup_review() {
   local case_tmp=$1
   local repo_root=$2
+  local review_status=$3
   local goal_source="$case_tmp/goal-source.json"
   local goal_result="$case_tmp/goal-result.json"
   local goal_request="$case_tmp/goal-request.json"
@@ -235,6 +236,7 @@ setup_accepted_debt() {
   jq -S -c \
     --arg construction "$construction_artifact_id" \
     --arg subject "$subject_digest" \
+    --arg status "$review_status" \
     '
       .artifact.artifact_id = null |
       .artifact.goal_id = "goal-1" |
@@ -243,7 +245,8 @@ setup_accepted_debt() {
       .artifact.payload.subject.artifact_digest = $subject |
       .artifact.payload.classes[0].class_id = "class-1" |
       .artifact.payload.classes[0].law_ref = "law-1" |
-      .artifact.payload.classes[0].owner_boundary = "owner"
+      .artifact.payload.classes[0].owner_boundary = "owner" |
+      .artifact.payload.classes[0].status = $status
     ' \
     "$counterexample_source" >"$counterexample_bound"
   materialize_source \
@@ -384,14 +387,18 @@ run_candidate() {
 }
 
 case_count=0
-while IFS=$'\t' read -r case_id candidate_kind expectation expected_error expected_digest; do
+while IFS=$'\t' read -r case_id setup candidate_kind expectation expected_error expected_digest; do
   case_count=$((case_count + 1))
   case_tmp="$scenario_tmp/$case_id"
   repo_root="$case_tmp/repo"
   mkdir -p "$repo_root"
   repo_root=$(cd "$repo_root" && pwd -P)
 
-  setup_accepted_debt "$case_tmp" "$repo_root"
+  review_status=accepted
+  if [[ "$setup" == "rejected-review" ]]; then
+    review_status=rejected
+  fi
+  setup_review "$case_tmp" "$repo_root" "$review_status"
   prepare_candidate "$case_id" "$candidate_kind" "$case_tmp"
   actual_digest="sha256:$(shasum -a 256 "$case_tmp/candidate.json" | awk '{print $1}')"
   if [[ "$actual_digest" != "$expected_digest" ]]; then
@@ -442,7 +449,7 @@ while IFS=$'\t' read -r case_id candidate_kind expectation expected_error expect
 done < <(
   jq -r \
     '.cases[] |
-     [.id, .candidate, .expect, (.error // "-"), .candidate_digest] |
+     [.id, .setup, .candidate, .expect, (.error // "-"), .candidate_digest] |
      @tsv' \
     "$scenarios"
 )
