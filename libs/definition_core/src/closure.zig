@@ -294,6 +294,7 @@ fn parseDefinition(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     ) catch |err| switch (err) {
         error.DuplicateField => return error.DuplicateDefinitionField,
@@ -970,7 +971,7 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "root.json",
         .data =
-        \\{"schema":"example/v1","imports":[{"id":"b","path":"nested/b.json"},"a.json"],"z":1,"a":2}
+        \\{"schema":"example/v1","imports":[{"id":"b","path":"nested/b.json"},"a.json"],"z":9007199254740992.1,"a":2}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -991,7 +992,7 @@ test "closure is canonical, deterministically ordered, and content addressed" {
     try std.testing.expectEqualStrings(
         "{\"a\":2,\"imports\":[{\"id\":\"b\"," ++
             "\"path\":\"nested/b.json\"},\"a.json\"]," ++
-            "\"schema\":\"example/v1\",\"z\":1}",
+            "\"schema\":\"example/v1\",\"z\":9007199254740992.1}",
         closure.files[2].canonical_json,
     );
     try std.testing.expect(canonical_json.isFingerprint(closure.digestSlice()));

@@ -761,6 +761,7 @@ fn applyWithParameters(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();
@@ -935,13 +936,10 @@ fn validateChainedSequence(
 ) !void {
     const value = object.get(plan.envelope.sequence_key) orelse
         return error.EventEnvelopeFieldMissing;
-    const sequence = switch (value) {
-        .integer => |number| if (number >= 0)
-            @as(u64, @intCast(number))
-        else
-            return error.InvalidEventSequence,
-        else => return error.InvalidEventSequence,
-    };
+    const number = definition_core.json.integer(value) catch
+        return error.InvalidEventSequence;
+    const sequence = std.math.cast(u64, number) orelse
+        return error.InvalidEventSequence;
     if (sequence != state.next_sequence) {
         return error.EventSequenceMismatch;
     }
@@ -1016,8 +1014,11 @@ fn validatePartitionValues(
             .timestamp => |expected| stringValueEquals(actual, expected),
             .safe_identifier => |expected| stringValueEquals(actual, expected),
             .relative_path => |expected| stringValueEquals(actual, expected),
-            .integer => |expected| actual == .integer and
-                actual.integer == expected,
+            .integer => |expected| integer: {
+                const actual_integer = definition_core.json.integer(actual) catch
+                    break :integer false;
+                break :integer actual_integer == expected;
+            },
             .boolean => |expected| actual == .bool and
                 actual.bool == expected,
         };
@@ -1756,11 +1757,10 @@ fn collectReconstructedField(
             value,
             prefix,
         ),
-        .unix_seconds => switch (value) {
-            .integer => |timestamp| {
-                if (timestamp < 0) return error.InvalidEventUnixTimestamp;
-            },
-            else => return error.InvalidEventUnixTimestamp,
+        .unix_seconds => {
+            const timestamp = definition_core.json.integer(value) catch
+                return error.InvalidEventUnixTimestamp;
+            if (timestamp < 0) return error.InvalidEventUnixTimestamp;
         },
         .derived => {
             if (value != .string) return error.EventDerivedValueInvalid;
@@ -2558,7 +2558,10 @@ fn advanceEventJsonValue(
                 number,
             );
         },
-        .number_string => return error.NumberOutOfRange,
+        .number_string => |number| try definition_core.exact_number.writeCanonical(
+            writer,
+            number,
+        ),
         .string => |text| try writeEventJsonString(
             writer,
             text,

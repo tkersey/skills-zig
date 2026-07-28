@@ -577,6 +577,7 @@ pub fn compile(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();
@@ -2315,6 +2316,7 @@ fn compileOperation(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();

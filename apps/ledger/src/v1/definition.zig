@@ -449,6 +449,7 @@ fn compileAtDepth(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();

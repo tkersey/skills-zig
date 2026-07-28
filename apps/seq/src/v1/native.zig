@@ -1039,7 +1039,7 @@ fn buildQueryOperations(
     defer operations.deinit(allocator);
     if (predicate_count != 0) {
         try operations.append(allocator, .{
-            .filter = .{ .start = 0, .len = @intCast(predicate_count) },
+            .filter_all = .{ .start = 0, .len = @intCast(predicate_count) },
         });
     }
     var first_blocking: ?u16 = null;
@@ -1562,7 +1562,9 @@ fn traceOptions(relation: physical.Relation) trace_core.TraceParseOptions {
     return .{
         .include_raw = relation == .source_events,
         .include_occurrences = relation == .source_events or
-            relation == .messages or relation == .token_events,
+            relation == .messages or relation == .tool_invocations or
+            relation == .tool_results or relation == .structured_documents or
+            relation == .structured_values or relation == .token_events,
         .include_token_events = relation == .token_events,
         .include_message_bodies = relation == .turns or
             relation == .messages,
@@ -1576,6 +1578,20 @@ fn environmentValue(
     const map = environment orelse return null;
     const value = map.get(key) orelse return null;
     return if (value.len == 0) null else value;
+}
+
+test "relations that expose source event identity retain occurrences" {
+    inline for ([_]physical.Relation{
+        .source_events,
+        .messages,
+        .tool_invocations,
+        .tool_results,
+        .structured_documents,
+        .structured_values,
+        .token_events,
+    }) |relation| {
+        try std.testing.expect(traceOptions(relation).include_occurrences);
+    }
 }
 
 test "final native command registry is physical only" {

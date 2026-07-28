@@ -1182,6 +1182,7 @@ fn parseRule(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     if (parsed.value != .object) {

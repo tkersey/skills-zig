@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)
 bin_path=${1:-"$root_dir/zig-out/bin/seq"}
 
 if [[ ! -x "$bin_path" ]]; then

@@ -244,6 +244,7 @@ pub fn compile(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();
@@ -596,13 +597,14 @@ fn parseStep(
 ) !Step {
     const object = try definition_core.json.object(item);
     try definition_core.json.requireExactKeys(object, &.{
-        "op",     "input",    "inputs",
-        "as",     "name",     "relation",
-        "fields", "where",    "on",
-        "keys",   "metrics",  "by",
-        "limit",  "depth",    "max_nodes",
-        "state",  "order_by", "transitions",
-        "emit",   "window",   "classifications",
+        "op",              "input", "inputs",
+        "as",              "name",  "relation",
+        "fields",          "where", "where_mode",
+        "on",              "keys",  "metrics",
+        "by",              "limit", "depth",
+        "max_nodes",       "state", "order_by",
+        "transitions",     "emit",  "window",
+        "classifications",
     });
     const operator_name = try definition_core.json.requiredString(
         object,

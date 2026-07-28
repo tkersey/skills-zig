@@ -270,6 +270,8 @@ pub const Plan = struct {
     inputs: []definition.Input,
     pointers: []Pointer,
     rules: []CompiledRule,
+    root_shared_prefixes: []u16,
+    max_root_pointer_depth: u16,
     max_input_bytes: usize,
     max_records: usize,
     max_diagnostics: usize,
@@ -281,9 +283,64 @@ pub const Plan = struct {
         allocator.free(self.pointers);
         for (self.rules) |*rule| rule.deinit(allocator);
         allocator.free(self.rules);
+        allocator.free(self.root_shared_prefixes);
         self.* = undefined;
     }
 };
+
+const RootTraversal = struct {
+    shared_prefixes: []u16,
+    max_depth: u16,
+
+    fn deinit(self: RootTraversal, allocator: std.mem.Allocator) void {
+        allocator.free(self.shared_prefixes);
+    }
+};
+
+fn compileRootTraversal(
+    allocator: std.mem.Allocator,
+    pointers: []const Pointer,
+    rules: []const CompiledRule,
+) !RootTraversal {
+    const shared_prefixes = try allocator.alloc(u16, rules.len);
+    errdefer allocator.free(shared_prefixes);
+    var prior_input_index: ?u8 = null;
+    var prior_pointer_id: ?u16 = null;
+    var largest_depth: usize = 0;
+    for (rules, 0..) |rule, index| {
+        const depth = if (rule.pointer_id) |pointer_id|
+            pointers[pointer_id].segments.len
+        else
+            0;
+        if (depth > 1024) return error.JsonPointerTooDeep;
+        largest_depth = @max(largest_depth, depth);
+        shared_prefixes[index] =
+            if (prior_input_index == rule.input_index)
+                if (prior_pointer_id) |prior_id|
+                    if (rule.pointer_id) |pointer_id|
+                        @intCast(commonPointerDepth(
+                            pointers[prior_id],
+                            pointers[pointer_id],
+                        ))
+                    else
+                        0
+                else
+                    0
+            else
+                0;
+        if (rule.operator == .implies and rule.children.len != 0) {
+            prior_input_index = null;
+            prior_pointer_id = null;
+        } else {
+            prior_input_index = rule.input_index;
+            prior_pointer_id = rule.pointer_id;
+        }
+    }
+    return .{
+        .shared_prefixes = shared_prefixes,
+        .max_depth = @intCast(largest_depth),
+    };
+}
 
 const Builder = struct {
     allocator: std.mem.Allocator,
@@ -439,6 +496,7 @@ const Builder = struct {
             .{
                 .allocate = .alloc_always,
                 .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
             },
         );
         defer parsed.deinit();
@@ -2442,10 +2500,22 @@ pub fn compile(
         allocator.free(pointers);
     }
     const rules = try builder.rules.toOwnedSlice(allocator);
+    errdefer {
+        for (rules) |*rule| rule.deinit(allocator);
+        allocator.free(rules);
+    }
+    const root_traversal = try compileRootTraversal(
+        allocator,
+        pointers,
+        rules,
+    );
+    errdefer root_traversal.deinit(allocator);
     return .{
         .inputs = inputs,
         .pointers = pointers,
         .rules = rules,
+        .root_shared_prefixes = root_traversal.shared_prefixes,
+        .max_root_pointer_depth = root_traversal.max_depth,
         .max_input_bytes = definition_plan.bounds.max_input_bytes,
         .max_records = definition_plan.bounds.max_records,
         .max_diagnostics = definition_plan.bounds.max_diagnostics,
@@ -2492,10 +2562,22 @@ pub fn compileEmbedded(
         allocator.free(pointers);
     }
     const compiled_rules = try builder.rules.toOwnedSlice(allocator);
+    errdefer {
+        for (compiled_rules) |*rule| rule.deinit(allocator);
+        allocator.free(compiled_rules);
+    }
+    const root_traversal = try compileRootTraversal(
+        allocator,
+        pointers,
+        compiled_rules,
+    );
+    errdefer root_traversal.deinit(allocator);
     return .{
         .inputs = owned_inputs,
         .pointers = pointers,
         .rules = compiled_rules,
+        .root_shared_prefixes = root_traversal.shared_prefixes,
+        .max_root_pointer_depth = root_traversal.max_depth,
         .max_input_bytes = max_input_bytes,
         .max_records = max_records,
         .max_diagnostics = max_diagnostics,
@@ -2995,6 +3077,12 @@ fn decodeCachePlan(
         for (rules) |*rule| rule.deinit(allocator);
         allocator.free(rules);
     }
+    const root_traversal = try compileRootTraversal(
+        allocator,
+        pointers,
+        rules,
+    );
+    errdefer root_traversal.deinit(allocator);
     const max_input_bytes = try decoder.readUsize();
     const max_records = try decoder.readUsize();
     const max_diagnostics = try decoder.readUsize();
@@ -3008,6 +3096,8 @@ fn decodeCachePlan(
         .inputs = inputs,
         .pointers = pointers,
         .rules = rules,
+        .root_shared_prefixes = root_traversal.shared_prefixes,
+        .max_root_pointer_depth = root_traversal.max_depth,
         .max_input_bytes = max_input_bytes,
         .max_records = max_records,
         .max_diagnostics = max_diagnostics,
@@ -5224,6 +5314,10 @@ fn applyRules(
     };
     var stack: [17]RuleFrame = undefined;
     var stack_len: usize = 1;
+    var pointer_ancestors: [1025]?std.json.Value = undefined;
+    if (plan.max_root_pointer_depth >= pointer_ancestors.len) {
+        return error.JsonPointerTooDeep;
+    }
     stack[0] = .{ .rules = rules };
     while (stack_len != 0) {
         const frame = &stack[stack_len - 1];
@@ -5231,7 +5325,8 @@ fn applyRules(
             stack_len -= 1;
             continue;
         }
-        const rule = &frame.rules[frame.next_index];
+        const rule_index = frame.next_index;
+        const rule = &frame.rules[rule_index];
         frame.next_index += 1;
         if (rule.operator == .implies and rule.children.len != 0) {
             const root = loaded[rule.input_index].json() orelse continue;
@@ -5244,14 +5339,105 @@ fn applyRules(
             }
             continue;
         }
-        try applyRule(
-            allocator,
-            plan,
-            loaded,
-            rule,
-            diagnostics,
-        );
+        if (stack_len == 1) {
+            try applyRootRule(
+                allocator,
+                plan,
+                loaded,
+                rule,
+                rule_index,
+                &pointer_ancestors,
+                diagnostics,
+            );
+        } else {
+            try applyRule(
+                allocator,
+                plan,
+                loaded,
+                rule,
+                diagnostics,
+            );
+        }
     }
+}
+
+fn applyRootRule(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rule: *const CompiledRule,
+    rule_index: usize,
+    pointer_ancestors: *[1025]?std.json.Value,
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
+    const root = loaded[rule.input_index].json() orelse return;
+    const target = if (rule.pointer_id) |pointer_id| blk: {
+        const pointer = plan.pointers[pointer_id];
+        if (pointer.segments.len >= pointer_ancestors.len) {
+            return error.JsonPointerTooDeep;
+        }
+        const shared_prefix = plan.root_shared_prefixes[rule_index];
+        pointer_ancestors[0] = root;
+        var current = pointer_ancestors[shared_prefix];
+        for (
+            pointer.segments[shared_prefix..],
+            shared_prefix + 1..,
+        ) |segment, depth| {
+            current = if (current) |parent|
+                resolvePointerSegment(parent, segment)
+            else
+                null;
+            pointer_ancestors[depth] = current;
+        }
+        break :blk current;
+    } else blk: {
+        pointer_ancestors[0] = root;
+        break :blk root;
+    };
+    try applyResolvedRule(
+        allocator,
+        plan,
+        loaded,
+        rule,
+        root,
+        target,
+        diagnostics,
+    );
+}
+
+fn commonPointerDepth(left: Pointer, right: Pointer) usize {
+    const maximum = @min(left.segments.len, right.segments.len);
+    var depth: usize = 0;
+    while (depth < maximum and
+        std.mem.eql(u8, left.segments[depth], right.segments[depth])) : (depth += 1)
+    {}
+    return depth;
+}
+
+fn resolvePointerSegment(
+    parent: std.json.Value,
+    segment: []const u8,
+) ?std.json.Value {
+    return switch (parent) {
+        .object => |object| object.get(segment),
+        .array => |array| blk: {
+            if (segment.len == 0 or
+                (segment.len > 1 and segment[0] == '0'))
+            {
+                break :blk null;
+            }
+            const index = std.fmt.parseInt(
+                usize,
+                segment,
+                10,
+            ) catch break :blk null;
+            break :blk if (index < array.items.len)
+                array.items[index]
+            else
+                null;
+        },
+        else => null,
+    };
 }
 
 fn applyRule(
@@ -5266,6 +5452,26 @@ fn applyRule(
         resolve(root, plan.pointers[pointer_id])
     else
         root;
+    return applyResolvedRule(
+        allocator,
+        plan,
+        loaded,
+        rule,
+        root,
+        target,
+        diagnostics,
+    );
+}
+
+fn applyResolvedRule(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rule: *const CompiledRule,
+    root: std.json.Value,
+    target: ?std.json.Value,
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
     const path = if (rule.pointer_id) |pointer_id| plan.pointers[pointer_id].raw else "";
     const valid = (try evaluateRule(.{
         .allocator = allocator,
@@ -5293,7 +5499,7 @@ const RuleEvaluationContext = struct {
     target: ?std.json.Value,
 };
 
-fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
+inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
     return switch (context.rule.operator) {
         .required_field,
         .field_absent,
@@ -5330,7 +5536,7 @@ fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
     };
 }
 
-fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
+inline fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
     const rule = context.rule;
     const target = context.target;
     return switch (rule.operator) {
@@ -5397,7 +5603,7 @@ fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
     };
 }
 
-fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
+inline fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
     const rule = context.rule;
     return switch (rule.operator) {
         .keyed_unique => if (rule.reference_sources.len == 0)
@@ -5456,7 +5662,7 @@ fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
     };
 }
 
-fn evaluateProtocolRule(context: RuleEvaluationContext) anyerror!bool {
+inline fn evaluateProtocolRule(context: RuleEvaluationContext) anyerror!bool {
     const rule = context.rule;
     return switch (rule.operator) {
         .total_partition => try totalPartition(
@@ -5485,7 +5691,7 @@ fn evaluateProtocolRule(context: RuleEvaluationContext) anyerror!bool {
     };
 }
 
-fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
+inline fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
     const rule = context.rule;
     return switch (rule.operator) {
         .one_of => if (context.target) |value|

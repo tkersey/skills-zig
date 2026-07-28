@@ -1,5 +1,6 @@
 const std = @import("std");
 const canonical_json = @import("canonical_json.zig");
+const exact_number = @import("exact_number.zig");
 
 pub fn object(value: std.json.Value) !std.json.ObjectMap {
     return switch (value) {
@@ -52,6 +53,9 @@ pub fn boolean(value: std.json.Value) !bool {
 pub fn integer(value: std.json.Value) !i64 {
     return switch (value) {
         .integer => |number| number,
+        .number_string => |text| exact_number.toI64(
+            exact_number.parse(text) orelse return error.ExpectedInteger,
+        ) orelse error.ExpectedInteger,
         else => error.ExpectedInteger,
     };
 }

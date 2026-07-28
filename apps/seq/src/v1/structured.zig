@@ -129,6 +129,7 @@ fn appendToolDocument(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -498,7 +499,11 @@ fn valueKind(value: std.json.Value) []const u8 {
         .bool => "boolean",
         .integer => "integer",
         .float => "float",
-        .number_string => "number",
+        .number_string => |number| if (std.mem.indexOfAny(
+            u8,
+            number,
+            ".eE",
+        ) == null) "integer" else "float",
         .string => "string",
         .array => "array",
         .object => "object",
@@ -661,7 +666,8 @@ const structured_trace_source =
     "{\"timestamp\":\"2026-07-26T00:00:03Z\",\"type\":\"response_item\"," ++
     "\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-1\"," ++
     "\"output\":\"{\\\"nested\\\":{\\\"a/b\\\":true}," ++
-    "\\\"schema\\\":\\\"demo/v1\\\",\\\"items\\\":[3]}\"}}\n";
+    "\\\"schema\\\":\\\"demo/v1\\\"," ++
+    "\\\"precise\\\":9007199254740992.1,\\\"items\\\":[3]}\"}}\n";
 
 const structured_observation_definition =
     \\{
@@ -710,7 +716,8 @@ fn expectStructuredIndex(index: *const Index) !void {
         index.documents.items[0].document_type.?,
     );
     try std.testing.expectEqualStrings(
-        "{\"items\":[3],\"nested\":{\"a/b\":true},\"schema\":\"demo/v1\"}",
+        "{\"items\":[3],\"nested\":{\"a/b\":true}," ++
+            "\"precise\":9007199254740992.1,\"schema\":\"demo/v1\"}",
         index.documents.items[0].canonical_json,
     );
     try std.testing.expectEqualStrings(
@@ -719,6 +726,7 @@ fn expectStructuredIndex(index: *const Index) !void {
     );
     var saw_escaped_pointer = false;
     var saw_array_scalar = false;
+    var saw_precise_scalar = false;
     for (index.values.items) |value| {
         if (std.mem.eql(u8, value.json_pointer, "/nested/a~1b")) {
             saw_escaped_pointer = true;
@@ -730,9 +738,18 @@ fn expectStructuredIndex(index: *const Index) !void {
             try std.testing.expectEqualStrings("integer", value.value_kind);
             try std.testing.expectEqualStrings("3", value.scalar_value.?);
         }
+        if (std.mem.eql(u8, value.json_pointer, "/precise")) {
+            saw_precise_scalar = true;
+            try std.testing.expectEqualStrings("float", value.value_kind);
+            try std.testing.expectEqualStrings(
+                "9007199254740992.1",
+                value.scalar_value.?,
+            );
+        }
     }
     try std.testing.expect(saw_escaped_pointer);
     try std.testing.expect(saw_array_scalar);
+    try std.testing.expect(saw_precise_scalar);
 }
 
 fn expectStructuredObservation(index: *const Index) !void {

@@ -4,7 +4,7 @@ const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const plan = @import("plan.zig");
 
-const payload_version: u16 = 1;
+const payload_version: u16 = 2;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;

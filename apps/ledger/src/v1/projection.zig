@@ -12,13 +12,18 @@ const storage = @import("storage.zig");
 
 const Scalar = union(enum) {
     string: []u8,
+    number: []u8,
     integer: i64,
     float: f64,
     boolean: bool,
     null,
 
     fn deinit(self: *Scalar, allocator: std.mem.Allocator) void {
-        if (self.* == .string) allocator.free(self.string);
+        switch (self.*) {
+            .string => |value| allocator.free(value),
+            .number => |value| allocator.free(value),
+            else => {},
+        }
         self.* = undefined;
     }
 };
@@ -340,7 +345,10 @@ const FoldHistoryEntry = struct {
                     std.json.Value,
                     allocator,
                     retained,
-                    .{ .duplicate_field_behavior = .@"error" },
+                    .{
+                        .duplicate_field_behavior = .@"error",
+                        .parse_numbers = false,
+                    },
                 );
                 defer parsed.deinit();
                 for (snapshot.digest.fragments, 0..) |fragment, index| {
@@ -2201,6 +2209,10 @@ fn encodeCacheScalar(
             try encoder.writeBool(flag);
         },
         .null => try encoder.writeByte(4),
+        .number => |text| {
+            try encoder.writeByte(5);
+            try encoder.writeBytes(text);
+        },
     }
 }
 
@@ -2280,6 +2292,14 @@ fn decodeCacheScalar(
         },
         3 => .{ .boolean = try decoder.readBool() },
         4 => .null,
+        5 => number: {
+            const text = try decoder.readBytesAlloc(allocator, 1024);
+            errdefer allocator.free(text);
+            if (definition_core.exact_number.parse(text) == null) {
+                return error.CacheNumberInvalid;
+            }
+            break :number .{ .number = text };
+        },
         else => error.CacheProjectionScalarInvalid,
     };
 }
@@ -2298,6 +2318,7 @@ fn compileProjection(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();
@@ -5208,7 +5229,10 @@ fn writeConstructedKeyedFold(
         std.json.Value,
         allocator,
         row_array.written(),
-        .{ .duplicate_field_behavior = .@"error" },
+        .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        },
     );
     defer parsed.deinit();
     const rows = try definition_core.json.array(parsed.value);
@@ -5295,7 +5319,10 @@ fn matchesKeyedFold(
             std.json.Value,
             allocator,
             view.retained orelse return false,
-            .{ .duplicate_field_behavior = .@"error" },
+            .{
+                .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
+            },
         );
     }
     const retained = if (parsed_retained) |parsed|
@@ -5829,7 +5856,10 @@ fn writeRetainedProjectionOutput(
         std.json.Value,
         allocator,
         source.written(),
-        .{ .duplicate_field_behavior = .@"error" },
+        .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        },
     );
     defer parsed.deinit();
     try projection_value.write(
@@ -5861,7 +5891,10 @@ fn executeDocument(
         std.json.Value,
         allocator,
         bytes,
-        .{ .duplicate_field_behavior = .@"error" },
+        .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        },
     );
     defer parsed.deinit();
     stats.records_scanned = 1;
@@ -5948,7 +5981,10 @@ fn observeJsonlLine(
         std.json.Value,
         allocator,
         line,
-        .{ .duplicate_field_behavior = .@"error" },
+        .{
+            .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
+        },
     );
     defer parsed.deinit();
     if (!matches(projection, parsed.value, parameters)) return .next;
@@ -6076,7 +6112,10 @@ fn executeSortedJsonl(
             std.json.Value,
             allocator,
             line,
-            .{ .duplicate_field_behavior = .@"error" },
+            .{
+                .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
+            },
         );
         defer parsed.deinit();
         try accumulator.observeRaw(parsed.value, line);
@@ -6101,12 +6140,13 @@ fn lessSortedRow(
 }
 
 fn compareSortScalars(left: Scalar, right: Scalar) std.math.Order {
-    return switch (left) {
-        .string => |value| std.mem.order(u8, value, right.string),
-        .integer => |value| std.math.order(value, right.integer),
-        .float => |value| std.math.order(value, right.float),
-        else => unreachable,
-    };
+    if (left == .string and right == .string) {
+        return std.mem.order(u8, left.string, right.string);
+    }
+    return definition_core.exact_number.orderValues(
+        scalarNumberValue(left) orelse unreachable,
+        scalarNumberValue(right) orelse unreachable,
+    ) orelse unreachable;
 }
 
 fn matches(
@@ -6383,6 +6423,14 @@ fn scalarFromJsonAlloc(
         .string => |text| .{ .string = try allocator.dupe(u8, text) },
         .integer => |number| .{ .integer = number },
         .float => |number| .{ .float = number },
+        .number_string => |text| number: {
+            const parsed = definition_core.exact_number.parse(text) orelse
+                return error.ProjectionScalarRequired;
+            if (definition_core.exact_number.toI64(parsed)) |integer| {
+                break :number .{ .integer = integer };
+            }
+            break :number .{ .number = try allocator.dupe(u8, text) };
+        },
         .bool => |flag| .{ .boolean = flag },
         .null => .null,
         else => error.ProjectionScalarRequired,
@@ -6413,28 +6461,35 @@ fn scalarEqualsJson(expected: Scalar, actual: std.json.Value) bool {
     return switch (expected) {
         .string => |text| actual == .string and
             std.mem.eql(u8, text, actual.string),
-        .integer => |number| actual == .integer and actual.integer == number,
-        .float => |number| actual == .float and actual.float == number,
+        .number, .integer, .float => definition_core.exact_number.valuesEqual(
+            scalarNumberValue(expected).?,
+            actual,
+        ),
         .boolean => |flag| actual == .bool and actual.bool == flag,
         .null => actual == .null,
     };
 }
 
 fn compareScalars(left: Scalar, right: Scalar) !std.math.Order {
-    return switch (left) {
-        .string => |value| switch (right) {
-            .string => |other| std.mem.order(u8, value, other),
-            else => error.ProjectionOrderingTypeMismatch,
-        },
-        .integer => |value| switch (right) {
-            .integer => |other| std.math.order(value, other),
-            else => error.ProjectionOrderingTypeMismatch,
-        },
-        .float => |value| switch (right) {
-            .float => |other| std.math.order(value, other),
-            else => error.ProjectionOrderingTypeMismatch,
-        },
-        else => error.ProjectionOrderingTypeMismatch,
+    if (left == .string and right == .string) {
+        return std.mem.order(u8, left.string, right.string);
+    }
+    const left_number = scalarNumberValue(left) orelse
+        return error.ProjectionOrderingTypeMismatch;
+    const right_number = scalarNumberValue(right) orelse
+        return error.ProjectionOrderingTypeMismatch;
+    return definition_core.exact_number.orderValues(
+        left_number,
+        right_number,
+    ) orelse error.ProjectionOrderingTypeMismatch;
+}
+
+fn scalarNumberValue(value: Scalar) ?std.json.Value {
+    return switch (value) {
+        .number => |text| .{ .number_string = text },
+        .integer => |number| .{ .integer = number },
+        .float => |number| .{ .float = number },
+        else => null,
     };
 }
 
@@ -7068,6 +7123,39 @@ test "exact lookup emits one definition-ordered or raw payload" {
     try verifyExactLookupOutputs(&plans);
     try verifyRelevanceOutputs(&plans);
     try verifyRequiredLookupFailure(&plans);
+}
+
+test "projected JSONL preserves precision-sensitive numeric tokens" {
+    var plans = try ProjectionTestPlans.init(exact_projection_definition);
+    defer plans.deinit();
+    var bindings = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &plans.definition_plan.parameter_declarations,
+        &.{.{ .name = "id", .raw_value = "precise" }},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = 0,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try executeJsonl(
+        std.testing.allocator,
+        plans.cached.find("nested").?,
+        "{\"record\":{\"id\":\"precise\"," ++
+            "\"value\":9007199254740992.1}}\n",
+        &bindings,
+        1,
+        1,
+        &output.writer,
+        &stats,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"precise\",\"value\":9007199254740992.1}",
+        output.written(),
+    );
 }
 
 fn expectExactProjectionShapes(cached: *const Plan) !void {

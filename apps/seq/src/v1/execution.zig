@@ -79,7 +79,8 @@ pub const RuntimeAggregateMetric = struct {
 };
 
 pub const RuntimeOperation = union(enum) {
-    filter: PredicateRange,
+    filter_all: PredicateRange,
+    filter_any: PredicateRange,
     limit: struct {
         count: usize,
         state_index: u16,
@@ -305,12 +306,19 @@ const ProgramBuilder = struct {
                 .case_insensitive = predicate.case_insensitive,
             });
         }
-        try self.operations.append(self.allocator, .{
-            .filter = .{
-                .start = @intCast(start),
-                .len = @intCast(self.predicates.items.len - start),
+        try self.operations.append(
+            self.allocator,
+            switch (filter.mode) {
+                .all => .{ .filter_all = .{
+                    .start = @intCast(start),
+                    .len = @intCast(self.predicates.items.len - start),
+                } },
+                .any => .{ .filter_any = .{
+                    .start = @intCast(start),
+                    .len = @intCast(self.predicates.items.len - start),
+                } },
             },
-        });
+        );
     }
 
     fn applyProject(
@@ -728,9 +736,15 @@ pub const Runner = struct {
             }
             for (self.program.operations[start..]) |operation| {
                 active_count = switch (operation) {
-                    .filter => |range| self.filterRows(
+                    .filter_all => |range| self.filterRows(
                         active_count,
                         range,
+                        .all,
+                    ),
+                    .filter_any => |range| self.filterRows(
+                        active_count,
+                        range,
+                        .any,
                     ),
                     .limit => |limit| @min(active_count, limit.count),
                     .sort => |range| self.sortRows(active_count, range),
@@ -783,8 +797,14 @@ pub const Runner = struct {
         var stop_after_row = false;
         for (operations) |operation| {
             switch (operation) {
-                .filter => |range| {
-                    if (!self.rowMatches(row, range)) {
+                .filter_all => |range| {
+                    if (!self.rowMatches(row, range, .all)) {
+                        accepted = false;
+                        break;
+                    }
+                },
+                .filter_any => |range| {
+                    if (!self.rowMatches(row, range, .any)) {
                         accepted = false;
                         break;
                     }
@@ -821,12 +841,27 @@ pub const Runner = struct {
         self: *const Runner,
         row: []const Value,
         range: PredicateRange,
+        mode: plan.FilterMode,
     ) bool {
         const end = @as(usize, range.start) + range.len;
-        for (self.program.predicates[range.start..end]) |predicate| {
-            if (!matches(row[predicate.field_index], predicate)) return false;
-        }
-        return true;
+        return switch (mode) {
+            .all => all: {
+                for (self.program.predicates[range.start..end]) |predicate| {
+                    if (!matches(row[predicate.field_index], predicate)) {
+                        break :all false;
+                    }
+                }
+                break :all true;
+            },
+            .any => any: {
+                for (self.program.predicates[range.start..end]) |predicate| {
+                    if (matches(row[predicate.field_index], predicate)) {
+                        break :any true;
+                    }
+                }
+                break :any false;
+            },
+        };
     }
 
     fn materialize(self: *Runner, row: []const Value) !void {
@@ -948,12 +983,14 @@ pub const Runner = struct {
         self: *Runner,
         active_count: usize,
         range: PredicateRange,
+        mode: plan.FilterMode,
     ) usize {
         var output_index: usize = 0;
         for (self.row_refs[0..active_count]) |ref| {
             if (!self.rowMatches(
                 self.materializedRow(ref.row_index),
                 range,
+                mode,
             )) continue;
             self.row_refs[output_index] = ref;
             output_index += 1;
@@ -1599,10 +1636,14 @@ const filter_test_definition =
     \\    {"op":"scan","relation":"messages","as":"source"},
     \\    {
     \\      "op":"filter","input":"source","as":"matched",
-    \\      "where":[{
-    \\        "field":"text","op":"contains","param":"needle",
-    \\        "case_insensitive":true
-    \\      }]
+    \\      "where_mode":"any",
+    \\      "where":[
+    \\        {
+    \\          "field":"text","op":"contains","param":"needle",
+    \\          "case_insensitive":true
+    \\        },
+    \\        {"field":"role","op":"exact","value":"tool"}
+    \\      ]
     \\    },
     \\    {
     \\      "op":"project","input":"matched","as":"rows",

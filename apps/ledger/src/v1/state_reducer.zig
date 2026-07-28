@@ -1967,6 +1967,7 @@ fn prepareSet(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     errdefer parsed.deinit();

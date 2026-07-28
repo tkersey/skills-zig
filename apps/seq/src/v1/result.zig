@@ -279,6 +279,7 @@ const BoundedJson = struct {
             .{
                 .allocate = .alloc_always,
                 .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
             },
         ) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -475,7 +476,7 @@ test "observation result preserves identities provenance limits and no authority
     const values = [_]execution.Value{
         .{ .string = "row\none" },
         .{ .float = 1.5 },
-        .{ .json = "{\"a\":1}" },
+        .{ .json = "{\"a\":9007199254740992.1}" },
     };
     const envelope = testEnvelope(
         &fixture.plan,
@@ -510,6 +511,13 @@ test "observation result preserves identities provenance limits and no authority
     try std.testing.expectEqualStrings(
         zero_digest,
         root.get("corpus").?.object.get("digest").?.string,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            rendered,
+            "\"a\":9007199254740992.1",
+        ) != null,
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,

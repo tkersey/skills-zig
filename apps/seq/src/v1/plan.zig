@@ -139,12 +139,27 @@ pub const Predicate = struct {
 };
 
 pub const Filter = struct {
+    mode: FilterMode,
     predicates: []Predicate,
 
     fn deinit(self: *Filter, allocator: std.mem.Allocator) void {
         for (self.predicates) |*predicate| predicate.deinit(allocator);
         allocator.free(self.predicates);
         self.* = undefined;
+    }
+};
+
+pub const FilterMode = enum {
+    all,
+    any,
+
+    fn parse(raw: []const u8) !FilterMode {
+        inline for (@typeInfo(FilterMode).@"enum".fields) |field| {
+            if (std.mem.eql(u8, raw, field.name)) {
+                return @enumFromInt(field.value);
+            }
+        }
+        return error.InvalidFilterMode;
     }
 };
 
@@ -375,6 +390,7 @@ fn compileStage(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     );
     defer parsed.deinit();
@@ -579,7 +595,13 @@ fn compileFilterStage(
     );
     return .{
         .source = input.source,
-        .operation = .{ .filter = .{ .predicates = predicates } },
+        .operation = .{ .filter = .{
+            .mode = if (object.get("where_mode")) |raw|
+                try FilterMode.parse(try definition_core.json.string(raw))
+            else
+                .all,
+            .predicates = predicates,
+        } },
         .schema = input.schema,
     };
 }
@@ -1036,12 +1058,14 @@ fn compileLimit(
 ) !Limit {
     const value = try definition_core.json.field(object, "limit");
     return switch (value) {
-        .integer => |count| if (count > 0 and
-            std.math.cast(usize, count) != null and
-            @as(usize, @intCast(count)) <= definition_plan.bounds.max_rows)
-            .{ .fixed = @intCast(count) }
-        else
-            error.InvalidObservationLimit,
+        .integer, .number_string => fixed: {
+            const count = definition_core.json.unsigned(value) catch
+                return error.InvalidObservationLimit;
+            if (count == 0 or count > definition_plan.bounds.max_rows) {
+                return error.InvalidObservationLimit;
+            }
+            break :fixed .{ .fixed = count };
+        },
         .string => |name| parameter: {
             const index = try parameterIndex(
                 &definition_plan.parameter_declarations,
@@ -1266,9 +1290,27 @@ fn constantFromJson(
             .{ .float = number }
         else
             error.InvalidFilterConstant,
+        .number_string => |text| number: {
+            const parsed = definition_core.exact_number.parse(text) orelse
+                return error.InvalidFilterConstant;
+            if (definition_core.exact_number.toI64(parsed)) |integer| {
+                break :number .{ .integer = integer };
+            }
+            const float = std.fmt.parseFloat(f64, text) catch
+                return error.InvalidFilterConstant;
+            if (!std.math.isFinite(float) or
+                !definition_core.exact_number.valuesEqual(
+                    .{ .number_string = text },
+                    .{ .float = float },
+                ))
+            {
+                return error.InvalidFilterConstant;
+            }
+            break :number .{ .float = float };
+        },
         .bool => |flag| .{ .boolean = flag },
         .null => .null,
-        .number_string, .array, .object => error.InvalidFilterConstant,
+        .array, .object => error.InvalidFilterConstant,
     };
 }
 
@@ -2076,6 +2118,7 @@ fn encodeFilter(
     filter: Filter,
     encoder: *definition_core.cache.Encoder,
 ) !void {
+    try encoder.writeEnum(filter.mode);
     try encoder.writeCount(filter.predicates.len);
     for (filter.predicates) |predicate| {
         try encoder.writeU16(predicate.field_index);
@@ -2186,6 +2229,7 @@ fn decodeFilter(
     decoder: *definition_core.cache.Decoder,
     schema: *const Schema,
 ) !Filter {
+    const mode = try decoder.readEnum(FilterMode);
     const count = try decoder.readCount(64);
     if (count == 0) return error.InvalidFilterPredicateCount;
     const predicates = try allocator.alloc(Predicate, count);
@@ -2212,7 +2256,7 @@ fn decodeFilter(
         };
         initialized += 1;
     }
-    return .{ .predicates = predicates };
+    return .{ .mode = mode, .predicates = predicates };
 }
 
 fn decodeOperand(

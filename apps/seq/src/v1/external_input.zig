@@ -105,6 +105,7 @@ fn parseExternalJson(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     ) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -255,6 +256,12 @@ fn convertValue(
         },
         .integer => switch (value) {
             .integer => |number| .{ .integer = number },
+            .number_string => |text| .{
+                .integer = definition_core.exact_number.toI64(
+                    definition_core.exact_number.parse(text) orelse
+                        return error.ExternalInputFieldTypeMismatch,
+                ) orelse return error.ExternalInputFieldTypeMismatch,
+            },
             else => error.ExternalInputFieldTypeMismatch,
         },
         .float => switch (value) {
@@ -265,6 +272,14 @@ fn convertValue(
                 .{ .float = number }
             else
                 error.ExternalInputFieldTypeMismatch,
+            .number_string => |text| float: {
+                const number = std.fmt.parseFloat(f64, text) catch
+                    return error.ExternalInputFieldTypeMismatch;
+                if (!std.math.isFinite(number)) {
+                    return error.ExternalInputFieldTypeMismatch;
+                }
+                break :float .{ .float = number };
+            },
             else => error.ExternalInputFieldTypeMismatch,
         },
         .boolean => switch (value) {
@@ -403,7 +418,7 @@ const external_input_document =
     \\  "schema": "example-facts/v1",
     \\  "rows": [
     \\    {"id": "a", "count": 2, "score": 1.5, "active": true,
-    \\     "detail": {"z": 1, "a": 2}},
+    \\     "detail": {"z": 1, "a": 2, "precise": 9007199254740992.1}},
     \\    {"id": "b", "count": 3, "score": 2, "active": false, "detail": null}
     \\  ]
     \\}
@@ -463,7 +478,7 @@ test "external immutable relations validate schema fields and canonical json" {
     try std.testing.expectEqual(@as(i64, 2), relation.rows().row(0)[1].integer);
     try std.testing.expectEqual(@as(f64, 2), relation.rows().row(1)[2].float);
     try std.testing.expectEqualStrings(
-        "{\"a\":2,\"z\":1}",
+        "{\"a\":2,\"precise\":9007199254740992.1,\"z\":1}",
         relation.rows().row(0)[4].json,
     );
     try std.testing.expect(relation.rows().row(1)[4] == .null);

@@ -389,15 +389,22 @@ const IdentityOrdinal = struct {
 };
 
 fn identityOrdinal(object: std.json.ObjectMap) !IdentityOrdinal {
-    const width: u8 = @intCast(if (object.get("ordinal_width")) |value|
+    const width_value = if (object.get("ordinal_width")) |value|
         try definition_core.json.unsigned(value)
     else
-        4);
-    if (width == 0 or width > 9) return error.InvalidTimestampOrdinalWidth;
-    const maximum: u32 = @intCast(if (object.get("max_ordinal")) |value|
+        4;
+    if (width_value == 0 or width_value > 9) {
+        return error.InvalidTimestampOrdinalWidth;
+    }
+    const width: u8 = @intCast(width_value);
+    const maximum_value = if (object.get("max_ordinal")) |value|
         try definition_core.json.unsigned(value)
     else
-        9999);
+        9999;
+    if (maximum_value > std.math.maxInt(u32)) {
+        return error.InvalidTimestampOrdinalMaximum;
+    }
+    const maximum: u32 = @intCast(maximum_value);
     var capacity: u64 = 1;
     for (0..width) |_| capacity *= 10;
     if (@as(u64, maximum) >= capacity) {
@@ -1247,6 +1254,34 @@ test "bounded document plans render timestamp templates and append-once edits" {
     );
     defer definition_plan.deinit(std.testing.allocator);
     try expectTimestampTemplate(&definition_plan);
+}
+
+test "timestamp ordinal bounds reject before integer narrowing" {
+    inline for ([_]struct {
+        source: []const u8,
+        expected: anyerror,
+    }{
+        .{
+            .source = "{\"ordinal_width\":257,\"max_ordinal\":1}",
+            .expected = error.InvalidTimestampOrdinalWidth,
+        },
+        .{
+            .source = "{\"ordinal_width\":9,\"max_ordinal\":4294967296}",
+            .expected = error.InvalidTimestampOrdinalMaximum,
+        },
+    }) |case| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
+            case.source,
+            .{ .parse_numbers = false },
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            case.expected,
+            identityOrdinal(parsed.value.object),
+        );
+    }
 }
 
 fn expectTimestampTemplate(definition_plan: *const definition.Plan) !void {

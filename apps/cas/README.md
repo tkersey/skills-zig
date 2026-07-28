@@ -125,7 +125,9 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Run a bounded inquiry from DCP/RIP inputs.
 ./zig-out/bin/cas session_inquiry run \
   --capsule capsule.json \
+  --capsule-validation capsule.validation.json \
   --plan plan.json \
+  --plan-validation plan.validation.json \
   --receipt-dir .retrace/INQ-001 \
   --sandbox read-only \
   --json
@@ -133,7 +135,9 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Start detached state and inspect the persisted handle.
 ./zig-out/bin/cas session_inquiry start \
   --capsule capsule.json \
+  --capsule-validation capsule.validation.json \
   --plan plan.json \
+  --plan-validation plan.validation.json \
   --receipt-dir .retrace/INQ-001 \
   --json
 ./zig-out/bin/cas session_inquiry status --inquiry-id INQ-001 --json

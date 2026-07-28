@@ -1366,13 +1366,8 @@ fn validateComponentWeights(
 }
 
 fn jsonNumber(value: std.json.Value, positive: bool) !f64 {
-    const number: f64 = switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        else => return error.ExpectedNumber,
-    };
-    if (!std.math.isFinite(number) or
-        (positive and number <= 0.0) or
+    const number = try exactF64(value);
+    if ((positive and number <= 0.0) or
         (!positive and number < 0.0))
     {
         return error.InvalidRankedNumber;
@@ -1381,12 +1376,25 @@ fn jsonNumber(value: std.json.Value, positive: bool) !f64 {
 }
 
 fn jsonSignedNumber(value: std.json.Value) !f64 {
+    return exactF64(value);
+}
+
+fn exactF64(value: std.json.Value) !f64 {
     const number: f64 = switch (value) {
         .integer => |integer| @floatFromInt(integer),
         .float => |float| float,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch
+            return error.ExpectedNumber,
         else => return error.ExpectedNumber,
     };
-    if (!std.math.isFinite(number)) return error.InvalidRankedNumber;
+    if (!std.math.isFinite(number) or
+        !definition_core.exact_number.valuesEqual(
+            value,
+            .{ .float = number },
+        ))
+    {
+        return error.InvalidRankedNumber;
+    }
     return number;
 }
 
