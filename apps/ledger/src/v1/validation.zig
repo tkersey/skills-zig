@@ -5218,37 +5218,29 @@ fn applyRules(
     rules: []const CompiledRule,
     diagnostics: *definition_core.diagnostics.Collector,
 ) !void {
-    try applyRuleSequence(
-        allocator,
-        plan,
-        loaded,
-        rules,
-        diagnostics,
-        0,
-    );
-}
-
-fn applyRuleSequence(
-    allocator: std.mem.Allocator,
-    plan: *const Plan,
-    loaded: []const LoadedInput,
-    rules: []const CompiledRule,
-    diagnostics: *definition_core.diagnostics.Collector,
-    depth: usize,
-) !void {
-    if (depth > 16) return error.ConditionalRuleDepthExceeded;
-    for (rules) |*rule| {
+    const RuleFrame = struct {
+        rules: []const CompiledRule,
+        next_index: usize = 0,
+    };
+    var stack: [17]RuleFrame = undefined;
+    var stack_len: usize = 1;
+    stack[0] = .{ .rules = rules };
+    while (stack_len != 0) {
+        const frame = &stack[stack_len - 1];
+        if (frame.next_index == frame.rules.len) {
+            stack_len -= 1;
+            continue;
+        }
+        const rule = &frame.rules[frame.next_index];
+        frame.next_index += 1;
         if (rule.operator == .implies and rule.children.len != 0) {
             const root = loaded[rule.input_index].json() orelse continue;
             if (implicationPredicateHolds(plan, root, rule)) {
-                try applyRuleSequence(
-                    allocator,
-                    plan,
-                    loaded,
-                    rule.children,
-                    diagnostics,
-                    depth + 1,
-                );
+                if (stack_len == stack.len) {
+                    return error.ConditionalRuleDepthExceeded;
+                }
+                stack[stack_len] = .{ .rules = rule.children };
+                stack_len += 1;
             }
             continue;
         }
