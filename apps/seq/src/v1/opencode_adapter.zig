@@ -16,6 +16,14 @@ pub const Selection = struct {
     contains: ?[]const u8 = null,
 };
 
+const ScanResult = struct {
+    records: usize,
+    source_records: usize,
+    warnings: usize,
+    tools: usize,
+    session_matches: bool,
+};
+
 pub fn recognizes(path: []const u8) bool {
     return std.mem.eql(
         u8,
@@ -60,42 +68,87 @@ pub fn feedFileSelected(
     const session_id = try sessionId(&session_id_buffer, path);
     const raw = try readFileAlloc(allocator, path, max_input_bytes);
     defer allocator.free(raw);
-    var records: usize = 0;
-    var source_records: usize = 0;
-    var warnings: usize = 0;
-    var tools: usize = 0;
-    var session_matches = selection.contains == null or
-        containsIgnoreCase(path, selection.contains.?);
+    const scanned = try scanRecords(
+        allocator,
+        program,
+        runner,
+        relation,
+        session_id,
+        path,
+        raw,
+        selection,
+    );
+    if (relation == .sessions and !runner.stopped and
+        scanned.session_matches)
+    {
+        var row_storage: [256]execution.Value = undefined;
+        const row = row_storage[0..program.source_width];
+        try fillSession(
+            row,
+            program.source_field_indices,
+            session_id,
+            path,
+            scanned.records,
+            scanned.tools,
+        );
+        _ = try runner.feed(row);
+    }
+    return .{
+        .bytes_read = raw.len,
+        .records = scanned.records,
+        .warnings = scanned.warnings,
+        .digest = digest(raw),
+    };
+}
+
+fn scanRecords(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    runner: *execution.Runner,
+    relation: physical.Relation,
+    session_id: []const u8,
+    path: []const u8,
+    raw: []const u8,
+    selection: Selection,
+) !ScanResult {
+    var result = ScanResult{
+        .records = 0,
+        .source_records = 0,
+        .warnings = 0,
+        .tools = 0,
+        .session_matches = selection.contains == null or
+            containsIgnoreCase(path, selection.contains.?),
+    };
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |untrimmed| {
+        result.source_records += 1;
         const line = std.mem.trim(u8, untrimmed, " \t\r");
         if (line.len == 0) continue;
-        source_records += 1;
         var parsed = std.json.parseFromSlice(
             std.json.Value,
             allocator,
             line,
             .{ .parse_numbers = false },
         ) catch {
-            warnings += 1;
+            result.warnings += 1;
             continue;
         };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |value| value,
             else => {
-                warnings += 1;
+                result.warnings += 1;
                 continue;
             },
         };
-        records += 1;
-        session_matches = session_matches or
+        result.records += 1;
+        result.session_matches = result.session_matches or
             (selection.contains != null and
                 containsIgnoreCase(
                     stringField(object, "input"),
                     selection.contains.?,
                 ));
-        tools += toolCount(object);
+        result.tools += toolCount(object);
         if (relation == .sessions) continue;
         if (relation == .turns and !turnPasses(object, path, selection)) {
             continue;
@@ -108,31 +161,13 @@ pub fn feedFileSelected(
             session_id,
             path,
             line,
-            records,
-            source_records,
+            result.records,
+            result.source_records,
             object,
         );
         if (feed == .stop) break;
     }
-    if (relation == .sessions and !runner.stopped and session_matches) {
-        var row_storage: [256]execution.Value = undefined;
-        const row = row_storage[0..program.source_width];
-        try fillSession(
-            row,
-            program.source_field_indices,
-            session_id,
-            path,
-            records,
-            tools,
-        );
-        _ = try runner.feed(row);
-    }
-    return .{
-        .bytes_read = raw.len,
-        .records = records,
-        .warnings = warnings,
-        .digest = digest(raw),
-    };
+    return result;
 }
 
 fn turnPasses(
@@ -173,49 +208,11 @@ fn feedRecord(
         session_id,
         source_record_number,
     );
-    switch (relation) {
-        .source_events => {
-            try fillSourceEvent(
-                row,
-                program.source_field_indices,
-                session_id,
-                record_id,
-                path,
-                raw,
-                source_record_number,
-                turn_number,
-                object,
-            );
-            return runner.feed(row);
-        },
-        .messages => {
-            try fillMessage(
-                row,
-                program.source_field_indices,
-                session_id,
-                record_id,
-                path,
-                turn_number,
-                object,
-            );
-            return runner.feed(row);
-        },
-        .turns => {
-            try fillTurn(
-                row,
-                program.source_field_indices,
-                session_id,
-                record_id,
-                path,
-                turn_number,
-                object,
-            );
-            return runner.feed(row);
-        },
-        .tool_invocations,
-        .tool_results,
-        .tool_lifecycle,
-        => return feedTools(
+    if (relation == .tool_invocations or
+        relation == .tool_results or
+        relation == .tool_lifecycle)
+    {
+        return feedTools(
             allocator,
             program,
             runner,
@@ -225,11 +222,73 @@ fn feedRecord(
             turn_number,
             source_record_number,
             object,
+        );
+    }
+    return feedNonToolRecord(
+        runner,
+        row,
+        program.source_field_indices,
+        relation,
+        session_id,
+        record_id,
+        path,
+        raw,
+        turn_number,
+        source_record_number,
+        object,
+    );
+}
+
+fn feedNonToolRecord(
+    runner: *execution.Runner,
+    row: []execution.Value,
+    fields: []const u16,
+    relation: physical.Relation,
+    session_id: []const u8,
+    record_id: []const u8,
+    path: []const u8,
+    raw: []const u8,
+    turn_number: usize,
+    source_record_number: usize,
+    object: std.json.ObjectMap,
+) !execution.Feed {
+    switch (relation) {
+        .source_events => return feedSourceEvent(
+            runner,
+            row,
+            fields,
+            session_id,
+            record_id,
+            path,
+            raw,
+            source_record_number,
+            turn_number,
+            object,
+        ),
+        .messages => return feedMessage(
+            runner,
+            row,
+            fields,
+            session_id,
+            record_id,
+            path,
+            turn_number,
+            object,
+        ),
+        .turns => return feedTurn(
+            runner,
+            row,
+            fields,
+            session_id,
+            record_id,
+            path,
+            turn_number,
+            object,
         ),
         .structured_documents => return feedStructuredDocument(
             runner,
             row,
-            program.source_field_indices,
+            fields,
             session_id,
             record_id,
             raw,
@@ -239,8 +298,81 @@ fn feedRecord(
         .session_edges,
         .token_events,
         .structured_values,
+        .tool_invocations,
+        .tool_results,
+        .tool_lifecycle,
         => return .continue_scanning,
     }
+}
+
+fn feedSourceEvent(
+    runner: *execution.Runner,
+    row: []execution.Value,
+    fields: []const u16,
+    session_id: []const u8,
+    record_id: []const u8,
+    path: []const u8,
+    raw: []const u8,
+    source_record_number: usize,
+    turn_number: usize,
+    object: std.json.ObjectMap,
+) !execution.Feed {
+    try fillSourceEvent(
+        row,
+        fields,
+        session_id,
+        record_id,
+        path,
+        raw,
+        source_record_number,
+        turn_number,
+        object,
+    );
+    return runner.feed(row);
+}
+
+fn feedMessage(
+    runner: *execution.Runner,
+    row: []execution.Value,
+    fields: []const u16,
+    session_id: []const u8,
+    record_id: []const u8,
+    path: []const u8,
+    turn_number: usize,
+    object: std.json.ObjectMap,
+) !execution.Feed {
+    try fillMessage(
+        row,
+        fields,
+        session_id,
+        record_id,
+        path,
+        turn_number,
+        object,
+    );
+    return runner.feed(row);
+}
+
+fn feedTurn(
+    runner: *execution.Runner,
+    row: []execution.Value,
+    fields: []const u16,
+    session_id: []const u8,
+    record_id: []const u8,
+    path: []const u8,
+    turn_number: usize,
+    object: std.json.ObjectMap,
+) !execution.Feed {
+    try fillTurn(
+        row,
+        fields,
+        session_id,
+        record_id,
+        path,
+        turn_number,
+        object,
+    );
+    return runner.feed(row);
 }
 
 fn feedStructuredDocument(
@@ -817,4 +949,42 @@ test "OpenCode tool results require a terminal lifecycle status" {
     try std.testing.expect(terminalToolStatus("failed"));
     try std.testing.expect(!terminalToolStatus("running"));
     try std.testing.expect(!terminalToolStatus("pending"));
+}
+
+test "OpenCode physical line numbers include blank source records" {
+    var source_fields = [_]u16{3};
+    var output_fields = [_]u16{0};
+    const program = execution.Program{
+        .source = .{ .physical = .source_events },
+        .source_width = 1,
+        .source_field_indices = &source_fields,
+        .materialized_field_indices = &.{},
+        .source_row_bound = null,
+        .operations = &.{},
+        .predicates = &.{},
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = &output_fields,
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 2,
+    };
+    var output: [2]execution.Value = undefined;
+    var runner = try execution.Runner.init(&program, &output);
+    defer runner.deinit();
+    const scanned = try scanRecords(
+        std.testing.allocator,
+        &program,
+        &runner,
+        .source_events,
+        "session",
+        "/tmp/prompt-history.jsonl",
+        "\n{\"input\":\"one\"}\n\n{\"input\":\"two\"}",
+        .{},
+    );
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 4), scanned.source_records);
+    try std.testing.expectEqual(@as(i64, 2), result.rows().row(0)[0].integer);
+    try std.testing.expectEqual(@as(i64, 4), result.rows().row(1)[0].integer);
 }

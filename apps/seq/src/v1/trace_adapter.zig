@@ -16,15 +16,18 @@ pub const Options = struct {
 
 pub const SessionSelection = struct {
     session_id: ?[]const u8 = null,
+    exclude_session_id: ?[]const u8 = null,
     repo: ?[]const u8 = null,
     since_ms: ?i64 = null,
     until_ms: ?i64 = null,
     filter_time: bool = false,
+    filter_source_mtime_since: bool = false,
 };
 
 pub const SelectedParse = struct {
     parsed: ?ParsedTrace,
     discovery_bytes_read: usize,
+    file_opened: bool,
 };
 
 pub const Observation = struct {
@@ -80,6 +83,15 @@ pub fn parseFileSelected(
         .external => return error.ObservationRequiresExternalInput,
     };
     if (!supported(relation)) return error.UnsupportedTracePhysicalRelation;
+    if (selection) |selected| {
+        if (!canonicalPathPassesSessionSelection(path, selected)) {
+            return .{
+                .parsed = null,
+                .discovery_bytes_read = 0,
+                .file_opened = false,
+            };
+        }
+    }
 
     const io = std.Io.Threaded.global_single_threaded.io();
     const file = if (std.fs.path.isAbsolute(path))
@@ -88,9 +100,19 @@ pub fn parseFileSelected(
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
+    if (selection) |selected| {
+        if (!sourceMtimePassesSince(stat.mtime.nanoseconds, selected)) {
+            return .{
+                .parsed = null,
+                .discovery_bytes_read = 0,
+                .file_opened = true,
+            };
+        }
+    }
     var file_reader = file.reader(io, &.{});
     var prefix: [16 * 1024]u8 = undefined;
-    const prefix_len = if (selection != null)
+    const prefix_len = if (selection != null and
+        requiresSummaryPreselection(selection.?))
         try file_reader.interface.readSliceShort(&prefix)
     else
         0;
@@ -109,6 +131,7 @@ pub fn parseFileSelected(
         return .{
             .parsed = null,
             .discovery_bytes_read = preselection.bytes_read,
+            .file_opened = true,
         };
     }
     if (stat.size > options.max_input_bytes) {
@@ -122,6 +145,30 @@ pub fn parseFileSelected(
         &replay_reader.interface
     else
         &file_reader.interface;
+    return .{
+        .parsed = try parseSelectedReader(
+            allocator,
+            program,
+            relation,
+            path,
+            stat.mtime.nanoseconds,
+            reader,
+            options,
+        ),
+        .discovery_bytes_read = 0,
+        .file_opened = true,
+    };
+}
+
+fn parseSelectedReader(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    relation: physical.Relation,
+    path: []const u8,
+    source_mtime_ns: i128,
+    reader: *std.Io.Reader,
+    options: Options,
+) !ParsedTrace {
     var metrics = trace_core.StreamMetrics{};
     const parse_options = traceParseOptions(
         relation,
@@ -134,7 +181,7 @@ pub fn parseFileSelected(
             allocator,
             path,
             reader,
-            stat.mtime.nanoseconds,
+            source_mtime_ns,
             parse_options,
             &corpus_hasher,
             CorpusHasher.visit,
@@ -145,19 +192,16 @@ pub fn parseFileSelected(
             allocator,
             path,
             reader,
-            stat.mtime.nanoseconds,
+            source_mtime_ns,
             parse_options,
             &corpus_hasher,
             CorpusHasher.visit,
             &metrics,
         );
-    return .{
-        .parsed = .{
-            .trace = trace,
-            .metrics = metrics,
-            .corpus_digest = corpus_hasher.digest(),
-        },
-        .discovery_bytes_read = 0,
+    return ParsedTrace{
+        .trace = trace,
+        .metrics = metrics,
+        .corpus_digest = corpus_hasher.digest(),
     };
 }
 
@@ -165,6 +209,111 @@ const Preselection = struct {
     passes: bool = true,
     bytes_read: usize = 0,
 };
+
+fn canonicalPathPassesSessionSelection(
+    path: []const u8,
+    selection: SessionSelection,
+) bool {
+    const basename = std.fs.path.basename(path);
+    if (!std.mem.startsWith(u8, basename, "rollout-") or
+        !std.mem.endsWith(u8, basename, ".jsonl"))
+    {
+        return true;
+    }
+    if (selection.session_id) |wanted| {
+        if (canonicalSessionFilenameSuffix(wanted)) |suffix| {
+            return std.mem.endsWith(u8, basename, &suffix);
+        }
+    }
+    if (selection.exclude_session_id) |excluded| {
+        if (canonicalSessionFilenameSuffix(excluded)) |suffix| {
+            if (std.mem.endsWith(u8, basename, &suffix)) return false;
+        }
+    }
+    return true;
+}
+
+fn canonicalSessionFilenameSuffix(session_id: []const u8) ?[42]u8 {
+    if (!canonicalSessionId(session_id)) return null;
+    var suffix: [42]u8 = undefined;
+    @memcpy(suffix[0..36], session_id);
+    @memcpy(suffix[36..], ".jsonl");
+    return suffix;
+}
+
+fn canonicalSessionId(session_id: []const u8) bool {
+    if (session_id.len != 36) return false;
+    for (session_id, 0..) |byte, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (byte != '-') return false;
+        } else if (!std.ascii.isHex(byte)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+test "canonical rollout paths preselect exact and excluded sessions" {
+    const wanted = "019f9cf9-37b3-7692-9bd6-f479dc16e385";
+    const other = "019fa6a7-2fe4-7d32-beba-280ecf4e9ff6";
+    const wanted_path =
+        "/sessions/rollout-2026-07-25T22-50-06-" ++ wanted ++ ".jsonl";
+    const other_path =
+        "/sessions/rollout-2026-07-27T19-56-42-" ++ other ++ ".jsonl";
+    try std.testing.expect(canonicalPathPassesSessionSelection(
+        wanted_path,
+        .{ .session_id = wanted },
+    ));
+    try std.testing.expect(!canonicalPathPassesSessionSelection(
+        other_path,
+        .{ .session_id = wanted },
+    ));
+    try std.testing.expect(!canonicalPathPassesSessionSelection(
+        wanted_path,
+        .{ .exclude_session_id = wanted },
+    ));
+    try std.testing.expect(canonicalPathPassesSessionSelection(
+        "renamed.jsonl",
+        .{ .session_id = wanted },
+    ));
+}
+
+fn requiresSummaryPreselection(selection: SessionSelection) bool {
+    return selection.session_id != null or
+        selection.exclude_session_id != null or
+        selection.repo != null or
+        selection.filter_time;
+}
+
+fn sourceMtimePassesSince(
+    source_mtime_ns: i128,
+    selection: SessionSelection,
+) bool {
+    if (!selection.filter_source_mtime_since or
+        selection.since_ms == null or
+        source_mtime_ns <= 0)
+    {
+        return true;
+    }
+    const since_ns = @as(i128, selection.since_ms.?) * std.time.ns_per_ms;
+    return source_mtime_ns >= since_ns;
+}
+
+test "source mtime preselection excludes only files wholly before since" {
+    const since_ms: i64 = 2_000;
+    try std.testing.expect(!sourceMtimePassesSince(
+        @as(i128, 1_999) * std.time.ns_per_ms,
+        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
+    ));
+    try std.testing.expect(sourceMtimePassesSince(
+        @as(i128, 2_000) * std.time.ns_per_ms,
+        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
+    ));
+    try std.testing.expect(sourceMtimePassesSince(
+        0,
+        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
+    ));
+}
 
 fn preselectSession(
     allocator: std.mem.Allocator,
@@ -174,10 +323,7 @@ fn preselectSession(
     selection: SessionSelection,
     prefix: []const u8,
 ) !Preselection {
-    if (selection.session_id == null and
-        selection.repo == null and
-        !selection.filter_time)
-    {
+    if (!requiresSummaryPreselection(selection)) {
         return .{};
     }
     var reader = std.Io.Reader.fixed(prefix);
@@ -192,6 +338,13 @@ fn preselectSession(
     if (selection.session_id) |wanted| {
         if (summary.session.session_id) |actual| {
             if (!std.mem.eql(u8, wanted, actual)) {
+                return .{ .passes = false, .bytes_read = prefix.len };
+            }
+        }
+    }
+    if (selection.exclude_session_id) |excluded| {
+        if (summary.session.session_id) |actual| {
+            if (std.mem.eql(u8, excluded, actual)) {
                 return .{ .passes = false, .bytes_read = prefix.len };
             }
         }
@@ -1547,6 +1700,19 @@ test "selector discovery replays the admitted prefix without a second read" {
     try std.testing.expectEqual(
         @as(usize, trace_rollout.len),
         rejected.discovery_bytes_read,
+    );
+
+    const excluded = try parseFileSelected(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+        .{ .exclude_session_id = "session-1" },
+    );
+    try std.testing.expect(excluded.parsed == null);
+    try std.testing.expectEqual(
+        @as(usize, trace_rollout.len),
+        excluded.discovery_bytes_read,
     );
 }
 

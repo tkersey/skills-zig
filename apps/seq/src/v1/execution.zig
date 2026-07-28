@@ -78,6 +78,11 @@ pub const RuntimeAggregateMetric = struct {
     output_kind: plan.ColumnKind,
 };
 
+pub const RuntimeTopK = struct {
+    keys: FieldRange,
+    count: usize,
+};
+
 pub const RuntimeOperation = union(enum) {
     filter_all: PredicateRange,
     filter_any: PredicateRange,
@@ -86,10 +91,7 @@ pub const RuntimeOperation = union(enum) {
         state_index: u16,
     },
     sort: FieldRange,
-    top_k: struct {
-        keys: FieldRange,
-        count: usize,
-    },
+    top_k: RuntimeTopK,
     distinct: FieldRange,
     aggregate: FieldRange,
 };
@@ -98,6 +100,7 @@ pub const Program = struct {
     source: Source,
     source_width: u16,
     source_field_indices: []u16,
+    materialized_field_indices: []u16,
     source_row_bound: ?usize,
     operations: []RuntimeOperation,
     predicates: []RuntimePredicate,
@@ -111,6 +114,7 @@ pub const Program = struct {
 
     pub fn deinit(self: *Program, allocator: std.mem.Allocator) void {
         allocator.free(self.source_field_indices);
+        allocator.free(self.materialized_field_indices);
         allocator.free(self.operations);
         allocator.free(self.predicates);
         allocator.free(self.sort_keys);
@@ -120,6 +124,77 @@ pub const Program = struct {
         self.* = undefined;
     }
 };
+
+pub fn excludedSessionId(program: *const Program) ?[]const u8 {
+    const relation = switch (program.source) {
+        .physical => |value| value,
+        .external => return null,
+    };
+    const physical_index = relation.fieldIndex("session_id") catch return null;
+    var row_index: ?u16 = null;
+    for (program.source_field_indices, 0..) |field_index, index| {
+        if (field_index == physical_index) {
+            row_index = @intCast(index);
+            break;
+        }
+    }
+    const wanted_index = row_index orelse return null;
+    for (program.operations) |operation| {
+        const range = switch (operation) {
+            .filter_all => |value| value,
+            else => continue,
+        };
+        const end = @as(usize, range.start) + range.len;
+        for (program.predicates[range.start..end]) |predicate| {
+            if (predicate.field_index != wanted_index or
+                predicate.operator != .not_equal)
+            {
+                continue;
+            }
+            const excluded = switch (predicate.operand) {
+                .string => |value| value,
+                else => continue,
+            };
+            if (excluded.len != 0) return excluded;
+        }
+    }
+    return null;
+}
+
+test "session exclusion derives from conjunctive not-equal predicate" {
+    var source_fields = [_]u16{1};
+    var operations = [_]RuntimeOperation{
+        .{ .filter_all = .{ .start = 0, .len = 1 } },
+    };
+    var predicates = [_]RuntimePredicate{.{
+        .field_index = 0,
+        .operator = .not_equal,
+        .operand = .{ .string = "session-current" },
+        .case_insensitive = false,
+    }};
+    var program = Program{
+        .source = .{ .physical = .source_events },
+        .source_width = 1,
+        .source_field_indices = &source_fields,
+        .materialized_field_indices = &.{},
+        .source_row_bound = null,
+        .operations = &operations,
+        .predicates = &predicates,
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = &.{},
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 1,
+    };
+    try std.testing.expectEqualStrings(
+        "session-current",
+        excludedSessionId(&program).?,
+    );
+    program.operations[0] = .{ .filter_any = .{ .start = 0, .len = 1 } };
+    try std.testing.expect(excludedSessionId(&program) == null);
+}
 
 pub fn compile(
     allocator: std.mem.Allocator,
@@ -220,6 +295,7 @@ const ProgramBuilder = struct {
     sort_keys: std.ArrayList(RuntimeSortKey) = .empty,
     distinct_fields: std.ArrayList(u16) = .empty,
     aggregate_metrics: std.ArrayList(RuntimeAggregateMetric) = .empty,
+    materialized_field_indices: std.ArrayList(u16) = .empty,
     limit_state_count: u16 = 0,
     first_blocking_operation: ?u16 = null,
     aggregate_seen: bool = false,
@@ -254,6 +330,7 @@ const ProgramBuilder = struct {
         self.sort_keys.deinit(self.allocator);
         self.distinct_fields.deinit(self.allocator);
         self.aggregate_metrics.deinit(self.allocator);
+        self.materialized_field_indices.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -278,10 +355,17 @@ const ProgramBuilder = struct {
         }
     }
 
-    fn markBlocking(self: *ProgramBuilder) void {
+    fn markBlocking(self: *ProgramBuilder) !void {
         if (self.first_blocking_operation == null) {
             self.first_blocking_operation =
                 @intCast(self.operations.items.len);
+            try self.materialized_field_indices.appendSlice(
+                self.allocator,
+                self.field_map[0..self.field_count],
+            );
+            for (self.field_map[0..self.field_count], 0..) |*field, index| {
+                field.* = @intCast(index);
+            }
         }
     }
 
@@ -388,14 +472,14 @@ const ProgramBuilder = struct {
 
     fn applySort(self: *ProgramBuilder, sort: plan.Sort) !void {
         try self.requireStreaming();
-        self.markBlocking();
+        try self.markBlocking();
         const keys = try self.appendSortKeys(sort.keys);
         try self.operations.append(self.allocator, .{ .sort = keys });
     }
 
     fn applyTopK(self: *ProgramBuilder, top_k: plan.TopK) !void {
         try self.requireStreaming();
-        self.markBlocking();
+        try self.markBlocking();
         const keys = try self.appendSortKeys(top_k.keys);
         try self.operations.append(self.allocator, .{
             .top_k = .{
@@ -415,7 +499,7 @@ const ProgramBuilder = struct {
         distinct: plan.Distinct,
     ) !void {
         try self.requireStreaming();
-        self.markBlocking();
+        try self.markBlocking();
         const start = self.distinct_fields.items.len;
         for (distinct.field_indices) |field_index| {
             if (field_index >= self.field_count) {
@@ -487,6 +571,9 @@ const ProgramBuilder = struct {
     ) !Program {
         const source_fields = try self.sourceFields(resolved);
         errdefer self.allocator.free(source_fields);
+        const materialized_fields =
+            try self.materialized_field_indices.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(materialized_fields);
         const output_fields = try self.outputFields(projection);
         errdefer self.allocator.free(output_fields);
         const operation_slice =
@@ -508,6 +595,7 @@ const ProgramBuilder = struct {
             .source = resolved.source,
             .source_width = @intCast(resolved.source_width),
             .source_field_indices = source_fields,
+            .materialized_field_indices = materialized_fields,
             .source_row_bound = resolved.source_row_bound,
             .operations = operation_slice,
             .predicates = predicate_slice,
@@ -581,6 +669,7 @@ pub const Runner = struct {
     allocator: ?std.mem.Allocator = null,
     value_allocator: ?std.mem.Allocator = null,
     owned_values: std.ArrayList([]u8) = .empty,
+    top_k_owned_values: []std.ArrayList([]u8) = &.{},
     owned_value_bytes: usize = 0,
     owned_value_bytes_max: ?usize = null,
     materialized: []Value = &.{},
@@ -621,10 +710,12 @@ pub const Runner = struct {
         if (program.first_blocking_operation == null) {
             return init(program, output);
         }
+        const row_capacity = materializationRowCapacity(program);
+        const materialized_width = program.materialized_field_indices.len;
         const materialized_cells = std.math.mul(
             usize,
-            program.max_rows,
-            program.source_width,
+            row_capacity,
+            materialized_width,
         ) catch return error.ObservationMaterializationCellBoundExceeded;
         if (materialized_cells > max_materialized_cells) {
             return error.ObservationMaterializationCellBoundExceeded;
@@ -634,16 +725,16 @@ pub const Runner = struct {
             materialized_cells,
         );
         errdefer allocator.free(materialized);
-        const row_refs = try allocator.alloc(RowRef, program.max_rows);
+        const row_refs = try allocator.alloc(RowRef, row_capacity);
         errdefer allocator.free(row_refs);
         const auxiliary_refs = try allocator.alloc(
             RowRef,
-            program.max_rows,
+            row_capacity,
         );
         errdefer allocator.free(auxiliary_refs);
         const duplicate_marks = try allocator.alloc(
             bool,
-            program.max_rows,
+            row_capacity,
         );
         errdefer allocator.free(duplicate_marks);
         var runner = Runner{
@@ -685,8 +776,16 @@ pub const Runner = struct {
             return error.ObservationRetainedValueByteBoundInvalid;
         }
         var runner = try initAlloc(allocator, program, output);
+        errdefer runner.deinit();
         runner.value_allocator = allocator;
         runner.owned_value_bytes_max = owned_value_bytes_max;
+        if (streamingTopK(program) != null) {
+            runner.top_k_owned_values = try allocator.alloc(
+                std.ArrayList([]u8),
+                runner.row_refs.len,
+            );
+            @memset(runner.top_k_owned_values, .empty);
+        }
         return runner;
     }
 
@@ -698,6 +797,13 @@ pub const Runner = struct {
             allocator.free(self.duplicate_marks);
         }
         if (self.value_allocator) |allocator| {
+            for (self.top_k_owned_values) |*values| {
+                for (values.items) |value| allocator.free(value);
+                values.deinit(allocator);
+            }
+            if (self.top_k_owned_values.len != 0) {
+                allocator.free(self.top_k_owned_values);
+            }
             for (self.owned_values.items) |value| allocator.free(value);
             self.owned_values.deinit(allocator);
         }
@@ -724,7 +830,13 @@ pub const Runner = struct {
             self.program.operations[0..operation_end],
         );
         if (disposition.accepted) {
-            if (self.program.first_blocking_operation != null) {
+            if (streamingTopK(self.program)) |top_k| {
+                try self.materializeTopK(
+                    row,
+                    top_k,
+                    self.source_row_count - 1,
+                );
+            } else if (self.program.first_blocking_operation != null) {
                 try self.materialize(row);
             } else {
                 try self.append(row);
@@ -742,7 +854,10 @@ pub const Runner = struct {
         if (self.program.first_blocking_operation) |start| {
             var active_count = self.materialized_row_count;
             for (self.row_refs[0..active_count], 0..) |*ref, index| {
-                ref.* = .{ .row_index = index, .ordinal = index };
+                ref.row_index = index;
+                if (streamingTopK(self.program) == null) {
+                    ref.ordinal = index;
+                }
             }
             for (self.program.operations[start..]) |operation| {
                 active_count = switch (operation) {
@@ -874,19 +989,207 @@ pub const Runner = struct {
         };
     }
 
+    fn materializeTopK(
+        self: *Runner,
+        row: []const Value,
+        top_k: RuntimeTopK,
+        ordinal: usize,
+    ) !void {
+        const capacity = self.row_refs.len;
+        if (capacity == 0) return;
+        const keys = sortKeySlice(self.program, top_k.keys);
+        if (self.materialized_row_count < capacity) {
+            const index = self.materialized_row_count;
+            try self.materializeTopKAt(index, row);
+            const reference = RowRef{
+                .row_index = index,
+                .ordinal = ordinal,
+            };
+            self.row_refs[index] = reference;
+            self.auxiliary_refs[index] = reference;
+            self.materialized_row_count += 1;
+            self.topKHeapSiftUp(index, keys);
+            return;
+        }
+        const worst_index = self.auxiliary_refs[0].row_index;
+        if (!rowSortsBefore(
+            row,
+            ordinal,
+            self.materializedRow(worst_index),
+            self.row_refs[worst_index].ordinal,
+            keys,
+        )) return;
+        self.releaseTopKAt(worst_index);
+        try self.materializeTopKAt(worst_index, row);
+        self.row_refs[worst_index].ordinal = ordinal;
+        self.auxiliary_refs[0] = self.row_refs[worst_index];
+        self.topKHeapSiftDown(keys);
+    }
+
+    fn topKHeapSiftUp(
+        self: *Runner,
+        initial_index: usize,
+        keys: []const RuntimeSortKey,
+    ) void {
+        var index = initial_index;
+        while (index != 0) {
+            const parent = (index - 1) / 2;
+            if (!self.topKRefSortsBefore(
+                self.auxiliary_refs[parent],
+                self.auxiliary_refs[index],
+                keys,
+            )) return;
+            std.mem.swap(
+                RowRef,
+                &self.auxiliary_refs[parent],
+                &self.auxiliary_refs[index],
+            );
+            index = parent;
+        }
+    }
+
+    fn topKHeapSiftDown(
+        self: *Runner,
+        keys: []const RuntimeSortKey,
+    ) void {
+        var index: usize = 0;
+        var remaining = self.materialized_row_count;
+        while (remaining > 0) : (remaining -= 1) {
+            const left = index * 2 + 1;
+            if (left >= self.materialized_row_count) return;
+            const right = left + 1;
+            const worse_child = if (right < self.materialized_row_count and
+                self.topKRefSortsBefore(
+                    self.auxiliary_refs[left],
+                    self.auxiliary_refs[right],
+                    keys,
+                ))
+                right
+            else
+                left;
+            if (!self.topKRefSortsBefore(
+                self.auxiliary_refs[index],
+                self.auxiliary_refs[worse_child],
+                keys,
+            )) return;
+            std.mem.swap(
+                RowRef,
+                &self.auxiliary_refs[index],
+                &self.auxiliary_refs[worse_child],
+            );
+            index = worse_child;
+        }
+    }
+
+    fn topKRefSortsBefore(
+        self: *const Runner,
+        left: RowRef,
+        right: RowRef,
+        keys: []const RuntimeSortKey,
+    ) bool {
+        return rowSortsBefore(
+            self.materializedRow(left.row_index),
+            left.ordinal,
+            self.materializedRow(right.row_index),
+            right.ordinal,
+            keys,
+        );
+    }
+
+    fn materializeTopKAt(
+        self: *Runner,
+        index: usize,
+        row: []const Value,
+    ) !void {
+        const destination = self.materializedRowMut(index);
+        if (self.value_allocator == null) {
+            for (
+                self.program.materialized_field_indices,
+                destination,
+            ) |source_index, *value| value.* = row[source_index];
+            return;
+        }
+        errdefer self.releaseTopKAt(index);
+        for (
+            self.program.materialized_field_indices,
+            destination,
+        ) |source_index, *value| {
+            value.* = try self.retainTopKValue(
+                index,
+                row[source_index],
+            );
+        }
+    }
+
+    fn retainTopKValue(
+        self: *Runner,
+        index: usize,
+        value: Value,
+    ) !Value {
+        return switch (value) {
+            .string => |text| .{
+                .string = try self.retainTopKBytes(index, text),
+            },
+            .json => |json| .{
+                .json = try self.retainTopKBytes(index, json),
+            },
+            else => value,
+        };
+    }
+
+    fn retainTopKBytes(
+        self: *Runner,
+        index: usize,
+        bytes: []const u8,
+    ) ![]const u8 {
+        const allocator = self.value_allocator orelse unreachable;
+        const new_total = std.math.add(
+            usize,
+            self.owned_value_bytes,
+            bytes.len,
+        ) catch return error.ObservationRetainedValueByteBoundExceeded;
+        if (self.owned_value_bytes_max) |max_bytes| {
+            if (new_total > max_bytes) {
+                return error.ObservationRetainedValueByteBoundExceeded;
+            }
+        }
+        const copy = try allocator.dupe(u8, bytes);
+        errdefer allocator.free(copy);
+        try self.top_k_owned_values[index].append(allocator, copy);
+        self.owned_value_bytes = new_total;
+        return copy;
+    }
+
+    fn releaseTopKAt(self: *Runner, index: usize) void {
+        if (self.value_allocator) |allocator| {
+            const values = &self.top_k_owned_values[index];
+            for (values.items) |value| {
+                std.debug.assert(self.owned_value_bytes >= value.len);
+                self.owned_value_bytes -= value.len;
+                allocator.free(value);
+            }
+            values.clearRetainingCapacity();
+        }
+    }
+
     fn materialize(self: *Runner, row: []const Value) !void {
         if (self.materialized_row_count == self.program.max_rows) {
             return error.ObservationMaterializationRowBoundExceeded;
         }
-        const start = self.materialized_row_count * self.program.source_width;
-        const destination =
-            self.materialized[start..][0..self.program.source_width];
+        const width = self.program.materialized_field_indices.len;
+        const destination = self.materialized[self.materialized_row_count * width ..][0..width];
         if (self.value_allocator != null) {
-            for (row, 0..) |value, index| {
-                destination[index] = try self.retainValue(value);
+            for (
+                self.program.materialized_field_indices,
+                destination,
+            ) |source_index, *value| {
+                value.* = try self.retainValue(row[source_index]);
             }
         } else {
-            @memcpy(destination, row);
+            for (
+                self.program.materialized_field_indices,
+                destination,
+            ) |source_index, *value| value.* = row[source_index];
         }
         self.materialized_row_count += 1;
     }
@@ -985,8 +1288,18 @@ pub const Runner = struct {
         self: *const Runner,
         row_index: usize,
     ) []const Value {
-        const start = row_index * self.program.source_width;
-        return self.materialized[start..][0..self.program.source_width];
+        const width = self.program.materialized_field_indices.len;
+        const start = row_index * width;
+        return self.materialized[start..][0..width];
+    }
+
+    fn materializedRowMut(
+        self: *Runner,
+        row_index: usize,
+    ) []Value {
+        const width = self.program.materialized_field_indices.len;
+        const start = row_index * width;
+        return self.materialized[start..][0..width];
     }
 
     fn filterRows(
@@ -1212,10 +1525,63 @@ fn validateRunnerInputs(program: *const Program) !void {
     if (program.output_field_indices.len == 0) {
         return error.InvalidObservationOutputWidth;
     }
+    if (program.first_blocking_operation != null and
+        program.materialized_field_indices.len == 0)
+    {
+        return error.InvalidObservationMaterializedWidth;
+    }
+}
+
+fn streamingTopK(program: *const Program) ?RuntimeTopK {
+    const index = program.first_blocking_operation orelse return null;
+    return switch (program.operations[index]) {
+        .top_k => |top_k| top_k,
+        else => null,
+    };
+}
+
+fn materializationRowCapacity(program: *const Program) usize {
+    const top_k = streamingTopK(program) orelse return program.max_rows;
+    return @min(program.max_rows, top_k.count);
 }
 
 fn resetOrdinals(refs: []RowRef) void {
     for (refs, 0..) |*ref, index| ref.ordinal = index;
+}
+
+fn sortKeySlice(
+    program: *const Program,
+    range: FieldRange,
+) []const RuntimeSortKey {
+    const end = @as(usize, range.start) + range.len;
+    return program.sort_keys[range.start..end];
+}
+
+fn rowSortsBefore(
+    left_row: []const Value,
+    left_ordinal: usize,
+    right_row: []const Value,
+    right_ordinal: usize,
+    keys: []const RuntimeSortKey,
+) bool {
+    for (keys) |key| {
+        const left_value = left_row[key.field_index];
+        const right_value = right_row[key.field_index];
+        const order = compareForSort(
+            left_value,
+            right_value,
+            key.nulls,
+        );
+        if (order == .eq) continue;
+        if (left_value == .null or right_value == .null) {
+            return order == .lt;
+        }
+        return if (key.direction == .ascending)
+            order == .lt
+        else
+            order == .gt;
+    }
+    return left_ordinal < right_ordinal;
 }
 
 const SortContext = struct {
@@ -1223,26 +1589,13 @@ const SortContext = struct {
     keys: []const RuntimeSortKey,
 
     fn lessThan(context: SortContext, left: RowRef, right: RowRef) bool {
-        const left_row = context.runner.materializedRow(left.row_index);
-        const right_row = context.runner.materializedRow(right.row_index);
-        for (context.keys) |key| {
-            const left_value = left_row[key.field_index];
-            const right_value = right_row[key.field_index];
-            const order = compareForSort(
-                left_value,
-                right_value,
-                key.nulls,
-            );
-            if (order == .eq) continue;
-            if (left_value == .null or right_value == .null) {
-                return order == .lt;
-            }
-            return if (key.direction == .ascending)
-                order == .lt
-            else
-                order == .gt;
-        }
-        return left.ordinal < right.ordinal;
+        return rowSortsBefore(
+            context.runner.materializedRow(left.row_index),
+            left.ordinal,
+            context.runner.materializedRow(right.row_index),
+            right.ordinal,
+            context.keys,
+        );
     }
 };
 
@@ -2126,6 +2479,48 @@ test "compiled top-k binds its count once before execution" {
     );
 }
 
+test "top-k retains only its bounded native working set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try compileTestProgram(
+        &tmp.dir,
+        top_k_test_definition,
+        &.{.{ .name = "k", .raw_value = "2" }},
+        "rows",
+    );
+    defer fixture.deinit();
+    const source = [_]Value{
+        .{ .string = "a" ** 128 }, .{ .integer = 2 },
+        .{ .string = "b" ** 128 }, .{ .integer = 4 },
+        .{ .string = "c" ** 128 }, .{ .integer = 4 },
+        .{ .string = "d" ** 128 }, .{ .integer = 1 },
+    };
+    var output: [2]Value = undefined;
+    var runner = try Runner.initOwnedAllocBounded(
+        std.testing.allocator,
+        &fixture.program,
+        &output,
+        256,
+    );
+    defer runner.deinit();
+    for (0..4) |index| {
+        const start = index * 2;
+        _ = try runner.feed(source[start..][0..2]);
+    }
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqual(@as(usize, 2), result.materialized_row_count);
+    try std.testing.expectEqual(@as(usize, 256), runner.owned_value_bytes);
+    try std.testing.expectEqualStrings(
+        "b" ** 128,
+        result.rows().row(0)[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "c" ** 128,
+        result.rows().row(1)[0].string,
+    );
+}
+
 test "compiled aggregate streams bounded numeric summaries in one pass" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2223,6 +2618,7 @@ test "owned runners bound retained value bytes" {
         .source = .{ .physical = .messages },
         .source_width = 1,
         .source_field_indices = source_fields[0..],
+        .materialized_field_indices = &.{},
         .source_row_bound = null,
         .operations = &.{},
         .predicates = &.{},

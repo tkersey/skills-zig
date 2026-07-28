@@ -1287,9 +1287,8 @@ fn compileAdmission(
         try definition_core.json.field(object, "forbids"),
     );
     errdefer allocator.free(forbidden);
-    if (setsIntersect(required, forbidden)) {
+    if (setsIntersect(required, forbidden))
         return error.ConflictingRetainedAdmissionState;
-    }
     const guards = try compileOptionalSetGuards(
         allocator,
         registers,
@@ -1316,18 +1315,15 @@ fn compileAdmission(
         event_max_bytes,
     );
     errdefer if (replay_validator) |*plan| plan.deinit(allocator);
-    const actions = try compileActions(
+    const actions = try compileAdmissionActions(
         allocator,
+        definition_plan,
         registers,
         sets,
         required,
-        try definition_core.json.field(object, "actions"),
-        definition_plan.bounds.max_records,
+        object,
     );
-    errdefer {
-        for (actions) |*action| action.deinit(allocator);
-        allocator.free(actions);
-    }
+    errdefer deinitActions(allocator, actions);
     return .{
         .on = try allocator.dupe(u8, on),
         .required = required,
@@ -1337,6 +1333,29 @@ fn compileAdmission(
         .replay_validation_plan = replay_validator,
         .actions = actions,
     };
+}
+
+fn compileAdmissionActions(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    registers: []const Register,
+    sets: []const RetainedSet,
+    required: []const u16,
+    object: std.json.ObjectMap,
+) ![]Action {
+    return compileActions(
+        allocator,
+        registers,
+        sets,
+        required,
+        try definition_core.json.field(object, "actions"),
+        definition_plan.bounds.max_records,
+    );
+}
+
+fn deinitActions(allocator: std.mem.Allocator, actions: []Action) void {
+    for (actions) |*action| action.deinit(allocator);
+    allocator.free(actions);
 }
 
 fn validateAdmissionObject(object: std.json.ObjectMap) ![]const u8 {

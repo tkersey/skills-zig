@@ -121,6 +121,16 @@ write_ledger_smoke() {
   printf '#!/usr/bin/env bash\n' >scripts/test-ledger-cli.sh
 }
 
+write_durable_store_perf() {
+  mkdir -p tools
+  printf 'pub fn main() void {}\n' >tools/durable_store_perf.zig
+}
+
+write_ci_helper() {
+  mkdir -p .github/scripts
+  printf '#!/usr/bin/env bash\n' >.github/scripts/ci-helper.sh
+}
+
 assert_affected seq write_seq
 assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas write_trace_core
@@ -133,9 +143,11 @@ assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_c
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
 assert_affected "" write_readme
+assert_affected seq write_durable_store_perf
 assert_ci_affected seq,cas,ledger write_definition_guard
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
+assert_ci_affected seq,lift,cas,cron,ledger,memory-note,img write_ci_helper
 
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION

@@ -605,10 +605,12 @@ fn executePhysicalObservation(
         return error.ExternalInputNotAcceptedForPhysicalObservation;
     }
     try validateSelectedSelectors(&context.definition_plan, args.selectors);
+    var discovery_selectors = args.selectors;
+    discovery_selectors.session_id = null;
     var paths = try seq.native.resolveTargetPaths(
         allocator,
         defaultIo(),
-        args.selectors,
+        discovery_selectors,
         false,
     );
     defer seq.native.freePaths(allocator, &paths);
@@ -633,7 +635,11 @@ fn executePhysicalObservation(
             &digest_set,
             &metrics,
         );
-        if (feed == .stop) break;
+        if (feed == .stop and args.selectors.session_id == null) break;
+    }
+    if (args.selectors.session_id != null) {
+        if (metrics.sessions == 0) return error.SessionNotFound;
+        if (metrics.sessions != 1) return error.AmbiguousSessionTarget;
     }
     return .{
         .result = try runner.finish(),
@@ -732,6 +738,16 @@ fn feedOpenCodeFile(
             session_id,
         )) return .continue_scanning;
     }
+    if (seq.execution.excludedSessionId(program)) |excluded| {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = try seq.opencode_adapter.sessionId(
+            &session_id_buffer,
+            path,
+        );
+        if (std.mem.eql(u8, excluded, session_id)) {
+            return .continue_scanning;
+        }
+    }
     const remaining_bytes = if (metrics.corpus_bytes < bounds.max_input_bytes)
         bounds.max_input_bytes - metrics.corpus_bytes
     else
@@ -789,34 +805,20 @@ fn feedCodexFile(
         },
         .{
             .session_id = args.selectors.session_id,
+            .exclude_session_id = seq.execution.excludedSessionId(program),
             .repo = args.selectors.repo,
             .since_ms = args.selectors.since_ms,
             .until_ms = args.selectors.until_ms,
             .filter_time = relation == .sessions,
+            .filter_source_mtime_since = true,
         },
     );
-    metrics.opened += 1;
-    metrics.bytes_read = std.math.add(
-        usize,
-        metrics.bytes_read,
-        selected.discovery_bytes_read,
-    ) catch return error.ObservationMetricOverflow;
-    if (metrics.bytes_read > max_discovery_bytes + metrics.corpus_bytes) {
-        return error.ObservationDiscoveryByteBoundExceeded;
-    }
+    if (selected.file_opened) metrics.opened += 1;
+    try recordDiscoveryBytes(metrics, selected.discovery_bytes_read);
     var parsed = selected.parsed orelse return .continue_scanning;
     defer parsed.deinit(allocator);
     try metrics.admitAdapter("codex-rollout-jsonl/v1");
-    metrics.bytes_read = std.math.add(
-        usize,
-        metrics.bytes_read,
-        parsed.metrics.bytes_read,
-    ) catch return error.ObservationMetricOverflow;
-    metrics.corpus_bytes = std.math.add(
-        usize,
-        metrics.corpus_bytes,
-        parsed.metrics.bytes_read,
-    ) catch return error.ObservationMetricOverflow;
+    try recordCorpusBytes(metrics, parsed.metrics.bytes_read);
     if (relation == .sessions) {
         if (!seq.native.sessionPasses(
             parsed.trace.session,
@@ -828,13 +830,7 @@ fn feedCodexFile(
     )) {
         return .continue_scanning;
     }
-    metrics.warnings = std.math.add(
-        usize,
-        metrics.warnings,
-        parsed.trace.warnings.items.len,
-    ) catch return error.ObservationMetricOverflow;
-    metrics.files += 1;
-    metrics.sessions += 1;
+    try admitCodexSession(metrics, &parsed);
     digest_set.add(path, &parsed.corpus_digest);
     return feedCodexRows(
         allocator,
@@ -845,6 +841,43 @@ fn feedCodexFile(
         runner,
         &parsed,
     );
+}
+
+fn recordDiscoveryBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
+    metrics.bytes_read = std.math.add(
+        usize,
+        metrics.bytes_read,
+        bytes,
+    ) catch return error.ObservationMetricOverflow;
+    if (metrics.bytes_read > max_discovery_bytes + metrics.corpus_bytes) {
+        return error.ObservationDiscoveryByteBoundExceeded;
+    }
+}
+
+fn recordCorpusBytes(metrics: *PhysicalMetrics, bytes: usize) !void {
+    metrics.bytes_read = std.math.add(
+        usize,
+        metrics.bytes_read,
+        bytes,
+    ) catch return error.ObservationMetricOverflow;
+    metrics.corpus_bytes = std.math.add(
+        usize,
+        metrics.corpus_bytes,
+        bytes,
+    ) catch return error.ObservationMetricOverflow;
+}
+
+fn admitCodexSession(
+    metrics: *PhysicalMetrics,
+    parsed: *const seq.trace_adapter.ParsedTrace,
+) !void {
+    metrics.warnings = std.math.add(
+        usize,
+        metrics.warnings,
+        parsed.trace.warnings.items.len,
+    ) catch return error.ObservationMetricOverflow;
+    metrics.files += 1;
+    metrics.sessions += 1;
 }
 
 fn feedCodexRows(

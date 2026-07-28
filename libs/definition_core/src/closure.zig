@@ -208,7 +208,14 @@ const Builder = struct {
         self: *Builder,
         relative_path: []const u8,
     ) !LoadedDefinition {
-        const source_bytes = try self.definitionSize(relative_path);
+        const raw = try readAdmittedFileAlloc(
+            self.root,
+            relative_path,
+            self.allocator,
+            self.limits.max_file_bytes,
+        );
+        defer self.allocator.free(raw);
+        const source_bytes = raw.len;
         const next_total = std.math.add(
             usize,
             self.total_definition_bytes,
@@ -217,13 +224,6 @@ const Builder = struct {
         if (next_total > self.limits.max_total_bytes) {
             return error.DefinitionClosureTooLarge;
         }
-        const raw = try self.root.readFileAlloc(
-            defaultIo(),
-            relative_path,
-            self.allocator,
-            .limited(self.limits.max_file_bytes),
-        );
-        defer self.allocator.free(raw);
         var parsed = try parseDefinition(self.allocator, raw);
         defer parsed.deinit();
         var loaded = LoadedDefinition{
@@ -244,23 +244,6 @@ const Builder = struct {
             &loaded.imports,
         );
         return loaded;
-    }
-
-    fn definitionSize(
-        self: *Builder,
-        relative_path: []const u8,
-    ) !usize {
-        try rejectSymlinkComponents(self.root, relative_path);
-        const stat = try self.root.statFile(defaultIo(), relative_path, .{
-            .follow_symlinks = false,
-        });
-        if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
-        if (stat.kind != .file) return error.DefinitionNotRegularFile;
-        if (stat.size > self.limits.max_file_bytes) {
-            return error.DefinitionFileTooLarge;
-        }
-        return std.math.cast(usize, stat.size) orelse
-            error.DefinitionFileTooLarge;
     }
 };
 
@@ -540,22 +523,16 @@ fn verifySourceFile(
     file: anytype,
     limits: Limits,
 ) !void {
-    try rejectSymlinkComponents(root, file.path);
-    const stat = try root.statFile(defaultIo(), file.path, .{
-        .follow_symlinks = false,
-    });
-    if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
-    if (stat.kind != .file) return error.DefinitionNotRegularFile;
-    if (stat.size != file.source_bytes) {
-        return error.DefinitionSourceSizeMismatch;
-    }
-    const raw = try root.readFileAlloc(
-        defaultIo(),
+    const raw = try readAdmittedFileAlloc(
+        root,
         file.path,
         allocator,
-        .limited(limits.max_file_bytes),
+        limits.max_file_bytes,
     );
     defer allocator.free(raw);
+    if (raw.len != file.source_bytes) {
+        return error.DefinitionSourceSizeMismatch;
+    }
     if (!std.unicode.utf8ValidateSlice(raw)) {
         return error.InvalidDefinitionUtf8;
     }
@@ -564,6 +541,44 @@ fn verifySourceFile(
     if (!std.mem.eql(u8, &digest, &file.source_digest)) {
         return error.DefinitionSourceDigestMismatch;
     }
+}
+
+fn readAdmittedFileAlloc(
+    root: *std.Io.Dir,
+    relative_path: []const u8,
+    allocator: std.mem.Allocator,
+    max_file_bytes: usize,
+) ![]u8 {
+    try rejectSymlinkComponents(root, relative_path);
+    var source = root.openFile(defaultIo(), relative_path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.IsDir => return error.DefinitionNotRegularFile,
+        else => return err,
+    };
+    defer source.close(defaultIo());
+    const stat = try source.stat(defaultIo());
+    if (stat.kind == .sym_link) return error.SymlinkDefinitionPath;
+    if (stat.kind != .file) return error.DefinitionNotRegularFile;
+    if (stat.size > max_file_bytes) return error.DefinitionFileTooLarge;
+    const read_limit = std.math.add(
+        usize,
+        max_file_bytes,
+        1,
+    ) catch return error.DefinitionFileTooLarge;
+    var reader = source.reader(defaultIo(), &.{});
+    const raw = reader.interface.allocRemaining(
+        allocator,
+        .limited(read_limit),
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return error.DefinitionFileTooLarge,
+        else => return err,
+    };
+    errdefer allocator.free(raw);
+    if (raw.len > max_file_bytes) return error.DefinitionFileTooLarge;
+    return raw;
 }
 
 fn validateManifestPath(

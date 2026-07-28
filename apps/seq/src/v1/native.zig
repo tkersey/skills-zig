@@ -401,15 +401,7 @@ fn runRelation(
     try writer.writeByte('[');
     var first = true;
     var remaining = options.limit;
-    var selection = trace_adapter.RowSelection{
-        .remaining = if (options.limit == 0) null else &remaining,
-    };
-    if (relation == .turns) {
-        selection.since_ms = options.since_ms;
-        selection.until_ms = options.until_ms;
-        selection.status = options.status;
-        selection.contains = options.contains;
-    }
+    const selection = relationRowSelection(options, relation, &remaining);
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
         if (opencode_adapter.recognizes(path)) {
@@ -451,6 +443,23 @@ fn runRelation(
         );
     }
     try writer.writeAll("]\n");
+}
+
+fn relationRowSelection(
+    options: Options,
+    relation: physical.Relation,
+    remaining: *usize,
+) trace_adapter.RowSelection {
+    var selection = trace_adapter.RowSelection{
+        .remaining = if (options.limit == 0) null else remaining,
+    };
+    if (relation == .turns) {
+        selection.since_ms = options.since_ms;
+        selection.until_ms = options.until_ms;
+        selection.status = options.status;
+        selection.contains = options.contains;
+    }
+    return selection;
 }
 
 fn runSessionDetail(
@@ -790,30 +799,13 @@ fn feedQueryPath(
     runner: *execution.Runner,
 ) !execution.Feed {
     if (opencode_adapter.recognizes(path)) {
-        if (options.repo != null or
-            options.since_ms != null or
-            options.until_ms != null)
-        {
-            return error.OpenCodePromptHistorySelectorUnavailable;
-        }
-        if (options.session_id) |wanted| {
-            var session_id_buffer: [64]u8 = undefined;
-            const session_id = try opencode_adapter.sessionId(
-                &session_id_buffer,
-                path,
-            );
-            if (!std.mem.eql(u8, wanted, session_id)) {
-                return .continue_scanning;
-            }
-        }
-        _ = try opencode_adapter.feedFile(
+        return feedOpenCodeQueryPath(
             allocator,
-            &compilation.program,
-            runner,
             path,
-            256 * 1024 * 1024,
+            options,
+            compilation,
+            runner,
         );
-        return if (runner.stopped) .stop else .continue_scanning;
     }
     var trace = if (compilation.relation == .sessions)
         try trace_core.parseSessionSummaryTrace(
@@ -863,6 +855,39 @@ fn feedQueryPath(
             selection,
         ),
     };
+}
+
+fn feedOpenCodeQueryPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+    compilation: *const QueryCompilation,
+    runner: *execution.Runner,
+) !execution.Feed {
+    if (options.repo != null or
+        options.since_ms != null or
+        options.until_ms != null)
+    {
+        return error.OpenCodePromptHistorySelectorUnavailable;
+    }
+    if (options.session_id) |wanted| {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = try opencode_adapter.sessionId(
+            &session_id_buffer,
+            path,
+        );
+        if (!std.mem.eql(u8, wanted, session_id)) {
+            return .continue_scanning;
+        }
+    }
+    _ = try opencode_adapter.feedFile(
+        allocator,
+        &compilation.program,
+        runner,
+        path,
+        256 * 1024 * 1024,
+    );
+    return if (runner.stopped) .stop else .continue_scanning;
 }
 
 fn loadQuerySpecAlloc(
@@ -1167,6 +1192,14 @@ fn finishQueryCompilation(
         demand.physical_indices[0..demand.count],
     );
     errdefer allocator.free(source_fields);
+    const materialized_fields = try allocator.alloc(
+        u16,
+        if (operation_set.first_blocking == null) 0 else demand.count,
+    );
+    errdefer allocator.free(materialized_fields);
+    for (materialized_fields, 0..) |*field, index| {
+        field.* = @intCast(index);
+    }
     const owned_predicates = try predicates.toOwnedSlice(allocator);
     errdefer allocator.free(owned_predicates);
     const owned_sort_keys = try sort_keys.toOwnedSlice(allocator);
@@ -1188,6 +1221,7 @@ fn finishQueryCompilation(
             .source = .{ .physical = relation },
             .source_width = @intCast(demand.count),
             .source_field_indices = source_fields,
+            .materialized_field_indices = materialized_fields,
             .source_row_bound = null,
             .operations = operation_set.items,
             .predicates = owned_predicates,
@@ -1286,20 +1320,7 @@ fn writeOpenCodeRelationRows(
     first: *bool,
     remaining: *usize,
 ) !void {
-    if (options.repo != null or
-        options.since_ms != null or
-        options.until_ms != null)
-    {
-        return error.OpenCodePromptHistorySelectorUnavailable;
-    }
-    if (options.session_id) |wanted| {
-        var session_id_buffer: [64]u8 = undefined;
-        const session_id = try opencode_adapter.sessionId(
-            &session_id_buffer,
-            path,
-        );
-        if (!std.mem.eql(u8, wanted, session_id)) return;
-    }
+    if (!try openCodePathPasses(options, path)) return;
     const limit = if (options.limit == 0) 100_000 else remaining.*;
     var compilation = try compileAllFieldsQuery(
         allocator,
@@ -1343,13 +1364,46 @@ fn writeOpenCodeRelationRows(
     }
     const result = try runner.finish();
     const rows = result.rows();
+    const count = try writeOpenCodeQueryRows(
+        writer,
+        compilation.output_names,
+        rows,
+        first,
+    );
+    if (options.limit != 0) remaining.* -|= count;
+}
+
+fn openCodePathPasses(options: Options, path: []const u8) !bool {
+    if (options.repo != null or
+        options.since_ms != null or
+        options.until_ms != null)
+    {
+        return error.OpenCodePromptHistorySelectorUnavailable;
+    }
+    if (options.session_id) |wanted| {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = try opencode_adapter.sessionId(
+            &session_id_buffer,
+            path,
+        );
+        return std.mem.eql(u8, wanted, session_id);
+    }
+    return true;
+}
+
+fn writeOpenCodeQueryRows(
+    writer: *std.Io.Writer,
+    names: []const []const u8,
+    rows: execution.Rows,
+    first: *bool,
+) !usize {
     const count = try rows.count();
     for (0..count) |row_index| {
         if (!first.*) try writer.writeByte(',');
         first.* = false;
         const row = rows.row(row_index);
         try writer.writeByte('{');
-        for (compilation.output_names, row, 0..) |name, value, field_index| {
+        for (names, row, 0..) |name, value, field_index| {
             if (field_index != 0) try writer.writeByte(',');
             try definition_core.canonical_json.writeCanonicalString(
                 writer,
@@ -1360,7 +1414,7 @@ fn writeOpenCodeRelationRows(
         }
         try writer.writeByte('}');
     }
-    if (options.limit != 0) remaining.* -|= count;
+    return count;
 }
 
 fn compileAllFieldsQuery(
@@ -1679,7 +1733,9 @@ pub fn absolutePathAlloc(
             return error.EnvironmentVariableNotFound;
         return std.fs.path.resolve(allocator, &.{ home, path[2..] });
     }
-    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         ".",
@@ -2034,8 +2090,12 @@ test "OpenCode native surfaces preserve valid turn numbering and filtering" {
     );
     defer std.testing.allocator.free(path);
 
-    var sessions_output: std.Io.Writer.Allocating =
-        .init(std.testing.allocator);
+    try expectOpenCodeSessionSurfaces(root);
+    try expectOpenCodeTurnSurfaces(path);
+}
+
+fn expectOpenCodeSessionSurfaces(root: []const u8) !void {
+    var sessions_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer sessions_output.deinit();
     try runRelation(
         std.testing.allocator,
@@ -2053,8 +2113,25 @@ test "OpenCode native surfaces preserve valid turn numbering and filtering" {
         ) != null,
     );
 
-    var turns_output: std.Io.Writer.Allocating =
-        .init(std.testing.allocator);
+    var find_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer find_output.deinit();
+    try runFindSession(
+        std.testing.allocator,
+        &find_output.writer,
+        std.testing.io,
+        .{ .root = root, .prompt = "beta" },
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            find_output.written(),
+            "\"turn_count\":2",
+        ) != null,
+    );
+}
+
+fn expectOpenCodeTurnSurfaces(path: []const u8) !void {
+    var turns_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer turns_output.deinit();
     try runRelation(
         std.testing.allocator,
@@ -2074,25 +2151,7 @@ test "OpenCode native surfaces preserve valid turn numbering and filtering" {
         std.mem.indexOf(u8, turns_output.written(), "\"turn_index\":2") == null,
     );
 
-    var find_output: std.Io.Writer.Allocating =
-        .init(std.testing.allocator);
-    defer find_output.deinit();
-    try runFindSession(
-        std.testing.allocator,
-        &find_output.writer,
-        std.testing.io,
-        .{ .root = root, .prompt = "beta" },
-    );
-    try std.testing.expect(
-        std.mem.indexOf(
-            u8,
-            find_output.written(),
-            "\"turn_count\":2",
-        ) != null,
-    );
-
-    var detail_output: std.Io.Writer.Allocating =
-        .init(std.testing.allocator);
+    var detail_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer detail_output.deinit();
     try std.testing.expectError(
         error.OpenCodeSessionDetailUnavailable,
@@ -2118,6 +2177,16 @@ test "repository selectors require path-component boundaries" {
         session,
         .{ .repo = "/rep" },
     ));
+}
+
+test "absolute repository selectors normalize lexical aliases" {
+    const normalized = try absolutePathAlloc(
+        std.testing.allocator,
+        null,
+        "/repo/project/sub/../",
+    );
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqualStrings("/repo/project", normalized);
 }
 
 fn testSession(

@@ -138,6 +138,9 @@ case "$mode" in
         scripts/test-ledger-cli.sh)
           mark_app ledger
           ;;
+        tools/durable_store_perf.zig)
+          mark_app seq
+          ;;
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;

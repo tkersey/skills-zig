@@ -1387,74 +1387,83 @@ fn lowerStateAdmissions(
     const raw_admissions = try definition_core.json.array(raw);
     var admissions = std.json.Array.init(allocator);
     for (raw_admissions.items) |raw_admission| {
-        const admission = try definition_core.json.object(raw_admission);
-        try definition_core.json.requireExactKeys(admission, &.{
-            "on",
-            "requires",
-            "forbids",
-            "laws",
-            "current_laws",
-            "actions",
-        });
-        try definition_core.json.requireFields(admission, &.{"on"});
-        var lowered = std.json.ObjectMap.empty;
-        try lowered.put(
+        try admissions.append(.{ .object = try lowerStateAdmission(
             allocator,
-            "on",
-            try definition_core.json.field(admission, "on"),
-        );
-        try lowered.put(
-            allocator,
-            "requires",
-            admission.get("requires") orelse
-                .{ .array = std.json.Array.init(allocator) },
-        );
-        try lowered.put(
-            allocator,
-            "forbids",
-            admission.get("forbids") orelse
-                .{ .array = std.json.Array.init(allocator) },
-        );
-        const admission_laws = if (admission.get("laws")) |laws|
-            try lowerExpressions(
-                allocator,
-                try definition_core.json.array(laws),
-                null,
-                null,
-                terms,
-                true,
-                budget,
-            )
-        else
-            std.json.Array.init(allocator);
-        try lowered.put(allocator, "rules", .{ .array = admission_laws });
-        if (admission.get("current_laws")) |laws| {
-            const current_laws = try lowerExpressions(
-                allocator,
-                try definition_core.json.array(laws),
-                null,
-                null,
-                terms,
-                true,
-                budget,
-            );
-            try lowered.put(allocator, "current_rules", .{
-                .array = current_laws,
-            });
-        }
-        const admission_actions = if (admission.get("actions")) |actions|
-            try lowerStateActions(
-                allocator,
-                try definition_core.json.array(actions),
-            )
-        else
-            std.json.Array.init(allocator);
-        try lowered.put(allocator, "actions", .{
-            .array = admission_actions,
-        });
-        try admissions.append(.{ .object = lowered });
+            try definition_core.json.object(raw_admission),
+            terms,
+            budget,
+        ) });
     }
     return admissions;
+}
+
+fn lowerStateAdmission(
+    allocator: std.mem.Allocator,
+    admission: std.json.ObjectMap,
+    terms: ?std.json.ObjectMap,
+    budget: *ExpansionBudget,
+) !std.json.ObjectMap {
+    try definition_core.json.requireExactKeys(admission, &.{
+        "on",
+        "requires",
+        "forbids",
+        "laws",
+        "current_laws",
+        "actions",
+    });
+    try definition_core.json.requireFields(admission, &.{"on"});
+    var lowered = std.json.ObjectMap.empty;
+    try lowered.put(
+        allocator,
+        "on",
+        try definition_core.json.field(admission, "on"),
+    );
+    try lowered.put(
+        allocator,
+        "requires",
+        admission.get("requires") orelse
+            .{ .array = std.json.Array.init(allocator) },
+    );
+    try lowered.put(
+        allocator,
+        "forbids",
+        admission.get("forbids") orelse
+            .{ .array = std.json.Array.init(allocator) },
+    );
+    const admission_laws = if (admission.get("laws")) |laws|
+        try lowerExpressions(
+            allocator,
+            try definition_core.json.array(laws),
+            null,
+            null,
+            terms,
+            true,
+            budget,
+        )
+    else
+        std.json.Array.init(allocator);
+    try lowered.put(allocator, "rules", .{ .array = admission_laws });
+    if (admission.get("current_laws")) |laws| {
+        const current_laws = try lowerExpressions(
+            allocator,
+            try definition_core.json.array(laws),
+            null,
+            null,
+            terms,
+            true,
+            budget,
+        );
+        try lowered.put(allocator, "current_rules", .{ .array = current_laws });
+    }
+    const admission_actions = if (admission.get("actions")) |actions|
+        try lowerStateActions(
+            allocator,
+            try definition_core.json.array(actions),
+        )
+    else
+        std.json.Array.init(allocator);
+    try lowered.put(allocator, "actions", .{ .array = admission_actions });
+    return lowered;
 }
 
 fn lowerStateActions(
