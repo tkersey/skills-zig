@@ -92,13 +92,19 @@ pub fn parseFileSelected(
     const file = try openTraceFile(io, path);
     defer file.close(io);
     const stat = try file.stat(io);
+    if (stat.size > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     var file_reader = file.reader(io, &.{});
-    var prefix: [16 * 1024]u8 = undefined;
-    const prefix_len = if (selection != null and
+    const prefix = if (selection != null and
         requiresSummaryPreselection(selection.?))
-        try file_reader.interface.readSliceShort(&prefix)
+        try readSummaryPrefixAlloc(
+            allocator,
+            &file_reader.interface,
+        )
     else
-        0;
+        try allocator.alloc(u8, 0);
+    defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
             allocator,
@@ -106,18 +112,15 @@ pub fn parseFileSelected(
             stat.mtime.nanoseconds,
             options,
             selected,
-            prefix[0..prefix_len],
+            prefix,
         )
     else
         Preselection{};
     if (!preselection.passes) {
         return skippedSelection(true, preselection.bytes_read);
     }
-    if (stat.size > options.max_input_bytes) {
-        return error.ObservationInputByteBoundExceeded;
-    }
     var replay_reader = PrefixReader.init(
-        prefix[0..prefix_len],
+        prefix,
         &file_reader.interface,
     );
     const reader = if (selection != null)
@@ -137,6 +140,26 @@ pub fn parseFileSelected(
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
+}
+
+fn readSummaryPrefixAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+) ![]u8 {
+    const max_line_bytes = 256 * 1024 * 1024;
+    var prefix: std.ArrayList(u8) = .empty;
+    errdefer prefix.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) { // tiger: event-loop -- bounded by newline, EOF, or max_line_bytes.
+        const read = try reader.readSliceShort(&chunk);
+        if (read == 0) break;
+        if (read > max_line_bytes -| prefix.items.len) {
+            return error.LineTooLong;
+        }
+        try prefix.appendSlice(allocator, chunk[0..read]);
+        if (std.mem.indexOfScalar(u8, chunk[0..read], '\n') != null) break;
+    }
+    return prefix.toOwnedSlice(allocator);
 }
 
 fn openTraceFile(io: std.Io, path: []const u8) !std.Io.File {
@@ -1692,6 +1715,64 @@ test "selector discovery replays the admitted prefix without a second read" {
         @as(usize, trace_rollout.len),
         excluded.discovery_bytes_read,
     );
+}
+
+test "selector discovery reads a complete large session metadata record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(
+        std.testing.allocator,
+        "{\"timestamp\":\"2026-07-26T10:00:00Z\",\"type\":\"session_meta\"," ++
+            "\"payload\":{\"id\":\"session-large\",\"model\":\"gpt-test\"," ++
+            "\"cwd\":\"/repo\",\"padding\":\"",
+    );
+    try source.appendNTimes(std.testing.allocator, 'x', 17 * 1024);
+    try source.appendSlice(
+        std.testing.allocator,
+        "\"}}\n" ++
+            "{\"timestamp\":\"2026-07-26T10:00:01Z\",\"type\":\"event_msg\"," ++
+            "\"payload\":{\"type\":\"agent_message\",\"message\":\"observed\"}}\n",
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = source.items,
+    });
+    var event_program = try TestProgram.init(
+        &tmp.dir,
+        "events.json",
+        event_observation_definition,
+    );
+    defer event_program.deinit();
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+
+    var selected = try parseFileSelected(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+        .{ .session_id = "session-large" },
+    );
+    defer if (selected.parsed) |*parsed|
+        parsed.deinit(std.testing.allocator);
+    try std.testing.expect(selected.parsed != null);
+    try std.testing.expectEqual(source.items.len, selected.parsed.?.metrics.bytes_read);
+
+    const rejected = try parseFileSelected(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+        .{ .session_id = "session-other" },
+    );
+    try std.testing.expect(rejected.parsed == null);
+    try std.testing.expect(rejected.discovery_bytes_read > 16 * 1024);
 }
 
 test "trace adapter applies temporal selectors to physical event rows" {

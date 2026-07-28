@@ -61,8 +61,11 @@ pub const Operator = enum {
         return error.UnsupportedObservationOperator;
     }
 
-    pub fn version(_: Operator) u16 {
-        return 1;
+    pub fn version(self: Operator) u16 {
+        return switch (self) {
+            .filter => 2,
+            else => 1,
+        };
     }
 };
 

@@ -120,6 +120,7 @@ fn scanRecords(
             containsIgnoreCase(path, selection.contains.?),
     };
     var lines = std.mem.splitScalar(u8, raw, '\n');
+    var emission_stopped = false;
     while (lines.next()) |untrimmed| {
         result.source_records += 1;
         const feed = try scanRecordLine(
@@ -132,8 +133,9 @@ fn scanRecords(
             untrimmed,
             selection,
             &result,
+            !emission_stopped,
         );
-        if (feed == .stop) break;
+        if (feed == .stop) emission_stopped = true;
     }
     return result;
 }
@@ -148,6 +150,7 @@ fn scanRecordLine(
     untrimmed: []const u8,
     selection: Selection,
     result: *ScanResult,
+    emit: bool,
 ) !execution.Feed {
     const line = std.mem.trim(u8, untrimmed, " \t\r");
     if (line.len == 0) return .continue_scanning;
@@ -177,6 +180,7 @@ fn scanRecordLine(
         (selection.contains != null and
             containsIgnoreCase(stringField(object, "input"), selection.contains.?));
     result.tools += toolCount(object);
+    if (!emit) return .continue_scanning;
     if (relation == .sessions or
         (relation == .turns and !turnPasses(object, path, selection)))
     {
@@ -1013,6 +1017,45 @@ test "OpenCode physical line numbers include blank source records" {
     try std.testing.expectEqual(@as(usize, 4), scanned.source_records);
     try std.testing.expectEqual(@as(i64, 2), result.rows().row(0)[0].integer);
     try std.testing.expectEqual(@as(i64, 4), result.rows().row(1)[0].integer);
+}
+
+test "OpenCode validates trailing records after the row limit" {
+    var source_fields = [_]u16{3};
+    var output_fields = [_]u16{0};
+    const program = execution.Program{
+        .source = .{ .physical = .source_events },
+        .source_width = 1,
+        .source_field_indices = &source_fields,
+        .materialized_field_indices = &.{},
+        .source_row_bound = null,
+        .operations = &.{},
+        .predicates = &.{},
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = &output_fields,
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 1,
+    };
+    var output: [1]execution.Value = undefined;
+    var runner = try execution.Runner.init(&program, &output);
+    defer runner.deinit();
+    const scanned = try scanRecords(
+        std.testing.allocator,
+        &program,
+        &runner,
+        .source_events,
+        "session",
+        "/tmp/prompt-history.jsonl",
+        "{\"input\":\"one\"}\n{malformed}\n",
+        .{},
+    );
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 3), scanned.source_records);
+    try std.testing.expectEqual(@as(usize, 1), scanned.records);
+    try std.testing.expectEqual(@as(usize, 1), scanned.warnings);
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
 }
 
 test "OpenCode scan rejects renamed non-prompt records" {

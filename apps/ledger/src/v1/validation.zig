@@ -153,7 +153,10 @@ const Sha256Mode = enum {
     canonical_json_null,
     framed_items,
     framed_fields,
+    canonical_json,
 };
+
+const imported_self_input = std.math.maxInt(u16);
 
 const CompiledReferenceTarget = struct {
     pointer_id: u16,
@@ -187,6 +190,7 @@ const CompiledReferenceSource = struct {
     items_pointer_id: ?u16 = null,
     reference_pointer_id: u16,
     optional: bool = false,
+    singleton: bool = false,
     rules: []CompiledRule,
     format_parts: []CompiledFormatPart,
 
@@ -1195,6 +1199,7 @@ const Builder = struct {
                 "fragments",
                 "rules",
                 "optional",
+                "singleton",
             },
         );
         try definition_core.json.requireFields(
@@ -1224,6 +1229,11 @@ const Builder = struct {
                 input_index,
                 0,
             );
+        }
+        source.singleton =
+            try optionalBoolean(object, "singleton") orelse false;
+        if (source.singleton and source.items_pointer_id != null) {
+            return error.ReferenceSourceModeConflict;
         }
         if (object.get("fragments")) |raw_fragments| {
             source.format_parts = try self.compileFormatParts(
@@ -2094,12 +2104,12 @@ const Builder = struct {
         if (allow_input) {
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "op", "input", "path", "definition" },
+                &.{ "op", "input", "path", "definition", "inputs" },
             );
         } else {
             try definition_core.json.requireExactKeys(
                 object,
-                &.{ "op", "path", "definition" },
+                &.{ "op", "path", "definition", "inputs" },
             );
         }
         try definition_core.json.requireFields(
@@ -2129,14 +2139,60 @@ const Builder = struct {
             imported_definition.id,
             definition_id,
         )) return error.ImportedDefinitionIdMismatch;
-        if (imported_definition.inputs.len != 1 or
-            imported_definition.inputs[0].codec != .json or
-            !imported_definition.inputs[0].required)
-        {
-            return error.ImportedDefinitionNotReusable;
+        for (imported_definition.inputs) |input| {
+            if (input.codec != .json or !input.required) {
+                return error.ImportedDefinitionNotReusable;
+            }
         }
+        const bindings = try self.compileImportedInputBindings(
+            object.get("inputs"),
+            imported_definition.inputs,
+        );
+        self.allocator.free(rule.path_ids);
+        rule.path_ids = bindings;
         rule.imported_plan = try self.compileImportedPlan(imported_definition);
         rule.import_index = import_index;
+    }
+
+    fn compileImportedInputBindings(
+        self: *Builder,
+        raw: ?std.json.Value,
+        imported_inputs: []const definition.Input,
+    ) ![]u16 {
+        if (raw == null) {
+            if (imported_inputs.len != 1) {
+                return error.ImportedDefinitionInputBindingsMissing;
+            }
+            const bindings = try self.allocator.alloc(u16, 1);
+            bindings[0] = imported_self_input;
+            return bindings;
+        }
+        const object = try definition_core.json.object(raw.?);
+        if (object.count() != imported_inputs.len) {
+            return error.ImportedDefinitionInputBindingsMismatch;
+        }
+        const bindings = try self.allocator.alloc(
+            u16,
+            imported_inputs.len,
+        );
+        errdefer self.allocator.free(bindings);
+        var self_count: usize = 0;
+        for (imported_inputs, 0..) |input, index| {
+            const binding = try definition_core.json.requiredString(
+                object,
+                input.name,
+            );
+            if (std.mem.eql(u8, binding, "$self")) {
+                bindings[index] = imported_self_input;
+                self_count += 1;
+            } else {
+                bindings[index] = try self.inputIndex(binding);
+            }
+        }
+        if (self_count != 1) {
+            return error.ImportedDefinitionSelfBindingInvalid;
+        }
+        return bindings;
     }
 
     fn compileImportedPlan(
@@ -2157,11 +2213,7 @@ const Builder = struct {
         );
         imported_plan_initialized = true;
         for (imported_plan.rules) |imported_rule| {
-            if (imported_rule.input_index != 0 or
-                (imported_rule.other_input_index != null and
-                    imported_rule.other_input_index.? != 0) or
-                !isValidationOperator(imported_rule.operator))
-            {
+            if (!isValidationOperator(imported_rule.operator)) {
                 return error.UnsupportedImportedDefinitionRule;
             }
         }
@@ -2181,9 +2233,15 @@ const Builder = struct {
         );
         try self.compileSha256Header(object, rule);
         switch (rule.sha256_mode.?) {
+            .canonical_json => try self.compileSha256Canonical(
+                object,
+                rule,
+                false,
+            ),
             .canonical_json_null => try self.compileSha256Canonical(
                 object,
                 rule,
+                true,
             ),
             .framed_items => try self.compileSha256Items(object, rule),
             .framed_fields => try self.compileSha256Fields(object, rule),
@@ -2203,6 +2261,8 @@ const Builder = struct {
                     "path",
                     "mode",
                     "field",
+                    "field_input",
+                    "allow_bare",
                     "null",
                     "items",
                     "prefix",
@@ -2218,6 +2278,8 @@ const Builder = struct {
                     "path",
                     "mode",
                     "field",
+                    "field_input",
+                    "allow_bare",
                     "null",
                     "items",
                     "prefix",
@@ -2237,6 +2299,12 @@ const Builder = struct {
         rule.sha256_mode = if (std.mem.eql(
             u8,
             mode,
+            "canonical-json",
+        ))
+            .canonical_json
+        else if (std.mem.eql(
+            u8,
+            mode,
             "canonical-json-null",
         ))
             .canonical_json_null
@@ -2252,6 +2320,12 @@ const Builder = struct {
         if (self.pointers.items[rule.other_pointer_id.?].raw.len == 0) {
             return error.Sha256FieldPointerEmpty;
         }
+        rule.other_input_index = if (object.get("field_input")) |raw|
+            try self.inputIndex(try definition_core.json.string(raw))
+        else
+            null;
+        rule.allow_bare_digest =
+            try optionalBoolean(object, "allow_bare") orelse false;
         rule.max_count = try optionalUnsigned(object, "max_bytes") orelse
             return error.MissingSha256Bound;
         if (rule.max_count.? == 0 or
@@ -2265,20 +2339,30 @@ const Builder = struct {
         self: *Builder,
         object: std.json.ObjectMap,
         rule: *CompiledRule,
+        null_field_required: bool,
     ) !void {
-        try definition_core.json.requireFields(object, &.{"null"});
+        if (null_field_required) {
+            try definition_core.json.requireFields(object, &.{"null"});
+        }
         if (object.get("items") != null or
             object.get("prefix") != null or
             object.get("fragments") != null)
         {
             return error.ConflictingSha256ModeFields;
         }
-        rule.path_ids = try self.allocator.alloc(u16, 1);
-        rule.path_ids[0] = try self.internPointer(
-            try definition_core.json.requiredString(object, "null"),
-        );
-        if (self.pointers.items[rule.path_ids[0]].raw.len == 0) {
-            return error.Sha256NullPointerEmpty;
+        if (null_field_required) {
+            const null_pointer = try self.internPointer(
+                try definition_core.json.requiredString(object, "null"),
+            );
+            if (self.pointers.items[null_pointer].raw.len == 0) {
+                return error.Sha256NullPointerEmpty;
+            }
+            const path_ids = try self.allocator.alloc(u16, 1);
+            path_ids[0] = null_pointer;
+            self.allocator.free(rule.path_ids);
+            rule.path_ids = path_ids;
+        } else if (object.get("null") != null) {
+            return error.ConflictingSha256ModeFields;
         }
     }
 
@@ -2613,7 +2697,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(32);
+    try encoder.writeU16(33);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -2963,6 +3047,7 @@ fn encodeCacheSourceTask(
     try writeOptionalU16(encoder, source.items_pointer_id);
     try encoder.writeU16(source.reference_pointer_id);
     try encoder.writeBool(source.optional);
+    try encoder.writeBool(source.singleton);
     try pushCacheEncodeTask(
         tasks,
         allocator,
@@ -3042,7 +3127,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 32) {
+    if (try decoder.readU16() != 33) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -3857,6 +3942,7 @@ fn decodeCacheReferenceSource(
     const items_pointer_id = try readOptionalU16(context.decoder);
     const reference_pointer_id = try context.decoder.readU16();
     const optional = try context.decoder.readBool();
+    const singleton = try context.decoder.readBool();
     const rules = try context.decodeRules();
     errdefer deinitRuleSlice(context.allocator, rules);
     return .{
@@ -3864,6 +3950,7 @@ fn decodeCacheReferenceSource(
         .items_pointer_id = items_pointer_id,
         .reference_pointer_id = reference_pointer_id,
         .optional = optional,
+        .singleton = singleton,
         .rules = rules,
         .format_parts = try decodeCompiledFormatParts(
             context.allocator,
@@ -4197,7 +4284,15 @@ fn validateCachedRuleIndices(
         return error.CacheRuleIndexInvalid;
     }
     for (rule.path_ids) |path_id| {
-        if (path_id >= pointer_count) return error.CacheRuleIndexInvalid;
+        if (rule.operator == .definition_ref) {
+            if (path_id != imported_self_input and
+                path_id >= input_count)
+            {
+                return error.CacheRuleIndexInvalid;
+            }
+        } else if (path_id >= pointer_count) {
+            return error.CacheRuleIndexInvalid;
+        }
     }
     if (rule.min_count != null and rule.max_count != null and
         rule.min_count.? > rule.max_count.?)
@@ -4229,7 +4324,10 @@ fn validateCachedRuleIndices(
 }
 
 fn validateCachedBasicRule(rule: CompiledRule) !void {
-    if (rule.allow_bare_digest and rule.operator != .digest) {
+    if (rule.allow_bare_digest and
+        rule.operator != .digest and
+        rule.operator != .sha256)
+    {
         return error.CacheRuleConfigurationInvalid;
     }
     switch (rule.operator) {
@@ -4313,6 +4411,11 @@ fn validateCachedSha256Rule(rule: CompiledRule) !void {
         return error.CacheRuleConfigurationInvalid;
     }
     switch (rule.sha256_mode.?) {
+        .canonical_json => if (rule.path_ids.len != 0 or
+            rule.sha256_prefix != null or rule.format_parts.len != 0)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
         .canonical_json_null => if (rule.path_ids.len != 1 or
             rule.sha256_prefix != null or rule.format_parts.len != 0)
         {
@@ -4544,11 +4647,13 @@ fn validateCachedProtocolRule(rule: CompiledRule) !void {
         .definition_ref => if (rule.pointer_id == null or
             rule.import_index == null or
             rule.imported_plan == null or
-            rule.imported_plan.?.inputs.len != 1 or
-            rule.imported_plan.?.inputs[0].codec != .json or
-            !rule.imported_plan.?.inputs[0].required)
+            rule.path_ids.len != rule.imported_plan.?.inputs.len)
         {
             return error.CacheRuleConfigurationInvalid;
+        } else for (rule.imported_plan.?.inputs) |input| {
+            if (input.codec != .json or !input.required) {
+                return error.CacheRuleConfigurationInvalid;
+            }
         },
         else => {},
     }
@@ -4711,7 +4816,8 @@ fn validateCachedReferenceRelations(
         if (source.pointer_id >= pointer_count or
             source.reference_pointer_id >= pointer_count or
             (source.items_pointer_id != null and
-                source.items_pointer_id.? >= pointer_count))
+                source.items_pointer_id.? >= pointer_count) or
+            (source.singleton and source.items_pointer_id != null))
         {
             return error.CacheRuleIndexInvalid;
         }
@@ -4751,12 +4857,13 @@ fn validateCachedVariantRelations(rule: CompiledRule) !void {
 
 fn validateCachedImportedRelations(rule: CompiledRule) !void {
     const imported_plan = rule.imported_plan orelse return;
+    var self_count: usize = 0;
+    for (rule.path_ids) |binding| {
+        self_count += @intFromBool(binding == imported_self_input);
+    }
+    if (self_count != 1) return error.CacheRuleConfigurationInvalid;
     for (imported_plan.rules) |imported_rule| {
-        if (imported_rule.input_index != 0 or
-            (imported_rule.other_input_index != null and
-                imported_rule.other_input_index.? != 0) or
-            !isValidationOperator(imported_rule.operator))
-        {
+        if (!isValidationOperator(imported_rule.operator)) {
             return error.CacheRuleConfigurationInvalid;
         }
     }
@@ -5629,7 +5736,13 @@ inline fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .regex => if (target) |value| regexHolds(value, rule) else false,
         .sha256 => if (target) |value|
-            try sha256Holds(context.allocator, context.plan, rule, value)
+            try sha256Holds(
+                context.allocator,
+                context.plan,
+                context.loaded,
+                rule,
+                value,
+            )
         else
             false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
@@ -5771,7 +5884,13 @@ inline fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
         else
             false,
         .definition_ref => if (context.target) |value|
-            try importedPlanHolds(context.allocator, rule.imported_plan.?, value)
+            try importedPlanHolds(
+                context.allocator,
+                rule.imported_plan.?,
+                rule.path_ids,
+                context.loaded,
+                value,
+            )
         else
             false,
         .all_rules, .any_rules, .no_rules => if (context.target) |value|
@@ -6330,10 +6449,29 @@ fn isComparisonExecutionOperator(operator: definition.Operator) bool {
 fn importedPlanHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    root: std.json.Value,
+    bindings: []const u16,
+    outer_loaded: []const LoadedInput,
+    target: std.json.Value,
 ) anyerror!bool {
-    if (plan.inputs.len != 1) return error.ImportedDefinitionNotReusable;
-    return itemRulesHold(allocator, plan, plan.rules, root);
+    if (bindings.len != plan.inputs.len) {
+        return error.ImportedDefinitionInputBindingsMismatch;
+    }
+    const values = try allocator.alloc(InputValue, plan.inputs.len);
+    defer allocator.free(values);
+    for (plan.inputs, bindings, values) |input, binding, *value| {
+        value.* = .{
+            .name = input.name,
+            .value = if (binding == imported_self_input)
+                target
+            else if (binding < outer_loaded.len)
+                outer_loaded[binding].json() orelse return false
+            else
+                return error.ImportedDefinitionInputBindingInvalid,
+        };
+    }
+    var execution = try executeValues(allocator, plan, values);
+    defer execution.deinit();
+    return execution.isValid();
 }
 
 fn compareRule(
@@ -6831,22 +6969,33 @@ fn regexHolds(value: std.json.Value, rule: *const CompiledRule) bool {
 fn sha256Holds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
+    loaded: []const LoadedInput,
     rule: *const CompiledRule,
     value: std.json.Value,
 ) !bool {
     if (plan.pointers[rule.other_pointer_id.?].raw.len == 0) return false;
+    const expected_root = if (rule.other_input_index) |input_index|
+        loaded[input_index].json() orelse return false
+    else
+        value;
     const expected_value = resolve(
-        value,
+        expected_root,
         plan.pointers[rule.other_pointer_id.?],
     ) orelse return false;
     const expected = switch (expected_value) {
         .string => |text| text,
         else => return false,
     };
-    if (!validateScalar(expected_value, .digest)) return false;
+    if (!digestHolds(expected_value, rule.allow_bare_digest)) return false;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     switch (rule.sha256_mode.?) {
+        .canonical_json => if (!try hashCanonicalJson(
+            allocator,
+            rule,
+            value,
+            &hasher,
+        )) return false,
         .canonical_json_null => if (!try hashCanonicalJsonNull(
             allocator,
             plan,
@@ -6867,7 +7016,30 @@ fn sha256Holds(
             &hasher,
         )) return false,
     }
-    return sha256FinalMatches(&hasher, expected);
+    return sha256FinalMatches(
+        &hasher,
+        expected,
+        rule.allow_bare_digest,
+    );
+}
+
+fn hashCanonicalJson(
+    allocator: std.mem.Allocator,
+    rule: *const CompiledRule,
+    value: std.json.Value,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) !bool {
+    const canonical = definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        value,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    if (canonical.len > rule.max_count.?) return false;
+    hasher.update(canonical);
+    return true;
 }
 
 fn hashCanonicalJsonNull(
@@ -6985,6 +7157,7 @@ fn hashFormattedParts(
 fn sha256FinalMatches(
     hasher: *std.crypto.hash.sha2.Sha256,
     expected: []const u8,
+    allow_bare: bool,
 ) bool {
     var raw: [32]u8 = undefined;
     hasher.final(&raw);
@@ -6992,7 +7165,8 @@ fn sha256FinalMatches(
     var computed: [71]u8 = undefined;
     @memcpy(computed[0..7], "sha256:");
     @memcpy(computed[7..], &hex);
-    return std.mem.eql(u8, expected, &computed);
+    return std.mem.eql(u8, expected, &computed) or
+        (allow_bare and std.mem.eql(u8, expected, computed[7..]));
 }
 
 fn compiledRegexMatches(
@@ -7900,9 +8074,13 @@ fn markDeclaredReferenceSources(
             if (source.optional) continue;
             return false;
         };
+        const singleton_items = [1]std.json.Value{items_value};
         const items = switch (items_value) {
             .array => |array| array.items,
-            else => return false,
+            else => if (source.singleton)
+                singleton_items[0..]
+            else
+                return false,
         };
         if (!try markDeclaredReferenceSource(
             allocator,
@@ -11086,6 +11264,14 @@ const validation_test_definition_17 =
     \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
 ;
 
+const multi_input_receipt_definition =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/decision-receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["cross-input-equal","exact-object","reference-exists","sha256"]},"inputs":{"contract":{"codec":"json","required":true,"max_bytes":4096},"receipt":{"codec":"json","required":true,"max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"contract":{"object":"exact","fields":{"routes":{},"skill":{},"triggers":{}}},"receipt":{"object":"exact","fields":{"fingerprint":{},"route":{},"skill":{},"trigger_refs":{}}}}},"constraints":{"laws":[["cross-input-equal",{"input":"receipt","left_input":"receipt","left":"/skill","right_input":"contract","right":"/skill"}],["reference-exists",{"input":"receipt","sources":[{"path":"","reference":"/route","singleton":true}],"target_input":"contract","targets":[{"path":"/routes","key":"/id"}]}],["reference-exists",{"input":"receipt","path":"/trigger_refs","reference":"","target_input":"contract","target":"/triggers","key":""}],["sha256",{"input":"contract","path":"","mode":"canonical-json","field_input":"receipt","field":"/fingerprint","allow_bare":true,"max_bytes":4096}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const multi_input_receipt_wrapper_definition =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt-wrapper","owner":"example","imports":[{"id":"example/decision-receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},"inputs":{"contract":{"codec":"json","required":true,"max_bytes":4096},"receipt":{"codec":"json","required":true,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":{"laws":[["definition-ref",{"input":"receipt","path":"","definition":"example/decision-receipt","inputs":{"contract":"contract","receipt":"$self"}}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
 const bare_digest_test_definition =
     \\{
     \\  "schema":"ledger-artifact-definition/v1",
@@ -11790,6 +11976,98 @@ test "definition references preserve transacted validators across caches" {
         decodeForAllocationFailure,
         .{test_plan.payload},
     );
+}
+
+test "definition references bind reusable multi-input validators" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "receipt.json",
+        .data = multi_input_receipt_definition,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packet.json",
+        .data = multi_input_receipt_wrapper_definition,
+    });
+    var test_plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "packet.json",
+        8 * 1024 * 1024,
+    );
+    defer test_plan.deinit();
+
+    const contract =
+        "{\"skill\":\"example\",\"routes\":[{\"id\":\"inspect\"}," ++
+        "{\"id\":\"replace\"}],\"triggers\":[\"manual\",\"review\"]}";
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        contract,
+        .{},
+    );
+    defer parsed.deinit();
+    const canonical =
+        try definition_core.canonical_json.canonicalJsonAlloc(
+            std.testing.allocator,
+            parsed.value,
+        );
+    defer std.testing.allocator.free(canonical);
+    const digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            std.testing.allocator,
+            canonical,
+        );
+    defer std.testing.allocator.free(digest);
+    const valid_receipt = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fingerprint\":\"{s}\",\"route\":\"inspect\"," ++
+            "\"skill\":\"example\",\"trigger_refs\":[\"review\"]}}",
+        .{digest[7..]},
+    );
+    defer std.testing.allocator.free(valid_receipt);
+    const stale_receipt =
+        "{\"fingerprint\":\"0000000000000000000000000000000000000000000000000000000000000000\"," ++
+        "\"route\":\"inspect\",\"skill\":\"example\",\"trigger_refs\":[\"review\"]}";
+    const unknown_reference = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fingerprint\":\"{s}\",\"route\":\"missing\"," ++
+            "\"skill\":\"example\",\"trigger_refs\":[\"unknown\"]}}",
+        .{digest[7..]},
+    );
+    defer std.testing.allocator.free(unknown_reference);
+    const cases = [_]struct {
+        receipt: []const u8,
+        valid: bool,
+    }{
+        .{ .receipt = valid_receipt, .valid = true },
+        .{ .receipt = stale_receipt, .valid = false },
+        .{ .receipt = unknown_reference, .valid = false },
+    };
+    for (cases) |case| {
+        var compiled = try validate(
+            std.testing.allocator,
+            &test_plan.definition_plan,
+            &test_plan.plan,
+            &.{
+                .{ .name = "contract", .bytes = contract },
+                .{ .name = "receipt", .bytes = case.receipt },
+            },
+        );
+        defer compiled.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.valid, compiled.valid);
+        var cached = try validate(
+            std.testing.allocator,
+            &test_plan.definition_plan,
+            &test_plan.cached,
+            &.{
+                .{ .name = "contract", .bytes = contract },
+                .{ .name = "receipt", .bytes = case.receipt },
+            },
+        );
+        defer cached.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.valid, cached.valid);
+    }
 }
 
 test "collection item rules reuse one imported scalar definition" {

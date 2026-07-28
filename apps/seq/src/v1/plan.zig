@@ -77,6 +77,10 @@ pub const PredicateOperator = enum {
     contains,
     prefix,
     suffix,
+    less_than,
+    less_or_equal,
+    greater_than,
+    greater_or_equal,
 
     fn parse(raw: []const u8) !PredicateOperator {
         if (std.mem.eql(u8, raw, "exact") or
@@ -92,13 +96,55 @@ pub const PredicateOperator = enum {
         if (std.mem.eql(u8, raw, "contains")) return .contains;
         if (std.mem.eql(u8, raw, "prefix")) return .prefix;
         if (std.mem.eql(u8, raw, "suffix")) return .suffix;
+        if (std.mem.eql(u8, raw, "less-than") or
+            std.mem.eql(u8, raw, "lt"))
+        {
+            return .less_than;
+        }
+        if (std.mem.eql(u8, raw, "less-or-equal") or
+            std.mem.eql(u8, raw, "le"))
+        {
+            return .less_or_equal;
+        }
+        if (std.mem.eql(u8, raw, "greater-than") or
+            std.mem.eql(u8, raw, "gt"))
+        {
+            return .greater_than;
+        }
+        if (std.mem.eql(u8, raw, "greater-or-equal") or
+            std.mem.eql(u8, raw, "ge"))
+        {
+            return .greater_or_equal;
+        }
         return error.UnsupportedFilterPredicate;
     }
 
     fn requiresString(self: PredicateOperator) bool {
         return switch (self) {
             .contains, .prefix, .suffix => true,
-            .exact, .not_equal => false,
+            .exact,
+            .not_equal,
+            .less_than,
+            .less_or_equal,
+            .greater_than,
+            .greater_or_equal,
+            => false,
+        };
+    }
+
+    fn requiresNumber(self: PredicateOperator) bool {
+        return switch (self) {
+            .less_than,
+            .less_or_equal,
+            .greater_than,
+            .greater_or_equal,
+            => true,
+            .exact,
+            .not_equal,
+            .contains,
+            .prefix,
+            .suffix,
+            => false,
         };
     }
 };
@@ -1326,6 +1372,12 @@ fn validatePredicateTypes(
     {
         return error.FilterPredicateTypeMismatch;
     }
+    if (operator.requiresNumber() and
+        column.kind != .integer and
+        column.kind != .float)
+    {
+        return error.FilterPredicateTypeMismatch;
+    }
     const operand_kind: ColumnKind = switch (operand) {
         .constant => |constant| switch (constant) {
             .string => .string,
@@ -1334,6 +1386,7 @@ fn validatePredicateTypes(
             .boolean => .boolean,
             .null => return if (column.nullable and
                 !operator.requiresString() and
+                !operator.requiresNumber() and
                 !case_insensitive)
             {} else error.FilterPredicateTypeMismatch,
         },
@@ -1345,6 +1398,10 @@ fn validatePredicateTypes(
         operator.requiresString())
     {
         return;
+    }
+    if (operator.requiresNumber()) {
+        if (operand_kind == .integer or operand_kind == .float) return;
+        return error.FilterPredicateTypeMismatch;
     }
     if (column.kind == .float and operand_kind == .integer) return;
     if (column.kind != operand_kind) {

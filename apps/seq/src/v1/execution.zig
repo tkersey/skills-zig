@@ -1808,7 +1808,36 @@ fn matches(value: Value, predicate: RuntimePredicate) bool {
             predicate.case_insensitive,
             .suffix,
         ),
+        .less_than => if (numericOrder(value, predicate.operand)) |order|
+            order == .lt
+        else
+            false,
+        .less_or_equal => if (numericOrder(
+            value,
+            predicate.operand,
+        )) |order|
+            order == .lt or order == .eq
+        else
+            false,
+        .greater_than => if (numericOrder(value, predicate.operand)) |order|
+            order == .gt
+        else
+            false,
+        .greater_or_equal => if (numericOrder(
+            value,
+            predicate.operand,
+        )) |order|
+            order == .gt or order == .eq
+        else
+            false,
     };
+}
+
+fn numericOrder(left: Value, right: Value) ?std.math.Order {
+    const left_numeric = left == .integer or left == .float;
+    const right_numeric = right == .integer or right == .float;
+    if (!left_numeric or !right_numeric) return null;
+    return compareValues(left, right);
 }
 
 const StringOperation = enum { contains, prefix, suffix };
@@ -2064,6 +2093,37 @@ const ordered_limit_test_definition =
     \\  "bounds":{
     \\    "max_rows":3,"max_output_bytes":4096,"max_fold_states":2
     \\  }
+    \\}
+;
+
+const numeric_filter_test_definition =
+    \\{
+    \\  "schema":"seq-observation-definition/v1",
+    \\  "id":"example/numeric-filter",
+    \\  "requires":{"abi":"seq-observation-abi/v1",
+    \\              "operators":["filter","project"]},
+    \\  "parameters":{"through":{"type":"integer","required":true}},
+    \\  "selectors":[],"relations":[],
+    \\  "inputs":[{
+    \\    "name":"facts","schema":"example-facts/v1",
+    \\    "fields":[
+    \\      {"name":"id","type":"string","nullable":false},
+    \\      {"name":"turn_index","type":"integer","nullable":true}
+    \\    ],
+    \\    "max_rows":8,"max_bytes":4096
+    \\  }],
+    \\  "pipeline":[
+    \\    {"op":"filter","input":"facts","as":"bounded",
+    \\     "where":[{"field":"turn_index","op":"less-or-equal",
+    \\               "param":"through"}]},
+    \\    {"op":"project","input":"bounded","as":"rows","fields":["id"]}
+    \\  ],
+    \\  "projections":{"rows":{
+    \\    "relation":"rows","schema":"example-numeric-rows/v1",
+    \\    "fields":["id"],"renderers":["json"]
+    \\  }},
+    \\  "bounds":{"max_rows":8,"max_output_bytes":4096,
+    \\            "max_fold_states":1}
     \\}
 ;
 
@@ -2336,6 +2396,43 @@ test "compiled execution filters projects and limits without intermediate rows" 
             &fixture.native_plan,
             &fixture.bindings,
         },
+    );
+}
+
+test "compiled numeric predicates bound nullable integer evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fixture = try compileTestProgram(
+        &tmp.dir,
+        numeric_filter_test_definition,
+        &.{.{ .name = "through", .raw_value = "2" }},
+        "rows",
+    );
+    defer fixture.deinit();
+    const source = [_]Value{
+        .{ .string = "before" },
+        .{ .integer = 1 },
+        .{ .string = "selected" },
+        .{ .integer = 2 },
+        .{ .string = "unassigned" },
+        .null,
+        .{ .string = "outcome" },
+        .{ .integer = 3 },
+    };
+    var output: [4]Value = undefined;
+    const result = try execute(
+        &fixture.program,
+        .{ .values = &source, .width = 2 },
+        &output,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+    try std.testing.expectEqualStrings(
+        "before",
+        result.rows().row(0)[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "selected",
+        result.rows().row(1)[0].string,
     );
 }
 

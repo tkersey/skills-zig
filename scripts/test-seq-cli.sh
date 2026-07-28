@@ -235,7 +235,7 @@ capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"seq-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"
 grep -Fq '"id":"scan","version":1' <<<"$capabilities"
-grep -Fq '"id":"filter","version":1' <<<"$capabilities"
+grep -Fq '"id":"filter","version":2' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
 grep -Fq '"id":"aggregate","version":1' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"

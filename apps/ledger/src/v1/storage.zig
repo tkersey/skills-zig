@@ -641,7 +641,7 @@ pub fn resolveWithGenerated(
     const slots = resolved.slotSlice();
     for (slots, 0..) |left, index| {
         for (slots[index + 1 ..]) |right| {
-            if (std.ascii.eqlIgnoreCase(
+            if (slotPathsAmbiguous(
                 left.relative_path,
                 right.relative_path,
             )) return error.StoragePathCaseAmbiguity;
@@ -1131,7 +1131,7 @@ fn decodeCacheSlot(
         return error.StorageSlotBoundsExceeded;
     }
     for (prior_slots) |prior| {
-        if (std.ascii.eqlIgnoreCase(
+        if (slotPathsAmbiguous(
             prior.relative_path,
             relative_path,
         )) return error.StoragePathCaseAmbiguity;
@@ -2265,12 +2265,27 @@ fn compileSlot(
 fn validateSlotPathAmbiguity(slots: []const Slot) !void {
     for (slots, 0..) |left, index| {
         for (slots[index + 1 ..]) |right| {
-            if (std.ascii.eqlIgnoreCase(
+            if (slotPathsAmbiguous(
                 left.relative_path,
                 right.relative_path,
             )) return error.StoragePathCaseAmbiguity;
         }
     }
+}
+
+fn slotPathsAmbiguous(left: []const u8, right: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(left, right) or
+        slotPathAncestorOf(left, right) or
+        slotPathAncestorOf(right, left);
+}
+
+fn slotPathAncestorOf(ancestor: []const u8, descendant: []const u8) bool {
+    return ancestor.len < descendant.len and
+        descendant[ancestor.len] == '/' and
+        std.ascii.eqlIgnoreCase(
+            ancestor,
+            descendant[0..ancestor.len],
+        );
 }
 
 fn compileOperations(
@@ -5833,4 +5848,23 @@ test "storage compiler rejects reserved paths and implicit multi effects" {
         error.ReservedStoragePath,
         storage_reserved_definition,
     );
+}
+
+test "storage slot paths reject ancestor and case ambiguity" {
+    try std.testing.expect(slotPathsAmbiguous(
+        "events.jsonl",
+        "events.jsonl/child",
+    ));
+    try std.testing.expect(slotPathsAmbiguous(
+        "Events.JSONL/child",
+        "events.jsonl",
+    ));
+    try std.testing.expect(slotPathsAmbiguous(
+        "events.jsonl",
+        "EVENTS.JSONL",
+    ));
+    try std.testing.expect(!slotPathsAmbiguous(
+        "events.jsonl",
+        "events.jsonl-child",
+    ));
 }

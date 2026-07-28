@@ -1683,6 +1683,10 @@ pub fn commitTextTransaction(
     const transaction_dir = try std.fs.path.join(allocator, &.{ transactions_dir, transaction_id });
     errdefer allocator.free(transaction_dir);
     try ensureDirectoryPathNoSymlinks(transaction_dir);
+    var record_persisted = false;
+    errdefer if (!record_persisted) {
+        std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir) catch {};
+    };
     const record_path = try std.fs.path.join(allocator, &.{ transaction_dir, "transaction.json" });
     errdefer allocator.free(record_path);
     const commit_marker_path = try std.fs.path.join(allocator, &.{ transaction_dir, "commit.json" });
@@ -1818,6 +1822,7 @@ pub fn commitTextTransaction(
     }
 
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .prepared, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), true);
+    record_persisted = true;
 
     for (ordered) |mutation| {
         if (mutation.action == .check_only) continue;
@@ -3266,6 +3271,18 @@ pub fn countPendingTransactions(
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
 ) !usize {
+    return countPendingTransactionsBounded(
+        allocator,
+        transactions_dir,
+        4096,
+    );
+}
+
+fn countPendingTransactionsBounded(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    max_pending: usize,
+) !usize {
     const dir_stat = std.Io.Dir.cwd().statFile(Io.io(), transactions_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
@@ -3280,13 +3297,10 @@ pub fn countPendingTransactions(
     defer dir.close(Io.io());
 
     var pending: usize = 0;
-    var entries: usize = 0;
     var iter = dir.iterate();
     while (try iter.next(Io.io())) |entry| {
         if (entry.kind == .sym_link) return error.SymlinkComponent;
         if (entry.kind != .file and entry.kind != .directory) continue;
-        if (entries >= 4096) return error.TooManyFiles;
-        entries += 1;
 
         const entry_path = try std.fs.path.join(allocator, &.{ transactions_dir, entry.name });
         defer allocator.free(entry_path);
@@ -3302,15 +3316,25 @@ pub fn countPendingTransactions(
             defer allocator.free(commit_name);
             const commit_path = try std.fs.path.join(allocator, &.{ transactions_dir, commit_name });
             defer allocator.free(commit_path);
-            if (!fileExists(commit_path)) pending += 1;
+            if (!fileExists(commit_path)) try incrementPending(
+                &pending,
+                max_pending,
+            );
             continue;
         }
 
         if (stat.kind == .directory) {
-            if (try transactionDirectoryPending(allocator, entry_path)) pending += 1;
+            if (try transactionDirectoryPending(allocator, entry_path)) {
+                try incrementPending(&pending, max_pending);
+            }
         }
     }
     return pending;
+}
+
+fn incrementPending(pending: *usize, max_pending: usize) !void {
+    if (pending.* >= max_pending) return error.TooManyFiles;
+    pending.* += 1;
 }
 
 fn transactionDirectoryPending(allocator: std.mem.Allocator, transaction_dir: []const u8) !bool {
@@ -4356,6 +4380,10 @@ test "durable transactions atomically publish bounded raw documents" {
             },
         ),
     );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
 
     var root_dir = try std.Io.Dir.openDirAbsolute(Io.io(), root, .{});
     defer root_dir.close(Io.io());
@@ -4387,6 +4415,69 @@ test "durable transactions atomically publish bounded raw documents" {
                 },
                 .fencing_counter_path = counter,
             },
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
+}
+
+test "pending transaction bounds exclude committed flat journals" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(tmp_root);
+    const root = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ tmp_root, "transactions" },
+    );
+    defer std.testing.allocator.free(root);
+    try ensureDirectoryPathNoSymlinks(root);
+    for (0..5) |index| {
+        const prepared = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "transactions/txn-{d}.prepared.json",
+            .{index},
+        );
+        defer std.testing.allocator.free(prepared);
+        const committed = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "transactions/txn-{d}.commit.json",
+            .{index},
+        );
+        defer std.testing.allocator.free(committed);
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = prepared,
+            .data = "{}\n",
+        });
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = committed,
+            .data = "{}\n",
+        });
+    }
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countPendingTransactionsBounded(
+            std.testing.allocator,
+            root,
+            0,
+        ),
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "transactions/pending.prepared.json",
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.TooManyFiles,
+        countPendingTransactionsBounded(
+            std.testing.allocator,
+            root,
+            0,
         ),
     );
 }
