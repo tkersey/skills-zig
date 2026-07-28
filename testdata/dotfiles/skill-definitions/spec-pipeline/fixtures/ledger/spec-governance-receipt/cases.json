@@ -1,9 +1,0 @@
-{
-  "invalid": {
-    "missing-retro": {
-      "remove": [
-        "/spec_governance_receipt/retro"
-      ]
-    }
-  }
-}

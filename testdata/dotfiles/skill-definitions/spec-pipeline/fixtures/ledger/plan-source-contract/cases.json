@@ -1,9 +1,0 @@
-{
-  "invalid": {
-    "gate-only": {
-      "set": {
-        "/plan_source_contract/sgr_v2/spec_governance_receipt/mode": "gate-only"
-      }
-    }
-  }
-}

@@ -1,9 +1,0 @@
-{
-  "invalid": {
-    "unknown-condition-atom": {
-      "set": {
-        "/execution_policy_graph/actions/0/preconditions/all/0": "fact:MISSING"
-      }
-    }
-  }
-}

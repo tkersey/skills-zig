@@ -1,9 +1,0 @@
-{
-  "invalid": {
-    "review-digest": {
-      "set": {
-        "/review_contract/contract_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      }
-    }
-  }
-}
