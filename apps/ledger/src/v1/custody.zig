@@ -88,6 +88,7 @@ pub const BindingSnapshot = struct {
 };
 
 pub const SlotSnapshot = struct {
+    exists: bool,
     path: []u8,
     content: []u8,
     revision: []u8,
@@ -143,10 +144,74 @@ pub fn readSlot(
     );
     errdefer binding.deinit(allocator);
     return .{
+        .exists = true,
         .path = path,
         .content = content,
         .revision = revision,
         .binding = binding,
+    };
+}
+
+pub fn readSlotOrMissing(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+) !SlotSnapshot {
+    return readSlot(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+    ) catch |err| switch (err) {
+        error.FileNotFound => missingSlot(
+            allocator,
+            repo_root,
+            slot,
+        ),
+        else => err,
+    };
+}
+
+fn missingSlot(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+) !SlotSnapshot {
+    if (!std.fs.path.isAbsolute(repo_root)) {
+        return error.RepositoryRootNotAbsolute;
+    }
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", slot.relative_path },
+    );
+    errdefer allocator.free(path);
+    try durable_store.rejectSymlinkComponents(path);
+    const content = try allocator.dupe(u8, "");
+    errdefer allocator.free(content);
+    const revision = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        content,
+    );
+    errdefer allocator.free(revision);
+    const binding_bytes = try allocator.dupe(u8, "");
+    errdefer allocator.free(binding_bytes);
+    const binding_rows = try allocator.alloc(BindingRow, 0);
+    errdefer allocator.free(binding_rows);
+    return .{
+        .exists = false,
+        .path = path,
+        .content = content,
+        .revision = revision,
+        .binding = .{
+            .exists = false,
+            .bytes = binding_bytes,
+            .digest = null,
+            .last_revision = null,
+            .rows = binding_rows,
+            .idempotency_match = false,
+            .idempotency_match_index = null,
+        },
     };
 }
 

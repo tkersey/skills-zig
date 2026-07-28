@@ -4419,7 +4419,7 @@ fn executeResolvedProjection(
         try storage.resolve(allocator, storage_plan, parameters);
     defer resolved_storage.deinit(allocator);
     const slot = resolved_storage.slot(compiled.slot_index);
-    var snapshot = try custody.readSlot(
+    var snapshot = try custody.readSlotOrMissing(
         allocator,
         repo_root,
         definition_plan.id,
@@ -4597,6 +4597,17 @@ fn validateProjectionReplay(
 ) !replay.Stats {
     const protocol_required = event_protocol != null and
         event_protocol.?.target_slot_index == compiled.slot_index;
+    if (!snapshot.exists) {
+        if (slot.kind != .event_log) return error.FileNotFound;
+        return .{
+            .records_validated = 0,
+            .definition_versions = 1,
+            .protocol_state = if (protocol_required)
+                protocol.ReplayState.init(event_protocol.?)
+            else
+                null,
+        };
+    }
     if (fold_history) |accumulator| {
         return replay.validateSlotObserved(
             allocator,

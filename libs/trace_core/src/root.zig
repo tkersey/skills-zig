@@ -567,7 +567,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
     var saw_primary_session_meta = false;
     var seen_messages = std.AutoHashMap(
         [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        void,
+        u8,
     ).init(allocator);
     defer seen_messages.deinit();
     var lines = try jsonl_stream.Stream.init(allocator, reader, .{});
@@ -604,6 +604,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 line_number,
                 line,
                 options.include_raw,
+                saw_task_started,
                 &seen_messages,
             )
         else
@@ -994,9 +995,10 @@ fn appendOccurrence(
     line_number: usize,
     raw_json: []const u8,
     include_raw: bool,
+    saw_task_started: bool,
     seen_messages: *std.AutoHashMap(
         [std.crypto.hash.sha2.Sha256.digest_length]u8,
-        void,
+        u8,
     ),
 ) !usize {
     const source = payload orelse root;
@@ -1061,9 +1063,32 @@ fn appendOccurrence(
                     !(std.mem.eql(u8, message_role, "user") and
                         isMetaUserMessage(normalized)))
                 {
-                    const digest = messageDigest(message_role, normalized);
+                    const carrier: u8 = if (std.mem.eql(
+                        u8,
+                        entry_type,
+                        "event_msg",
+                    )) 0b10 else 0b01;
+                    const counterpart: u8 = if (carrier == 0b01)
+                        0b10
+                    else
+                        0b01;
+                    const digest = messageMirrorDigest(
+                        message_role,
+                        normalized,
+                        messageTurnKey(
+                            trace,
+                            source,
+                            entry_type,
+                            message_role,
+                            current_turn_index,
+                            saw_task_started,
+                        ),
+                        timestamp,
+                    );
                     const entry = try seen_messages.getOrPut(digest);
-                    message_visible = !entry.found_existing;
+                    if (!entry.found_existing) entry.value_ptr.* = 0;
+                    message_visible = entry.value_ptr.* & counterpart == 0;
+                    entry.value_ptr.* |= carrier;
                 }
             }
         }
@@ -1657,17 +1682,60 @@ fn normalizeTimestampAlloc(
     return allocator.dupe(u8, timestamp);
 }
 
-fn messageDigest(
+fn messageMirrorDigest(
     role: []const u8,
     text: []const u8,
+    turn_key: usize,
+    timestamp: ?[]const u8,
 ) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(role);
     hasher.update("\x1f");
     hasher.update(text);
+    hasher.update("\x1f");
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(
+        u64,
+        &number,
+        @intCast(turn_key),
+        .big,
+    );
+    hasher.update(&number);
+    hasher.update("\x1f");
+    if (timestamp) |value| {
+        if (value.len > 0 and value[value.len - 1] == 'Z') {
+            hasher.update(value[0 .. value.len - 1]);
+            hasher.update("+00:00");
+        } else {
+            hasher.update(value);
+        }
+    }
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn messageTurnKey(
+    trace: *const CanonicalSessionTrace,
+    source: std.json.ObjectMap,
+    entry_type: []const u8,
+    role: []const u8,
+    current_turn_index: ?usize,
+    saw_task_started: bool,
+) usize {
+    if (std.mem.eql(u8, role, "user") and
+        ((std.mem.eql(u8, entry_type, "response_item") and
+            !saw_task_started) or
+            std.mem.eql(u8, entry_type, "message")))
+    {
+        return trace.turns.items.len;
+    }
+    if (stringField(source, "turn_id")) |turn_id| {
+        for (trace.turns.items, 0..) |turn, index| {
+            if (std.mem.eql(u8, turn.turn_id, turn_id)) return index;
+        }
+    }
+    return current_turn_index orelse trace.turns.items.len;
 }
 
 fn messageTextPartsAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]MessageTextPart {
@@ -2166,6 +2234,35 @@ test "canonical messages normalize and suppress repeated source carriers" {
         trace.occurrences.items[4].text.?,
     );
     try std.testing.expect(!trace.occurrences.items[5].message_visible);
+}
+
+test "canonical messages preserve identical text across turns" {
+    const source =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\"," ++
+        "\"payload\":{\"id\":\"repeated-messages\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:00:02Z\"," ++
+        "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\",\"text\":\"yes\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:02Z\"," ++
+        "\"payload\":{\"type\":\"user_message\",\"message\":\"yes\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-07-13T00:01:02Z\"," ++
+        "\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[" ++
+        "{\"type\":\"input_text\",\"text\":\"yes\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:01:02Z\"," ++
+        "\"payload\":{\"type\":\"user_message\",\"message\":\"yes\"}}\n";
+    var trace = try parseSessionTraceBytes(
+        std.testing.allocator,
+        "/tmp/repeated-messages.jsonl",
+        source,
+        nowRealtimeNs(),
+        .{},
+    );
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expect(trace.occurrences.items[1].message_visible);
+    try std.testing.expect(!trace.occurrences.items[2].message_visible);
+    try std.testing.expect(trace.occurrences.items[3].message_visible);
+    try std.testing.expect(!trace.occurrences.items[4].message_visible);
 }
 
 test "parseRawTraceEvent skips state and malformed lines" {

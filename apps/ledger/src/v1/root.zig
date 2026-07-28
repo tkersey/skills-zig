@@ -234,3 +234,28 @@ test "plain protocol binds appends replays and folds without rewriting history" 
     try appendPlainEvent(&plans, repo_root);
     try expectPlainProjection(&plans, repo_root);
 }
+
+test "event-log projection treats a missing store as an empty relation" {
+    var plans = try compilePlainPlans();
+    defer plans.deinit();
+    var repo_tmp = std.testing.tmpDir(.{});
+    defer repo_tmp.cleanup();
+    const repo_root = try repo_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    var result = try projection.execute(
+        std.testing.allocator,
+        &plans.artifact,
+        &plans.store,
+        &plans.protocol,
+        &plans.projection,
+        "current",
+        repo_root,
+        &plans.parameters,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("[]", result.payload);
+}

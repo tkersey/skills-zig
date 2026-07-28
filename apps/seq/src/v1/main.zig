@@ -515,11 +515,14 @@ fn emitObservation(
                 .digest = &execution.corpus_digest,
                 .files = execution.corpus_files,
                 .sessions = execution.corpus_sessions,
-                .contaminated = false,
+                .contaminated = execution.warning_count != 0,
             },
             .rows = execution.result.rows(),
             .compile_stats = context.stats,
             .execution_stats = execution_stats,
+            .limitations = observationLimitations(
+                execution.warning_count,
+            ),
         },
         &execution_stats,
     );
@@ -540,6 +543,7 @@ const ObservationExecution = struct {
     corpus_sessions: usize,
     files_opened: usize,
     bytes_read: usize,
+    warning_count: usize = 0,
 
     fn deinit(self: *ObservationExecution, allocator: std.mem.Allocator) void {
         if (self.runner) |*runner| runner.deinit();
@@ -624,6 +628,7 @@ fn executePhysicalObservation(
         .corpus_sessions = metrics.sessions,
         .files_opened = metrics.opened,
         .bytes_read = metrics.bytes_read,
+        .warning_count = metrics.warnings,
     };
 }
 
@@ -632,6 +637,7 @@ const PhysicalMetrics = struct {
     sessions: usize = 0,
     opened: usize = 0,
     bytes_read: usize = 0,
+    warnings: usize = 0,
 };
 
 fn feedPhysicalFile(
@@ -660,6 +666,11 @@ fn feedPhysicalFile(
     if (!seq.native.sessionPasses(parsed.trace.session, args.selectors)) {
         return .continue_scanning;
     }
+    metrics.warnings = std.math.add(
+        usize,
+        metrics.warnings,
+        parsed.trace.warnings.items.len,
+    ) catch return error.ObservationMetricOverflow;
     metrics.files += 1;
     metrics.sessions += 1;
     digest_set.add(path, &parsed.corpus_digest);
@@ -720,6 +731,15 @@ fn executeExternalObservation(
         .files_opened = 1,
         .bytes_read = relation.input_bytes,
     };
+}
+
+fn observationLimitations(
+    warning_count: usize,
+) []const []const u8 {
+    return if (warning_count == 0)
+        &.{}
+    else
+        &.{"selected corpus contains parser warnings; evidence may be incomplete"};
 }
 
 fn renderObservationAlloc(
@@ -1339,4 +1359,17 @@ test "observe parser accepts explicit definition selectors and parameters" {
         args.selectors.path.?,
     );
     try std.testing.expectEqual(@as(usize, 1), args.parameter_specs.len);
+}
+
+test "selected parser warnings contaminate the observation envelope" {
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        observationLimitations(0).len,
+    );
+    const limitations = observationLimitations(1);
+    try std.testing.expectEqual(@as(usize, 1), limitations.len);
+    try std.testing.expectEqualStrings(
+        "selected corpus contains parser warnings; evidence may be incomplete",
+        limitations[0],
+    );
 }

@@ -129,42 +129,37 @@ case "$mode" in
     done < <(git diff --name-only "$base" "$head")
 
     if [[ "$build_changed" -eq 1 ]]; then
-      build_diff=$(
-        git diff -U0 --no-ext-diff "$base" "$head" -- build.zig |
-          awk '
-            /^\+\+\+|^---|^@@/ { next }
-            /^\+/ { delta[substr($0, 2)] += 1; next }
-            /^-/ { delta[substr($0, 2)] -= 1; next }
-            END {
-              for (line in delta) {
-                if (delta[line] != 0) print line
-              }
-            }
-          '
-      )
-      build_matched=0
-      for app in "${apps[@]}"; do
-        token=${app//-/_}
-        if grep -Eq "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$build_diff"; then
-          mark_app "$app"
-          build_matched=1
+      while IFS= read -r line; do
+        case "$line" in
+          "+++"*|"---"*|"@@"*) continue ;;
+          "+"*|"-"*) ;;
+          *) continue ;;
+        esac
+        raw=${line:1}
+        line_matched=0
+        for app in "${apps[@]}"; do
+          token=${app//-/_}
+          if grep -Eq "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
+            mark_app "$app"
+            line_matched=1
+          fi
+        done
+        if grep -Eq 'definition_core|definition-core' <<<"$raw"; then
+          mark_definition_consumers
+          line_matched=1
         fi
-      done
-      if grep -Eq 'definition_core|definition-core' <<<"$build_diff"; then
-        mark_definition_consumers
-        build_matched=1
-      fi
-      if grep -Eq 'trace_core|trace-core' <<<"$build_diff"; then
-        mark_trace_consumers
-        build_matched=1
-      fi
-      if grep -Eq 'durable_store|durable-store|jsonl_core|jsonl-core' <<<"$build_diff"; then
-        mark_store_consumers
-        build_matched=1
-      fi
-      if [[ -n "$build_diff" && "$build_matched" -eq 0 ]]; then
-        mark_all
-      fi
+        if grep -Eq 'trace_core|trace-core' <<<"$raw"; then
+          mark_trace_consumers
+          line_matched=1
+        fi
+        if grep -Eq 'durable_store|durable-store|jsonl_core|jsonl-core' <<<"$raw"; then
+          mark_store_consumers
+          line_matched=1
+        fi
+        if [[ "$line_matched" -eq 0 ]]; then
+          mark_all
+        fi
+      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig)
     fi
 
     if [[ "$package_changed" -eq 1 ]]; then

@@ -1607,6 +1607,7 @@ fn prepareEffectReplay(
     );
     if (source.before) |content| {
         const snapshot: custody.SlotSnapshot = .{
+            .exists = true,
             .path = source.slot_path,
             .content = content,
             .revision = source.before_digest.?,
