@@ -92,6 +92,11 @@ Seq reads Codex rollout/session sources, supported OpenCode execution sources,
 and caller-supplied immutable relations. It does not scan memory roots, Ledger
 stores, artifact directories, or arbitrary durable stores implicitly.
 
+Select OpenCode prompt history explicitly with
+`--path ~/.local/state/opencode/prompt-history.jsonl`. Its prompts, parts, and
+tool lifecycle appear through the same physical relations used by passive
+observations; no source-specific command is restored.
+
 Compose durable structural facts explicitly:
 
 ```bash

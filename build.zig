@@ -253,6 +253,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "core_path", .module = core_path },
+            .{ .name = "definition_core", .module = definition_core },
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },

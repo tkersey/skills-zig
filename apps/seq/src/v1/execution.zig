@@ -344,7 +344,11 @@ const ProgramBuilder = struct {
 
     fn applyLimit(self: *ProgramBuilder, limit: plan.Limit) !void {
         try self.requireStreaming();
-        if (self.limit_state_count == 256) {
+        if (self.limit_state_count == 256 or
+            @as(usize, self.limit_state_count) + 1 +
+                self.aggregate_metrics.items.len >
+                self.definition_plan.bounds.max_fold_states)
+        {
             return error.TooManyObservationLimits;
         }
         try self.operations.append(self.allocator, .{
@@ -438,6 +442,12 @@ const ProgramBuilder = struct {
         try self.requireStreaming();
         if (self.first_blocking_operation != null) {
             return error.ObservationAggregateRequiresStreamingPrefix;
+        }
+        if (@as(usize, self.limit_state_count) +
+            self.aggregate_metrics.items.len + aggregate.metrics.len >
+            self.definition_plan.bounds.max_fold_states)
+        {
+            return error.ObservationFoldStateBoundExceeded;
         }
         const start = self.aggregate_metrics.items.len;
         for (aggregate.metrics, 0..) |metric, metric_index| {

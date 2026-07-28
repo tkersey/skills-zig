@@ -1336,7 +1336,7 @@ fn validateTextItem(text: []const u8, ascii_only: bool) !void {
         return error.InvalidRankedTextItem;
     }
     if (ascii_only) for (text) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '_') {
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte)) {
             return error.InvalidRankedTextItem;
         }
     };
@@ -1429,17 +1429,25 @@ fn tokenizeSet(
     errdefer deinitOwnedStringSet(allocator, &output);
     var token: std.ArrayList(u8) = .empty;
     defer token.deinit(allocator);
+    var overflowed = false;
     for (text) |raw| {
         const char = asciiLower(raw);
         if (std.ascii.isLower(char) or std.ascii.isDigit(char)) {
             if (token.items.len < max_token_bytes) {
                 try token.append(allocator, char);
+            } else {
+                overflowed = true;
             }
             continue;
         }
-        try flushToken(allocator, tokenizer, &output, &token);
+        if (overflowed) {
+            token.clearRetainingCapacity();
+            overflowed = false;
+        } else {
+            try flushToken(allocator, tokenizer, &output, &token);
+        }
     }
-    try flushToken(allocator, tokenizer, &output, &token);
+    if (!overflowed) try flushToken(allocator, tokenizer, &output, &token);
     return output;
 }
 
@@ -1704,7 +1712,7 @@ fn nonEmptyStringAt(
 }
 
 fn parseIsoTimestampSeconds(timestamp: []const u8) ?i64 {
-    if (timestamp.len < 19 or
+    if (timestamp.len < 20 or
         timestamp[4] != '-' or timestamp[7] != '-' or
         timestamp[10] != 'T' or timestamp[13] != ':' or
         timestamp[16] != ':')
@@ -1719,14 +1727,77 @@ fn parseIsoTimestampSeconds(timestamp: []const u8) ?i64 {
         return null;
     const second = std.fmt.parseInt(i64, timestamp[17..19], 10) catch
         return null;
-    if (month < 1 or month > 12 or day < 1 or day > 31 or
+    if (month < 1 or month > 12 or day < 1 or
+        day > daysInMonth(year, month) or
         hour < 0 or hour > 23 or minute < 0 or minute > 59 or
-        second < 0 or second > 60)
+        second < 0 or second > 59)
     {
         return null;
     }
-    return daysFromCivil(year, month, day) * 86_400 +
-        hour * 3600 + minute * 60 + second;
+    var cursor: usize = 19;
+    if (timestamp[cursor] == '.') {
+        cursor += 1;
+        const fraction_start = cursor;
+        while (cursor < timestamp.len and
+            std.ascii.isDigit(timestamp[cursor])) : (cursor += 1)
+        {}
+        if (cursor == fraction_start) return null;
+    }
+    const offset_seconds = if (cursor < timestamp.len and
+        timestamp[cursor] == 'Z')
+    offset: {
+        cursor += 1;
+        break :offset @as(i64, 0);
+    } else parseTimestampOffset(timestamp, &cursor) orelse return null;
+    if (cursor != timestamp.len) return null;
+    const day_seconds = std.math.mul(
+        i64,
+        daysFromCivil(year, month, day),
+        86_400,
+    ) catch return null;
+    const local_seconds = std.math.add(
+        i64,
+        day_seconds,
+        hour * 3600 + minute * 60 + second,
+    ) catch return null;
+    return std.math.sub(i64, local_seconds, offset_seconds) catch null;
+}
+
+fn parseTimestampOffset(timestamp: []const u8, cursor: *usize) ?i64 {
+    if (cursor.* + 6 != timestamp.len) return null;
+    const sign: i64 = switch (timestamp[cursor.*]) {
+        '+' => 1,
+        '-' => -1,
+        else => return null,
+    };
+    if (timestamp[cursor.* + 3] != ':') return null;
+    const hour = std.fmt.parseInt(
+        i64,
+        timestamp[cursor.* + 1 .. cursor.* + 3],
+        10,
+    ) catch return null;
+    const minute = std.fmt.parseInt(
+        i64,
+        timestamp[cursor.* + 4 .. cursor.* + 6],
+        10,
+    ) catch return null;
+    if (hour > 23 or minute > 59) return null;
+    cursor.* += 6;
+    return sign * (hour * 3600 + minute * 60);
+}
+
+fn daysInMonth(year: i64, month: i64) i64 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(year: i64) bool {
+    return @mod(year, 4) == 0 and
+        (@mod(year, 100) != 0 or @mod(year, 400) == 0);
 }
 
 fn daysFromCivil(year_input: i64, month: i64, day: i64) i64 {

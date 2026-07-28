@@ -240,12 +240,15 @@ fn runTransact(
         return 2;
     };
     defer result.deinit(allocator);
-    try emitTransaction(
+    emitTransaction(
         allocator,
         args.common.format,
         &result,
         context.stats,
-    );
+    ) catch |err| {
+        try emitTransactionError(err, result.storage_mutated);
+        return 2;
+    };
     return if (result.validation_result.valid) 0 else 2;
 }
 

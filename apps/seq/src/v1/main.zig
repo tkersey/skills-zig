@@ -139,6 +139,12 @@ fn runExplain(
     var args = try parseObserveArgs(allocator, argv);
     defer args.deinit(allocator);
     args.selectors.environment = environment;
+    const normalized_repo = if (args.selectors.repo) |repo|
+        try seq.native.absolutePathAlloc(allocator, environment, repo)
+    else
+        null;
+    defer if (normalized_repo) |repo| allocator.free(repo);
+    if (normalized_repo) |repo| args.selectors.repo = repo;
     if (hasPhysicalSelector(args.selectors) or args.input_specs.len != 0) {
         return error.ExplainDoesNotReadCorpus;
     }
@@ -522,6 +528,7 @@ fn emitObservation(
             .execution_stats = execution_stats,
             .limitations = observationLimitations(
                 execution.warning_count,
+                programMayTruncate(program),
             ),
         },
         &execution_stats,
@@ -614,6 +621,7 @@ fn executePhysicalObservation(
             program,
             relation,
             path,
+            context.definition_plan.bounds,
             &runner,
             &digest_set,
             &metrics,
@@ -623,7 +631,7 @@ fn executePhysicalObservation(
     return .{
         .result = try runner.finish(),
         .runner = runner,
-        .corpus_adapter = "codex-rollout-jsonl/v1",
+        .corpus_adapter = metrics.adapter orelse "codex-rollout-jsonl/v1",
         .corpus_digest = digest_set.digest(),
         .corpus_files = metrics.files,
         .corpus_sessions = metrics.sessions,
@@ -639,6 +647,17 @@ const PhysicalMetrics = struct {
     opened: usize = 0,
     bytes_read: usize = 0,
     warnings: usize = 0,
+    adapter: ?[]const u8 = null,
+
+    fn admitAdapter(self: *PhysicalMetrics, adapter: []const u8) !void {
+        if (self.adapter) |current| {
+            if (!std.mem.eql(u8, current, adapter)) {
+                return error.MixedPhysicalSourceAdapters;
+            }
+        } else {
+            self.adapter = adapter;
+        }
+    }
 };
 
 fn feedPhysicalFile(
@@ -647,17 +666,66 @@ fn feedPhysicalFile(
     program: *const seq.execution.Program,
     relation: seq.physical.Relation,
     path: []const u8,
+    bounds: seq.definition.Bounds,
     runner: *seq.execution.Runner,
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
 ) !seq.execution.Feed {
+    if (seq.opencode_adapter.recognizes(path)) {
+        if (args.selectors.repo != null or
+            args.selectors.since_ms != null or
+            args.selectors.until_ms != null)
+        {
+            return error.OpenCodePromptHistorySelectorUnavailable;
+        }
+        if (args.selectors.session_id) |wanted| {
+            if (!std.mem.eql(
+                u8,
+                wanted,
+                seq.opencode_adapter.session_id,
+            )) return .continue_scanning;
+        }
+        const remaining_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
+            bounds.max_input_bytes - metrics.bytes_read
+        else
+            return error.ObservationInputByteBoundExceeded;
+        const observed = try seq.opencode_adapter.feedFile(
+            allocator,
+            program,
+            runner,
+            path,
+            remaining_bytes,
+        );
+        try metrics.admitAdapter(seq.opencode_adapter.adapter_id);
+        metrics.opened += 1;
+        metrics.bytes_read = try std.math.add(
+            usize,
+            metrics.bytes_read,
+            observed.bytes_read,
+        );
+        metrics.warnings = try std.math.add(
+            usize,
+            metrics.warnings,
+            observed.warnings,
+        );
+        metrics.files += 1;
+        metrics.sessions += 1;
+        digest_set.add(path, &observed.digest);
+        return if (runner.stopped) .stop else .continue_scanning;
+    }
     var parsed = try seq.trace_adapter.parseFile(
         allocator,
         program,
         path,
-        .{},
+        .{
+            .max_input_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
+                bounds.max_input_bytes - metrics.bytes_read
+            else
+                0,
+        },
     );
     defer parsed.deinit(allocator);
+    try metrics.admitAdapter("codex-rollout-jsonl/v1");
     metrics.opened += 1;
     metrics.bytes_read = std.math.add(
         usize,
@@ -689,7 +757,7 @@ fn feedPhysicalFile(
                 allocator,
                 &parsed.trace,
                 relation == .structured_values,
-                .{},
+                structuredLimitsFor(bounds),
             );
             defer index.deinit(allocator);
             break :result try seq.structured.feedSelected(
@@ -708,6 +776,21 @@ fn feedPhysicalFile(
                 .since_ms = args.selectors.since_ms,
                 .until_ms = args.selectors.until_ms,
             },
+        ),
+    };
+}
+
+fn structuredLimitsFor(
+    bounds: seq.definition.Bounds,
+) seq.structured.Limits {
+    return .{
+        .max_documents = bounds.max_graph_nodes,
+        .max_document_bytes = bounds.max_input_bytes,
+        .max_values = bounds.max_graph_nodes,
+        .max_depth = bounds.max_graph_depth,
+        .max_owned_bytes = @min(
+            bounds.max_input_bytes,
+            bounds.max_output_bytes,
         ),
     };
 }
@@ -754,11 +837,35 @@ fn executeExternalObservation(
 
 fn observationLimitations(
     warning_count: usize,
+    projection_bounded: bool,
 ) []const []const u8 {
-    return if (warning_count == 0)
-        &.{}
-    else
-        &.{"selected corpus contains parser warnings; evidence may be incomplete"};
+    if (warning_count != 0 and projection_bounded) {
+        return &.{
+            "selected corpus contains parser warnings; evidence may be incomplete",
+            "projection is definition-bounded; additional matching evidence may be omitted",
+        };
+    }
+    if (warning_count != 0) {
+        return &.{
+            "selected corpus contains parser warnings; evidence may be incomplete",
+        };
+    }
+    if (projection_bounded) {
+        return &.{
+            "projection is definition-bounded; additional matching evidence may be omitted",
+        };
+    }
+    return &.{};
+}
+
+fn programMayTruncate(program: *const seq.execution.Program) bool {
+    for (program.operations) |operation| {
+        switch (operation) {
+            .limit, .top_k => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn renderObservationAlloc(
@@ -1211,6 +1318,7 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         "{{\"schema\":\"seq-capabilities/v1\",\"version\":\"{s}\"," ++
             "\"observation_abis\":[\"{s}\"],\"source_adapters\":" ++
             "[\"codex-rollout-jsonl/v1\"," ++
+            "\"opencode-prompt-history-jsonl/v1\"," ++
             "\"immutable-relation-json/v1\"],\"operators\":[",
         .{ Version, seq.definition.abi },
     );
@@ -1383,12 +1491,18 @@ test "observe parser accepts explicit definition selectors and parameters" {
 test "selected parser warnings contaminate the observation envelope" {
     try std.testing.expectEqual(
         @as(usize, 0),
-        observationLimitations(0).len,
+        observationLimitations(0, false).len,
     );
-    const limitations = observationLimitations(1);
+    const limitations = observationLimitations(1, false);
     try std.testing.expectEqual(@as(usize, 1), limitations.len);
     try std.testing.expectEqualStrings(
         "selected corpus contains parser warnings; evidence may be incomplete",
         limitations[0],
+    );
+    const bounded = observationLimitations(0, true);
+    try std.testing.expectEqual(@as(usize, 1), bounded.len);
+    try std.testing.expectEqualStrings(
+        "projection is definition-bounded; additional matching evidence may be omitted",
+        bounded[0],
     );
 }

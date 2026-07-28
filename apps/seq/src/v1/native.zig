@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const native_plan = @import("plan.zig");
@@ -85,6 +86,12 @@ pub fn run(
 ) !u8 {
     var options = try parseOptions(command, argv);
     options.environment = environment;
+    const normalized_repo = if (options.repo) |repo|
+        try absolutePathAlloc(allocator, options.environment, repo)
+    else
+        null;
+    defer if (normalized_repo) |repo| allocator.free(repo);
+    if (normalized_repo) |repo| options.repo = repo;
     switch (command) {
         .sessions => try runRelation(
             allocator,
@@ -330,6 +337,11 @@ pub fn resolveTemporalBounds(options: *Options) !void {
     } else if (options.since) |raw| {
         options.since_ms = seq_time.parseIsoTimestampMillis(raw) orelse
             return error.InvalidTimestampSelector;
+    }
+    if (options.since_ms != null and options.until_ms != null and
+        options.since_ms.? > options.until_ms.?)
+    {
+        return error.InvalidTemporalWindow;
     }
 }
 
@@ -1295,10 +1307,12 @@ fn writeIndex(
             .{ stat.size, stat.mtime.nanoseconds },
         );
     }
-    try std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = index_path,
-        .data = output.written(),
-    });
+    try durable_store.rejectSymlinkComponents(index_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        index_path,
+        output.written(),
+    );
 }
 
 fn indexExists(io: std.Io, path: []const u8) bool {
@@ -1418,7 +1432,12 @@ fn collectTargetJsonlPaths(
     root: []const u8,
     _: Options,
 ) !std.ArrayList([]u8) {
-    return collectJsonlPaths(allocator, io, root);
+    var paths = try collectJsonlPaths(allocator, io, root);
+    errdefer freePaths(allocator, &paths);
+    if (paths.items.len > 1_000_000) {
+        return error.SessionCandidateBoundExceeded;
+    }
+    return paths;
 }
 
 fn lessThanPath(_: void, left: []u8, right: []u8) bool {
@@ -1449,7 +1468,7 @@ fn resolveRootAlloc(
     return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
 }
 
-fn absolutePathAlloc(
+pub fn absolutePathAlloc(
     allocator: std.mem.Allocator,
     environment: ?*const std.process.Environ.Map,
     path: []const u8,

@@ -106,6 +106,7 @@ pub fn load(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     ) catch return error.InvalidDefinitionArchive;
     defer parsed.deinit();

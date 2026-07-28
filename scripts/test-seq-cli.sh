@@ -8,6 +8,7 @@ external_facts=apps/seq/src/v1/fixtures/external-facts.json
 ranked_definition=apps/seq/src/v1/fixtures/ranked-observation.json
 ranked_facts=apps/seq/src/v1/fixtures/ranked-facts.json
 rollout=apps/seq/src/v1/fixtures/rollout.jsonl
+opencode_history=apps/seq/src/v1/fixtures/opencode/prompt-history.jsonl
 temp_base=$(cd "${TMPDIR:-/tmp}" && pwd -P)
 cache_dir=$(mktemp -d "$temp_base/seq-v1-smoke.XXXXXX")
 trap 'test -n "${cache_dir:-}" && rm -rf -- "$cache_dir"' EXIT
@@ -54,6 +55,18 @@ grep -Fq '"physical_passes":1' <<<"$observation_output"
 grep -Fq '"files_opened":1' <<<"$observation_output"
 grep -Fq '"rows_materialized":0' <<<"$observation_output"
 grep -Fq '"authority_granted":false' <<<"$observation_output"
+
+opencode_output=$("$binary" observe \
+  --definition "$message_definition" \
+  --projection rows \
+  --path "$opencode_history" \
+  --param needle=verifier \
+  --format json)
+grep -Fq '"adapter":"opencode-prompt-history-jsonl/v1"' <<<"$opencode_output"
+grep -Fq '"session_id":"opencode-prompt-history"' <<<"$opencode_output"
+grep -Fq '"text":"run the verifier"' <<<"$opencode_output"
+grep -Fq '"physical_passes":1' <<<"$opencode_output"
+grep -Fq '"files_opened":1' <<<"$opencode_output"
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \
@@ -188,6 +201,7 @@ grep -Fq '"id":"aggregate","version":1' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"
 grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
+grep -Fq '"opencode-prompt-history-jsonl/v1"' <<<"$capabilities"
 if grep -Eq '"id":"(join|ordered-fold|reachability)"' \
   <<<"$capabilities"
 then

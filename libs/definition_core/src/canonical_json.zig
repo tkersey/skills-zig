@@ -11,6 +11,8 @@ const Omission = struct {
     recursive: bool = false,
 };
 
+const max_nesting_depth: usize = 256;
+
 pub fn canonicalJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return canonicalJsonAllocWithOmission(allocator, value, .{});
 }
@@ -60,6 +62,7 @@ fn writeCanonicalJsonWithOmission(
     omission: Omission,
     depth: usize,
 ) !void {
+    if (depth > max_nesting_depth) return error.JsonNestingExceeded;
     switch (value) {
         .null => try writer.writeAll("null"),
         .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
@@ -294,6 +297,7 @@ pub fn finalizeFingerprintAlloc(
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
     });
     defer parsed.deinit();
     const object = switch (parsed.value) {

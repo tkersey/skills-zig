@@ -891,8 +891,10 @@ const SortedAccumulator = struct {
             );
             initialized += 1;
             if (self.rows.items.len != 0 and
-                std.meta.activeTag(self.rows.items[0].keys[index]) !=
-                    std.meta.activeTag(keys[index]))
+                !scalarKindsCompatible(
+                    self.rows.items[0].keys[index],
+                    keys[index],
+                ))
             {
                 return error.ProjectionOrderingTypeMismatch;
             }
@@ -919,7 +921,7 @@ const SortedAccumulator = struct {
             ),
         };
         switch (key) {
-            .string, .integer, .float => return key,
+            .string, .number, .integer, .float => return key,
             else => {
                 var owned = key;
                 owned.deinit(self.allocator);
@@ -6482,6 +6484,13 @@ fn compareScalars(left: Scalar, right: Scalar) !std.math.Order {
         left_number,
         right_number,
     ) orelse error.ProjectionOrderingTypeMismatch;
+}
+
+fn scalarKindsCompatible(left: Scalar, right: Scalar) bool {
+    if (left == .string or right == .string) {
+        return left == .string and right == .string;
+    }
+    return scalarNumberValue(left) != null and scalarNumberValue(right) != null;
 }
 
 fn scalarNumberValue(value: Scalar) ?std.json.Value {

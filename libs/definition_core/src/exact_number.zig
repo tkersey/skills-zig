@@ -31,7 +31,17 @@ const Syntax = struct {
 
 pub fn parse(text: []const u8) ?Number {
     const syntax = scan(text) orelse return null;
-    return normalize(text, syntax);
+    const number = normalize(text, syntax) orelse return null;
+    if (number.significant_len != 0) {
+        const canonical_exponent = @as(i128, @intCast(number.significant_len)) +
+            @as(i128, number.scale) - 1;
+        if (canonical_exponent < std.math.minInt(i64) or
+            canonical_exponent > std.math.maxInt(i64))
+        {
+            return null;
+        }
+    }
+    return number;
 }
 
 pub fn fromValue(value: std.json.Value, buffer: *[128]u8) ?Number {
@@ -287,4 +297,13 @@ test "exact numbers compare and canonicalize without binary float loss" {
     defer out.deinit();
     try writeCanonical(&out.writer, "9007199254740992.100");
     try std.testing.expectEqualStrings("9007199254740992.1", out.written());
+}
+
+test "accepted exact numbers remain canonical parse closed" {
+    try std.testing.expect(parse("12e9223372036854775807") == null);
+    try std.testing.expect(parse("1e9223372036854775807") != null);
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try writeCanonical(&out.writer, "1e9223372036854775807");
+    try std.testing.expect(parse(out.written()) != null);
 }

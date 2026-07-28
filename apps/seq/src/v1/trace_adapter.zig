@@ -11,6 +11,7 @@ const structured = @import("structured.zig");
 pub const Options = struct {
     ongoing_threshold_secs: i64 = 60,
     structured_limits: structured.Limits = .{},
+    max_input_bytes: usize = std.math.maxInt(usize),
 };
 
 pub const Observation = struct {
@@ -57,6 +58,9 @@ pub fn parseFile(
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
+    if (stat.size > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
     var reader = file.reader(io, &.{});
     var metrics = trace_core.StreamMetrics{};
     const parse_options = traceParseOptions(
