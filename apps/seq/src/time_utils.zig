@@ -90,6 +90,10 @@ pub fn dateFromTimestampMillis(ts_ms: i64, tz: TimeZone) ?Date {
     };
 }
 
+pub fn dateFromUtcTimestampMillis(ts_ms: i64) Date {
+    return dateFromTimestampMillisWithOffset(ts_ms, 0);
+}
+
 pub fn formatDateInto(date: Date, out: *[10]u8) void {
     _ = std.fmt.bufPrint(out[0..], "{d:0>4}-{d:0>2}-{d:0>2}", .{
         @as(u32, @intCast(@max(date.year, 0))),

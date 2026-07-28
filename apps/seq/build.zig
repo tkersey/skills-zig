@@ -64,7 +64,6 @@ pub fn build(b: *std.Build) void {
         .name = "seq",
         .root_module = root_module,
     });
-    exe.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -76,7 +75,6 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = root_module,
     });
-    unit_tests.root_module.linkSystemLibrary("c", .{});
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run Seq 1.0 tests");
     test_step.dependOn(&run_unit_tests.step);

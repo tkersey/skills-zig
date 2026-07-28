@@ -1426,14 +1426,8 @@ fn collectBoundedDayPaths(
 ) !?std.ArrayList([]u8) {
     const since = since_ms orelse return null;
     const until = until_ms orelse return null;
-    const start = seq_time.dateFromTimestampMillis(
-        since,
-        .utc,
-    ) orelse return null;
-    const end = seq_time.dateFromTimestampMillis(
-        until,
-        .utc,
-    ) orelse return null;
+    const start = seq_time.dateFromUtcTimestampMillis(since);
+    const end = seq_time.dateFromUtcTimestampMillis(until);
     const day_count = seq_time.daysBetweenInclusive(start, end);
     if (day_count < 1 or day_count > 45) return null;
     if (!try rootHasDatedHierarchy(io, root)) return null;
@@ -1452,10 +1446,7 @@ fn collectBoundedDayPaths(
             start_day + offset,
             86_400_000,
         ) catch return error.TimestampOutOfRange;
-        const date = seq_time.dateFromTimestampMillis(
-            day_ms,
-            .utc,
-        ) orelse return error.TimestampOutOfRange;
+        const date = seq_time.dateFromUtcTimestampMillis(day_ms);
         const relative = try std.fmt.allocPrint(
             allocator,
             "{d:0>4}/{d:0>2}/{d:0>2}",
