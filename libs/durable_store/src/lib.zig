@@ -4634,7 +4634,7 @@ test "durable transactions hold check-only CAS guards through publication" {
         .metadata_path = metadata_path,
     };
     const thread = try std.Thread.spawn(.{}, runGuardedTransaction, .{&context});
-    std.Io.sleep(Io.io(), .fromMilliseconds(10), .awake) catch {};
+    try std.Io.sleep(Io.io(), .fromMilliseconds(10), .awake);
     try writeTextAtomic(
         std.testing.allocator,
         guarded_path,
