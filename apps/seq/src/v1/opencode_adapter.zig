@@ -61,13 +61,16 @@ pub fn feedFileSelected(
     const raw = try readFileAlloc(allocator, path, max_input_bytes);
     defer allocator.free(raw);
     var records: usize = 0;
+    var source_records: usize = 0;
     var warnings: usize = 0;
     var tools: usize = 0;
+    var session_matches = selection.contains == null or
+        containsIgnoreCase(path, selection.contains.?);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |untrimmed| {
         const line = std.mem.trim(u8, untrimmed, " \t\r");
         if (line.len == 0) continue;
-        records += 1;
+        source_records += 1;
         var parsed = std.json.parseFromSlice(
             std.json.Value,
             allocator,
@@ -85,6 +88,13 @@ pub fn feedFileSelected(
                 continue;
             },
         };
+        records += 1;
+        session_matches = session_matches or
+            (selection.contains != null and
+                containsIgnoreCase(
+                    stringField(object, "input"),
+                    selection.contains.?,
+                ));
         tools += toolCount(object);
         if (relation == .sessions) continue;
         if (relation == .turns and !turnPasses(object, path, selection)) {
@@ -99,11 +109,12 @@ pub fn feedFileSelected(
             path,
             line,
             records,
+            source_records,
             object,
         );
         if (feed == .stop) break;
     }
-    if (relation == .sessions and !runner.stopped) {
+    if (relation == .sessions and !runner.stopped and session_matches) {
         var row_storage: [256]execution.Value = undefined;
         const row = row_storage[0..program.source_width];
         try fillSession(
@@ -150,7 +161,8 @@ fn feedRecord(
     session_id: []const u8,
     path: []const u8,
     raw: []const u8,
-    record_index: usize,
+    turn_number: usize,
+    source_record_number: usize,
     object: std.json.ObjectMap,
 ) !execution.Feed {
     var row_storage: [256]execution.Value = undefined;
@@ -159,7 +171,7 @@ fn feedRecord(
     const record_id = try recordId(
         &record_id_buffer,
         session_id,
-        record_index,
+        source_record_number,
     );
     switch (relation) {
         .source_events => {
@@ -170,7 +182,8 @@ fn feedRecord(
                 record_id,
                 path,
                 raw,
-                record_index,
+                source_record_number,
+                turn_number,
                 object,
             );
             return runner.feed(row);
@@ -182,7 +195,7 @@ fn feedRecord(
                 session_id,
                 record_id,
                 path,
-                record_index,
+                turn_number,
                 object,
             );
             return runner.feed(row);
@@ -194,7 +207,7 @@ fn feedRecord(
                 session_id,
                 record_id,
                 path,
-                record_index,
+                turn_number,
                 object,
             );
             return runner.feed(row);
@@ -209,7 +222,8 @@ fn feedRecord(
             relation,
             session_id,
             path,
-            record_index,
+            turn_number,
+            source_record_number,
             object,
         ),
         .structured_documents => return feedStructuredDocument(
@@ -219,7 +233,7 @@ fn feedRecord(
             session_id,
             record_id,
             raw,
-            record_index - 1,
+            turn_number - 1,
         ),
         .sessions,
         .session_edges,
@@ -256,7 +270,8 @@ fn feedTools(
     relation: physical.Relation,
     session_id: []const u8,
     path: []const u8,
-    record_index: usize,
+    turn_number: usize,
+    source_record_number: usize,
     object: std.json.ObjectMap,
 ) !execution.Feed {
     const parts = arrayField(object, "parts") orelse
@@ -291,7 +306,7 @@ fn feedTools(
             &id_buffer,
             path,
             stringField(part_object, "callID"),
-            record_index,
+            source_record_number,
             part_index + 1,
         );
         try fillTool(
@@ -300,7 +315,7 @@ fn feedTools(
             relation,
             session_id,
             path,
-            record_index,
+            turn_number,
             call_id,
             part_object,
             state,
@@ -340,7 +355,8 @@ fn fillSourceEvent(
     record_id: []const u8,
     path: []const u8,
     raw: []const u8,
-    record_index: usize,
+    source_record_number: usize,
+    turn_number: usize,
     object: std.json.ObjectMap,
 ) !void {
     const input = stringField(object, "input");
@@ -350,13 +366,13 @@ fn fillSourceEvent(
             0 => .{ .string = record_id },
             1 => .{ .string = session_id },
             2 => .{ .string = path },
-            3 => try usizeInteger(record_index),
+            3 => try usizeInteger(source_record_number),
             4 => .{ .string = "prompt_history" },
             5 => optionalString(mode),
             6 => .null,
             7, 8 => .{ .json = raw },
             9 => .{ .string = "opencode_jsonl" },
-            10 => try usizeInteger(record_index - 1),
+            10 => try usizeInteger(turn_number - 1),
             11 => .{ .string = "user" },
             12 => optionalString(input),
             13 => .{ .boolean = false },

@@ -6,6 +6,7 @@ const seq = @import("seq_v1_core");
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
 const source_adapter_version = "seq-source-adapter-set/v1";
 const max_output_cells: usize = 4_000_000;
+const max_discovery_bytes: usize = 256 * 1024 * 1024;
 threadlocal var runtime_io: ?std.Io = null;
 
 const Help =
@@ -432,6 +433,12 @@ fn runObserve(
     var args = try parseObserveArgs(allocator, argv);
     defer args.deinit(allocator);
     args.selectors.environment = environment;
+    const normalized_repo = if (args.selectors.repo) |repo|
+        try seq.native.absolutePathAlloc(allocator, environment, repo)
+    else
+        null;
+    defer if (normalized_repo) |repo| allocator.free(repo);
+    if (normalized_repo) |repo| args.selectors.repo = repo;
     if (args.format != .json) return error.UnsupportedObservationRenderer;
     const projection_names = [_][]const u8{args.projection};
     var context = try loadDefinition(
@@ -646,6 +653,7 @@ const PhysicalMetrics = struct {
     sessions: usize = 0,
     opened: usize = 0,
     bytes_read: usize = 0,
+    corpus_bytes: usize = 0,
     warnings: usize = 0,
     adapter: ?[]const u8 = null,
 
@@ -724,8 +732,8 @@ fn feedOpenCodeFile(
             session_id,
         )) return .continue_scanning;
     }
-    const remaining_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
-        bounds.max_input_bytes - metrics.bytes_read
+    const remaining_bytes = if (metrics.corpus_bytes < bounds.max_input_bytes)
+        bounds.max_input_bytes - metrics.corpus_bytes
     else
         return error.ObservationInputByteBoundExceeded;
     const observed = try seq.opencode_adapter.feedFile(
@@ -740,6 +748,11 @@ fn feedOpenCodeFile(
     metrics.bytes_read = try std.math.add(
         usize,
         metrics.bytes_read,
+        observed.bytes_read,
+    );
+    metrics.corpus_bytes = try std.math.add(
+        usize,
+        metrics.corpus_bytes,
         observed.bytes_read,
     );
     metrics.warnings = try std.math.add(
@@ -764,23 +777,44 @@ fn feedCodexFile(
     digest_set: *CorpusSetHasher,
     metrics: *PhysicalMetrics,
 ) !seq.execution.Feed {
-    var parsed = try seq.trace_adapter.parseFile(
+    const selected = try seq.trace_adapter.parseFileSelected(
         allocator,
         program,
         path,
         .{
-            .max_input_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
-                bounds.max_input_bytes - metrics.bytes_read
+            .max_input_bytes = if (metrics.corpus_bytes < bounds.max_input_bytes)
+                bounds.max_input_bytes - metrics.corpus_bytes
             else
                 0,
         },
+        .{
+            .session_id = args.selectors.session_id,
+            .repo = args.selectors.repo,
+            .since_ms = args.selectors.since_ms,
+            .until_ms = args.selectors.until_ms,
+            .filter_time = relation == .sessions,
+        },
     );
-    defer parsed.deinit(allocator);
-    try metrics.admitAdapter("codex-rollout-jsonl/v1");
     metrics.opened += 1;
     metrics.bytes_read = std.math.add(
         usize,
         metrics.bytes_read,
+        selected.discovery_bytes_read,
+    ) catch return error.ObservationMetricOverflow;
+    if (metrics.bytes_read > max_discovery_bytes + metrics.corpus_bytes) {
+        return error.ObservationDiscoveryByteBoundExceeded;
+    }
+    var parsed = selected.parsed orelse return .continue_scanning;
+    defer parsed.deinit(allocator);
+    try metrics.admitAdapter("codex-rollout-jsonl/v1");
+    metrics.bytes_read = std.math.add(
+        usize,
+        metrics.bytes_read,
+        parsed.metrics.bytes_read,
+    ) catch return error.ObservationMetricOverflow;
+    metrics.corpus_bytes = std.math.add(
+        usize,
+        metrics.corpus_bytes,
         parsed.metrics.bytes_read,
     ) catch return error.ObservationMetricOverflow;
     if (relation == .sessions) {

@@ -122,18 +122,18 @@ write_ledger_smoke() {
 }
 
 assert_affected seq write_seq
-assert_affected seq,ledger write_definition_core
+assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq write_seq_build
 assert_affected img move_build_line
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_mixed_seq_unknown_build
-assert_affected seq,ledger write_definition_package_path
+assert_affected seq,cas,ledger write_definition_package_path
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_change
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
 assert_affected "" write_readme
-assert_ci_affected seq,ledger write_definition_guard
+assert_ci_affected seq,cas,ledger write_definition_guard
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 

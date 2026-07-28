@@ -14,6 +14,10 @@ const canonical_trace = trace_core;
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxInputBytes = 8 * 1024 * 1024;
 const MaxSchemaBytes = 64 * 1024 * 1024;
+const MaxInquiryForks: u64 = 4;
+const MaxInquiryLanes: usize = 16;
+const MaxInquiryTokens: u64 = 1_000_000;
+const MaxInquiryTimeoutMs: u64 = 2_700_000;
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas_session_inquiry",
@@ -606,6 +610,19 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--receipt-dir");
     };
 
+    revalidateLedgerInput(
+        allocator,
+        capsule_definition_path,
+        capsule_path,
+        "packet",
+    ) catch |err| {
+        try printFailureJson(
+            allocator,
+            FailureCode.capsule_invalid,
+            @errorName(err),
+        );
+        std.process.exit(2);
+    };
     const capsule_definition_digest = definitionDigestAlloc(
         allocator,
         capsule_definition_path,
@@ -635,6 +652,19 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         std.process.exit(2);
     };
     defer deinitDcp(allocator, dcp);
+    revalidateLedgerInput(
+        allocator,
+        plan_definition_path,
+        plan_path,
+        "plan",
+    ) catch |err| {
+        try printFailureJson(
+            allocator,
+            FailureCode.plan_invalid,
+            @errorName(err),
+        );
+        std.process.exit(2);
+    };
     const plan_definition_digest = definitionDigestAlloc(
         allocator,
         plan_definition_path,
@@ -1151,6 +1181,23 @@ fn spawnAndWaitOkPosix(allocator: std.mem.Allocator, cwd: []const u8, argv: []co
     var actions: std.c.posix_spawn_file_actions_t = undefined;
     if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
     defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+    const write_null = @as(c_int, @bitCast(std.posix.O{
+        .ACCMODE = .WRONLY,
+    }));
+    if (std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        std.posix.STDOUT_FILENO,
+        "/dev/null",
+        write_null,
+        0,
+    ) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        std.posix.STDERR_FILENO,
+        "/dev/null",
+        write_null,
+        0,
+    ) != 0) return error.SpawnFileActionsFailed;
 
     var cwd_storage: ?[:0]u8 = null;
     defer if (cwd_storage) |path| allocator.free(path);
@@ -1214,6 +1261,36 @@ fn statusToExitCode(status: u32) u8 {
         return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
     }
     return 1;
+}
+
+fn revalidateLedgerInput(
+    allocator: std.mem.Allocator,
+    definition_path: []const u8,
+    input_path: []const u8,
+    input_name: []const u8,
+) !void {
+    const input_spec = try std.fmt.allocPrint(
+        allocator,
+        "{s}={s}",
+        .{ input_name, input_path },
+    );
+    defer allocator.free(input_spec);
+    const argv = [_][]const u8{
+        "ledger",
+        "validate",
+        "--definition",
+        definition_path,
+        "--input",
+        input_spec,
+        "--format",
+        "json",
+    };
+    spawnAndWaitOk(
+        allocator,
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        &argv,
+    ) catch return error.LedgerRevalidationFailed;
 }
 
 fn shellQuoteAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -1645,6 +1722,7 @@ fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
         else => return error.MissingLanes,
     };
     if (lanes_arr.items.len == 0) return error.MissingLanes;
+    if (lanes_arr.items.len > MaxInquiryLanes) return error.TooManyLanes;
     var lanes = try allocator.alloc(Lane, lanes_arr.items.len);
     var total_forks: u64 = 0;
     for (lanes_arr.items, 0..) |value, index| {
@@ -1653,7 +1731,12 @@ fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
             else => return error.BadLane,
         };
         const fork_count = try requiredU64(obj, "fork_count");
-        total_forks += fork_count;
+        if (fork_count > MaxInquiryForks) return error.MaxForksExceeded;
+        total_forks = std.math.add(
+            u64,
+            total_forks,
+            fork_count,
+        ) catch return error.MaxForksExceeded;
         lanes[index] = .{
             .lane_id = try allocator.dupe(u8, try requiredString(obj, "lane_id")),
             .temporal_horizon = try allocator.dupe(u8, try requiredString(obj, "temporal_horizon")),
@@ -1668,9 +1751,21 @@ fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
     const permissions = rootObject(plan, "permission_policy") orelse return error.MissingPermissionPolicy;
     const budgets = rootObject(plan, "budgets") orelse return error.MissingBudgets;
     const max_forks = try requiredU64(budgets, "max_forks");
+    if (max_forks > MaxInquiryForks) return error.MaxForksExceeded;
     if (total_forks > max_forks) return error.MaxForksExceeded;
     const max_turns = try requiredU64(budgets, "max_turns_per_fork");
     if (max_turns < 1) return error.BadBudget;
+    const max_total_tokens = try requiredU64(
+        budgets,
+        "max_total_tokens",
+    );
+    if (max_total_tokens > MaxInquiryTokens) {
+        return error.MaxTotalTokensExceeded;
+    }
+    const timeout_ms = try requiredU64(budgets, "timeout_ms");
+    if (timeout_ms > MaxInquiryTimeoutMs) {
+        return error.InquiryTimeoutExceeded;
+    }
     return .{
         .plan_id = try allocator.dupe(u8, try requiredString(plan, "source_capsule")),
         .inquiry_id = try allocator.dupe(u8, try requiredString(plan, "inquiry_id")),
@@ -1681,8 +1776,8 @@ fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
         .permission_network = try requiredBool(permissions, "network"),
         .max_forks = max_forks,
         .max_turns_per_fork = max_turns,
-        .max_total_tokens = try requiredU64(budgets, "max_total_tokens"),
-        .timeout_ms = try requiredU64(budgets, "timeout_ms"),
+        .max_total_tokens = max_total_tokens,
+        .timeout_ms = timeout_ms,
         .lanes = lanes,
     };
 }

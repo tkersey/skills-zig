@@ -232,6 +232,7 @@ const TransactionPaths = struct {
     bindings: []u8,
     definitions: []u8,
     revisions: []u8,
+    created_control_paths: bool,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -252,6 +253,7 @@ const TransactionPaths = struct {
             .bindings = undefined,
             .definitions = undefined,
             .revisions = undefined,
+            .created_control_paths = false,
         };
         errdefer allocator.free(paths.transactions);
         var initialized = paths;
@@ -270,6 +272,12 @@ const TransactionPaths = struct {
             &.{ ledger_root, ".revisions" },
         );
         errdefer allocator.free(initialized.revisions);
+        initialized.created_control_paths =
+            !directoryExists(initialized.ledger_root) or
+            !directoryExists(initialized.transactions) or
+            !directoryExists(initialized.bindings) or
+            !directoryExists(initialized.definitions) or
+            (require_revisions and !directoryExists(initialized.revisions));
         try initialized.ensure(allocator, require_revisions);
         return initialized;
     }
@@ -304,6 +312,14 @@ const TransactionPaths = struct {
         self.* = undefined;
     }
 };
+
+fn directoryExists(path: []const u8) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var directory = std.Io.Dir.openDirAbsolute(io, path, .{}) catch
+        return false;
+    directory.close(io);
+    return true;
+}
 
 fn invalidTransactionResult(
     allocator: std.mem.Allocator,
@@ -347,12 +363,14 @@ fn transactValidated(
     parameters: *const definition_core.parameters.Bindings,
     transaction_generated: []const protocol.GeneratedOutput,
 ) !Result {
+    last_mutation_state = null;
     var paths = try TransactionPaths.init(
         allocator,
         repo_root,
         operationNeedsRevisionArchive(operation),
     );
     defer paths.deinit(allocator);
+    last_mutation_state = paths.created_control_paths;
     var archive = try definition_archive.prepare(
         allocator,
         repo_root,
@@ -569,12 +587,14 @@ fn bindExisting(
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !Result {
+    last_mutation_state = null;
     var paths = try TransactionPaths.init(
         allocator,
         repo_root,
         false,
     );
     defer paths.deinit(allocator);
+    last_mutation_state = paths.created_control_paths;
     var archive = try definition_archive.prepare(
         allocator,
         repo_root,

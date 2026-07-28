@@ -218,8 +218,8 @@ const CompiledRule = struct {
     min_count: ?usize = null,
     max_count: ?usize = null,
     trimmed_min_count: ?usize = null,
-    min_number: ?f64 = null,
-    max_number: ?f64 = null,
+    min_number: ?EnumScalar = null,
+    max_number: ?EnumScalar = null,
     identifier_style: IdentifierStyle = .portable,
     allow_root: bool = true,
     case_insensitive: bool = false,
@@ -248,6 +248,8 @@ const CompiledRule = struct {
         allocator.free(self.optional_keys);
         for (self.values) |*value| value.deinit(allocator);
         allocator.free(self.values);
+        if (self.min_number) |*value| value.deinit(allocator);
+        if (self.max_number) |*value| value.deinit(allocator);
         for (self.children) |*child| child.deinit(allocator);
         allocator.free(self.children);
         for (self.coverage_children) |*child| child.deinit(allocator);
@@ -590,7 +592,11 @@ const Builder = struct {
                 rule,
             ),
             .sorted => try self.compileSortedRootRule(object, rule),
-            .bounded_number => try compileNumberBoundRootRule(object, rule),
+            .bounded_number => try compileNumberBoundRootRule(
+                self.allocator,
+                object,
+                rule,
+            ),
             .enum_value => rule.values = try parseEnumValues(
                 self.allocator,
                 try definition_core.json.field(object, "values"),
@@ -807,7 +813,7 @@ const Builder = struct {
         {
             return error.DeclaredFieldValueTypeUnsupported;
         }
-        try compileNumberBoundRootRule(object, rule);
+        try compileNumberBoundRootRule(self.allocator, object, rule);
     }
 
     fn compileCrossInputRootRule(
@@ -1804,7 +1810,11 @@ const Builder = struct {
                 object,
                 rule,
             ),
-            .bounded_number => try compileNumberBoundItemRule(object, rule),
+            .bounded_number => try compileNumberBoundItemRule(
+                self.allocator,
+                object,
+                rule,
+            ),
             .enum_value => try compileEnumItemRule(
                 self.allocator,
                 object,
@@ -2845,8 +2855,8 @@ fn encodeCacheRuleHeader(
     try writeOptionalUsize(encoder, rule.min_count);
     try writeOptionalUsize(encoder, rule.max_count);
     try writeOptionalUsize(encoder, rule.trimmed_min_count);
-    try writeOptionalF64(encoder, rule.min_number);
-    try writeOptionalF64(encoder, rule.max_number);
+    try writeOptionalEnumScalar(encoder, rule.min_number);
+    try writeOptionalEnumScalar(encoder, rule.max_number);
     try encoder.writeEnum(rule.identifier_style);
     try encoder.writeBool(rule.allow_root);
     try encoder.writeBool(rule.case_insensitive);
@@ -3508,8 +3518,8 @@ const DecodedCacheRuleHeader = struct {
     min_count: ?usize,
     max_count: ?usize,
     trimmed_min_count: ?usize,
-    min_number: ?f64,
-    max_number: ?f64,
+    min_number: ?EnumScalar,
+    max_number: ?EnumScalar,
     identifier_style: IdentifierStyle,
     allow_root: bool,
     case_insensitive: bool,
@@ -3530,6 +3540,8 @@ const DecodedCacheRuleHeader = struct {
         deinitKeySlices(allocator, self.optional_keys);
         for (self.values) |*value| value.deinit(allocator);
         allocator.free(self.values);
+        if (self.min_number) |*value| value.deinit(allocator);
+        if (self.max_number) |*value| value.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -3669,6 +3681,23 @@ fn decodeCacheRuleHeader(
         for (values) |*value| value.deinit(context.allocator);
         context.allocator.free(values);
     }
+    const scalar_kind = if (try context.decoder.readBool())
+        try context.decoder.readEnum(JsonKind)
+    else
+        null;
+    const min_count = try readOptionalUsize(context.decoder);
+    const max_count = try readOptionalUsize(context.decoder);
+    const trimmed_min_count = try readOptionalUsize(context.decoder);
+    var min_number = try readOptionalEnumScalar(
+        context.allocator,
+        context.decoder,
+    );
+    errdefer if (min_number) |*value| value.deinit(context.allocator);
+    var max_number = try readOptionalEnumScalar(
+        context.allocator,
+        context.decoder,
+    );
+    errdefer if (max_number) |*value| value.deinit(context.allocator);
     return .{
         .operator = operator,
         .input_index = input_index,
@@ -3680,15 +3709,12 @@ fn decodeCacheRuleHeader(
         .keys = keys,
         .optional_keys = optional_keys,
         .values = values,
-        .scalar_kind = if (try context.decoder.readBool())
-            try context.decoder.readEnum(JsonKind)
-        else
-            null,
-        .min_count = try readOptionalUsize(context.decoder),
-        .max_count = try readOptionalUsize(context.decoder),
-        .trimmed_min_count = try readOptionalUsize(context.decoder),
-        .min_number = try readOptionalF64(context.decoder),
-        .max_number = try readOptionalF64(context.decoder),
+        .scalar_kind = scalar_kind,
+        .min_count = min_count,
+        .max_count = max_count,
+        .trimmed_min_count = trimmed_min_count,
+        .min_number = min_number,
+        .max_number = max_number,
         .identifier_style = try context.decoder.readEnum(IdentifierStyle),
         .allow_root = try context.decoder.readBool(),
         .case_insensitive = try context.decoder.readBool(),
@@ -4184,9 +4210,21 @@ fn validateCachedRuleIndices(
         return error.InvalidRuleBounds;
     }
     if (rule.min_number != null and rule.max_number != null and
-        rule.min_number.? > rule.max_number.?)
+        (!isNumericScalar(rule.min_number.?) or
+            !isNumericScalar(rule.max_number.?) or
+            exactNumberOrder(
+                numericScalarValue(rule.min_number.?),
+                numericScalarValue(rule.max_number.?),
+            ) == .gt))
     {
         return error.InvalidRuleBounds;
+    }
+    if ((rule.min_number != null and
+        !isNumericScalar(rule.min_number.?)) or
+        (rule.max_number != null and
+            !isNumericScalar(rule.max_number.?)))
+    {
+        return error.CacheNumberInvalid;
     }
 }
 
@@ -4877,21 +4915,26 @@ fn readOptionalUsize(
     return @as(?usize, try decoder.readUsize());
 }
 
-fn writeOptionalF64(
+fn writeOptionalEnumScalar(
     encoder: *definition_core.cache.Encoder,
-    value: ?f64,
+    value: ?EnumScalar,
 ) !void {
     try encoder.writeBool(value != null);
-    if (value) |number| try encoder.writeF64(number);
+    if (value) |scalar| try encodeEnumScalar(encoder, scalar);
 }
 
-fn readOptionalF64(
+fn readOptionalEnumScalar(
+    allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
-) !?f64 {
+) !?EnumScalar {
     if (!try decoder.readBool()) return null;
-    const value = try decoder.readF64();
-    if (!std.math.isFinite(value)) return error.CacheNumberInvalid;
-    return @as(?f64, value);
+    const value = try decodeEnumScalar(allocator, decoder);
+    if (!isNumericScalar(value)) {
+        var owned = value;
+        owned.deinit(allocator);
+        return error.CacheNumberInvalid;
+    }
+    return value;
 }
 
 const LoadedInput = struct {
@@ -7013,14 +7056,14 @@ fn boundedNumber(value: std.json.Value, rule: *const CompiledRule) bool {
     if (rule.min_number) |minimum| {
         const order = exactNumberOrder(
             value,
-            .{ .float = minimum },
+            numericScalarValue(minimum),
         ) orelse return false;
         if (order == .lt) return false;
     }
     if (rule.max_number) |maximum| {
         const order = exactNumberOrder(
             value,
-            .{ .float = maximum },
+            numericScalarValue(maximum),
         ) orelse return false;
         if (order == .gt) return false;
     }
@@ -7122,6 +7165,22 @@ fn withinCount(count: usize, rule: *const CompiledRule) bool {
 fn enumContains(values: []const EnumScalar, value: std.json.Value) bool {
     for (values) |candidate| if (enumEqual(candidate, value)) return true;
     return false;
+}
+
+fn isNumericScalar(value: EnumScalar) bool {
+    return switch (value) {
+        .integer, .float, .number => true,
+        else => false,
+    };
+}
+
+fn numericScalarValue(value: EnumScalar) std.json.Value {
+    return switch (value) {
+        .integer => |number| .{ .integer = number },
+        .float => |number| .{ .float = number },
+        .number => |number| .{ .number_string = number },
+        else => unreachable,
+    };
 }
 
 fn enumEqual(candidate: EnumScalar, value: std.json.Value) bool {
@@ -8855,15 +8914,6 @@ fn exactNumberOrder(
     return definition_core.exact_number.orderValues(left, right);
 }
 
-fn jsonNumber(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
-        else => null,
-    };
-}
-
 test "relational numbers preserve exact JSON values" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -9539,14 +9589,54 @@ test "numeric enums preserve exact values beyond binary float precision" {
     try std.testing.expect(!enumEqual(scalar, parsed.value.array.items[1]));
 }
 
+test "bounded numbers preserve exact definition thresholds through cache" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-bounds","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-number","exact-object"]},"parameters":{},"inputs":{"record":{"codec":"json","required":true,"max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"exact","fields":{"value":{"number":{"min":9007199254740993,"max":9007199254740995}}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "definition.json",
+        .data = source,
+    });
+    var test_plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "definition.json",
+        1024 * 1024,
+    );
+    defer test_plan.deinit();
+    try expectTestValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        "record",
+        "{\"value\":9007199254740993}",
+        true,
+    );
+    try expectTestValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        "record",
+        "{\"value\":9007199254740992}",
+        false,
+    );
+}
+
 fn optionalUnsigned(object: std.json.ObjectMap, name: []const u8) !?usize {
     const raw = object.get(name) orelse return null;
     return try definition_core.json.unsigned(raw);
 }
 
-fn optionalNumber(object: std.json.ObjectMap, name: []const u8) !?f64 {
+fn optionalNumber(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    name: []const u8,
+) !?EnumScalar {
     const raw = object.get(name) orelse return null;
-    return jsonNumber(raw) orelse error.ExpectedNumber;
+    var scalar = try parseEnumScalar(allocator, raw);
+    errdefer scalar.deinit(allocator);
+    if (!isNumericScalar(scalar)) return error.ExpectedNumber;
+    return scalar;
 }
 
 fn optionalBoolean(object: std.json.ObjectMap, name: []const u8) !?bool {
@@ -9827,17 +9917,21 @@ fn compileIdentifierRootRule(
 }
 
 fn compileNumberBoundRootRule(
+    allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
     rule: *CompiledRule,
 ) !void {
-    rule.min_number = try optionalNumber(object, "min");
-    rule.max_number = try optionalNumber(object, "max");
+    rule.min_number = try optionalNumber(allocator, object, "min");
+    rule.max_number = try optionalNumber(allocator, object, "max");
     if (rule.min_number == null and rule.max_number == null) {
         return error.MissingRuleBound;
     }
     if (rule.min_number != null and
         rule.max_number != null and
-        rule.min_number.? > rule.max_number.?)
+        exactNumberOrder(
+            numericScalarValue(rule.min_number.?),
+            numericScalarValue(rule.max_number.?),
+        ) == .gt)
     {
         return error.InvalidRuleBounds;
     }
@@ -10033,6 +10127,7 @@ fn compileIdentifierItemRule(
 }
 
 fn compileNumberBoundItemRule(
+    allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
     rule: *CompiledRule,
 ) !void {
@@ -10040,14 +10135,17 @@ fn compileNumberBoundItemRule(
         object,
         &.{ "op", "path", "min", "max" },
     );
-    rule.min_number = try optionalNumber(object, "min");
-    rule.max_number = try optionalNumber(object, "max");
+    rule.min_number = try optionalNumber(allocator, object, "min");
+    rule.max_number = try optionalNumber(allocator, object, "max");
     if (rule.min_number == null and rule.max_number == null) {
         return error.MissingRuleBound;
     }
     if (rule.min_number != null and
         rule.max_number != null and
-        rule.min_number.? > rule.max_number.?)
+        exactNumberOrder(
+            numericScalarValue(rule.min_number.?),
+            numericScalarValue(rule.max_number.?),
+        ) == .gt)
     {
         return error.InvalidRuleBounds;
     }

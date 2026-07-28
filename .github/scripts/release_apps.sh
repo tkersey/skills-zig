@@ -42,6 +42,7 @@ case "$mode" in
 
     mark_definition_consumers() {
       mark_app seq
+      mark_app cas
       mark_app ledger
     }
 

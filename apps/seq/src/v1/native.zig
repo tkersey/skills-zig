@@ -462,6 +462,9 @@ fn runSessionDetail(
     if (options.format != .json) return error.UnsupportedNativeFormat;
     var paths = try resolveTargetPaths(allocator, io, options, true);
     defer freePaths(allocator, &paths);
+    if (opencode_adapter.recognizes(paths.items[0])) {
+        return error.OpenCodeSessionDetailUnavailable;
+    }
     var trace = try trace_core.parseSessionTrace(
         allocator,
         paths.items[0],
@@ -561,6 +564,20 @@ fn runFindSession(
     };
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
+        if (opencode_adapter.recognizes(path)) {
+            var opencode_options = options;
+            opencode_options.contains = options.prompt;
+            try writeOpenCodeRelationRows(
+                allocator,
+                writer,
+                .sessions,
+                opencode_options,
+                path,
+                &first,
+                &remaining,
+            );
+            continue;
+        }
         var trace = try trace_core.parseSessionTrace(
             allocator,
             path,
@@ -1315,9 +1332,15 @@ fn writeOpenCodeRelationRows(
         256 * 1024 * 1024,
         .{
             .status = if (relation == .turns) options.status else null,
-            .contains = if (relation == .turns) options.contains else null,
+            .contains = if (relation == .turns or relation == .sessions)
+                options.contains
+            else
+                null,
         },
     );
+    if (options.limit == 0 and runner.stopped) {
+        return error.OpenCodeNativeResultBoundExceeded;
+    }
     const result = try runner.finish();
     const rows = result.rows();
     const count = try rows.count();
@@ -1985,6 +2008,100 @@ test "physical queries select row timestamps across session directories" {
     try std.testing.expectEqualStrings(
         "[{\"text\":\"later\",\"timestamp\":\"2026-07-27T00:01:00+00:00\"}]\n",
         output.written(),
+    );
+}
+
+test "OpenCode native surfaces preserve valid turn numbering and filtering" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "prompt-history.jsonl",
+        .data = "{bad-json\n" ++
+            "{\"input\":\"alpha prompt\",\"mode\":\"build\",\"parts\":[]}\n" ++
+            "[]\n" ++
+            "{\"input\":\"beta needle\",\"mode\":\"ask\",\"parts\":[]}\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "prompt-history.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+
+    var sessions_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer sessions_output.deinit();
+    try runRelation(
+        std.testing.allocator,
+        &sessions_output.writer,
+        std.testing.io,
+        .sessions,
+        .{ .root = root, .contains = "beta" },
+        false,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            sessions_output.written(),
+            "\"turn_count\":2",
+        ) != null,
+    );
+
+    var turns_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer turns_output.deinit();
+    try runRelation(
+        std.testing.allocator,
+        &turns_output.writer,
+        std.testing.io,
+        .turns,
+        .{ .path = path },
+        true,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, turns_output.written(), "\"turn_index\":0") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, turns_output.written(), "\"turn_index\":1") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, turns_output.written(), "\"turn_index\":2") == null,
+    );
+
+    var find_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer find_output.deinit();
+    try runFindSession(
+        std.testing.allocator,
+        &find_output.writer,
+        std.testing.io,
+        .{ .root = root, .prompt = "beta" },
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            find_output.written(),
+            "\"turn_count\":2",
+        ) != null,
+    );
+
+    var detail_output: std.Io.Writer.Allocating =
+        .init(std.testing.allocator);
+    defer detail_output.deinit();
+    try std.testing.expectError(
+        error.OpenCodeSessionDetailUnavailable,
+        runSessionDetail(
+            std.testing.allocator,
+            &detail_output.writer,
+            std.testing.io,
+            .{ .path = path },
+        ),
     );
 }
 

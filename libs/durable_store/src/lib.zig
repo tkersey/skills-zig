@@ -1821,11 +1821,17 @@ pub fn commitTextTransaction(
 
     for (ordered) |mutation| {
         if (mutation.action == .check_only) continue;
+        var expectation = mutation.expectation;
+        if (mutation.content_mode == .raw and
+            expectation.expected_sequence == 0)
+        {
+            expectation.expected_sequence = null;
+        }
         var receipt = try writeTextAtomicCasBounded(
             allocator,
             mutation.path,
             mutation.text,
-            mutation.expectation,
+            expectation,
             mutation.max_bytes,
         );
         receipt.deinit(allocator);
@@ -4283,7 +4289,10 @@ test "durable transactions atomically publish bounded raw documents" {
         .{
             .path = document_path,
             .text = "{\"value\":1}\n",
-            .expectation = .{ .expected_exists = false },
+            .expectation = .{
+                .expected_exists = false,
+                .expected_sequence = 0,
+            },
             .content_mode = .raw,
             .max_bytes = 4096,
         },

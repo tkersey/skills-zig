@@ -14,6 +14,19 @@ pub const Options = struct {
     max_input_bytes: usize = std.math.maxInt(usize),
 };
 
+pub const SessionSelection = struct {
+    session_id: ?[]const u8 = null,
+    repo: ?[]const u8 = null,
+    since_ms: ?i64 = null,
+    until_ms: ?i64 = null,
+    filter_time: bool = false,
+};
+
+pub const SelectedParse = struct {
+    parsed: ?ParsedTrace,
+    discovery_bytes_read: usize,
+};
+
 pub const Observation = struct {
     trace: trace_core.CanonicalSessionTrace,
     structured_index: structured.Index = .{},
@@ -45,6 +58,23 @@ pub fn parseFile(
     path: []const u8,
     options: Options,
 ) !ParsedTrace {
+    const selected = try parseFileSelected(
+        allocator,
+        program,
+        path,
+        options,
+        null,
+    );
+    return selected.parsed orelse unreachable;
+}
+
+pub fn parseFileSelected(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    path: []const u8,
+    options: Options,
+    selection: ?SessionSelection,
+) !SelectedParse {
     const relation = switch (program.source) {
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
@@ -58,10 +88,40 @@ pub fn parseFile(
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
+    var file_reader = file.reader(io, &.{});
+    var prefix: [16 * 1024]u8 = undefined;
+    const prefix_len = if (selection != null)
+        try file_reader.interface.readSliceShort(&prefix)
+    else
+        0;
+    const preselection = if (selection) |selected|
+        try preselectSession(
+            allocator,
+            path,
+            stat.mtime.nanoseconds,
+            options,
+            selected,
+            prefix[0..prefix_len],
+        )
+    else
+        Preselection{};
+    if (!preselection.passes) {
+        return .{
+            .parsed = null,
+            .discovery_bytes_read = preselection.bytes_read,
+        };
+    }
     if (stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
     }
-    var reader = file.reader(io, &.{});
+    var replay_reader = PrefixReader.init(
+        prefix[0..prefix_len],
+        &file_reader.interface,
+    );
+    const reader = if (selection != null)
+        &replay_reader.interface
+    else
+        &file_reader.interface;
     var metrics = trace_core.StreamMetrics{};
     const parse_options = traceParseOptions(
         relation,
@@ -73,7 +133,7 @@ pub fn parseFile(
         try trace_core.parseSessionSummaryTraceReaderWithVisitorMetrics(
             allocator,
             path,
-            &reader.interface,
+            reader,
             stat.mtime.nanoseconds,
             parse_options,
             &corpus_hasher,
@@ -84,7 +144,7 @@ pub fn parseFile(
         try trace_core.parseSessionTraceReaderWithVisitorMetrics(
             allocator,
             path,
-            &reader.interface,
+            reader,
             stat.mtime.nanoseconds,
             parse_options,
             &corpus_hasher,
@@ -92,10 +152,133 @@ pub fn parseFile(
             &metrics,
         );
     return .{
-        .trace = trace,
-        .metrics = metrics,
-        .corpus_digest = corpus_hasher.digest(),
+        .parsed = .{
+            .trace = trace,
+            .metrics = metrics,
+            .corpus_digest = corpus_hasher.digest(),
+        },
+        .discovery_bytes_read = 0,
     };
+}
+
+const Preselection = struct {
+    passes: bool = true,
+    bytes_read: usize = 0,
+};
+
+fn preselectSession(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    source_mtime_ns: i128,
+    options: Options,
+    selection: SessionSelection,
+    prefix: []const u8,
+) !Preselection {
+    if (selection.session_id == null and
+        selection.repo == null and
+        !selection.filter_time)
+    {
+        return .{};
+    }
+    var reader = std.Io.Reader.fixed(prefix);
+    var summary = try trace_core.parseSessionSummaryTraceReader(
+        allocator,
+        path,
+        &reader,
+        source_mtime_ns,
+        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs },
+    );
+    defer summary.deinit(allocator);
+    if (selection.session_id) |wanted| {
+        if (summary.session.session_id) |actual| {
+            if (!std.mem.eql(u8, wanted, actual)) {
+                return .{ .passes = false, .bytes_read = prefix.len };
+            }
+        }
+    }
+    if (selection.repo) |repo| {
+        if (summary.session.cwd) |cwd| {
+            if (!pathEqualOrDescendant(cwd, repo)) {
+                return .{ .passes = false, .bytes_read = prefix.len };
+            }
+        }
+    }
+    if (selection.filter_time) {
+        const timestamp =
+            summary.session.start_time orelse summary.session.end_time;
+        if (timestamp) |actual| {
+            const actual_ms = seq_time.parseIsoTimestampMillis(actual);
+            if ((selection.since_ms != null and
+                (actual_ms == null or actual_ms.? < selection.since_ms.?)) or
+                (selection.until_ms != null and
+                    (actual_ms == null or
+                        actual_ms.? > selection.until_ms.?)))
+            {
+                return .{ .passes = false, .bytes_read = prefix.len };
+            }
+        }
+    }
+    return .{ .bytes_read = prefix.len };
+}
+
+const PrefixReader = struct {
+    prefix: []const u8,
+    prefix_pos: usize = 0,
+    remaining: *std.Io.Reader,
+    interface: std.Io.Reader,
+
+    fn init(prefix: []const u8, remaining: *std.Io.Reader) PrefixReader {
+        return .{
+            .prefix = prefix,
+            .remaining = remaining,
+            .interface = .{
+                .vtable = &.{ .stream = stream },
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        const self: *PrefixReader = @fieldParentPtr("interface", reader);
+        var written: usize = 0;
+        if (self.prefix_pos < self.prefix.len) {
+            const available = self.prefix[self.prefix_pos..];
+            const selected = limit.sliceConst(available);
+            const count = try writer.write(selected);
+            self.prefix_pos += count;
+            written += count;
+            if (count < selected.len or
+                written == @intFromEnum(limit))
+            {
+                return written;
+            }
+        }
+        const remaining_limit = limit.subtract(written) orelse unreachable;
+        const count = self.remaining.stream(
+            writer,
+            remaining_limit,
+        ) catch |err| switch (err) {
+            error.EndOfStream => if (written == 0)
+                return error.EndOfStream
+            else
+                return written,
+            else => return err,
+        };
+        return written + count;
+    }
+};
+
+fn pathEqualOrDescendant(path: []const u8, root: []const u8) bool {
+    if (std.mem.eql(u8, path, root)) return true;
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (root.len == 0 or std.fs.path.isSep(root[root.len - 1])) return true;
+    return path.len > root.len and std.fs.path.isSep(path[root.len]);
 }
 
 pub fn observeFile(
@@ -1312,6 +1495,59 @@ test "trace adapter scans demanded session columns in one file pass" {
     );
     defer events.deinit(std.testing.allocator);
     try expectEventObservation(&events);
+}
+
+test "selector discovery replays the admitted prefix without a second read" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = trace_rollout,
+    });
+    var event_program = try TestProgram.init(
+        &tmp.dir,
+        "events.json",
+        event_observation_definition,
+    );
+    defer event_program.deinit();
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+
+    var selected = try parseFileSelected(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+        .{ .repo = "/repo" },
+    );
+    defer if (selected.parsed) |*parsed|
+        parsed.deinit(std.testing.allocator);
+    try std.testing.expect(selected.parsed != null);
+    try std.testing.expectEqual(
+        @as(usize, trace_rollout.len),
+        selected.parsed.?.metrics.bytes_read,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        selected.discovery_bytes_read,
+    );
+
+    const rejected = try parseFileSelected(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+        .{ .repo = "/another-repo" },
+    );
+    try std.testing.expect(rejected.parsed == null);
+    try std.testing.expectEqual(
+        @as(usize, trace_rollout.len),
+        rejected.discovery_bytes_read,
+    );
 }
 
 test "trace adapter applies temporal selectors to physical event rows" {
