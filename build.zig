@@ -371,6 +371,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const seq = addExecutable(b, "seq", seq_root);
+    seq.root_module.linkSystemLibrary("c", .{});
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
     const lift_bench_perf = addExecutable(b, "lift-perf-bench-stats", lift_bench_perf_root);
@@ -434,11 +435,12 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&img_install.step);
     install_all.dependOn(&perf_hub_install.step);
 
-    const run_seq_tests = addTestStep(
+    const run_seq_tests = addTestStepWithOptions(
         b,
         seq_root,
         "test-seq",
         "Run Seq 1.0 command and observation tests",
+        .{ .link_libc = true },
     );
 
     addBenchStep(
@@ -651,11 +653,12 @@ pub fn build(b: *std.Build) void {
         "test-trace-core",
         "Run canonical physical trace tests",
     );
-    const run_seq_core_tests = addTestStep(
+    const run_seq_core_tests = addTestStepWithOptions(
         b,
         seq_v1_core,
         "test-seq-core",
         "Run Seq 1.0 observation-definition compiler tests",
+        .{ .link_libc = true },
     );
     const seq_cli_smoke_cmd = b.addSystemCommand(&.{
         "bash",
