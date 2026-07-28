@@ -64,7 +64,17 @@ fn writeCanonicalJsonWithOmission(
         .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
         .integer => |number| try writer.print("{d}", .{number}),
         .float => |number| try writeCanonicalFloat(writer, number),
-        .number_string => return error.NumberOutOfRange,
+        .number_string => |text| {
+            const parsed = std.json.Value.parseFromNumberSlice(text);
+            if (parsed == .number_string) return error.NumberOutOfRange;
+            try writeCanonicalJsonWithOmission(
+                allocator,
+                writer,
+                parsed,
+                omission,
+                depth,
+            );
+        },
         .string => |text| try writeCanonicalString(writer, text),
         .array => |items| {
             try writer.writeByte('[');

@@ -1221,6 +1221,16 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
     const anchors_obj = rootObject(packet, "anchors") orelse return error.MissingAnchors;
     const total = try requiredU64(turns, "total_turns");
     const decision = try requiredU64(turns, "decision_turn_index");
+    const reconstructability = try requiredString(
+        artifact,
+        "reconstructability",
+    );
+    if (!isOneOf(reconstructability, &.{
+        "exact",
+        "head_only",
+        "transcript_only",
+        "unavailable",
+    })) return error.BadReconstructability;
     var anchors = [_]Anchor{
         try parseAnchor(allocator, anchors_obj, .pre_decision, total),
         try parseAnchor(allocator, anchors_obj, .post_decision_pre_outcome, total),
@@ -1236,7 +1246,10 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
         .source_model = try dupeOptionalString(allocator, optionalString(source, "source_model")),
         .source_model_provider = try dupeOptionalString(allocator, optionalString(source, "source_model_provider")),
         .source_codex_version = try dupeOptionalString(allocator, optionalString(source, "source_codex_version")),
-        .reconstructability = try allocator.dupe(u8, try requiredString(artifact, "reconstructability")),
+        .reconstructability = try allocator.dupe(
+            u8,
+            reconstructability,
+        ),
         .total_turns = total,
         .decision_turn_index = decision,
         .first_outcome_turn_index = optionalU64(turns, "first_outcome_turn_index"),
@@ -4689,6 +4702,29 @@ test "CAS consumes the explicit DCP-v2 source episode identity" {
     const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
     try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
+}
+
+test "CAS rejects unsupported DCP reconstructability before inquiry" {
+    const allocator = std.testing.allocator;
+    const unsupported = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        test_dcp_json,
+        "\"reconstructability\": \"head_only\"",
+        "\"reconstructability\": \"invented\"",
+    );
+    defer allocator.free(unsupported);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        unsupported,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.BadReconstructability,
+        dcpFromValue(allocator, parsed.value),
+    );
 }
 
 test "CAS derives DCP-v2 source episode identity from canonical locators" {

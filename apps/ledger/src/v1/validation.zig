@@ -4793,6 +4793,43 @@ const LoadedInput = struct {
     }
 };
 
+fn normalizeParsedNumbers(
+    backing_allocator: std.mem.Allocator,
+    root: *std.json.Value,
+) !void {
+    var pending = std.heap.stackFallback(
+        4096,
+        backing_allocator,
+    );
+    const allocator = pending.get();
+    var values: std.ArrayList(*std.json.Value) = .empty;
+    defer values.deinit(allocator);
+    try values.append(allocator, root);
+    while (values.pop()) |value| {
+        switch (value.*) {
+            .number_string => |text| {
+                const parsed = std.json.Value.parseFromNumberSlice(text);
+                if (parsed != .number_string) value.* = parsed;
+            },
+            .array => |*array| {
+                for (array.items) |*item| {
+                    try values.append(allocator, item);
+                }
+            },
+            .object => |*object| {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    try values.append(
+                        allocator,
+                        entry.value_ptr,
+                    );
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 pub const Execution = struct {
     allocator: std.mem.Allocator,
     loaded: []LoadedInput,
@@ -4923,6 +4960,14 @@ pub fn execute(
         validation_plan.rules,
         &diagnostics,
     );
+    for (loaded) |*input| {
+        if (input.parsed_json) |*parsed| {
+            try normalizeParsedNumbers(
+                allocator,
+                &parsed.value,
+            );
+        }
+    }
     std.sort.heap(InputDigest, digests.items, {}, struct {
         fn lessThan(_: void, left: InputDigest, right: InputDigest) bool {
             return std.mem.lessThan(u8, left.name, right.name);
@@ -5011,6 +5056,7 @@ fn parseLoadedInput(
             .{
                 .allocate = .alloc_always,
                 .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
             },
         ) catch {
             try diagnostics.add(
@@ -5339,7 +5385,8 @@ fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
         .implies => implicationHolds(
             context.plan,
             context.root,
-            context.loaded[rule.other_input_index.?].json() orelse return null,
+            context.loaded[rule.other_input_index.?].json() orelse
+                return null,
             rule,
         ),
         else => unreachable,
@@ -6407,7 +6454,11 @@ fn exactObject(value: std.json.Value, rule: CompiledRule) bool {
 fn valueHasKind(value: std.json.Value, kind: JsonKind) bool {
     return switch (kind) {
         .string => value == .string,
-        .integer => value == .integer,
+        .integer => value == .integer or
+            (value == .number_string and
+                std.json.Scanner.isNumberFormattedLikeAnInteger(
+                    value.number_string,
+                )),
         .number => value == .integer or value == .float or value == .number_string,
         .boolean => value == .bool,
         .array => value == .array,
@@ -6665,9 +6716,20 @@ fn regexStateContains(states: [4]u64, state: usize) bool {
 }
 
 fn boundedNumber(value: std.json.Value, rule: CompiledRule) bool {
-    const number = jsonNumber(value) orelse return false;
-    if (rule.min_number) |minimum| if (number < minimum) return false;
-    if (rule.max_number) |maximum| if (number > maximum) return false;
+    if (rule.min_number) |minimum| {
+        const order = exactNumberOrder(
+            value,
+            .{ .float = minimum },
+        ) orelse return false;
+        if (order == .lt) return false;
+    }
+    if (rule.max_number) |maximum| {
+        const order = exactNumberOrder(
+            value,
+            .{ .float = maximum },
+        ) orelse return false;
+        if (order == .gt) return false;
+    }
     return true;
 }
 
@@ -6771,8 +6833,14 @@ fn enumContains(values: []const EnumScalar, value: std.json.Value) bool {
 fn enumEqual(candidate: EnumScalar, value: std.json.Value) bool {
     return switch (candidate) {
         .string => |text| value == .string and std.mem.eql(u8, text, value.string),
-        .integer => |number| value == .integer and number == value.integer,
-        .float => |number| jsonNumber(value) != null and number == jsonNumber(value).?,
+        .integer => |number| exactNumbersEqual(
+            .{ .integer = number },
+            value,
+        ),
+        .float => |number| exactNumbersEqual(
+            .{ .float = number },
+            value,
+        ),
         .boolean => |flag| value == .bool and flag == value.bool,
         .null => value == .null,
     };
@@ -8126,12 +8194,26 @@ fn scalarKeyDigest(value: std.json.Value) ?[32]u8 {
             hasher.update(text);
         },
         .integer, .float, .number_string => {
-            const number = jsonNumber(value) orelse return null;
-            if (!std.math.isFinite(number)) return null;
-            const normalized: f64 = if (number == 0) 0 else number;
-            const bits: u64 = @bitCast(normalized);
+            var buffer: [128]u8 = undefined;
+            const number = exactNumber(value, &buffer) orelse return null;
             hasher.update("number:");
-            hasher.update(std.mem.asBytes(&bits));
+            hasher.update(if (number.negative) "-" else "+");
+            var scale_buffer: [32]u8 = undefined;
+            const scale = std.fmt.bufPrint(
+                &scale_buffer,
+                "{d}:",
+                .{number.scale},
+            ) catch return null;
+            hasher.update(scale);
+            if (number.significant_len == 0) {
+                hasher.update("0");
+            } else {
+                var index: usize = 0;
+                while (index < number.significant_len) : (index += 1) {
+                    const digit = [1]u8{number.digit(index)};
+                    hasher.update(&digit);
+                }
+            }
         },
         .array, .object => return null,
     }
@@ -8317,10 +8399,11 @@ fn valuePairEqualOrExpanded(
     pair: ValuePair,
     pending: *std.ArrayList(ValuePair),
 ) bool {
+    if (isJsonNumber(pair.left) or isJsonNumber(pair.right)) {
+        return exactNumbersEqual(pair.left, pair.right);
+    }
     if (std.meta.activeTag(pair.left) != std.meta.activeTag(pair.right)) {
-        const left_number = jsonNumber(pair.left) orelse return false;
-        const right_number = jsonNumber(pair.right) orelse return false;
-        return left_number == right_number;
+        return false;
     }
     return switch (pair.left) {
         .null => true,
@@ -8404,9 +8487,229 @@ fn valueOrder(left: std.json.Value, right: std.json.Value) std.math.Order {
         if (left.bool == right.bool) return .eq;
         return if (!left.bool and right.bool) .lt else .gt;
     }
-    const left_number = jsonNumber(left) orelse return .gt;
-    const right_number = jsonNumber(right) orelse return .lt;
-    return std.math.order(left_number, right_number);
+    return exactNumberOrder(left, right) orelse
+        if (isJsonNumber(left)) .lt else .gt;
+}
+
+const ExactNumber = struct {
+    raw: []const u8,
+    negative: bool,
+    digits_offset: usize,
+    integer_digits: usize,
+    significant_start: usize,
+    significant_len: usize,
+    scale: i64,
+
+    fn digit(self: ExactNumber, index: usize) u8 {
+        const ordinal = self.significant_start + index;
+        const dot_offset: usize = if (ordinal >= self.integer_digits and
+            self.integer_digits < self.raw.len and
+            self.raw[self.digits_offset + self.integer_digits] == '.')
+            1
+        else
+            0;
+        return self.raw[self.digits_offset + ordinal + dot_offset];
+    }
+};
+
+fn isJsonNumber(value: std.json.Value) bool {
+    return value == .integer or value == .float or value == .number_string;
+}
+
+fn exactNumbersEqual(left: std.json.Value, right: std.json.Value) bool {
+    return exactNumberOrder(left, right) == .eq;
+}
+
+fn exactNumberOrder(
+    left: std.json.Value,
+    right: std.json.Value,
+) ?std.math.Order {
+    var left_buffer: [128]u8 = undefined;
+    var right_buffer: [128]u8 = undefined;
+    const left_number = exactNumber(left, &left_buffer) orelse return null;
+    const right_number = exactNumber(right, &right_buffer) orelse return null;
+    if (left_number.significant_len == 0 and
+        right_number.significant_len == 0)
+    {
+        return .eq;
+    }
+    if (left_number.negative != right_number.negative) {
+        return if (left_number.negative) .lt else .gt;
+    }
+    const magnitude_order = exactMagnitudeOrder(
+        left_number,
+        right_number,
+    );
+    return if (left_number.negative)
+        switch (magnitude_order) {
+            .lt => .gt,
+            .eq => .eq,
+            .gt => .lt,
+        }
+    else
+        magnitude_order;
+}
+
+fn exactMagnitudeOrder(
+    left: ExactNumber,
+    right: ExactNumber,
+) std.math.Order {
+    if (left.significant_len == 0) {
+        return if (right.significant_len == 0) .eq else .lt;
+    }
+    if (right.significant_len == 0) return .gt;
+    const left_width = @as(i128, @intCast(left.significant_len)) +
+        @as(i128, left.scale);
+    const right_width = @as(i128, @intCast(right.significant_len)) +
+        @as(i128, right.scale);
+    const width_order = std.math.order(left_width, right_width);
+    if (width_order != .eq) return width_order;
+    const digit_count = @max(
+        left.significant_len,
+        right.significant_len,
+    );
+    var index: usize = 0;
+    while (index < digit_count) : (index += 1) {
+        const left_digit = if (index < left.significant_len)
+            left.digit(index)
+        else
+            '0';
+        const right_digit = if (index < right.significant_len)
+            right.digit(index)
+        else
+            '0';
+        const digit_order = std.math.order(left_digit, right_digit);
+        if (digit_order != .eq) return digit_order;
+    }
+    return .eq;
+}
+
+fn exactNumber(
+    value: std.json.Value,
+    buffer: *[128]u8,
+) ?ExactNumber {
+    const text = switch (value) {
+        .integer => |number| std.fmt.bufPrint(
+            buffer,
+            "{d}",
+            .{number},
+        ) catch return null,
+        .float => |number| number: {
+            if (!std.math.isFinite(number)) return null;
+            break :number std.fmt.bufPrint(
+                buffer,
+                "{d}",
+                .{number},
+            ) catch return null;
+        },
+        .number_string => |number| number,
+        else => return null,
+    };
+    return parseExactNumber(text);
+}
+
+fn parseExactNumber(text: []const u8) ?ExactNumber {
+    if (text.len == 0) return null;
+    const negative = text[0] == '-';
+    const digits_offset: usize = if (negative) 1 else 0;
+    if (digits_offset == text.len) return null;
+    var cursor = digits_offset;
+    while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
+        cursor += 1;
+    }
+    const integer_digits = cursor - digits_offset;
+    if (integer_digits == 0) return null;
+    var fraction_digits: usize = 0;
+    if (cursor < text.len and text[cursor] == '.') {
+        cursor += 1;
+        const fraction_start = cursor;
+        while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
+            cursor += 1;
+        }
+        fraction_digits = cursor - fraction_start;
+        if (fraction_digits == 0) return null;
+    }
+    var exponent: i64 = 0;
+    if (cursor < text.len and
+        (text[cursor] == 'e' or text[cursor] == 'E'))
+    {
+        cursor += 1;
+        const exponent_negative = cursor < text.len and text[cursor] == '-';
+        if (cursor < text.len and
+            (text[cursor] == '-' or text[cursor] == '+'))
+        {
+            cursor += 1;
+        }
+        const exponent_start = cursor;
+        while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
+            cursor += 1;
+        }
+        if (cursor == exponent_start) return null;
+        const magnitude = std.fmt.parseInt(
+            u64,
+            text[exponent_start..cursor],
+            10,
+        ) catch return null;
+        if (exponent_negative) {
+            if (magnitude > @as(u64, @intCast(std.math.maxInt(i64))) + 1) {
+                return null;
+            }
+            exponent = if (magnitude ==
+                @as(u64, @intCast(std.math.maxInt(i64))) + 1)
+                std.math.minInt(i64)
+            else
+                -@as(i64, @intCast(magnitude));
+        } else {
+            exponent = std.math.cast(i64, magnitude) orelse return null;
+        }
+    }
+    if (cursor != text.len) return null;
+    const total_digits = std.math.add(
+        usize,
+        integer_digits,
+        fraction_digits,
+    ) catch return null;
+    var number = ExactNumber{
+        .raw = text,
+        .negative = negative,
+        .digits_offset = digits_offset,
+        .integer_digits = integer_digits,
+        .significant_start = 0,
+        .significant_len = total_digits,
+        .scale = 0,
+    };
+    while (number.significant_start < total_digits and
+        number.digit(0) == '0')
+    {
+        number.significant_start += 1;
+        number.significant_len -= 1;
+    }
+    if (number.significant_len == 0) {
+        number.negative = false;
+        return number;
+    }
+    var trailing_zeros: usize = 0;
+    while (trailing_zeros < number.significant_len and
+        number.digit(number.significant_len - trailing_zeros - 1) == '0')
+    {
+        trailing_zeros += 1;
+    }
+    number.significant_len -= trailing_zeros;
+    const fraction_scale = std.math.cast(i64, fraction_digits) orelse
+        return null;
+    const trailing_scale = std.math.cast(i64, trailing_zeros) orelse
+        return null;
+    number.scale = std.math.sub(
+        i64,
+        exponent,
+        fraction_scale,
+    ) catch return null;
+    number.scale = std.math.add(
+        i64,
+        number.scale,
+        trailing_scale,
+    ) catch return null;
+    return number;
 }
 
 fn jsonNumber(value: std.json.Value) ?f64 {
@@ -8416,6 +8719,69 @@ fn jsonNumber(value: std.json.Value) ?f64 {
         .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
         else => null,
     };
+}
+
+test "relational numbers preserve exact JSON values" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[9007199254740992.0,9007199254740993.0,1,1.0,1e0,-0.0,0]",
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    const values = parsed.value.array.items;
+    try std.testing.expect(!valuesEqual(values[0], values[1]));
+    try std.testing.expect(
+        !std.mem.eql(
+            u8,
+            &scalarKeyDigest(values[0]).?,
+            &scalarKeyDigest(values[1]).?,
+        ),
+    );
+    try std.testing.expectEqual(
+        std.math.Order.lt,
+        valueOrder(values[0], values[1]),
+    );
+    try std.testing.expect(valuesEqual(values[2], values[3]));
+    try std.testing.expect(valuesEqual(values[3], values[4]));
+    try std.testing.expect(valuesEqual(values[5], values[6]));
+    try std.testing.expectEqual(
+        scalarKeyDigest(values[2]).?,
+        scalarKeyDigest(values[4]).?,
+    );
+}
+
+test "compiled uniqueness distinguishes adjacent large JSON numbers" {
+    const definition_bytes =
+        \\{"schema":"ledger-artifact-definition/v1","id":"example/exact-number-set","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["unique"]},"inputs":{"record":{"codec":"json","max_bytes":128}},"canonicalization":{},"shape":{"documents":{"record":{"unique":true}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":128,"max_store_bytes":128,"max_records":8,"max_output_bytes":128,"max_diagnostics":4,"max_reducer_states":1}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = definition_bytes,
+    });
+    var plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        8 * 1024 * 1024,
+    );
+    defer plan.deinit();
+    try expectTestValidation(
+        &plan.definition_plan,
+        &plan.cached,
+        "record",
+        "[9007199254740992.0,9007199254740993.0]",
+        true,
+    );
+    try expectTestValidation(
+        &plan.definition_plan,
+        &plan.cached,
+        "record",
+        "[1,1.0]",
+        false,
+    );
 }
 
 fn validateJsonl(
