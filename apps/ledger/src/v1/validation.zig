@@ -8,6 +8,8 @@ const max_regex_total_atoms: usize =
     max_regex_patterns * max_regex_atoms_per_pattern;
 const max_regex_subject_bytes: usize = 16 * 1024 * 1024;
 const max_sha256_subject_bytes: usize = 16 * 1024 * 1024;
+const max_cache_rule_tasks: usize = 128 * 65_535;
+const max_value_equality_pairs: usize = 1_000_000;
 
 pub const InputDocument = struct {
     name: []const u8,
@@ -292,6 +294,39 @@ const Builder = struct {
     conditional_depth: usize = 0,
     inherited_input_index: ?u8 = null,
 
+    fn initRule(
+        self: *Builder,
+        operator: definition.Operator,
+        input_index: u8,
+        pointer_id: ?u16,
+    ) !CompiledRule {
+        return .{
+            .operator = operator,
+            .input_index = input_index,
+            .pointer_id = pointer_id,
+            .path_ids = try self.allocator.alloc(u16, 0),
+            .keys = try self.allocator.alloc([]u8, 0),
+            .optional_keys = try self.allocator.alloc([]u8, 0),
+            .values = try self.allocator.alloc(EnumScalar, 0),
+            .children = try self.allocator.alloc(CompiledRule, 0),
+            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
+            .variants = try self.allocator.alloc(CompiledVariant, 0),
+            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+            .regex_patterns = try self.allocator.alloc(
+                CompiledRegexPattern,
+                0,
+            ),
+            .reference_sources = try self.allocator.alloc(
+                CompiledReferenceSource,
+                0,
+            ),
+            .reference_targets = try self.allocator.alloc(
+                CompiledReferenceTarget,
+                0,
+            ),
+        };
+    }
+
     fn deinit(self: *Builder) void {
         for (self.pointers.items) |*pointer| pointer.deinit(self.allocator);
         self.pointers.deinit(self.allocator);
@@ -416,190 +451,96 @@ const Builder = struct {
         else
             return error.AmbiguousRuleInput;
 
-        var rule: CompiledRule = .{
-            .operator = source.operator,
-            .input_index = input_index,
-            .pointer_id = source.pointer_id,
-            .path_ids = try self.allocator.alloc(u16, 0),
-            .keys = try self.allocator.alloc([]u8, 0),
-            .optional_keys = try self.allocator.alloc([]u8, 0),
-            .values = try self.allocator.alloc(EnumScalar, 0),
-            .children = try self.allocator.alloc(CompiledRule, 0),
-            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
-            .variants = try self.allocator.alloc(CompiledVariant, 0),
-            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
-            .regex_patterns = try self.allocator.alloc(
-                CompiledRegexPattern,
-                0,
-            ),
-            .reference_sources = try self.allocator.alloc(
-                CompiledReferenceSource,
-                0,
-            ),
-            .reference_targets = try self.allocator.alloc(
-                CompiledReferenceTarget,
-                0,
-            ),
-        };
+        var rule = try self.initRule(
+            source.operator,
+            input_index,
+            source.pointer_id,
+        );
         errdefer rule.deinit(self.allocator);
 
-        switch (source.operator) {
+        try self.compileRootRuleOperator(source, object, input_index, &rule);
+        try self.rules.append(self.allocator, rule);
+    }
+
+    fn compileRootRuleOperator(
+        self: *Builder,
+        source: definition.Rule,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (isPrimitiveRootOperator(source.operator)) {
+            return self.compilePrimitiveRootRule(object, rule);
+        }
+        if (isRelationalRootOperator(source.operator)) {
+            return self.compileRelationalRootRule(
+                source,
+                object,
+                input_index,
+                rule,
+            );
+        }
+        return self.compileNestedProtocolRootRule(
+            source,
+            object,
+            input_index,
+            rule,
+        );
+    }
+
+    fn compilePrimitiveRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        switch (rule.operator) {
             .exact_object => try compileExactObjectRule(
                 self.allocator,
                 object,
                 true,
-                &rule,
+                rule,
             ),
-            .field_absent => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path" },
-                );
-            },
+            .field_absent => try requireRootPathOnly(object),
             .forbidden_object_keys => try compileForbiddenObjectKeysRule(
                 self.allocator,
                 object,
                 true,
-                &rule,
+                rule,
             ),
-            .optional_field => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "rules", "allow_null" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path" },
-                );
-                if (object.get("rules")) |raw_rules| {
-                    rule.children = try self.compileItemRules(
-                        raw_rules,
-                        input_index,
-                        0,
-                    );
-                }
-                rule.allow_null =
-                    try optionalBoolean(object, "allow_null") orelse false;
-            },
+            .optional_field => try self.compileOptionalRootRule(object, rule),
             .scalar_type => rule.scalar_kind = try JsonKind.parse(
                 try definition_core.json.requiredString(object, "type"),
             ),
             .bounded_array,
             .bounded_object,
-            => {
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count == null and rule.max_count == null) {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .bounded_string => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "min", "max", "trimmed_min" },
-                );
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                rule.trimmed_min_count = try optionalUnsigned(
-                    object,
-                    "trimmed_min",
-                );
-                if (rule.min_count == null and rule.max_count == null and
-                    rule.trimmed_min_count == null)
-                {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-                if (rule.trimmed_min_count != null and
-                    rule.max_count != null and
-                    rule.trimmed_min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .regex => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "patterns", "max" },
-                );
-                rule.max_count = try optionalUnsigned(object, "max") orelse
-                    return error.MissingRegexBound;
-                if (rule.max_count.? == 0 or
-                    rule.max_count.? > max_regex_subject_bytes)
-                {
-                    return error.InvalidRegexBound;
-                }
-                rule.regex_patterns = try compileRegexPatterns(
-                    self.allocator,
-                    try definition_core.json.field(object, "patterns"),
-                );
-            },
-            .sha256 => try self.compileSha256Rule(object, true, &rule),
-            .safe_identifier => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "min", "max", "style" },
-                );
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-                if (object.get("style")) |raw| {
-                    rule.identifier_style = try IdentifierStyle.parse(
-                        try definition_core.json.string(raw),
-                    );
-                }
-            },
-            .safe_relative_path => {
-                try compileRelativePathRule(self.allocator, object, &rule);
-            },
-            .sorted => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "key" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path" },
-                );
-                if (object.get("key")) |raw_key| {
-                    rule.other_pointer_id = try self.internPointer(
-                        try definition_core.json.string(raw_key),
-                    );
-                }
-            },
-            .bounded_number => {
-                rule.min_number = try optionalNumber(object, "min");
-                rule.max_number = try optionalNumber(object, "max");
-                if (rule.min_number == null and rule.max_number == null) {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_number != null and rule.max_number != null and
-                    rule.min_number.? > rule.max_number.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
+            => try compileCountBoundRootRule(object, rule),
+            .bounded_string => try compileStringBoundRootRule(object, rule),
+            .regex => try compileRegexRootRule(self.allocator, object, rule),
+            .sha256 => try self.compileSha256Rule(object, true, rule),
+            .safe_identifier => try compileIdentifierRootRule(object, rule),
+            .safe_relative_path => try compileRelativePathRule(
+                self.allocator,
+                object,
+                rule,
+            ),
+            .sorted => try self.compileSortedRootRule(object, rule),
+            .bounded_number => try compileNumberBoundRootRule(object, rule),
             .enum_value => rule.values = try parseEnumValues(
                 self.allocator,
                 try definition_core.json.field(object, "values"),
             ),
+            else => unreachable,
+        }
+    }
+
+    fn compileRelationalRootRule(
+        self: *Builder,
+        source: definition.Rule,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        switch (source.operator) {
             .set_equality,
             .subset,
             .superset,
@@ -610,556 +551,531 @@ const Builder = struct {
             .not_member_of,
             .field_equal,
             .field_not_equal,
-            => {
-                const scope_pointer_id = source.pointer_id;
-                const left_input = if (object.get("left_input")) |raw|
-                    try self.inputIndex(try definition_core.json.string(raw))
-                else
-                    input_index;
-                const right_input = if (object.get("right_input")) |raw|
-                    try self.inputIndex(try definition_core.json.string(raw))
-                else
-                    input_index;
-                rule.input_index = left_input;
-                rule.other_input_index = right_input;
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "left"),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "right"),
-                );
-                if (scope_pointer_id) |scope| {
-                    if (left_input != right_input) {
-                        return error.ScopedComparisonInputsConflict;
-                    }
-                    rule.path_ids = try self.allocator.alloc(u16, 1);
-                    rule.path_ids[0] = scope;
-                }
-            },
-            .declared_field_values => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "path",
-                        "object",
-                        "declarations",
-                        "declaration_paths",
-                        "type",
-                        "min",
-                        "max",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{
-                        "op",
-                        "path",
-                        "object",
-                        "declarations",
-                        "declaration_paths",
-                        "type",
-                    },
-                );
-                if (source.pointer_id == null) {
-                    return error.DeclaredFieldCollectionMissing;
-                }
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "object"),
-                );
-                const declaration_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "declarations",
-                    ),
-                );
-                const declaration_paths = try self.parsePaths(
-                    try definition_core.json.field(
-                        object,
-                        "declaration_paths",
-                    ),
-                );
-                defer self.allocator.free(declaration_paths);
-                rule.path_ids = try self.allocator.alloc(
-                    u16,
-                    declaration_paths.len + 1,
-                );
-                rule.path_ids[0] = declaration_pointer_id;
-                @memcpy(rule.path_ids[1..], declaration_paths);
-                rule.scalar_kind = try JsonKind.parse(
-                    try definition_core.json.requiredString(object, "type"),
-                );
-                if (rule.scalar_kind.? != .integer and
-                    rule.scalar_kind.? != .number)
-                {
-                    return error.DeclaredFieldValueTypeUnsupported;
-                }
-                rule.min_number = try optionalNumber(object, "min");
-                rule.max_number = try optionalNumber(object, "max");
-                if (rule.min_number == null and rule.max_number == null) {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_number != null and
-                    rule.max_number != null and
-                    rule.min_number.? > rule.max_number.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .cross_input_equal => {
-                rule.input_index = try self.inputIndex(
-                    try definition_core.json.requiredString(object, "left_input"),
-                );
-                rule.other_input_index = try self.inputIndex(
-                    try definition_core.json.requiredString(object, "right_input"),
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "left"),
-                    ),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "right"),
-                    ),
-                );
-            },
+            => try self.compileComparisonRootRule(
+                object,
+                input_index,
+                source.pointer_id,
+                rule,
+            ),
+            .declared_field_values => try self.compileDeclaredValuesRootRule(
+                object,
+                source.pointer_id,
+                rule,
+            ),
+            .cross_input_equal => try self.compileCrossInputRootRule(
+                object,
+                rule,
+            ),
             .implies => try self.compileImplication(
                 object,
                 input_index,
                 0,
                 false,
-                &rule,
+                rule,
             ),
-            .total_partition => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "universe", "parts" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "universe", "parts" },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "universe",
-                    ),
-                );
-                rule.path_ids = try self.parsePaths(
-                    try definition_core.json.field(object, "parts"),
-                );
-                if (rule.path_ids.len < 2) {
-                    return error.TotalPartitionRequiresMultipleParts;
-                }
-            },
-            .total_mapping => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "source",
-                        "target",
-                        "mapping",
-                        "from",
-                        "to",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{
-                        "op",
-                        "source",
-                        "target",
-                        "mapping",
-                        "from",
-                        "to",
-                    },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "source",
-                    ),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "target",
-                    ),
-                );
-                rule.path_ids = try self.allocator.alloc(u16, 3);
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "mapping",
-                    ),
-                );
-                rule.path_ids[1] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "from"),
-                );
-                rule.path_ids[2] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "to"),
-                );
-            },
-            .path_format => try self.compilePathFormat(object, &rule),
-            .exactly_one, .at_least_one => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "paths", "rules" },
-                );
-                const has_path = object.get("path") != null;
-                const has_paths = object.get("paths") != null;
-                if (has_path == has_paths) {
-                    return error.ConflictingCountRuleTargets;
-                }
-                if (has_path) {
-                    if (source.pointer_id == null) {
-                        return error.CountRuleCollectionMissing;
-                    }
-                    rule.children = try self.compileItemRules(
-                        try definition_core.json.field(object, "rules"),
-                        input_index,
-                        0,
-                    );
-                } else {
-                    rule.path_ids = try self.parsePaths(
-                        try definition_core.json.field(object, "paths"),
-                    );
-                    if (object.get("rules")) |raw_rules| {
-                        rule.children = try self.compileItemRules(
-                            raw_rules,
-                            input_index,
-                            0,
-                        );
-                    }
-                }
-            },
-            .keyed_join => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "collection",
-                        "key",
-                        "selector",
-                        "value",
-                        "equals",
-                        "rules",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{
-                        "op",
-                        "collection",
-                        "key",
-                        "selector",
-                        "value",
-                        "equals",
-                    },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "collection",
-                    ),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "equals"),
-                );
-                rule.path_ids = try self.allocator.alloc(u16, 3);
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "key"),
-                );
-                rule.path_ids[1] = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "selector",
-                    ),
-                );
-                rule.path_ids[2] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "value"),
-                );
-                if (object.get("rules")) |raw_rules| {
-                    rule.children = try self.compileItemRules(
-                        raw_rules,
-                        input_index,
-                        0,
-                    );
-                }
-            },
-            .predecessor_successor => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "predecessor",
-                        "predecessor_key",
-                        "successor",
-                        "successor_key",
-                        "preserved",
-                        "retired",
-                        "introduced",
-                        "mappings",
-                        "mapping_predecessors",
-                        "mapping_successors",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{
-                        "op",
-                        "predecessor",
-                        "predecessor_key",
-                        "successor",
-                        "successor_key",
-                        "preserved",
-                        "retired",
-                        "introduced",
-                        "mappings",
-                        "mapping_predecessors",
-                        "mapping_successors",
-                    },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "predecessor",
-                    ),
-                );
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(
-                        object,
-                        "successor",
-                    ),
-                );
-                const pointer_names = [_][]const u8{
-                    "predecessor_key",
-                    "successor_key",
-                    "preserved",
-                    "retired",
-                    "introduced",
-                    "mappings",
-                    "mapping_predecessors",
-                    "mapping_successors",
-                };
-                rule.path_ids = try self.allocator.alloc(
-                    u16,
-                    pointer_names.len,
-                );
-                for (pointer_names, 0..) |name, index| {
-                    rule.path_ids[index] = try self.internPointer(
-                        try definition_core.json.requiredString(object, name),
-                    );
-                }
-            },
-            .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "rules" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "rules" },
-                );
-                rule.children = try self.compileItemRules(
-                    try definition_core.json.field(object, "rules"),
-                    input_index,
-                    0,
-                );
-            },
+            .total_partition => try self.compilePartitionRootRule(object, rule),
+            .total_mapping => try self.compileMappingRootRule(object, rule),
+            .path_format => try self.compilePathFormat(object, rule),
+            .exactly_one, .at_least_one => try self.compileCountRootRule(
+                object,
+                input_index,
+                source.pointer_id,
+                rule,
+            ),
+            .keyed_join => try self.compileKeyedJoinRootRule(
+                object,
+                input_index,
+                rule,
+            ),
+            .predecessor_successor => try self.compileCorrespondenceRootRule(
+                object,
+                rule,
+            ),
+            else => unreachable,
+        }
+    }
+
+    fn compileNestedProtocolRootRule(
+        self: *Builder,
+        source: definition.Rule,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        switch (source.operator) {
+            .one_of,
+            .all_rules,
+            .any_rules,
+            .no_rules,
+            .object_values,
+            => try self.compileNestedRootRule(object, input_index, rule),
             .tagged_union => try self.compileTaggedUnion(
                 object,
                 input_index,
                 0,
                 true,
-                &rule,
+                rule,
             ),
             .definition_ref => try self.compileDefinitionRef(
                 object,
                 true,
                 source.import_index,
-                &rule,
+                rule,
             ),
-            .keyed_unique => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "input", "path", "key", "sources" },
-                );
-                const has_path = object.get("path") != null;
-                const has_sources = object.get("sources") != null;
-                if (has_path == has_sources) {
-                    return error.ConflictingKeyedUniqueSources;
-                }
-                if (has_path) {
-                    try definition_core.json.requireFields(
-                        object,
-                        &.{ "op", "path", "key" },
-                    );
-                    if (source.pointer_id == null) {
-                        return error.KeyedUniqueCollectionMissing;
-                    }
-                    rule.other_pointer_id = try self.internPointer(
-                        try definition_core.json.requiredString(object, "key"),
-                    );
-                } else {
-                    if (object.get("key") != null) {
-                        return error.KeyedUniqueKeyUnexpected;
-                    }
-                    rule.pointer_id = null;
-                    rule.reference_sources = try self.compileKeySources(
-                        try definition_core.json.field(object, "sources"),
-                    );
-                }
-            },
-            .reference_exists => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "input",
-                        "path",
-                        "reference",
-                        "sources",
-                        "target_input",
-                        "target",
-                        "target_items",
-                        "target_rules",
-                        "coverage_rules",
-                        "targets",
-                        "key",
-                        "coverage",
-                        "self_reference",
-                        "ignore_null",
-                    },
-                );
-                try definition_core.json.requireFields(object, &.{"op"});
-                rule.other_input_index = if (object.get("target_input")) |raw|
-                    try self.inputIndex(try definition_core.json.string(raw))
-                else
-                    input_index;
-                if (object.get("sources")) |raw_sources| {
-                    if (object.get("path") != null or
-                        object.get("reference") != null)
-                    {
-                        return error.ConflictingReferenceSources;
-                    }
-                    rule.reference_sources =
-                        try self.compileReferenceSources(
-                            raw_sources,
-                            input_index,
-                        );
-                } else {
-                    try definition_core.json.requireFields(
-                        object,
-                        &.{ "path", "reference" },
-                    );
-                    if (source.pointer_id == null) {
-                        return error.ReferenceCollectionMissing;
-                    }
-                    rule.other_pointer_id = try self.internPointer(
-                        try definition_core.json.string(
-                            try definition_core.json.field(
-                                object,
-                                "reference",
-                            ),
-                        ),
-                    );
-                }
-                if (object.get("targets")) |raw_targets| {
-                    if (object.get("target") != null or
-                        object.get("target_items") != null or
-                        object.get("target_rules") != null or
-                        object.get("coverage_rules") != null or
-                        object.get("key") != null)
-                    {
-                        return error.ConflictingReferenceTargets;
-                    }
-                    rule.reference_targets =
-                        try self.compileReferenceTargets(
-                            raw_targets,
-                            rule.other_input_index.?,
-                        );
-                } else {
-                    try definition_core.json.requireFields(
-                        object,
-                        &.{ "target", "key" },
-                    );
-                    const target_items = if (object.get("target_items")) |raw|
-                        try self.internPointer(
-                            try definition_core.json.string(raw),
-                        )
-                    else
-                        null;
-                    rule.path_ids = try self.allocator.alloc(
-                        u16,
-                        if (target_items == null) 2 else 3,
-                    );
-                    rule.path_ids[0] = try self.internPointer(
-                        try definition_core.json.requiredString(
-                            object,
-                            "target",
-                        ),
-                    );
-                    rule.path_ids[1] = try self.internPointer(
-                        try definition_core.json.string(
-                            try definition_core.json.field(object, "key"),
-                        ),
-                    );
-                    if (target_items) |pointer_id| {
-                        rule.path_ids[2] = pointer_id;
-                    }
-                    if (object.get("target_rules")) |raw_rules| {
-                        rule.children = try self.compileItemRules(
-                            raw_rules,
-                            rule.other_input_index.?,
-                            0,
-                        );
-                    }
-                    if (object.get("coverage_rules")) |raw_rules| {
-                        rule.coverage_children = try self.compileItemRules(
-                            raw_rules,
-                            rule.other_input_index.?,
-                            0,
-                        );
-                    }
-                }
-                if (object.get("coverage")) |raw_coverage| {
-                    const coverage = try definition_core.json.string(
-                        raw_coverage,
-                    );
-                    if (!std.mem.eql(u8, coverage, "all-targets")) {
-                        return error.UnsupportedReferenceCoverage;
-                    }
-                    rule.total_coverage = true;
-                }
-                if (object.get("self_reference")) |raw_policy| {
-                    const policy = try definition_core.json.string(
-                        raw_policy,
-                    );
-                    if (!std.mem.eql(u8, policy, "reject")) {
-                        return error.UnsupportedSelfReferencePolicy;
-                    }
-                    if (rule.reference_sources.len != 0 or
-                        rule.reference_targets.len != 0 or
-                        rule.other_input_index.? != rule.input_index or
-                        rule.path_ids[0] != rule.pointer_id.?)
-                    {
-                        return error.SelfReferenceRequiresOneCollection;
-                    }
-                    rule.reject_self_reference = true;
-                }
-                rule.ignore_null_references =
-                    try optionalBoolean(object, "ignore_null") orelse false;
-            },
+            .keyed_unique => try self.compileKeyedUniqueRootRule(
+                object,
+                source.pointer_id,
+                rule,
+            ),
+            .reference_exists => try self.compileReferenceRootRule(
+                object,
+                input_index,
+                source.pointer_id,
+                rule,
+            ),
             else => {},
         }
-        try self.rules.append(self.allocator, rule);
+    }
+
+    fn compileOptionalRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "rules", "allow_null" },
+        );
+        try definition_core.json.requireFields(object, &.{ "op", "path" });
+        if (object.get("rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                rule.input_index,
+                0,
+            );
+        }
+        rule.allow_null =
+            try optionalBoolean(object, "allow_null") orelse false;
+    }
+
+    fn compileSortedRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "key" },
+        );
+        try definition_core.json.requireFields(object, &.{ "op", "path" });
+        if (object.get("key")) |raw_key| {
+            rule.other_pointer_id = try self.internPointer(
+                try definition_core.json.string(raw_key),
+            );
+        }
+    }
+
+    fn compileComparisonRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        scope_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) !void {
+        const left_input = if (object.get("left_input")) |raw|
+            try self.inputIndex(try definition_core.json.string(raw))
+        else
+            input_index;
+        const right_input = if (object.get("right_input")) |raw|
+            try self.inputIndex(try definition_core.json.string(raw))
+        else
+            input_index;
+        rule.input_index = left_input;
+        rule.other_input_index = right_input;
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "left"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "right"),
+        );
+        if (scope_pointer_id) |scope| {
+            if (left_input != right_input) {
+                return error.ScopedComparisonInputsConflict;
+            }
+            rule.path_ids = try self.allocator.alloc(u16, 1);
+            rule.path_ids[0] = scope;
+        }
+    }
+
+    fn compileDeclaredValuesRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        source_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) !void {
+        try requireDeclaredValuesKeys(object);
+        if (source_pointer_id == null) {
+            return error.DeclaredFieldCollectionMissing;
+        }
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "object"),
+        );
+        const declaration_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "declarations"),
+        );
+        const declaration_paths = try self.parsePaths(
+            try definition_core.json.field(object, "declaration_paths"),
+        );
+        defer self.allocator.free(declaration_paths);
+        rule.path_ids = try self.allocator.alloc(
+            u16,
+            declaration_paths.len + 1,
+        );
+        rule.path_ids[0] = declaration_pointer_id;
+        @memcpy(rule.path_ids[1..], declaration_paths);
+        rule.scalar_kind = try JsonKind.parse(
+            try definition_core.json.requiredString(object, "type"),
+        );
+        if (rule.scalar_kind.? != .integer and
+            rule.scalar_kind.? != .number)
+        {
+            return error.DeclaredFieldValueTypeUnsupported;
+        }
+        try compileNumberBoundRootRule(object, rule);
+    }
+
+    fn compileCrossInputRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        rule.input_index = try self.inputIndex(
+            try definition_core.json.requiredString(object, "left_input"),
+        );
+        rule.other_input_index = try self.inputIndex(
+            try definition_core.json.requiredString(object, "right_input"),
+        );
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "left"),
+            ),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "right"),
+            ),
+        );
+    }
+
+    fn compilePartitionRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "universe", "parts" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "universe", "parts" },
+        );
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "universe"),
+        );
+        rule.path_ids = try self.parsePaths(
+            try definition_core.json.field(object, "parts"),
+        );
+        if (rule.path_ids.len < 2) {
+            return error.TotalPartitionRequiresMultipleParts;
+        }
+    }
+
+    fn compileMappingRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try requireMappingKeys(object);
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "source"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "target"),
+        );
+        rule.path_ids = try self.allocator.alloc(u16, 3);
+        const names = [_][]const u8{ "mapping", "from", "to" };
+        for (names, 0..) |name, index| {
+            rule.path_ids[index] = try self.internPointer(
+                try definition_core.json.requiredString(object, name),
+            );
+        }
+    }
+
+    fn compileCountRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        source_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "paths", "rules" },
+        );
+        const has_path = object.get("path") != null;
+        if (has_path == (object.get("paths") != null)) {
+            return error.ConflictingCountRuleTargets;
+        }
+        if (has_path) {
+            if (source_pointer_id == null) {
+                return error.CountRuleCollectionMissing;
+            }
+            rule.children = try self.compileItemRules(
+                try definition_core.json.field(object, "rules"),
+                input_index,
+                0,
+            );
+            return;
+        }
+        rule.path_ids = try self.parsePaths(
+            try definition_core.json.field(object, "paths"),
+        );
+        if (object.get("rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+    }
+
+    fn compileKeyedJoinRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try requireKeyedJoinKeys(object);
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "collection"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "equals"),
+        );
+        rule.path_ids = try self.allocator.alloc(u16, 3);
+        const names = [_][]const u8{ "key", "selector", "value" };
+        for (names, 0..) |name, index| {
+            rule.path_ids[index] = try self.internPointer(
+                try definition_core.json.requiredString(object, name),
+            );
+        }
+        if (object.get("rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+    }
+
+    fn compileCorrespondenceRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try requireCorrespondenceKeys(object);
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "predecessor"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "successor"),
+        );
+        const pointer_names = [_][]const u8{
+            "predecessor_key",
+            "successor_key",
+            "preserved",
+            "retired",
+            "introduced",
+            "mappings",
+            "mapping_predecessors",
+            "mapping_successors",
+        };
+        rule.path_ids = try self.allocator.alloc(u16, pointer_names.len);
+        for (pointer_names, 0..) |name, index| {
+            rule.path_ids[index] = try self.internPointer(
+                try definition_core.json.requiredString(object, name),
+            );
+        }
+    }
+
+    fn compileNestedRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "rules" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "path", "rules" },
+        );
+        rule.children = try self.compileItemRules(
+            try definition_core.json.field(object, "rules"),
+            input_index,
+            0,
+        );
+    }
+
+    fn compileKeyedUniqueRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        source_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "key", "sources" },
+        );
+        const has_path = object.get("path") != null;
+        if (has_path == (object.get("sources") != null)) {
+            return error.ConflictingKeyedUniqueSources;
+        }
+        if (has_path) {
+            try definition_core.json.requireFields(
+                object,
+                &.{ "op", "path", "key" },
+            );
+            if (source_pointer_id == null) {
+                return error.KeyedUniqueCollectionMissing;
+            }
+            rule.other_pointer_id = try self.internPointer(
+                try definition_core.json.requiredString(object, "key"),
+            );
+            return;
+        }
+        if (object.get("key") != null) {
+            return error.KeyedUniqueKeyUnexpected;
+        }
+        rule.pointer_id = null;
+        rule.reference_sources = try self.compileKeySources(
+            try definition_core.json.field(object, "sources"),
+        );
+    }
+
+    fn compileReferenceRootRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        source_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try requireReferenceRootKeys(object);
+        rule.other_input_index = if (object.get("target_input")) |raw|
+            try self.inputIndex(try definition_core.json.string(raw))
+        else
+            input_index;
+        try self.compileReferenceRootSources(
+            object,
+            input_index,
+            source_pointer_id,
+            rule,
+        );
+        try self.compileReferenceRootTargets(object, rule);
+        try compileReferenceRootPolicies(object, rule);
+    }
+
+    fn compileReferenceRootSources(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        source_pointer_id: ?u16,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (object.get("sources")) |raw_sources| {
+            if (object.get("path") != null or
+                object.get("reference") != null)
+            {
+                return error.ConflictingReferenceSources;
+            }
+            rule.reference_sources = try self.compileReferenceSources(
+                raw_sources,
+                input_index,
+            );
+            return;
+        }
+        try definition_core.json.requireFields(
+            object,
+            &.{ "path", "reference" },
+        );
+        if (source_pointer_id == null) {
+            return error.ReferenceCollectionMissing;
+        }
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "reference"),
+            ),
+        );
+    }
+
+    fn compileReferenceRootTargets(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (object.get("targets")) |raw_targets| {
+            if (hasSingleReferenceTargetFields(object)) {
+                return error.ConflictingReferenceTargets;
+            }
+            rule.reference_targets = try self.compileReferenceTargets(
+                raw_targets,
+                rule.other_input_index.?,
+            );
+            return;
+        }
+        try definition_core.json.requireFields(
+            object,
+            &.{ "target", "key" },
+        );
+        const target_items = try self.optionalPointer(object, "target_items");
+        rule.path_ids = try self.allocator.alloc(
+            u16,
+            if (target_items == null) 2 else 3,
+        );
+        rule.path_ids[0] = try self.internPointer(
+            try definition_core.json.requiredString(object, "target"),
+        );
+        rule.path_ids[1] = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "key"),
+            ),
+        );
+        if (target_items) |pointer_id| rule.path_ids[2] = pointer_id;
+        try self.compileReferenceRootTargetRules(object, rule);
+    }
+
+    fn compileReferenceRootTargetRules(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        if (object.get("target_rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                rule.other_input_index.?,
+                0,
+            );
+        }
+        if (object.get("coverage_rules")) |raw_rules| {
+            rule.coverage_children = try self.compileItemRules(
+                raw_rules,
+                rule.other_input_index.?,
+                0,
+            );
+        }
     }
 
     fn compileReferenceSources(
@@ -1183,67 +1099,67 @@ const Builder = struct {
             self.allocator.free(sources);
         }
         for (items.items, 0..) |item, index| {
-            const object = try definition_core.json.object(item);
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{
-                    "path",
-                    "items",
-                    "reference",
-                    "fragments",
-                    "rules",
-                    "optional",
-                },
+            sources[index] = try self.compileReferenceSource(
+                item,
+                input_index,
             );
-            try definition_core.json.requireFields(
-                object,
-                &.{ "path", "reference" },
-            );
-            var source: CompiledReferenceSource = .{
-                .pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "path"),
-                    ),
-                ),
-                .items_pointer_id = if (object.get("items")) |raw_items|
-                    try self.internPointer(
-                        try definition_core.json.string(raw_items),
-                    )
-                else
-                    null,
-                .reference_pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(
-                            object,
-                            "reference",
-                        ),
-                    ),
-                ),
-                .optional = try optionalBoolean(object, "optional") orelse false,
-                .rules = try self.allocator.alloc(CompiledRule, 0),
-                .format_parts = try self.allocator.alloc(
-                    CompiledFormatPart,
-                    0,
-                ),
-            };
-            errdefer source.deinit(self.allocator);
-            if (object.get("rules")) |raw_rules| {
-                source.rules = try self.compileItemRules(
-                    raw_rules,
-                    input_index,
-                    0,
-                );
-            }
-            if (object.get("fragments")) |raw_fragments| {
-                source.format_parts = try self.compileFormatParts(
-                    raw_fragments,
-                    true,
-                );
-            }
-            sources[index] = source;
             initialized += 1;
         }
         return sources;
+    }
+
+    fn compileReferenceSource(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+    ) anyerror!CompiledReferenceSource {
+        const object = try definition_core.json.object(raw);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{
+                "path",
+                "items",
+                "reference",
+                "fragments",
+                "rules",
+                "optional",
+            },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "path", "reference" },
+        );
+        var source: CompiledReferenceSource = .{
+            .pointer_id = try self.internPointer(
+                try definition_core.json.string(
+                    try definition_core.json.field(object, "path"),
+                ),
+            ),
+            .items_pointer_id = try self.optionalPointer(object, "items"),
+            .reference_pointer_id = try self.internPointer(
+                try definition_core.json.string(
+                    try definition_core.json.field(object, "reference"),
+                ),
+            ),
+            .optional = try optionalBoolean(object, "optional") orelse false,
+            .rules = try self.allocator.alloc(CompiledRule, 0),
+            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+        };
+        errdefer source.deinit(self.allocator);
+        if (object.get("rules")) |raw_rules| {
+            source.rules = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+        if (object.get("fragments")) |raw_fragments| {
+            source.format_parts = try self.compileFormatParts(
+                raw_fragments,
+                true,
+            );
+        }
+        return source;
     }
 
     fn compileKeySources(
@@ -1314,92 +1230,103 @@ const Builder = struct {
             self.allocator.free(targets);
         }
         for (items.items, 0..) |item, index| {
-            const object = try definition_core.json.object(item);
-            try definition_core.json.requireExactKeys(
-                object,
-                &.{
-                    "path",
-                    "items",
-                    "key",
-                    "coverage_key",
-                    "fragments",
-                    "rules",
-                    "match_rules",
-                    "coverage_rules",
-                    "optional",
-                },
+            targets[index] = try self.compileReferenceTarget(
+                item,
+                input_index,
             );
-            try definition_core.json.requireFields(object, &.{"path"});
-            const has_key = object.get("key") != null;
-            const has_fragments = object.get("fragments") != null;
-            if (has_key == has_fragments) {
-                return error.ReferenceTargetKeyInvalid;
-            }
-            var target: CompiledReferenceTarget = .{
-                .pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "path"),
-                ),
-                .optional = try optionalBoolean(object, "optional") orelse false,
-                .items_pointer_id = if (object.get("items")) |raw_items|
-                    try self.internPointer(
-                        try definition_core.json.string(raw_items),
-                    )
-                else
-                    null,
-                .key_pointer_id = if (object.get("key")) |raw_key|
-                    try self.internPointer(
-                        try definition_core.json.string(raw_key),
-                    )
-                else
-                    null,
-                .coverage_key_pointer_id = if (object.get(
-                    "coverage_key",
-                )) |raw_key|
-                    try self.internPointer(
-                        try definition_core.json.string(raw_key),
-                    )
-                else
-                    null,
-                .rules = try self.allocator.alloc(CompiledRule, 0),
-                .match_rules = try self.allocator.alloc(CompiledRule, 0),
-                .coverage_rules = try self.allocator.alloc(CompiledRule, 0),
-                .format_parts = try self.allocator.alloc(
-                    CompiledFormatPart,
-                    0,
-                ),
-            };
-            errdefer target.deinit(self.allocator);
-            if (object.get("rules")) |raw_rules| {
-                target.rules = try self.compileItemRules(
-                    raw_rules,
-                    input_index,
-                    0,
-                );
-            }
-            if (object.get("match_rules")) |raw_rules| {
-                target.match_rules = try self.compileItemRules(
-                    raw_rules,
-                    input_index,
-                    0,
-                );
-            }
-            if (object.get("coverage_rules")) |raw_rules| {
-                target.coverage_rules = try self.compileItemRules(
-                    raw_rules,
-                    input_index,
-                    0,
-                );
-            }
-            if (object.get("fragments")) |raw_fragments| {
-                target.format_parts = try self.compileFormatParts(
-                    raw_fragments,
-                    false,
-                );
-            }
-            targets[index] = target;
             initialized += 1;
         }
         return targets;
+    }
+
+    fn compileReferenceTarget(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+    ) anyerror!CompiledReferenceTarget {
+        const object = try definition_core.json.object(raw);
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{
+                "path",
+                "items",
+                "key",
+                "coverage_key",
+                "fragments",
+                "rules",
+                "match_rules",
+                "coverage_rules",
+                "optional",
+            },
+        );
+        try definition_core.json.requireFields(object, &.{"path"});
+        if ((object.get("key") == null) == (object.get("fragments") == null)) {
+            return error.ReferenceTargetKeyInvalid;
+        }
+        var target = try self.initReferenceTarget(object);
+        errdefer target.deinit(self.allocator);
+        if (object.get("rules")) |raw_rules| {
+            target.rules = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+        if (object.get("match_rules")) |raw_rules| {
+            target.match_rules = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+        if (object.get("coverage_rules")) |raw_rules| {
+            target.coverage_rules = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                0,
+            );
+        }
+        if (object.get("fragments")) |raw_fragments| {
+            target.format_parts = try self.compileFormatParts(
+                raw_fragments,
+                false,
+            );
+        }
+        return target;
+    }
+
+    fn initReferenceTarget(
+        self: *Builder,
+        object: std.json.ObjectMap,
+    ) !CompiledReferenceTarget {
+        return .{
+            .pointer_id = try self.internPointer(
+                try definition_core.json.requiredString(object, "path"),
+            ),
+            .optional = try optionalBoolean(object, "optional") orelse false,
+            .items_pointer_id = try self.optionalPointer(object, "items"),
+            .key_pointer_id = try self.optionalPointer(object, "key"),
+            .coverage_key_pointer_id = try self.optionalPointer(
+                object,
+                "coverage_key",
+            ),
+            .rules = try self.allocator.alloc(CompiledRule, 0),
+            .match_rules = try self.allocator.alloc(CompiledRule, 0),
+            .coverage_rules = try self.allocator.alloc(CompiledRule, 0),
+            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
+        };
+    }
+
+    fn optionalPointer(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        name: []const u8,
+    ) !?u16 {
+        const raw = object.get(name) orelse return null;
+        return @as(
+            ?u16,
+            try self.internPointer(try definition_core.json.string(raw)),
+        );
     }
 
     fn compilePathFormat(
@@ -1512,6 +1439,32 @@ const Builder = struct {
         item_mode: bool,
         rule: *CompiledRule,
     ) anyerror!void {
+        try requireImplicationKeys(object, item_mode);
+        try definition_core.json.requireFields(object, &.{ "op", "if" });
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "if"),
+        );
+        const conditional_rules = object.get("rules");
+        try self.compileImplicationConsequence(
+            object,
+            input_index,
+            depth,
+            item_mode,
+            conditional_rules,
+            rule,
+        );
+        try compileImplicationPredicates(
+            self.allocator,
+            object,
+            conditional_rules != null,
+            rule,
+        );
+    }
+
+    fn requireImplicationKeys(
+        object: std.json.ObjectMap,
+        item_mode: bool,
+    ) !void {
         if (item_mode) {
             try definition_core.json.requireExactKeys(
                 object,
@@ -1545,12 +1498,18 @@ const Builder = struct {
                 },
             );
         }
-        try definition_core.json.requireFields(object, &.{ "op", "if" });
-        rule.pointer_id = try self.internPointer(
-            try definition_core.json.requiredString(object, "if"),
-        );
+    }
+
+    fn compileImplicationConsequence(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        item_mode: bool,
+        conditional_rules: ?std.json.Value,
+        rule: *CompiledRule,
+    ) anyerror!void {
         const consequent_path = object.get("then");
-        const conditional_rules = object.get("rules");
         if ((consequent_path == null) == (conditional_rules == null)) {
             return error.ImplicationConsequenceAmbiguous;
         }
@@ -1586,6 +1545,14 @@ const Builder = struct {
                     input_index,
                 );
         }
+    }
+
+    fn compileImplicationPredicates(
+        allocator: std.mem.Allocator,
+        object: std.json.ObjectMap,
+        has_conditional_rules: bool,
+        rule: *CompiledRule,
+    ) !void {
         const condition_equals = object.get("equals");
         const condition_empty =
             try optionalBoolean(object, "empty") orelse false;
@@ -1603,7 +1570,7 @@ const Builder = struct {
         if (consequent_equals != null and rule.then_nonempty) {
             return error.ConflictingImplicationConsequences;
         }
-        if (conditional_rules != null and consequent_equals != null) {
+        if (has_conditional_rules and consequent_equals != null) {
             return error.ConditionalRulesHaveScalarConsequence;
         }
         if (consequent_equals != null and
@@ -1617,32 +1584,40 @@ const Builder = struct {
             @as(usize, @intFromBool(condition_equals != null)) +
             @as(usize, @intFromBool(consequent_equals != null));
         if (value_count != 0) {
-            const values = try self.allocator.alloc(EnumScalar, value_count);
-            var value_index: usize = 0;
-            errdefer {
-                for (values[0..value_index]) |*value| {
-                    value.deinit(self.allocator);
-                }
-                self.allocator.free(values);
-            }
-            if (condition_equals) |value| {
-                values[value_index] = try parseEnumScalar(
-                    self.allocator,
-                    value,
-                );
-                value_index += 1;
-            }
-            if (consequent_equals) |value| {
-                values[value_index] = try parseEnumScalar(
-                    self.allocator,
-                    value,
-                );
-                value_index += 1;
-            }
-            rule.values = values;
+            rule.values = try implicationValues(
+                allocator,
+                condition_equals,
+                consequent_equals,
+                value_count,
+            );
         }
         if (condition_nonempty) rule.min_count = 1;
         if (condition_empty) rule.max_count = 0;
+    }
+
+    fn implicationValues(
+        allocator: std.mem.Allocator,
+        condition_equals: ?std.json.Value,
+        consequent_equals: ?std.json.Value,
+        value_count: usize,
+    ) ![]EnumScalar {
+        const values = try allocator.alloc(EnumScalar, value_count);
+        var value_index: usize = 0;
+        errdefer {
+            for (values[0..value_index]) |*value| {
+                value.deinit(allocator);
+            }
+            allocator.free(values);
+        }
+        if (condition_equals) |value| {
+            values[value_index] = try parseEnumScalar(allocator, value);
+            value_index += 1;
+        }
+        if (consequent_equals) |value| {
+            values[value_index] = try parseEnumScalar(allocator, value);
+            value_index += 1;
+        }
+        return values;
     }
 
     fn compileItemRules(
@@ -1699,58 +1674,39 @@ const Builder = struct {
             try self.internPointer(try definition_core.json.string(raw))
         else
             null;
-        var rule: CompiledRule = .{
-            .operator = operator,
-            .input_index = input_index,
-            .pointer_id = pointer_id,
-            .path_ids = try self.allocator.alloc(u16, 0),
-            .keys = try self.allocator.alloc([]u8, 0),
-            .optional_keys = try self.allocator.alloc([]u8, 0),
-            .values = try self.allocator.alloc(EnumScalar, 0),
-            .children = try self.allocator.alloc(CompiledRule, 0),
-            .coverage_children = try self.allocator.alloc(CompiledRule, 0),
-            .variants = try self.allocator.alloc(CompiledVariant, 0),
-            .format_parts = try self.allocator.alloc(CompiledFormatPart, 0),
-            .regex_patterns = try self.allocator.alloc(
-                CompiledRegexPattern,
-                0,
-            ),
-            .reference_sources = try self.allocator.alloc(
-                CompiledReferenceSource,
-                0,
-            ),
-            .reference_targets = try self.allocator.alloc(
-                CompiledReferenceTarget,
-                0,
-            ),
-        };
+        var rule = try self.initRule(operator, input_index, pointer_id);
         errdefer rule.deinit(self.allocator);
-        switch (operator) {
+        if (isPrimitiveItemOperator(operator)) {
+            try self.compilePrimitiveItemRule(object, depth, &rule);
+        } else {
+            try self.compileCompositeItemRule(
+                object,
+                input_index,
+                depth,
+                &rule,
+            );
+        }
+        return rule;
+    }
+
+    fn compilePrimitiveItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        switch (rule.operator) {
             .exact_object => try compileExactObjectRule(
                 self.allocator,
                 object,
                 false,
-                &rule,
+                rule,
             ),
-            .optional_field => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "rules", "allow_null" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path" },
-                );
-                if (object.get("rules")) |raw_rules| {
-                    rule.children = try self.compileItemRules(
-                        raw_rules,
-                        input_index,
-                        depth + 1,
-                    );
-                }
-                rule.allow_null =
-                    try optionalBoolean(object, "allow_null") orelse false;
-            },
+            .optional_field => try self.compileOptionalItemRule(
+                object,
+                depth,
+                rule,
+            ),
             .required_field,
             .field_absent,
             .digest,
@@ -1764,139 +1720,44 @@ const Builder = struct {
                 self.allocator,
                 object,
                 false,
-                &rule,
+                rule,
             ),
-            .sorted => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "key" },
-                );
-                if (object.get("key")) |raw_key| {
-                    rule.other_pointer_id = try self.internPointer(
-                        try definition_core.json.string(raw_key),
-                    );
-                }
-            },
-            .scalar_type => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "type" },
-                );
-                rule.scalar_kind = try JsonKind.parse(
-                    try definition_core.json.requiredString(object, "type"),
-                );
-            },
+            .sorted => try self.compileSortedItemRule(object, rule),
+            .scalar_type => try compileScalarItemRule(object, rule),
             .bounded_array,
             .bounded_object,
-            => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "min", "max" },
-                );
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count == null and rule.max_count == null) {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .bounded_string => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "min", "max", "trimmed_min" },
-                );
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                rule.trimmed_min_count = try optionalUnsigned(
-                    object,
-                    "trimmed_min",
-                );
-                if (rule.min_count == null and rule.max_count == null and
-                    rule.trimmed_min_count == null)
-                {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-                if (rule.trimmed_min_count != null and
-                    rule.max_count != null and
-                    rule.trimmed_min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .regex => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "patterns", "max" },
-                );
-                rule.max_count = try optionalUnsigned(object, "max") orelse
-                    return error.MissingRegexBound;
-                if (rule.max_count.? == 0 or
-                    rule.max_count.? > max_regex_subject_bytes)
-                {
-                    return error.InvalidRegexBound;
-                }
-                rule.regex_patterns = try compileRegexPatterns(
-                    self.allocator,
-                    try definition_core.json.field(object, "patterns"),
-                );
-            },
-            .sha256 => try self.compileSha256Rule(object, false, &rule),
-            .safe_identifier => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "min", "max", "style" },
-                );
-                rule.min_count = try optionalUnsigned(object, "min");
-                rule.max_count = try optionalUnsigned(object, "max");
-                if (rule.min_count != null and rule.max_count != null and
-                    rule.min_count.? > rule.max_count.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-                if (object.get("style")) |raw| {
-                    rule.identifier_style = try IdentifierStyle.parse(
-                        try definition_core.json.string(raw),
-                    );
-                }
-            },
-            .safe_relative_path => {
-                try compileRelativePathRule(self.allocator, object, &rule);
-            },
-            .bounded_number => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "min", "max" },
-                );
-                rule.min_number = try optionalNumber(object, "min");
-                rule.max_number = try optionalNumber(object, "max");
-                if (rule.min_number == null and rule.max_number == null) {
-                    return error.MissingRuleBound;
-                }
-                if (rule.min_number != null and rule.max_number != null and
-                    rule.min_number.? > rule.max_number.?)
-                {
-                    return error.InvalidRuleBounds;
-                }
-            },
-            .enum_value => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "values" },
-                );
-                rule.values = try parseEnumValues(
-                    self.allocator,
-                    try definition_core.json.field(object, "values"),
-                );
-            },
+            => try compileCountBoundItemRule(object, rule),
+            .bounded_string => try compileStringBoundItemRule(object, rule),
+            .regex => try compileRegexItemRule(
+                self.allocator,
+                object,
+                rule,
+            ),
+            .sha256 => try self.compileSha256Rule(object, false, rule),
+            .safe_identifier => try compileIdentifierItemRule(object, rule),
+            .safe_relative_path => try compileRelativePathRule(
+                self.allocator,
+                object,
+                rule,
+            ),
+            .bounded_number => try compileNumberBoundItemRule(object, rule),
+            .enum_value => try compileEnumItemRule(
+                self.allocator,
+                object,
+                rule,
+            ),
+            else => unreachable,
+        }
+    }
+
+    fn compileCompositeItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        switch (rule.operator) {
             .set_equality,
             .subset,
             .superset,
@@ -1907,197 +1768,246 @@ const Builder = struct {
             .not_member_of,
             .field_equal,
             .field_not_equal,
-            => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "left", "right" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "left", "right" },
-                );
-                rule.pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "left"),
-                );
-                rule.other_input_index = input_index;
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "right"),
-                );
-            },
-            .exactly_one, .at_least_one => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "paths", "rules" },
-                );
-                const has_path = object.get("path") != null;
-                const has_paths = object.get("paths") != null;
-                if (has_path == has_paths) {
-                    return error.ConflictingCountRuleTargets;
-                }
-                if (has_path) {
-                    if (pointer_id == null) {
-                        return error.CountRuleCollectionMissing;
-                    }
-                    rule.children = try self.compileItemRules(
-                        try definition_core.json.field(object, "rules"),
-                        input_index,
-                        depth + 1,
-                    );
-                } else {
-                    rule.path_ids = try self.parsePaths(
-                        try definition_core.json.field(object, "paths"),
-                    );
-                    if (object.get("rules")) |raw_rules| {
-                        rule.children = try self.compileItemRules(
-                            raw_rules,
-                            input_index,
-                            depth + 1,
-                        );
-                    }
-                }
-            },
-            .keyed_unique => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "key" },
-                );
-                if (pointer_id == null) {
-                    return error.KeyedUniqueCollectionMissing;
-                }
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.requiredString(object, "key"),
-                );
-            },
-            .reference_exists => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{
-                        "op",
-                        "path",
-                        "reference",
-                        "target",
-                        "target_items",
-                        "target_rules",
-                        "coverage_rules",
-                        "key",
-                        "coverage",
-                        "self_reference",
-                        "ignore_null",
-                    },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "reference", "target", "key" },
-                );
-                if (pointer_id == null) {
-                    return error.ReferenceCollectionMissing;
-                }
-                rule.other_input_index = input_index;
-                rule.other_pointer_id = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(
-                            object,
-                            "reference",
-                        ),
-                    ),
-                );
-                const target_items = if (object.get("target_items")) |raw|
-                    try self.internPointer(
-                        try definition_core.json.string(raw),
-                    )
-                else
-                    null;
-                rule.path_ids = try self.allocator.alloc(
-                    u16,
-                    if (target_items == null) 2 else 3,
-                );
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "target"),
-                );
-                rule.path_ids[1] = try self.internPointer(
-                    try definition_core.json.string(
-                        try definition_core.json.field(object, "key"),
-                    ),
-                );
-                if (target_items) |target_items_pointer_id| {
-                    rule.path_ids[2] = target_items_pointer_id;
-                }
-                if (object.get("target_rules")) |raw_rules| {
-                    rule.children = try self.compileItemRules(
-                        raw_rules,
-                        input_index,
-                        depth + 1,
-                    );
-                }
-                if (object.get("coverage_rules")) |raw_rules| {
-                    rule.coverage_children = try self.compileItemRules(
-                        raw_rules,
-                        input_index,
-                        depth + 1,
-                    );
-                }
-                if (object.get("coverage")) |raw_coverage| {
-                    const coverage = try definition_core.json.string(
-                        raw_coverage,
-                    );
-                    if (!std.mem.eql(u8, coverage, "all-targets")) {
-                        return error.UnsupportedReferenceCoverage;
-                    }
-                    rule.total_coverage = true;
-                }
-                if (object.get("self_reference")) |raw_policy| {
-                    const policy = try definition_core.json.string(
-                        raw_policy,
-                    );
-                    if (!std.mem.eql(u8, policy, "reject")) {
-                        return error.UnsupportedSelfReferencePolicy;
-                    }
-                    if (rule.path_ids[0] != pointer_id) {
-                        return error.SelfReferenceRequiresOneCollection;
-                    }
-                    rule.reject_self_reference = true;
-                }
-                rule.ignore_null_references =
-                    try optionalBoolean(object, "ignore_null") orelse false;
-            },
+            => try self.compileComparisonItemRule(object, input_index, rule),
+            .exactly_one,
+            .at_least_one,
+            => try self.compileCountItemRule(object, input_index, depth, rule),
+            .keyed_unique => try self.compileKeyedUniqueItemRule(object, rule),
+            .reference_exists => try self.compileReferenceItemRule(
+                object,
+                input_index,
+                depth,
+                rule,
+            ),
             .implies => try self.compileImplication(
                 object,
                 input_index,
                 depth,
                 true,
-                &rule,
+                rule,
             ),
-            .one_of, .all_rules, .any_rules, .no_rules, .object_values => {
-                try definition_core.json.requireExactKeys(
-                    object,
-                    &.{ "op", "path", "rules" },
-                );
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "op", "path", "rules" },
-                );
-                rule.children = try self.compileItemRules(
-                    try definition_core.json.field(object, "rules"),
-                    input_index,
-                    depth + 1,
-                );
-            },
+            .one_of,
+            .all_rules,
+            .any_rules,
+            .no_rules,
+            .object_values,
+            => try self.compileNestedItemRule(object, input_index, depth, rule),
             .tagged_union => try self.compileTaggedUnion(
                 object,
                 input_index,
                 depth,
                 false,
-                &rule,
+                rule,
             ),
             .definition_ref => try self.compileDefinitionRef(
                 object,
                 false,
                 null,
-                &rule,
+                rule,
             ),
             else => unreachable,
         }
-        return rule;
+    }
+
+    fn compileOptionalItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "rules", "allow_null" },
+        );
+        try definition_core.json.requireFields(object, &.{ "op", "path" });
+        if (object.get("rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                rule.input_index,
+                depth + 1,
+            );
+        }
+        rule.allow_null =
+            try optionalBoolean(object, "allow_null") orelse false;
+    }
+
+    fn compileSortedItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "key" },
+        );
+        if (object.get("key")) |raw_key| {
+            rule.other_pointer_id = try self.internPointer(
+                try definition_core.json.string(raw_key),
+            );
+        }
+    }
+
+    fn compileComparisonItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "left", "right" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "left", "right" },
+        );
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "left"),
+        );
+        rule.other_input_index = input_index;
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "right"),
+        );
+    }
+
+    fn compileCountItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "paths", "rules" },
+        );
+        const has_path = object.get("path") != null;
+        if (has_path == (object.get("paths") != null)) {
+            return error.ConflictingCountRuleTargets;
+        }
+        if (has_path) {
+            if (rule.pointer_id == null) {
+                return error.CountRuleCollectionMissing;
+            }
+            rule.children = try self.compileItemRules(
+                try definition_core.json.field(object, "rules"),
+                input_index,
+                depth + 1,
+            );
+            return;
+        }
+        rule.path_ids = try self.parsePaths(
+            try definition_core.json.field(object, "paths"),
+        );
+        if (object.get("rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                depth + 1,
+            );
+        }
+    }
+
+    fn compileKeyedUniqueItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "key" },
+        );
+        if (rule.pointer_id == null) {
+            return error.KeyedUniqueCollectionMissing;
+        }
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "key"),
+        );
+    }
+
+    fn compileReferenceItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try requireReferenceItemKeys(object);
+        if (rule.pointer_id == null) {
+            return error.ReferenceCollectionMissing;
+        }
+        rule.other_input_index = input_index;
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "reference"),
+            ),
+        );
+        try self.compileReferenceItemTarget(
+            object,
+            input_index,
+            depth,
+            rule,
+        );
+        try compileReferencePolicies(object, rule.pointer_id.?, rule);
+    }
+
+    fn compileReferenceItemTarget(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        const target_items = try self.optionalPointer(object, "target_items");
+        rule.path_ids = try self.allocator.alloc(
+            u16,
+            if (target_items == null) 2 else 3,
+        );
+        rule.path_ids[0] = try self.internPointer(
+            try definition_core.json.requiredString(object, "target"),
+        );
+        rule.path_ids[1] = try self.internPointer(
+            try definition_core.json.string(
+                try definition_core.json.field(object, "key"),
+            ),
+        );
+        if (target_items) |pointer_id| rule.path_ids[2] = pointer_id;
+        if (object.get("target_rules")) |raw_rules| {
+            rule.children = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                depth + 1,
+            );
+        }
+        if (object.get("coverage_rules")) |raw_rules| {
+            rule.coverage_children = try self.compileItemRules(
+                raw_rules,
+                input_index,
+                depth + 1,
+            );
+        }
+    }
+
+    fn compileNestedItemRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        input_index: u8,
+        depth: usize,
+        rule: *CompiledRule,
+    ) anyerror!void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "rules" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "path", "rules" },
+        );
+        rule.children = try self.compileItemRules(
+            try definition_core.json.field(object, "rules"),
+            input_index,
+            depth + 1,
+        );
     }
 
     fn compileDefinitionRef(
@@ -2151,15 +2061,22 @@ const Builder = struct {
         {
             return error.ImportedDefinitionNotReusable;
         }
+        rule.imported_plan = try self.compileImportedPlan(imported_definition);
+        rule.import_index = import_index;
+    }
+
+    fn compileImportedPlan(
+        self: *Builder,
+        imported_definition: *const definition.Plan,
+    ) !*Plan {
         const imported_plan = try self.allocator.create(Plan);
         var imported_plan_initialized = false;
-        var imported_plan_owned = true;
-        errdefer if (imported_plan_owned) {
+        errdefer {
             if (imported_plan_initialized) {
                 imported_plan.deinit(self.allocator);
             }
             self.allocator.destroy(imported_plan);
-        };
+        }
         imported_plan.* = try compile(
             self.allocator,
             imported_definition,
@@ -2174,9 +2091,7 @@ const Builder = struct {
                 return error.UnsupportedImportedDefinitionRule;
             }
         }
-        rule.import_index = import_index;
-        rule.imported_plan = imported_plan;
-        imported_plan_owned = false;
+        return imported_plan;
     }
 
     fn compileSha256Rule(
@@ -2185,6 +2100,26 @@ const Builder = struct {
         allow_input: bool,
         rule: *CompiledRule,
     ) anyerror!void {
+        try requireSha256Keys(object, allow_input);
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "mode", "field", "max_bytes" },
+        );
+        try self.compileSha256Header(object, rule);
+        switch (rule.sha256_mode.?) {
+            .canonical_json_null => try self.compileSha256Canonical(
+                object,
+                rule,
+            ),
+            .framed_items => try self.compileSha256Items(object, rule),
+            .framed_fields => try self.compileSha256Fields(object, rule),
+        }
+    }
+
+    fn requireSha256Keys(
+        object: std.json.ObjectMap,
+        allow_input: bool,
+    ) !void {
         if (allow_input) {
             try definition_core.json.requireExactKeys(
                 object,
@@ -2217,10 +2152,13 @@ const Builder = struct {
                 },
             );
         }
-        try definition_core.json.requireFields(
-            object,
-            &.{ "op", "mode", "field", "max_bytes" },
-        );
+    }
+
+    fn compileSha256Header(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
         const mode = try definition_core.json.requiredString(object, "mode");
         rule.sha256_mode = if (std.mem.eql(
             u8,
@@ -2247,77 +2185,84 @@ const Builder = struct {
         {
             return error.InvalidSha256Bound;
         }
-        switch (rule.sha256_mode.?) {
-            .canonical_json_null => {
-                try definition_core.json.requireFields(
-                    object,
-                    &.{"null"},
-                );
-                if (object.get("items") != null or
-                    object.get("prefix") != null or
-                    object.get("fragments") != null)
-                {
-                    return error.ConflictingSha256ModeFields;
-                }
-                rule.path_ids = try self.allocator.alloc(u16, 1);
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "null"),
-                );
-                if (self.pointers.items[rule.path_ids[0]].raw.len == 0) {
-                    return error.Sha256NullPointerEmpty;
-                }
-            },
-            .framed_items => {
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "items", "prefix", "fragments" },
-                );
-                if (object.get("null") != null) {
-                    return error.ConflictingSha256ModeFields;
-                }
-                rule.path_ids = try self.allocator.alloc(u16, 1);
-                rule.path_ids[0] = try self.internPointer(
-                    try definition_core.json.requiredString(object, "items"),
-                );
-                const prefix = (try definition_core.json.optionalString(
-                    object,
-                    "prefix",
-                )) orelse return error.MissingField;
-                if (prefix.len > 4096) {
-                    return error.Sha256PrefixBytesExceeded;
-                }
-                rule.sha256_prefix = try self.allocator.dupe(u8, prefix);
-                rule.format_parts = try self.compileFormatParts(
-                    try definition_core.json.field(object, "fragments"),
-                    false,
-                );
-            },
-            .framed_fields => {
-                try definition_core.json.requireFields(
-                    object,
-                    &.{ "prefix", "fragments" },
-                );
-                if (object.get("null") != null or object.get("items") != null) {
-                    return error.ConflictingSha256ModeFields;
-                }
-                const prefix = (try definition_core.json.optionalString(
-                    object,
-                    "prefix",
-                )) orelse return error.MissingField;
-                if (prefix.len > 4096) {
-                    return error.Sha256PrefixBytesExceeded;
-                }
-                rule.sha256_prefix = try self.allocator.dupe(u8, prefix);
-                rule.format_parts = try self.compileFormatParts(
-                    try definition_core.json.field(object, "fragments"),
-                    false,
-                );
-                for (rule.format_parts) |part| switch (part) {
-                    .literal, .parent => {},
-                    .item, .value => return error.InvalidSha256FieldFragment,
-                };
-            },
+    }
+
+    fn compileSha256Canonical(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireFields(object, &.{"null"});
+        if (object.get("items") != null or
+            object.get("prefix") != null or
+            object.get("fragments") != null)
+        {
+            return error.ConflictingSha256ModeFields;
         }
+        rule.path_ids = try self.allocator.alloc(u16, 1);
+        rule.path_ids[0] = try self.internPointer(
+            try definition_core.json.requiredString(object, "null"),
+        );
+        if (self.pointers.items[rule.path_ids[0]].raw.len == 0) {
+            return error.Sha256NullPointerEmpty;
+        }
+    }
+
+    fn compileSha256Items(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireFields(
+            object,
+            &.{ "items", "prefix", "fragments" },
+        );
+        if (object.get("null") != null) {
+            return error.ConflictingSha256ModeFields;
+        }
+        rule.path_ids = try self.allocator.alloc(u16, 1);
+        rule.path_ids[0] = try self.internPointer(
+            try definition_core.json.requiredString(object, "items"),
+        );
+        try self.compileSha256Framing(object, rule);
+    }
+
+    fn compileSha256Fields(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireFields(
+            object,
+            &.{ "prefix", "fragments" },
+        );
+        if (object.get("null") != null or object.get("items") != null) {
+            return error.ConflictingSha256ModeFields;
+        }
+        try self.compileSha256Framing(object, rule);
+        for (rule.format_parts) |part| switch (part) {
+            .literal, .parent => {},
+            .item, .value => return error.InvalidSha256FieldFragment,
+        };
+    }
+
+    fn compileSha256Framing(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        const prefix = (try definition_core.json.optionalString(
+            object,
+            "prefix",
+        )) orelse return error.MissingField;
+        if (prefix.len > 4096) {
+            return error.Sha256PrefixBytesExceeded;
+        }
+        rule.sha256_prefix = try self.allocator.dupe(u8, prefix);
+        rule.format_parts = try self.compileFormatParts(
+            try definition_core.json.field(object, "fragments"),
+            false,
+        );
     }
 
     fn compileTaggedUnion(
@@ -2366,70 +2311,84 @@ const Builder = struct {
             self.allocator.free(variants);
         }
         for (raw_variants.items, 0..) |raw_variant, index| {
-            const variant_object =
-                try definition_core.json.object(raw_variant);
-            if (rule.other_pointer_id != null) {
-                try definition_core.json.requireExactKeys(
-                    variant_object,
-                    &.{ "value", "rules" },
-                );
-                try definition_core.json.requireFields(
-                    variant_object,
-                    &.{ "value", "rules" },
-                );
-            } else {
-                try definition_core.json.requireExactKeys(
-                    variant_object,
-                    &.{ "kind", "rules" },
-                );
-                try definition_core.json.requireFields(
-                    variant_object,
-                    &.{ "kind", "rules" },
-                );
-            }
-            var variant: CompiledVariant = .{
-                .kind = if (rule.other_pointer_id == null)
-                    try JsonKind.parse(
-                        try definition_core.json.requiredString(
-                            variant_object,
-                            "kind",
-                        ),
-                    )
-                else
-                    null,
-                .tag_value = if (rule.other_pointer_id != null)
-                    try parseEnumScalar(
-                        self.allocator,
-                        try definition_core.json.field(
-                            variant_object,
-                            "value",
-                        ),
-                    )
-                else
-                    null,
-                .rules = try self.compileVariantRules(
-                    try definition_core.json.field(variant_object, "rules"),
-                    input_index,
-                    depth + 1,
-                ),
-            };
+            var variant = try self.compileVariant(
+                raw_variant,
+                input_index,
+                depth,
+                rule.other_pointer_id != null,
+            );
             errdefer variant.deinit(self.allocator);
-            for (variants[0..initialized]) |prior| {
-                if ((variant.kind != null and prior.kind == variant.kind) or
-                    (variant.tag_value != null and
-                        prior.tag_value != null and
-                        enumScalarsEqual(
-                            variant.tag_value.?,
-                            prior.tag_value.?,
-                        )))
-                {
-                    return error.DuplicateTaggedUnionVariant;
-                }
+            if (variantDuplicates(variant, variants[0..initialized])) {
+                return error.DuplicateTaggedUnionVariant;
             }
             variants[index] = variant;
             initialized += 1;
         }
         rule.variants = variants;
+    }
+
+    fn compileVariant(
+        self: *Builder,
+        raw: std.json.Value,
+        input_index: u8,
+        depth: usize,
+        tagged: bool,
+    ) anyerror!CompiledVariant {
+        const object = try definition_core.json.object(raw);
+        if (tagged) {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "value", "rules" },
+            );
+            try definition_core.json.requireFields(
+                object,
+                &.{ "value", "rules" },
+            );
+        } else {
+            try definition_core.json.requireExactKeys(
+                object,
+                &.{ "kind", "rules" },
+            );
+            try definition_core.json.requireFields(
+                object,
+                &.{ "kind", "rules" },
+            );
+        }
+        return .{
+            .kind = if (!tagged)
+                try JsonKind.parse(
+                    try definition_core.json.requiredString(object, "kind"),
+                )
+            else
+                null,
+            .tag_value = if (tagged)
+                try parseEnumScalar(
+                    self.allocator,
+                    try definition_core.json.field(object, "value"),
+                )
+            else
+                null,
+            .rules = try self.compileVariantRules(
+                try definition_core.json.field(object, "rules"),
+                input_index,
+                depth + 1,
+            ),
+        };
+    }
+
+    fn variantDuplicates(
+        variant: CompiledVariant,
+        prior_variants: []const CompiledVariant,
+    ) bool {
+        for (prior_variants) |prior| {
+            if (variant.kind != null and prior.kind == variant.kind) return true;
+            if (variant.tag_value != null and prior.tag_value != null and
+                enumScalarsEqual(variant.tag_value.?, prior.tag_value.?))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn compileVariantRules(
@@ -2565,23 +2524,419 @@ fn encodeCachePlan(
     encoder: *definition_core.cache.Encoder,
     depth: usize,
 ) anyerror!void {
-    if (depth > 32) return error.ImportDepthExceeded;
-    try encoder.writeCount(plan.inputs.len);
-    for (plan.inputs) |input| {
+    const allocator = std.heap.page_allocator;
+    var tasks: std.ArrayList(CacheEncodeTask) = .empty;
+    defer tasks.deinit(allocator);
+    try pushCacheEncodeTask(
+        &tasks,
+        allocator,
+        .{ .plan = .{ .plan = plan, .depth = depth } },
+    );
+    while (tasks.pop()) |task| {
+        try encodeCacheTask(&tasks, allocator, encoder, task);
+    }
+}
+
+const CacheEncodePlan = struct {
+    plan: *const Plan,
+    depth: usize,
+};
+
+const CacheEncodeRule = struct {
+    rule: *const CompiledRule,
+    depth: usize,
+};
+
+const CacheEncodeRuleGroup = struct {
+    rules: []const CompiledRule,
+    depth: usize,
+};
+
+const CacheEncodeTask = union(enum) {
+    plan: CacheEncodePlan,
+    plan_finish: *const Plan,
+    rule: CacheEncodeRule,
+    rule_group: CacheEncodeRuleGroup,
+    variants: CacheEncodeRule,
+    variant: struct {
+        variant: *const CompiledVariant,
+        depth: usize,
+    },
+    suffix: *const CompiledRule,
+    sources: CacheEncodeRule,
+    source: struct {
+        source: *const CompiledReferenceSource,
+        depth: usize,
+    },
+    targets: CacheEncodeRule,
+    target: struct {
+        target: *const CompiledReferenceTarget,
+        depth: usize,
+    },
+    imported: CacheEncodeRule,
+    format_parts: []const CompiledFormatPart,
+};
+
+fn pushCacheEncodeTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    task: CacheEncodeTask,
+) !void {
+    if (tasks.items.len == max_cache_rule_tasks) {
+        return error.CacheRuleCountExceeded;
+    }
+    try tasks.append(allocator, task);
+}
+
+fn encodeCacheTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    task: CacheEncodeTask,
+) anyerror!void {
+    switch (task) {
+        .plan => |value| try encodeCachePlanTask(tasks, allocator, encoder, value),
+        .plan_finish => |plan| try encodeCachePlanFinish(encoder, plan),
+        .rule => |value| try encodeCacheRuleTask(tasks, allocator, encoder, value),
+        .rule_group => |value| try encodeCacheRuleGroupTask(
+            tasks,
+            allocator,
+            encoder,
+            value,
+        ),
+        .variants => |value| try encodeCacheVariantsTask(
+            tasks,
+            allocator,
+            encoder,
+            value,
+        ),
+        .variant => |value| try encodeCacheVariantTask(
+            tasks,
+            allocator,
+            encoder,
+            value.variant,
+            value.depth,
+        ),
+        .suffix => |rule| try encodeCacheRuleSuffix(encoder, rule),
+        .sources => |value| try encodeCacheSourcesTask(tasks, allocator, encoder, value),
+        .source => |value| try encodeCacheSourceTask(
+            tasks,
+            allocator,
+            encoder,
+            value.source,
+            value.depth,
+        ),
+        .targets => |value| try encodeCacheTargetsTask(tasks, allocator, encoder, value),
+        .target => |value| try encodeCacheTargetTask(
+            tasks,
+            allocator,
+            encoder,
+            value.target,
+            value.depth,
+        ),
+        .imported => |value| try encodeCacheImportedTask(
+            tasks,
+            allocator,
+            encoder,
+            value,
+        ),
+        .format_parts => |parts| try encodeCompiledFormatParts(encoder, parts),
+    }
+}
+
+fn encodeCachePlanTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodePlan,
+) !void {
+    if (value.depth > 32) return error.ImportDepthExceeded;
+    try encoder.writeCount(value.plan.inputs.len);
+    for (value.plan.inputs) |input| {
         try encoder.writeBytes(input.name);
         try encoder.writeEnum(input.codec);
         try encoder.writeBool(input.required);
         try encoder.writeUsize(input.max_bytes);
     }
-    try encoder.writeCount(plan.pointers.len);
-    for (plan.pointers) |pointer| try encoder.writeBytes(pointer.raw);
-    try encoder.writeCount(plan.rules.len);
-    for (plan.rules) |rule| {
-        try encodeCompiledRule(encoder, rule, depth);
+    try encoder.writeCount(value.plan.pointers.len);
+    for (value.plan.pointers) |pointer| {
+        try encoder.writeBytes(pointer.raw);
     }
+    try pushCacheEncodeTask(
+        tasks,
+        allocator,
+        .{ .plan_finish = value.plan },
+    );
+    try pushCacheEncodeTask(
+        tasks,
+        allocator,
+        .{ .rule_group = .{
+            .rules = value.plan.rules,
+            .depth = value.depth,
+        } },
+    );
+}
+
+fn encodeCachePlanFinish(
+    encoder: *definition_core.cache.Encoder,
+    plan: *const Plan,
+) !void {
     try encoder.writeUsize(plan.max_input_bytes);
     try encoder.writeUsize(plan.max_records);
     try encoder.writeUsize(plan.max_diagnostics);
+}
+
+fn encodeCacheRuleGroupTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRuleGroup,
+) !void {
+    try encoder.writeCount(value.rules.len);
+    var index = value.rules.len;
+    while (index > 0) {
+        index -= 1;
+        try pushCacheEncodeTask(
+            tasks,
+            allocator,
+            .{ .rule = .{
+                .rule = &value.rules[index],
+                .depth = value.depth,
+            } },
+        );
+    }
+}
+
+fn encodeCacheRuleTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRule,
+) !void {
+    try encodeCacheRuleHeader(encoder, value.rule);
+    const followups = [_]CacheEncodeTask{
+        .{ .imported = value },
+        .{ .targets = value },
+        .{ .sources = value },
+        .{ .suffix = value.rule },
+        .{ .variants = value },
+        .{ .rule_group = .{
+            .rules = value.rule.coverage_children,
+            .depth = value.depth,
+        } },
+        .{ .rule_group = .{
+            .rules = value.rule.children,
+            .depth = value.depth,
+        } },
+    };
+    for (followups) |task| {
+        try pushCacheEncodeTask(tasks, allocator, task);
+    }
+}
+
+fn encodeCacheRuleHeader(
+    encoder: *definition_core.cache.Encoder,
+    rule: *const CompiledRule,
+) !void {
+    try encoder.writeEnum(rule.operator);
+    try encoder.writeByte(rule.input_index);
+    try writeOptionalU16(encoder, rule.pointer_id);
+    try writeOptionalU16(encoder, rule.import_index);
+    try writeOptionalByte(encoder, rule.other_input_index);
+    try writeOptionalU16(encoder, rule.other_pointer_id);
+    try encoder.writeCount(rule.path_ids.len);
+    for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
+    try encoder.writeCount(rule.keys.len);
+    for (rule.keys) |key| try encoder.writeBytes(key);
+    try encoder.writeCount(rule.optional_keys.len);
+    for (rule.optional_keys) |key| try encoder.writeBytes(key);
+    try encoder.writeCount(rule.values.len);
+    for (rule.values) |value| try encodeEnumScalar(encoder, value);
+    try encoder.writeBool(rule.scalar_kind != null);
+    if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
+    try writeOptionalUsize(encoder, rule.min_count);
+    try writeOptionalUsize(encoder, rule.max_count);
+    try writeOptionalUsize(encoder, rule.trimmed_min_count);
+    try writeOptionalF64(encoder, rule.min_number);
+    try writeOptionalF64(encoder, rule.max_number);
+    try encoder.writeEnum(rule.identifier_style);
+    try encoder.writeBool(rule.allow_root);
+    try encoder.writeBool(rule.case_insensitive);
+    try encoder.writeBool(rule.allow_additional);
+    try encoder.writeBool(rule.allow_null);
+    try encoder.writeBool(rule.total_coverage);
+    try encoder.writeBool(rule.reject_self_reference);
+    try encoder.writeBool(rule.ignore_null_references);
+    try encoder.writeBool(rule.then_nonempty);
+}
+
+fn encodeCacheVariantsTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRule,
+) !void {
+    try encoder.writeCount(value.rule.variants.len);
+    var index = value.rule.variants.len;
+    while (index > 0) {
+        index -= 1;
+        try pushCacheEncodeTask(
+            tasks,
+            allocator,
+            .{ .variant = .{
+                .variant = &value.rule.variants[index],
+                .depth = value.depth,
+            } },
+        );
+    }
+}
+
+fn encodeCacheVariantTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    variant: *const CompiledVariant,
+    depth: usize,
+) !void {
+    if (variant.kind) |kind| {
+        try encoder.writeByte(0);
+        try encoder.writeEnum(kind);
+    } else if (variant.tag_value) |tag_value| {
+        try encoder.writeByte(1);
+        try encodeEnumScalar(encoder, tag_value);
+    } else {
+        return error.TaggedUnionVariantInvalid;
+    }
+    try pushCacheEncodeTask(
+        tasks,
+        allocator,
+        .{ .rule_group = .{ .rules = variant.rules, .depth = depth } },
+    );
+}
+
+fn encodeCacheRuleSuffix(
+    encoder: *definition_core.cache.Encoder,
+    rule: *const CompiledRule,
+) !void {
+    try encodeCompiledFormatParts(encoder, rule.format_parts);
+    try encoder.writeCount(rule.regex_patterns.len);
+    for (rule.regex_patterns) |pattern| {
+        try encoder.writeCount(pattern.atoms.len);
+        for (pattern.atoms) |atom| {
+            for (atom.bytes) |word| try encoder.writeU64(word);
+            try encoder.writeEnum(atom.quantifier);
+        }
+    }
+    try encoder.writeBool(rule.sha256_mode != null);
+    if (rule.sha256_mode) |mode| try encoder.writeEnum(mode);
+    try encoder.writeOptionalBytes(rule.sha256_prefix);
+}
+
+fn encodeCacheSourcesTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRule,
+) !void {
+    try encoder.writeCount(value.rule.reference_sources.len);
+    var index = value.rule.reference_sources.len;
+    while (index > 0) {
+        index -= 1;
+        try pushCacheEncodeTask(
+            tasks,
+            allocator,
+            .{ .source = .{
+                .source = &value.rule.reference_sources[index],
+                .depth = value.depth,
+            } },
+        );
+    }
+}
+
+fn encodeCacheSourceTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    source: *const CompiledReferenceSource,
+    depth: usize,
+) !void {
+    try encoder.writeU16(source.pointer_id);
+    try writeOptionalU16(encoder, source.items_pointer_id);
+    try encoder.writeU16(source.reference_pointer_id);
+    try encoder.writeBool(source.optional);
+    try pushCacheEncodeTask(
+        tasks,
+        allocator,
+        .{ .format_parts = source.format_parts },
+    );
+    try pushCacheEncodeTask(
+        tasks,
+        allocator,
+        .{ .rule_group = .{ .rules = source.rules, .depth = depth } },
+    );
+}
+
+fn encodeCacheTargetsTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRule,
+) !void {
+    try encoder.writeCount(value.rule.reference_targets.len);
+    var index = value.rule.reference_targets.len;
+    while (index > 0) {
+        index -= 1;
+        try pushCacheEncodeTask(
+            tasks,
+            allocator,
+            .{ .target = .{
+                .target = &value.rule.reference_targets[index],
+                .depth = value.depth,
+            } },
+        );
+    }
+}
+
+fn encodeCacheTargetTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    target: *const CompiledReferenceTarget,
+    depth: usize,
+) !void {
+    try encoder.writeU16(target.pointer_id);
+    try encoder.writeBool(target.optional);
+    try writeOptionalU16(encoder, target.items_pointer_id);
+    try writeOptionalU16(encoder, target.key_pointer_id);
+    try writeOptionalU16(encoder, target.coverage_key_pointer_id);
+    const followups = [_]CacheEncodeTask{
+        .{ .format_parts = target.format_parts },
+        .{ .rule_group = .{ .rules = target.coverage_rules, .depth = depth } },
+        .{ .rule_group = .{ .rules = target.match_rules, .depth = depth } },
+        .{ .rule_group = .{ .rules = target.rules, .depth = depth } },
+    };
+    for (followups) |task| {
+        try pushCacheEncodeTask(tasks, allocator, task);
+    }
+}
+
+fn encodeCacheImportedTask(
+    tasks: *std.ArrayList(CacheEncodeTask),
+    allocator: std.mem.Allocator,
+    encoder: *definition_core.cache.Encoder,
+    value: CacheEncodeRule,
+) !void {
+    try encoder.writeBool(value.rule.imported_plan != null);
+    if (value.rule.imported_plan) |imported_plan| {
+        try pushCacheEncodeTask(
+            tasks,
+            allocator,
+            .{ .plan = .{
+                .plan = imported_plan,
+                .depth = value.depth + 1,
+            } },
+        );
+    }
 }
 
 pub fn decodeCache(
@@ -2661,6 +3016,14 @@ pub fn validateCachePlan(
     plan: *const Plan,
     definition_plan: *const definition.Plan,
 ) anyerror!void {
+    try validateCachePlanHeader(plan, definition_plan);
+    try validateRuleGraph(plan.rules, definition_plan);
+}
+
+fn validateCachePlanHeader(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
     if (plan.inputs.len != definition_plan.inputs.len or
         plan.max_input_bytes != definition_plan.bounds.max_input_bytes or
         plan.max_records != definition_plan.bounds.max_records or
@@ -2676,9 +3039,6 @@ pub fn validateCachePlan(
         {
             return error.CacheValidationPlanMismatch;
         }
-    }
-    for (plan.rules) |rule| {
-        try validateRuleAgainstDefinition(rule, definition_plan);
     }
 }
 
@@ -2708,15 +3068,51 @@ pub fn validateEmbeddedCachePlan(
             return error.CacheValidationPlanMismatch;
         }
     }
-    for (plan.rules) |rule| {
-        try validateRuleAgainstDefinition(rule, definition_plan);
+    try validateRuleGraph(plan.rules, definition_plan);
+}
+
+const CacheRuleTask = struct {
+    rule: *const CompiledRule,
+    definition_plan: *const definition.Plan,
+};
+
+fn validateRuleGraph(
+    root_rules: []const CompiledRule,
+    definition_plan: *const definition.Plan,
+) !void {
+    const allocator = std.heap.page_allocator;
+    var tasks: std.ArrayList(CacheRuleTask) = .empty;
+    defer tasks.deinit(allocator);
+    try appendCacheRuleTasks(&tasks, allocator, root_rules, definition_plan);
+    while (tasks.pop()) |task| {
+        try validateCacheRuleTask(&tasks, allocator, task);
     }
 }
 
-fn validateRuleAgainstDefinition(
-    rule: CompiledRule,
+fn appendCacheRuleTasks(
+    tasks: *std.ArrayList(CacheRuleTask),
+    allocator: std.mem.Allocator,
+    rules: []const CompiledRule,
     definition_plan: *const definition.Plan,
 ) !void {
+    if (rules.len > max_cache_rule_tasks - tasks.items.len) {
+        return error.CacheRuleCountExceeded;
+    }
+    for (rules) |*rule| {
+        try tasks.append(allocator, .{
+            .rule = rule,
+            .definition_plan = definition_plan,
+        });
+    }
+}
+
+fn validateCacheRuleTask(
+    tasks: *std.ArrayList(CacheRuleTask),
+    allocator: std.mem.Allocator,
+    task: CacheRuleTask,
+) !void {
+    const rule = task.rule;
+    const definition_plan = task.definition_plan;
     if (!definition_plan.requires(rule.operator)) {
         return error.CacheValidationPlanMismatch;
     }
@@ -2728,14 +3124,28 @@ fn validateRuleAgainstDefinition(
         {
             return error.CacheValidationPlanMismatch;
         }
-        try validateCachePlan(
-            rule.imported_plan.?,
-            &definition_plan.imports[import_index],
+        const imported_definition = &definition_plan.imports[import_index];
+        try validateCachePlanHeader(rule.imported_plan.?, imported_definition);
+        try appendCacheRuleTasks(
+            tasks,
+            allocator,
+            rule.imported_plan.?.rules,
+            imported_definition,
         );
     } else if (rule.import_index != null or rule.imported_plan != null) {
         return error.CacheValidationPlanMismatch;
     }
-    for (rule.children) |child| {
+    try appendNestedCacheRules(tasks, allocator, rule, definition_plan);
+    try appendReferenceCacheRules(tasks, allocator, rule, definition_plan);
+}
+
+fn appendNestedCacheRules(
+    tasks: *std.ArrayList(CacheRuleTask),
+    allocator: std.mem.Allocator,
+    rule: *const CompiledRule,
+    definition_plan: *const definition.Plan,
+) !void {
+    for (rule.children) |*child| {
         if (rule.operator == .implies) {
             if (!isValidationOperator(child.operator)) {
                 return error.CacheValidationPlanMismatch;
@@ -2745,50 +3155,42 @@ fn validateRuleAgainstDefinition(
         {
             return error.CacheValidationPlanMismatch;
         }
-        try validateRuleAgainstDefinition(child, definition_plan);
     }
-    for (rule.coverage_children) |child| {
+    try appendCacheRuleTasks(
+        tasks,
+        allocator,
+        rule.children,
+        definition_plan,
+    );
+    for (rule.coverage_children) |*child| {
         if (child.input_index != rule.other_input_index.? or
             !isItemOperator(child.operator))
         {
             return error.CacheValidationPlanMismatch;
         }
-        try validateRuleAgainstDefinition(child, definition_plan);
     }
+    try appendCacheRuleTasks(
+        tasks,
+        allocator,
+        rule.coverage_children,
+        definition_plan,
+    );
+}
+
+fn appendReferenceCacheRules(
+    tasks: *std.ArrayList(CacheRuleTask),
+    allocator: std.mem.Allocator,
+    rule: *const CompiledRule,
+    definition_plan: *const definition.Plan,
+) !void {
     for (rule.reference_targets) |target| {
-        for (target.rules) |target_rule| {
-            if (target_rule.input_index != rule.other_input_index.? or
-                !isItemOperator(target_rule.operator))
-            {
-                return error.CacheValidationPlanMismatch;
-            }
-            try validateRuleAgainstDefinition(
-                target_rule,
-                definition_plan,
-            );
-        }
-        for (target.match_rules) |match_rule| {
-            if (match_rule.input_index != rule.other_input_index.? or
-                !isItemOperator(match_rule.operator))
-            {
-                return error.CacheValidationPlanMismatch;
-            }
-            try validateRuleAgainstDefinition(
-                match_rule,
-                definition_plan,
-            );
-        }
-        for (target.coverage_rules) |coverage_rule| {
-            if (coverage_rule.input_index != rule.other_input_index.? or
-                !isItemOperator(coverage_rule.operator))
-            {
-                return error.CacheValidationPlanMismatch;
-            }
-            try validateRuleAgainstDefinition(
-                coverage_rule,
-                definition_plan,
-            );
-        }
+        try appendTargetCacheRules(
+            tasks,
+            allocator,
+            rule,
+            target,
+            definition_plan,
+        );
     }
     for (rule.reference_sources) |source| {
         for (source.rules) |source_rule| {
@@ -2797,11 +3199,13 @@ fn validateRuleAgainstDefinition(
             {
                 return error.CacheValidationPlanMismatch;
             }
-            try validateRuleAgainstDefinition(
-                source_rule,
-                definition_plan,
-            );
         }
+        try appendCacheRuleTasks(
+            tasks,
+            allocator,
+            source.rules,
+            definition_plan,
+        );
     }
     for (rule.variants) |variant| {
         for (variant.rules) |variant_rule| {
@@ -2810,11 +3214,37 @@ fn validateRuleAgainstDefinition(
             {
                 return error.CacheValidationPlanMismatch;
             }
-            try validateRuleAgainstDefinition(
-                variant_rule,
-                definition_plan,
-            );
         }
+        try appendCacheRuleTasks(
+            tasks,
+            allocator,
+            variant.rules,
+            definition_plan,
+        );
+    }
+}
+
+fn appendTargetCacheRules(
+    tasks: *std.ArrayList(CacheRuleTask),
+    allocator: std.mem.Allocator,
+    parent: *const CompiledRule,
+    target: CompiledReferenceTarget,
+    definition_plan: *const definition.Plan,
+) !void {
+    const groups = [_][]const CompiledRule{
+        target.rules,
+        target.match_rules,
+        target.coverage_rules,
+    };
+    for (groups) |rules| {
+        for (rules) |target_rule| {
+            if (target_rule.input_index != parent.other_input_index.? or
+                !isItemOperator(target_rule.operator))
+            {
+                return error.CacheValidationPlanMismatch;
+            }
+        }
+        try appendCacheRuleTasks(tasks, allocator, rules, definition_plan);
     }
 }
 
@@ -2874,116 +3304,6 @@ fn decodeCachePointers(
         initialized += 1;
     }
     return pointers;
-}
-
-fn encodeCompiledRule(
-    encoder: *definition_core.cache.Encoder,
-    rule: CompiledRule,
-    depth: usize,
-) anyerror!void {
-    try encoder.writeEnum(rule.operator);
-    try encoder.writeByte(rule.input_index);
-    try writeOptionalU16(encoder, rule.pointer_id);
-    try writeOptionalU16(encoder, rule.import_index);
-    try writeOptionalByte(encoder, rule.other_input_index);
-    try writeOptionalU16(encoder, rule.other_pointer_id);
-    try encoder.writeCount(rule.path_ids.len);
-    for (rule.path_ids) |path_id| try encoder.writeU16(path_id);
-    try encoder.writeCount(rule.keys.len);
-    for (rule.keys) |key| try encoder.writeBytes(key);
-    try encoder.writeCount(rule.optional_keys.len);
-    for (rule.optional_keys) |key| try encoder.writeBytes(key);
-    try encoder.writeCount(rule.values.len);
-    for (rule.values) |value| try encodeEnumScalar(encoder, value);
-    try encoder.writeBool(rule.scalar_kind != null);
-    if (rule.scalar_kind) |kind| try encoder.writeEnum(kind);
-    try writeOptionalUsize(encoder, rule.min_count);
-    try writeOptionalUsize(encoder, rule.max_count);
-    try writeOptionalUsize(encoder, rule.trimmed_min_count);
-    try writeOptionalF64(encoder, rule.min_number);
-    try writeOptionalF64(encoder, rule.max_number);
-    try encoder.writeEnum(rule.identifier_style);
-    try encoder.writeBool(rule.allow_root);
-    try encoder.writeBool(rule.case_insensitive);
-    try encoder.writeBool(rule.allow_additional);
-    try encoder.writeBool(rule.allow_null);
-    try encoder.writeBool(rule.total_coverage);
-    try encoder.writeBool(rule.reject_self_reference);
-    try encoder.writeBool(rule.ignore_null_references);
-    try encoder.writeBool(rule.then_nonempty);
-    try encoder.writeCount(rule.children.len);
-    for (rule.children) |child| {
-        try encodeCompiledRule(encoder, child, depth);
-    }
-    try encoder.writeCount(rule.coverage_children.len);
-    for (rule.coverage_children) |child| {
-        try encodeCompiledRule(encoder, child, depth);
-    }
-    try encoder.writeCount(rule.variants.len);
-    for (rule.variants) |variant| {
-        if (variant.kind) |kind| {
-            try encoder.writeByte(0);
-            try encoder.writeEnum(kind);
-        } else if (variant.tag_value) |tag_value| {
-            try encoder.writeByte(1);
-            try encodeEnumScalar(encoder, tag_value);
-        } else {
-            return error.TaggedUnionVariantInvalid;
-        }
-        try encoder.writeCount(variant.rules.len);
-        for (variant.rules) |variant_rule| {
-            try encodeCompiledRule(encoder, variant_rule, depth);
-        }
-    }
-    try encodeCompiledFormatParts(encoder, rule.format_parts);
-    try encoder.writeCount(rule.regex_patterns.len);
-    for (rule.regex_patterns) |pattern| {
-        try encoder.writeCount(pattern.atoms.len);
-        for (pattern.atoms) |atom| {
-            for (atom.bytes) |word| try encoder.writeU64(word);
-            try encoder.writeEnum(atom.quantifier);
-        }
-    }
-    try encoder.writeBool(rule.sha256_mode != null);
-    if (rule.sha256_mode) |mode| try encoder.writeEnum(mode);
-    try encoder.writeOptionalBytes(rule.sha256_prefix);
-    try encoder.writeCount(rule.reference_sources.len);
-    for (rule.reference_sources) |source| {
-        try encoder.writeU16(source.pointer_id);
-        try writeOptionalU16(encoder, source.items_pointer_id);
-        try encoder.writeU16(source.reference_pointer_id);
-        try encoder.writeBool(source.optional);
-        try encoder.writeCount(source.rules.len);
-        for (source.rules) |source_rule| {
-            try encodeCompiledRule(encoder, source_rule, depth);
-        }
-        try encodeCompiledFormatParts(encoder, source.format_parts);
-    }
-    try encoder.writeCount(rule.reference_targets.len);
-    for (rule.reference_targets) |target| {
-        try encoder.writeU16(target.pointer_id);
-        try encoder.writeBool(target.optional);
-        try writeOptionalU16(encoder, target.items_pointer_id);
-        try writeOptionalU16(encoder, target.key_pointer_id);
-        try writeOptionalU16(encoder, target.coverage_key_pointer_id);
-        try encoder.writeCount(target.rules.len);
-        for (target.rules) |target_rule| {
-            try encodeCompiledRule(encoder, target_rule, depth);
-        }
-        try encoder.writeCount(target.match_rules.len);
-        for (target.match_rules) |match_rule| {
-            try encodeCompiledRule(encoder, match_rule, depth);
-        }
-        try encoder.writeCount(target.coverage_rules.len);
-        for (target.coverage_rules) |coverage_rule| {
-            try encodeCompiledRule(encoder, coverage_rule, depth);
-        }
-        try encodeCompiledFormatParts(encoder, target.format_parts);
-    }
-    try encoder.writeBool(rule.imported_plan != null);
-    if (rule.imported_plan) |imported_plan| {
-        try encodeCachePlan(imported_plan, encoder, depth + 1);
-    }
 }
 
 fn encodeCompiledFormatParts(
@@ -3052,6 +3372,117 @@ fn decodeCacheRules(
     return rules;
 }
 
+const CacheRuleDecodeContext = struct {
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+    input_count: usize,
+    pointer_count: usize,
+    depth: usize,
+    total_rule_count: *usize,
+    plan_depth: usize,
+    imported_plan_count: *usize,
+
+    fn decodeRules(self: CacheRuleDecodeContext) anyerror![]CompiledRule {
+        return decodeCacheRules(
+            self.allocator,
+            self.decoder,
+            self.input_count,
+            self.pointer_count,
+            self.depth + 1,
+            self.total_rule_count,
+            self.plan_depth,
+            self.imported_plan_count,
+        );
+    }
+};
+
+const DecodedCacheRuleHeader = struct {
+    operator: definition.Operator,
+    input_index: u8,
+    pointer_id: ?u16,
+    import_index: ?u16,
+    other_input_index: ?u8,
+    other_pointer_id: ?u16,
+    path_ids: []u16,
+    keys: [][]u8,
+    optional_keys: [][]u8,
+    values: []EnumScalar,
+    scalar_kind: ?JsonKind,
+    min_count: ?usize,
+    max_count: ?usize,
+    trimmed_min_count: ?usize,
+    min_number: ?f64,
+    max_number: ?f64,
+    identifier_style: IdentifierStyle,
+    allow_root: bool,
+    case_insensitive: bool,
+    allow_additional: bool,
+    allow_null: bool,
+    total_coverage: bool,
+    reject_self_reference: bool,
+    ignore_null_references: bool,
+    then_nonempty: bool,
+
+    fn deinit(
+        self: *DecodedCacheRuleHeader,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.path_ids);
+        deinitKeySlices(allocator, self.keys);
+        deinitKeySlices(allocator, self.optional_keys);
+        for (self.values) |*value| value.deinit(allocator);
+        allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+const DecodedCacheRuleNested = struct {
+    children: []CompiledRule,
+    coverage_children: []CompiledRule,
+    variants: []CompiledVariant,
+
+    fn deinit(
+        self: *DecodedCacheRuleNested,
+        allocator: std.mem.Allocator,
+    ) void {
+        deinitRuleSlice(allocator, self.children);
+        deinitRuleSlice(allocator, self.coverage_children);
+        for (self.variants) |*variant| variant.deinit(allocator);
+        allocator.free(self.variants);
+        self.* = undefined;
+    }
+};
+
+const DecodedCacheRuleTail = struct {
+    format_parts: []CompiledFormatPart,
+    regex_patterns: []CompiledRegexPattern,
+    sha256_mode: ?Sha256Mode,
+    sha256_prefix: ?[]u8,
+    reference_sources: []CompiledReferenceSource,
+    reference_targets: []CompiledReferenceTarget,
+    imported_plan: ?*Plan,
+
+    fn deinit(
+        self: *DecodedCacheRuleTail,
+        allocator: std.mem.Allocator,
+    ) void {
+        for (self.format_parts) |*part| part.deinit(allocator);
+        allocator.free(self.format_parts);
+        for (self.regex_patterns) |*pattern| pattern.deinit(allocator);
+        allocator.free(self.regex_patterns);
+        if (self.sha256_prefix) |prefix| allocator.free(prefix);
+        for (self.reference_sources) |*source| source.deinit(allocator);
+        allocator.free(self.reference_sources);
+        for (self.reference_targets) |*target| target.deinit(allocator);
+        allocator.free(self.reference_targets);
+        if (self.imported_plan) |plan| {
+            plan.deinit(allocator);
+            allocator.destroy(plan);
+        }
+        self.* = undefined;
+    }
+};
+
 fn decodeCacheRule(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
@@ -3062,329 +3493,372 @@ fn decodeCacheRule(
     plan_depth: usize,
     imported_plan_count: *usize,
 ) anyerror!CompiledRule {
-    const operator = try decoder.readEnum(definition.Operator);
-    const input_index = try decoder.readByte();
-    const pointer_id = try readOptionalU16(decoder);
-    const import_index = try readOptionalU16(decoder);
-    const other_input_index = try readOptionalByte(decoder);
-    const other_pointer_id = try readOptionalU16(decoder);
-    const path_ids = try decodePathIds(allocator, decoder);
-    errdefer allocator.free(path_ids);
-    const keys = try decodeKeys(allocator, decoder);
-    errdefer {
-        for (keys) |key| allocator.free(key);
-        allocator.free(keys);
-    }
-    const optional_keys = try decodeKeys(allocator, decoder);
-    errdefer {
-        for (optional_keys) |key| allocator.free(key);
-        allocator.free(optional_keys);
-    }
-    const values = try decodeEnumScalars(allocator, decoder);
-    errdefer {
-        for (values) |*value| value.deinit(allocator);
-        allocator.free(values);
-    }
-    const scalar_kind = if (try decoder.readBool())
-        try decoder.readEnum(JsonKind)
-    else
-        null;
-    const min_count = try readOptionalUsize(decoder);
-    const max_count = try readOptionalUsize(decoder);
-    const trimmed_min_count = try readOptionalUsize(decoder);
-    const min_number = try readOptionalF64(decoder);
-    const max_number = try readOptionalF64(decoder);
-    const identifier_style = try decoder.readEnum(IdentifierStyle);
-    const allow_root = try decoder.readBool();
-    const case_insensitive = try decoder.readBool();
-    const allow_additional = try decoder.readBool();
-    const allow_null = try decoder.readBool();
-    const total_coverage = try decoder.readBool();
-    const reject_self_reference = try decoder.readBool();
-    const ignore_null_references = try decoder.readBool();
-    const then_nonempty = try decoder.readBool();
-    const children = try decodeCacheRules(
-        allocator,
-        decoder,
-        input_count,
-        pointer_count,
-        depth + 1,
-        total_rule_count,
-        plan_depth,
-        imported_plan_count,
-    );
-    errdefer {
-        for (children) |*child| child.deinit(allocator);
-        allocator.free(children);
-    }
-    const coverage_children = try decodeCacheRules(
-        allocator,
-        decoder,
-        input_count,
-        pointer_count,
-        depth + 1,
-        total_rule_count,
-        plan_depth,
-        imported_plan_count,
-    );
-    errdefer {
-        for (coverage_children) |*child| child.deinit(allocator);
-        allocator.free(coverage_children);
-    }
-    const variant_count = try decoder.readCount(64);
-    const variants = try allocator.alloc(CompiledVariant, variant_count);
-    var variants_initialized: usize = 0;
-    errdefer {
-        for (variants[0..variants_initialized]) |*variant| {
-            variant.deinit(allocator);
-        }
-        allocator.free(variants);
-    }
-    for (variants) |*variant| {
-        const kind_or_tag = try decoder.readByte();
-        var tag_value: ?EnumScalar = null;
-        errdefer if (tag_value) |*value| value.deinit(allocator);
-        const kind: ?JsonKind = switch (kind_or_tag) {
-            0 => try decoder.readEnum(JsonKind),
-            1 => tag: {
-                tag_value = try decodeEnumScalar(allocator, decoder);
-                break :tag null;
-            },
-            else => return error.CacheTaggedUnionVariantInvalid,
-        };
-        const variant_rules = try decodeCacheRules(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth + 1,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        errdefer {
-            for (variant_rules) |*variant_rule| {
-                variant_rule.deinit(allocator);
-            }
-            allocator.free(variant_rules);
-        }
-        variant.* = .{
-            .kind = kind,
-            .tag_value = tag_value,
-            .rules = variant_rules,
-        };
-        tag_value = null;
-        variants_initialized += 1;
-    }
-    const format_parts = try decodeCompiledFormatParts(allocator, decoder);
-    errdefer {
-        for (format_parts) |*part| part.deinit(allocator);
-        allocator.free(format_parts);
-    }
-    const regex_patterns = try decodeCompiledRegexPatterns(
-        allocator,
-        decoder,
-    );
-    errdefer {
-        for (regex_patterns) |*pattern| pattern.deinit(allocator);
-        allocator.free(regex_patterns);
-    }
-    const sha256_mode = if (try decoder.readBool())
-        try decoder.readEnum(Sha256Mode)
-    else
-        null;
-    const sha256_prefix = try decoder.readOptionalBytesAlloc(
-        allocator,
-        4096,
-    );
-    errdefer if (sha256_prefix) |prefix| allocator.free(prefix);
-    const reference_source_count = try decoder.readCount(64);
-    const reference_sources = try allocator.alloc(
-        CompiledReferenceSource,
-        reference_source_count,
-    );
-    var reference_sources_initialized: usize = 0;
-    errdefer {
-        for (reference_sources[0..reference_sources_initialized]) |*source| {
-            source.deinit(allocator);
-        }
-        allocator.free(reference_sources);
-    }
-    for (reference_sources) |*source| {
-        const source_pointer_id = try decoder.readU16();
-        const source_items_pointer_id = try readOptionalU16(decoder);
-        const reference_pointer_id = try decoder.readU16();
-        const source_optional = try decoder.readBool();
-        const source_rules = try decodeCacheRules(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth + 1,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        errdefer {
-            for (source_rules) |*source_rule| {
-                source_rule.deinit(allocator);
-            }
-            allocator.free(source_rules);
-        }
-        source.* = .{
-            .pointer_id = source_pointer_id,
-            .items_pointer_id = source_items_pointer_id,
-            .reference_pointer_id = reference_pointer_id,
-            .optional = source_optional,
-            .rules = source_rules,
-            .format_parts = try decodeCompiledFormatParts(
-                allocator,
-                decoder,
-            ),
-        };
-        reference_sources_initialized += 1;
-    }
-    const reference_target_count = try decoder.readCount(64);
-    const reference_targets = try allocator.alloc(
-        CompiledReferenceTarget,
-        reference_target_count,
-    );
-    var reference_targets_initialized: usize = 0;
-    errdefer {
-        for (reference_targets[0..reference_targets_initialized]) |*target| {
-            target.deinit(allocator);
-        }
-        allocator.free(reference_targets);
-    }
-    for (reference_targets) |*target| {
-        const target_pointer_id = try decoder.readU16();
-        const target_optional = try decoder.readBool();
-        const items_pointer_id = try readOptionalU16(decoder);
-        const key_pointer_id = try readOptionalU16(decoder);
-        const coverage_key_pointer_id = try readOptionalU16(decoder);
-        const target_rules = try decodeCacheRules(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth + 1,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        errdefer {
-            for (target_rules) |*target_rule| {
-                target_rule.deinit(allocator);
-            }
-            allocator.free(target_rules);
-        }
-        const match_rules = try decodeCacheRules(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth + 1,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        errdefer {
-            for (match_rules) |*match_rule| {
-                match_rule.deinit(allocator);
-            }
-            allocator.free(match_rules);
-        }
-        const coverage_rules = try decodeCacheRules(
-            allocator,
-            decoder,
-            input_count,
-            pointer_count,
-            depth + 1,
-            total_rule_count,
-            plan_depth,
-            imported_plan_count,
-        );
-        errdefer {
-            for (coverage_rules) |*coverage_rule| {
-                coverage_rule.deinit(allocator);
-            }
-            allocator.free(coverage_rules);
-        }
-        const target_format_parts =
-            try decodeCompiledFormatParts(allocator, decoder);
-        errdefer {
-            for (target_format_parts) |*part| part.deinit(allocator);
-            allocator.free(target_format_parts);
-        }
-        target.* = .{
-            .pointer_id = target_pointer_id,
-            .optional = target_optional,
-            .items_pointer_id = items_pointer_id,
-            .key_pointer_id = key_pointer_id,
-            .coverage_key_pointer_id = coverage_key_pointer_id,
-            .rules = target_rules,
-            .match_rules = match_rules,
-            .coverage_rules = coverage_rules,
-            .format_parts = target_format_parts,
-        };
-        reference_targets_initialized += 1;
-    }
-    const imported_plan = if (try decoder.readBool()) blk: {
-        const plan = try allocator.create(Plan);
-        errdefer allocator.destroy(plan);
-        plan.* = try decodeCachePlan(
-            allocator,
-            decoder,
-            plan_depth + 1,
-            imported_plan_count,
-        );
-        break :blk plan;
-    } else null;
-    errdefer if (imported_plan) |plan| {
-        plan.deinit(allocator);
-        allocator.destroy(plan);
+    const context: CacheRuleDecodeContext = .{
+        .allocator = allocator,
+        .decoder = decoder,
+        .input_count = input_count,
+        .pointer_count = pointer_count,
+        .depth = depth,
+        .total_rule_count = total_rule_count,
+        .plan_depth = plan_depth,
+        .imported_plan_count = imported_plan_count,
     };
+    var header = try decodeCacheRuleHeader(context);
+    errdefer header.deinit(allocator);
+    var nested = try decodeCacheRuleNested(context);
+    errdefer nested.deinit(allocator);
+    var tail = try decodeCacheRuleTail(context);
+    errdefer tail.deinit(allocator);
     const rule: CompiledRule = .{
+        .operator = header.operator,
+        .input_index = header.input_index,
+        .pointer_id = header.pointer_id,
+        .import_index = header.import_index,
+        .imported_plan = tail.imported_plan,
+        .other_input_index = header.other_input_index,
+        .other_pointer_id = header.other_pointer_id,
+        .path_ids = header.path_ids,
+        .keys = header.keys,
+        .optional_keys = header.optional_keys,
+        .values = header.values,
+        .scalar_kind = header.scalar_kind,
+        .min_count = header.min_count,
+        .max_count = header.max_count,
+        .trimmed_min_count = header.trimmed_min_count,
+        .min_number = header.min_number,
+        .max_number = header.max_number,
+        .identifier_style = header.identifier_style,
+        .allow_root = header.allow_root,
+        .case_insensitive = header.case_insensitive,
+        .allow_additional = header.allow_additional,
+        .allow_null = header.allow_null,
+        .total_coverage = header.total_coverage,
+        .reject_self_reference = header.reject_self_reference,
+        .ignore_null_references = header.ignore_null_references,
+        .then_nonempty = header.then_nonempty,
+        .children = nested.children,
+        .coverage_children = nested.coverage_children,
+        .variants = nested.variants,
+        .format_parts = tail.format_parts,
+        .regex_patterns = tail.regex_patterns,
+        .sha256_mode = tail.sha256_mode,
+        .sha256_prefix = tail.sha256_prefix,
+        .reference_sources = tail.reference_sources,
+        .reference_targets = tail.reference_targets,
+    };
+    try validateCachedRule(rule, input_count, pointer_count);
+    return rule;
+}
+
+fn decodeCacheRuleHeader(
+    context: CacheRuleDecodeContext,
+) !DecodedCacheRuleHeader {
+    const operator = try context.decoder.readEnum(definition.Operator);
+    const input_index = try context.decoder.readByte();
+    const pointer_id = try readOptionalU16(context.decoder);
+    const import_index = try readOptionalU16(context.decoder);
+    const other_input_index = try readOptionalByte(context.decoder);
+    const other_pointer_id = try readOptionalU16(context.decoder);
+    const path_ids = try decodePathIds(context.allocator, context.decoder);
+    errdefer context.allocator.free(path_ids);
+    const keys = try decodeKeys(context.allocator, context.decoder);
+    errdefer deinitKeySlices(context.allocator, keys);
+    const optional_keys = try decodeKeys(context.allocator, context.decoder);
+    errdefer deinitKeySlices(context.allocator, optional_keys);
+    const values = try decodeEnumScalars(context.allocator, context.decoder);
+    errdefer {
+        for (values) |*value| value.deinit(context.allocator);
+        context.allocator.free(values);
+    }
+    return .{
         .operator = operator,
         .input_index = input_index,
         .pointer_id = pointer_id,
         .import_index = import_index,
-        .imported_plan = imported_plan,
         .other_input_index = other_input_index,
         .other_pointer_id = other_pointer_id,
         .path_ids = path_ids,
         .keys = keys,
         .optional_keys = optional_keys,
         .values = values,
-        .scalar_kind = scalar_kind,
-        .min_count = min_count,
-        .max_count = max_count,
-        .trimmed_min_count = trimmed_min_count,
-        .min_number = min_number,
-        .max_number = max_number,
-        .identifier_style = identifier_style,
-        .allow_root = allow_root,
-        .case_insensitive = case_insensitive,
-        .allow_additional = allow_additional,
-        .allow_null = allow_null,
-        .total_coverage = total_coverage,
-        .reject_self_reference = reject_self_reference,
-        .ignore_null_references = ignore_null_references,
-        .then_nonempty = then_nonempty,
+        .scalar_kind = if (try context.decoder.readBool())
+            try context.decoder.readEnum(JsonKind)
+        else
+            null,
+        .min_count = try readOptionalUsize(context.decoder),
+        .max_count = try readOptionalUsize(context.decoder),
+        .trimmed_min_count = try readOptionalUsize(context.decoder),
+        .min_number = try readOptionalF64(context.decoder),
+        .max_number = try readOptionalF64(context.decoder),
+        .identifier_style = try context.decoder.readEnum(IdentifierStyle),
+        .allow_root = try context.decoder.readBool(),
+        .case_insensitive = try context.decoder.readBool(),
+        .allow_additional = try context.decoder.readBool(),
+        .allow_null = try context.decoder.readBool(),
+        .total_coverage = try context.decoder.readBool(),
+        .reject_self_reference = try context.decoder.readBool(),
+        .ignore_null_references = try context.decoder.readBool(),
+        .then_nonempty = try context.decoder.readBool(),
+    };
+}
+
+fn decodeCacheRuleNested(
+    context: CacheRuleDecodeContext,
+) anyerror!DecodedCacheRuleNested {
+    const children = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, children);
+    const coverage_children = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, coverage_children);
+    const variants = try decodeCacheVariants(context);
+    errdefer {
+        for (variants) |*variant| variant.deinit(context.allocator);
+        context.allocator.free(variants);
+    }
+    return .{
         .children = children,
         .coverage_children = coverage_children,
         .variants = variants,
+    };
+}
+
+fn decodeCacheVariants(
+    context: CacheRuleDecodeContext,
+) anyerror![]CompiledVariant {
+    const count = try context.decoder.readCount(64);
+    const variants = try context.allocator.alloc(CompiledVariant, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (variants[0..initialized]) |*variant| {
+            variant.deinit(context.allocator);
+        }
+        context.allocator.free(variants);
+    }
+    for (variants) |*variant| {
+        variant.* = try decodeCacheVariant(context);
+        initialized += 1;
+    }
+    return variants;
+}
+
+fn decodeCacheVariant(
+    context: CacheRuleDecodeContext,
+) anyerror!CompiledVariant {
+    var tag_value: ?EnumScalar = null;
+    errdefer if (tag_value) |*value| value.deinit(context.allocator);
+    const kind: ?JsonKind = switch (try context.decoder.readByte()) {
+        0 => try context.decoder.readEnum(JsonKind),
+        1 => tag: {
+            tag_value = try decodeEnumScalar(
+                context.allocator,
+                context.decoder,
+            );
+            break :tag null;
+        },
+        else => return error.CacheTaggedUnionVariantInvalid,
+    };
+    return .{
+        .kind = kind,
+        .tag_value = tag_value,
+        .rules = try context.decodeRules(),
+    };
+}
+
+fn decodeCacheRuleTail(
+    context: CacheRuleDecodeContext,
+) anyerror!DecodedCacheRuleTail {
+    const format_parts = try decodeCompiledFormatParts(
+        context.allocator,
+        context.decoder,
+    );
+    errdefer deinitFormatParts(context.allocator, format_parts);
+    const regex_patterns = try decodeCompiledRegexPatterns(
+        context.allocator,
+        context.decoder,
+    );
+    errdefer deinitRegexPatterns(context.allocator, regex_patterns);
+    const sha256_mode = if (try context.decoder.readBool())
+        try context.decoder.readEnum(Sha256Mode)
+    else
+        null;
+    const sha256_prefix = try context.decoder.readOptionalBytesAlloc(
+        context.allocator,
+        4096,
+    );
+    errdefer if (sha256_prefix) |prefix| context.allocator.free(prefix);
+    const reference_sources = try decodeCacheReferenceSources(context);
+    errdefer deinitReferenceSources(context.allocator, reference_sources);
+    const reference_targets = try decodeCacheReferenceTargets(context);
+    errdefer deinitReferenceTargets(context.allocator, reference_targets);
+    const imported_plan = try decodeCacheImportedPlan(context);
+    errdefer if (imported_plan) |plan| {
+        plan.deinit(context.allocator);
+        context.allocator.destroy(plan);
+    };
+    return .{
         .format_parts = format_parts,
         .regex_patterns = regex_patterns,
         .sha256_mode = sha256_mode,
         .sha256_prefix = sha256_prefix,
         .reference_sources = reference_sources,
         .reference_targets = reference_targets,
+        .imported_plan = imported_plan,
     };
-    try validateCachedRule(rule, input_count, pointer_count);
-    return rule;
 }
 
+fn decodeCacheReferenceSources(
+    context: CacheRuleDecodeContext,
+) anyerror![]CompiledReferenceSource {
+    const count = try context.decoder.readCount(64);
+    const sources = try context.allocator.alloc(CompiledReferenceSource, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (sources[0..initialized]) |*source| {
+            source.deinit(context.allocator);
+        }
+        context.allocator.free(sources);
+    }
+    for (sources) |*source| {
+        source.* = try decodeCacheReferenceSource(context);
+        initialized += 1;
+    }
+    return sources;
+}
+
+fn decodeCacheReferenceSource(
+    context: CacheRuleDecodeContext,
+) anyerror!CompiledReferenceSource {
+    const pointer_id = try context.decoder.readU16();
+    const items_pointer_id = try readOptionalU16(context.decoder);
+    const reference_pointer_id = try context.decoder.readU16();
+    const optional = try context.decoder.readBool();
+    const rules = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, rules);
+    return .{
+        .pointer_id = pointer_id,
+        .items_pointer_id = items_pointer_id,
+        .reference_pointer_id = reference_pointer_id,
+        .optional = optional,
+        .rules = rules,
+        .format_parts = try decodeCompiledFormatParts(
+            context.allocator,
+            context.decoder,
+        ),
+    };
+}
+
+fn decodeCacheReferenceTargets(
+    context: CacheRuleDecodeContext,
+) anyerror![]CompiledReferenceTarget {
+    const count = try context.decoder.readCount(64);
+    const targets = try context.allocator.alloc(CompiledReferenceTarget, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (targets[0..initialized]) |*target| {
+            target.deinit(context.allocator);
+        }
+        context.allocator.free(targets);
+    }
+    for (targets) |*target| {
+        target.* = try decodeCacheReferenceTarget(context);
+        initialized += 1;
+    }
+    return targets;
+}
+
+fn decodeCacheReferenceTarget(
+    context: CacheRuleDecodeContext,
+) anyerror!CompiledReferenceTarget {
+    const pointer_id = try context.decoder.readU16();
+    const optional = try context.decoder.readBool();
+    const items_pointer_id = try readOptionalU16(context.decoder);
+    const key_pointer_id = try readOptionalU16(context.decoder);
+    const coverage_key_pointer_id = try readOptionalU16(context.decoder);
+    const rules = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, rules);
+    const match_rules = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, match_rules);
+    const coverage_rules = try context.decodeRules();
+    errdefer deinitRuleSlice(context.allocator, coverage_rules);
+    const format_parts = try decodeCompiledFormatParts(
+        context.allocator,
+        context.decoder,
+    );
+    errdefer deinitFormatParts(context.allocator, format_parts);
+    return .{
+        .pointer_id = pointer_id,
+        .optional = optional,
+        .items_pointer_id = items_pointer_id,
+        .key_pointer_id = key_pointer_id,
+        .coverage_key_pointer_id = coverage_key_pointer_id,
+        .rules = rules,
+        .match_rules = match_rules,
+        .coverage_rules = coverage_rules,
+        .format_parts = format_parts,
+    };
+}
+
+fn decodeCacheImportedPlan(
+    context: CacheRuleDecodeContext,
+) anyerror!?*Plan {
+    if (!try context.decoder.readBool()) return null;
+    const plan = try context.allocator.create(Plan);
+    errdefer context.allocator.destroy(plan);
+    plan.* = try decodeCachePlan(
+        context.allocator,
+        context.decoder,
+        context.plan_depth + 1,
+        context.imported_plan_count,
+    );
+    return plan;
+}
+
+fn deinitKeySlices(
+    allocator: std.mem.Allocator,
+    keys: [][]u8,
+) void {
+    for (keys) |key| allocator.free(key);
+    allocator.free(keys);
+}
+
+fn deinitRuleSlice(
+    allocator: std.mem.Allocator,
+    rules: []CompiledRule,
+) void {
+    for (rules) |*rule| rule.deinit(allocator);
+    allocator.free(rules);
+}
+
+fn deinitFormatParts(
+    allocator: std.mem.Allocator,
+    parts: []CompiledFormatPart,
+) void {
+    for (parts) |*part| part.deinit(allocator);
+    allocator.free(parts);
+}
+
+fn deinitRegexPatterns(
+    allocator: std.mem.Allocator,
+    patterns: []CompiledRegexPattern,
+) void {
+    for (patterns) |*pattern| pattern.deinit(allocator);
+    allocator.free(patterns);
+}
+
+fn deinitReferenceSources(
+    allocator: std.mem.Allocator,
+    sources: []CompiledReferenceSource,
+) void {
+    for (sources) |*source| source.deinit(allocator);
+    allocator.free(sources);
+}
+
+fn deinitReferenceTargets(
+    allocator: std.mem.Allocator,
+    targets: []CompiledReferenceTarget,
+) void {
+    for (targets) |*target| target.deinit(allocator);
+    allocator.free(targets);
+}
 fn decodeCompiledFormatParts(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
@@ -3548,6 +4022,29 @@ fn validateCachedRule(
     input_count: usize,
     pointer_count: usize,
 ) anyerror!void {
+    try validateCachedRuleIndices(rule, input_count, pointer_count);
+    try validateCachedBasicRule(rule);
+    try validateCachedRegexRule(rule);
+    try validateCachedSha256Rule(rule);
+    try validateCachedPathRule(rule);
+    try validateCachedComparisonRule(rule);
+    try validateCachedReferenceRule(rule);
+    try validateCachedProtocolRule(rule);
+    try validateCachedOwnershipFields(rule);
+    try validateCachedPayloadFields(rule);
+    try validateCachedExtensionFields(rule);
+    try validateCachedFormatParts(rule.format_parts, pointer_count, false);
+    try validateCachedChildRelations(rule);
+    try validateCachedReferenceRelations(rule, pointer_count);
+    try validateCachedVariantRelations(rule);
+    try validateCachedImportedRelations(rule);
+}
+
+fn validateCachedRuleIndices(
+    rule: CompiledRule,
+    input_count: usize,
+    pointer_count: usize,
+) !void {
     if (rule.input_index >= input_count or
         (rule.pointer_id != null and rule.pointer_id.? >= pointer_count) or
         (rule.other_input_index != null and
@@ -3575,6 +4072,9 @@ fn validateCachedRule(
     {
         return error.InvalidRuleBounds;
     }
+}
+
+fn validateCachedBasicRule(rule: CompiledRule) !void {
     switch (rule.operator) {
         .required_field, .field_absent => if (rule.pointer_id == null) {
             return error.CacheRuleConfigurationInvalid;
@@ -3597,79 +4097,6 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .regex => if (rule.max_count == null or
-            rule.max_count.? == 0 or
-            rule.max_count.? > max_regex_subject_bytes or
-            rule.regex_patterns.len == 0 or
-            rule.regex_patterns.len > max_regex_patterns)
-        {
-            return error.CacheRuleConfigurationInvalid;
-        } else {
-            var total_atoms: usize = 0;
-            for (rule.regex_patterns) |pattern| {
-                if (pattern.atoms.len == 0 or
-                    pattern.atoms.len > max_regex_atoms_per_pattern)
-                {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-                total_atoms = std.math.add(
-                    usize,
-                    total_atoms,
-                    pattern.atoms.len,
-                ) catch return error.CacheRuleConfigurationInvalid;
-                if (total_atoms > max_regex_total_atoms) {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-                for (pattern.atoms) |atom| {
-                    if (regexByteSetEmpty(atom.bytes)) {
-                        return error.CacheRuleConfigurationInvalid;
-                    }
-                }
-            }
-        },
-        .sha256 => if (rule.max_count == null or
-            rule.max_count.? == 0 or
-            rule.max_count.? > max_sha256_subject_bytes or
-            rule.other_pointer_id == null or
-            rule.sha256_mode == null)
-        {
-            return error.CacheRuleConfigurationInvalid;
-        } else switch (rule.sha256_mode.?) {
-            .canonical_json_null => {
-                if (rule.path_ids.len != 1 or
-                    rule.sha256_prefix != null or
-                    rule.format_parts.len != 0)
-                {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-            },
-            .framed_items => {
-                if (rule.path_ids.len != 1 or
-                    rule.sha256_prefix == null or
-                    rule.sha256_prefix.?.len > 4096 or
-                    rule.format_parts.len == 0 or
-                    rule.format_parts.len > 32)
-                {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-            },
-            .framed_fields => {
-                if (rule.path_ids.len != 0 or
-                    rule.sha256_prefix == null or
-                    rule.sha256_prefix.?.len > 4096 or
-                    rule.format_parts.len == 0 or
-                    rule.format_parts.len > 32)
-                {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-                for (rule.format_parts) |part| switch (part) {
-                    .literal, .parent => {},
-                    .item, .value => {
-                        return error.CacheRuleConfigurationInvalid;
-                    },
-                };
-            },
-        },
         .bounded_number => if (rule.min_number == null and
             rule.max_number == null)
         {
@@ -3678,6 +4105,89 @@ fn validateCachedRule(
         .enum_value => if (rule.values.len == 0) {
             return error.CacheRuleConfigurationInvalid;
         },
+        .sorted => if (rule.pointer_id == null or rule.path_ids.len != 0) {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        else => {},
+    }
+}
+
+fn validateCachedRegexRule(rule: CompiledRule) !void {
+    if (rule.operator != .regex) return;
+    if (rule.max_count == null or
+        rule.max_count.? == 0 or
+        rule.max_count.? > max_regex_subject_bytes or
+        rule.regex_patterns.len == 0 or
+        rule.regex_patterns.len > max_regex_patterns)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    var total_atoms: usize = 0;
+    for (rule.regex_patterns) |pattern| {
+        if (pattern.atoms.len == 0 or
+            pattern.atoms.len > max_regex_atoms_per_pattern)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        total_atoms = std.math.add(
+            usize,
+            total_atoms,
+            pattern.atoms.len,
+        ) catch return error.CacheRuleConfigurationInvalid;
+        if (total_atoms > max_regex_total_atoms) {
+            return error.CacheRuleConfigurationInvalid;
+        }
+        for (pattern.atoms) |atom| {
+            if (regexByteSetEmpty(atom.bytes)) {
+                return error.CacheRuleConfigurationInvalid;
+            }
+        }
+    }
+}
+
+fn validateCachedSha256Rule(rule: CompiledRule) !void {
+    if (rule.operator != .sha256) return;
+    if (rule.max_count == null or
+        rule.max_count.? == 0 or
+        rule.max_count.? > max_sha256_subject_bytes or
+        rule.other_pointer_id == null or
+        rule.sha256_mode == null)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    switch (rule.sha256_mode.?) {
+        .canonical_json_null => if (rule.path_ids.len != 1 or
+            rule.sha256_prefix != null or rule.format_parts.len != 0)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .framed_items => if (rule.path_ids.len != 1 or
+            rule.sha256_prefix == null or
+            rule.sha256_prefix.?.len > 4096 or
+            rule.format_parts.len == 0 or
+            rule.format_parts.len > 32)
+        {
+            return error.CacheRuleConfigurationInvalid;
+        },
+        .framed_fields => {
+            if (rule.path_ids.len != 0 or
+                rule.sha256_prefix == null or
+                rule.sha256_prefix.?.len > 4096 or
+                rule.format_parts.len == 0 or
+                rule.format_parts.len > 32)
+            {
+                return error.CacheRuleConfigurationInvalid;
+            }
+            for (rule.format_parts) |part| switch (part) {
+                .literal, .parent => {},
+                .item, .value => return error.CacheRuleConfigurationInvalid,
+            };
+        },
+    }
+}
+
+fn validateCachedPathRule(rule: CompiledRule) !void {
+    switch (rule.operator) {
         .safe_relative_path => {
             if (rule.keys.len > 64) {
                 return error.CacheRuleConfigurationInvalid;
@@ -3701,11 +4211,12 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .sorted => if (rule.pointer_id == null or
-            rule.path_ids.len != 0)
-        {
-            return error.CacheRuleConfigurationInvalid;
-        },
+        else => {},
+    }
+}
+
+fn validateCachedComparisonRule(rule: CompiledRule) !void {
+    switch (rule.operator) {
         .set_equality,
         .subset,
         .superset,
@@ -3717,17 +4228,7 @@ fn validateCachedRule(
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
-        => if (rule.other_input_index == null or
-            rule.pointer_id == null or
-            rule.other_pointer_id == null)
-        {
-            return error.CacheRuleConfigurationInvalid;
-        } else if (rule.path_ids.len > 1 or
-            (rule.path_ids.len == 1 and
-                rule.input_index != rule.other_input_index.?))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        },
+        => try validateCachedComparisonPointers(rule),
         .exactly_one, .at_least_one => {
             const field_mode = rule.path_ids.len != 0 and
                 rule.pointer_id == null and rule.children.len <= 64;
@@ -3749,88 +4250,119 @@ fn validateCachedRule(
             }
         },
         .keyed_join => if (rule.pointer_id == null or
-            rule.other_pointer_id == null or
-            rule.path_ids.len != 3)
+            rule.other_pointer_id == null or rule.path_ids.len != 3)
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .declared_field_values => if (rule.pointer_id == null or
-            rule.other_pointer_id == null or
-            rule.path_ids.len < 2 or
-            rule.scalar_kind == null or
-            (rule.scalar_kind.? != .integer and
-                rule.scalar_kind.? != .number) or
-            (rule.min_number == null and rule.max_number == null))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        },
-        .reference_exists => if (rule.other_input_index == null or
-            (rule.reference_sources.len == 0 and
-                (rule.pointer_id == null or
-                    rule.other_pointer_id == null)) or
-            (rule.reference_sources.len != 0 and
-                (rule.pointer_id != null or
-                    rule.other_pointer_id != null)))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        } else if ((rule.reference_targets.len == 0 and
-            rule.path_ids.len != 2 and rule.path_ids.len != 3) or
-            (rule.reference_targets.len != 0 and
-                (rule.path_ids.len != 0 or
-                    rule.children.len != 0 or
-                    rule.coverage_children.len != 0)))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        } else if (rule.reject_self_reference and rule.path_ids.len != 2) {
-            return error.CacheRuleConfigurationInvalid;
-        } else if (rule.coverage_children.len != 0 and
-            !rule.total_coverage)
-        {
-            return error.CacheRuleConfigurationInvalid;
-        },
-        .implies => {
-            const scalar_mode = rule.other_input_index != null and
-                rule.other_pointer_id != null and
-                rule.children.len == 0;
-            const conditional_mode = rule.other_input_index == null and
-                rule.other_pointer_id == null and
-                rule.children.len > 0 and rule.children.len <= 64;
-            const max_values: usize = if (scalar_mode) 2 else 1;
-            const max_values_with_nonempty: usize =
-                if (scalar_mode) 1 else 0;
-            if (rule.pointer_id == null or
-                (!scalar_mode and !conditional_mode) or
-                rule.values.len > max_values or
-                (rule.min_count != null and rule.min_count.? != 1) or
-                (rule.max_count != null and rule.max_count.? != 0) or
-                (rule.min_count != null and rule.max_count != null) or
-                (rule.min_count != null and
-                    rule.values.len > max_values_with_nonempty) or
-                (rule.max_count != null and
-                    rule.values.len > max_values_with_nonempty) or
-                (rule.then_nonempty and
-                    (!scalar_mode or
-                        rule.values.len == 2 or
-                        ((rule.min_count != null or rule.max_count != null) and
-                            rule.values.len == 1))))
-            {
-                return error.CacheRuleConfigurationInvalid;
-            }
-        },
+        .declared_field_values => try validateCachedDeclaredValues(rule),
+        else => {},
+    }
+}
+
+fn validateCachedComparisonPointers(rule: CompiledRule) !void {
+    if (rule.other_input_index == null or
+        rule.pointer_id == null or
+        rule.other_pointer_id == null)
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.path_ids.len > 1 or
+        (rule.path_ids.len == 1 and
+            rule.input_index != rule.other_input_index.?))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+}
+
+fn validateCachedDeclaredValues(rule: CompiledRule) !void {
+    if (rule.pointer_id == null or
+        rule.other_pointer_id == null or
+        rule.path_ids.len < 2 or
+        rule.scalar_kind == null or
+        (rule.scalar_kind.? != .integer and
+            rule.scalar_kind.? != .number) or
+        (rule.min_number == null and rule.max_number == null))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+}
+
+fn validateCachedReferenceRule(rule: CompiledRule) !void {
+    switch (rule.operator) {
+        .reference_exists => try validateCachedReferenceShape(rule),
+        .implies => try validateCachedImplication(rule),
+        else => {},
+    }
+}
+
+fn validateCachedReferenceShape(rule: CompiledRule) !void {
+    if (rule.other_input_index == null or
+        (rule.reference_sources.len == 0 and
+            (rule.pointer_id == null or rule.other_pointer_id == null)) or
+        (rule.reference_sources.len != 0 and
+            (rule.pointer_id != null or rule.other_pointer_id != null)))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if ((rule.reference_targets.len == 0 and
+        rule.path_ids.len != 2 and rule.path_ids.len != 3) or
+        (rule.reference_targets.len != 0 and
+            (rule.path_ids.len != 0 or
+                rule.children.len != 0 or
+                rule.coverage_children.len != 0)))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.reject_self_reference and rule.path_ids.len != 2) {
+        return error.CacheRuleConfigurationInvalid;
+    }
+    if (rule.coverage_children.len != 0 and !rule.total_coverage) {
+        return error.CacheRuleConfigurationInvalid;
+    }
+}
+
+fn validateCachedImplication(rule: CompiledRule) !void {
+    const scalar_mode = rule.other_input_index != null and
+        rule.other_pointer_id != null and rule.children.len == 0;
+    const conditional_mode = rule.other_input_index == null and
+        rule.other_pointer_id == null and
+        rule.children.len > 0 and rule.children.len <= 64;
+    const max_values: usize = if (scalar_mode) 2 else 1;
+    const max_nonempty_values: usize = if (scalar_mode) 1 else 0;
+    if (rule.pointer_id == null or
+        (!scalar_mode and !conditional_mode) or
+        rule.values.len > max_values or
+        (rule.min_count != null and rule.min_count.? != 1) or
+        (rule.max_count != null and rule.max_count.? != 0) or
+        (rule.min_count != null and rule.max_count != null) or
+        (rule.min_count != null and
+            rule.values.len > max_nonempty_values) or
+        (rule.max_count != null and
+            rule.values.len > max_nonempty_values) or
+        (rule.then_nonempty and
+            (!scalar_mode or
+                rule.values.len == 2 or
+                ((rule.min_count != null or rule.max_count != null) and
+                    rule.values.len == 1))))
+    {
+        return error.CacheRuleConfigurationInvalid;
+    }
+}
+
+fn validateCachedProtocolRule(rule: CompiledRule) !void {
+    switch (rule.operator) {
         .total_partition => if (rule.pointer_id == null or
             rule.path_ids.len < 2)
         {
             return error.CacheRuleConfigurationInvalid;
         },
-        .total_mapping => if (rule.pointer_id == null or
-            rule.other_pointer_id == null or
-            rule.path_ids.len != 3)
+        .total_mapping, .keyed_join => if (rule.pointer_id == null or
+            rule.other_pointer_id == null or rule.path_ids.len != 3)
         {
             return error.CacheRuleConfigurationInvalid;
         },
         .predecessor_successor => if (rule.pointer_id == null or
-            rule.other_pointer_id == null or
-            rule.path_ids.len != 8)
+            rule.other_pointer_id == null or rule.path_ids.len != 8)
         {
             return error.CacheRuleConfigurationInvalid;
         },
@@ -3863,6 +4395,9 @@ fn validateCachedRule(
         },
         else => {},
     }
+}
+
+fn validateCachedOwnershipFields(rule: CompiledRule) !void {
     if (rule.operator != .definition_ref and
         (rule.import_index != null or rule.imported_plan != null))
     {
@@ -3895,6 +4430,9 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
+}
+
+fn validateCachedPayloadFields(rule: CompiledRule) !void {
     if (rule.operator != .exact_object and
         rule.operator != .safe_relative_path and
         rule.operator != .forbidden_object_keys and
@@ -3920,21 +4458,30 @@ fn validateCachedRule(
             }
         }
     }
-    if (rule.operator != .optional_field and
-        rule.operator != .one_of and
-        rule.operator != .all_rules and
-        rule.operator != .any_rules and
-        rule.operator != .no_rules and
-        rule.operator != .object_values and
-        rule.operator != .reference_exists and
-        rule.operator != .keyed_join and
-        rule.operator != .exactly_one and
-        rule.operator != .at_least_one and
-        rule.operator != .implies and
-        rule.children.len != 0)
-    {
+    if (!operatorOwnsChildren(rule.operator) and rule.children.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
+}
+
+fn operatorOwnsChildren(operator: definition.Operator) bool {
+    return switch (operator) {
+        .optional_field,
+        .one_of,
+        .all_rules,
+        .any_rules,
+        .no_rules,
+        .object_values,
+        .reference_exists,
+        .keyed_join,
+        .exactly_one,
+        .at_least_one,
+        .implies,
+        => true,
+        else => false,
+    };
+}
+
+fn validateCachedExtensionFields(rule: CompiledRule) !void {
     if (rule.operator != .tagged_union and rule.variants.len != 0) {
         return error.CacheRuleConfigurationInvalid;
     }
@@ -3953,16 +4500,13 @@ fn validateCachedRule(
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .reference_exists and
-        rule.ignore_null_references)
+        (rule.ignore_null_references or
+            rule.coverage_children.len != 0 or
+            rule.reference_targets.len != 0))
     {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .implies and rule.then_nonempty) {
-        return error.CacheRuleConfigurationInvalid;
-    }
-    if (rule.operator != .reference_exists and
-        rule.coverage_children.len != 0)
-    {
         return error.CacheRuleConfigurationInvalid;
     }
     if (rule.operator != .reference_exists and
@@ -3971,35 +4515,9 @@ fn validateCachedRule(
     {
         return error.CacheRuleConfigurationInvalid;
     }
-    if (rule.operator != .reference_exists and
-        rule.reference_targets.len != 0)
-    {
-        return error.CacheRuleConfigurationInvalid;
-    }
-    var format_literal_bytes: usize = 0;
-    for (rule.format_parts) |part| {
-        switch (part) {
-            .literal => |literal| {
-                if (literal.len == 0) {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-                format_literal_bytes = std.math.add(
-                    usize,
-                    format_literal_bytes,
-                    literal.len,
-                ) catch return error.CacheRuleConfigurationInvalid;
-                if (format_literal_bytes > 4096) {
-                    return error.CacheRuleConfigurationInvalid;
-                }
-            },
-            .parent, .item => |pointer_id| {
-                if (pointer_id >= pointer_count) {
-                    return error.CacheRuleIndexInvalid;
-                }
-            },
-            .value => return error.CacheRuleConfigurationInvalid,
-        }
-    }
+}
+
+fn validateCachedChildRelations(rule: CompiledRule) !void {
     for (rule.children) |child| {
         if (rule.operator == .implies) {
             if (!isValidationOperator(child.operator)) {
@@ -4010,7 +4528,6 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         }
-        try validateCachedRule(child, input_count, pointer_count);
     }
     for (rule.coverage_children) |child| {
         if (child.input_index != rule.other_input_index.? or
@@ -4018,14 +4535,18 @@ fn validateCachedRule(
         {
             return error.CacheRuleConfigurationInvalid;
         }
-        try validateCachedRule(child, input_count, pointer_count);
     }
+}
+
+fn validateCachedReferenceRelations(
+    rule: CompiledRule,
+    pointer_count: usize,
+) anyerror!void {
     for (rule.reference_targets) |target| {
         try validateCachedReferenceTarget(
             target,
             rule.other_input_index.?,
             rule.total_coverage,
-            input_count,
             pointer_count,
         );
     }
@@ -4042,19 +4563,11 @@ fn validateCachedRule(
             pointer_count,
             true,
         );
-        for (source.rules) |source_rule| {
-            if (source_rule.input_index != rule.input_index or
-                !isItemOperator(source_rule.operator))
-            {
-                return error.CacheRuleConfigurationInvalid;
-            }
-            try validateCachedRule(
-                source_rule,
-                input_count,
-                pointer_count,
-            );
-        }
+        try validateCachedItemRuleGroup(source.rules, rule.input_index);
     }
+}
+
+fn validateCachedVariantRelations(rule: CompiledRule) !void {
     for (rule.variants, 0..) |variant, index| {
         if ((rule.other_pointer_id == null and
             (variant.kind == null or variant.tag_value != null)) or
@@ -4075,28 +4588,19 @@ fn validateCachedRule(
                 return error.CacheRuleConfigurationInvalid;
             }
         }
-        for (variant.rules) |variant_rule| {
-            if (variant_rule.input_index != rule.input_index or
-                !isItemOperator(variant_rule.operator))
-            {
-                return error.CacheRuleConfigurationInvalid;
-            }
-            try validateCachedRule(
-                variant_rule,
-                input_count,
-                pointer_count,
-            );
-        }
+        try validateCachedItemRuleGroup(variant.rules, rule.input_index);
     }
-    if (rule.imported_plan) |imported_plan| {
-        for (imported_plan.rules) |imported_rule| {
-            if (imported_rule.input_index != 0 or
-                (imported_rule.other_input_index != null and
-                    imported_rule.other_input_index.? != 0) or
-                !isValidationOperator(imported_rule.operator))
-            {
-                return error.CacheRuleConfigurationInvalid;
-            }
+}
+
+fn validateCachedImportedRelations(rule: CompiledRule) !void {
+    const imported_plan = rule.imported_plan orelse return;
+    for (imported_plan.rules) |imported_rule| {
+        if (imported_rule.input_index != 0 or
+            (imported_rule.other_input_index != null and
+                imported_rule.other_input_index.? != 0) or
+            !isValidationOperator(imported_rule.operator))
+        {
+            return error.CacheRuleConfigurationInvalid;
         }
     }
 }
@@ -4105,7 +4609,6 @@ fn validateCachedReferenceTarget(
     target: CompiledReferenceTarget,
     input_index: u8,
     total_coverage: bool,
-    input_count: usize,
     pointer_count: usize,
 ) anyerror!void {
     if (target.pointer_id >= pointer_count or
@@ -4129,29 +4632,21 @@ fn validateCachedReferenceTarget(
         pointer_count,
         false,
     );
-    for (target.rules) |rule| {
+    try validateCachedItemRuleGroup(target.rules, input_index);
+    try validateCachedItemRuleGroup(target.match_rules, input_index);
+    try validateCachedItemRuleGroup(target.coverage_rules, input_index);
+}
+
+fn validateCachedItemRuleGroup(
+    rules: []const CompiledRule,
+    input_index: u8,
+) !void {
+    for (rules) |rule| {
         if (rule.input_index != input_index or
             !isItemOperator(rule.operator))
         {
             return error.CacheRuleConfigurationInvalid;
         }
-        try validateCachedRule(rule, input_count, pointer_count);
-    }
-    for (target.match_rules) |rule| {
-        if (rule.input_index != input_index or
-            !isItemOperator(rule.operator))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        }
-        try validateCachedRule(rule, input_count, pointer_count);
-    }
-    for (target.coverage_rules) |rule| {
-        if (rule.input_index != input_index or
-            !isItemOperator(rule.operator))
-        {
-            return error.CacheRuleConfigurationInvalid;
-        }
-        try validateCachedRule(rule, input_count, pointer_count);
     }
 }
 
@@ -4409,89 +4904,25 @@ pub fn execute(
 
     var total_bytes: usize = 0;
     for (documents) |document| {
-        const input_index = findInput(validation_plan.inputs, document.name) orelse
-            return error.UnknownInputBinding;
-        if (seen[input_index]) return error.DuplicateInputBinding;
-        seen[input_index] = true;
-        total_bytes = std.math.add(usize, total_bytes, document.bytes.len) catch
-            return error.InputBytesExceeded;
-        if (document.bytes.len > validation_plan.inputs[input_index].max_bytes or
-            total_bytes > validation_plan.max_input_bytes)
-        {
-            try diagnostics.add(
-                "artifact.input-too-large",
-                document.name,
-                "input exceeds its declared byte bound",
-            );
-            continue;
-        }
-        loaded[input_index].bytes = document.bytes;
-        {
-            const digest_name = try allocator.dupe(u8, document.name);
-            errdefer allocator.free(digest_name);
-            const digest_value = try definition_core.canonical_json.digestBytesAlloc(
-                allocator,
-                document.bytes,
-            );
-            errdefer allocator.free(digest_value);
-            try digests.append(allocator, .{
-                .name = digest_name,
-                .digest = digest_value,
-            });
-        }
-        switch (validation_plan.inputs[input_index].codec) {
-            .json => {
-                loaded[input_index].parsed_json = std.json.parseFromSlice(
-                    std.json.Value,
-                    allocator,
-                    document.bytes,
-                    .{
-                        .allocate = .alloc_always,
-                        .duplicate_field_behavior = .@"error",
-                    },
-                ) catch {
-                    try diagnostics.add(
-                        "artifact.invalid-json",
-                        document.name,
-                        "input is not duplicate-free JSON",
-                    );
-                    continue;
-                };
-            },
-            .jsonl => try validateJsonl(
-                allocator,
-                document.name,
-                document.bytes,
-                validation_plan.max_records,
-                &diagnostics,
-            ),
-            .text => if (!std.unicode.utf8ValidateSlice(document.bytes)) {
-                try diagnostics.add(
-                    "artifact.invalid-utf8",
-                    document.name,
-                    "text input is not valid UTF-8",
-                );
-            },
-        }
-    }
-    for (validation_plan.inputs, 0..) |input, index| {
-        if (input.required and !seen[index]) {
-            try diagnostics.add(
-                "artifact.missing-input",
-                input.name,
-                "required input was not supplied",
-            );
-        }
-    }
-    for (validation_plan.rules) |rule| {
-        try applyRule(
+        try loadInputDocument(
             allocator,
             validation_plan,
+            document,
             loaded,
-            rule,
+            seen,
+            &total_bytes,
+            &digests,
             &diagnostics,
         );
     }
+    try addMissingInputDiagnostics(validation_plan, seen, &diagnostics);
+    try applyRules(
+        allocator,
+        validation_plan,
+        loaded,
+        validation_plan.rules,
+        &diagnostics,
+    );
     std.sort.heap(InputDigest, digests.items, {}, struct {
         fn lessThan(_: void, left: InputDigest, right: InputDigest) bool {
             return std.mem.lessThan(u8, left.name, right.name);
@@ -4504,6 +4935,122 @@ pub fn execute(
         .input_digests = input_digests,
         .diagnostics = diagnostics,
     };
+}
+
+fn loadInputDocument(
+    allocator: std.mem.Allocator,
+    validation_plan: *const Plan,
+    document: InputDocument,
+    loaded: []LoadedInput,
+    seen: []bool,
+    total_bytes: *usize,
+    digests: *std.ArrayList(InputDigest),
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
+    const input_index = findInput(
+        validation_plan.inputs,
+        document.name,
+    ) orelse return error.UnknownInputBinding;
+    if (seen[input_index]) return error.DuplicateInputBinding;
+    seen[input_index] = true;
+    total_bytes.* = std.math.add(
+        usize,
+        total_bytes.*,
+        document.bytes.len,
+    ) catch return error.InputBytesExceeded;
+    if (document.bytes.len > validation_plan.inputs[input_index].max_bytes or
+        total_bytes.* > validation_plan.max_input_bytes)
+    {
+        try diagnostics.add(
+            "artifact.input-too-large",
+            document.name,
+            "input exceeds its declared byte bound",
+        );
+        return;
+    }
+    loaded[input_index].bytes = document.bytes;
+    try appendInputDigest(allocator, document, digests);
+    try parseLoadedInput(
+        allocator,
+        validation_plan,
+        document,
+        input_index,
+        loaded,
+        diagnostics,
+    );
+}
+
+fn appendInputDigest(
+    allocator: std.mem.Allocator,
+    document: InputDocument,
+    digests: *std.ArrayList(InputDigest),
+) !void {
+    const name = try allocator.dupe(u8, document.name);
+    errdefer allocator.free(name);
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        document.bytes,
+    );
+    errdefer allocator.free(digest);
+    try digests.append(allocator, .{ .name = name, .digest = digest });
+}
+
+fn parseLoadedInput(
+    allocator: std.mem.Allocator,
+    validation_plan: *const Plan,
+    document: InputDocument,
+    input_index: usize,
+    loaded: []LoadedInput,
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
+    switch (validation_plan.inputs[input_index].codec) {
+        .json => loaded[input_index].parsed_json = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            document.bytes,
+            .{
+                .allocate = .alloc_always,
+                .duplicate_field_behavior = .@"error",
+            },
+        ) catch {
+            try diagnostics.add(
+                "artifact.invalid-json",
+                document.name,
+                "input is not duplicate-free JSON",
+            );
+            return;
+        },
+        .jsonl => try validateJsonl(
+            allocator,
+            document.name,
+            document.bytes,
+            validation_plan.max_records,
+            diagnostics,
+        ),
+        .text => if (!std.unicode.utf8ValidateSlice(document.bytes)) {
+            try diagnostics.add(
+                "artifact.invalid-utf8",
+                document.name,
+                "text input is not valid UTF-8",
+            );
+        },
+    }
+}
+
+fn addMissingInputDiagnostics(
+    validation_plan: *const Plan,
+    seen: []const bool,
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
+    for (validation_plan.inputs, 0..) |input, index| {
+        if (input.required and !seen[index]) {
+            try diagnostics.add(
+                "artifact.missing-input",
+                input.name,
+                "required input was not supplied",
+            );
+        }
+    }
 }
 
 pub const InputValue = struct {
@@ -4537,24 +5084,14 @@ pub fn executeValues(
         seen[input_index] = true;
         loaded[input_index].borrowed_json = value.value;
     }
-    for (validation_plan.inputs, 0..) |input, index| {
-        if (input.required and !seen[index]) {
-            try diagnostics.add(
-                "artifact.missing-input",
-                input.name,
-                "required input was not supplied",
-            );
-        }
-    }
-    for (validation_plan.rules) |rule| {
-        try applyRule(
-            allocator,
-            validation_plan,
-            loaded,
-            rule,
-            &diagnostics,
-        );
-    }
+    try addMissingInputDiagnostics(validation_plan, seen, &diagnostics);
+    try applyRules(
+        allocator,
+        validation_plan,
+        loaded,
+        validation_plan.rules,
+        &diagnostics,
+    );
     return .{
         .allocator = allocator,
         .loaded = loaded,
@@ -4574,6 +5111,43 @@ pub fn validate(
     return execution.takeResult(allocator, definition_plan);
 }
 
+fn applyRules(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rules: []const CompiledRule,
+    diagnostics: *definition_core.diagnostics.Collector,
+) !void {
+    var pending: std.ArrayList(*const CompiledRule) = .empty;
+    defer pending.deinit(allocator);
+    try pushExecutionRules(&pending, allocator, rules);
+    while (pending.pop()) |rule| {
+        if (rule.operator == .implies and rule.children.len != 0) {
+            const root = loaded[rule.input_index].json() orelse continue;
+            if (implicationPredicateHolds(plan, root, rule.*)) {
+                try pushExecutionRules(&pending, allocator, rule.children);
+            }
+            continue;
+        }
+        try applyRule(allocator, plan, loaded, rule.*, diagnostics);
+    }
+}
+
+fn pushExecutionRules(
+    pending: *std.ArrayList(*const CompiledRule),
+    allocator: std.mem.Allocator,
+    rules: []const CompiledRule,
+) !void {
+    if (rules.len > 65_535 - pending.items.len) {
+        return error.TooManyItemRules;
+    }
+    var index = rules.len;
+    while (index > 0) {
+        index -= 1;
+        try pending.append(allocator, &rules[index]);
+    }
+}
+
 fn applyRule(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -4587,161 +5161,246 @@ fn applyRule(
     else
         root;
     const path = if (rule.pointer_id) |pointer_id| plan.pointers[pointer_id].raw else "";
-    if (rule.operator == .implies and rule.children.len != 0) {
-        if (implicationPredicateHolds(plan, root, rule)) {
-            for (rule.children) |child| {
-                try applyRule(
-                    allocator,
-                    plan,
-                    loaded,
-                    child,
-                    diagnostics,
-                );
-            }
-        }
-        return;
+    const valid = (try evaluateRule(.{
+        .allocator = allocator,
+        .plan = plan,
+        .loaded = loaded,
+        .rule = rule,
+        .root = root,
+        .target = target,
+    })) orelse return;
+    if (!valid) {
+        try diagnostics.add(
+            rule.operator.id(),
+            path,
+            "artifact does not satisfy the compiled structural rule",
+        );
     }
-    const valid = switch (rule.operator) {
+}
+
+const RuleEvaluationContext = struct {
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rule: CompiledRule,
+    root: std.json.Value,
+    target: ?std.json.Value,
+};
+
+fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
+    return switch (context.rule.operator) {
+        .required_field,
+        .field_absent,
+        .optional_field,
+        .exact_object,
+        .scalar_type,
+        .bounded_string,
+        .regex,
+        .sha256,
+        .bounded_number,
+        .bounded_array,
+        .bounded_object,
+        .enum_value,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .safe_relative_path,
+        .forbidden_object_keys,
+        .unique,
+        .sorted,
+        => try evaluatePrimitiveRule(context),
+        .keyed_unique,
+        .keyed_join,
+        .declared_field_values,
+        .reference_exists,
+        .implies,
+        => try evaluateIndexedRule(context),
+        .total_partition,
+        .total_mapping,
+        .predecessor_successor,
+        .path_format,
+        => try evaluateProtocolRule(context),
+        else => try evaluateCompositeRule(context),
+    };
+}
+
+fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
+    const rule = context.rule;
+    const target = context.target;
+    return switch (rule.operator) {
         .required_field => target != null,
         .field_absent => target == null,
         .optional_field => if (target) |value|
             (rule.allow_null and value == .null) or
                 rule.children.len == 0 or
                 try itemRulesHold(
-                    allocator,
-                    plan,
+                    context.allocator,
+                    context.plan,
                     rule.children,
                     value,
                 )
         else
             true,
         .exact_object => if (target) |value| exactObject(value, rule) else false,
-        .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
+        .scalar_type => if (target) |value|
+            valueHasKind(value, rule.scalar_kind.?)
+        else
+            false,
         .bounded_string => if (target) |value| boundedString(value, rule) else false,
         .regex => if (target) |value| regexHolds(value, rule) else false,
         .sha256 => if (target) |value|
-            try sha256Holds(allocator, plan, rule, value)
+            try sha256Holds(context.allocator, context.plan, rule, value)
         else
             false,
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
-        .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
-        .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
+        .bounded_array => if (target) |value|
+            boundedCount(value, .array, rule)
+        else
+            false,
+        .bounded_object => if (target) |value|
+            boundedCount(value, .object, rule)
+        else
+            false,
         .enum_value => if (target) |value| enumContains(rule.values, value) else false,
         .digest => if (target) |value| validateScalar(value, .digest) else false,
-        .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
+        .timestamp => if (target) |value|
+            validateScalar(value, .timestamp)
+        else
+            false,
         .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
-        .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
+        .safe_relative_path => if (target) |value|
+            safeRelativePath(value, rule)
+        else
+            false,
         .forbidden_object_keys => if (target) |value|
-            forbiddenObjectKeysHold(value, rule)
+            try forbiddenObjectKeysHold(context.allocator, value, rule)
         else
             false,
         .unique => if (target) |value| arrayUnique(value) else false,
         .sorted => if (target) |value|
             arraySorted(value, if (rule.other_pointer_id) |pointer_id|
-                plan.pointers[pointer_id]
+                context.plan.pointers[pointer_id]
             else
                 null)
         else
             false,
+        else => unreachable,
+    };
+}
+
+fn evaluateIndexedRule(context: RuleEvaluationContext) anyerror!?bool {
+    const rule = context.rule;
+    return switch (rule.operator) {
         .keyed_unique => if (rule.reference_sources.len == 0)
-            if (target) |value|
+            if (context.target) |value|
                 try keyedUnique(
-                    allocator,
+                    context.allocator,
                     value,
-                    plan.pointers[rule.other_pointer_id.?],
-                    plan.max_records,
+                    context.plan.pointers[rule.other_pointer_id.?],
+                    context.plan.max_records,
                 )
             else
                 false
         else
-            try keyedUniqueSources(allocator, plan, root, rule),
+            try keyedUniqueSources(
+                context.allocator,
+                context.plan,
+                context.root,
+                rule,
+            ),
         .keyed_join => try selectedKeyedJoin(
-            allocator,
-            plan,
-            root,
+            context.allocator,
+            context.plan,
+            context.root,
             rule,
         ),
-        .declared_field_values => if (target) |value|
+        .declared_field_values => if (context.target) |value|
             try declaredFieldValuesHold(
-                allocator,
-                plan,
-                root,
+                context.allocator,
+                context.plan,
+                context.root,
                 rule,
                 value,
             )
         else
             false,
-        .reference_exists => if (target) |value|
+        .reference_exists => if (context.target) |value|
             try referencesExist(
-                allocator,
-                plan,
+                context.allocator,
+                context.plan,
                 rule,
                 value,
-                root,
-                loaded[rule.other_input_index.?].json() orelse return,
+                context.root,
+                context.loaded[rule.other_input_index.?].json() orelse
+                    return null,
             )
         else
             false,
         .implies => implicationHolds(
-            plan,
-            root,
-            loaded[rule.other_input_index.?].json() orelse return,
+            context.plan,
+            context.root,
+            context.loaded[rule.other_input_index.?].json() orelse return null,
             rule,
         ),
+        else => unreachable,
+    };
+}
+
+fn evaluateProtocolRule(context: RuleEvaluationContext) anyerror!bool {
+    const rule = context.rule;
+    return switch (rule.operator) {
         .total_partition => try totalPartition(
-            allocator,
-            plan,
-            root,
+            context.allocator,
+            context.plan,
+            context.root,
             rule,
         ),
         .total_mapping => try totalMapping(
-            allocator,
-            plan,
-            root,
+            context.allocator,
+            context.plan,
+            context.root,
             rule,
         ),
         .predecessor_successor => try predecessorSuccessorHolds(
-            allocator,
-            plan,
-            root,
+            context.allocator,
+            context.plan,
+            context.root,
             rule,
         ),
-        .path_format => if (target) |value|
-            formattedFieldsHold(plan, rule, value)
+        .path_format => if (context.target) |value|
+            formattedFieldsHold(context.plan, rule, value)
         else
             false,
-        .one_of => if (target) |value|
-            try oneOfRulesHold(allocator, plan, rule, value)
+        else => unreachable,
+    };
+}
+
+fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
+    const rule = context.rule;
+    return switch (rule.operator) {
+        .one_of => if (context.target) |value|
+            try oneOfRulesHold(context.allocator, context.plan, rule, value)
         else
             false,
-        .tagged_union => if (target) |value|
-            try taggedUnionHolds(allocator, plan, rule, value)
+        .tagged_union => if (context.target) |value|
+            try taggedUnionHolds(context.allocator, context.plan, rule, value)
         else
             false,
-        .definition_ref => if (target) |value|
-            try importedPlanHolds(
-                allocator,
-                rule.imported_plan.?,
-                value,
-            )
+        .definition_ref => if (context.target) |value|
+            try importedPlanHolds(context.allocator, rule.imported_plan.?, value)
         else
             false,
-        .all_rules, .any_rules, .no_rules => if (target) |value|
+        .all_rules, .any_rules, .no_rules => if (context.target) |value|
             try collectionRuleHolds(
-                allocator,
-                plan,
+                context.allocator,
+                context.plan,
                 rule,
                 value,
             )
         else
             false,
-        .object_values => if (target) |value|
-            try objectValuesHold(
-                allocator,
-                plan,
-                rule,
-                value,
-            )
+        .object_values => if (context.target) |value|
+            try objectValuesHold(context.allocator, context.plan, rule, value)
         else
             false,
         .set_equality,
@@ -4755,28 +5414,26 @@ fn applyRule(
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
-        => compareRule(plan, loaded, rule),
+        => compareRule(context.plan, context.loaded, rule),
         .exactly_one, .at_least_one => if (rule.path_ids.len != 0)
             if (rule.children.len == 0)
-                countPresent(plan, root, rule)
+                countPresent(context.plan, context.root, rule)
             else
                 try countMatchingFields(
-                    allocator,
-                    plan,
-                    root,
+                    context.allocator,
+                    context.plan,
+                    context.root,
                     rule,
                 )
         else
-            try countMatching(allocator, plan, root, rule),
+            try countMatching(
+                context.allocator,
+                context.plan,
+                context.root,
+                rule,
+            ),
         else => true,
     };
-    if (!valid) {
-        try diagnostics.add(
-            rule.operator.id(),
-            path,
-            "artifact does not satisfy the compiled structural rule",
-        );
-    }
 }
 
 fn collectionRuleHolds(
@@ -4845,52 +5502,103 @@ fn objectValuesHold(
 }
 
 fn forbiddenObjectKeysHold(
+    allocator: std.mem.Allocator,
     value: std.json.Value,
     rule: CompiledRule,
-) bool {
+) !bool {
+    var pending: std.ArrayList(ForbiddenValueTask) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, .{ .value = value, .depth = 0 });
     var visited: usize = 0;
-    return forbiddenObjectKeysVisit(value, rule, 0, &visited);
+    while (pending.pop()) |task| {
+        if (task.depth > rule.min_count.?) return false;
+        visited = std.math.add(usize, visited, 1) catch return false;
+        if (visited > rule.max_count.?) return false;
+        if (!try inspectForbiddenValue(
+            allocator,
+            &pending,
+            task,
+            rule,
+            visited,
+        )) return false;
+    }
+    return true;
 }
 
-fn forbiddenObjectKeysVisit(
+const ForbiddenValueTask = struct {
     value: std.json.Value,
-    rule: CompiledRule,
     depth: usize,
-    visited: *usize,
-) bool {
-    if (depth > rule.min_count.?) return false;
-    visited.* = std.math.add(usize, visited.*, 1) catch return false;
-    if (visited.* > rule.max_count.?) return false;
-    switch (value) {
+};
+
+fn inspectForbiddenValue(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(ForbiddenValueTask),
+    task: ForbiddenValueTask,
+    rule: CompiledRule,
+    visited: usize,
+) !bool {
+    switch (task.value) {
         .object => |object| {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                for (rule.keys) |forbidden| {
-                    const matches = if (rule.case_insensitive)
-                        std.ascii.eqlIgnoreCase(entry.key_ptr.*, forbidden)
-                    else
-                        std.mem.eql(u8, entry.key_ptr.*, forbidden);
-                    if (matches) return false;
-                }
-                if (!forbiddenObjectKeysVisit(
+                if (forbiddenKeyMatches(entry.key_ptr.*, rule)) return false;
+                if (!try pushForbiddenValue(
+                    allocator,
+                    pending,
                     entry.value_ptr.*,
+                    task.depth + 1,
                     rule,
-                    depth + 1,
                     visited,
-                )) return false;
+                )) {
+                    return false;
+                }
             }
         },
         .array => |array| for (array.items) |item| {
-            if (!forbiddenObjectKeysVisit(
+            if (!try pushForbiddenValue(
+                allocator,
+                pending,
                 item,
+                task.depth + 1,
                 rule,
-                depth + 1,
                 visited,
-            )) return false;
+            )) {
+                return false;
+            }
         },
         else => {},
     }
     return true;
+}
+
+fn pushForbiddenValue(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(ForbiddenValueTask),
+    value: std.json.Value,
+    depth: usize,
+    rule: CompiledRule,
+    visited: usize,
+) !bool {
+    if (depth > rule.min_count.?) return false;
+    const scheduled = std.math.add(
+        usize,
+        visited,
+        pending.items.len,
+    ) catch return false;
+    if (scheduled >= rule.max_count.?) return false;
+    try pending.append(allocator, .{ .value = value, .depth = depth });
+    return true;
+}
+
+fn forbiddenKeyMatches(key: []const u8, rule: CompiledRule) bool {
+    for (rule.keys) |forbidden| {
+        const matches = if (rule.case_insensitive)
+            std.ascii.eqlIgnoreCase(key, forbidden)
+        else
+            std.mem.eql(u8, key, forbidden);
+        if (matches) return true;
+    }
+    return false;
 }
 
 fn oneOfRulesHold(
@@ -4936,50 +5644,75 @@ fn formattedFieldsHold(
         ) catch return false;
         if (item_count > plan.max_records) return false;
         for (items) |item| {
-            const target_value = resolve(
-                item,
-                plan.pointers[rule.path_ids[0]],
-            ) orelse return false;
-            const target = switch (target_value) {
-                .string => |text| text,
-                else => return false,
-            };
-            var offset: usize = 0;
-            for (rule.format_parts) |part| {
-                const fragment = switch (part) {
-                    .literal => |literal| literal,
-                    .parent => |pointer_id| switch (resolve(
-                        parent,
-                        plan.pointers[pointer_id],
-                    ) orelse return false) {
-                        .string => |text| text,
-                        else => return false,
-                    },
-                    .item => |pointer_id| switch (resolve(
-                        item,
-                        plan.pointers[pointer_id],
-                    ) orelse return false) {
-                        .string => |text| text,
-                        else => return false,
-                    },
-                    .value => return false,
-                };
-                const end = std.math.add(
-                    usize,
-                    offset,
-                    fragment.len,
-                ) catch return false;
-                if (end > target.len or
-                    !std.mem.eql(u8, target[offset..end], fragment))
-                {
-                    return false;
-                }
-                offset = end;
+            if (!formattedItemTargetHolds(plan, rule, parent, item)) {
+                return false;
             }
-            if (offset != target.len) return false;
         }
     }
     return true;
+}
+
+fn formattedItemTargetHolds(
+    plan: *const Plan,
+    rule: CompiledRule,
+    parent: std.json.Value,
+    item: std.json.Value,
+) bool {
+    const target_value = resolve(
+        item,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    const target = switch (target_value) {
+        .string => |text| text,
+        else => return false,
+    };
+    var offset: usize = 0;
+    for (rule.format_parts) |part| {
+        const fragment = formattedFieldFragment(
+            plan,
+            part,
+            parent,
+            item,
+        ) orelse return false;
+        const end = std.math.add(
+            usize,
+            offset,
+            fragment.len,
+        ) catch return false;
+        if (end > target.len or
+            !std.mem.eql(u8, target[offset..end], fragment))
+        {
+            return false;
+        }
+        offset = end;
+    }
+    return offset == target.len;
+}
+
+fn formattedFieldFragment(
+    plan: *const Plan,
+    part: CompiledFormatPart,
+    parent: std.json.Value,
+    item: std.json.Value,
+) ?[]const u8 {
+    return switch (part) {
+        .literal => |literal| literal,
+        .parent => |pointer_id| switch (resolve(
+            parent,
+            plan.pointers[pointer_id],
+        ) orelse return null) {
+            .string => |text| text,
+            else => null,
+        },
+        .item => |pointer_id| switch (resolve(
+            item,
+            plan.pointers[pointer_id],
+        ) orelse return null) {
+            .string => |text| text,
+            else => null,
+        },
+        .value => null,
+    };
 }
 
 fn taggedUnionHolds(
@@ -5040,116 +5773,161 @@ fn itemRuleHolds(
         resolve(root, plan.pointers[pointer_id])
     else
         root;
+    const context: RuleEvaluationContext = .{
+        .allocator = allocator,
+        .plan = plan,
+        .loaded = &.{},
+        .rule = rule,
+        .root = root,
+        .target = target,
+    };
+    if (isPrimitiveExecutionOperator(rule.operator)) {
+        return evaluatePrimitiveRule(context);
+    }
+    if (isIndexedExecutionOperator(rule.operator)) {
+        return evaluateIndexedItemRule(context);
+    }
+    if (isProtocolExecutionOperator(rule.operator)) {
+        return evaluateProtocolRule(context);
+    }
+    return evaluateCompositeItemRule(context);
+}
+
+fn evaluateIndexedItemRule(
+    context: RuleEvaluationContext,
+) anyerror!bool {
+    const rule = context.rule;
     return switch (rule.operator) {
-        .required_field => target != null,
-        .field_absent => target == null,
-        .optional_field => if (target) |value|
-            (rule.allow_null and value == .null) or
-                rule.children.len == 0 or
-                try itemRulesHold(
-                    allocator,
-                    plan,
-                    rule.children,
-                    value,
-                )
-        else
-            true,
-        .exact_object => if (target) |value| exactObject(value, rule) else false,
-        .scalar_type => if (target) |value| valueHasKind(value, rule.scalar_kind.?) else false,
-        .bounded_string => if (target) |value| boundedString(value, rule) else false,
-        .regex => if (target) |value| regexHolds(value, rule) else false,
-        .sha256 => if (target) |value|
-            try sha256Holds(allocator, plan, rule, value)
-        else
-            false,
-        .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
-        .bounded_array => if (target) |value| boundedCount(value, .array, rule) else false,
-        .bounded_object => if (target) |value| boundedCount(value, .object, rule) else false,
-        .enum_value => if (target) |value| enumContains(rule.values, value) else false,
-        .digest => if (target) |value| validateScalar(value, .digest) else false,
-        .timestamp => if (target) |value| validateScalar(value, .timestamp) else false,
-        .safe_identifier => if (target) |value| safeIdentifier(value, rule) else false,
-        .safe_relative_path => if (target) |value| safeRelativePath(value, rule) else false,
-        .forbidden_object_keys => if (target) |value|
-            forbiddenObjectKeysHold(value, rule)
-        else
-            false,
-        .unique => if (target) |value| arrayUnique(value) else false,
-        .sorted => if (target) |value|
-            arraySorted(value, if (rule.other_pointer_id) |pointer_id|
-                plan.pointers[pointer_id]
-            else
-                null)
-        else
-            false,
         .keyed_unique => if (rule.reference_sources.len == 0)
-            if (target) |value|
+            if (context.target) |value|
                 try keyedUnique(
-                    allocator,
+                    context.allocator,
                     value,
-                    plan.pointers[rule.other_pointer_id.?],
-                    plan.max_records,
+                    context.plan.pointers[rule.other_pointer_id.?],
+                    context.plan.max_records,
                 )
             else
                 false
         else
-            try keyedUniqueSources(allocator, plan, root, rule),
+            try keyedUniqueSources(
+                context.allocator,
+                context.plan,
+                context.root,
+                rule,
+            ),
         .keyed_join => try selectedKeyedJoin(
-            allocator,
-            plan,
-            root,
+            context.allocator,
+            context.plan,
+            context.root,
             rule,
         ),
-        .declared_field_values => if (target) |value|
+        .declared_field_values => if (context.target) |value|
             try declaredFieldValuesHold(
-                allocator,
-                plan,
-                root,
+                context.allocator,
+                context.plan,
+                context.root,
                 rule,
                 value,
             )
         else
             false,
-        .reference_exists => if (target) |value|
+        .reference_exists => if (context.target) |value|
             try referencesExist(
-                allocator,
-                plan,
+                context.allocator,
+                context.plan,
                 rule,
                 value,
-                root,
-                root,
+                context.root,
+                context.root,
             )
         else
             false,
         .implies => if (rule.children.len != 0)
-            if (implicationPredicateHolds(plan, root, rule))
-                itemRulesHold(allocator, plan, rule.children, root)
+            if (implicationPredicateHolds(context.plan, context.root, rule))
+                itemRulesHold(
+                    context.allocator,
+                    context.plan,
+                    rule.children,
+                    context.root,
+                )
             else
                 true
         else
-            implicationHolds(plan, root, root, rule),
-        .total_partition => try totalPartition(
-            allocator,
-            plan,
-            root,
-            rule,
-        ),
-        .total_mapping => try totalMapping(
-            allocator,
-            plan,
-            root,
-            rule,
-        ),
-        .predecessor_successor => try predecessorSuccessorHolds(
-            allocator,
-            plan,
-            root,
-            rule,
-        ),
-        .path_format => if (target) |value|
-            formattedFieldsHold(plan, rule, value)
-        else
-            false,
+            implicationHolds(
+                context.plan,
+                context.root,
+                context.root,
+                rule,
+            ),
+        else => unreachable,
+    };
+}
+
+fn evaluateCompositeItemRule(
+    context: RuleEvaluationContext,
+) anyerror!bool {
+    if (isComparisonExecutionOperator(context.rule.operator)) {
+        return compareRuleRoots(
+            context.plan,
+            context.rule,
+            context.root,
+            context.root,
+        );
+    }
+    return evaluateCompositeRule(context);
+}
+
+fn isPrimitiveExecutionOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .required_field,
+        .field_absent,
+        .optional_field,
+        .exact_object,
+        .scalar_type,
+        .bounded_string,
+        .regex,
+        .sha256,
+        .bounded_number,
+        .bounded_array,
+        .bounded_object,
+        .enum_value,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .safe_relative_path,
+        .forbidden_object_keys,
+        .unique,
+        .sorted,
+        => true,
+        else => false,
+    };
+}
+
+fn isIndexedExecutionOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .keyed_unique,
+        .keyed_join,
+        .declared_field_values,
+        .reference_exists,
+        .implies,
+        => true,
+        else => false,
+    };
+}
+
+fn isProtocolExecutionOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .total_partition,
+        .total_mapping,
+        .predecessor_successor,
+        .path_format,
+        => true,
+        else => false,
+    };
+}
+
+fn isComparisonExecutionOperator(operator: definition.Operator) bool {
+    return switch (operator) {
         .set_equality,
         .subset,
         .superset,
@@ -5161,43 +5939,10 @@ fn itemRuleHolds(
         .field_equal,
         .field_not_equal,
         .cross_input_equal,
-        => compareRuleRoots(plan, rule, root, root),
-        .exactly_one, .at_least_one => if (rule.path_ids.len != 0)
-            if (rule.children.len == 0)
-                countPresent(plan, root, rule)
-            else
-                try countMatchingFields(
-                    allocator,
-                    plan,
-                    root,
-                    rule,
-                )
-        else
-            try countMatching(allocator, plan, root, rule),
-        .one_of => if (target) |value|
-            oneOfRulesHold(allocator, plan, rule, value)
-        else
-            false,
-        .tagged_union => if (target) |value|
-            taggedUnionHolds(allocator, plan, rule, value)
-        else
-            false,
-        .definition_ref => if (target) |value|
-            importedPlanHolds(allocator, rule.imported_plan.?, value)
-        else
-            false,
-        .all_rules, .any_rules, .no_rules => if (target) |value|
-            collectionRuleHolds(allocator, plan, rule, value)
-        else
-            false,
-        .object_values => if (target) |value|
-            objectValuesHold(allocator, plan, rule, value)
-        else
-            false,
-        else => unreachable,
+        => true,
+        else => false,
     };
 }
-
 fn importedPlanHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
@@ -5467,52 +6212,107 @@ const MappingSource = struct {
     mapped: bool = false,
 };
 
+const MappingCollections = struct {
+    sources: []const std.json.Value,
+    targets: []const std.json.Value,
+    mappings: []const std.json.Value,
+};
+
 fn totalMapping(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
     rule: CompiledRule,
 ) !bool {
-    const source_value = resolve(
+    const collections = resolveMappingCollections(
+        plan,
         root,
-        plan.pointers[rule.pointer_id.?],
+        rule,
     ) orelse return false;
-    const target_value = resolve(
-        root,
-        plan.pointers[rule.other_pointer_id.?],
-    ) orelse return false;
-    const mapping_value = resolve(
-        root,
-        plan.pointers[rule.path_ids[0]],
-    ) orelse return false;
-    const sources = switch (source_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    const targets = switch (target_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    const mappings = switch (mapping_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (sources.len > plan.max_records or
-        targets.len > plan.max_records or
-        mappings.len > plan.max_records or
-        mappings.len != sources.len)
-    {
-        return false;
-    }
 
     var source_index: std.AutoHashMapUnmanaged(
         [32]u8,
         MappingSource,
     ) = .empty;
     defer source_index.deinit(allocator);
+    if (!try indexMappingSources(
+        allocator,
+        collections.sources,
+        &source_index,
+    )) return false;
+
+    var target_index: std.AutoHashMapUnmanaged(
+        [32]u8,
+        std.json.Value,
+    ) = .empty;
+    defer target_index.deinit(allocator);
+    if (!try indexMappingTargets(
+        allocator,
+        collections.targets,
+        &target_index,
+    )) return false;
+    if (!try mappingsHold(
+        collections.mappings,
+        plan,
+        rule,
+        &source_index,
+        &target_index,
+    )) return false;
+    var iterator = source_index.valueIterator();
+    while (iterator.next()) |source| {
+        if (!source.mapped) return false;
+    }
+    return true;
+}
+
+fn resolveMappingCollections(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+) ?MappingCollections {
+    const sources = switch (resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return null) {
+        .array => |array| array.items,
+        else => return null,
+    };
+    const targets = switch (resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return null) {
+        .array => |array| array.items,
+        else => return null,
+    };
+    const mappings = switch (resolve(
+        root,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return null) {
+        .array => |array| array.items,
+        else => return null,
+    };
+    if (sources.len > plan.max_records or
+        targets.len > plan.max_records or
+        mappings.len > plan.max_records or
+        mappings.len != sources.len)
+    {
+        return null;
+    }
+    return .{
+        .sources = sources,
+        .targets = targets,
+        .mappings = mappings,
+    };
+}
+
+fn indexMappingSources(
+    allocator: std.mem.Allocator,
+    sources: []const std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, MappingSource),
+) !bool {
     for (sources) |value| {
         const digest = scalarKeyDigest(value) orelse return false;
-        const result = try source_index.getOrPut(allocator, digest);
+        const result = try index.getOrPut(allocator, digest);
         if (result.found_existing) {
             if (!valuesEqual(result.value_ptr.value, value)) {
                 return error.TotalMappingDigestCollision;
@@ -5521,15 +6321,17 @@ fn totalMapping(
         }
         result.value_ptr.* = .{ .value = value };
     }
+    return true;
+}
 
-    var target_index: std.AutoHashMapUnmanaged(
-        [32]u8,
-        std.json.Value,
-    ) = .empty;
-    defer target_index.deinit(allocator);
+fn indexMappingTargets(
+    allocator: std.mem.Allocator,
+    targets: []const std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, std.json.Value),
+) !bool {
     for (targets) |value| {
         const digest = scalarKeyDigest(value) orelse return false;
-        const result = try target_index.getOrPut(allocator, digest);
+        const result = try index.getOrPut(allocator, digest);
         if (result.found_existing) {
             if (!valuesEqual(result.value_ptr.*, value)) {
                 return error.TotalMappingDigestCollision;
@@ -5538,7 +6340,16 @@ fn totalMapping(
         }
         result.value_ptr.* = value;
     }
+    return true;
+}
 
+fn mappingsHold(
+    mappings: []const std.json.Value,
+    plan: *const Plan,
+    rule: CompiledRule,
+    source_index: *std.AutoHashMapUnmanaged([32]u8, MappingSource),
+    target_index: *std.AutoHashMapUnmanaged([32]u8, std.json.Value),
+) !bool {
     for (mappings) |mapping| {
         const from = resolve(
             mapping,
@@ -5561,10 +6372,6 @@ fn totalMapping(
         if (!valuesEqual(target, to)) {
             return error.TotalMappingDigestCollision;
         }
-    }
-    var iterator = source_index.valueIterator();
-    while (iterator.next()) |source| {
-        if (!source.mapped) return false;
     }
     return true;
 }
@@ -5652,93 +6459,139 @@ fn sha256Holds(
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     switch (rule.sha256_mode.?) {
-        .canonical_json_null => {
-            if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
-            var mutable = value;
-            const null_field = definition_core.json_pointer.lookupPtr(
-                &mutable,
-                plan.pointers[rule.path_ids[0]],
-            ) orelse return false;
-            const preserved = null_field.*;
-            defer null_field.* = preserved;
-            null_field.* = .null;
-            const canonical =
-                definition_core.canonical_json.canonicalJsonAlloc(
-                    allocator,
-                    mutable,
-                ) catch |err| switch (err) {
-                    error.WriteFailed => return error.OutOfMemory,
-                    else => return err,
-                };
-            defer allocator.free(canonical);
-            if (canonical.len > rule.max_count.?) return false;
-            hasher.update(canonical);
-        },
-        .framed_items => {
-            if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
-            const prefix = rule.sha256_prefix.?;
-            var total_bytes = prefix.len;
-            if (total_bytes > rule.max_count.?) return false;
-            hasher.update(prefix);
-            const items = switch (resolve(
-                value,
-                plan.pointers[rule.path_ids[0]],
-            ) orelse return false) {
-                .array => |array| array.items,
-                else => return false,
-            };
-            if (items.len > plan.max_records) return false;
-            for (items) |item| {
-                const key: FormattedReferenceKey = .{
-                    .parent = value,
-                    .item = item,
-                    .value = item,
-                    .parts = rule.format_parts,
-                };
-                for (rule.format_parts) |part| {
-                    const fragment = formattedReferenceFragment(
-                        plan,
-                        key,
-                        part,
-                    ) orelse return false;
-                    total_bytes = std.math.add(
-                        usize,
-                        total_bytes,
-                        fragment.len,
-                    ) catch return false;
-                    if (total_bytes > rule.max_count.?) return false;
-                    hasher.update(fragment);
-                }
-            }
-        },
-        .framed_fields => {
-            const prefix = rule.sha256_prefix.?;
-            var total_bytes = prefix.len;
-            if (total_bytes > rule.max_count.?) return false;
-            hasher.update(prefix);
-            const key: FormattedReferenceKey = .{
-                .parent = value,
-                .item = value,
-                .value = value,
-                .parts = rule.format_parts,
-            };
-            for (rule.format_parts) |part| {
-                const fragment = formattedReferenceFragment(
-                    plan,
-                    key,
-                    part,
-                ) orelse return false;
-                total_bytes = std.math.add(
-                    usize,
-                    total_bytes,
-                    fragment.len,
-                ) catch return false;
-                if (total_bytes > rule.max_count.?) return false;
-                hasher.update(fragment);
-            }
-        },
+        .canonical_json_null => if (!try hashCanonicalJsonNull(
+            allocator,
+            plan,
+            rule,
+            value,
+            &hasher,
+        )) return false,
+        .framed_items => if (!hashFramedItems(
+            plan,
+            rule,
+            value,
+            &hasher,
+        )) return false,
+        .framed_fields => if (!hashFramedFields(
+            plan,
+            rule,
+            value,
+            &hasher,
+        )) return false,
     }
     return sha256FinalMatches(&hasher, expected);
+}
+
+fn hashCanonicalJsonNull(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) !bool {
+    if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
+    var mutable = value;
+    const null_field = definition_core.json_pointer.lookupPtr(
+        &mutable,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false;
+    const preserved = null_field.*;
+    defer null_field.* = preserved;
+    null_field.* = .null;
+    const canonical = definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        mutable,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    if (canonical.len > rule.max_count.?) return false;
+    hasher.update(canonical);
+    return true;
+}
+
+fn hashFramedItems(
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) bool {
+    if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
+    const items = switch (resolve(
+        value,
+        plan.pointers[rule.path_ids[0]],
+    ) orelse return false) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records) return false;
+    var total_bytes = rule.sha256_prefix.?.len;
+    if (total_bytes > rule.max_count.?) return false;
+    hasher.update(rule.sha256_prefix.?);
+    for (items) |item| {
+        const key: FormattedReferenceKey = .{
+            .parent = value,
+            .item = item,
+            .value = item,
+            .parts = rule.format_parts,
+        };
+        if (!hashFormattedParts(
+            plan,
+            rule,
+            key,
+            &total_bytes,
+            hasher,
+        )) return false;
+    }
+    return true;
+}
+
+fn hashFramedFields(
+    plan: *const Plan,
+    rule: CompiledRule,
+    value: std.json.Value,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) bool {
+    var total_bytes = rule.sha256_prefix.?.len;
+    if (total_bytes > rule.max_count.?) return false;
+    hasher.update(rule.sha256_prefix.?);
+    return hashFormattedParts(
+        plan,
+        rule,
+        .{
+            .parent = value,
+            .item = value,
+            .value = value,
+            .parts = rule.format_parts,
+        },
+        &total_bytes,
+        hasher,
+    );
+}
+
+fn hashFormattedParts(
+    plan: *const Plan,
+    rule: CompiledRule,
+    key: FormattedReferenceKey,
+    total_bytes: *usize,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) bool {
+    for (rule.format_parts) |part| {
+        const fragment = formattedReferenceFragment(
+            plan,
+            key,
+            part,
+        ) orelse return false;
+        total_bytes.* = std.math.add(
+            usize,
+            total_bytes.*,
+            fragment.len,
+        ) catch return false;
+        if (total_bytes.* > rule.max_count.?) return false;
+        hasher.update(fragment);
+    }
+    return true;
 }
 
 fn sha256FinalMatches(
@@ -6207,6 +7060,37 @@ fn predecessorSuccessorHolds(
 
     var reference_count: usize = 0;
     const max_reference_count = plan.max_records *| 8;
+    if (!try markDirectCorrespondence(
+        plan,
+        root,
+        rule,
+        &predecessors,
+        &successors,
+        &reference_count,
+        max_reference_count,
+    )) return false;
+    if (!try markMappedCorrespondence(
+        plan,
+        root,
+        rule,
+        &predecessors,
+        &successors,
+        &reference_count,
+        max_reference_count,
+    )) return false;
+    return correspondenceComplete(&predecessors) and
+        correspondenceComplete(&successors);
+}
+
+fn markDirectCorrespondence(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+    predecessors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    successors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    reference_count: *usize,
+    max_reference_count: usize,
+) !bool {
     const preserved = try correspondenceReferences(
         plan,
         root,
@@ -6214,9 +7098,9 @@ fn predecessorSuccessorHolds(
     ) orelse return false;
     if (!try markPreservedCorrespondence(
         preserved,
-        &predecessors,
-        &successors,
-        &reference_count,
+        predecessors,
+        successors,
+        reference_count,
         max_reference_count,
     )) return false;
     const retired = try correspondenceReferences(
@@ -6226,8 +7110,8 @@ fn predecessorSuccessorHolds(
     ) orelse return false;
     if (!try markCorrespondenceReferences(
         retired,
-        &predecessors,
-        &reference_count,
+        predecessors,
+        reference_count,
         max_reference_count,
     )) return false;
     const introduced = try correspondenceReferences(
@@ -6237,11 +7121,22 @@ fn predecessorSuccessorHolds(
     ) orelse return false;
     if (!try markCorrespondenceReferences(
         introduced,
-        &successors,
-        &reference_count,
+        successors,
+        reference_count,
         max_reference_count,
     )) return false;
+    return true;
+}
 
+fn markMappedCorrespondence(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: CompiledRule,
+    predecessors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    successors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
+    reference_count: *usize,
+    max_reference_count: usize,
+) !bool {
     const mappings = switch (resolve(
         root,
         plan.pointers[rule.path_ids[5]],
@@ -6269,20 +7164,19 @@ fn predecessorSuccessorHolds(
             successor_refs.len > plan.max_records or
             !try markCorrespondenceReferences(
                 predecessor_refs,
-                &predecessors,
-                &reference_count,
+                predecessors,
+                reference_count,
                 max_reference_count,
             ) or !try markCorrespondenceReferences(
             successor_refs,
-            &successors,
-            &reference_count,
+            successors,
+            reference_count,
             max_reference_count,
         )) {
             return false;
         }
     }
-    return correspondenceComplete(&predecessors) and
-        correspondenceComplete(&successors);
+    return true;
 }
 
 fn indexCorrespondenceCollection(
@@ -6456,93 +7350,25 @@ fn referencesExist(
     var source_count: usize = 0;
     var reference_count: usize = 0;
     if (rule.reference_sources.len == 0) {
-        const source_items = switch (source_value) {
-            .array => |array| array.items,
-            else => return false,
-        };
-        source_count = source_items.len;
-        if (source_count > plan.max_records or
-            !try markReferencesFromItems(
-                allocator,
-                plan,
-                rule,
-                source_items,
-                rule.other_pointer_id.?,
-                &.{},
-                &.{},
-                &index,
-                &reference_count,
-            ))
-        {
-            return false;
-        }
-    } else {
-        for (rule.reference_sources) |source| {
-            const items_value = resolve(
-                source_root,
-                plan.pointers[source.pointer_id],
-            ) orelse {
-                if (source.optional) continue;
-                return false;
-            };
-            const items = switch (items_value) {
-                .array => |array| array.items,
-                else => return false,
-            };
-            if (source.items_pointer_id) |items_pointer_id| {
-                for (items) |parent| {
-                    const nested_value = resolve(
-                        parent,
-                        plan.pointers[items_pointer_id],
-                    ) orelse return false;
-                    const nested_items = switch (nested_value) {
-                        .array => |array| array.items,
-                        else => return false,
-                    };
-                    source_count = std.math.add(
-                        usize,
-                        source_count,
-                        nested_items.len,
-                    ) catch return false;
-                    if (source_count > plan.max_records or
-                        !try markReferencesFromItems(
-                            allocator,
-                            plan,
-                            rule,
-                            nested_items,
-                            source.reference_pointer_id,
-                            source.rules,
-                            source.format_parts,
-                            &index,
-                            &reference_count,
-                        ))
-                    {
-                        return false;
-                    }
-                }
-            } else {
-                source_count = std.math.add(
-                    usize,
-                    source_count,
-                    items.len,
-                ) catch return false;
-                if (source_count > plan.max_records or
-                    !try markReferencesFromItems(
-                        allocator,
-                        plan,
-                        rule,
-                        items,
-                        source.reference_pointer_id,
-                        source.rules,
-                        source.format_parts,
-                        &index,
-                        &reference_count,
-                    ))
-                {
-                    return false;
-                }
-            }
-        }
+        if (!try markSingleReferenceSource(
+            allocator,
+            plan,
+            rule,
+            source_value,
+            &index,
+            &source_count,
+            &reference_count,
+        )) return false;
+    } else if (!try markDeclaredReferenceSources(
+        allocator,
+        plan,
+        rule,
+        source_root,
+        &index,
+        &source_count,
+        &reference_count,
+    )) {
+        return false;
     }
     if (rule.total_coverage and
         !try referenceCoverageComplete(
@@ -6554,6 +7380,143 @@ fn referencesExist(
         return false;
     }
     return true;
+}
+
+fn markSingleReferenceSource(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    source_value: std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    source_count: *usize,
+    reference_count: *usize,
+) !bool {
+    const source_items = switch (source_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    source_count.* = source_items.len;
+    if (source_count.* > plan.max_records) return false;
+    return markReferencesFromItems(
+        allocator,
+        plan,
+        rule,
+        source_items,
+        rule.other_pointer_id.?,
+        &.{},
+        &.{},
+        index,
+        reference_count,
+    );
+}
+
+fn markDeclaredReferenceSources(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    source_root: std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    source_count: *usize,
+    reference_count: *usize,
+) !bool {
+    for (rule.reference_sources) |source| {
+        const items_value = resolve(
+            source_root,
+            plan.pointers[source.pointer_id],
+        ) orelse {
+            if (source.optional) continue;
+            return false;
+        };
+        const items = switch (items_value) {
+            .array => |array| array.items,
+            else => return false,
+        };
+        if (!try markDeclaredReferenceSource(
+            allocator,
+            plan,
+            rule,
+            source,
+            items,
+            index,
+            source_count,
+            reference_count,
+        )) return false;
+    }
+    return true;
+}
+
+fn markDeclaredReferenceSource(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    source: CompiledReferenceSource,
+    items: []const std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    source_count: *usize,
+    reference_count: *usize,
+) !bool {
+    if (source.items_pointer_id) |items_pointer_id| {
+        for (items) |parent| {
+            const nested_value = resolve(
+                parent,
+                plan.pointers[items_pointer_id],
+            ) orelse return false;
+            const nested_items = switch (nested_value) {
+                .array => |array| array.items,
+                else => return false,
+            };
+            if (!try addReferenceSourceItems(
+                allocator,
+                plan,
+                rule,
+                source,
+                nested_items,
+                index,
+                source_count,
+                reference_count,
+            )) return false;
+        }
+        return true;
+    }
+    return addReferenceSourceItems(
+        allocator,
+        plan,
+        rule,
+        source,
+        items,
+        index,
+        source_count,
+        reference_count,
+    );
+}
+
+fn addReferenceSourceItems(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    rule: CompiledRule,
+    source: CompiledReferenceSource,
+    items: []const std.json.Value,
+    index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
+    source_count: *usize,
+    reference_count: *usize,
+) !bool {
+    source_count.* = std.math.add(
+        usize,
+        source_count.*,
+        items.len,
+    ) catch return false;
+    if (source_count.* > plan.max_records) return false;
+    return markReferencesFromItems(
+        allocator,
+        plan,
+        rule,
+        items,
+        source.reference_pointer_id,
+        source.rules,
+        source.format_parts,
+        index,
+        reference_count,
+    );
 }
 
 fn markReferencesFromItems(
@@ -7322,36 +8285,117 @@ fn pathWithinScope(path: []const u8, scope: []const u8) bool {
             std.mem.eql(u8, path[0..scope.len], scope));
 }
 
+const ValuePair = struct {
+    left: std.json.Value,
+    right: std.json.Value,
+};
+
 pub fn valuesEqual(left: std.json.Value, right: std.json.Value) bool {
-    if (std.meta.activeTag(left) != std.meta.activeTag(right)) {
-        const left_number = jsonNumber(left) orelse return false;
-        const right_number = jsonNumber(right) orelse return false;
+    var stack = std.heap.stackFallback(4096, std.heap.page_allocator);
+    const allocator = stack.get();
+    var pending: std.ArrayList(ValuePair) = .empty;
+    defer pending.deinit(allocator);
+    pending.append(allocator, .{
+        .left = left,
+        .right = right,
+    }) catch return false;
+    var visited: usize = 0;
+    while (pending.pop()) |pair| {
+        visited = std.math.add(usize, visited, 1) catch return false;
+        if (visited > max_value_equality_pairs) return false;
+        if (!valuePairEqualOrExpanded(
+            allocator,
+            pair,
+            &pending,
+        )) return false;
+    }
+    return true;
+}
+
+fn valuePairEqualOrExpanded(
+    allocator: std.mem.Allocator,
+    pair: ValuePair,
+    pending: *std.ArrayList(ValuePair),
+) bool {
+    if (std.meta.activeTag(pair.left) != std.meta.activeTag(pair.right)) {
+        const left_number = jsonNumber(pair.left) orelse return false;
+        const right_number = jsonNumber(pair.right) orelse return false;
         return left_number == right_number;
     }
-    return switch (left) {
+    return switch (pair.left) {
         .null => true,
-        .bool => |value| value == right.bool,
-        .integer => |value| value == right.integer,
-        .float => |value| value == right.float,
-        .number_string => |value| std.mem.eql(u8, value, right.number_string),
-        .string => |value| std.mem.eql(u8, value, right.string),
-        .array => |array| blk: {
-            if (array.items.len != right.array.items.len) break :blk false;
-            for (array.items, right.array.items) |a, b| {
-                if (!valuesEqual(a, b)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |object| blk: {
-            if (object.count() != right.object.count()) break :blk false;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                const other = right.object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!valuesEqual(entry.value_ptr.*, other)) break :blk false;
-            }
-            break :blk true;
-        },
+        .bool => |value| value == pair.right.bool,
+        .integer => |value| value == pair.right.integer,
+        .float => |value| value == pair.right.float,
+        .number_string => |value| std.mem.eql(
+            u8,
+            value,
+            pair.right.number_string,
+        ),
+        .string => |value| std.mem.eql(u8, value, pair.right.string),
+        .array => |array| appendArrayPairs(
+            allocator,
+            array.items,
+            pair.right.array.items,
+            pending,
+        ),
+        .object => |object| appendObjectPairs(
+            allocator,
+            object,
+            pair.right.object,
+            pending,
+        ),
     };
+}
+
+fn appendArrayPairs(
+    allocator: std.mem.Allocator,
+    left: []const std.json.Value,
+    right: []const std.json.Value,
+    pending: *std.ArrayList(ValuePair),
+) bool {
+    if (left.len != right.len) return false;
+    const pending_count = std.math.add(
+        usize,
+        pending.items.len,
+        left.len,
+    ) catch return false;
+    if (pending_count > max_value_equality_pairs) {
+        return false;
+    }
+    for (left, right) |left_value, right_value| {
+        pending.append(allocator, .{
+            .left = left_value,
+            .right = right_value,
+        }) catch return false;
+    }
+    return true;
+}
+
+fn appendObjectPairs(
+    allocator: std.mem.Allocator,
+    left: std.json.ObjectMap,
+    right: std.json.ObjectMap,
+    pending: *std.ArrayList(ValuePair),
+) bool {
+    if (left.count() != right.count()) return false;
+    const pending_count = std.math.add(
+        usize,
+        pending.items.len,
+        left.count(),
+    ) catch return false;
+    if (pending_count > max_value_equality_pairs) {
+        return false;
+    }
+    var iterator = left.iterator();
+    while (iterator.next()) |entry| {
+        const other = right.get(entry.key_ptr.*) orelse return false;
+        pending.append(allocator, .{
+            .left = entry.value_ptr.*,
+            .right = other,
+        }) catch return false;
+    }
+    return true;
 }
 
 fn valueOrder(left: std.json.Value, right: std.json.Value) std.math.Order {
@@ -7552,69 +8596,103 @@ fn compileRegexPattern(
     defer atoms.deinit(allocator);
     var index: usize = 0;
     while (index < expression.len) {
-        var bytes: [4]u64 = @splat(0);
-        switch (expression[index]) {
-            '\\' => {
-                index += 1;
-                if (index >= expression.len) {
-                    return error.RegexEscapeInvalid;
-                }
-                regexByteSet(&bytes, expression[index]);
-                index += 1;
-            },
-            '[' => {
-                bytes = try compileRegexClass(expression, &index);
-            },
-            '.' => {
-                bytes = @splat(std.math.maxInt(u64));
-                regexByteClear(&bytes, '\n');
-                regexByteClear(&bytes, '\r');
-                index += 1;
-            },
-            '*', '+', '?', '{', '}', '(', ')', '|', '^', '$', ']' => {
-                return error.RegexConstructUnsupported;
-            },
-            else => |byte| {
-                regexByteSet(&bytes, byte);
-                index += 1;
-            },
-        }
+        const bytes = try compileRegexAtomBytes(expression, &index);
         if (index < expression.len and expression[index] == '{') {
             const repetition = try readRegexRepetition(expression, &index);
-            for (0..repetition.maximum) |repetition_index| {
-                if (atoms.items.len >= max_regex_atoms_per_pattern) {
-                    return error.RegexStateBoundExceeded;
-                }
-                try atoms.append(allocator, .{
-                    .bytes = bytes,
-                    .quantifier = if (repetition_index < repetition.minimum)
-                        .one
-                    else
-                        .zero_or_one,
-                });
-            }
+            try appendRepeatedRegexAtoms(
+                allocator,
+                &atoms,
+                bytes,
+                repetition,
+            );
         } else {
-            var quantifier: RegexQuantifier = .one;
-            if (index < expression.len) {
-                quantifier = switch (expression[index]) {
-                    '?' => .zero_or_one,
-                    '*' => .zero_or_more,
-                    '+' => .one_or_more,
-                    else => .one,
-                };
-                if (quantifier != .one) index += 1;
-            }
-            if (atoms.items.len >= max_regex_atoms_per_pattern) {
-                return error.RegexStateBoundExceeded;
-            }
-            try atoms.append(allocator, .{
-                .bytes = bytes,
-                .quantifier = quantifier,
-            });
+            try appendSingleRegexAtom(
+                allocator,
+                &atoms,
+                bytes,
+                expression,
+                &index,
+            );
         }
     }
     if (atoms.items.len == 0) return error.RegexPatternEmpty;
     return .{ .atoms = try atoms.toOwnedSlice(allocator) };
+}
+
+fn compileRegexAtomBytes(
+    expression: []const u8,
+    index: *usize,
+) ![4]u64 {
+    var bytes: [4]u64 = @splat(0);
+    switch (expression[index.*]) {
+        '\\' => {
+            index.* += 1;
+            if (index.* >= expression.len) return error.RegexEscapeInvalid;
+            regexByteSet(&bytes, expression[index.*]);
+            index.* += 1;
+        },
+        '[' => bytes = try compileRegexClass(expression, index),
+        '.' => {
+            bytes = @splat(std.math.maxInt(u64));
+            regexByteClear(&bytes, '\n');
+            regexByteClear(&bytes, '\r');
+            index.* += 1;
+        },
+        '*', '+', '?', '{', '}', '(', ')', '|', '^', '$', ']' => {
+            return error.RegexConstructUnsupported;
+        },
+        else => |byte| {
+            regexByteSet(&bytes, byte);
+            index.* += 1;
+        },
+    }
+    return bytes;
+}
+
+fn appendRepeatedRegexAtoms(
+    allocator: std.mem.Allocator,
+    atoms: *std.ArrayList(CompiledRegexAtom),
+    bytes: [4]u64,
+    repetition: RegexRepetition,
+) !void {
+    for (0..repetition.maximum) |repetition_index| {
+        if (atoms.items.len >= max_regex_atoms_per_pattern) {
+            return error.RegexStateBoundExceeded;
+        }
+        try atoms.append(allocator, .{
+            .bytes = bytes,
+            .quantifier = if (repetition_index < repetition.minimum)
+                .one
+            else
+                .zero_or_one,
+        });
+    }
+}
+
+fn appendSingleRegexAtom(
+    allocator: std.mem.Allocator,
+    atoms: *std.ArrayList(CompiledRegexAtom),
+    bytes: [4]u64,
+    expression: []const u8,
+    index: *usize,
+) !void {
+    var quantifier: RegexQuantifier = .one;
+    if (index.* < expression.len) {
+        quantifier = switch (expression[index.*]) {
+            '?' => .zero_or_one,
+            '*' => .zero_or_more,
+            '+' => .one_or_more,
+            else => .one,
+        };
+        if (quantifier != .one) index.* += 1;
+    }
+    if (atoms.items.len >= max_regex_atoms_per_pattern) {
+        return error.RegexStateBoundExceeded;
+    }
+    try atoms.append(allocator, .{
+        .bytes = bytes,
+        .quantifier = quantifier,
+    });
 }
 
 fn readRegexRepetition(
@@ -8017,6 +9095,523 @@ fn isValidationOperator(operator: definition.Operator) bool {
     };
 }
 
+fn isPrimitiveItemOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .exact_object,
+        .required_field,
+        .field_absent,
+        .optional_field,
+        .scalar_type,
+        .bounded_string,
+        .regex,
+        .sha256,
+        .bounded_number,
+        .bounded_array,
+        .bounded_object,
+        .enum_value,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .safe_relative_path,
+        .unique,
+        .sorted,
+        .forbidden_object_keys,
+        => true,
+        else => false,
+    };
+}
+
+fn isPrimitiveRootOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .exact_object,
+        .field_absent,
+        .forbidden_object_keys,
+        .optional_field,
+        .scalar_type,
+        .bounded_array,
+        .bounded_object,
+        .bounded_string,
+        .regex,
+        .sha256,
+        .safe_identifier,
+        .safe_relative_path,
+        .sorted,
+        .bounded_number,
+        .enum_value,
+        => true,
+        else => false,
+    };
+}
+
+fn isRelationalRootOperator(operator: definition.Operator) bool {
+    return switch (operator) {
+        .set_equality,
+        .subset,
+        .superset,
+        .disjoint,
+        .path_scope_subset,
+        .path_scope_disjoint,
+        .member_of,
+        .not_member_of,
+        .field_equal,
+        .field_not_equal,
+        .declared_field_values,
+        .cross_input_equal,
+        .implies,
+        .total_partition,
+        .total_mapping,
+        .path_format,
+        .exactly_one,
+        .at_least_one,
+        .keyed_join,
+        .predecessor_successor,
+        => true,
+        else => false,
+    };
+}
+
+fn requireRootPathOnly(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input", "path" },
+    );
+    try definition_core.json.requireFields(object, &.{ "op", "path" });
+}
+
+fn compileCountBoundRootRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    try validateCountBounds(rule);
+}
+
+fn compileStringBoundRootRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input", "path", "min", "max", "trimmed_min" },
+    );
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    rule.trimmed_min_count = try optionalUnsigned(object, "trimmed_min");
+    if (rule.min_count == null and
+        rule.max_count == null and
+        rule.trimmed_min_count == null)
+    {
+        return error.MissingRuleBound;
+    }
+    if (rule.min_count != null or rule.max_count != null) {
+        try validateCountBounds(rule);
+    }
+    if (rule.trimmed_min_count != null and
+        rule.max_count != null and
+        rule.trimmed_min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+}
+
+fn compileRegexRootRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input", "path", "patterns", "max" },
+    );
+    rule.max_count = try optionalUnsigned(object, "max") orelse
+        return error.MissingRegexBound;
+    if (rule.max_count.? == 0 or
+        rule.max_count.? > max_regex_subject_bytes)
+    {
+        return error.InvalidRegexBound;
+    }
+    rule.regex_patterns = try compileRegexPatterns(
+        allocator,
+        try definition_core.json.field(object, "patterns"),
+    );
+}
+
+fn compileIdentifierRootRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input", "path", "min", "max", "style" },
+    );
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    if (rule.min_count != null and
+        rule.max_count != null and
+        rule.min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+    if (object.get("style")) |raw| {
+        rule.identifier_style = try IdentifierStyle.parse(
+            try definition_core.json.string(raw),
+        );
+    }
+}
+
+fn compileNumberBoundRootRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    rule.min_number = try optionalNumber(object, "min");
+    rule.max_number = try optionalNumber(object, "max");
+    if (rule.min_number == null and rule.max_number == null) {
+        return error.MissingRuleBound;
+    }
+    if (rule.min_number != null and
+        rule.max_number != null and
+        rule.min_number.? > rule.max_number.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+}
+
+fn requireDeclaredValuesKeys(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{
+            "op",
+            "input",
+            "path",
+            "object",
+            "declarations",
+            "declaration_paths",
+            "type",
+            "min",
+            "max",
+        },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{
+            "op",
+            "path",
+            "object",
+            "declarations",
+            "declaration_paths",
+            "type",
+        },
+    );
+}
+
+fn requireMappingKeys(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "input", "source", "target", "mapping", "from", "to" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "source", "target", "mapping", "from", "to" },
+    );
+}
+
+fn requireKeyedJoinKeys(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{
+            "op",
+            "input",
+            "collection",
+            "key",
+            "selector",
+            "value",
+            "equals",
+            "rules",
+        },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "collection", "key", "selector", "value", "equals" },
+    );
+}
+
+fn requireCorrespondenceKeys(object: std.json.ObjectMap) !void {
+    const keys = [_][]const u8{
+        "op",
+        "input",
+        "predecessor",
+        "predecessor_key",
+        "successor",
+        "successor_key",
+        "preserved",
+        "retired",
+        "introduced",
+        "mappings",
+        "mapping_predecessors",
+        "mapping_successors",
+    };
+    try definition_core.json.requireExactKeys(object, &keys);
+    try definition_core.json.requireFields(object, keys[2..]);
+}
+
+fn compileScalarItemRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "type" },
+    );
+    rule.scalar_kind = try JsonKind.parse(
+        try definition_core.json.requiredString(object, "type"),
+    );
+}
+
+fn compileCountBoundItemRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "min", "max" },
+    );
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    try validateCountBounds(rule);
+}
+
+fn compileStringBoundItemRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "min", "max", "trimmed_min" },
+    );
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    rule.trimmed_min_count = try optionalUnsigned(object, "trimmed_min");
+    if (rule.min_count == null and
+        rule.max_count == null and
+        rule.trimmed_min_count == null)
+    {
+        return error.MissingRuleBound;
+    }
+    if (rule.min_count != null or rule.max_count != null) {
+        try validateCountBounds(rule);
+    }
+    if (rule.trimmed_min_count != null and
+        rule.max_count != null and
+        rule.trimmed_min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+}
+
+fn validateCountBounds(rule: *const CompiledRule) !void {
+    if (rule.min_count == null and rule.max_count == null) {
+        return error.MissingRuleBound;
+    }
+    if (rule.min_count != null and
+        rule.max_count != null and
+        rule.min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+}
+
+fn compileRegexItemRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "patterns", "max" },
+    );
+    rule.max_count = try optionalUnsigned(object, "max") orelse
+        return error.MissingRegexBound;
+    if (rule.max_count.? == 0 or
+        rule.max_count.? > max_regex_subject_bytes)
+    {
+        return error.InvalidRegexBound;
+    }
+    rule.regex_patterns = try compileRegexPatterns(
+        allocator,
+        try definition_core.json.field(object, "patterns"),
+    );
+}
+
+fn compileIdentifierItemRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "min", "max", "style" },
+    );
+    rule.min_count = try optionalUnsigned(object, "min");
+    rule.max_count = try optionalUnsigned(object, "max");
+    if (rule.min_count != null and
+        rule.max_count != null and
+        rule.min_count.? > rule.max_count.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+    if (object.get("style")) |raw| {
+        rule.identifier_style = try IdentifierStyle.parse(
+            try definition_core.json.string(raw),
+        );
+    }
+}
+
+fn compileNumberBoundItemRule(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "min", "max" },
+    );
+    rule.min_number = try optionalNumber(object, "min");
+    rule.max_number = try optionalNumber(object, "max");
+    if (rule.min_number == null and rule.max_number == null) {
+        return error.MissingRuleBound;
+    }
+    if (rule.min_number != null and
+        rule.max_number != null and
+        rule.min_number.? > rule.max_number.?)
+    {
+        return error.InvalidRuleBounds;
+    }
+}
+
+fn compileEnumItemRule(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "op", "path", "values" },
+    );
+    rule.values = try parseEnumValues(
+        allocator,
+        try definition_core.json.field(object, "values"),
+    );
+}
+
+fn requireReferenceItemKeys(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{
+            "op",
+            "path",
+            "reference",
+            "target",
+            "target_items",
+            "target_rules",
+            "coverage_rules",
+            "key",
+            "coverage",
+            "self_reference",
+            "ignore_null",
+        },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "op", "path", "reference", "target", "key" },
+    );
+}
+
+fn requireReferenceRootKeys(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{
+            "op",
+            "input",
+            "path",
+            "reference",
+            "sources",
+            "target_input",
+            "target",
+            "target_items",
+            "target_rules",
+            "coverage_rules",
+            "targets",
+            "key",
+            "coverage",
+            "self_reference",
+            "ignore_null",
+        },
+    );
+    try definition_core.json.requireFields(object, &.{"op"});
+}
+
+fn hasSingleReferenceTargetFields(object: std.json.ObjectMap) bool {
+    return object.get("target") != null or
+        object.get("target_items") != null or
+        object.get("target_rules") != null or
+        object.get("coverage_rules") != null or
+        object.get("key") != null;
+}
+
+fn compileReferenceRootPolicies(
+    object: std.json.ObjectMap,
+    rule: *CompiledRule,
+) !void {
+    if (object.get("coverage")) |raw_coverage| {
+        const coverage = try definition_core.json.string(raw_coverage);
+        if (!std.mem.eql(u8, coverage, "all-targets")) {
+            return error.UnsupportedReferenceCoverage;
+        }
+        rule.total_coverage = true;
+    }
+    if (object.get("self_reference")) |raw_policy| {
+        const policy = try definition_core.json.string(raw_policy);
+        if (!std.mem.eql(u8, policy, "reject")) {
+            return error.UnsupportedSelfReferencePolicy;
+        }
+        if (rule.reference_sources.len != 0 or
+            rule.reference_targets.len != 0 or
+            rule.other_input_index.? != rule.input_index or
+            rule.path_ids[0] != rule.pointer_id.?)
+        {
+            return error.SelfReferenceRequiresOneCollection;
+        }
+        rule.reject_self_reference = true;
+    }
+    rule.ignore_null_references =
+        try optionalBoolean(object, "ignore_null") orelse false;
+}
+
+fn compileReferencePolicies(
+    object: std.json.ObjectMap,
+    source_pointer_id: u16,
+    rule: *CompiledRule,
+) !void {
+    if (object.get("coverage")) |raw_coverage| {
+        const coverage = try definition_core.json.string(raw_coverage);
+        if (!std.mem.eql(u8, coverage, "all-targets")) {
+            return error.UnsupportedReferenceCoverage;
+        }
+        rule.total_coverage = true;
+    }
+    if (object.get("self_reference")) |raw_policy| {
+        const policy = try definition_core.json.string(raw_policy);
+        if (!std.mem.eql(u8, policy, "reject")) {
+            return error.UnsupportedSelfReferencePolicy;
+        }
+        if (rule.path_ids[0] != source_pointer_id) {
+            return error.SelfReferenceRequiresOneCollection;
+        }
+        rule.reject_self_reference = true;
+    }
+    rule.ignore_null_references =
+        try optionalBoolean(object, "ignore_null") orelse false;
+}
+
 fn isItemOperator(operator: definition.Operator) bool {
     return switch (operator) {
         .exact_object,
@@ -8104,544 +9699,415 @@ fn decodeForAllocationFailure(
     try decoder.finish();
 }
 
-test "compiled validation plan accepts valid structure and rejects invalid structure" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "artifact.json",
-        .data =
-        \\{
-        \\  "schema":"ledger-artifact-definition/v1",
-        \\  "id":"example/record",
-        \\  "owner":"example",
-        \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","field-absent","optional-field","scalar-type","enum","safe-identifier","regex","tagged-union","unique","sorted","field-equal","keyed-unique","reference-exists","declared-field-values","disjoint","implies","total-partition","total-mapping","path-format","all","any","none","object-values"]},
-        \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
-        \\  "canonicalization":{},
-        \\  "shape":{"rules":[
-        \\    {"op":"exact-object","path":"","keys":["schema","record_id","status","tags","mirror","items","groups","links","optional_links","containers","selected","checks","more_checks","guards","changes","meta","universe","ordering","accepted","rejected","targets","mappings","declarations","scored"],"allow_additional":true},
-        \\    {"op":"field-absent","path":"/forbidden"},
-        \\    {"op":"optional-field","path":"/nullable","allow_null":true,"rules":[{"op":"scalar-type","type":"string"}]},
-        \\    {"op":"object-values","path":"/meta","rules":[{"op":"tagged-union","path":"","variants":[{"kind":"string","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"scalar-type","path":"/value","type":"string"}]}]}]},
-        \\    {"op":"scalar-type","path":"/record_id","type":"string"},
-        \\    {"op":"safe-identifier","path":"/record_id","max":64},
-        \\    {"op":"regex","path":"/record_id","patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64},
-        \\    {"op":"enum","path":"/status","values":["open","closed"]},
-        \\    {"op":"unique","path":"/tags"},
-        \\    {"op":"sorted","path":"/tags"},
-        \\    {"op":"unique","path":"/ordering"},
-        \\    {"op":"keyed-unique","path":"/items","key":"/id"},
-        \\    {"op":"reference-exists","path":"/links","reference":"/item_refs","target":"/items","key":"/id"},
-        \\    {"op":"reference-exists","path":"/links","reference":"/optional_target","target":"/items","key":"/id","ignore_null":true},
-        \\    {"op":"reference-exists","path":"/optional_links","reference":"/item_refs","target":"/items","key":"/id"},
-        \\    {"op":"reference-exists","path":"/items","reference":"/related_ids","target":"/items","key":"/id","self_reference":"reject"},
-        \\    {"op":"reference-exists","path":"/selected","reference":"","target":"/containers","target_items":"/entries","target_rules":[{"op":"enum","path":"/status","values":["active","inactive"]}],"coverage_rules":[{"op":"enum","path":"/status","values":["active"]}],"key":"/id","coverage":"all-targets"},
-        \\    {"op":"path-format","path":"/groups","items":"/members","target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
-        \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum","values":["confirmed"]}]},
-        \\    {"op":"all","path":"/items","rules":[
-        \\      {"op":"exact-object","keys":["id","kind","state","labels","related_ids"]},
-        \\      {"op":"scalar-type","path":"/id","type":"string"},
-        \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
-        \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
-        \\    ]},
-        \\    {"op":"any","path":"/items","rules":[{"op":"enum","path":"/id","values":["item-2"]}]},
-        \\    {"op":"none","path":"/items","rules":[{"op":"enum","path":"/id","values":["forbidden"]}]}
-        \\  ]},
-        \\  "constraints":[
-        \\    {"op":"field-equal","left":"/status","right":"/mirror"},
-        \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
-        \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure","then_nonempty":true},
-        \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
-        \\    {"op":"reference-exists","path":"/accepted","reference":"","target":"/universe","key":""},
-        \\    {"op":"reference-exists","path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"},
-        \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{"path":"/more_checks","reference":""},{"path":"/groups","items":"/members","reference":"/target_id"},{"path":"/missing_checks","reference":"","optional":true}],"targets":[
-        \\      {"path":"/items","key":"/id"},
-        \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},
-        \\      {"path":"/missing_groups","key":"","optional":true}
-        \\    ]},
-        \\    {"op":"reference-exists","sources":[
-        \\      {"path":"/guards","reference":"/ids","rules":[{"op":"enum","path":"/mode","values":["active"]}],"fragments":[{"literal":"id:"},{"value":true}]},
-        \\      {"path":"/guards","reference":"/kinds","rules":[{"op":"enum","path":"/mode","values":["active"]}],"fragments":[{"literal":"kind:"},{"value":true}]}
-        \\    ],"targets":[
-        \\      {"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],"coverage_key":"/id"},
-        \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],"coverage_key":"/id","match_rules":[{"op":"enum","path":"/state","values":["ready"]}]}
-        \\    ],"coverage":"all-targets"},
-        \\    {"op":"declared-field-values","path":"/scored","object":"/values","declarations":"/declarations","declaration_paths":["/increase","/decrease"],"type":"integer","min":0,"max":100},
-        \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
-        \\    {"op":"total-mapping","source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}
-        \\  ],
-        \\  "identity":{},
-        \\  "storage":{"kind":"pure"},
-        \\  "operations":{},
-        \\  "projections":{},
-        \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}
-        \\}
-        ,
-    });
-    var closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "artifact.json",
-        .{},
-    );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        8 * 1024 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try std.testing.expectEqual(plan.inputs.len, cached.inputs.len);
-    try std.testing.expectEqual(plan.pointers.len, cached.pointers.len);
-    try std.testing.expectEqual(plan.rules.len, cached.rules.len);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        compileForAllocationFailure,
-        .{&definition_plan},
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        decodeForAllocationFailure,
-        .{payload},
-    );
+const ValidationTestPlan = struct {
+    allocator: std.mem.Allocator,
+    closure: definition_core.Closure,
+    definition_plan: definition.Plan,
+    plan: Plan,
+    payload: []u8,
+    cached: Plan,
 
-    const valid_bytes =
-        "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"a\"],\"related_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\",\"target_id\":\"item-1\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optional_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10,\"undeclared\":999}}],\"nullable\":null,\"extension\":\"preserved\"}";
-    var valid = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = valid_bytes,
-        }},
-    );
-    defer valid.deinit(std.testing.allocator);
-    try std.testing.expect(valid.valid);
-    try std.testing.expect(!valid.authority_granted);
-    try std.testing.expect(!valid.storage_mutated);
+    fn init(
+        allocator: std.mem.Allocator,
+        directory: anytype,
+        path: []const u8,
+        cache_limit: usize,
+    ) !ValidationTestPlan {
+        var closure = try definition_core.closure.loadFromDir(
+            allocator,
+            directory,
+            path,
+            .{},
+        );
+        errdefer closure.deinit(allocator);
+        var definition_plan = try definition.compile(
+            allocator,
+            &closure,
+            path,
+        );
+        errdefer definition_plan.deinit(allocator);
+        var plan = try compile(allocator, &definition_plan);
+        errdefer plan.deinit(allocator);
+        var encoder = definition_core.cache.Encoder.init(
+            allocator,
+            cache_limit,
+        );
+        defer encoder.deinit();
+        try encodeCache(&plan, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        errdefer allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var cached = try decodeCache(allocator, &decoder);
+        errdefer cached.deinit(allocator);
+        try decoder.finish();
+        try validateCachePlan(&cached, &definition_plan);
+        return .{
+            .allocator = allocator,
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .plan = plan,
+            .payload = payload,
+            .cached = cached,
+        };
+    }
 
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "wrapper.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record","path":"artifact.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"definition-ref","path":"","definition":"example/record"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
-        ,
-    });
-    var wrapper_closure = try definition_core.closure.loadFromDir(
-        std.testing.allocator,
-        &tmp.dir,
-        "wrapper.json",
-        .{},
-    );
-    defer wrapper_closure.deinit(std.testing.allocator);
-    var wrapper_definition = try definition.compile(
-        std.testing.allocator,
-        &wrapper_closure,
-        "wrapper.json",
-    );
-    defer wrapper_definition.deinit(std.testing.allocator);
-    var wrapper_plan = try compile(
-        std.testing.allocator,
-        &wrapper_definition,
-    );
-    defer wrapper_plan.deinit(std.testing.allocator);
-    var wrapper_encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        8 * 1024 * 1024,
-    );
-    defer wrapper_encoder.deinit();
-    try encodeCache(&wrapper_plan, &wrapper_encoder);
-    const wrapper_payload = try wrapper_encoder.toOwnedSlice();
-    defer std.testing.allocator.free(wrapper_payload);
-    var wrapper_decoder =
-        definition_core.cache.Decoder.init(wrapper_payload);
-    var cached_wrapper = try decodeCache(
-        std.testing.allocator,
-        &wrapper_decoder,
-    );
-    defer cached_wrapper.deinit(std.testing.allocator);
-    try wrapper_decoder.finish();
-    try validateCachePlan(&cached_wrapper, &wrapper_definition);
-    var wrapped_valid = try validate(
-        std.testing.allocator,
-        &wrapper_definition,
-        &cached_wrapper,
-        &.{.{ .name = "record", .bytes = valid_bytes }},
-    );
-    defer wrapped_valid.deinit(std.testing.allocator);
-    try std.testing.expect(wrapped_valid.valid);
+    fn deinit(self: *ValidationTestPlan) void {
+        self.cached.deinit(self.allocator);
+        self.allocator.free(self.payload);
+        self.plan.deinit(self.allocator);
+        self.definition_plan.deinit(self.allocator);
+        self.closure.deinit(self.allocator);
+        self.* = undefined;
+    }
 
-    const invalid_pattern_bytes = try std.mem.replaceOwned(
+    fn checkAllocationFailures(self: *const ValidationTestPlan) !void {
+        try std.testing.checkAllAllocationFailures(
+            self.allocator,
+            compileForAllocationFailure,
+            .{&self.definition_plan},
+        );
+        try std.testing.checkAllAllocationFailures(
+            self.allocator,
+            decodeForAllocationFailure,
+            .{self.payload},
+        );
+    }
+
+    fn expectCacheShape(self: *const ValidationTestPlan) !void {
+        try std.testing.expectEqual(
+            self.plan.inputs.len,
+            self.cached.inputs.len,
+        );
+        try std.testing.expectEqual(
+            self.plan.pointers.len,
+            self.cached.pointers.len,
+        );
+        try std.testing.expectEqual(
+            self.plan.rules.len,
+            self.cached.rules.len,
+        );
+    }
+
+    fn checkValidationAllocationFailures(
+        self: *const ValidationTestPlan,
+        bytes: []const u8,
+    ) !void {
+        try std.testing.checkAllAllocationFailures(
+            self.allocator,
+            validateForAllocationFailure,
+            .{ &self.definition_plan, &self.plan, bytes },
+        );
+    }
+};
+
+const DefinitionReferenceTestPlan = struct {
+    allocator: std.mem.Allocator,
+    closure: definition_core.Closure,
+    definition_plan: definition.Plan,
+    definition_payload: []u8,
+    cached_definition: definition.Plan,
+    plan: Plan,
+    payload: []u8,
+    cached: Plan,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        directory: anytype,
+    ) !DefinitionReferenceTestPlan {
+        var closure = try definition_core.closure.loadFromDir(
+            allocator,
+            directory,
+            "packet.json",
+            .{},
+        );
+        errdefer closure.deinit(allocator);
+        var definition_plan = try definition.compile(
+            allocator,
+            &closure,
+            "packet.json",
+        );
+        errdefer definition_plan.deinit(allocator);
+        var definition_encoder = definition_core.cache.Encoder.init(
+            allocator,
+            8 * 1024 * 1024,
+        );
+        defer definition_encoder.deinit();
+        try definition.encodeCache(
+            &definition_plan,
+            &definition_encoder,
+        );
+        const definition_payload =
+            try definition_encoder.toOwnedSlice();
+        errdefer allocator.free(definition_payload);
+        var definition_decoder =
+            definition_core.cache.Decoder.init(definition_payload);
+        var cached_definition = try definition.decodeCache(
+            allocator,
+            &definition_decoder,
+        );
+        errdefer cached_definition.deinit(allocator);
+        try definition_decoder.finish();
+        var plan = try compile(allocator, &cached_definition);
+        errdefer plan.deinit(allocator);
+        var encoder = definition_core.cache.Encoder.init(
+            allocator,
+            8 * 1024 * 1024,
+        );
+        defer encoder.deinit();
+        try encodeCache(&plan, &encoder);
+        const payload = try encoder.toOwnedSlice();
+        errdefer allocator.free(payload);
+        var decoder = definition_core.cache.Decoder.init(payload);
+        var cached = try decodeCache(allocator, &decoder);
+        errdefer cached.deinit(allocator);
+        try decoder.finish();
+        try validateCachePlan(&cached, &cached_definition);
+        return .{
+            .allocator = allocator,
+            .closure = closure,
+            .definition_plan = definition_plan,
+            .definition_payload = definition_payload,
+            .cached_definition = cached_definition,
+            .plan = plan,
+            .payload = payload,
+            .cached = cached,
+        };
+    }
+
+    fn deinit(self: *DefinitionReferenceTestPlan) void {
+        self.cached.deinit(self.allocator);
+        self.allocator.free(self.payload);
+        self.plan.deinit(self.allocator);
+        self.cached_definition.deinit(self.allocator);
+        self.allocator.free(self.definition_payload);
+        self.definition_plan.deinit(self.allocator);
+        self.closure.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn expectTestValidation(
+    definition_plan: *const definition.Plan,
+    plan: *const Plan,
+    input_name: []const u8,
+    bytes: []const u8,
+    expected: bool,
+) !void {
+    var result = try validate(
+        std.testing.allocator,
+        definition_plan,
+        plan,
+        &.{.{ .name = input_name, .bytes = bytes }},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(expected, result.valid);
+}
+
+fn expectValidTestEnvelope(
+    test_plan: *const ValidationTestPlan,
+    bytes: []const u8,
+) !void {
+    var result = try validate(
+        std.testing.allocator,
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        &.{.{ .name = "record", .bytes = bytes }},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.valid);
+    try std.testing.expect(!result.authority_granted);
+    try std.testing.expect(!result.storage_mutated);
+}
+
+fn expectReplacementValidation(
+    definition_plan: *const definition.Plan,
+    plan: *const Plan,
+    base: []const u8,
+    before: []const u8,
+    after: []const u8,
+    expected: bool,
+) !void {
+    const bytes = try std.mem.replaceOwned(
         u8,
         std.testing.allocator,
-        valid_bytes,
-        "\"record_id\":\"record-1\"",
-        "\"record_id\":\"other-1\"",
+        base,
+        before,
+        after,
     );
-    defer std.testing.allocator.free(invalid_pattern_bytes);
-    var invalid_pattern = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_pattern_bytes,
-        }},
+    defer std.testing.allocator.free(bytes);
+    try expectTestValidation(
+        definition_plan,
+        plan,
+        "record",
+        bytes,
+        expected,
     );
-    defer invalid_pattern.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_pattern.valid);
-    var wrapped_invalid = try validate(
-        std.testing.allocator,
-        &wrapper_definition,
-        &cached_wrapper,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_pattern_bytes,
-        }},
-    );
-    defer wrapped_invalid.deinit(std.testing.allocator);
-    try std.testing.expect(!wrapped_invalid.valid);
+}
 
-    const forbidden_field_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+fn checkShapeValidationVariants(
+    test_plan: *const ValidationTestPlan,
+    valid_bytes: []const u8,
+) !void {
+    const definition_plan = &test_plan.definition_plan;
+    const plan = &test_plan.cached;
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"extension\":\"preserved\"",
         "\"extension\":\"preserved\",\"forbidden\":true",
+        false,
     );
-    defer std.testing.allocator.free(forbidden_field_bytes);
-    var forbidden_field = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = forbidden_field_bytes,
-        }},
-    );
-    defer forbidden_field.deinit(std.testing.allocator);
-    try std.testing.expect(!forbidden_field.valid);
-
-    const missing_declared_field_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"speed\":90,\"cost\":10",
         "\"speed\":90",
+        false,
     );
-    defer std.testing.allocator.free(missing_declared_field_bytes);
-    var missing_declared_field = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = missing_declared_field_bytes,
-        }},
-    );
-    defer missing_declared_field.deinit(std.testing.allocator);
-    try std.testing.expect(!missing_declared_field.valid);
-
-    const duplicate_declaration_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "{\"increase\":\"speed\"},{\"decrease\":\"cost\"}",
         "{\"increase\":\"speed\"},{\"decrease\":\"speed\"}",
+        false,
     );
-    defer std.testing.allocator.free(duplicate_declaration_bytes);
-    var duplicate_declaration = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = duplicate_declaration_bytes,
-        }},
-    );
-    defer duplicate_declaration.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate_declaration.valid);
-
-    const out_of_bounds_declared_field_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"speed\":90,\"cost\":10",
         "\"speed\":101,\"cost\":10",
+        false,
     );
-    defer std.testing.allocator.free(out_of_bounds_declared_field_bytes);
-    var out_of_bounds_declared_field = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = out_of_bounds_declared_field_bytes,
-        }},
-    );
-    defer out_of_bounds_declared_field.deinit(std.testing.allocator);
-    try std.testing.expect(!out_of_bounds_declared_field.valid);
-
-    const present_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"meta\":{}",
         "\"meta\":{\"closure\":\"confirmed\"}",
+        true,
     );
-    defer std.testing.allocator.free(present_bytes);
-    var valid_present = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = present_bytes,
-        }},
-    );
-    defer valid_present.deinit(std.testing.allocator);
-    try std.testing.expect(valid_present.valid);
-
-    const invalid_optional_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"meta\":{}",
         "\"meta\":{\"closure\":\"wrong\"}",
+        false,
     );
-    defer std.testing.allocator.free(invalid_optional_bytes);
-    var invalid_optional = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_optional_bytes,
-        }},
-    );
-    defer invalid_optional.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_optional.valid);
+}
 
-    const invalid_object_value_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+fn checkReferenceValidationVariants(
+    test_plan: *const ValidationTestPlan,
+    valid_bytes: []const u8,
+) !void {
+    const definition_plan = &test_plan.definition_plan;
+    const plan = &test_plan.cached;
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"meta\":{}",
         "\"meta\":{\"entry\":{\"value\":1}}",
+        false,
     );
-    defer std.testing.allocator.free(invalid_object_value_bytes);
-    var invalid_object_value = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_object_value_bytes,
-        }},
-    );
-    defer invalid_object_value.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_object_value.valid);
-
-    const invalid_scalar_reference_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"accepted\":[\"a\"]",
         "\"accepted\":[\"missing\"]",
+        false,
     );
-    defer std.testing.allocator.free(invalid_scalar_reference_bytes);
-    var invalid_scalar_reference = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_scalar_reference_bytes,
-        }},
-    );
-    defer invalid_scalar_reference.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_scalar_reference.valid);
-
-    const incomplete_coverage_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"ordering\":[\"a\",\"b\"]",
         "\"ordering\":[\"a\"]",
+        false,
     );
-    defer std.testing.allocator.free(incomplete_coverage_bytes);
-    var incomplete_coverage = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = incomplete_coverage_bytes,
-        }},
-    );
-    defer incomplete_coverage.deinit(std.testing.allocator);
-    try std.testing.expect(!incomplete_coverage.valid);
-
-    const self_reference_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"related_ids\":[\"item-2\"]",
         "\"related_ids\":[\"item-1\"]",
+        false,
     );
-    defer std.testing.allocator.free(self_reference_bytes);
-    var self_reference = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = self_reference_bytes,
-        }},
-    );
-    defer self_reference.deinit(std.testing.allocator);
-    try std.testing.expect(!self_reference.valid);
-
-    const filtered_reference_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"selected\":[\"nested-1\"]",
         "\"selected\":[\"nested-3\"]",
+        false,
     );
-    defer std.testing.allocator.free(filtered_reference_bytes);
-    var filtered_reference = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = filtered_reference_bytes,
-        }},
-    );
-    defer filtered_reference.deinit(std.testing.allocator);
-    try std.testing.expect(!filtered_reference.valid);
-
-    const invalid_union_reference_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"checks\":[\"item-1\",\"g:one\"]",
         "\"checks\":[\"item-1\",\"g:missing\"]",
+        false,
     );
-    defer std.testing.allocator.free(invalid_union_reference_bytes);
-    var invalid_union_reference = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_union_reference_bytes,
-        }},
-    );
-    defer invalid_union_reference.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_union_reference.valid);
+}
 
-    const incomplete_alias_coverage_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+fn checkProtocolValidationVariants(
+    test_plan: *const ValidationTestPlan,
+    valid_bytes: []const u8,
+) !void {
+    const definition_plan = &test_plan.definition_plan;
+    const plan = &test_plan.cached;
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
-        "\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}]",
-        "\"guards\":[{\"mode\":\"active\",\"ids\":[\"item-1\"],\"kinds\":[]},{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"shared\"]}]",
+        "\"guards\":[{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]}," ++
+            "{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"missing\"]}]",
+        "\"guards\":[{\"mode\":\"active\",\"ids\":[\"item-1\"],\"kinds\":[]}," ++
+            "{\"mode\":\"inactive\",\"ids\":[],\"kinds\":[\"shared\"]}]",
+        false,
     );
-    defer std.testing.allocator.free(incomplete_alias_coverage_bytes);
-    var incomplete_alias_coverage = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = incomplete_alias_coverage_bytes,
-        }},
-    );
-    defer incomplete_alias_coverage.deinit(std.testing.allocator);
-    try std.testing.expect(!incomplete_alias_coverage.valid);
-
-    const disallowed_match_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"ready\"",
         "\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"blocked\"",
+        false,
     );
-    defer std.testing.allocator.free(disallowed_match_bytes);
-    var disallowed_match = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = disallowed_match_bytes,
-        }},
-    );
-    defer disallowed_match.deinit(std.testing.allocator);
-    try std.testing.expect(!disallowed_match.valid);
-
-    const missing_implication_target_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"changes\":[]",
         "\"changes\":[\"changed\"]",
+        false,
     );
-    defer std.testing.allocator.free(missing_implication_target_bytes);
-    var missing_implication_target = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = missing_implication_target_bytes,
-        }},
-    );
-    defer missing_implication_target.deinit(std.testing.allocator);
-    try std.testing.expect(!missing_implication_target.valid);
-
-    const invalid_format_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
+    try expectReplacementValidation(
+        definition_plan,
+        plan,
         valid_bytes,
         "\"label\":\"g:one\"",
         "\"label\":\"wrong\"",
+        false,
     );
-    defer std.testing.allocator.free(invalid_format_bytes);
-    var invalid_format = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{
-            .name = "record",
-            .bytes = invalid_format_bytes,
-        }},
-    );
-    defer invalid_format.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_format.valid);
+}
 
+fn checkInvalidDiagnosticSet(
+    test_plan: *const ValidationTestPlan,
+) !void {
     var invalid = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &plan,
+        &test_plan.definition_plan,
+        &test_plan.plan,
         &.{.{
             .name = "record",
-            .bytes = "{\"schema\":\"example/v1\",\"record_id\":\"bad id\",\"status\":\"closed\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"item-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"item_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"],\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"changes\":[],\"meta\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"declarations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values\":{\"speed\":90,\"cost\":10}}],\"extra\":true}",
+            .bytes = validation_invalid_record_bytes,
         }},
     );
     defer invalid.deinit(std.testing.allocator);
@@ -8667,10 +10133,787 @@ test "compiled validation plan accepts valid structure and rejects invalid struc
     try std.testing.expect(saw_mapping);
     try std.testing.expect(saw_all);
     try std.testing.expect(saw_any);
-    try std.testing.checkAllAllocationFailures(
+}
+
+fn testSha256Digest(parts: []const []const u8) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for (parts) |part| hasher.update(part);
+    var raw: [32]u8 = undefined;
+    hasher.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(
         std.testing.allocator,
-        validateForAllocationFailure,
-        .{ &definition_plan, &plan, valid_bytes },
+        "sha256:{s}",
+        .{hex},
+    );
+}
+
+const test_resource_digest =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+const ShaTestVectors = struct {
+    document_digest: []u8,
+    framed_digest: []u8,
+    field_digest: []u8,
+    transport_digest: []u8,
+    valid_bytes: []u8,
+
+    fn init() !ShaTestVectors {
+        const allocator = std.testing.allocator;
+        const document_digest =
+            try definition_core.canonical_json.digestBytesAlloc(
+                allocator,
+                "{\"digest\":null,\"id\":\"doc\",\"schema\":\"document/v1\"}",
+            );
+        errdefer allocator.free(document_digest);
+        const framed_digest = try testSha256Digest(&.{
+            "group/v1\x00",
+            "item.txt",
+            "\x00",
+            test_resource_digest,
+            "\x00",
+        });
+        errdefer allocator.free(framed_digest);
+        const field_digest = try testSha256Digest(&.{
+            "bundle/v1\x00",
+            "owner-1",
+            "\x00",
+            "parent-1",
+            "\x00",
+            "subject-1",
+            "\x00",
+            test_resource_digest,
+        });
+        errdefer allocator.free(field_digest);
+        const transport_digest = try testSha256Digest(
+            &.{"example\nrecord\n{}\n"},
+        );
+        errdefer allocator.free(transport_digest);
+        const valid_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"bundle\":{{\"digest\":\"{s}\",\"document_digest\":\"{s}\"," ++
+                "\"owner_id\":\"owner-1\",\"parent_ref\":\"parent-1\"," ++
+                "\"subject_ref\":\"subject-1\"}},\"document\":{{\"digest\":" ++
+                "\"{s}\",\"id\":\"doc\",\"schema\":\"document/v1\"}}," ++
+                "\"groups\":{{\"standard\":{{\"digest\":\"{s}\",\"entries\":" ++
+                "[{{\"checksum\":\"{s}\",\"path\":\"item.txt\"}}]}}}}," ++
+                "\"transport\":{{\"channel\":\"example\",\"fingerprint\":" ++
+                "\"{s}\",\"payload\":\"{{}}\\n\",\"type\":\"record\"}}}}",
+            .{
+                field_digest,
+                test_resource_digest,
+                document_digest,
+                framed_digest,
+                test_resource_digest,
+                transport_digest,
+            },
+        );
+        return .{
+            .document_digest = document_digest,
+            .framed_digest = framed_digest,
+            .field_digest = field_digest,
+            .transport_digest = transport_digest,
+            .valid_bytes = valid_bytes,
+        };
+    }
+
+    fn deinit(self: *ShaTestVectors) void {
+        const allocator = std.testing.allocator;
+        allocator.free(self.valid_bytes);
+        allocator.free(self.transport_digest);
+        allocator.free(self.field_digest);
+        allocator.free(self.framed_digest);
+        allocator.free(self.document_digest);
+        self.* = undefined;
+    }
+};
+
+fn checkDefinitionReferenceCases(
+    definition_plan: *const definition.Plan,
+    plan: *const Plan,
+) !void {
+    const valid_bytes =
+        "{\"receipt\":{\"count\":2,\"parent\":null,\"status\":\"complete\"}}";
+    var valid = try validate(
+        std.testing.allocator,
+        definition_plan,
+        plan,
+        &.{.{ .name = "packet", .bytes = valid_bytes }},
+    );
+    defer valid.deinit(std.testing.allocator);
+    try std.testing.expect(valid.valid);
+    try std.testing.expect(!valid.authority_granted);
+    try std.testing.expect(!valid.storage_mutated);
+    try expectTestValidation(
+        definition_plan,
+        plan,
+        "packet",
+        "{\"metadata\":{},\"receipt\":{\"count\":2,\"parent\":{\"value\":" ++
+            "\"prior\"},\"status\":\"complete\"}}",
+        true,
+    );
+    try expectTestValidation(
+        definition_plan,
+        plan,
+        "packet",
+        "{\"receipt\":{\"count\":\"two\",\"parent\":null,\"status\":" ++
+            "\"complete\"}}",
+        false,
+    );
+    try expectTestValidation(
+        definition_plan,
+        plan,
+        "packet",
+        "{\"other\":{},\"receipt\":{\"count\":2,\"parent\":null,\"status\":" ++
+            "\"complete\"}}",
+        false,
+    );
+    try expectTestValidation(
+        definition_plan,
+        plan,
+        "packet",
+        "{\"receipt\":{\"count\":2,\"parent\":{\"value\":\"\"},\"status\":" ++
+            "\"complete\"}}",
+        false,
+    );
+}
+
+fn expectEmbeddedValues(
+    plan: *const Plan,
+    event_bytes: []const u8,
+    state_bytes: []const u8,
+    expected: bool,
+) !void {
+    var event = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        event_bytes,
+        .{},
+    );
+    defer event.deinit();
+    var state = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        state_bytes,
+        .{},
+    );
+    defer state.deinit();
+    var result = try executeValues(
+        std.testing.allocator,
+        plan,
+        &.{
+            .{ .name = "event", .value = event.value },
+            .{ .name = "state", .value = state.value },
+        },
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(expected, result.isValid());
+}
+
+fn checkEmbeddedValidationCases(
+    plan: *const Plan,
+    cached: *const Plan,
+) !void {
+    const replacement =
+        "{\"new_refs\":[\"item-1\"],\"operation\":\"replace\"," ++
+        "\"stream_id\":\"stream-1\"}";
+    const matching =
+        "{\"existing_refs\":[],\"phase\":\"open\"," ++
+        "\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}";
+    const debt =
+        "{\"existing_refs\":[\"item-0\"],\"phase\":\"closed\"," ++
+        "\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}";
+    try expectEmbeddedValues(plan, replacement, matching, true);
+    try expectEmbeddedValues(
+        plan,
+        replacement,
+        "{\"existing_refs\":[],\"phase\":\"open\"," ++
+            "\"replacement_allowed\":true,\"stream_id\":\"stream-2\"}",
+        false,
+    );
+    try expectEmbeddedValues(
+        plan,
+        replacement,
+        "{\"existing_refs\":[],\"phase\":\"open\"," ++
+            "\"replacement_allowed\":false,\"stream_id\":\"stream-1\"}",
+        false,
+    );
+    try expectEmbeddedValues(cached, replacement, debt, false);
+    try expectEmbeddedValues(
+        cached,
+        "{\"new_refs\":[],\"operation\":\"replace\"," ++
+            "\"stream_id\":\"stream-1\"}",
+        matching,
+        false,
+    );
+    try expectEmbeddedValues(
+        cached,
+        "{\"operation\":\"inspect\",\"stream_id\":\"stream-1\"}",
+        debt,
+        true,
+    );
+}
+
+const validation_test_definition_01 =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/record",
+    \\  "owner":"example",
+    \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object",
+    \\"field-absent","optional-field","scalar-type","enum","safe-identifier",
+    \\"regex","tagged-union","unique","sorted","field-equal","keyed-unique",
+    \\"reference-exists","declared-field-values","disjoint","implies",
+    \\"total-partition","total-mapping","path-format","all","any","none",
+    \\"object-values"]},
+    \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
+    \\  "canonicalization":{},
+    \\  "shape":{"rules":[
+    \\    {"op":"exact-object","path":"","keys":["schema","record_id","status",
+    \\"tags","mirror","items","groups","links","optional_links","containers",
+    \\"selected","checks","more_checks","guards","changes","meta","universe",
+    \\"ordering","accepted","rejected","targets","mappings","declarations",
+    \\"scored"],"allow_additional":true},
+    \\    {"op":"field-absent","path":"/forbidden"},
+    \\    {"op":"optional-field","path":"/nullable","allow_null":true,"rules":[{
+    \\"op":"scalar-type","type":"string"}]},
+    \\    {"op":"object-values","path":"/meta","rules":[{"op":"tagged-union",
+    \\"path":"","variants":[{"kind":"string","rules":[]},{"kind":"object","rules":[
+    \\{"op":"exact-object","keys":["value"]},{"op":"scalar-type","path":"/value",
+    \\"type":"string"}]}]}]},
+    \\    {"op":"scalar-type","path":"/record_id","type":"string"},
+    \\    {"op":"safe-identifier","path":"/record_id","max":64},
+    \\    {"op":"regex","path":"/record_id","patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64},
+    \\    {"op":"enum","path":"/status","values":["open","closed"]},
+    \\    {"op":"unique","path":"/tags"},
+    \\    {"op":"sorted","path":"/tags"},
+    \\    {"op":"unique","path":"/ordering"},
+    \\    {"op":"keyed-unique","path":"/items","key":"/id"},
+    \\    {"op":"reference-exists","path":"/links","reference":"/item_refs",
+    \\"target":"/items","key":"/id"},
+    \\    {"op":"reference-exists","path":"/links","reference":"/optional_target",
+    \\"target":"/items","key":"/id","ignore_null":true},
+    \\    {"op":"reference-exists","path":"/optional_links",
+    \\"reference":"/item_refs","target":"/items","key":"/id"},
+    \\    {"op":"reference-exists","path":"/items","reference":"/related_ids",
+    \\"target":"/items","key":"/id","self_reference":"reject"},
+    \\    {"op":"reference-exists","path":"/selected","reference":"",
+    \\"target":"/containers","target_items":"/entries","target_rules":[{
+    \\"op":"enum","path":"/status","values":["active","inactive"]}],
+    \\"coverage_rules":[{"op":"enum","path":"/status","values":["active"]}],
+    \\"key":"/id","coverage":"all-targets"},
+    \\    {"op":"path-format","path":"/groups","items":"/members",
+    \\"target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{
+    \\"item":"/name"}]},
+    \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum",
+    \\"values":["confirmed"]}]},
+    \\    {"op":"all","path":"/items","rules":[
+    \\      {"op":"exact-object","keys":["id","kind","state","labels","related_ids"]},
+    \\      {"op":"scalar-type","path":"/id","type":"string"},
+    \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
+    \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
+    \\    ]},
+    \\    {"op":"any","path":"/items","rules":[{"op":"enum","path":"/id","values":["item-2"]}]},
+    \\    {"op":"none","path":"/items","rules":[{"op":"enum","path":"/id",
+    \\"values":["forbidden"]}]}
+    \\  ]},
+    \\  "constraints":[
+    \\    {"op":"field-equal","left":"/status","right":"/mirror"},
+    \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
+    \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure",
+    \\"then_nonempty":true},
+    \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
+    \\    {"op":"reference-exists","path":"/accepted","reference":"",
+    \\"target":"/universe","key":""},
+    \\    {"op":"reference-exists","path":"/ordering","reference":"",
+    \\"target":"/universe","key":"","coverage":"all-targets"},
+    \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{
+    \\"path":"/more_checks","reference":""},{"path":"/groups","items":"/members",
+    \\"reference":"/target_id"},{"path":"/missing_checks","reference":"",
+    \\"optional":true}],"targets":[
+    \\      {"path":"/items","key":"/id"},
+    \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},
+    \\{"literal":":"},{"item":"/name"}]},
+    \\      {"path":"/missing_groups","key":"","optional":true}
+    \\    ]},
+    \\    {"op":"reference-exists","sources":[
+    \\      {"path":"/guards","reference":"/ids","rules":[{"op":"enum",
+    \\"path":"/mode","values":["active"]}],"fragments":[{"literal":"id:"},{
+    \\"value":true}]},
+    \\      {"path":"/guards","reference":"/kinds","rules":[{"op":"enum",
+    \\"path":"/mode","values":["active"]}],"fragments":[{"literal":"kind:"},{
+    \\"value":true}]}
+    \\    ],"targets":[
+    \\      {"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],
+    \\"coverage_key":"/id"},
+    \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],
+    \\"coverage_key":"/id","match_rules":[{"op":"enum","path":"/state","values":[
+    \\"ready"]}]}
+    \\    ],"coverage":"all-targets"},
+    \\    {"op":"declared-field-values","path":"/scored","object":"/values",
+    \\"declarations":"/declarations","declaration_paths":["/increase","/decrease"],
+    \\"type":"integer","min":0,"max":100},
+    \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
+    \\    {"op":"total-mapping","source":"/universe","target":"/targets",
+    \\"mapping":"/mappings","from":"/from","to":"/to"}
+    \\  ],
+    \\  "identity":{},
+    \\  "storage":{"kind":"pure"},
+    \\  "operations":{},
+    \\  "projections":{},
+    \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,
+    \\"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}
+    \\}
+;
+
+const validation_test_definition_02 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper",
+    \\"owner":"example","imports":[{"id":"example/record","path":"artifact.json"}],
+    \\"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},
+    \\"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},
+    \\"shape":{"rules":[{"op":"definition-ref","path":"",
+    \\"definition":"example/record"}]},"constraints":[],"identity":{},"storage":{
+    \\"kind":"pure"},"operations":{},"projections":{},"bounds":{
+    \\"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,
+    \\"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
+;
+
+const validation_test_definition_03 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"all","bounded-string","digest","enum","exact-object","one-of",
+    \\"safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json",
+    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"exact-object","path":"","keys":["identity","label","paths",
+    \\"record_id"]},{"op":"safe-identifier","path":"/record_id","max":128,
+    \\"style":"lowercase-component"},{"op":"bounded-string","path":"/label",
+    \\"trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{
+    \\"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths",
+    \\"rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[
+    \\".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],
+    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
+    \\"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,
+    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_04 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"exact-object","member-of","not-member-of","path-scope-disjoint",
+    \\"path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},
+    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
+    \\"keys":["allowed","choices","paths","prohibited","selection"]}]},
+    \\"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},
+    \\{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{
+    \\"op":"member-of","left":"/selection","right":"/choices"},{
+    \\"op":"not-member-of","left":"/selection","right":"/prohibited"}],"identity":{
+    \\},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{
+    \\"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,
+    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_05 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/input",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},
+    \\"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},
+    \\"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},
+    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,
+    \\"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,
+    \\"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_06 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/field-count",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"at-least-one","enum","exactly-one"]},"inputs":{"record":{"codec":"json",
+    \\"max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"at-least-one","paths":["/first","/second","/third"],"rules":[{
+    \\"op":"enum","values":["blocked"]}]},{"op":"exactly-one","paths":["/left",
+    \\"/right"],"rules":[{"op":"enum","values":["selected"]}]}]},"constraints":[],
+    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
+    \\"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,
+    \\"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_07 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/correspondence",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"at-least-one","enum","exactly-one","keyed-join","predecessor-successor",
+    \\"sorted"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},
+    \\"canonicalization":{},"shape":{"rules":[
+    \\{"op":"sorted","path":"/successors","key":"/id"},
+    \\{"op":"exactly-one","path":"/candidates","rules":[{"op":"enum",
+    \\"path":"/status","values":["selected"]}]},
+    \\{"op":"at-least-one","path":"/candidates","rules":[{"op":"enum",
+    \\"path":"/derivation","values":["independent"]}]}
+    \\]},"constraints":[
+    \\{"op":"keyed-join","collection":"/candidates","key":"/id",
+    \\"selector":"/selected_id","value":"/factors","equals":"/surface","rules":[{
+    \\"op":"enum","path":"/status","values":["selected"]}]},
+    \\{"op":"predecessor-successor","predecessor":"/predecessors",
+    \\"predecessor_key":"/id","successor":"/successors","successor_key":"/id",
+    \\"preserved":"/preserved","retired":"/retired","introduced":"/introduced",
+    \\"mappings":"/mappings","mapping_predecessors":"/from",
+    \\"mapping_successors":"/to"}
+    \\],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
+    \\"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":32,
+    \\"max_output_bytes":8192,"max_diagnostics":16,"max_reducer_states":1}}
+;
+
+const validation_test_definition_08 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/namespaces",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"keyed-unique","reference-exists","tagged-union"]},"inputs":{"record":{
+    \\"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[
+    \\{"op":"keyed-unique","sources":[{"path":"/first","key":"/id"},{
+    \\"path":"/second","key":"/name"}]},
+    \\{"op":"tagged-union","path":"","tag":"/mode","variants":[{"value":"expanded",
+    \\"rules":[{"op":"reference-exists","path":"/introduced","reference":"",
+    \\"target":"/additions","key":"/id","coverage":"all-targets"}]},{
+    \\"value":"plain","rules":[]}]}
+    \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
+    \\"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_09 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/digests",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"object-values","sha256"]},"inputs":{"record":{"codec":"json",
+    \\"max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
+    \\{"op":"sha256","path":"/document","mode":"canonical-json-null",
+    \\"field":"/digest","null":"/digest","max_bytes":4096},
+    \\{"op":"object-values","path":"/groups","rules":[{"op":"sha256",
+    \\"mode":"framed-items","field":"/digest","items":"/entries",
+    \\"prefix":"group/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},
+    \\{"item":"/checksum"},{"literal":"\u0000"}],"max_bytes":4096}]},
+    \\{"op":"sha256","path":"/bundle","mode":"framed-fields","field":"/digest",
+    \\"prefix":"bundle/v1\u0000","fragments":[{"parent":"/owner_id"},{
+    \\"literal":"\u0000"},{"parent":"/parent_ref"},{"literal":"\u0000"},{
+    \\"parent":"/subject_ref"},{"literal":"\u0000"},{"parent":"/document_digest"}],
+    \\"max_bytes":4096},
+    \\{"op":"sha256","path":"/transport","mode":"framed-fields",
+    \\"field":"/fingerprint","prefix":"","fragments":[{"parent":"/channel"},{
+    \\"literal":"\n"},{"parent":"/type"},{"literal":"\n"},{"parent":"/payload"}],
+    \\"max_bytes":4096}
+    \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,
+    \\"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_10 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"bounded-string","compare-and-append","exact-object","enum","scalar-type",
+    \\"tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},
+    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
+    \\"keys":["count","parent","status"]},{"op":"scalar-type","path":"/count",
+    \\"type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{
+    \\"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{
+    \\"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{
+    \\"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},
+    \\"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{
+    \\"events":{"path":"example/receipts.jsonl","kind":"event-log","codec":"jsonl",
+    \\"max_bytes":4096}}},"operations":{"append":{"effects":[{
+    \\"op":"compare-and-append","slot":"events","input":"receipt"}]}},
+    \\"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,
+    \\"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_11 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/packet",
+    \\"owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],
+    \\"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref",
+    \\"exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},
+    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
+    \\"required_keys":["receipt"],"optional_keys":["metadata"]},{
+    \\"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},
+    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,
+    \\"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_12 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"bounded-string"]},"inputs":{"value":{"codec":"json","max_bytes":16}},
+    \\"canonicalization":{},"shape":{"rules":[{"op":"bounded-string","path":"",
+    \\"min":3,"max":3}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},
+    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":16,
+    \\"max_store_bytes":16,"max_records":1,"max_output_bytes":16,
+    \\"max_diagnostics":4,"max_reducer_states":1}}
+;
+
+const validation_test_definition_13 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier-list",
+    \\"owner":"example","imports":[{"id":"example/identifier",
+    \\"path":"identifier.json"}],"requires":{"abi":"ledger-artifact-abi/v1",
+    \\"operators":["all","definition-ref"]},"inputs":{"values":{"codec":"json",
+    \\"max_bytes":128}},"canonicalization":{},"shape":{"rules":[{"op":"all",
+    \\"path":"","rules":[{"op":"definition-ref","path":"",
+    \\"definition":"example/identifier"}]}]},"constraints":[],"identity":{},
+    \\"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{
+    \\"max_input_bytes":128,"max_store_bytes":128,"max_records":8,
+    \\"max_output_bytes":128,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_14 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/record-set",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"exact-object","keyed-unique"]},"inputs":{"record":{"codec":"json",
+    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"exact-object","path":"","keys":["left","right"]}]},"constraints":[{
+    \\"op":"keyed-unique","sources":[{"path":"/left","key":"/id"},{"path":"/right",
+    \\"key":"/id"}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
+    \\"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_15 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper",
+    \\"owner":"example","imports":[{"id":"example/record-set",
+    \\"path":"record.json"}],"requires":{"abi":"ledger-artifact-abi/v1",
+    \\"operators":["definition-ref","exact-object"]},"inputs":{"wrapper":{
+    \\"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"exact-object","path":"","keys":["record"]},{"op":"definition-ref",
+    \\"path":"/record","definition":"example/record-set"}]},"constraints":[],
+    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
+    \\"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,
+    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const validation_test_definition_16 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/no-sensitive-keys",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"exact-object","forbidden-object-keys"]},"inputs":{"record":{"codec":"json",
+    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"exact-object","path":"","keys":["payload"]},{
+    \\"op":"forbidden-object-keys","path":"","keys":["api_key","password",
+    \\"secret"],"case_insensitive":true,"max_depth":4,"max_nodes":16}]},
+    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
+    \\"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,
+    \\"max_reducer_states":1}}
+;
+
+const validation_test_definition_17 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{
+    \\"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json",
+    \\"required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},
+    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
+    \\"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,
+    \\"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,
+    \\"max_reducer_states":2}}
+;
+
+const validation_test_definition_18 =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication",
+    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
+    \\"bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{
+    \\"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{
+    \\"op":"tagged-union","path":"","tag":"/kind","variants":[{"value":"capture",
+    \\"rules":[{"op":"implies","if":"/status","equals":"active","rules":[{
+    \\"op":"bounded-string","path":"/proof","trimmed_min":1,"max":128}]}]},{
+    \\"value":"status","rules":[{"op":"enum","path":"/status","values":[
+    \\"closed"]}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},
+    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,
+    \\"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,
+    \\"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+const path_scope_valid_cases = [_][]const u8{
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",\"edit\"],\"paths\":[\"s" ++
+        "rc/file.zig\"],\"prohibited\":[\"docs\"],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\".\"],\"choices\":[1,2],\"paths\":[\"src\"],\"prohibited" ++
+        "\":[],\"selection\":2}",
+    "{\"allowed\":[\"src\",\"tests\"],\"choices\":[true],\"paths\":[],\"prohi" ++
+        "bited\":[\".git\"],\"selection\":true}",
+};
+
+const path_scope_invalid_cases = [_][]const u8{
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"vendor/fil" ++
+        "e\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"" ++
+        "],\"prohibited\":[\"inspect\"],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src\"],\"p" ++
+        "rohibited\":[\"src/generated\"],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\"src\",\"bad/../scope\"],\"choices\":[\"inspect\"],\"path" ++
+        "s\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\".\"],\"choices\":[\"inspect\"],\"paths\":[\"a\",\"b\",\"" ++
+        "c\",\"d\",\"e\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"" ++
+        "],\"prohibited\":[],\"selection\":\"edit\"}",
+    "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",{}],\"paths\":[\"src/fil" ++
+        "e\"],\"prohibited\":[],\"selection\":\"inspect\"}",
+};
+
+const correspondence_valid_bytes =
+    \\{"candidates":[{"derivation":"independent","factors":["factor-a"],
+    \\"id":"candidate-a","status":"selected"},{"derivation":"relative","factors":[
+    \\"factor-b"],"id":"candidate-b","status":"dominated"}],"introduced":[
+    \\"factor-c"],"mappings":[],"predecessors":[{"id":"factor-a","value":"same"},{
+    \\"id":"factor-b","value":"old"}],"preserved":["factor-a"],"retired":[
+    \\"factor-b"],"selected_id":"candidate-a","successors":[{"id":"factor-a",
+    \\"value":"same"},{"id":"factor-c","value":"new"}],"surface":["factor-a"]}
+;
+
+const correspondence_invalid_cases = [_][]const u8{
+    "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a" ++
+        "\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"re" ++
+        "lative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"" ++
+        "selected\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessor" ++
+        "s\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"val" ++
+        "ue\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"]," ++
+        "\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"v" ++
+        "alue\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[" ++
+        "\"factor-a\"]}",
+    "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a" ++
+        "\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"re" ++
+        "lative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"" ++
+        "dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecesso" ++
+        "rs\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"va" ++
+        "lue\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"]," ++
+        "\"selected_id\":\"candidate-b\",\"successors\":[{\"id\":\"factor-a\",\"v" ++
+        "alue\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[" ++
+        "\"factor-b\"]}",
+    "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a" ++
+        "\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"re" ++
+        "lative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"" ++
+        "dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecesso" ++
+        "rs\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"va" ++
+        "lue\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"]," ++
+        "\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"v" ++
+        "alue\":\"changed\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\"" ++
+        ":[\"factor-a\"]}",
+    "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a" ++
+        "\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"re" ++
+        "lative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"" ++
+        "dominated\"}],\"introduced\":[],\"mappings\":[],\"predecessors\":[{\"id" ++
+        "\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old" ++
+        "\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_" ++
+        "id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"sa" ++
+        "me\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"" ++
+        "]}",
+    "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a" ++
+        "\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"re" ++
+        "lative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"" ++
+        "dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecesso" ++
+        "rs\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"va" ++
+        "lue\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"]," ++
+        "\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-c\",\"v" ++
+        "alue\":\"new\"},{\"id\":\"factor-a\",\"value\":\"same\"}],\"surface\":[" ++
+        "\"factor-a\"]}",
+};
+
+const validation_valid_record_bytes =
+    "{\"schema\":\"example/v1\",\"record_id\":\"record-1\",\"status\":\"open" ++
+    "\",\"tags\":[\"a\",\"b\"],\"mirror\":\"open\",\"items\":[{\"id\":\"item-" ++
+    "1\",\"kind\":\"shared\",\"state\":\"ready\",\"labels\":[\"a\"],\"related" ++
+    "_ids\":[\"item-2\"]},{\"id\":\"item-2\",\"kind\":\"shared\",\"state\":\"" ++
+    "ready\",\"labels\":[\"b\"],\"related_ids\":[]}],\"groups\":[{\"prefix\":" ++
+    "\"g\",\"members\":[{\"name\":\"one\",\"label\":\"g:one\",\"target_id\":" ++
+    "\"item-1\"}]}],\"links\":[{\"item_refs\":[\"item-1\",\"item-2\"],\"optio" ++
+    "nal_target\":null,\"expected\":[\"a\"],\"prohibited\":[\"b\"]}],\"option" ++
+    "al_links\":[{}],\"containers\":[{\"entries\":[{\"id\":\"nested-1\",\"sta" ++
+    "tus\":\"active\"},{\"id\":\"nested-2\",\"status\":\"inactive\"},{\"id\":" ++
+    "\"nested-3\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"c" ++
+    "hecks\":[\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"guards\":[" ++
+    "{\"mode\":\"active\",\"ids\":[],\"kinds\":[\"shared\"]},{\"mode\":\"inac" ++
+    "tive\",\"ids\":[],\"kinds\":[\"missing\"]}],\"changes\":[],\"meta\":{}," ++
+    "\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\":[\"a" ++
+    "\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings\":[{\"from" ++
+    "\":\"a\",\"to\":\"x\"},{\"from\":\"b\",\"to\":\"y\"}],\"declarations\":[" ++
+    "{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":[{\"values" ++
+    "\":{\"speed\":90,\"cost\":10,\"undeclared\":999}}],\"nullable\":null,\"e" ++
+    "xtension\":\"preserved\"}";
+
+const validation_invalid_record_bytes =
+    "{\"schema\":\"example/v1\",\"record_id\":\"bad id\"," ++
+    "\"status\":\"closed" ++
+    "\",\"tags\":[\"b\",\"a\",\"a\"],\"mirror\":\"open\",\"items\":[{\"id\":" ++
+    "\"item-1\",\"labels\":[1,\"forbidden\"],\"related_ids\":[]},{\"id\":\"it" ++
+    "em-1\",\"labels\":[],\"related_ids\":[]}],\"groups\":[{\"prefix\":\"g\"," ++
+    "\"members\":[{\"name\":\"one\",\"label\":\"g:one\"}]}],\"links\":[{\"ite" ++
+    "m_refs\":[\"missing\"],\"optional_target\":null,\"expected\":[\"same\"]," ++
+    "\"prohibited\":[\"same\"]}],\"optional_links\":[{}],\"containers\":[{\"e" ++
+    "ntries\":[{\"id\":\"nested-1\",\"status\":\"active\"},{\"id\":\"nested-3" ++
+    "\",\"status\":\"disabled\"}]}],\"selected\":[\"nested-1\"],\"checks\":[" ++
+    "\"item-1\",\"g:one\"],\"more_checks\":[\"item-2\"],\"changes\":[],\"meta" ++
+    "\":{},\"universe\":[\"a\",\"b\"],\"ordering\":[\"a\",\"b\"],\"accepted\"" ++
+    ":[\"a\",\"b\"],\"rejected\":[\"b\"],\"targets\":[\"x\",\"y\"],\"mappings" ++
+    "\":[{\"from\":\"a\",\"to\":\"x\"},{\"from\":\"a\",\"to\":\"y\"}],\"decla" ++
+    "rations\":[{\"increase\":\"speed\"},{\"decrease\":\"cost\"}],\"scored\":" ++
+    "[{\"values\":{\"speed\":90,\"cost\":10}}],\"extra\":true}";
+
+test "compiled validation plan accepts valid structure and rejects invalid structure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = validation_test_definition_01,
+    });
+    var test_plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        8 * 1024 * 1024,
+    );
+    defer test_plan.deinit();
+    try test_plan.expectCacheShape();
+    try test_plan.checkAllocationFailures();
+    try expectValidTestEnvelope(
+        &test_plan,
+        validation_valid_record_bytes,
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "wrapper.json",
+        .data = validation_test_definition_02,
+    });
+    var wrapper = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "wrapper.json",
+        8 * 1024 * 1024,
+    );
+    defer wrapper.deinit();
+    try expectTestValidation(
+        &wrapper.definition_plan,
+        &wrapper.cached,
+        "record",
+        validation_valid_record_bytes,
+        true,
+    );
+
+    try expectReplacementValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        validation_valid_record_bytes,
+        "\"record_id\":\"record-1\"",
+        "\"record_id\":\"other-1\"",
+        false,
+    );
+    try expectReplacementValidation(
+        &wrapper.definition_plan,
+        &wrapper.cached,
+        validation_valid_record_bytes,
+        "\"record_id\":\"record-1\"",
+        "\"record_id\":\"other-1\"",
+        false,
+    );
+    try checkShapeValidationVariants(&test_plan, validation_valid_record_bytes);
+    try checkReferenceValidationVariants(&test_plan, validation_valid_record_bytes);
+    try checkProtocolValidationVariants(&test_plan, validation_valid_record_bytes);
+
+    try checkInvalidDiagnosticSet(&test_plan);
+    try test_plan.checkValidationAllocationFailures(
+        validation_valid_record_bytes,
     );
 }
 
@@ -8679,56 +10922,25 @@ test "compiled identifier and repository path policies preserve exact boundaries
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","bounded-string","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["identity","label","paths","record_id"]},{"op":"safe-identifier","path":"/record_id","max":128,"style":"lowercase-component"},{"op":"bounded-string","path":"/label","trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths","rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_03,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try ValidationTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
-        .{},
+        8 * 1024 * 1024,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        4096,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        compileForAllocationFailure,
-        .{&definition_plan},
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        decodeForAllocationFailure,
-        .{payload},
-    );
+    defer test_plan.deinit();
+    try test_plan.checkAllocationFailures();
 
     var valid = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"identity\":null,\"label\":\"value\",\"paths\":[\".\",\".github\",\"src/lib\"],\"record_id\":\"record-1\"}",
+            .bytes = "{\"identity\":null,\"label\":\"value\",\"paths\":[\".\",\".github\",\"sr" ++
+                "c/lib\"],\"record_id\":\"record-1\"}",
         }},
     );
     defer valid.deinit(std.testing.allocator);
@@ -8736,11 +10948,13 @@ test "compiled identifier and repository path policies preserve exact boundaries
 
     var valid_digest = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
-            .bytes = "{\"identity\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
+            .bytes = "{\"identity\":\"sha256:1111111111111111111111111111111111111111111111111" ++
+                "111111111111111\",\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":" ++
+                "\"record-1\"}",
         }},
     );
     defer valid_digest.deinit(std.testing.allocator);
@@ -8749,17 +10963,21 @@ test "compiled identifier and repository path policies preserve exact boundaries
     const invalid_cases = [_][]const u8{
         "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"Record-1\"}",
         "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\".record\"}",
-        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".GIT/config\"],\"record_id\":\"record-1\"}",
-        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".ledger\"],\"record_id\":\"record-1\"}",
-        "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src/../lib\"],\"record_id\":\"record-1\"}",
-        "{\"identity\":\"not-a-digest\",\"label\":\"value\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".GIT/config\"],\"rec" ++
+            "ord_id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\".ledger\"],\"record_" ++
+            "id\":\"record-1\"}",
+        "{\"identity\":null,\"label\":\"value\",\"paths\":[\"src/../lib\"],\"reco" ++
+            "rd_id\":\"record-1\"}",
+        "{\"identity\":\"not-a-digest\",\"label\":\"value\",\"paths\":[\"src\"]," ++
+            "\"record_id\":\"record-1\"}",
         "{\"identity\":null,\"label\":\" \\t\",\"paths\":[\"src\"],\"record_id\":\"record-1\"}",
     };
     for (invalid_cases) |bytes| {
         var rejected = try validate(
             std.testing.allocator,
-            &definition_plan,
-            &cached,
+            &test_plan.definition_plan,
+            &test_plan.cached,
             &.{.{ .name = "record", .bytes = bytes }},
         );
         defer rejected.deinit(std.testing.allocator);
@@ -8772,79 +10990,33 @@ test "compiled path scope comparisons preserve hierarchy and bounds" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","member-of","not-member-of","path-scope-disjoint","path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["allowed","choices","paths","prohibited","selection"]}]},"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{"op":"member-of","left":"/selection","right":"/choices"},{"op":"not-member-of","left":"/selection","right":"/prohibited"}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_04,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try ValidationTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
-        .{},
+        8 * 1024 * 1024,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        4096,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        compileForAllocationFailure,
-        .{&definition_plan},
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        decodeForAllocationFailure,
-        .{payload},
-    );
+    defer test_plan.deinit();
+    try test_plan.checkAllocationFailures();
 
-    const valid_cases = [_][]const u8{
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",\"edit\"],\"paths\":[\"src/file.zig\"],\"prohibited\":[\"docs\"],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\".\"],\"choices\":[1,2],\"paths\":[\"src\"],\"prohibited\":[],\"selection\":2}",
-        "{\"allowed\":[\"src\",\"tests\"],\"choices\":[true],\"paths\":[],\"prohibited\":[\".git\"],\"selection\":true}",
-    };
-    for (valid_cases) |bytes| {
+    for (path_scope_valid_cases) |bytes| {
         var result = try validate(
             std.testing.allocator,
-            &definition_plan,
-            &cached,
+            &test_plan.definition_plan,
+            &test_plan.cached,
             &.{.{ .name = "record", .bytes = bytes }},
         );
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(result.valid);
     }
 
-    const invalid_cases = [_][]const u8{
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"vendor/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[\"inspect\"],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src\"],\"prohibited\":[\"src/generated\"],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\"src\",\"bad/../scope\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\".\"],\"choices\":[\"inspect\"],\"paths\":[\"a\",\"b\",\"c\",\"d\",\"e\"],\"prohibited\":[],\"selection\":\"inspect\"}",
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\"],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"edit\"}",
-        "{\"allowed\":[\"src\"],\"choices\":[\"inspect\",{}],\"paths\":[\"src/file\"],\"prohibited\":[],\"selection\":\"inspect\"}",
-    };
-    for (invalid_cases) |bytes| {
+    for (path_scope_invalid_cases) |bytes| {
         var result = try validate(
             std.testing.allocator,
-            &definition_plan,
-            &cached,
+            &test_plan.definition_plan,
+            &test_plan.cached,
             &.{.{ .name = "record", .bytes = bytes }},
         );
         defer result.deinit(std.testing.allocator);
@@ -8854,9 +11026,9 @@ test "compiled path scope comparisons preserve hierarchy and bounds" {
         std.testing.allocator,
         validateForAllocationFailure,
         .{
-            &definition_plan,
-            &plan,
-            valid_cases[0],
+            &test_plan.definition_plan,
+            &test_plan.plan,
+            path_scope_valid_cases[0],
         },
     );
 }
@@ -8866,9 +11038,7 @@ test "validation reports missing and malformed inputs without granting authority
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/input","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_05,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -8912,9 +11082,7 @@ test "count rules apply predicates across declared fields and survive cache" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/field-count","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"at-least-one","paths":["/first","/second","/third"],"rules":[{"op":"enum","values":["blocked"]}]},{"op":"exactly-one","paths":["/left","/right"],"rules":[{"op":"enum","values":["selected"]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_06,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -8948,11 +11116,13 @@ test "count rules apply predicates across declared fields and survive cache" {
 
     const cases = [_]struct { bytes: []const u8, valid: bool }{
         .{
-            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"second\":\"blocked\"}",
+            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"seco" ++
+                "nd\":\"blocked\"}",
             .valid = true,
         },
         .{
-            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"second\":\"clear\"}",
+            .bytes = "{\"first\":\"clear\",\"left\":\"selected\",\"right\":\"rejected\",\"seco" ++
+                "nd\":\"clear\"}",
             .valid = false,
         },
         .{
@@ -8977,71 +11147,31 @@ test "compiled correspondence rules bind selected values and total successor par
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/correspondence","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one","keyed-join","predecessor-successor","sorted"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
-        \\{"op":"sorted","path":"/successors","key":"/id"},
-        \\{"op":"exactly-one","path":"/candidates","rules":[{"op":"enum","path":"/status","values":["selected"]}]},
-        \\{"op":"at-least-one","path":"/candidates","rules":[{"op":"enum","path":"/derivation","values":["independent"]}]}
-        \\]},"constraints":[
-        \\{"op":"keyed-join","collection":"/candidates","key":"/id","selector":"/selected_id","value":"/factors","equals":"/surface","rules":[{"op":"enum","path":"/status","values":["selected"]}]},
-        \\{"op":"predecessor-successor","predecessor":"/predecessors","predecessor_key":"/id","successor":"/successors","successor_key":"/id","preserved":"/preserved","retired":"/retired","introduced":"/introduced","mappings":"/mappings","mapping_predecessors":"/from","mapping_successors":"/to"}
-        \\],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":32,"max_output_bytes":8192,"max_diagnostics":16,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_07,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try ValidationTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
-        .{},
+        8 * 1024 * 1024,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
+    defer test_plan.deinit();
+    try test_plan.checkAllocationFailures();
 
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        1024 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-
-    const valid_bytes =
-        \\{"candidates":[{"derivation":"independent","factors":["factor-a"],"id":"candidate-a","status":"selected"},{"derivation":"relative","factors":["factor-b"],"id":"candidate-b","status":"dominated"}],"introduced":["factor-c"],"mappings":[],"predecessors":[{"id":"factor-a","value":"same"},{"id":"factor-b","value":"old"}],"preserved":["factor-a"],"retired":["factor-b"],"selected_id":"candidate-a","successors":[{"id":"factor-a","value":"same"},{"id":"factor-c","value":"new"}],"surface":["factor-a"]}
-    ;
     var valid = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = valid_bytes }},
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        &.{.{ .name = "record", .bytes = correspondence_valid_bytes }},
     );
     defer valid.deinit(std.testing.allocator);
     try std.testing.expect(valid.valid);
 
-    const invalid_cases = [_][]const u8{
-        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"selected\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
-        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-b\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-b\"]}",
-        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"changed\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
-        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-c\",\"value\":\"new\"}],\"surface\":[\"factor-a\"]}",
-        "{\"candidates\":[{\"derivation\":\"independent\",\"factors\":[\"factor-a\"],\"id\":\"candidate-a\",\"status\":\"selected\"},{\"derivation\":\"relative\",\"factors\":[\"factor-b\"],\"id\":\"candidate-b\",\"status\":\"dominated\"}],\"introduced\":[\"factor-c\"],\"mappings\":[],\"predecessors\":[{\"id\":\"factor-a\",\"value\":\"same\"},{\"id\":\"factor-b\",\"value\":\"old\"}],\"preserved\":[\"factor-a\"],\"retired\":[\"factor-b\"],\"selected_id\":\"candidate-a\",\"successors\":[{\"id\":\"factor-c\",\"value\":\"new\"},{\"id\":\"factor-a\",\"value\":\"same\"}],\"surface\":[\"factor-a\"]}",
-    };
-    for (invalid_cases) |bytes| {
+    for (correspondence_invalid_cases) |bytes| {
         var rejected = try validate(
             std.testing.allocator,
-            &definition_plan,
-            &cached,
+            &test_plan.definition_plan,
+            &test_plan.cached,
             &.{.{ .name = "record", .bytes = bytes }},
         );
         defer rejected.deinit(std.testing.allocator);
@@ -9054,12 +11184,7 @@ test "compiled namespace uniqueness and nested reference coverage survive cache"
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/namespaces","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["keyed-unique","reference-exists","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[
-        \\{"op":"keyed-unique","sources":[{"path":"/first","key":"/id"},{"path":"/second","key":"/name"}]},
-        \\{"op":"tagged-union","path":"","tag":"/mode","variants":[{"value":"expanded","rules":[{"op":"reference-exists","path":"/introduced","reference":"","target":"/additions","key":"/id","coverage":"all-targets"}]},{"value":"plain","rules":[]}]}
-        \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_08,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -9092,15 +11217,21 @@ test "compiled namespace uniqueness and nested reference coverage survive cache"
 
     const cases = [_]struct { bytes: []const u8, valid: bool }{
         .{
-            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"retirement-1\"}]}",
+            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}" ++
+                "],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"n" ++
+                "ame\":\"retirement-1\"}]}",
             .valid = true,
         },
         .{
-            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"proof-1\"}]}",
+            .bytes = "{\"additions\":[{\"id\":\"factor-new\"}],\"first\":[{\"id\":\"proof-1\"}" ++
+                "],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"n" ++
+                "ame\":\"proof-1\"}]}",
             .valid = false,
         },
         .{
-            .bytes = "{\"additions\":[],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"factor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"retirement-1\"}]}",
+            .bytes = "{\"additions\":[],\"first\":[{\"id\":\"proof-1\"}],\"introduced\":[\"fac" ++
+                "tor-new\"],\"mode\":\"expanded\",\"second\":[{\"name\":\"retirement-1\"}" ++
+                "]}",
             .valid = false,
         },
     };
@@ -9121,338 +11252,104 @@ test "compiled sha256 validates canonical documents and framed streams" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
-        \\{"op":"sha256","path":"/document","mode":"canonical-json-null","field":"/digest","null":"/digest","max_bytes":4096},
-        \\{"op":"object-values","path":"/groups","rules":[{"op":"sha256","mode":"framed-items","field":"/digest","items":"/entries","prefix":"group/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/checksum"},{"literal":"\u0000"}],"max_bytes":4096}]},
-        \\{"op":"sha256","path":"/bundle","mode":"framed-fields","field":"/digest","prefix":"bundle/v1\u0000","fragments":[{"parent":"/owner_id"},{"literal":"\u0000"},{"parent":"/parent_ref"},{"literal":"\u0000"},{"parent":"/subject_ref"},{"literal":"\u0000"},{"parent":"/document_digest"}],"max_bytes":4096},
-        \\{"op":"sha256","path":"/transport","mode":"framed-fields","field":"/fingerprint","prefix":"","fragments":[{"parent":"/channel"},{"literal":"\n"},{"parent":"/type"},{"literal":"\n"},{"parent":"/payload"}],"max_bytes":4096}
-        \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_09,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try ValidationTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
-        .{},
+        8 * 1024 * 1024,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
+    defer test_plan.deinit();
+    try test_plan.checkAllocationFailures();
 
-    const document_basis =
-        "{\"digest\":null,\"id\":\"doc\",\"schema\":\"document/v1\"}";
-    const document_digest =
-        try definition_core.canonical_json.digestBytesAlloc(
-            std.testing.allocator,
-            document_basis,
-        );
-    defer std.testing.allocator.free(document_digest);
-    const resource_digest =
-        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-    var framed_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    framed_hasher.update("group/v1\x00");
-    framed_hasher.update("item.txt");
-    framed_hasher.update("\x00");
-    framed_hasher.update(resource_digest);
-    framed_hasher.update("\x00");
-    var framed_raw: [32]u8 = undefined;
-    framed_hasher.final(&framed_raw);
-    const framed_hex = std.fmt.bytesToHex(framed_raw, .lower);
-    const framed_digest = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "sha256:{s}",
-        .{framed_hex},
+    var vectors = try ShaTestVectors.init();
+    defer vectors.deinit();
+    try expectTestValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        "record",
+        vectors.valid_bytes,
+        true,
     );
-    defer std.testing.allocator.free(framed_digest);
-    var field_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    field_hasher.update("bundle/v1\x00");
-    field_hasher.update("owner-1");
-    field_hasher.update("\x00");
-    field_hasher.update("parent-1");
-    field_hasher.update("\x00");
-    field_hasher.update("subject-1");
-    field_hasher.update("\x00");
-    field_hasher.update(resource_digest);
-    var field_raw: [32]u8 = undefined;
-    field_hasher.final(&field_raw);
-    const field_hex = std.fmt.bytesToHex(field_raw, .lower);
-    const field_digest = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "sha256:{s}",
-        .{field_hex},
-    );
-    defer std.testing.allocator.free(field_digest);
-    var transport_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    transport_hasher.update("example\nrecord\n{}\n");
-    var transport_raw: [32]u8 = undefined;
-    transport_hasher.final(&transport_raw);
-    const transport_hex = std.fmt.bytesToHex(transport_raw, .lower);
-    const transport_digest = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "sha256:{s}",
-        .{transport_hex},
-    );
-    defer std.testing.allocator.free(transport_digest);
-    const valid_bytes = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"bundle\":{{\"digest\":\"{s}\",\"document_digest\":\"{s}\",\"owner_id\":\"owner-1\",\"parent_ref\":\"parent-1\",\"subject_ref\":\"subject-1\"}},\"document\":{{\"digest\":\"{s}\",\"id\":\"doc\",\"schema\":\"document/v1\"}},\"groups\":{{\"standard\":{{\"digest\":\"{s}\",\"entries\":[{{\"checksum\":\"{s}\",\"path\":\"item.txt\"}}]}}}},\"transport\":{{\"channel\":\"example\",\"fingerprint\":\"{s}\",\"payload\":\"{{}}\\n\",\"type\":\"record\"}}}}",
-        .{
-            field_digest,
-            resource_digest,
-            document_digest,
-            framed_digest,
-            resource_digest,
-            transport_digest,
-        },
-    );
-    defer std.testing.allocator.free(valid_bytes);
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        64 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
-
-    var valid = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = valid_bytes }},
-    );
-    defer valid.deinit(std.testing.allocator);
-    try std.testing.expect(valid.valid);
 
     const wrong_digest =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const invalid_document_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
-        valid_bytes,
-        document_digest,
+    try expectReplacementValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        vectors.valid_bytes,
+        vectors.document_digest,
         wrong_digest,
+        false,
     );
-    defer std.testing.allocator.free(invalid_document_bytes);
-    var invalid_document = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = invalid_document_bytes }},
-    );
-    defer invalid_document.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_document.valid);
-
-    const invalid_group_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
-        valid_bytes,
-        framed_digest,
+    try expectReplacementValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        vectors.valid_bytes,
+        vectors.framed_digest,
         wrong_digest,
+        false,
     );
-    defer std.testing.allocator.free(invalid_group_bytes);
-    var invalid_group = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = invalid_group_bytes }},
-    );
-    defer invalid_group.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_group.valid);
-    const invalid_bundle_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
-        valid_bytes,
-        field_digest,
+    try expectReplacementValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        vectors.valid_bytes,
+        vectors.field_digest,
         wrong_digest,
+        false,
     );
-    defer std.testing.allocator.free(invalid_bundle_bytes);
-    var invalid_bundle = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = invalid_bundle_bytes }},
-    );
-    defer invalid_bundle.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_bundle.valid);
-    const invalid_transport_bytes = try std.mem.replaceOwned(
-        u8,
-        std.testing.allocator,
-        valid_bytes,
-        transport_digest,
+    try expectReplacementValidation(
+        &test_plan.definition_plan,
+        &test_plan.cached,
+        vectors.valid_bytes,
+        vectors.transport_digest,
         wrong_digest,
+        false,
     );
-    defer std.testing.allocator.free(invalid_transport_bytes);
-    var invalid_transport = try validate(
-        std.testing.allocator,
-        &definition_plan,
-        &cached,
-        &.{.{ .name = "record", .bytes = invalid_transport_bytes }},
-    );
-    defer invalid_transport.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_transport.valid);
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        validateForAllocationFailure,
-        .{ &definition_plan, &plan, valid_bytes },
-    );
+    try test_plan.checkValidationAllocationFailures(vectors.valid_bytes);
 }
 
-test "definition references reuse transacted validators without effects and survive cache round trips" {
+test "definition references preserve transacted validators across caches" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "receipt.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","compare-and-append","exact-object","enum","scalar-type","tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["count","parent","status"]},{"op":"scalar-type","path":"/count","type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/receipts.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"receipt"}]}},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_10,
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "packet.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/packet","owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","required_keys":["receipt"],"optional_keys":["metadata"]},{"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_11,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try DefinitionReferenceTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
-        "packet.json",
-        .{},
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "packet.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), definition_plan.imports.len);
-    try std.testing.expectEqualStrings(
-        "example/receipt",
-        definition_plan.imports[0].id,
-    );
-
-    var definition_encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        8 * 1024 * 1024,
-    );
-    defer definition_encoder.deinit();
-    try definition.encodeCache(&definition_plan, &definition_encoder);
-    const definition_payload = try definition_encoder.toOwnedSlice();
-    defer std.testing.allocator.free(definition_payload);
-    var definition_decoder =
-        definition_core.cache.Decoder.init(definition_payload);
-    var cached_definition = try definition.decodeCache(
-        std.testing.allocator,
-        &definition_decoder,
-    );
-    defer cached_definition.deinit(std.testing.allocator);
-    try definition_decoder.finish();
+    defer test_plan.deinit();
     try std.testing.expectEqual(
         @as(usize, 1),
-        cached_definition.imports.len,
+        test_plan.definition_plan.imports.len,
+    );
+    try std.testing.expectEqualStrings(
+        "example/receipt",
+        test_plan.definition_plan.imports[0].id,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        test_plan.cached_definition.imports.len,
     );
 
-    var plan = try compile(std.testing.allocator, &cached_definition);
-    defer plan.deinit(std.testing.allocator);
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        8 * 1024 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &cached_definition);
-
-    var valid = try validate(
-        std.testing.allocator,
-        &cached_definition,
-        &cached,
-        &.{.{
-            .name = "packet",
-            .bytes = "{\"receipt\":{\"count\":2,\"parent\":null,\"status\":\"complete\"}}",
-        }},
-    );
-    defer valid.deinit(std.testing.allocator);
-    try std.testing.expect(valid.valid);
-    try std.testing.expect(!valid.authority_granted);
-    try std.testing.expect(!valid.storage_mutated);
-
-    var valid_with_optional = try validate(
-        std.testing.allocator,
-        &cached_definition,
-        &cached,
-        &.{.{
-            .name = "packet",
-            .bytes = "{\"metadata\":{},\"receipt\":{\"count\":2,\"parent\":{\"value\":\"prior\"},\"status\":\"complete\"}}",
-        }},
-    );
-    defer valid_with_optional.deinit(std.testing.allocator);
-    try std.testing.expect(valid_with_optional.valid);
-
-    var invalid = try validate(
-        std.testing.allocator,
-        &cached_definition,
-        &cached,
-        &.{.{
-            .name = "packet",
-            .bytes = "{\"receipt\":{\"count\":\"two\",\"parent\":null,\"status\":\"complete\"}}",
-        }},
-    );
-    defer invalid.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid.valid);
-
-    var unknown_key = try validate(
-        std.testing.allocator,
-        &cached_definition,
-        &cached,
-        &.{.{
-            .name = "packet",
-            .bytes = "{\"other\":{},\"receipt\":{\"count\":2,\"parent\":null,\"status\":\"complete\"}}",
-        }},
-    );
-    defer unknown_key.deinit(std.testing.allocator);
-    try std.testing.expect(!unknown_key.valid);
-
-    var invalid_variant = try validate(
-        std.testing.allocator,
-        &cached_definition,
-        &cached,
-        &.{.{
-            .name = "packet",
-            .bytes = "{\"receipt\":{\"count\":2,\"parent\":{\"value\":\"\"},\"status\":\"complete\"}}",
-        }},
-    );
-    defer invalid_variant.deinit(std.testing.allocator);
-    try std.testing.expect(!invalid_variant.valid);
+    try checkDefinitionReferenceCases(&test_plan.cached_definition, &test_plan.cached);
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         compileForAllocationFailure,
-        .{&cached_definition},
+        .{&test_plan.cached_definition},
     );
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         decodeForAllocationFailure,
-        .{payload},
+        .{test_plan.payload},
     );
 }
 
@@ -9461,15 +11358,11 @@ test "collection item rules reuse one imported scalar definition" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "identifier.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string"]},"inputs":{"value":{"codec":"json","max_bytes":16}},"canonicalization":{},"shape":{"rules":[{"op":"bounded-string","path":"","min":3,"max":3}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":16,"max_store_bytes":16,"max_records":1,"max_output_bytes":16,"max_diagnostics":4,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_12,
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "list.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier-list","owner":"example","imports":[{"id":"example/identifier","path":"identifier.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["all","definition-ref"]},"inputs":{"values":{"codec":"json","max_bytes":128}},"canonicalization":{},"shape":{"rules":[{"op":"all","path":"","rules":[{"op":"definition-ref","path":"","definition":"example/identifier"}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":128,"max_store_bytes":128,"max_records":8,"max_output_bytes":128,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_13,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -9522,15 +11415,11 @@ test "definition references execute imported cross-record constraints" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "record.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/record-set","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","keyed-unique"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["left","right"]}]},"constraints":[{"op":"keyed-unique","sources":[{"path":"/left","key":"/id"},{"path":"/right","key":"/id"}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_14,
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "wrapper.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record-set","path":"record.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"wrapper":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["record"]},{"op":"definition-ref","path":"/record","definition":"example/record-set"}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_15,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -9578,44 +11467,21 @@ test "forbidden object keys reject bounded nested sensitive fields" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/no-sensitive-keys","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","forbidden-object-keys"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"","keys":["payload"]},{"op":"forbidden-object-keys","path":"","keys":["api_key","password","secret"],"case_insensitive":true,"max_depth":4,"max_nodes":16}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_16,
     });
-    var closure = try definition_core.closure.loadFromDir(
+    var test_plan = try ValidationTestPlan.init(
         std.testing.allocator,
         &tmp.dir,
         "artifact.json",
-        .{},
+        8 * 1024 * 1024,
     );
-    defer closure.deinit(std.testing.allocator);
-    var definition_plan = try definition.compile(
-        std.testing.allocator,
-        &closure,
-        "artifact.json",
-    );
-    defer definition_plan.deinit(std.testing.allocator);
-    var plan = try compile(std.testing.allocator, &definition_plan);
-    defer plan.deinit(std.testing.allocator);
-
-    var encoder = definition_core.cache.Encoder.init(
-        std.testing.allocator,
-        256 * 1024,
-    );
-    defer encoder.deinit();
-    try encodeCache(&plan, &encoder);
-    const payload = try encoder.toOwnedSlice();
-    defer std.testing.allocator.free(payload);
-    var decoder = definition_core.cache.Decoder.init(payload);
-    var cached = try decodeCache(std.testing.allocator, &decoder);
-    defer cached.deinit(std.testing.allocator);
-    try decoder.finish();
-    try validateCachePlan(&cached, &definition_plan);
+    defer test_plan.deinit();
+    try test_plan.checkAllocationFailures();
 
     var valid = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
             .bytes = "{\"payload\":{\"items\":[{\"token\":\"public\"}]}}",
@@ -9626,8 +11492,8 @@ test "forbidden object keys reject bounded nested sensitive fields" {
 
     var sensitive = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
             .bytes = "{\"payload\":{\"items\":[{\"SeCrEt\":\"value\"}]}}",
@@ -9638,8 +11504,8 @@ test "forbidden object keys reject bounded nested sensitive fields" {
 
     var too_deep = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
             .bytes = "{\"payload\":{\"a\":{\"b\":{\"c\":{\"d\":\"value\"}}}}}",
@@ -9650,8 +11516,8 @@ test "forbidden object keys reject bounded nested sensitive fields" {
 
     var too_many = try validate(
         std.testing.allocator,
-        &definition_plan,
-        &cached,
+        &test_plan.definition_plan,
+        &test_plan.cached,
         &.{.{
             .name = "record",
             .bytes = "{\"payload\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}",
@@ -9674,14 +11540,25 @@ test "optional-only exact objects compile an empty required-key set" {
     try std.testing.expectEqual(@as(usize, 0), keys.len);
 }
 
+const embedded_validation_rules =
+    \\[
+    \\  {"op":"cross-input-equal","input":"event","left_input":"event",
+    \\"left":"/stream_id","right_input":"state","right":"/stream_id"},
+    \\  {"op":"implies","input":"event","if":"/operation","equals":"replace",
+    \\"then_input":"state","then":"/replacement_allowed","then_equals":true},
+    \\  {"op":"implies","input":"event","if":"/operation","equals":"replace",
+    \\"rules":[{"op":"enum","input":"state","path":"/phase","values":["open"]}]},
+    \\  {"op":"implies","input":"state","if":"/existing_refs","empty":true,
+    \\"rules":[{"op":"bounded-array","input":"event","path":"/new_refs","min":1}]}
+    \\]
+;
+
 test "embedded validation compares borrowed event and retained state values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
-        ,
+        .data = validation_test_definition_17,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
@@ -9699,13 +11576,7 @@ test "embedded validation compares borrowed event and retained state values" {
     var rules = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\[
-        \\  {"op":"cross-input-equal","input":"event","left_input":"event","left":"/stream_id","right_input":"state","right":"/stream_id"},
-        \\  {"op":"implies","input":"event","if":"/operation","equals":"replace","then_input":"state","then":"/replacement_allowed","then_equals":true},
-        \\  {"op":"implies","input":"event","if":"/operation","equals":"replace","rules":[{"op":"enum","input":"state","path":"/phase","values":["open"]}]},
-        \\  {"op":"implies","input":"state","if":"/existing_refs","empty":true,"rules":[{"op":"bounded-array","input":"event","path":"/new_refs","min":1}]}
-        \\]
-    ,
+        embedded_validation_rules,
         .{},
     );
     defer rules.deinit();
@@ -9732,120 +11603,7 @@ test "embedded validation compares borrowed event and retained state values" {
     defer cached.deinit(std.testing.allocator);
     try decoder.finish();
     try validateEmbeddedCachePlan(&cached, &definition_plan);
-    var event = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"new_refs\":[\"item-1\"],\"operation\":\"replace\",\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer event.deinit();
-    var matching = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer matching.deinit();
-    var valid = try executeValues(
-        std.testing.allocator,
-        &plan,
-        &.{
-            .{ .name = "event", .value = event.value },
-            .{ .name = "state", .value = matching.value },
-        },
-    );
-    defer valid.deinit();
-    try std.testing.expect(valid.isValid());
-
-    var stale = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":true,\"stream_id\":\"stream-2\"}",
-        .{},
-    );
-    defer stale.deinit();
-    var invalid = try executeValues(
-        std.testing.allocator,
-        &plan,
-        &.{
-            .{ .name = "event", .value = event.value },
-            .{ .name = "state", .value = stale.value },
-        },
-    );
-    defer invalid.deinit();
-    try std.testing.expect(!invalid.isValid());
-
-    var denied = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"existing_refs\":[],\"phase\":\"open\",\"replacement_allowed\":false,\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer denied.deinit();
-    var denied_edit = try executeValues(
-        std.testing.allocator,
-        &plan,
-        &.{
-            .{ .name = "event", .value = event.value },
-            .{ .name = "state", .value = denied.value },
-        },
-    );
-    defer denied_edit.deinit();
-    try std.testing.expect(!denied_edit.isValid());
-
-    var debt = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"existing_refs\":[\"item-0\"],\"phase\":\"closed\",\"replacement_allowed\":true,\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer debt.deinit();
-    var blocked_edit = try executeValues(
-        std.testing.allocator,
-        &cached,
-        &.{
-            .{ .name = "event", .value = event.value },
-            .{ .name = "state", .value = debt.value },
-        },
-    );
-    defer blocked_edit.deinit();
-    try std.testing.expect(!blocked_edit.isValid());
-
-    var empty_replacement = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"new_refs\":[],\"operation\":\"replace\",\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer empty_replacement.deinit();
-    var missing_replacement = try executeValues(
-        std.testing.allocator,
-        &cached,
-        &.{
-            .{ .name = "event", .value = empty_replacement.value },
-            .{ .name = "state", .value = matching.value },
-        },
-    );
-    defer missing_replacement.deinit();
-    try std.testing.expect(!missing_replacement.isValid());
-
-    var inspection = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        "{\"operation\":\"inspect\",\"stream_id\":\"stream-1\"}",
-        .{},
-    );
-    defer inspection.deinit();
-    var allowed_inspection = try executeValues(
-        std.testing.allocator,
-        &cached,
-        &.{
-            .{ .name = "event", .value = inspection.value },
-            .{ .name = "state", .value = debt.value },
-        },
-    );
-    defer allowed_inspection.deinit();
-    try std.testing.expect(allowed_inspection.isValid());
+    try checkEmbeddedValidationCases(&plan, &cached);
 }
 
 test "tagged union item implications compile conditional native rules" {
@@ -9853,9 +11611,7 @@ test "tagged union item implications compile conditional native rules" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "artifact.json",
-        .data =
-        \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{"op":"tagged-union","path":"","tag":"/kind","variants":[{"value":"capture","rules":[{"op":"implies","if":"/status","equals":"active","rules":[{"op":"bounded-string","path":"/proof","trimmed_min":1,"max":128}]}]},{"value":"status","rules":[{"op":"enum","path":"/status","values":["closed"]}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
-        ,
+        .data = validation_test_definition_18,
     });
     var closure = try definition_core.closure.loadFromDir(
         std.testing.allocator,
