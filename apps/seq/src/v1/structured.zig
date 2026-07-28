@@ -4,6 +4,7 @@ const trace_core = @import("trace_core");
 const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const plan = @import("plan.zig");
+const seq_time = @import("seq_time");
 
 pub const Limits = struct {
     max_documents: usize = 4_096,
@@ -189,6 +190,16 @@ pub fn feed(
     program: *const execution.Program,
     index: *const Index,
 ) !execution.Feed {
+    return feedSelected(runner, program, index, null, null);
+}
+
+pub fn feedSelected(
+    runner: *execution.Runner,
+    program: *const execution.Program,
+    index: *const Index,
+    since_ms: ?i64,
+    until_ms: ?i64,
+) !execution.Feed {
     const relation = switch (program.source) {
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
@@ -196,6 +207,11 @@ pub fn feed(
     var row: [256]execution.Value = undefined;
     switch (relation) {
         .structured_documents => for (index.documents.items) |*document| {
+            if (!timestampPasses(
+                document.timestamp,
+                since_ms,
+                until_ms,
+            )) continue;
             try fillDocument(
                 row[0..program.source_width],
                 program.source_field_indices,
@@ -207,10 +223,16 @@ pub fn feed(
             if (value.document_index >= index.documents.items.len) {
                 return error.StructuredDocumentIndexInvalid;
             }
+            const document = &index.documents.items[value.document_index];
+            if (!timestampPasses(
+                document.timestamp,
+                since_ms,
+                until_ms,
+            )) continue;
             try fillValue(
                 row[0..program.source_width],
                 program.source_field_indices,
-                &index.documents.items[value.document_index],
+                document,
                 value,
             );
             if (try runner.feed(row[0..program.source_width]) == .stop) break;
@@ -218,6 +240,26 @@ pub fn feed(
         else => return error.ObservationRequiresStructuredRelation,
     }
     return if (runner.stopped) .stop else .continue_scanning;
+}
+
+fn timestampPasses(
+    timestamp: ?[]const u8,
+    since_ms: ?i64,
+    until_ms: ?i64,
+) bool {
+    if (since_ms) |since| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual < since) return false;
+    }
+    if (until_ms) |until| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual > until) return false;
+    }
+    return true;
 }
 
 fn fillDocument(

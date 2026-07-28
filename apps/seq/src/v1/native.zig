@@ -754,7 +754,17 @@ fn feedQueryPath(
             traceOptions(compilation.relation),
         );
     defer trace.deinit(allocator);
-    if (!sessionPasses(trace.session, options)) return .continue_scanning;
+    if (compilation.relation == .sessions) {
+        if (!sessionPasses(trace.session, options)) {
+            return .continue_scanning;
+        }
+    } else if (!sessionMetadataPasses(trace.session, options)) {
+        return .continue_scanning;
+    }
+    const selection = trace_adapter.RowSelection{
+        .since_ms = options.since_ms,
+        .until_ms = options.until_ms,
+    };
     return switch (compilation.relation) {
         .structured_documents, .structured_values => result: {
             var index = try structured.build(
@@ -764,16 +774,19 @@ fn feedQueryPath(
                 .{},
             );
             defer index.deinit(allocator);
-            break :result try structured.feed(
+            break :result try structured.feedSelected(
                 runner,
                 &compilation.program,
                 &index,
+                options.since_ms,
+                options.until_ms,
             );
         },
-        else => try trace_adapter.feedTrace(
+        else => try trace_adapter.feedTraceSelected(
             runner,
             &compilation.program,
             &trace,
+            selection,
         ),
     };
 }
@@ -1403,135 +1416,9 @@ fn collectTargetJsonlPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
-    options: Options,
+    _: Options,
 ) !std.ArrayList([]u8) {
-    if (try collectBoundedDayPaths(
-        allocator,
-        io,
-        root,
-        options.since_ms,
-        options.until_ms,
-    )) |paths| {
-        return paths;
-    }
     return collectJsonlPaths(allocator, io, root);
-}
-
-fn collectBoundedDayPaths(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    since_ms: ?i64,
-    until_ms: ?i64,
-) !?std.ArrayList([]u8) {
-    const since = since_ms orelse return null;
-    const until = until_ms orelse return null;
-    const start = seq_time.dateFromUtcTimestampMillis(since);
-    const end = seq_time.dateFromUtcTimestampMillis(until);
-    const day_count = seq_time.daysBetweenInclusive(start, end);
-    if (day_count < 1 or day_count > 45) return null;
-    if (!try rootHasDatedHierarchy(io, root)) return null;
-
-    var paths: std.ArrayList([]u8) = .empty;
-    errdefer freePaths(allocator, &paths);
-    const start_day = seq_time.daysFromCivil(
-        start.year,
-        start.month,
-        start.day,
-    );
-    var offset: i64 = 0;
-    while (offset < day_count) : (offset += 1) {
-        const day_ms = std.math.mul(
-            i64,
-            start_day + offset,
-            86_400_000,
-        ) catch return error.TimestampOutOfRange;
-        const date = seq_time.dateFromUtcTimestampMillis(day_ms);
-        const relative = try std.fmt.allocPrint(
-            allocator,
-            "{d:0>4}/{d:0>2}/{d:0>2}",
-            .{
-                @as(u32, @intCast(date.year)),
-                date.month,
-                date.day,
-            },
-        );
-        defer allocator.free(relative);
-        const day_root = try std.fs.path.join(
-            allocator,
-            &.{ root, relative },
-        );
-        defer allocator.free(day_root);
-        try appendJsonlPathsUnderExistingDir(
-            allocator,
-            io,
-            &paths,
-            day_root,
-        );
-    }
-    std.mem.sort([]u8, paths.items, {}, lessThanPath);
-    return paths;
-}
-
-fn rootHasDatedHierarchy(io: std.Io, root: []const u8) !bool {
-    var root_dir = std.Io.Dir.openDirAbsolute(
-        io,
-        root,
-        .{ .iterate = true },
-    ) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return false,
-        else => return err,
-    };
-    defer root_dir.close(io);
-    var iterator = root_dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (entry.kind == .directory and
-            isFourDigitYear(entry.name))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn isFourDigitYear(name: []const u8) bool {
-    if (name.len != 4) return false;
-    for (name) |byte| if (!std.ascii.isDigit(byte)) return false;
-    return true;
-}
-
-fn appendJsonlPathsUnderExistingDir(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    paths: *std.ArrayList([]u8),
-    root: []const u8,
-) !void {
-    var directory = std.Io.Dir.openDirAbsolute(
-        io,
-        root,
-        .{ .iterate = true },
-    ) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return,
-        else => return err,
-    };
-    defer directory.close(io);
-    var walker = try directory.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
-        if (std.mem.eql(
-            u8,
-            std.fs.path.basename(entry.path),
-            ".seq-index.jsonl",
-        )) {
-            continue;
-        }
-        try paths.append(
-            allocator,
-            try std.fs.path.join(allocator, &.{ root, entry.path }),
-        );
-    }
 }
 
 fn lessThanPath(_: void, left: []u8, right: []u8) bool {
@@ -1599,6 +1486,13 @@ pub fn sessionPasses(
         ) orelse return false;
         if (actual > until) return false;
     }
+    return sessionMetadataPasses(session, options);
+}
+
+pub fn sessionMetadataPasses(
+    session: trace_core.SessionRecord,
+    options: Options,
+) bool {
     if (options.repo) |repo| {
         const cwd = session.cwd orelse return false;
         if (!pathEqualOrDescendant(cwd, repo)) return false;
@@ -1783,7 +1677,7 @@ test "exact session selector rejects duplicate corpus matches" {
     );
 }
 
-test "bounded temporal selectors enumerate only matching day directories" {
+test "bounded temporal selectors preserve all possible session directories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "2026/07/26");
@@ -1796,37 +1690,6 @@ test "bounded temporal selectors enumerate only matching day directories" {
         .sub_path = "2026/07/27/current.jsonl",
         .data = testSession("current-session", "2026-07-27T10:00:00Z"),
     });
-    const root = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        ".",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(root);
-    var paths = try resolveTargetPaths(
-        std.testing.allocator,
-        std.testing.io,
-        .{
-            .root = root,
-            .since_ms = seq_time.parseIsoTimestampMillis(
-                "2026-07-27T00:00:00Z",
-            ),
-            .until_ms = seq_time.parseIsoTimestampMillis(
-                "2026-07-27T23:59:59Z",
-            ),
-        },
-        false,
-    );
-    defer freePaths(std.testing.allocator, &paths);
-    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
-    try std.testing.expectEqualStrings(
-        "current.jsonl",
-        std.fs.path.basename(paths.items[0]),
-    );
-}
-
-test "bounded temporal selectors preserve flat corpus roots" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "flat.jsonl",
         .data = testSession("flat-session", "2026-07-27T10:00:00Z"),
@@ -1852,10 +1715,63 @@ test "bounded temporal selectors preserve flat corpus roots" {
         false,
     );
     defer freePaths(std.testing.allocator, &paths);
-    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
+    try std.testing.expectEqual(@as(usize, 3), paths.items.len);
+    try std.testing.expectEqualStrings(
+        "old.jsonl",
+        std.fs.path.basename(paths.items[0]),
+    );
     try std.testing.expectEqualStrings(
         "flat.jsonl",
-        std.fs.path.basename(paths.items[0]),
+        std.fs.path.basename(paths.items[2]),
+    );
+}
+
+test "physical queries select row timestamps across session directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "2026/07/26");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "2026/07/26/rollout.jsonl",
+        .data = "{\"timestamp\":\"2026-07-26T23:59:00Z\",\"type\":\"session_meta\"," ++
+            "\"payload\":{\"id\":\"multi-day\"}}\n" ++
+            "{\"timestamp\":\"2026-07-26T23:59:30Z\",\"type\":\"event_msg\"," ++
+            "\"payload\":{\"type\":\"agent_message\",\"message\":\"early\"}}\n" ++
+            "{\"timestamp\":\"2026-07-27T00:01:00Z\",\"type\":\"event_msg\"," ++
+            "\"payload\":{\"type\":\"agent_message\",\"message\":\"later\"}}\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"dataset\":\"messages\",\"select\":[\"text\",\"timestamp\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try runQueryObject(
+        std.testing.allocator,
+        &output.writer,
+        std.testing.io,
+        .{
+            .root = root,
+            .since_ms = seq_time.parseIsoTimestampMillis(
+                "2026-07-27T00:00:00Z",
+            ),
+            .until_ms = seq_time.parseIsoTimestampMillis(
+                "2026-07-27T00:02:00Z",
+            ),
+        },
+        parsed.value.object,
+    );
+    try std.testing.expectEqualStrings(
+        "[{\"text\":\"later\",\"timestamp\":\"2026-07-27T00:01:00+00:00\"}]\n",
+        output.written(),
     );
 }
 

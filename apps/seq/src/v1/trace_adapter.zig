@@ -160,6 +160,15 @@ pub fn feedTrace(
     program: *const execution.Program,
     trace: *const trace_core.CanonicalSessionTrace,
 ) !execution.Feed {
+    return feedTraceSelected(runner, program, trace, .{});
+}
+
+pub fn feedTraceSelected(
+    runner: *execution.Runner,
+    program: *const execution.Program,
+    trace: *const trace_core.CanonicalSessionTrace,
+    selection: RowSelection,
+) !execution.Feed {
     const relation = switch (program.source) {
         .physical => |value| value,
         .external => return error.ObservationRequiresExternalInput,
@@ -170,6 +179,7 @@ pub fn feedTrace(
         .program = program,
         .trace = trace,
         .row = row_storage[0..program.source_width],
+        .selection = selection,
     };
     return switch (relation) {
         .sessions, .source_events, .turns, .messages => context.feedPrimary(relation),
@@ -190,6 +200,7 @@ const FeedContext = struct {
     program: *const execution.Program,
     trace: *const trace_core.CanonicalSessionTrace,
     row: []execution.Value,
+    selection: RowSelection,
 
     fn feed(self: *FeedContext) !bool {
         return try self.runner.feed(self.row) == .stop;
@@ -206,6 +217,12 @@ const FeedContext = struct {
         const fields = self.program.source_field_indices;
         switch (relation) {
             .sessions => {
+                const timestamp = self.trace.session.start_time orelse
+                    self.trace.session.end_time;
+                if (!timestampPassesSelection(
+                    timestamp,
+                    self.selection,
+                )) return self.result();
                 try fillSession(
                     self.row,
                     fields,
@@ -214,6 +231,10 @@ const FeedContext = struct {
                 _ = try self.feed();
             },
             .source_events => for (self.trace.occurrences.items) |*occurrence| {
+                if (!timestampPassesSelection(
+                    occurrence.timestamp,
+                    self.selection,
+                )) continue;
                 try fillSourceEvent(
                     self.row,
                     fields,
@@ -223,10 +244,15 @@ const FeedContext = struct {
                 if (try self.feed()) break;
             },
             .turns => for (self.trace.turns.items) |turn| {
+                if (!turnPassesSelection(turn, self.selection)) continue;
                 try fillTurn(self.row, fields, turn);
                 if (try self.feed()) break;
             },
             .messages => for (self.trace.occurrences.items) |*occurrence| {
+                if (!timestampPassesSelection(
+                    occurrence.timestamp,
+                    self.selection,
+                )) continue;
                 if (!occurrence.message_visible or
                     occurrence.role == null or
                     occurrence.text == null)
@@ -254,6 +280,10 @@ const FeedContext = struct {
         switch (relation) {
             .tool_invocations => for (self.trace.tools.items) |tool| {
                 if (tool.declared_line == null) continue;
+                if (!timestampPassesSelection(
+                    tool.started_at,
+                    self.selection,
+                )) continue;
                 const occurrence = if (containsField(
                     fields,
                     12,
@@ -266,6 +296,10 @@ const FeedContext = struct {
             },
             .tool_results => for (self.trace.tools.items) |tool| {
                 if (tool.finalized_line == null) continue;
+                if (!timestampPassesSelection(
+                    tool.completed_at,
+                    self.selection,
+                )) continue;
                 const occurrence = if (containsField(
                     fields,
                     10,
@@ -277,10 +311,18 @@ const FeedContext = struct {
                 if (try self.feed()) break;
             },
             .tool_lifecycle => for (self.trace.tools.items) |tool| {
+                if (!timestampPassesSelection(
+                    tool.started_at orelse tool.completed_at,
+                    self.selection,
+                )) continue;
                 try fillToolLifecycle(self.row, fields, tool);
                 if (try self.feed()) break;
             },
             .session_edges => for (self.trace.graph_edges.items) |edge| {
+                if (!timestampPassesSelection(
+                    edge.spawned_at,
+                    self.selection,
+                )) continue;
                 try fillSessionEdge(self.row, fields, edge);
                 if (try self.feed()) break;
             },
@@ -294,11 +336,17 @@ const FeedContext = struct {
             if (event.occurrence_index >= self.trace.occurrences.items.len) {
                 return error.TokenEventOccurrenceMissing;
             }
+            const occurrence =
+                &self.trace.occurrences.items[event.occurrence_index];
+            if (!timestampPassesSelection(
+                occurrence.timestamp,
+                self.selection,
+            )) continue;
             try fillTokenEvent(
                 self.row,
                 self.program.source_field_indices,
                 self.trace.session,
-                &self.trace.occurrences.items[event.occurrence_index],
+                occurrence,
                 event,
             );
             if (try self.feed()) break;
@@ -411,11 +459,21 @@ const WriteContext = struct {
     ) !void {
         switch (relation) {
             .sessions => {
+                const timestamp = self.trace.session.start_time orelse
+                    self.trace.session.end_time;
+                if (!timestampPassesSelection(
+                    timestamp,
+                    self.selection,
+                )) return;
                 try fillSession(self.values, self.indices, self.trace.session);
                 _ = try self.write();
             },
             .source_events => for (self.trace.occurrences.items) |*occurrence| {
                 if (self.exhausted()) break;
+                if (!timestampPassesSelection(
+                    occurrence.timestamp,
+                    self.selection,
+                )) continue;
                 try fillSourceEvent(
                     self.values,
                     self.indices,
@@ -431,6 +489,10 @@ const WriteContext = struct {
             },
             .messages => for (self.trace.occurrences.items) |*occurrence| {
                 if (self.exhausted()) break;
+                if (!timestampPassesSelection(
+                    occurrence.timestamp,
+                    self.selection,
+                )) continue;
                 if (!occurrence.message_visible or
                     occurrence.role == null or
                     occurrence.text == null)
@@ -457,6 +519,10 @@ const WriteContext = struct {
             .tool_invocations => for (self.trace.tools.items) |tool| {
                 if (self.exhausted()) break;
                 if (tool.declared_line == null) continue;
+                if (!timestampPassesSelection(
+                    tool.started_at,
+                    self.selection,
+                )) continue;
                 try fillToolInvocation(
                     self.values,
                     self.indices,
@@ -468,6 +534,10 @@ const WriteContext = struct {
             .tool_results => for (self.trace.tools.items) |tool| {
                 if (self.exhausted()) break;
                 if (tool.finalized_line == null) continue;
+                if (!timestampPassesSelection(
+                    tool.completed_at,
+                    self.selection,
+                )) continue;
                 try fillToolResult(
                     self.values,
                     self.indices,
@@ -478,11 +548,19 @@ const WriteContext = struct {
             },
             .tool_lifecycle => for (self.trace.tools.items) |tool| {
                 if (self.exhausted()) break;
+                if (!timestampPassesSelection(
+                    tool.started_at orelse tool.completed_at,
+                    self.selection,
+                )) continue;
                 try fillToolLifecycle(self.values, self.indices, tool);
                 _ = try self.write();
             },
             .session_edges => for (self.trace.graph_edges.items) |edge| {
                 if (self.exhausted()) break;
+                if (!timestampPassesSelection(
+                    edge.spawned_at,
+                    self.selection,
+                )) continue;
                 try fillSessionEdge(self.values, self.indices, edge);
                 _ = try self.write();
             },
@@ -496,11 +574,17 @@ const WriteContext = struct {
             if (event.occurrence_index >= self.trace.occurrences.items.len) {
                 return error.TokenEventOccurrenceMissing;
             }
+            const occurrence =
+                &self.trace.occurrences.items[event.occurrence_index];
+            if (!timestampPassesSelection(
+                occurrence.timestamp,
+                self.selection,
+            )) continue;
             try fillTokenEvent(
                 self.values,
                 self.indices,
                 self.trace.session,
-                &self.trace.occurrences.items[event.occurrence_index],
+                occurrence,
                 event,
             );
             _ = try self.write();
@@ -513,18 +597,7 @@ fn turnPassesSelection(
     selection: RowSelection,
 ) bool {
     const timestamp = turn.started_at orelse turn.completed_at;
-    if (selection.since_ms) |since| {
-        const actual = seq_time.parseIsoTimestampMillis(
-            timestamp orelse return false,
-        ) orelse return false;
-        if (actual < since) return false;
-    }
-    if (selection.until_ms) |until| {
-        const actual = seq_time.parseIsoTimestampMillis(
-            timestamp orelse return false,
-        ) orelse return false;
-        if (actual > until) return false;
-    }
+    if (!timestampPassesSelection(timestamp, selection)) return false;
     if (selection.status) |status| {
         if (!std.mem.eql(u8, @tagName(turn.status), status)) return false;
     }
@@ -538,6 +611,25 @@ fn turnPassesSelection(
         {
             return false;
         }
+    }
+    return true;
+}
+
+fn timestampPassesSelection(
+    timestamp: ?[]const u8,
+    selection: RowSelection,
+) bool {
+    if (selection.since_ms) |since| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual < since) return false;
+    }
+    if (selection.until_ms) |until| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual > until) return false;
     }
     return true;
 }
@@ -1216,4 +1308,58 @@ test "trace adapter scans demanded session columns in one file pass" {
     );
     defer events.deinit(std.testing.allocator);
     try expectEventObservation(&events);
+}
+
+test "trace adapter applies temporal selectors to physical event rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout.jsonl",
+        .data = trace_rollout,
+    });
+    var event_program = try TestProgram.init(
+        &tmp.dir,
+        "events.json",
+        event_observation_definition,
+    );
+    defer event_program.deinit();
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "rollout.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    var parsed = try parseFile(
+        std.testing.allocator,
+        &event_program.program,
+        path,
+        .{},
+    );
+    defer parsed.deinit(std.testing.allocator);
+    var output: [5]execution.Value = undefined;
+    var runner = try execution.Runner.initAlloc(
+        std.testing.allocator,
+        &event_program.program,
+        &output,
+    );
+    defer runner.deinit();
+    _ = try feedTraceSelected(
+        &runner,
+        &event_program.program,
+        &parsed.trace,
+        .{
+            .since_ms = seq_time.parseIsoTimestampMillis(
+                "2026-07-26T10:00:02Z",
+            ),
+            .until_ms = seq_time.parseIsoTimestampMillis(
+                "2026-07-26T10:00:02Z",
+            ),
+        },
+    );
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqualStrings(
+        "observed",
+        result.rows().row(0)[2].string,
+    );
 }

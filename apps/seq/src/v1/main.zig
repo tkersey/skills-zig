@@ -664,7 +664,15 @@ fn feedPhysicalFile(
         metrics.bytes_read,
         parsed.metrics.bytes_read,
     ) catch return error.ObservationMetricOverflow;
-    if (!seq.native.sessionPasses(parsed.trace.session, args.selectors)) {
+    if (relation == .sessions) {
+        if (!seq.native.sessionPasses(
+            parsed.trace.session,
+            args.selectors,
+        )) return .continue_scanning;
+    } else if (!seq.native.sessionMetadataPasses(
+        parsed.trace.session,
+        args.selectors,
+    )) {
         return .continue_scanning;
     }
     metrics.warnings = std.math.add(
@@ -684,12 +692,22 @@ fn feedPhysicalFile(
                 .{},
             );
             defer index.deinit(allocator);
-            break :result try seq.structured.feed(runner, program, &index);
+            break :result try seq.structured.feedSelected(
+                runner,
+                program,
+                &index,
+                args.selectors.since_ms,
+                args.selectors.until_ms,
+            );
         },
-        else => try seq.trace_adapter.feedTrace(
+        else => try seq.trace_adapter.feedTraceSelected(
             runner,
             program,
             &parsed.trace,
+            .{
+                .since_ms = args.selectors.since_ms,
+                .until_ms = args.selectors.until_ms,
+            },
         ),
     };
 }
