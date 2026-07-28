@@ -5712,6 +5712,21 @@ inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
 }
 
 inline fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
+    return switch (context.rule.operator) {
+        .required_field,
+        .field_absent,
+        .optional_field,
+        .exact_object,
+        .scalar_type,
+        .bounded_string,
+        .regex,
+        .sha256,
+        => try evaluateScalarPrimitiveRule(context),
+        else => try evaluateBoundedPrimitiveRule(context),
+    };
+}
+
+inline fn evaluateScalarPrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
     const rule = context.rule;
     const target = context.target;
     return switch (rule.operator) {
@@ -5745,6 +5760,14 @@ inline fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
             )
         else
             false,
+        else => unreachable,
+    };
+}
+
+inline fn evaluateBoundedPrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
+    const rule = context.rule;
+    const target = context.target;
+    return switch (rule.operator) {
         .bounded_number => if (target) |value| boundedNumber(value, rule) else false,
         .bounded_array => if (target) |value|
             boundedCount(value, .array, rule)
@@ -11978,47 +12001,11 @@ test "definition references preserve transacted validators across caches" {
     );
 }
 
-test "definition references bind reusable multi-input validators" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "receipt.json",
-        .data = multi_input_receipt_definition,
-    });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "packet.json",
-        .data = multi_input_receipt_wrapper_definition,
-    });
-    var test_plan = try ValidationTestPlan.init(
-        std.testing.allocator,
-        &tmp.dir,
-        "packet.json",
-        8 * 1024 * 1024,
-    );
-    defer test_plan.deinit();
-
-    const contract =
-        "{\"skill\":\"example\",\"routes\":[{\"id\":\"inspect\"}," ++
-        "{\"id\":\"replace\"}],\"triggers\":[\"manual\",\"review\"]}";
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        std.testing.allocator,
-        contract,
-        .{},
-    );
-    defer parsed.deinit();
-    const canonical =
-        try definition_core.canonical_json.canonicalJsonAlloc(
-            std.testing.allocator,
-            parsed.value,
-        );
-    defer std.testing.allocator.free(canonical);
-    const digest =
-        try definition_core.canonical_json.digestBytesAlloc(
-            std.testing.allocator,
-            canonical,
-        );
-    defer std.testing.allocator.free(digest);
+fn checkMultiInputDefinitionReferenceCases(
+    test_plan: *const ValidationTestPlan,
+    contract: []const u8,
+    digest: []const u8,
+) !void {
     const valid_receipt = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"fingerprint\":\"{s}\",\"route\":\"inspect\"," ++
@@ -12068,6 +12055,48 @@ test "definition references bind reusable multi-input validators" {
         defer cached.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.valid, cached.valid);
     }
+}
+
+test "definition references bind reusable multi-input validators" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "receipt.json",
+        .data = multi_input_receipt_definition,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packet.json",
+        .data = multi_input_receipt_wrapper_definition,
+    });
+    var test_plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "packet.json",
+        8 * 1024 * 1024,
+    );
+    defer test_plan.deinit();
+
+    const contract =
+        "{\"skill\":\"example\",\"routes\":[{\"id\":\"inspect\"}," ++
+        "{\"id\":\"replace\"}],\"triggers\":[\"manual\",\"review\"]}";
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        contract,
+        .{},
+    );
+    defer parsed.deinit();
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        std.testing.allocator,
+        parsed.value,
+    );
+    defer std.testing.allocator.free(canonical);
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        std.testing.allocator,
+        canonical,
+    );
+    defer std.testing.allocator.free(digest);
+    try checkMultiInputDefinitionReferenceCases(&test_plan, contract, digest);
 }
 
 test "collection item rules reuse one imported scalar definition" {

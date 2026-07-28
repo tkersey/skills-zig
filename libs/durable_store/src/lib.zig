@@ -1685,7 +1685,12 @@ pub fn commitTextTransaction(
     try ensureDirectoryPathNoSymlinks(transaction_dir);
     var record_persisted = false;
     errdefer if (!record_persisted) {
-        std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(
+            Io.io(),
+            transaction_dir,
+        ) catch |cleanup_error| switch (cleanup_error) {
+            else => {},
+        };
     };
     const record_path = try std.fs.path.join(allocator, &.{ transaction_dir, "transaction.json" });
     errdefer allocator.free(record_path);

@@ -96,14 +96,11 @@ pub fn parseFileSelected(
         return error.ObservationInputByteBoundExceeded;
     }
     var file_reader = file.reader(io, &.{});
-    const prefix = if (selection != null and
-        requiresSummaryPreselection(selection.?))
-        try readSummaryPrefixAlloc(
-            allocator,
-            &file_reader.interface,
-        )
-    else
-        try allocator.alloc(u8, 0);
+    const prefix = try readSelectionPrefixAlloc(
+        allocator,
+        &file_reader.interface,
+        selection,
+    );
     defer allocator.free(prefix);
     const preselection = if (selection) |selected|
         try preselectSession(
@@ -140,6 +137,17 @@ pub fn parseFileSelected(
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
+}
+
+fn readSelectionPrefixAlloc(
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    selection: ?SessionSelection,
+) ![]u8 {
+    if (selection != null and requiresSummaryPreselection(selection.?)) {
+        return readSummaryPrefixAlloc(allocator, reader);
+    }
+    return allocator.alloc(u8, 0);
 }
 
 fn readSummaryPrefixAlloc(
