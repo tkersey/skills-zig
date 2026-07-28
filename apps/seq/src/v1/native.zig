@@ -8,6 +8,8 @@ const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
 const trace_adapter = @import("trace_adapter.zig");
 
+const query_output_bytes_max: usize = 16 * 1024 * 1024;
+
 pub const Command = enum {
     sessions,
     turns,
@@ -699,10 +701,11 @@ fn runQueryObject(
     }
     const output = try allocator.alloc(execution.Value, output_cells);
     defer allocator.free(output);
-    var runner = try execution.Runner.initOwnedAlloc(
+    var runner = try execution.Runner.initOwnedAllocBounded(
         allocator,
         &compilation.program,
         output,
+        query_output_bytes_max,
     );
     defer runner.deinit();
     var paths = try resolveTargetPaths(
@@ -802,6 +805,12 @@ fn queryTargetOptions(
             .object => |value| value,
             else => return error.InvalidQueryParams,
         };
+        try definition_core.json.requireExactKeys(params, &.{
+            "path",
+            "session_id",
+            "root",
+            "repo",
+        });
         if (params.get("path")) |value| {
             if (options.path != null) return error.DuplicatePathSelector;
             options.path = try jsonString(value, error.InvalidQueryPath);
@@ -839,6 +848,15 @@ fn compileQuery(
     allocator: std.mem.Allocator,
     object: std.json.ObjectMap,
 ) !QueryCompilation {
+    try definition_core.json.requireExactKeys(object, &.{
+        "dataset",
+        "select",
+        "where",
+        "sort",
+        "limit",
+        "format",
+        "params",
+    });
     const dataset = try jsonString(
         object.get("dataset") orelse return error.MissingQueryDataset,
         error.InvalidQueryDataset,
@@ -932,6 +950,12 @@ fn appendQueryPredicates(
             .object => |value| value,
             else => return error.InvalidQueryWhere,
         };
+        try definition_core.json.requireExactKeys(clause, &.{
+            "field",
+            "op",
+            "value",
+            "case_insensitive",
+        });
         const field = try jsonString(
             clause.get("field") orelse return error.MissingQueryField,
             error.InvalidQueryField,
@@ -1563,5 +1587,43 @@ test "native options reject ignored command modifiers" {
     try std.testing.expectError(
         error.UnsupportedNativeOption,
         parseOptions(.query, &.{ "--limit", "1" }),
+    );
+}
+
+test "native queries reject unknown spec keys" {
+    var top = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"dataset\":\"sessions\",\"selct\":[\"session_id\"]}",
+        .{},
+    );
+    defer top.deinit();
+    try std.testing.expectError(
+        error.UnknownField,
+        compileQuery(std.testing.allocator, top.value.object),
+    );
+
+    var params = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"dataset\":\"sessions\",\"params\":{\"rot\":\"sessions\"}}",
+        .{},
+    );
+    defer params.deinit();
+    try std.testing.expectError(
+        error.UnknownField,
+        queryTargetOptions(.{}, params.value.object),
+    );
+
+    var clause = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"dataset\":\"sessions\",\"where\":[{\"field\":\"session_id\",\"vaule\":\"x\"}]}",
+        .{},
+    );
+    defer clause.deinit();
+    try std.testing.expectError(
+        error.UnknownField,
+        compileQuery(std.testing.allocator, clause.value.object),
     );
 }

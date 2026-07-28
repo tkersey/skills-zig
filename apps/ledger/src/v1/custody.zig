@@ -164,13 +164,39 @@ pub fn readSlotOrMissing(
         definition_id,
         slot,
     ) catch |err| switch (err) {
-        error.FileNotFound => missingSlot(
-            allocator,
-            repo_root,
-            slot,
-        ),
+        error.FileNotFound => {
+            try rejectOrphanedBinding(
+                allocator,
+                repo_root,
+                slot.relative_path,
+            );
+            return missingSlot(allocator, repo_root, slot);
+        },
         else => err,
     };
+}
+
+fn rejectOrphanedBinding(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    logical_path: []const u8,
+) !void {
+    const binding_path = try bindingPathAlloc(
+        allocator,
+        repo_root,
+        logical_path,
+    );
+    defer allocator.free(binding_path);
+    const bytes = durable_store.readRegularFileNoSymlink(
+        allocator,
+        binding_path,
+        binding_max_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    allocator.free(bytes);
+    return error.StoreBindingWithoutSlot;
 }
 
 fn missingSlot(
@@ -774,4 +800,50 @@ fn optionalUnsigned(
     const value = object.get(name) orelse return null;
     if (value == .null) return null;
     return @as(?usize, try definition_core.json.unsigned(value));
+}
+
+test "missing slot rejects an orphaned custody binding" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/.bindings");
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "example/events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    var missing = try readSlotOrMissing(
+        std.testing.allocator,
+        root,
+        "example/events",
+        slot,
+    );
+    missing.deinit(std.testing.allocator);
+    const binding_path = try bindingPathAlloc(
+        std.testing.allocator,
+        root,
+        slot.relative_path,
+    );
+    defer std.testing.allocator.free(binding_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = binding_path,
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.StoreBindingWithoutSlot,
+        readSlotOrMissing(
+            std.testing.allocator,
+            root,
+            "example/events",
+            slot,
+        ),
+    );
 }

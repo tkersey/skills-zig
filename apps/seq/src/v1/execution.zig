@@ -563,6 +563,8 @@ pub const Runner = struct {
     allocator: ?std.mem.Allocator = null,
     value_allocator: ?std.mem.Allocator = null,
     owned_values: std.ArrayList([]u8) = .empty,
+    owned_value_bytes: usize = 0,
+    owned_value_bytes_max: ?usize = null,
     materialized: []Value = &.{},
     row_refs: []RowRef = &.{},
     auxiliary_refs: []RowRef = &.{},
@@ -647,8 +649,26 @@ pub const Runner = struct {
         program: *const Program,
         output: []Value,
     ) !Runner {
+        return initOwnedAllocBounded(
+            allocator,
+            program,
+            output,
+            std.math.maxInt(usize),
+        );
+    }
+
+    pub fn initOwnedAllocBounded(
+        allocator: std.mem.Allocator,
+        program: *const Program,
+        output: []Value,
+        owned_value_bytes_max: usize,
+    ) !Runner {
+        if (owned_value_bytes_max == 0) {
+            return error.ObservationRetainedValueByteBoundInvalid;
+        }
         var runner = try initAlloc(allocator, program, output);
         runner.value_allocator = allocator;
+        runner.owned_value_bytes_max = owned_value_bytes_max;
         return runner;
     }
 
@@ -1045,9 +1065,20 @@ pub const Runner = struct {
         allocator: std.mem.Allocator,
         bytes: []const u8,
     ) ![]const u8 {
+        const new_total = std.math.add(
+            usize,
+            self.owned_value_bytes,
+            bytes.len,
+        ) catch return error.ObservationRetainedValueByteBoundExceeded;
+        if (self.owned_value_bytes_max) |max_bytes| {
+            if (new_total > max_bytes) {
+                return error.ObservationRetainedValueByteBoundExceeded;
+            }
+        }
         const copy = try allocator.dupe(u8, bytes);
         errdefer allocator.free(copy);
         try self.owned_values.append(allocator, copy);
+        self.owned_value_bytes = new_total;
         return copy;
     }
 };
@@ -2080,5 +2111,37 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
         @as(f64, 0),
         empty_summary[6].float,
         0.000001,
+    );
+}
+
+test "owned runners bound retained value bytes" {
+    var source_fields = [_]u16{0};
+    var output_fields = [_]u16{0};
+    const program = Program{
+        .source = .{ .physical = .messages },
+        .source_width = 1,
+        .source_field_indices = source_fields[0..],
+        .source_row_bound = null,
+        .operations = &.{},
+        .predicates = &.{},
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = output_fields[0..],
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 1,
+    };
+    var output: [1]Value = undefined;
+    var runner = try Runner.initOwnedAllocBounded(
+        std.testing.allocator,
+        &program,
+        &output,
+        3,
+    );
+    defer runner.deinit();
+    try std.testing.expectError(
+        error.ObservationRetainedValueByteBoundExceeded,
+        runner.feed(&.{.{ .string = "four" }}),
     );
 }

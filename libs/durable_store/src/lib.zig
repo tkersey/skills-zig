@@ -1528,7 +1528,23 @@ pub fn writeTextAtomicCasBounded(
     defer allocator.free(cas_lock_path);
     var cas_lock = try acquireExclusiveLockPathRetry(allocator, cas_lock_path, 5000, 2);
     defer cas_lock.release(allocator);
+    return writeTextAtomicCasBoundedLocked(
+        allocator,
+        path,
+        text,
+        expectation,
+        max_bytes,
+    );
+}
 
+fn writeTextAtomicCasBoundedLocked(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    expectation: CasExpectation,
+    max_bytes: usize,
+) !CasWriteReceipt {
+    if (max_bytes == 0 or text.len > max_bytes) return error.FileTooBig;
     const current = readRegularFileNoSymlink(allocator, path, max_bytes) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -1689,6 +1705,31 @@ pub fn commitTextTransaction(
             .reject_symlinks = options.reject_symlinks,
         });
         lock_count += 1;
+    }
+
+    var cas_locks = try allocator.alloc(LockFile, ordered.len);
+    var cas_lock_count: usize = 0;
+    defer {
+        var index: usize = 0;
+        while (index < cas_lock_count) : (index += 1) {
+            cas_locks[index].release(allocator);
+        }
+        allocator.free(cas_locks);
+    }
+    for (ordered) |mutation| {
+        if (mutation.action != .check_only) continue;
+        const cas_lock_path = try casLockPathAlloc(allocator, mutation.path);
+        cas_locks[cas_lock_count] = acquireExclusiveLockPathRetry(
+            allocator,
+            cas_lock_path,
+            5000,
+            2,
+        ) catch |err| {
+            allocator.free(cas_lock_path);
+            return err;
+        };
+        allocator.free(cas_lock_path);
+        cas_lock_count += 1;
     }
 
     const now_ms = clockMillis(.real);
@@ -4491,6 +4532,118 @@ test "durable transactions compare check-only participants without rewriting the
             },
         ),
     );
+}
+
+const GuardedTransactionContext = struct {
+    transactions_dir: []const u8,
+    counter_path: []const u8,
+    guarded_path: []const u8,
+    guarded_digest: []const u8,
+    metadata_path: []const u8,
+    result: ?anyerror = null,
+};
+
+fn runGuardedTransaction(context: *GuardedTransactionContext) void {
+    const mutations = [_]TransactionMutation{
+        .{
+            .path = context.guarded_path,
+            .text = "",
+            .expectation = .{
+                .expected_digest = context.guarded_digest,
+                .expected_exists = true,
+            },
+            .content_mode = .raw,
+            .max_bytes = 4096,
+            .action = .check_only,
+        },
+        .{
+            .path = context.metadata_path,
+            .text = "{\"bound\":true}\n",
+            .expectation = .{ .expected_exists = false },
+            .content_mode = .raw,
+            .max_bytes = 4096,
+        },
+    };
+    var receipt = commitTextTransaction(
+        std.heap.smp_allocator,
+        context.transactions_dir,
+        &mutations,
+        .{
+            .owner = .{
+                .process_id = 402,
+                .session_id = "check-only-race",
+                .executor = "test",
+            },
+            .fencing_counter_path = context.counter_path,
+        },
+    ) catch |err| {
+        context.result = err;
+        return;
+    };
+    receipt.deinit(std.heap.smp_allocator);
+    context.result = null;
+}
+
+test "durable transactions hold check-only CAS guards through publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "transactions" },
+    );
+    defer std.testing.allocator.free(transactions_dir);
+    const counter = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer std.testing.allocator.free(counter);
+    const guarded_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "guarded.jsonl" },
+    );
+    defer std.testing.allocator.free(guarded_path);
+    const metadata_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "binding.jsonl" },
+    );
+    defer std.testing.allocator.free(metadata_path);
+    const before = "{\"seq\":1}\n";
+    try writeTextAtomic(std.testing.allocator, guarded_path, before);
+    const before_digest = try digestBytesAlloc(std.testing.allocator, before);
+    defer std.testing.allocator.free(before_digest);
+    const lock_path = try casLockPathAlloc(
+        std.testing.allocator,
+        guarded_path,
+    );
+    defer std.testing.allocator.free(lock_path);
+    var held_lock = try acquireExclusiveLockPath(
+        std.testing.allocator,
+        lock_path,
+    );
+    var context = GuardedTransactionContext{
+        .transactions_dir = transactions_dir,
+        .counter_path = counter,
+        .guarded_path = guarded_path,
+        .guarded_digest = before_digest,
+        .metadata_path = metadata_path,
+    };
+    const thread = try std.Thread.spawn(.{}, runGuardedTransaction, .{&context});
+    std.Io.sleep(Io.io(), .fromMilliseconds(10), .awake) catch {};
+    try writeTextAtomic(
+        std.testing.allocator,
+        guarded_path,
+        "{\"seq\":2}\n",
+    );
+    held_lock.release(std.testing.allocator);
+    thread.join();
+    try std.testing.expectEqual(error.DigestMismatch, context.result.?);
+    try std.testing.expect(!fileExists(metadata_path));
 }
 
 test "durable transactions commit and recover from prepared records" {

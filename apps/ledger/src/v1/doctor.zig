@@ -95,10 +95,7 @@ pub fn execute(
             parameters,
             event_protocol != null and
                 event_protocol.?.target_slot_index == index,
-        ) catch |err| if (err == error.FileNotFound)
-            try missingSlot(allocator, slot)
-        else
-            try unhealthySlot(allocator, slot, err);
+        ) catch |err| try classifySlotError(allocator, slot, err);
         initialized += 1;
         if (!slots[index].healthy) healthy = false;
     }
@@ -111,6 +108,17 @@ pub fn execute(
     };
 }
 
+fn classifySlotError(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    err: anyerror,
+) !SlotStatus {
+    return if (err == error.StoreSlotMissing)
+        missingSlot(allocator, slot)
+    else
+        unhealthySlot(allocator, slot, err);
+}
+
 fn inspectSlot(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -119,13 +127,14 @@ fn inspectSlot(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
-    var snapshot = try custody.readSlot(
+    var snapshot = try custody.readSlotOrMissing(
         allocator,
         repo_root,
         definition_plan.id,
         slot,
     );
     defer snapshot.deinit(allocator);
+    if (!snapshot.exists) return error.StoreSlotMissing;
     var replay_stats = try replay.validateSlot(
         allocator,
         repo_root,
@@ -250,4 +259,24 @@ test "missing declared storage is a healthy initial state" {
     try std.testing.expect(result.slots[0].healthy);
     try std.testing.expect(result.slots[0].revision == null);
     try std.testing.expect(result.slots[0].error_code == null);
+}
+
+test "missing replay dependencies remain unhealthy" {
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "example/events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    var result = try classifySlotError(
+        std.testing.allocator,
+        slot,
+        error.FileNotFound,
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(SlotState.invalid, result.state);
+    try std.testing.expect(!result.healthy);
+    try std.testing.expectEqualStrings("FileNotFound", result.error_code.?);
 }
