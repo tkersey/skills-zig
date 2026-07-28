@@ -728,6 +728,7 @@ pub fn apply(
         state,
         event_bytes,
         null,
+        .replay,
     );
 }
 
@@ -744,8 +745,31 @@ pub fn applyBound(
         state,
         event_bytes,
         parameters,
+        .replay,
     );
 }
+
+pub fn admitBound(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event_bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    return applyWithParameters(
+        allocator,
+        plan,
+        state,
+        event_bytes,
+        parameters,
+        .current,
+    );
+}
+
+const ApplyMode = enum {
+    replay,
+    current,
+};
 
 fn applyWithParameters(
     allocator: std.mem.Allocator,
@@ -753,6 +777,7 @@ fn applyWithParameters(
     state: *ReplayState,
     event_bytes: []const u8,
     parameters: ?*const definition_core.parameters.Bindings,
+    mode: ApplyMode,
 ) !void {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -771,6 +796,7 @@ fn applyWithParameters(
         state,
         parsed.value,
         parameters,
+        mode,
     );
 }
 
@@ -786,6 +812,7 @@ pub fn applyValue(
         state,
         event,
         null,
+        .replay,
     );
 }
 
@@ -802,6 +829,24 @@ pub fn applyValueBound(
         state,
         event,
         parameters,
+        .replay,
+    );
+}
+
+pub fn admitValueBound(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *ReplayState,
+    event: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    return applyValueWithParameters(
+        allocator,
+        plan,
+        state,
+        event,
+        parameters,
+        .current,
     );
 }
 
@@ -811,12 +856,13 @@ fn applyValueWithParameters(
     state: *ReplayState,
     event: std.json.Value,
     parameters: ?*const definition_core.parameters.Bindings,
+    mode: ApplyMode,
 ) !void {
     if (state.records >= plan.max_records) {
         return error.ProtocolRecordBoundsExceeded;
     }
     if (plan.mode == .plain) {
-        return applyPlainValue(allocator, plan, state, event);
+        return applyPlainValue(allocator, plan, state, event, mode);
     }
     return applyChainedValue(
         allocator,
@@ -824,6 +870,7 @@ fn applyValueWithParameters(
         state,
         event,
         parameters,
+        mode,
     );
 }
 
@@ -832,6 +879,7 @@ fn applyPlainValue(
     plan: *const Plan,
     state: *ReplayState,
     event: std.json.Value,
+    mode: ApplyMode,
 ) !void {
     const event_kind_pointer =
         if (plan.state_reducer_plan) |*compiled|
@@ -849,7 +897,7 @@ fn applyPlainValue(
     );
     const kind_index = findSortedIndex(plan.event_kinds, kind) orelse
         return error.UnknownEventKind;
-    try applyReducers(allocator, plan, state, event);
+    try applyReducers(allocator, plan, state, event, mode);
     state.kind_counts[kind_index] += 1;
     state.records += 1;
 }
@@ -860,6 +908,7 @@ fn applyChainedValue(
     state: *ReplayState,
     event: std.json.Value,
     parameters: ?*const definition_core.parameters.Bindings,
+    mode: ApplyMode,
 ) !void {
     const object = try definition_core.json.object(event);
     try validateEnvelopeKeys(object, plan.envelope.keys);
@@ -892,7 +941,7 @@ fn applyChainedValue(
     if (state.next_sequence == std.math.maxInt(u64)) {
         return error.EventSequenceOverflow;
     }
-    try applyReducers(allocator, plan, state, event);
+    try applyReducers(allocator, plan, state, event, mode);
     @memcpy(&state.previous_digest, claimed_event_digest);
     state.has_previous_digest = true;
     state.kind_counts[kind_index] += 1;
@@ -905,6 +954,7 @@ fn applyReducers(
     plan: *const Plan,
     state: *ReplayState,
     event: std.json.Value,
+    mode: ApplyMode,
 ) !void {
     if (plan.reducer_plan) |*compiled| {
         try reducer.apply(
@@ -915,12 +965,20 @@ fn applyReducers(
         );
     }
     if (plan.state_reducer_plan) |*compiled| {
-        try state_reducer.apply(
-            allocator,
-            compiled,
-            &state.state_reducer_state,
-            event,
-        );
+        switch (mode) {
+            .replay => try state_reducer.apply(
+                allocator,
+                compiled,
+                &state.state_reducer_state,
+                event,
+            ),
+            .current => try state_reducer.admit(
+                allocator,
+                compiled,
+                &state.state_reducer_state,
+                event,
+            ),
+        }
     }
     if (plan.reducer_plan == null and plan.state_reducer_plan == null and
         plan.mode == .plain)

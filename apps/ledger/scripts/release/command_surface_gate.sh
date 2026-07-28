@@ -29,10 +29,11 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 capabilities=$("$bin_path" capabilities --format json)
-jq -e \
+version=$(tr -d '[:space:]' < "$root_dir/apps/ledger/VERSION")
+jq -e --arg version "$version" \
   '
     .schema == "ledger-capabilities/v1" and
-    .version == "1.0.0" and
+    .version == $version and
     (.artifact_abis | index("ledger-artifact-abi/v1")) != null and
     (.operators | type == "array" and length > 0) and
     (.codecs | type == "array" and length > 0) and

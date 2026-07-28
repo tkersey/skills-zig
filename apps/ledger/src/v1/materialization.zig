@@ -1116,7 +1116,10 @@ fn canonicalizeJsonl(
             std.json.Value,
             allocator,
             line,
-            .{ .duplicate_field_behavior = .@"error" },
+            .{
+                .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
+            },
         );
         defer parsed.deinit();
         if (wrote_row) try output.writer.writeByte('\n');
@@ -1129,6 +1132,18 @@ fn canonicalizeJsonl(
     }
     if (wrote_row) try output.writer.writeByte('\n');
     return output.toOwnedSlice();
+}
+
+test "JSONL canonicalization preserves exact numeric lexemes" {
+    const canonical = try canonicalizeJsonl(
+        std.testing.allocator,
+        "{\"value\":9223372036854775808}\n",
+    );
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        "{\"value\":9223372036854775808}\n",
+        canonical,
+    );
 }
 
 fn canonicalizeText(

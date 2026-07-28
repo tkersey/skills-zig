@@ -46,6 +46,7 @@ pub const Plan = struct {
     on: definition_core.json_pointer.Pointer,
     event_kind: ?definition_core.json_pointer.Pointer,
     retain_once: ?definition_core.json_pointer.Pointer,
+    retain_latest: ?definition_core.json_pointer.Pointer,
     assert_from: ?definition_core.json_pointer.Pointer,
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
@@ -63,6 +64,7 @@ pub const Plan = struct {
         self.on.deinit(allocator);
         if (self.event_kind) |*pointer| pointer.deinit(allocator);
         if (self.retain_once) |*pointer| pointer.deinit(allocator);
+        if (self.retain_latest) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         self.* = undefined;
@@ -327,6 +329,7 @@ pub fn compile(
         .on = reducer.on,
         .event_kind = reducer.event_kind,
         .retain_once = reducer.retain_once,
+        .retain_latest = reducer.retain_latest,
         .assert_from = reducer.assert_from,
         .assert_to = reducer.assert_to,
         .assertion_presence = reducer.assertion_presence,
@@ -385,6 +388,7 @@ const ReducerConfig = struct {
     on: definition_core.json_pointer.Pointer,
     event_kind: ?definition_core.json_pointer.Pointer,
     retain_once: ?definition_core.json_pointer.Pointer,
+    retain_latest: ?definition_core.json_pointer.Pointer,
     assert_from: ?definition_core.json_pointer.Pointer,
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
@@ -395,6 +399,7 @@ const ReducerConfig = struct {
         self.on.deinit(allocator);
         if (self.event_kind) |*pointer| pointer.deinit(allocator);
         if (self.retain_once) |*pointer| pointer.deinit(allocator);
+        if (self.retain_latest) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
         for (self.guards) |*guard| guard.deinit(allocator);
@@ -435,6 +440,15 @@ fn compileReducerConfig(
         "retain_once",
     );
     errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
+    var retain_latest = try compileOptionalPointer(
+        allocator,
+        reducer,
+        "retain_latest",
+    );
+    errdefer if (retain_latest) |*pointer| pointer.deinit(allocator);
+    if (retain_once != null and retain_latest != null) {
+        return error.ConflictingReducerRetention;
+    }
     var assert_from = try compileOptionalPointer(allocator, reducer, "from");
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try compileOptionalPointer(allocator, reducer, "to");
@@ -457,6 +471,7 @@ fn compileReducerConfig(
         .on = on,
         .event_kind = event_kind,
         .retain_once = retain_once,
+        .retain_latest = retain_latest,
         .assert_from = assert_from,
         .assert_to = assert_to,
         .assertion_presence = try compileAssertionPresence(reducer),
@@ -473,6 +488,7 @@ fn validateReducerConfigObject(reducer: std.json.ObjectMap) !void {
             "on",
             "event_kind",
             "retain_once",
+            "retain_latest",
             "from",
             "to",
             "assertion_presence",
@@ -600,7 +616,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(4);
+    try encoder.writeU16(5);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
@@ -624,6 +640,10 @@ pub fn encodeCache(
         pointer.raw
     else
         null);
+    try encoder.writeOptionalBytes(if (plan.retain_latest) |pointer|
+        pointer.raw
+    else
+        null);
     try encoder.writeOptionalBytes(if (plan.assert_from) |pointer|
         pointer.raw
     else
@@ -642,7 +662,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 4) {
+    if (try decoder.readU16() != 5) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
@@ -659,6 +679,8 @@ pub fn decodeCache(
     errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
     var retain_once = try decodeOptionalPointer(allocator, decoder);
     errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
+    var retain_latest = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (retain_latest) |*pointer| pointer.deinit(allocator);
     var assert_from = try decodeOptionalPointer(allocator, decoder);
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try decodeOptionalPointer(allocator, decoder);
@@ -671,6 +693,7 @@ pub fn decodeCache(
         .on = on,
         .event_kind = event_kind,
         .retain_once = retain_once,
+        .retain_latest = retain_latest,
         .assert_from = assert_from,
         .assert_to = assert_to,
         .assertion_presence = try decoder.readEnum(AssertionPresence),
@@ -940,7 +963,8 @@ fn retainedValueAlloc(
     prior: ?Entry,
     event: std.json.Value,
 ) !?[]u8 {
-    const pointer = plan.retain_once orelse return null;
+    const pointer = plan.retain_once orelse
+        plan.retain_latest orelse return null;
     const value = definition_core.json_pointer.lookup(event, pointer) orelse {
         if (prior == null) return error.ReducerRetainedValueMissing;
         return null;
@@ -956,11 +980,15 @@ fn retainedValueAlloc(
     if (prior) |entry| {
         const retained = entry.retained orelse
             return error.ReducerRetainedValueMissing;
-        if (!std.mem.eql(u8, retained, canonical)) {
+        if (plan.retain_once != null and
+            !std.mem.eql(u8, retained, canonical))
+        {
             return error.ReducerRetainedValueChanged;
         }
-        allocator.free(canonical);
-        return null;
+        if (std.mem.eql(u8, retained, canonical)) {
+            allocator.free(canonical);
+            return null;
+        }
     }
     return canonical;
 }
@@ -981,6 +1009,16 @@ fn validateReducerCapacity(
         return error.ReducerRetainedTotalBoundsExceeded;
     }
     if (prior) |entry| {
+        if (retained_value) |value| {
+            const retained = entry.retained orelse
+                return error.ReducerRetainedValueMissing;
+            const without_prior = state.retained_bytes -| retained.len;
+            if (without_prior >
+                plan.max_retained_total_bytes -| value.len)
+            {
+                return error.ReducerRetainedTotalBoundsExceeded;
+            }
+        }
         if (entry.event_count == std.math.maxInt(usize)) {
             return error.ReducerEventCountOverflow;
         }
@@ -1000,6 +1038,15 @@ fn commitReducerTransition(
         }
         result.value_ptr.setState(context.transition.to);
         result.value_ptr.event_count += 1;
+        if (retained_value.*) |value| {
+            const prior = result.value_ptr.retained orelse
+                return error.ReducerRetainedValueMissing;
+            state.retained_bytes -= prior.len;
+            allocator.free(prior);
+            result.value_ptr.retained = value;
+            state.retained_bytes += value.len;
+            retained_value.* = null;
+        }
     } else {
         result.value_ptr.* = Entry.init(
             context.key,
@@ -1120,6 +1167,10 @@ pub fn validatePlan(plan: *const Plan) !void {
     try validatePointer(plan.on);
     if (plan.event_kind) |pointer| try validatePointer(pointer);
     if (plan.retain_once) |pointer| try validatePointer(pointer);
+    if (plan.retain_latest) |pointer| try validatePointer(pointer);
+    if (plan.retain_once != null and plan.retain_latest != null) {
+        return error.ConflictingReducerRetention;
+    }
     if (plan.assert_from) |pointer| try validatePointer(pointer);
     if (plan.assert_to) |pointer| try validatePointer(pointer);
     if (plan.assertion_presence == .when_present and
@@ -1515,6 +1566,13 @@ const assertion_reducer =
     "{\"assertion_presence\":\"when-present\",\"event_kind\":\"/event\"," ++
     "\"from\":\"/from\",\"key\":\"/id\",\"on\":\"/status\"," ++
     "\"op\":\"reducer\",\"retain_once\":\"/record\",\"to\":\"/to\"}";
+const replace_table =
+    "{\"op\":\"transition-table\",\"states\":[\"active\",\"candidate\"]," ++
+    "\"transitions\":[{\"from\":null,\"on\":\"candidate\",\"to\":\"candidate\"}," ++
+    "{\"from\":\"candidate\",\"on\":\"active\",\"to\":\"active\"}]}";
+const replace_reducer =
+    "{\"event_kind\":\"/event\",\"key\":\"/id\",\"on\":\"/status\"," ++
+    "\"op\":\"reducer\",\"retain_latest\":\"/record\"}";
 
 fn testRule(operator: definition.Operator, config: []const u8) definition.Rule {
     return .{
@@ -1749,4 +1807,39 @@ test "keyed reducer checks transition assertions when rows carry them" {
     defer state.deinit(std.testing.allocator);
     try exerciseAssertionTransitions(&plan, &state);
     try expectAssertionProjection(&state);
+}
+
+test "keyed reducer replaces retained state only when declared" {
+    var compiled = try compile(
+        std.testing.allocator,
+        null,
+        testRule(.transition_table, replace_table),
+        testRule(.reducer, replace_reducer),
+        testBounds(2),
+    );
+    defer compiled.deinit(std.testing.allocator);
+    var plan = try cacheRoundTripPlan(&compiled);
+    defer plan.deinit(std.testing.allocator);
+    try std.testing.expect(plan.retain_latest != null);
+
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+    try applyTestEvent(
+        &plan,
+        &state,
+        "{\"event\":\"capture\",\"id\":\"item-1\"," ++
+            "\"record\":{\"value\":1},\"status\":\"candidate\"}",
+    );
+    try applyTestEvent(
+        &plan,
+        &state,
+        "{\"event\":\"status\",\"id\":\"item-1\"," ++
+            "\"record\":{\"value\":2},\"status\":\"active\"}",
+    );
+    const current = state.get("item-1").?;
+    try std.testing.expectEqualStrings("active", current.state);
+    try std.testing.expectEqualStrings(
+        "{\"value\":2}",
+        current.retained.?,
+    );
 }

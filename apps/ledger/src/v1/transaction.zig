@@ -1884,7 +1884,7 @@ fn materializeEventEffectInput(
     };
     errdefer materialized_event.deinit(allocator);
     if (protocol_required) {
-        try protocol.applyBound(
+        try protocol.admitBound(
             allocator,
             event_protocol.?,
             &replay_context.state.?,
@@ -2053,7 +2053,7 @@ fn materializeRawEffectInput(
                 current_protocol,
             );
         }
-        try protocol.applyValueBound(
+        try protocol.admitValueBound(
             allocator,
             current_protocol,
             &replay_context.state.?,

@@ -1538,7 +1538,10 @@ fn validateCachedKeyedFold(
         value
     else
         return error.CacheProjectionPlanMismatch;
-    if (keyed.retained_field != null and keyed_plan.retain_once == null) {
+    if (keyed.retained_field != null and
+        keyed_plan.retain_once == null and
+        keyed_plan.retain_latest == null)
+    {
         return error.CacheProjectionPlanMismatch;
     }
     try validateKeyedFoldFields(
@@ -2671,7 +2674,8 @@ const ProjectionCompiler = struct {
             error.ProjectionFieldsConflict,
         );
         if (retained_field != null and
-            event_protocol.reducer_plan.?.retain_once == null)
+            event_protocol.reducer_plan.?.retain_once == null and
+            event_protocol.reducer_plan.?.retain_latest == null)
         {
             return error.FoldRetainedFieldRequiresRetainedValue;
         }

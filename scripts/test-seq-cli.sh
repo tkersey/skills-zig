@@ -63,10 +63,44 @@ opencode_output=$("$binary" observe \
   --param needle=verifier \
   --format json)
 grep -Fq '"adapter":"opencode-prompt-history-jsonl/v1"' <<<"$opencode_output"
-grep -Fq '"session_id":"opencode-prompt-history"' <<<"$opencode_output"
+grep -Fq '"session_id":"opencode-session:' <<<"$opencode_output"
 grep -Fq '"text":"run the verifier"' <<<"$opencode_output"
 grep -Fq '"physical_passes":1' <<<"$opencode_output"
 grep -Fq '"files_opened":1' <<<"$opencode_output"
+
+opencode_sessions=$("$binary" sessions \
+  --root apps/seq/src/v1/fixtures/opencode \
+  --format json)
+opencode_session_id=$(jq -er '.[0].session_id' <<<"$opencode_sessions")
+[[ "$opencode_session_id" == opencode-session:* ]]
+grep -Fq '"originator":"opencode"' <<<"$opencode_sessions"
+
+opencode_turns=$("$binary" turns \
+  --path "$opencode_history" \
+  --format json)
+grep -Fq "\"session_id\":\"$opencode_session_id\"" <<<"$opencode_turns"
+grep -Fq '"user_message":"run the verifier"' <<<"$opencode_turns"
+
+opencode_tools=$("$binary" tool-lifecycle \
+  --path "$opencode_history" \
+  --format json)
+grep -Fq "\"session_id\":\"$opencode_session_id\"" <<<"$opencode_tools"
+grep -Fq '"lifecycle_status":"completed"' <<<"$opencode_tools"
+grep -Fq '"output_text":"ok"' <<<"$opencode_tools"
+
+opencode_query=$("$binary" query \
+  --path "$opencode_history" \
+  --spec '{"dataset":"turns","select":["session_id","turn_index","user_message"],"limit":5,"format":"json"}')
+grep -Fq '"user_message":"inspect the adapter"' <<<"$opencode_query"
+if opencode_structured_error=$("$binary" query \
+  --path "$opencode_history" \
+  --spec '{"dataset":"structured_values","select":["document_id"],"limit":5,"format":"json"}' \
+  2>&1)
+then
+  exit 1
+fi
+grep -Fq '"code":"OpenCodeStructuredValuesUnavailable"' \
+  <<<"$opencode_structured_error"
 
 external_output=$("$binary" observe \
   --definition "$external_definition" \
@@ -175,6 +209,13 @@ grep -Fq \
 if "$binary" query \
   --limit 1 \
   --spec '{"dataset":"sessions","select":["session_id"]}' \
+  >/dev/null 2>&1
+then
+  exit 1
+fi
+if "$binary" query \
+  --path "$rollout" \
+  --spec '{"dataset":"sessions","select":["session_id","session_id"],"format":"json"}' \
   >/dev/null 2>&1
 then
   exit 1

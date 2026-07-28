@@ -1502,27 +1502,93 @@ fn completeTurn(allocator: std.mem.Allocator, turn: *TurnRecord, status: TurnSta
 }
 
 fn applyTokenCount(turn: *TurnRecord, session: *SessionRecord, payload: std.json.ObjectMap) void {
-    const total = tokenUsage(payload) orelse return;
-    if (intField(total, "input_tokens")) |v| {
-        turn.input_tokens = v;
-        session.input_tokens = v;
+    const info = objectField(payload, "info") orelse payload;
+    if (objectField(info, "total_token_usage")) |total| {
+        applyCumulativeToken(
+            &turn.input_tokens,
+            &session.input_tokens,
+            intField(total, "input_tokens"),
+        );
+        applyCumulativeToken(
+            &turn.cached_input_tokens,
+            &session.cached_input_tokens,
+            intField(total, "cached_input_tokens"),
+        );
+        applyCumulativeToken(
+            &turn.output_tokens,
+            &session.output_tokens,
+            intField(total, "output_tokens"),
+        );
+        applyCumulativeToken(
+            &turn.reasoning_output_tokens,
+            &session.reasoning_output_tokens,
+            intField(total, "reasoning_output_tokens"),
+        );
+        applyCumulativeToken(
+            &turn.total_tokens,
+            &session.total_tokens,
+            intField(total, "total_tokens"),
+        );
+        return;
     }
-    if (intField(total, "cached_input_tokens")) |v| {
-        turn.cached_input_tokens = v;
-        session.cached_input_tokens = v;
-    }
-    if (intField(total, "output_tokens")) |v| {
-        turn.output_tokens = v;
-        session.output_tokens = v;
-    }
-    if (intField(total, "reasoning_output_tokens")) |v| {
-        turn.reasoning_output_tokens = v;
-        session.reasoning_output_tokens = v;
-    }
-    if (intField(total, "total_tokens")) |v| {
-        turn.total_tokens = v;
-        session.total_tokens = v;
-    }
+    const last = objectField(info, "last_token_usage") orelse return;
+    applyTurnToken(
+        &turn.input_tokens,
+        &session.input_tokens,
+        intField(last, "input_tokens"),
+    );
+    applyTurnToken(
+        &turn.cached_input_tokens,
+        &session.cached_input_tokens,
+        intField(last, "cached_input_tokens"),
+    );
+    applyTurnToken(
+        &turn.output_tokens,
+        &session.output_tokens,
+        intField(last, "output_tokens"),
+    );
+    applyTurnToken(
+        &turn.reasoning_output_tokens,
+        &session.reasoning_output_tokens,
+        intField(last, "reasoning_output_tokens"),
+    );
+    applyTurnToken(
+        &turn.total_tokens,
+        &session.total_tokens,
+        intField(last, "total_tokens"),
+    );
+}
+
+fn applyCumulativeToken(
+    turn: *?i64,
+    session: *?i64,
+    next: ?i64,
+) void {
+    const value = next orelse return;
+    const prior_session = session.* orelse 0;
+    const prior_turn = turn.* orelse 0;
+    const baseline = if (prior_session >= prior_turn)
+        prior_session - prior_turn
+    else
+        0;
+    turn.* = if (value >= baseline) value - baseline else value;
+    session.* = value;
+}
+
+fn applyTurnToken(
+    turn: *?i64,
+    session: *?i64,
+    next: ?i64,
+) void {
+    const value = next orelse return;
+    const prior_session = session.* orelse 0;
+    const prior_turn = turn.* orelse 0;
+    const baseline = if (prior_session >= prior_turn)
+        prior_session - prior_turn
+    else
+        0;
+    turn.* = value;
+    session.* = std.math.add(i64, baseline, value) catch value;
 }
 
 fn tokenEvent(
@@ -1561,6 +1627,31 @@ fn tokenUsage(payload: std.json.ObjectMap) ?std.json.ObjectMap {
     const info = objectField(payload, "info") orelse payload;
     return objectField(info, "total_token_usage") orelse
         objectField(info, "last_token_usage");
+}
+
+test "cumulative token snapshots become per-turn deltas" {
+    var session_tokens: ?i64 = null;
+    var first_turn_tokens: ?i64 = null;
+    var second_turn_tokens: ?i64 = null;
+
+    applyCumulativeToken(
+        &first_turn_tokens,
+        &session_tokens,
+        100,
+    );
+    applyCumulativeToken(
+        &first_turn_tokens,
+        &session_tokens,
+        120,
+    );
+    applyCumulativeToken(
+        &second_turn_tokens,
+        &session_tokens,
+        175,
+    );
+    try std.testing.expectEqual(@as(i64, 120), first_turn_tokens.?);
+    try std.testing.expectEqual(@as(i64, 55), second_turn_tokens.?);
+    try std.testing.expectEqual(@as(i64, 175), session_tokens.?);
 }
 
 fn applyResponseItem(

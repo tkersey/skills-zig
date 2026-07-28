@@ -4,6 +4,7 @@ const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const native_plan = @import("plan.zig");
+const opencode_adapter = @import("opencode_adapter.zig");
 const physical = @import("physical.zig");
 const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
@@ -411,6 +412,18 @@ fn runRelation(
     }
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
+        if (opencode_adapter.recognizes(path)) {
+            try writeOpenCodeRelationRows(
+                allocator,
+                writer,
+                relation,
+                options,
+                path,
+                &first,
+                &remaining,
+            );
+            continue;
+        }
         var trace = if (relation == .sessions)
             try trace_core.parseSessionSummaryTrace(
                 allocator,
@@ -698,7 +711,13 @@ fn runQueryObject(
     options: Options,
     object: std.json.ObjectMap,
 ) !void {
-    const query_options = try queryTargetOptions(options, object);
+    var query_options = try queryTargetOptions(options, object);
+    const normalized_repo = if (query_options.repo) |repo|
+        try absolutePathAlloc(allocator, query_options.environment, repo)
+    else
+        null;
+    defer if (normalized_repo) |repo| allocator.free(repo);
+    if (normalized_repo) |repo| query_options.repo = repo;
     var compilation = try compileQuery(allocator, object);
     defer compilation.deinit(allocator);
     if (query_options.format != .json) return error.UnsupportedNativeFormat;
@@ -753,6 +772,32 @@ fn feedQueryPath(
     compilation: *const QueryCompilation,
     runner: *execution.Runner,
 ) !execution.Feed {
+    if (opencode_adapter.recognizes(path)) {
+        if (options.repo != null or
+            options.since_ms != null or
+            options.until_ms != null)
+        {
+            return error.OpenCodePromptHistorySelectorUnavailable;
+        }
+        if (options.session_id) |wanted| {
+            var session_id_buffer: [64]u8 = undefined;
+            const session_id = try opencode_adapter.sessionId(
+                &session_id_buffer,
+                path,
+            );
+            if (!std.mem.eql(u8, wanted, session_id)) {
+                return .continue_scanning;
+            }
+        }
+        _ = try opencode_adapter.feedFile(
+            allocator,
+            &compilation.program,
+            runner,
+            path,
+            256 * 1024 * 1024,
+        );
+        return if (runner.stopped) .stop else .continue_scanning;
+    }
     var trace = if (compilation.relation == .sessions)
         try trace_core.parseSessionSummaryTrace(
             allocator,
@@ -947,6 +992,11 @@ fn appendQueryOutputFields(
         if (select.items.len == 0) return error.EmptyQuerySelect;
         for (select.items) |item| {
             const name = try jsonString(item, error.InvalidQuerySelect);
+            for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) {
+                    return error.DuplicateQueryProjection;
+                }
+            }
             try names.append(allocator, name);
             try fields.append(allocator, try demand.add(name));
         }
@@ -1210,6 +1260,117 @@ fn writeQueryRows(
     if (format == .json) try writer.writeAll("]\n");
 }
 
+fn writeOpenCodeRelationRows(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    relation: physical.Relation,
+    options: Options,
+    path: []const u8,
+    first: *bool,
+    remaining: *usize,
+) !void {
+    if (options.repo != null or
+        options.since_ms != null or
+        options.until_ms != null)
+    {
+        return error.OpenCodePromptHistorySelectorUnavailable;
+    }
+    if (options.session_id) |wanted| {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = try opencode_adapter.sessionId(
+            &session_id_buffer,
+            path,
+        );
+        if (!std.mem.eql(u8, wanted, session_id)) return;
+    }
+    const limit = if (options.limit == 0) 100_000 else remaining.*;
+    var compilation = try compileAllFieldsQuery(
+        allocator,
+        relation,
+        limit,
+    );
+    defer compilation.deinit(allocator);
+    const output_cells = try std.math.mul(
+        usize,
+        compilation.program.max_rows,
+        compilation.program.output_field_indices.len,
+    );
+    if (output_cells > 4_000_000) {
+        return error.PhysicalQueryOutputBoundExceeded;
+    }
+    const output = try allocator.alloc(execution.Value, output_cells);
+    defer allocator.free(output);
+    var runner = try execution.Runner.initOwnedAllocBounded(
+        allocator,
+        &compilation.program,
+        output,
+        query_output_bytes_max,
+    );
+    defer runner.deinit();
+    _ = try opencode_adapter.feedFileSelected(
+        allocator,
+        &compilation.program,
+        &runner,
+        path,
+        256 * 1024 * 1024,
+        .{
+            .status = if (relation == .turns) options.status else null,
+            .contains = if (relation == .turns) options.contains else null,
+        },
+    );
+    const result = try runner.finish();
+    const rows = result.rows();
+    const count = try rows.count();
+    for (0..count) |row_index| {
+        if (!first.*) try writer.writeByte(',');
+        first.* = false;
+        const row = rows.row(row_index);
+        try writer.writeByte('{');
+        for (compilation.output_names, row, 0..) |name, value, field_index| {
+            if (field_index != 0) try writer.writeByte(',');
+            try definition_core.canonical_json.writeCanonicalString(
+                writer,
+                name,
+            );
+            try writer.writeByte(':');
+            try writeQueryValue(writer, value);
+        }
+        try writer.writeByte('}');
+    }
+    if (options.limit != 0) remaining.* -|= count;
+}
+
+fn compileAllFieldsQuery(
+    allocator: std.mem.Allocator,
+    relation: physical.Relation,
+    limit: usize,
+) !QueryCompilation {
+    var demand = Demand{ .relation = relation };
+    var output_names: std.ArrayList([]const u8) = .empty;
+    defer output_names.deinit(allocator);
+    var output_fields: std.ArrayList(u16) = .empty;
+    defer output_fields.deinit(allocator);
+    for (relation.fields()) |field| {
+        try output_names.append(allocator, field.name);
+        try output_fields.append(allocator, try demand.add(field.name));
+    }
+    var predicates: std.ArrayList(execution.RuntimePredicate) = .empty;
+    defer predicates.deinit(allocator);
+    var sort_keys: std.ArrayList(execution.RuntimeSortKey) = .empty;
+    defer sort_keys.deinit(allocator);
+    return finishQueryCompilation(
+        allocator,
+        relation,
+        &demand,
+        &output_names,
+        &output_fields,
+        &predicates,
+        &sort_keys,
+        limit,
+        .json,
+    );
+}
+
 fn writeQueryValue(
     writer: *std.Io.Writer,
     value: execution.Value,
@@ -1372,6 +1533,23 @@ fn retainSessionId(
 ) void {
     var write_index: usize = 0;
     for (paths.items) |path| {
+        if (opencode_adapter.recognizes(path)) {
+            var session_id_buffer: [64]u8 = undefined;
+            const session_id = opencode_adapter.sessionId(
+                &session_id_buffer,
+                path,
+            ) catch {
+                allocator.free(path);
+                continue;
+            };
+            if (std.mem.eql(u8, session_id, wanted)) {
+                paths.items[write_index] = path;
+                write_index += 1;
+            } else {
+                allocator.free(path);
+            }
+            continue;
+        }
         var trace = trace_core.parseSessionSummaryTrace(
             allocator,
             path,

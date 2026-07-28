@@ -81,11 +81,16 @@ const EnumScalar = union(enum) {
     string: []u8,
     integer: i64,
     float: f64,
+    number: []u8,
     boolean: bool,
     null,
 
     fn deinit(self: *EnumScalar, allocator: std.mem.Allocator) void {
-        if (self.* == .string) allocator.free(self.string);
+        switch (self.*) {
+            .string => |text| allocator.free(text),
+            .number => |text| allocator.free(text),
+            else => {},
+        }
         self.* = undefined;
     }
 };
@@ -2598,7 +2603,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(31);
+    try encoder.writeU16(32);
     try encodeCachePlan(plan, encoder, 0);
 }
 
@@ -3027,7 +3032,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 31) {
+    if (try decoder.readU16() != 32) {
         return error.LedgerValidationCacheVersionMismatch;
     }
     var imported_plan_count: usize = 0;
@@ -4108,8 +4113,24 @@ fn decodeEnumScalar(
         },
         3 => .{ .boolean = try decoder.readBool() },
         4 => .null,
+        5 => try decodeExactNumberScalar(allocator, decoder),
         else => return error.CacheEnumScalarInvalid,
     };
+}
+
+fn decodeExactNumberScalar(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) !EnumScalar {
+    const text = try decoder.readBytesAlloc(
+        allocator,
+        4 * 1024 * 1024,
+    );
+    errdefer allocator.free(text);
+    if (definition_core.exact_number.parse(text) == null) {
+        return error.CacheNumberInvalid;
+    }
+    return .{ .number = text };
 }
 
 fn validateCachedRule(
@@ -4798,6 +4819,10 @@ fn encodeEnumScalar(
         .float => |number| {
             try encoder.writeByte(2);
             try encoder.writeF64(number);
+        },
+        .number => |text| {
+            try encoder.writeByte(5);
+            try encoder.writeBytes(text);
         },
         .boolean => |flag| {
             try encoder.writeByte(3);
@@ -7110,6 +7135,10 @@ fn enumEqual(candidate: EnumScalar, value: std.json.Value) bool {
             .{ .float = number },
             value,
         ),
+        .number => |number| exactNumbersEqual(
+            .{ .number_string = number },
+            value,
+        ),
         .boolean => |flag| value == .bool and flag == value.bool,
         .null => value == .null,
     };
@@ -7119,8 +7148,45 @@ fn enumScalarsEqual(left: EnumScalar, right: EnumScalar) bool {
     return switch (left) {
         .string => |text| right == .string and
             std.mem.eql(u8, text, right.string),
-        .integer => |number| right == .integer and number == right.integer,
-        .float => |number| right == .float and number == right.float,
+        .integer => |number| switch (right) {
+            .integer => |other| number == other,
+            .float => |other| definition_core.exact_number.valuesEqual(
+                .{ .integer = number },
+                .{ .float = other },
+            ),
+            .number => |other| definition_core.exact_number.valuesEqual(
+                .{ .integer = number },
+                .{ .number_string = other },
+            ),
+            else => false,
+        },
+        .float => |number| switch (right) {
+            .integer => |other| definition_core.exact_number.valuesEqual(
+                .{ .float = number },
+                .{ .integer = other },
+            ),
+            .float => |other| number == other,
+            .number => |other| definition_core.exact_number.valuesEqual(
+                .{ .float = number },
+                .{ .number_string = other },
+            ),
+            else => false,
+        },
+        .number => |number| switch (right) {
+            .number => |other| definition_core.exact_number.valuesEqual(
+                .{ .number_string = number },
+                .{ .number_string = other },
+            ),
+            .integer => |other| definition_core.exact_number.valuesEqual(
+                .{ .number_string = number },
+                .{ .integer = other },
+            ),
+            .float => |other| definition_core.exact_number.valuesEqual(
+                .{ .number_string = number },
+                .{ .float = other },
+            ),
+            else => false,
+        },
         .boolean => |flag| right == .boolean and flag == right.boolean,
         .null => right == .null,
     };
@@ -9447,16 +9513,30 @@ fn parseEnumScalar(
             .{ .float = number }
         else
             error.InvalidEnumValue,
-        .number_string => |number| number: {
-            const parsed = std.fmt.parseFloat(f64, number) catch
-                return error.InvalidEnumValue;
-            if (!std.math.isFinite(parsed)) return error.InvalidEnumValue;
-            break :number .{ .float = parsed };
+        .number_string => |number| .{
+            .number = try allocator.dupe(u8, number),
         },
         .bool => |flag| .{ .boolean = flag },
         .null => .null,
         else => error.InvalidEnumValue,
     };
+}
+
+test "numeric enums preserve exact values beyond binary float precision" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[9223372036854775808,9223372036854775809]",
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    var scalar = try parseEnumScalar(
+        std.testing.allocator,
+        parsed.value.array.items[0],
+    );
+    defer scalar.deinit(std.testing.allocator);
+    try std.testing.expect(enumEqual(scalar, parsed.value.array.items[0]));
+    try std.testing.expect(!enumEqual(scalar, parsed.value.array.items[1]));
 }
 
 fn optionalUnsigned(object: std.json.ObjectMap, name: []const u8) !?usize {

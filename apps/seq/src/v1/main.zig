@@ -713,10 +713,15 @@ fn feedOpenCodeFile(
         return error.OpenCodePromptHistorySelectorUnavailable;
     }
     if (args.selectors.session_id) |wanted| {
+        var session_id_buffer: [64]u8 = undefined;
+        const session_id = try seq.opencode_adapter.sessionId(
+            &session_id_buffer,
+            path,
+        );
         if (!std.mem.eql(
             u8,
             wanted,
-            seq.opencode_adapter.session_id,
+            session_id,
         )) return .continue_scanning;
     }
     const remaining_bytes = if (metrics.bytes_read < bounds.max_input_bytes)

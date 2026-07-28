@@ -136,6 +136,23 @@ pub fn bind(
     declarations: *const Declarations,
     inputs: []const Input,
 ) !Bindings {
+    return bindMode(allocator, declarations, inputs, true);
+}
+
+pub fn bindProvided(
+    allocator: std.mem.Allocator,
+    declarations: *const Declarations,
+    inputs: []const Input,
+) !Bindings {
+    return bindMode(allocator, declarations, inputs, false);
+}
+
+fn bindMode(
+    allocator: std.mem.Allocator,
+    declarations: *const Declarations,
+    inputs: []const Input,
+    require_all: bool,
+) !Bindings {
     var items: std.ArrayList(Binding) = .empty;
     errdefer {
         for (items.items) |*item| item.deinit(allocator);
@@ -172,7 +189,7 @@ pub fn bind(
                 .name = owned_name,
                 .value = value,
             });
-        } else if (declaration.required) {
+        } else if (require_all and declaration.required) {
             return error.MissingParameter;
         }
     }
@@ -369,6 +386,33 @@ test "parameter declarations and values compile to stable typed digests" {
         bind(std.testing.allocator, &declarations, &.{
             .{ .name = "unknown", .raw_value = "x" },
         }),
+    );
+}
+
+test "partial parameter binding validates inputs without requiring store keys" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{
+        \\  "store": {"type": "safe_identifier", "required": true},
+        \\  "limit": {"type": "integer", "required": false, "default": 10}
+        \\}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    var declarations = try compile(std.testing.allocator, parsed.value);
+    defer declarations.deinit(std.testing.allocator);
+    var bindings = try bindProvided(
+        std.testing.allocator,
+        &declarations,
+        &.{},
+    );
+    defer bindings.deinit(std.testing.allocator);
+    try std.testing.expect(bindings.find("store") == null);
+    try std.testing.expectEqual(
+        @as(i64, 10),
+        bindings.find("limit").?.value.integer,
     );
 }
 

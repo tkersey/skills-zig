@@ -468,7 +468,7 @@ fn runValidate(
         .{ .kind = .validation },
     );
     defer context.deinit(allocator);
-    var bindings = try bindParameters(
+    var bindings = try bindProvidedParameters(
         allocator,
         &context.definition_plan.parameter_declarations,
         args.parameter_specs,
@@ -508,7 +508,7 @@ fn runMaterialize(
         .{ .kind = .materialization },
     );
     defer context.deinit(allocator);
-    var bindings = try bindParameters(
+    var bindings = try bindProvidedParameters(
         allocator,
         &context.definition_plan.parameter_declarations,
         args.parameter_specs,
@@ -965,8 +965,34 @@ fn bindParameters(
     declarations: *const definition_core.parameters.Declarations,
     specs: []const []const u8,
 ) !definition_core.parameters.Bindings {
-    const inputs = try allocator.alloc(definition_core.parameters.Input, specs.len);
+    const inputs = try parameterInputs(allocator, specs);
     defer allocator.free(inputs);
+    return definition_core.parameters.bind(allocator, declarations, inputs);
+}
+
+fn bindProvidedParameters(
+    allocator: std.mem.Allocator,
+    declarations: *const definition_core.parameters.Declarations,
+    specs: []const []const u8,
+) !definition_core.parameters.Bindings {
+    const inputs = try parameterInputs(allocator, specs);
+    defer allocator.free(inputs);
+    return definition_core.parameters.bindProvided(
+        allocator,
+        declarations,
+        inputs,
+    );
+}
+
+fn parameterInputs(
+    allocator: std.mem.Allocator,
+    specs: []const []const u8,
+) ![]definition_core.parameters.Input {
+    const inputs = try allocator.alloc(
+        definition_core.parameters.Input,
+        specs.len,
+    );
+    errdefer allocator.free(inputs);
     for (specs, 0..) |spec, index| {
         const separator = std.mem.indexOfScalar(u8, spec, '=') orelse
             return error.InvalidParameterBinding;
@@ -978,7 +1004,7 @@ fn bindParameters(
             .raw_value = spec[separator + 1 ..],
         };
     }
-    return definition_core.parameters.bind(allocator, declarations, inputs);
+    return inputs;
 }
 
 fn emitValidation(

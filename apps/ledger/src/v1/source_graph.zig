@@ -1393,6 +1393,7 @@ fn lowerStateAdmissions(
             "requires",
             "forbids",
             "laws",
+            "current_laws",
             "actions",
         });
         try definition_core.json.requireFields(admission, &.{"on"});
@@ -1427,6 +1428,20 @@ fn lowerStateAdmissions(
         else
             std.json.Array.init(allocator);
         try lowered.put(allocator, "rules", .{ .array = admission_laws });
+        if (admission.get("current_laws")) |laws| {
+            const current_laws = try lowerExpressions(
+                allocator,
+                try definition_core.json.array(laws),
+                null,
+                null,
+                terms,
+                true,
+                budget,
+            );
+            try lowered.put(allocator, "current_rules", .{
+                .array = current_laws,
+            });
+        }
         const admission_actions = if (admission.get("actions")) |actions|
             try lowerStateActions(
                 allocator,

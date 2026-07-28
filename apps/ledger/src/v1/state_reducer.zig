@@ -126,6 +126,7 @@ const Admission = struct {
     forbidden: []u16,
     set_guards: []SetGuard,
     validation_plan: validation.Plan,
+    replay_validation_plan: ?validation.Plan,
     actions: []Action,
 
     fn deinit(self: *Admission, allocator: std.mem.Allocator) void {
@@ -135,6 +136,7 @@ const Admission = struct {
         for (self.set_guards) |*guard| guard.deinit(allocator);
         allocator.free(self.set_guards);
         self.validation_plan.deinit(allocator);
+        if (self.replay_validation_plan) |*plan| plan.deinit(allocator);
         for (self.actions) |*action| action.deinit(allocator);
         allocator.free(self.actions);
         self.* = undefined;
@@ -373,7 +375,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encoder.writeBytes(plan.event_kind.raw);
     try encodeRegisters(plan.registers, encoder);
     try encodeSets(plan.sets, encoder);
@@ -423,6 +425,10 @@ fn encodeAdmission(
         try encoder.writeEnum(guard.mode);
     }
     try validation.encodeCache(&admission.validation_plan, encoder);
+    try encoder.writeBool(admission.replay_validation_plan != null);
+    if (admission.replay_validation_plan) |*plan| {
+        try validation.encodeCache(plan, encoder);
+    }
     try encoder.writeCount(admission.actions.len);
     for (admission.actions) |action| try encodeAction(action, encoder);
 }
@@ -479,7 +485,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerStateReducerCacheVersionMismatch;
     }
     const raw_event_kind = try decoder.readBytesAlloc(allocator, 1024);
@@ -603,6 +609,11 @@ fn decodeAdmission(
     errdefer deinitSetGuards(allocator, set_guards);
     var validation_plan = try validation.decodeCache(allocator, decoder);
     errdefer validation_plan.deinit(allocator);
+    var replay_validation_plan = if (try decoder.readBool())
+        try validation.decodeCache(allocator, decoder)
+    else
+        null;
+    errdefer if (replay_validation_plan) |*plan| plan.deinit(allocator);
     const actions = try decodeActions(allocator, decoder, register_count);
     errdefer {
         for (actions) |*action| action.deinit(allocator);
@@ -614,6 +625,7 @@ fn decodeAdmission(
         .forbidden = forbidden,
         .set_guards = set_guards,
         .validation_plan = validation_plan,
+        .replay_validation_plan = replay_validation_plan,
         .actions = actions,
     };
 }
@@ -833,6 +845,9 @@ fn validateAdmissionPlan(
         &admission.validation_plan,
         definition_plan,
     );
+    if (admission.replay_validation_plan) |*replay| {
+        try validation.validateEmbeddedCachePlan(replay, definition_plan);
+    }
     try validateAdmissionInputs(plan, admission, event_max_bytes);
     try validateActions(plan, definition_plan, admission);
     for (plan.admissions[0..index]) |prior| {
@@ -994,6 +1009,30 @@ pub fn apply(
     state: *State,
     event: std.json.Value,
 ) !void {
+    return applyMode(allocator, plan, state, event, .replay);
+}
+
+pub fn admit(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+    event: std.json.Value,
+) !void {
+    return applyMode(allocator, plan, state, event, .current);
+}
+
+const ApplyMode = enum {
+    replay,
+    current,
+};
+
+fn applyMode(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    state: *State,
+    event: std.json.Value,
+    mode: ApplyMode,
+) !void {
     try ensureState(allocator, plan, state);
     const kind_value = definition_core.json_pointer.lookup(
         event,
@@ -1024,9 +1063,13 @@ pub fn apply(
             value_index += 1;
         }
     }
+    const validation_plan = if (mode == .replay)
+        admission.replay_validation_plan orelse admission.validation_plan
+    else
+        admission.validation_plan;
     var execution = try validation.executeValues(
         allocator,
-        &admission.validation_plan,
+        &validation_plan,
         values,
     );
     defer execution.deinit();
@@ -1264,6 +1307,15 @@ fn compileAdmission(
         event_max_bytes,
     );
     errdefer validator.deinit(allocator);
+    var replay_validator = try compileReplayAdmissionValidator(
+        allocator,
+        definition_plan,
+        registers,
+        required,
+        object,
+        event_max_bytes,
+    );
+    errdefer if (replay_validator) |*plan| plan.deinit(allocator);
     const actions = try compileActions(
         allocator,
         registers,
@@ -1282,6 +1334,7 @@ fn compileAdmission(
         .forbidden = forbidden,
         .set_guards = guards,
         .validation_plan = validator,
+        .replay_validation_plan = replay_validator,
         .actions = actions,
     };
 }
@@ -1289,7 +1342,15 @@ fn compileAdmission(
 fn validateAdmissionObject(object: std.json.ObjectMap) ![]const u8 {
     try definition_core.json.requireExactKeys(
         object,
-        &.{ "on", "requires", "forbids", "set_guards", "rules", "actions" },
+        &.{
+            "on",
+            "requires",
+            "forbids",
+            "set_guards",
+            "rules",
+            "current_rules",
+            "actions",
+        },
     );
     try definition_core.json.requireFields(
         object,
@@ -1320,6 +1381,60 @@ fn compileAdmissionValidator(
     object: std.json.ObjectMap,
     event_max_bytes: usize,
 ) !validation.Plan {
+    const current = object.get("current_rules") orelse
+        return compileAdmissionValidatorRaw(
+            allocator,
+            definition_plan,
+            registers,
+            required,
+            try definition_core.json.field(object, "rules"),
+            event_max_bytes,
+        );
+    const base = try definition_core.json.array(
+        try definition_core.json.field(object, "rules"),
+    );
+    const current_rules = try definition_core.json.array(current);
+    var combined = std.json.Array.init(allocator);
+    defer combined.deinit();
+    try combined.appendSlice(base.items);
+    try combined.appendSlice(current_rules.items);
+    return compileAdmissionValidatorRaw(
+        allocator,
+        definition_plan,
+        registers,
+        required,
+        .{ .array = combined },
+        event_max_bytes,
+    );
+}
+
+fn compileReplayAdmissionValidator(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    registers: []const Register,
+    required: []const u16,
+    object: std.json.ObjectMap,
+    event_max_bytes: usize,
+) !?validation.Plan {
+    if (object.get("current_rules") == null) return null;
+    return try compileAdmissionValidatorRaw(
+        allocator,
+        definition_plan,
+        registers,
+        required,
+        try definition_core.json.field(object, "rules"),
+        event_max_bytes,
+    );
+}
+
+fn compileAdmissionValidatorRaw(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    registers: []const Register,
+    required: []const u16,
+    rules: std.json.Value,
+    event_max_bytes: usize,
+) !validation.Plan {
     const inputs = try admissionInputsAlloc(
         allocator,
         event_max_bytes,
@@ -1331,7 +1446,7 @@ fn compileAdmissionValidator(
         allocator,
         definition_plan,
         inputs,
-        try definition_core.json.field(object, "rules"),
+        rules,
         definition_plan.bounds.max_input_bytes,
         definition_plan.bounds.max_records,
         definition_plan.bounds.max_diagnostics,
@@ -2733,10 +2848,32 @@ fn validateAdmissionInputs(
     admission: *const Admission,
     event_max_bytes: usize,
 ) !void {
-    if (admission.validation_plan.inputs.len != plan.registers.len + 1) {
+    try validateAdmissionInputPlan(
+        plan,
+        admission,
+        &admission.validation_plan,
+        event_max_bytes,
+    );
+    if (admission.replay_validation_plan) |*replay| {
+        try validateAdmissionInputPlan(
+            plan,
+            admission,
+            replay,
+            event_max_bytes,
+        );
+    }
+}
+
+fn validateAdmissionInputPlan(
+    plan: *const Plan,
+    admission: *const Admission,
+    validation_plan: *const validation.Plan,
+    event_max_bytes: usize,
+) !void {
+    if (validation_plan.inputs.len != plan.registers.len + 1) {
         return error.CacheRetainedAdmissionInputsMismatch;
     }
-    for (admission.validation_plan.inputs) |input| {
+    for (validation_plan.inputs) |input| {
         if (std.mem.eql(u8, input.name, "event")) {
             if (!input.required or input.codec != .json or
                 input.max_bytes != event_max_bytes)
@@ -3335,6 +3472,16 @@ fn applyTestEvent(
     try apply(std.testing.allocator, plan, state, event.value);
 }
 
+fn admitTestEvent(
+    plan: *const Plan,
+    state: *State,
+    source: []const u8,
+) !void {
+    var event = try parseTestEvent(source);
+    defer event.deinit();
+    try admit(std.testing.allocator, plan, state, event.value);
+}
+
 fn expectTestEventError(
     expected: anyerror,
     plan: *const Plan,
@@ -3465,6 +3612,54 @@ const retained_state_definition =
     \\      ]
     \\    }]
     ++ retained_test_suffix;
+
+const retained_current_rules_definition =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/current-rules",
+    \\  "owner":"example",
+    \\  "requires":{
+    \\    "abi":"ledger-artifact-abi/v1",
+    \\    "operators":["bounded-string","reducer"]
+    \\  },
+    \\  "parameters":{},
+    \\  "inputs":{"event":{"codec":"json","max_bytes":4096}},
+    \\  "canonicalization":{},
+    \\  "shape":{},
+    \\  "constraints":{"laws":[
+    \\    ["reducer",{
+    \\      "mode":"retained",
+    \\      "event_kind":"/kind",
+    \\      "registers":[{"name":"current","max_bytes":4096}],
+    \\      "admissions":[{
+    \\        "on":"created",
+    \\        "requires":[],
+    \\        "forbids":["current"],
+    \\        "rules":[],
+    \\        "current_rules":[
+    \\          {"op":"bounded-string","input":"event",
+    \\"path":"/body/proof","trimmed_min":1}
+    \\        ],
+    \\        "actions":[
+    \\          {"op":"set","register":"current","input":"event","path":"/body"}
+    \\        ]
+    \\      }]
+    \\    }]
+    \\  ]},
+    \\  "identity":{},
+    \\  "storage":{"kind":"pure"},
+    \\  "operations":{},
+    \\  "projections":{},
+    \\  "bounds":{
+    \\    "max_input_bytes":4096,
+    \\    "max_store_bytes":4096,
+    \\    "max_records":4,
+    \\    "max_output_bytes":4096,
+    \\    "max_diagnostics":8,
+    \\    "max_reducer_states":1
+    \\  }
+    \\}
+;
 
 const retained_sets_definition =
     retained_test_prefix ++
@@ -3796,6 +3991,43 @@ test "retained reducer cache binds event bounds and actions commit atomically" {
     try expectRetainedStatus(&test_plan.reducer, &state, "open");
     try std.testing.expect(
         state.get(&test_plan.reducer, "shadow") == null,
+    );
+}
+
+test "retained reducer separates replay rules from current admission" {
+    var test_plan = try TestPlan.init(retained_current_rules_definition);
+    defer test_plan.deinit();
+    try std.testing.expect(
+        test_plan.reducer.admissions[0].replay_validation_plan != null,
+    );
+
+    var replay_state: State = .{};
+    defer replay_state.deinit(std.testing.allocator);
+    try applyTestEvent(
+        &test_plan.reducer,
+        &replay_state,
+        "{\"kind\":\"created\",\"body\":{\"value\":\"historical\"}}",
+    );
+
+    var rejected_state: State = .{};
+    defer rejected_state.deinit(std.testing.allocator);
+    var rejected = try parseTestEvent(
+        "{\"kind\":\"created\",\"body\":{\"value\":\"current\"}}",
+    );
+    defer rejected.deinit();
+    try std.testing.expectError(
+        error.ProtocolAdmissionRejected,
+        admit(
+            std.testing.allocator,
+            &test_plan.reducer,
+            &rejected_state,
+            rejected.value,
+        ),
+    );
+    try admitTestEvent(
+        &test_plan.reducer,
+        &rejected_state,
+        "{\"kind\":\"created\",\"body\":{\"proof\":\"present\"}}",
     );
 }
 

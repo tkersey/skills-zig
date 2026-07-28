@@ -467,6 +467,7 @@ fn cloneCanonicalFile(
         .{
             .allocate = .alloc_always,
             .duplicate_field_behavior = .@"error",
+            .parse_numbers = false,
         },
     ) catch return error.InvalidDefinitionJson;
     defer parsed.deinit();
@@ -865,6 +866,22 @@ fn lessThanClosureFile(_: void, left: ClosureFile, right: ClosureFile) bool {
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
+}
+
+test "canonical definition archives preserve exact JSON numbers" {
+    const source = ClosureFile{
+        .path = @constCast("definition.json"),
+        .canonical_json = @constCast(
+            "{\"value\":9223372036854775808}",
+        ),
+        .source_digest = undefined,
+    };
+    var cloned = try cloneCanonicalFile(std.testing.allocator, source);
+    defer cloned.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        source.canonical_json,
+        cloned.canonical_json,
+    );
 }
 
 test "canonical definition packages admit cross-package imports" {

@@ -29,10 +29,11 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 capabilities=$("$bin_path" capabilities --format json)
-jq -e \
+version=$(tr -d '[:space:]' < "$root_dir/apps/seq/VERSION")
+jq -e --arg version "$version" \
   '
     .schema == "seq-capabilities/v1" and
-    .version == "1.0.0" and
+    .version == $version and
     (.observation_abis | index("seq-observation-abi/v1")) != null and
     (.source_adapters | type == "array" and length > 0) and
     (.operators | type == "array" and length > 0) and
