@@ -57,6 +57,57 @@ case "$mode" in
       mark_app memory-note
     }
 
+    classify_build_line() {
+      local raw=$1
+      local app token
+      local matched=1
+      for app in "${apps[@]}"; do
+        token=${app//-/_}
+        if grep -Eqi "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
+          mark_app "$app"
+          matched=0
+        fi
+      done
+      if grep -Eqi 'definition_core|definition-core' <<<"$raw"; then
+        mark_definition_consumers
+        matched=0
+      fi
+      if grep -Eqi 'trace_core|trace-core' <<<"$raw"; then
+        mark_trace_consumers
+        matched=0
+      fi
+      if grep -Eqi 'durable_store|durable-store|jsonl_core|jsonl-core' <<<"$raw"; then
+        mark_store_consumers
+        matched=0
+      fi
+      if grep -Eqi 'jsonl_[A-Za-z0-9_]*|jsonl-[A-Za-z0-9-]*' <<<"$raw"; then
+        mark_store_consumers
+        matched=0
+      fi
+      if grep -Eqi 'canonical_json|canonical-json' <<<"$raw"; then
+        mark_definition_consumers
+        matched=0
+      fi
+      if grep -Eqi 'retrace|execution_policy|seq_bundle|seq_perf' <<<"$raw"; then
+        mark_app seq
+        matched=0
+      fi
+      if grep -Eqi '(^|[^[:alnum:]_])seq([^[:alnum:]_]|$)|seq[_\.]' <<<"$raw"; then
+        mark_app seq
+        matched=0
+      fi
+      if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
+        mark_app ledger
+        matched=0
+      fi
+      return "$matched"
+    }
+
+    contextual_build_line() {
+      local raw=$1
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|\[\]const u8,|\.target = target,|\.optimize = optimize,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+    }
+
     while IFS= read -r path; do
       case "$path" in
         build.zig)
@@ -129,37 +180,62 @@ case "$mode" in
     done < <(git diff --name-only "$base" "$head")
 
     if [[ "$build_changed" -eq 1 ]]; then
-      while IFS= read -r line; do
-        case "$line" in
-          "+++"*|"---"*|"@@"*) continue ;;
-          "+"*|"-"*) ;;
-          *) continue ;;
-        esac
-        raw=${line:1}
-        line_matched=0
-        for app in "${apps[@]}"; do
-          token=${app//-/_}
-          if grep -Eq "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
-            mark_app "$app"
-            line_matched=1
+      build_hunk=()
+      build_changed_lines=()
+
+      flush_build_hunk() {
+        if [[ "${#build_changed_lines[@]}" -eq 0 ]]; then
+          return
+        fi
+        local raw
+        local changed_matched=0
+        local context_matched=0
+        local substantive_unknown=0
+        for raw in "${build_changed_lines[@]}"; do
+          if classify_build_line "$raw"; then
+            changed_matched=1
+          elif ! contextual_build_line "$raw"; then
+            substantive_unknown=1
           fi
         done
-        if grep -Eq 'definition_core|definition-core' <<<"$raw"; then
-          mark_definition_consumers
-          line_matched=1
+        if [[ "$substantive_unknown" -eq 1 ]]; then
+          mark_all
+          return
         fi
-        if grep -Eq 'trace_core|trace-core' <<<"$raw"; then
-          mark_trace_consumers
-          line_matched=1
+        if [[ "$changed_matched" -eq 1 ]]; then
+          return
         fi
-        if grep -Eq 'durable_store|durable-store|jsonl_core|jsonl-core' <<<"$raw"; then
-          mark_store_consumers
-          line_matched=1
-        fi
-        if [[ "$line_matched" -eq 0 ]]; then
+        for raw in "${build_hunk[@]}"; do
+          if classify_build_line "$raw"; then
+            context_matched=1
+          fi
+        done
+        if [[ "$context_matched" -eq 0 ]]; then
           mark_all
         fi
-      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig)
+      }
+
+      while IFS= read -r line; do
+        case "$line" in
+          "+++"*|"---"*) continue ;;
+          "@@"*)
+            flush_build_hunk
+            build_hunk=()
+            build_changed_lines=()
+            continue
+            ;;
+          "+"*|"-"*)
+            raw=${line:1}
+            build_hunk+=("$raw")
+            build_changed_lines+=("$raw")
+            ;;
+          " "*)
+            build_hunk+=("${line:1}")
+            ;;
+          *) continue ;;
+        esac
+      done < <(git diff -U3 --no-ext-diff "$base" "$head" -- build.zig)
+      flush_build_hunk
     fi
 
     if [[ "$package_changed" -eq 1 ]]; then

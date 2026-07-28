@@ -145,6 +145,8 @@ pub fn build(b: *std.Build) void {
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
+    const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
+    const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
     const ledger_root = b.createModule(.{
         .root_source_file = b.path("apps/ledger/src/v1/main.zig"),
         .target = target,
@@ -156,8 +158,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ledger_v1_core", .module = ledger_v1_core },
         },
     });
-    const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
-    const img_meta = addVersionModule(b, @embedFile("apps/img/VERSION"));
     const img_atlas = b.createModule(.{
         .root_source_file = b.path("apps/img/assets/atlas.zig"),
         .target = target,
