@@ -448,9 +448,10 @@ pub fn writeCompileStatsJson(
     stats: definition_core.result.CompileStats,
 ) !void {
     try writer.print(
-        "{{\"cache_hit\":{s},\"compile_ns\":{d},\"closure_files\":{d},\"closure_bytes\":{d}}}",
+        "{{\"cache_hit\":{s},\"cache_write_failed\":{s},\"compile_ns\":{d},\"closure_files\":{d},\"closure_bytes\":{d}}}",
         .{
             if (stats.cache_hit) "true" else "false",
+            if (stats.cache_write_failed) "true" else "false",
             stats.compile_ns,
             stats.closure_files,
             stats.closure_bytes,
@@ -502,6 +503,9 @@ test "validation envelope preserves definition identity and denies authority" {
     );
     try std.testing.expect(
         std.mem.indexOf(u8, bytes, "\"cache_hit\":true") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, bytes, "\"cache_write_failed\":false") != null,
     );
     var parsed = try std.json.parseFromSlice(
         std.json.Value,

@@ -4991,7 +4991,18 @@ fn executeMatchingDocuments(
             source_slot.relative_path,
         );
     }
-    const selected_path = paths[paths.len - 1];
+    const selected_path = paths[
+        try latestMatchingPathIndex(
+            allocator,
+            definition_plan,
+            source_slot,
+            compiled.latest.?,
+            repo_root,
+            parameters,
+            plan.max_records,
+            paths,
+        )
+    ];
     return executeSelectedDocument(
         allocator,
         definition_plan,
@@ -5004,6 +5015,74 @@ fn executeMatchingDocuments(
         selected_path,
         paths.len,
     );
+}
+
+fn latestMatchingPathIndex(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    source_slot: storage.Slot,
+    pointer: definition_core.json_pointer.Pointer,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    max_records: usize,
+    paths: []const []u8,
+) !usize {
+    var selected_index: ?usize = null;
+    var selected_key: ?Scalar = null;
+    defer if (selected_key) |*key| key.deinit(allocator);
+    for (paths, 0..) |path, path_index| {
+        const resolved_slot = resolveMatchingSlot(source_slot, path);
+        var snapshot = try custody.readSlot(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            resolved_slot,
+        );
+        defer snapshot.deinit(allocator);
+        var replay_stats = try replay.validateSlot(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            resolved_slot,
+            &snapshot,
+            parameters,
+            max_records,
+            false,
+        );
+        defer replay_stats.deinit(allocator);
+        const physical = try textDocumentPhysicalJsonAlloc(
+            allocator,
+            resolved_slot,
+            &snapshot,
+        );
+        defer allocator.free(physical);
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            physical,
+            .{
+                .duplicate_field_behavior = .@"error",
+                .parse_numbers = false,
+            },
+        );
+        defer parsed.deinit();
+        const raw_key =
+            definition_core.json_pointer.lookup(parsed.value, pointer) orelse
+            continue;
+        var key = try scalarFromJsonAlloc(allocator, raw_key);
+        var key_owned = true;
+        defer if (key_owned) key.deinit(allocator);
+        if (selected_key != null and
+            (try compareScalars(key, selected_key.?)) != .gt)
+        {
+            continue;
+        }
+        if (selected_key) |*prior| prior.deinit(allocator);
+        selected_key = key;
+        key_owned = false;
+        selected_index = path_index;
+    }
+    return selected_index orelse error.ProjectionNotFound;
 }
 
 fn executeSelectedDocument(
@@ -5140,11 +5219,33 @@ fn executeTextDocument(
     writer: *std.Io.Writer,
     stats: *Stats,
 ) !void {
+    const physical = try textDocumentPhysicalJsonAlloc(
+        allocator,
+        slot,
+        snapshot,
+    );
+    defer allocator.free(physical);
+    try executeDocument(
+        allocator,
+        compiled,
+        physical,
+        parameters,
+        effective_limit,
+        writer,
+        stats,
+    );
+}
+
+fn textDocumentPhysicalJsonAlloc(
+    allocator: std.mem.Allocator,
+    slot: storage.ResolvedSlot,
+    snapshot: *const custody.SlotSnapshot,
+) ![]u8 {
     if (!std.unicode.utf8ValidateSlice(snapshot.content)) {
         return error.StoredDocumentNotUtf8;
     }
     var physical: std.Io.Writer.Allocating = .init(allocator);
-    defer physical.deinit();
+    errdefer physical.deinit();
     try physical.writer.writeAll("{\"content\":");
     try definition_core.canonical_json.writeCanonicalString(
         &physical.writer,
@@ -5166,15 +5267,7 @@ fn executeTextDocument(
         snapshot.revision,
     );
     try physical.writer.writeByte('}');
-    try executeDocument(
-        allocator,
-        compiled,
-        physical.written(),
-        parameters,
-        effective_limit,
-        writer,
-        stats,
-    );
+    return physical.toOwnedSlice();
 }
 
 const KeyedHistoryFieldSource = union(enum) {

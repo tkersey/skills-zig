@@ -171,6 +171,7 @@ pub fn load(
         ) catch |err| {
             // The cache is optional; a write failure cannot invalidate the plan.
             _ = @errorName(err);
+            compiled.stats.cache_write_failed = true;
         };
     }
     return compiled;
@@ -1247,6 +1248,27 @@ test "compiled plan cache rebuilds misses and skips definition parsing on hits" 
         .data = changed_definition,
     });
     try expectChangedAndCorruptCacheRebuild(source_root, cache_root, route);
+
+    try cache_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "not-a-directory",
+        .data = "cache writes must remain optional",
+    });
+    const blocked_cache = try cache_tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "not-a-directory",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(blocked_cache);
+    var write_failure = try load(
+        std.testing.allocator,
+        source_root,
+        "artifact.json",
+        route,
+        "1.0.1-test",
+        .{ .cache_dir = blocked_cache },
+    );
+    defer write_failure.deinit(std.testing.allocator);
+    try std.testing.expect(write_failure.stats.cache_write_failed);
 }
 
 test "transaction cache retains canonical definition archive sources" {

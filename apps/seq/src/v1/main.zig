@@ -810,7 +810,6 @@ fn feedCodexFile(
             .since_ms = args.selectors.since_ms,
             .until_ms = args.selectors.until_ms,
             .filter_time = relation == .sessions,
-            .filter_source_mtime_since = true,
         },
     );
     if (selected.file_opened) metrics.opened += 1;
@@ -1011,17 +1010,11 @@ fn renderObservationAlloc(
     base: seq.result.Envelope,
     stats: *definition_core.result.ExecutionStats,
 ) ![]u8 {
-    var expected_bytes: usize = 0;
-    for (0..8) |_| {
-        stats.output_bytes = expected_bytes;
-        var envelope = base;
-        envelope.execution_stats = stats.*;
-        const rendered = try seq.result.renderJsonAlloc(allocator, envelope);
-        if (rendered.len == expected_bytes) return rendered;
-        expected_bytes = rendered.len;
-        allocator.free(rendered);
-    }
-    return error.ObservationOutputSizeDidNotConverge;
+    var envelope = base;
+    envelope.execution_stats = stats.*;
+    const rendered = try seq.result.renderJsonAlloc(allocator, envelope);
+    stats.output_bytes = rendered.len;
+    return rendered;
 }
 
 fn parseDefinitionArgs(argv: []const []const u8) !DefinitionArgs {

@@ -142,7 +142,7 @@ pub fn excludedSessionId(program: *const Program) ?[]const u8 {
     for (program.operations) |operation| {
         const range = switch (operation) {
             .filter_all => |value| value,
-            else => continue,
+            else => break,
         };
         const end = @as(usize, range.start) + range.len;
         for (program.predicates[range.start..end]) |predicate| {
@@ -193,6 +193,12 @@ test "session exclusion derives from conjunctive not-equal predicate" {
         excludedSessionId(&program).?,
     );
     program.operations[0] = .{ .filter_any = .{ .start = 0, .len = 1 } };
+    try std.testing.expect(excludedSessionId(&program) == null);
+    var later_operations = [_]RuntimeOperation{
+        .{ .limit = .{ .count = 1, .state_index = 0 } },
+        .{ .filter_all = .{ .start = 0, .len = 1 } },
+    };
+    program.operations = &later_operations;
     try std.testing.expect(excludedSessionId(&program) == null);
 }
 

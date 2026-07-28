@@ -58,6 +58,11 @@ write_seq() {
   printf 'seq\n' >apps/seq/src/main.zig
 }
 
+write_ledger() {
+  mkdir -p apps/ledger/src
+  printf 'ledger\n' >apps/ledger/src/main.zig
+}
+
 write_definition_core() {
   mkdir -p libs/definition_core
   printf 'definition\n' >libs/definition_core/root.zig
@@ -132,6 +137,7 @@ write_ci_helper() {
 }
 
 assert_affected seq write_seq
+assert_affected cas,ledger write_ledger
 assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core

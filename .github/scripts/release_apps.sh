@@ -171,6 +171,9 @@ case "$mode" in
                 ;;
               "apps/$app/"*)
                 mark_app "$app"
+                if [[ "$app" == ledger ]]; then
+                  mark_app cas
+                fi
                 matched=1
                 ;;
             esac

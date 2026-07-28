@@ -1406,9 +1406,10 @@ fn makeLedgerSnapshotRoot(allocator: std.mem.Allocator) ![]u8 {
         .{suffix},
     );
     errdefer allocator.free(root);
-    std.Io.Dir.cwd().createDirPath(
+    std.Io.Dir.createDirAbsolute(
         std.Io.Threaded.global_single_threaded.io(),
         root,
+        @enumFromInt(0o700),
     ) catch |err| switch (err) {
         error.PathAlreadyExists => return error.TempDirCreationFailed,
         else => return err,

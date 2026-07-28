@@ -1,6 +1,5 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
-const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const execution = @import("execution.zig");
 const native_plan = @import("plan.zig");
@@ -11,6 +10,8 @@ const structured = @import("structured.zig");
 const trace_adapter = @import("trace_adapter.zig");
 
 const query_output_bytes_max: usize = 16 * 1024 * 1024;
+const session_candidate_max: usize = 1_000_000;
+const session_entry_visit_max: usize = 4_000_000;
 
 pub const Command = enum {
     sessions,
@@ -429,6 +430,7 @@ fn runRelation(
                 traceOptions(relation),
             );
         defer trace.deinit(allocator);
+        try rejectTraceWarnings(&trace);
         if (relation == .sessions and
             !sessionPasses(trace.session, options))
         {
@@ -820,6 +822,7 @@ fn feedQueryPath(
             traceOptions(compilation.relation),
         );
     defer trace.deinit(allocator);
+    try rejectTraceWarnings(&trace);
     if (compilation.relation == .sessions) {
         if (!sessionPasses(trace.session, options)) {
             return .continue_scanning;
@@ -880,14 +883,21 @@ fn feedOpenCodeQueryPath(
             return .continue_scanning;
         }
     }
-    _ = try opencode_adapter.feedFile(
+    const metrics = try opencode_adapter.feedFile(
         allocator,
         &compilation.program,
         runner,
         path,
         256 * 1024 * 1024,
     );
+    if (metrics.warnings != 0) return error.PhysicalSourceWarningsPresent;
     return if (runner.stopped) .stop else .continue_scanning;
+}
+
+fn rejectTraceWarnings(trace: *const trace_core.CanonicalSessionTrace) !void {
+    if (trace.warnings.items.len != 0) {
+        return error.PhysicalSourceWarningsPresent;
+    }
 }
 
 fn loadQuerySpecAlloc(
@@ -1345,7 +1355,7 @@ fn writeOpenCodeRelationRows(
         query_output_bytes_max,
     );
     defer runner.deinit();
-    _ = try opencode_adapter.feedFileSelected(
+    const metrics = try opencode_adapter.feedFileSelected(
         allocator,
         &compilation.program,
         &runner,
@@ -1359,6 +1369,7 @@ fn writeOpenCodeRelationRows(
                 null,
         },
     );
+    if (metrics.warnings != 0) return error.PhysicalSourceWarningsPresent;
     if (options.limit == 0 and runner.stopped) {
         return error.OpenCodeNativeResultBoundExceeded;
     }
@@ -1493,70 +1504,46 @@ fn runIndex(
         options.root,
     );
     defer allocator.free(root);
-    const index_path = try std.fs.path.join(
-        allocator,
-        &.{ root, ".seq-index.jsonl" },
-    );
-    defer allocator.free(index_path);
-    const action = options.action orelse "status";
-    if (std.mem.eql(u8, action, "build") or
-        std.mem.eql(u8, action, "refresh"))
+    const action = options.action orelse "build";
+    if (!std.mem.eql(u8, action, "build") and
+        !std.mem.eql(u8, action, "refresh") and
+        !std.mem.eql(u8, action, "status"))
     {
-        try writeIndex(allocator, io, root, index_path);
-    } else if (std.mem.eql(u8, action, "vacuum")) {
-        std.Io.Dir.deleteFileAbsolute(io, index_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    } else if (!std.mem.eql(u8, action, "status")) {
         return error.UnknownIndexAction;
     }
-    const exists = indexExists(io, index_path);
-    try writer.writeAll("[{\"root\":");
-    try definition_core.canonical_json.writeCanonicalString(writer, root);
-    try writer.writeAll(",\"index_path\":");
-    try definition_core.canonical_json.writeCanonicalString(writer, index_path);
-    try writer.print(",\"exists\":{},\"action\":", .{exists});
-    try definition_core.canonical_json.writeCanonicalString(writer, action);
-    try writer.writeAll("}]\n");
-}
-
-fn writeIndex(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    index_path: []const u8,
-) !void {
-    var paths = try collectJsonlPaths(allocator, io, root);
-    defer freePaths(allocator, &paths);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    defer output.deinit();
-    for (paths.items) |path| {
-        const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-        defer file.close(io);
-        const stat = try file.stat(io);
-        try output.writer.writeAll("{\"path\":");
-        try definition_core.canonical_json.writeCanonicalString(
-            &output.writer,
-            path,
-        );
-        try output.writer.print(
-            ",\"size_bytes\":{d},\"mtime_ns\":{d},\"schema_version\":1,\"parser_version\":1}}\n",
-            .{ stat.size, stat.mtime.nanoseconds },
-        );
-    }
-    try durable_store.rejectSymlinkComponents(index_path);
-    try durable_store.writeTextAtomic(
+    var paths = try collectJsonlPaths(
         allocator,
-        index_path,
-        output.written(),
+        io,
+        root,
+        options.root != null,
     );
-}
-
-fn indexExists(io: std.Io, path: []const u8) bool {
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    file.close(io);
-    return true;
+    defer freePaths(allocator, &paths);
+    var total_bytes: u64 = 0;
+    var newest_mtime_ns: i128 = 0;
+    var files: usize = 0;
+    for (paths.items) |path| {
+        const stat = std.Io.Dir.cwd().statFile(
+            io,
+            path,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (stat.kind != .file) continue;
+        total_bytes = std.math.add(u64, total_bytes, stat.size) catch
+            return error.SessionCorpusByteCountOverflow;
+        newest_mtime_ns = @max(newest_mtime_ns, stat.mtime.nanoseconds);
+        files += 1;
+    }
+    try writer.writeAll("{\"schema\":\"seq-index-result/v1\",\"root\":");
+    try definition_core.canonical_json.writeCanonicalString(writer, root);
+    try writer.writeAll(",\"action\":");
+    try definition_core.canonical_json.writeCanonicalString(writer, action);
+    try writer.print(
+        ",\"files\":{d},\"total_bytes\":{d},\"newest_mtime_ns\":{d}}}\n",
+        .{ files, total_bytes, newest_mtime_ns },
+    );
 }
 
 pub fn resolveTargetPaths(
@@ -1652,6 +1639,7 @@ fn collectJsonlPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
+    require_existing: bool,
 ) !std.ArrayList([]u8) {
     var paths: std.ArrayList([]u8) = .empty;
     errdefer freePaths(allocator, &paths);
@@ -1660,17 +1648,28 @@ fn collectJsonlPaths(
         root,
         .{ .iterate = true },
     ) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return paths,
+        error.FileNotFound, error.NotDir => {
+            if (require_existing) return error.SessionRootUnavailable;
+            return paths;
+        },
         else => return err,
     };
     defer root_dir.close(io);
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
+    var visited_entries: usize = 0;
     while (try walker.next(io)) |entry| {
+        visited_entries += 1;
+        if (visited_entries > session_entry_visit_max) {
+            return error.SessionTraversalBoundExceeded;
+        }
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
         if (std.mem.eql(u8, std.fs.path.basename(entry.path), ".seq-index.jsonl")) {
             continue;
+        }
+        if (paths.items.len == session_candidate_max) {
+            return error.SessionCandidateBoundExceeded;
         }
         try paths.append(
             allocator,
@@ -1685,14 +1684,9 @@ fn collectTargetJsonlPaths(
     allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
-    _: Options,
+    options: Options,
 ) !std.ArrayList([]u8) {
-    var paths = try collectJsonlPaths(allocator, io, root);
-    errdefer freePaths(allocator, &paths);
-    if (paths.items.len > 1_000_000) {
-        return error.SessionCandidateBoundExceeded;
-    }
-    return paths;
+    return collectJsonlPaths(allocator, io, root, options.root != null);
 }
 
 fn lessThanPath(_: void, left: []u8, right: []u8) bool {
@@ -2072,9 +2066,7 @@ test "OpenCode native surfaces preserve valid turn numbering and filtering" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "prompt-history.jsonl",
-        .data = "{bad-json\n" ++
-            "{\"input\":\"alpha prompt\",\"mode\":\"build\",\"parts\":[]}\n" ++
-            "[]\n" ++
+        .data = "{\"input\":\"alpha prompt\",\"mode\":\"build\",\"parts\":[]}\n" ++
             "{\"input\":\"beta needle\",\"mode\":\"ask\",\"parts\":[]}\n",
     });
     const root = try tmp.dir.realPathFileAlloc(
@@ -2092,6 +2084,35 @@ test "OpenCode native surfaces preserve valid turn numbering and filtering" {
 
     try expectOpenCodeSessionSurfaces(root);
     try expectOpenCodeTurnSurfaces(path);
+}
+
+test "OpenCode native surfaces reject malformed source records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "prompt-history.jsonl",
+        .data = "{bad-json\n" ++
+            "{\"input\":\"valid\",\"mode\":\"build\",\"parts\":[]}\n",
+    });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "prompt-history.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try std.testing.expectError(
+        error.PhysicalSourceWarningsPresent,
+        runRelation(
+            std.testing.allocator,
+            &output.writer,
+            std.testing.io,
+            .turns,
+            .{ .path = path },
+            true,
+        ),
+    );
 }
 
 fn expectOpenCodeSessionSurfaces(root: []const u8) !void {

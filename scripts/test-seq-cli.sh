@@ -226,10 +226,9 @@ cp "$rollout" "$cache_dir/sessions/rollout.jsonl"
 index_output=$("$binary" index build \
   --root "$cache_dir/sessions" \
   --format json)
-grep -Fq '"exists":true' <<<"$index_output"
+grep -Fq '"schema":"seq-index-result/v1"' <<<"$index_output"
 grep -Fq '"action":"build"' <<<"$index_output"
-grep -Fq '"schema_version":1' "$cache_dir/sessions/.seq-index.jsonl"
-"$binary" index vacuum --root "$cache_dir/sessions" --format json >/dev/null
+grep -Fq '"files":1' <<<"$index_output"
 test ! -e "$cache_dir/sessions/.seq-index.jsonl"
 
 capabilities=$("$binary" capabilities --format json)

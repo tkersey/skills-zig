@@ -4,6 +4,10 @@ const physical = @import("physical.zig");
 
 pub const schema = "seq-observation-definition/v1";
 pub const abi = "seq-observation-abi/v1";
+const max_observation_input_bytes: usize = if (@sizeOf(usize) >= 8)
+    64 * 1024 * 1024 * 1024
+else
+    std.math.maxInt(usize);
 
 pub const Operator = enum {
     scan,
@@ -900,7 +904,8 @@ fn validateBounds(bounds: Bounds) !void {
     if (bounds.max_rows == 0 or bounds.max_rows > 10_000_000 or
         bounds.max_output_bytes == 0 or bounds.max_output_bytes > 256 * 1024 * 1024 or
         bounds.max_fold_states == 0 or bounds.max_fold_states > 65_536 or
-        bounds.max_input_bytes == 0 or bounds.max_input_bytes > 4 * 1024 * 1024 * 1024 or
+        bounds.max_input_bytes == 0 or
+        bounds.max_input_bytes > max_observation_input_bytes or
         bounds.max_graph_depth == 0 or bounds.max_graph_depth > 256 or
         bounds.max_graph_nodes == 0 or bounds.max_graph_nodes > 1_000_000 or
         bounds.max_diagnostics == 0 or bounds.max_diagnostics > 1024)

@@ -21,7 +21,6 @@ pub const SessionSelection = struct {
     since_ms: ?i64 = null,
     until_ms: ?i64 = null,
     filter_time: bool = false,
-    filter_source_mtime_since: bool = false,
 };
 
 pub const SelectedParse = struct {
@@ -100,15 +99,6 @@ pub fn parseFileSelected(
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const stat = try file.stat(io);
-    if (selection) |selected| {
-        if (!sourceMtimePassesSince(stat.mtime.nanoseconds, selected)) {
-            return .{
-                .parsed = null,
-                .discovery_bytes_read = 0,
-                .file_opened = true,
-            };
-        }
-    }
     var file_reader = file.reader(io, &.{});
     var prefix: [16 * 1024]u8 = undefined;
     const prefix_len = if (selection != null and
@@ -285,36 +275,6 @@ fn requiresSummaryPreselection(selection: SessionSelection) bool {
         selection.filter_time;
 }
 
-fn sourceMtimePassesSince(
-    source_mtime_ns: i128,
-    selection: SessionSelection,
-) bool {
-    if (!selection.filter_source_mtime_since or
-        selection.since_ms == null or
-        source_mtime_ns <= 0)
-    {
-        return true;
-    }
-    const since_ns = @as(i128, selection.since_ms.?) * std.time.ns_per_ms;
-    return source_mtime_ns >= since_ns;
-}
-
-test "source mtime preselection excludes only files wholly before since" {
-    const since_ms: i64 = 2_000;
-    try std.testing.expect(!sourceMtimePassesSince(
-        @as(i128, 1_999) * std.time.ns_per_ms,
-        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
-    ));
-    try std.testing.expect(sourceMtimePassesSince(
-        @as(i128, 2_000) * std.time.ns_per_ms,
-        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
-    ));
-    try std.testing.expect(sourceMtimePassesSince(
-        0,
-        .{ .since_ms = since_ms, .filter_source_mtime_since = true },
-    ));
-}
-
 fn preselectSession(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -336,10 +296,8 @@ fn preselectSession(
     );
     defer summary.deinit(allocator);
     if (selection.session_id) |wanted| {
-        if (summary.session.session_id) |actual| {
-            if (!std.mem.eql(u8, wanted, actual)) {
-                return .{ .passes = false, .bytes_read = prefix.len };
-            }
+        if (!exactSessionPasses(summary.session.session_id, wanted)) {
+            return .{ .passes = false, .bytes_read = prefix.len };
         }
     }
     if (selection.exclude_session_id) |excluded| {
@@ -372,6 +330,22 @@ fn preselectSession(
         }
     }
     return .{ .bytes_read = prefix.len };
+}
+
+fn exactSessionPasses(actual: ?[]const u8, wanted: []const u8) bool {
+    return actual != null and std.mem.eql(u8, actual.?, wanted);
+}
+
+test "exact session selection rejects unidentified traces" {
+    try std.testing.expect(!exactSessionPasses(null, "session-wanted"));
+    try std.testing.expect(!exactSessionPasses(
+        "session-other",
+        "session-wanted",
+    ));
+    try std.testing.expect(exactSessionPasses(
+        "session-wanted",
+        "session-wanted",
+    ));
 }
 
 const PrefixReader = struct {

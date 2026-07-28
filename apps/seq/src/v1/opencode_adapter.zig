@@ -141,6 +141,10 @@ fn scanRecords(
                 continue;
             },
         };
+        if (stringField(object, "input") == null) {
+            result.warnings += 1;
+            continue;
+        }
         result.records += 1;
         result.session_matches = result.session_matches or
             (selection.contains != null and
@@ -987,4 +991,42 @@ test "OpenCode physical line numbers include blank source records" {
     try std.testing.expectEqual(@as(usize, 4), scanned.source_records);
     try std.testing.expectEqual(@as(i64, 2), result.rows().row(0)[0].integer);
     try std.testing.expectEqual(@as(i64, 4), result.rows().row(1)[0].integer);
+}
+
+test "OpenCode scan rejects renamed non-prompt records" {
+    var source_fields = [_]u16{3};
+    var output_fields = [_]u16{0};
+    const program = execution.Program{
+        .source = .{ .physical = .source_events },
+        .source_width = 1,
+        .source_field_indices = &source_fields,
+        .materialized_field_indices = &.{},
+        .source_row_bound = null,
+        .operations = &.{},
+        .predicates = &.{},
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = &output_fields,
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 1,
+    };
+    var output: [1]execution.Value = undefined;
+    var runner = try execution.Runner.init(&program, &output);
+    defer runner.deinit();
+    const scanned = try scanRecords(
+        std.testing.allocator,
+        &program,
+        &runner,
+        .source_events,
+        "session",
+        "/tmp/prompt-history.jsonl",
+        "{\"type\":\"session_meta\",\"payload\":{}}\n",
+        .{},
+    );
+    const result = try runner.finish();
+    try std.testing.expectEqual(@as(usize, 0), scanned.records);
+    try std.testing.expectEqual(@as(usize, 1), scanned.warnings);
+    try std.testing.expectEqual(@as(usize, 0), result.row_count);
 }

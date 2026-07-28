@@ -43,7 +43,7 @@ pub fn renderJsonAlloc(
     try writeRows(&output, envelope, projection);
     try writeStats(&output, envelope);
     try writeLimitations(&output, envelope.limitations);
-    return output.toOwnedSlice();
+    return output.toOwnedMeasuredSlice();
 }
 
 fn writeIdentityAndCorpus(
@@ -126,7 +126,7 @@ fn writeStats(
     try output.raw(",\"output_rows\":");
     try output.usizeValue(envelope.execution_stats.output_rows);
     try output.raw(",\"output_bytes\":");
-    try output.usizeValue(envelope.execution_stats.output_bytes);
+    try output.measuredUsizeValue();
 }
 
 fn writeLimitations(
@@ -187,9 +187,12 @@ fn findProjection(
 }
 
 const BoundedJson = struct {
+    const measurement_width: usize = 20;
+
     allocator: std.mem.Allocator,
     output: std.Io.Writer.Allocating,
     max_bytes: usize,
+    measurement_offset: ?usize = null,
 
     fn init(allocator: std.mem.Allocator, max_bytes: usize) BoundedJson {
         return .{
@@ -204,8 +207,35 @@ const BoundedJson = struct {
         self.* = undefined;
     }
 
-    fn toOwnedSlice(self: *BoundedJson) ![]u8 {
-        return self.output.toOwnedSlice();
+    fn toOwnedMeasuredSlice(self: *BoundedJson) ![]u8 {
+        const offset = self.measurement_offset orelse
+            return error.ObservationOutputMeasurementMissing;
+        var bytes = try self.output.toOwnedSlice();
+        errdefer self.allocator.free(bytes);
+        const base_len = bytes.len - measurement_width;
+        var measured_len = base_len + 1;
+        for (0..4) |_| {
+            const next = base_len + decimalDigits(measured_len);
+            if (next == measured_len) break;
+            measured_len = next;
+        }
+        if (measured_len > self.max_bytes) {
+            return error.ObservationOutputBytesExceeded;
+        }
+        var buffer: [measurement_width]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writer.print("{d}", .{measured_len}) catch
+            return error.IntegerFormatFailed;
+        const digits = writer.buffered();
+        std.mem.copyForwards(
+            u8,
+            bytes[offset + digits.len .. measured_len],
+            bytes[offset + measurement_width ..],
+        );
+        @memcpy(bytes[offset..][0..digits.len], digits);
+        bytes = self.allocator.realloc(bytes, measured_len) catch
+            return error.OutOfMemory;
+        return bytes;
     }
 
     fn raw(self: *BoundedJson, bytes: []const u8) !void {
@@ -241,6 +271,14 @@ const BoundedJson = struct {
         var writer = std.Io.Writer.fixed(&buffer);
         writer.print("{d}", .{value}) catch return error.IntegerFormatFailed;
         try self.raw(writer.buffered());
+    }
+
+    fn measuredUsizeValue(self: *BoundedJson) !void {
+        if (self.measurement_offset != null) {
+            return error.ObservationOutputMeasurementDuplicate;
+        }
+        self.measurement_offset = self.output.written().len;
+        try self.raw("00000000000000000000");
     }
 
     fn writeValue(self: *BoundedJson, item: execution.Value) !void {
@@ -303,11 +341,18 @@ const BoundedJson = struct {
             self.output.written().len,
             additional,
         ) catch return error.ObservationOutputBytesExceeded;
-        if (next > self.max_bytes) {
+        if (next > self.max_bytes +| (measurement_width - 1)) {
             return error.ObservationOutputBytesExceeded;
         }
     }
 };
+
+fn decimalDigits(value: usize) usize {
+    var remaining = value;
+    var count: usize = 1;
+    while (remaining >= 10) : (count += 1) remaining /= 10;
+    return count;
+}
 
 fn canonicalStringLength(value: []const u8) !usize {
     if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
@@ -498,6 +543,15 @@ test "observation result preserves identities provenance limits and no authority
     );
     defer parsed.deinit();
     const root = parsed.value.object;
+    try std.testing.expectEqual(
+        rendered.len,
+        @as(
+            usize,
+            @intCast(
+                root.get("stats").?.object.get("output_bytes").?.integer,
+            ),
+        ),
+    );
     try std.testing.expectEqualStrings(
         schema,
         root.get("schema").?.string,

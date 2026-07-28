@@ -5200,6 +5200,7 @@ pub fn enumerateMatchingPathsAlloc(
         for (paths.items) |path| allocator.free(path);
         paths.deinit(allocator);
     }
+    var visited_entries: usize = 0;
     try enumeratePathSegments(
         allocator,
         ledger_root,
@@ -5207,6 +5208,8 @@ pub fn enumerateMatchingPathsAlloc(
         slot.path_segments,
         0,
         max_paths,
+        maxEnumerationEntries(max_paths),
+        &visited_entries,
         &paths,
     );
     std.sort.heap([]u8, paths.items, {}, struct {
@@ -5224,6 +5227,8 @@ fn enumeratePathSegments(
     segments: []const PathSegment,
     segment_index: usize,
     max_paths: usize,
+    max_entries: usize,
+    visited_entries: *usize,
     paths: *std.ArrayList([]u8),
 ) !void {
     if (segment_index >= segments.len) return;
@@ -5260,6 +5265,8 @@ fn enumeratePathSegments(
                 &frame_count,
                 segments,
                 max_paths,
+                max_entries,
+                visited_entries,
                 paths,
             ),
         }
@@ -5370,11 +5377,17 @@ fn advanceParameterPathEnumeration(
     frame_count: *usize,
     segments: []const PathSegment,
     max_paths: usize,
+    max_entries: usize,
+    visited_entries: *usize,
     paths: *std.ArrayList([]u8),
 ) !void {
     const frame = &frames[frame_count.* - 1];
     const parameter = &frame.state.parameter;
     while (try parameter.iterator.next(storageIo())) |entry| {
+        visited_entries.* += 1;
+        if (visited_entries.* > max_entries) {
+            return error.StoragePathEntryBoundsExceeded;
+        }
         definition_core.json.safeIdentifier(entry.name, 128) catch continue;
         if (std.mem.indexOfScalar(u8, entry.name, '/') != null) continue;
         const stat = parameter.directory.statFile(
@@ -5414,6 +5427,12 @@ fn advanceParameterPathEnumeration(
     }
     frame.deinit(allocator);
     frame_count.* -= 1;
+}
+
+fn maxEnumerationEntries(max_paths: usize) usize {
+    const scaled = std.math.mul(usize, max_paths, 64) catch
+        return 1_000_000;
+    return @min(@max(scaled, 1_024), 1_000_000);
 }
 
 fn childPathEnumerationFrame(
