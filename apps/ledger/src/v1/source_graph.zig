@@ -129,74 +129,17 @@ pub fn lowerConstraints(
         try definition_core.json.object(value)
     else
         null;
-    if (scope) |value| {
-        try definition_core.json.requireExactKeys(value, &.{
-            "input",
-            "path",
-        });
-        try definition_core.json.requireFields(value, &.{
-            "input",
-            "path",
-        });
-        if (!containsString(
-            input_names,
-            try definition_core.json.requiredString(value, "input"),
-        )) {
-            return error.UnknownConstraintInput;
-        }
-    }
+    try validateConstraintScope(scope, input_names);
     if (terms) |term_map| {
-        var use_sites = std.json.ObjectMap.empty;
-        if (constraints.get("laws")) |laws| {
-            try collectLawTermUses(
-                allocator,
-                laws,
-                &use_sites,
-                0,
-            );
-        }
-        if (constraints.get("state")) |raw_state| {
-            const state = try definition_core.json.object(raw_state);
-            if (state.get("admissions")) |raw_admissions| {
-                const admissions = try definition_core.json.array(
-                    raw_admissions,
-                );
-                for (admissions.items) |raw_admission| {
-                    const admission = try definition_core.json.object(
-                        raw_admission,
-                    );
-                    if (admission.get("laws")) |laws| {
-                        try collectLawTermUses(
-                            allocator,
-                            laws,
-                            &use_sites,
-                            0,
-                        );
-                    }
-                }
-            }
-        }
-        try requireUsedDeclarationNames(
-            term_map,
-            use_sites,
-            error.UnusedLawTerm,
-        );
+        try validateConstraintTerms(allocator, constraints, term_map);
     }
     var rules = std.json.Array.init(allocator);
     if (constraints.get("laws")) |raw_laws| {
-        var lowered = try lowerExpressions(
+        var lowered = try lowerConstraintLaws(
             allocator,
-            try definition_core.json.array(raw_laws),
-            if (scope) |value|
-                try definition_core.json.requiredString(value, "input")
-            else
-                null,
-            if (scope) |value|
-                try definition_core.json.requiredString(value, "path")
-            else
-                null,
+            raw_laws,
+            scope,
             terms,
-            true,
             budget,
         );
         defer lowered.deinit();
@@ -213,6 +156,74 @@ pub fn lowerConstraints(
         );
     }
     return .{ .array = rules };
+}
+
+fn validateConstraintScope(
+    scope: ?std.json.ObjectMap,
+    input_names: []const []const u8,
+) !void {
+    const value = scope orelse return;
+    try definition_core.json.requireExactKeys(value, &.{ "input", "path" });
+    try definition_core.json.requireFields(value, &.{ "input", "path" });
+    const input = try definition_core.json.requiredString(value, "input");
+    if (!containsString(input_names, input)) {
+        return error.UnknownConstraintInput;
+    }
+}
+
+fn validateConstraintTerms(
+    allocator: std.mem.Allocator,
+    constraints: std.json.ObjectMap,
+    terms: std.json.ObjectMap,
+) !void {
+    var use_sites = std.json.ObjectMap.empty;
+    if (constraints.get("laws")) |laws| {
+        try collectLawTermUses(allocator, laws, &use_sites, 0);
+    }
+    const raw_state = constraints.get("state") orelse {
+        return requireUsedDeclarationNames(
+            terms,
+            use_sites,
+            error.UnusedLawTerm,
+        );
+    };
+    const state = try definition_core.json.object(raw_state);
+    if (state.get("admissions")) |raw_admissions| {
+        const admissions = try definition_core.json.array(raw_admissions);
+        for (admissions.items) |raw_admission| {
+            const admission = try definition_core.json.object(raw_admission);
+            if (admission.get("laws")) |laws| {
+                try collectLawTermUses(allocator, laws, &use_sites, 0);
+            }
+        }
+    }
+    try requireUsedDeclarationNames(terms, use_sites, error.UnusedLawTerm);
+}
+
+fn lowerConstraintLaws(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    scope: ?std.json.ObjectMap,
+    terms: ?std.json.ObjectMap,
+    budget: *ExpansionBudget,
+) !std.json.Array {
+    const input = if (scope) |value|
+        try definition_core.json.requiredString(value, "input")
+    else
+        null;
+    const path = if (scope) |value|
+        try definition_core.json.requiredString(value, "path")
+    else
+        null;
+    return lowerExpressions(
+        allocator,
+        try definition_core.json.array(raw),
+        input,
+        path,
+        terms,
+        true,
+        budget,
+    );
 }
 
 pub fn lowerOperations(
@@ -278,437 +289,748 @@ fn lowerNode(
     allow_types: bool,
     budget: *ExpansionBudget,
 ) anyerror!void {
-    if (raw == .array) {
-        const reference = try definition_core.json.array(raw);
-        if (!allow_types or reference.items.len != 2 or
-            !std.mem.eql(
-                u8,
-                try definition_core.json.string(reference.items[0]),
-                "use",
-            ))
+    var stack: std.ArrayList(NodeTask) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .lower = .{
+        .raw = raw,
+        .input = input,
+        .path = path,
+        .suppress_presence = suppress_presence,
+        .types = types,
+        .allow_types = allow_types,
+        .rules = rules,
+    } });
+    while (stack.pop()) |task| {
+        try runNodeTask(allocator, task, budget, &stack);
+        if (stack.items.len > ExpansionBudget.max_emitted) {
+            return error.SourceGraphExpansionLimitExceeded;
+        }
+    }
+}
+
+const NodeWork = struct {
+    raw: std.json.Value,
+    input: ?[]const u8,
+    path: []const u8,
+    suppress_presence: bool,
+    types: ?std.json.ObjectMap,
+    allow_types: bool,
+    rules: *std.json.Array,
+};
+
+const NodeContainerWork = struct {
+    source: std.json.Value,
+    operator: []const u8,
+    parent: NodeWork,
+};
+
+const NodeFinishWork = struct {
+    operator: []const u8,
+    input: ?[]const u8,
+    path: []const u8,
+    rules: *std.json.Array,
+    children: *std.json.Array,
+};
+
+const TaggedVariantWork = struct {
+    value: ?std.json.Value,
+    kind: ?std.json.Value,
+    rules: *std.json.Array,
+};
+
+const NodeTask = union(enum) {
+    lower: NodeWork,
+    emit: struct {
+        rules: *std.json.Array,
+        rule: std.json.Value,
+    },
+    container: NodeContainerWork,
+    finish_container: NodeFinishWork,
+    one_of: struct {
+        variants: std.json.Array,
+        parent: NodeWork,
+    },
+    finish_one_of: struct {
+        parent: NodeWork,
+        variants: []*std.json.Array,
+    },
+    tagged: struct {
+        raw: std.json.Value,
+        parent: NodeWork,
+    },
+    finish_tagged: struct {
+        parent: NodeWork,
+        tag: ?std.json.Value,
+        variants: []TaggedVariantWork,
+    },
+    laws: struct {
+        raw: std.json.Value,
+        parent: NodeWork,
+    },
+    fields: struct {
+        fields: std.json.ObjectMap,
+        parent: NodeWork,
+    },
+    finish_optional: struct {
+        parent: NodeWork,
+        children: *std.json.Array,
+        allow_null: bool,
+    },
+};
+
+fn runNodeTask(
+    allocator: std.mem.Allocator,
+    task: NodeTask,
+    budget: *ExpansionBudget,
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    switch (task) {
+        .lower => |work| try scheduleNode(
+            allocator,
+            work,
+            budget,
+            stack,
+        ),
+        .emit => |work| try appendRule(budget, work.rules, work.rule),
+        .container => |work| try scheduleNodeContainer(allocator, work, stack),
+        .finish_container => |work| try finishNodeContainer(
+            allocator,
+            work,
+            budget,
+        ),
+        .one_of => |work| try scheduleNodeOneOf(allocator, work, stack),
+        .finish_one_of => |work| try finishNodeOneOf(
+            allocator,
+            work,
+            budget,
+        ),
+        .tagged => |work| try scheduleNodeTagged(allocator, work, stack),
+        .finish_tagged => |work| try finishNodeTagged(
+            allocator,
+            work,
+            budget,
+        ),
+        .laws => |work| try appendNodeLaws(allocator, work, budget),
+        .fields => |work| try scheduleNodeFields(allocator, work, stack),
+        .finish_optional => |work| try finishOptionalNode(
+            allocator,
+            work,
+            budget,
+        ),
+    }
+}
+
+fn scheduleNode(
+    allocator: std.mem.Allocator,
+    initial: NodeWork,
+    budget: *ExpansionBudget,
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    var work = initial;
+    if (work.raw == .array) {
+        const reference = try definition_core.json.array(work.raw);
+        if (!work.allow_types or reference.items.len != 2 or
+            !std.mem.eql(u8, try definition_core.json.string(reference.items[0]), "use"))
         {
             return error.InvalidDocumentTypeReference;
         }
+        const type_map = work.types orelse return error.UnknownDocumentType;
         const name = try definition_core.json.string(reference.items[1]);
-        const type_map = types orelse return error.UnknownDocumentType;
-        const definition = type_map.get(name) orelse
-            return error.UnknownDocumentType;
-        return lowerNode(
-            allocator,
-            rules,
-            definition,
-            input,
-            path,
-            suppress_presence,
-            types,
-            false,
-            budget,
-        );
+        work.raw = type_map.get(name) orelse return error.UnknownDocumentType;
+        work.allow_types = false;
+        if (work.raw == .array) return error.NestedDocumentTypeReference;
     }
-    const node = try definition_core.json.object(raw);
+    const node = try definition_core.json.object(work.raw);
     try definition_core.json.requireExactKeys(node, &node_keys);
-
-    if (!suppress_presence) {
-        if (try optionalBool(node, "forbidden", false)) {
-            try appendRule(
-                budget,
-                rules,
-                try makeRule(allocator, "field-absent", input, path, null),
-            );
-            return;
-        }
-        const presence = try optionalPresence(node);
-        const if_present = try ifPresentPresence(node);
-        if (presence != .required or if_present != .required) {
-            var children = std.json.Array.init(allocator);
-            try lowerNode(
-                allocator,
-                &children,
-                raw,
-                null,
-                "",
-                true,
-                types,
-                allow_types,
-                budget,
-            );
-            if (children.items.len == 0) {
-                children.deinit();
-                return;
-            }
-            var config = std.json.ObjectMap.empty;
-            try config.put(allocator, "rules", .{ .array = children });
-            if (presence == .nullable or if_present == .nullable) {
-                try config.put(
-                    allocator,
-                    "allow_null",
-                    .{ .bool = true },
-                );
-            }
-            try appendRule(
-                budget,
-                rules,
-                try makeRule(
-                    allocator,
-                    "optional-field",
-                    input,
-                    path,
-                    .{ .object = config },
-                ),
-            );
-            return;
-        }
-        if (try optionalBool(node, "required", false)) {
-            try appendRule(
-                budget,
-                rules,
-                try makeRule(allocator, "required-field", input, path, null),
-            );
-            try lowerNode(
-                allocator,
-                rules,
-                raw,
-                input,
-                path,
-                true,
-                types,
-                allow_types,
-                budget,
-            );
-            return;
-        }
+    if (!work.suppress_presence and
+        try scheduleNodePresence(allocator, work, node, budget, stack))
+    {
+        return;
     }
+    try scheduleNodeBody(allocator, work, node, stack);
+}
 
-    if (node.get("object")) |raw_object| {
+fn scheduleNodePresence(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    budget: *ExpansionBudget,
+    stack: *std.ArrayList(NodeTask),
+) !bool {
+    if (try optionalBool(node, "forbidden", false)) {
         try appendRule(
             budget,
-            rules,
-            try lowerObjectRule(
-                allocator,
-                node,
-                input,
-                path,
-                try definition_core.json.string(raw_object),
-                types,
-                allow_types,
-            ),
+            work.rules,
+            try makeRule(allocator, "field-absent", work.input, work.path, null),
         );
+        return true;
     }
-    if (node.get("scalar")) |raw_scalar| {
+    const presence = try optionalPresence(node);
+    const if_present = try ifPresentPresence(node);
+    if (presence != .required or if_present != .required) {
+        const children = try allocator.create(std.json.Array);
+        children.* = std.json.Array.init(allocator);
+        try stack.append(allocator, .{ .finish_optional = .{
+            .parent = work,
+            .children = children,
+            .allow_null = presence == .nullable or if_present == .nullable,
+        } });
+        var child = work;
+        child.input = null;
+        child.path = "";
+        child.suppress_presence = true;
+        child.rules = children;
+        try stack.append(allocator, .{ .lower = child });
+        return true;
+    }
+    if (!try optionalBool(node, "required", false)) return false;
+    try appendRule(
+        budget,
+        work.rules,
+        try makeRule(allocator, "required-field", work.input, work.path, null),
+    );
+    var child = work;
+    child.suppress_presence = true;
+    try stack.append(allocator, .{ .lower = child });
+    return true;
+}
+
+fn finishOptionalNode(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "finish_optional"),
+    budget: *ExpansionBudget,
+) !void {
+    if (work.children.items.len == 0) {
+        work.children.deinit();
+        return;
+    }
+    var config = std.json.ObjectMap.empty;
+    try config.put(allocator, "rules", .{ .array = work.children.* });
+    if (work.allow_null) {
+        try config.put(allocator, "allow_null", .{ .bool = true });
+    }
+    try appendRule(
+        budget,
+        work.parent.rules,
+        try makeRule(
+            allocator,
+            "optional-field",
+            work.parent.input,
+            work.parent.path,
+            .{ .object = config },
+        ),
+    );
+}
+
+fn scheduleNodeBody(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    var tasks: std.ArrayList(NodeTask) = .empty;
+    defer tasks.deinit(allocator);
+    try queueNodeObjectRule(allocator, work, node, &tasks);
+    try queueNodeScalarRules(allocator, work, node, &tasks);
+    try queueNodeFormatRules(allocator, work, node, &tasks);
+    try queueNodeIdentityRules(allocator, work, node, &tasks);
+    try queueNodeCollectionRules(allocator, work, node, &tasks);
+    try queueNodeClosingRules(allocator, work, node, &tasks);
+    var index = tasks.items.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, tasks.items[index]);
+    }
+}
+
+fn queueNodeRule(
+    allocator: std.mem.Allocator,
+    tasks: *std.ArrayList(NodeTask),
+    rules: *std.json.Array,
+    rule: std.json.Value,
+) !void {
+    try tasks.append(allocator, .{ .emit = .{
+        .rules = rules,
+        .rule = rule,
+    } });
+}
+
+fn queueNodeObjectRule(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
+    const raw = node.get("object") orelse return;
+    try queueNodeRule(
+        allocator,
+        tasks,
+        work.rules,
+        try lowerObjectRule(
+            allocator,
+            node,
+            work.input,
+            work.path,
+            try definition_core.json.string(raw),
+            work.types,
+            work.allow_types,
+        ),
+    );
+}
+
+fn queueNodeScalarRules(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
+    if (node.get("scalar")) |raw| {
         var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "type", raw_scalar);
-        try appendRule(
-            budget,
-            rules,
+        try config.put(allocator, "type", raw);
+        try queueNodeRule(
+            allocator,
+            tasks,
+            work.rules,
             try makeRule(
                 allocator,
                 "scalar-type",
-                input,
-                path,
+                work.input,
+                work.path,
                 .{ .object = config },
             ),
         );
     }
-    if (node.get("string")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "bounded-string", input, path, config),
-        );
+    inline for (.{
+        .{ "string", "bounded-string" },
+        .{ "number", "bounded-number" },
+        .{ "array", "bounded-array" },
+        .{ "object_bounds", "bounded-object" },
+        .{ "regex", "regex" },
+    }) |entry| {
+        if (node.get(entry[0])) |config| {
+            try queueNodeRule(
+                allocator,
+                tasks,
+                work.rules,
+                try makeRule(allocator, entry[1], work.input, work.path, config),
+            );
+        }
     }
-    if (node.get("number")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "bounded-number", input, path, config),
-        );
-    }
-    if (node.get("array")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "bounded-array", input, path, config),
-        );
-    }
-    if (node.get("object_bounds")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "bounded-object", input, path, config),
-        );
-    }
+}
+
+fn queueNodeFormatRules(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
     if (node.get("enum")) |values| {
         var config = std.json.ObjectMap.empty;
         try config.put(allocator, "values", values);
-        try appendRule(
-            budget,
-            rules,
+        try queueNodeRule(
+            allocator,
+            tasks,
+            work.rules,
             try makeRule(
                 allocator,
                 "enum",
-                input,
-                path,
+                work.input,
+                work.path,
                 .{ .object = config },
             ),
         );
     }
-    if (node.get("format")) |raw_format| {
-        const format = try definition_core.json.string(raw_format);
+    if (node.get("format")) |raw| {
+        const format = try definition_core.json.string(raw);
         if (!std.mem.eql(u8, format, "digest") and
             !std.mem.eql(u8, format, "timestamp"))
         {
             return error.UnsupportedDocumentFormat;
         }
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, format, input, path, null),
-        );
-    }
-    if (node.get("identifier")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "safe-identifier",
-                input,
-                path,
-                boolAsEmptyObject(config),
-            ),
-        );
-    }
-    if (node.get("relative_path")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "safe-relative-path",
-                input,
-                path,
-                boolAsEmptyObject(config),
-            ),
-        );
-    }
-    if (node.get("regex")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "regex", input, path, config),
-        );
-    }
-    if (node.get("definition")) |raw_definition| {
-        var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "definition", raw_definition);
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "definition-ref",
-                input,
-                path,
-                .{ .object = config },
-            ),
-        );
-    }
-    if (try optionalBool(node, "unique", false)) {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "unique", input, path, null),
-        );
-    }
-    if (node.get("sorted")) |config| {
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "sorted",
-                input,
-                path,
-                boolAsEmptyObject(config),
-            ),
-        );
-    }
-    if (node.get("key")) |raw_key| {
-        var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "key", raw_key);
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "keyed-unique",
-                input,
-                path,
-                .{ .object = config },
-            ),
-        );
-    }
-    if (node.get("items")) |items| {
-        var children = std.json.Array.init(allocator);
-        try lowerNode(
+        try queueNodeRule(
             allocator,
-            &children,
-            items,
-            null,
-            "",
-            false,
-            types,
-            allow_types,
-            budget,
-        );
-        var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "rules", .{ .array = children });
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "all",
-                input,
-                path,
-                .{ .object = config },
-            ),
+            tasks,
+            work.rules,
+            try makeRule(allocator, format, work.input, work.path, null),
         );
     }
-    if (node.get("values")) |values| {
-        var children = std.json.Array.init(allocator);
-        try lowerNode(
-            allocator,
-            &children,
-            values,
-            null,
-            "",
-            false,
-            types,
-            allow_types,
-            budget,
-        );
-        var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "rules", .{ .array = children });
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
+}
+
+fn queueNodeIdentityRules(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
+    inline for (.{
+        .{ "identifier", "safe-identifier" },
+        .{ "relative_path", "safe-relative-path" },
+        .{ "sorted", "sorted" },
+    }) |entry| {
+        if (node.get(entry[0])) |config| {
+            try queueNodeRule(
                 allocator,
-                "object-values",
-                input,
-                path,
-                .{ .object = config },
-            ),
-        );
-    }
-    if (node.get("one_of")) |raw_variants| {
-        const variants = try definition_core.json.array(raw_variants);
-        var lowered = std.json.Array.init(allocator);
-        for (variants.items) |variant| {
-            var variant_rules = std.json.Array.init(allocator);
-            try lowerNode(
-                allocator,
-                &variant_rules,
-                variant,
-                null,
-                "",
-                false,
-                types,
-                allow_types,
-                budget,
+                tasks,
+                work.rules,
+                try makeRule(
+                    allocator,
+                    entry[1],
+                    work.input,
+                    work.path,
+                    boolAsEmptyObject(config),
+                ),
             );
-            if (variant_rules.items.len != 1) {
-                return error.InvalidOneOfDocumentVariant;
-            }
-            try lowered.append(variant_rules.items[0]);
         }
-        var config = std.json.ObjectMap.empty;
-        try config.put(allocator, "rules", .{ .array = lowered });
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(
-                allocator,
-                "one-of",
-                input,
-                path,
-                .{ .object = config },
-            ),
+    }
+    try queueNodeDefinitionRule(allocator, work, node, tasks);
+    if (try optionalBool(node, "unique", false)) {
+        try queueNodeRule(
+            allocator,
+            tasks,
+            work.rules,
+            try makeRule(allocator, "unique", work.input, work.path, null),
         );
     }
-    if (node.get("tagged")) |raw_tagged| {
-        try appendRule(
-            budget,
-            rules,
-            try lowerTaggedRule(
+}
+
+fn queueNodeDefinitionRule(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
+    inline for (.{ .{ "definition", "definition-ref", "definition" }, .{
+        "key",
+        "keyed-unique",
+        "key",
+    } }) |entry| {
+        if (node.get(entry[0])) |raw| {
+            var config = std.json.ObjectMap.empty;
+            try config.put(allocator, entry[2], raw);
+            try queueNodeRule(
                 allocator,
-                raw_tagged,
-                input,
-                path,
-                types,
-                allow_types,
-                budget,
-            ),
-        );
+                tasks,
+                work.rules,
+                try makeRule(
+                    allocator,
+                    entry[1],
+                    work.input,
+                    work.path,
+                    .{ .object = config },
+                ),
+            );
+        }
     }
+}
+
+fn queueNodeCollectionRules(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
+    if (node.get("items")) |source| {
+        try tasks.append(allocator, .{ .container = .{
+            .source = source,
+            .operator = "all",
+            .parent = work,
+        } });
+    }
+    if (node.get("values")) |source| {
+        try tasks.append(allocator, .{ .container = .{
+            .source = source,
+            .operator = "object-values",
+            .parent = work,
+        } });
+    }
+    if (node.get("one_of")) |raw| {
+        try tasks.append(allocator, .{ .one_of = .{
+            .variants = try definition_core.json.array(raw),
+            .parent = work,
+        } });
+    }
+    if (node.get("tagged")) |raw| {
+        try tasks.append(allocator, .{ .tagged = .{
+            .raw = raw,
+            .parent = work,
+        } });
+    }
+}
+
+fn queueNodeClosingRules(
+    allocator: std.mem.Allocator,
+    work: NodeWork,
+    node: std.json.ObjectMap,
+    tasks: *std.ArrayList(NodeTask),
+) !void {
     inline for (.{
         .{ "sha256", "sha256" },
         .{ "declared_field_values", "declared-field-values" },
         .{ "forbidden_keys", "forbidden-object-keys" },
     }) |entry| {
         if (node.get(entry[0])) |config| {
-            try appendRule(
-                budget,
-                rules,
-                try makeRule(allocator, entry[1], input, path, config),
+            try queueNodeRule(
+                allocator,
+                tasks,
+                work.rules,
+                try makeRule(allocator, entry[1], work.input, work.path, config),
             );
         }
     }
     if (node.get("event_envelope")) |config| {
-        if (path.len != 0) return error.EventEnvelopeMustBeDocumentRoot;
-        try appendRule(
-            budget,
-            rules,
-            try makeRule(allocator, "event-envelope", input, null, config),
-        );
-    }
-    if (node.get("laws")) |raw_laws| {
-        const laws = try definition_core.json.array(raw_laws);
-        var lowered = try lowerExpressions(
+        if (work.path.len != 0) return error.EventEnvelopeMustBeDocumentRoot;
+        try queueNodeRule(
             allocator,
-            laws,
-            input,
-            path,
-            null,
-            false,
-            budget,
+            tasks,
+            work.rules,
+            try makeRule(allocator, "event-envelope", work.input, null, config),
         );
-        defer lowered.deinit();
-        try rules.appendSlice(lowered.items);
     }
+    if (node.get("laws")) |raw| {
+        try tasks.append(allocator, .{ .laws = .{ .raw = raw, .parent = work } });
+    }
+    if (node.get("fields")) |raw| {
+        try tasks.append(allocator, .{ .fields = .{
+            .fields = try definition_core.json.object(raw),
+            .parent = work,
+        } });
+    }
+}
 
-    if (node.get("fields")) |raw_fields| {
-        const fields = try definition_core.json.object(raw_fields);
-        var iterator = fields.iterator();
-        while (iterator.next()) |entry| {
-            const child_path = try joinPointer(
-                allocator,
-                path,
-                entry.key_ptr.*,
-            );
-            try lowerNode(
-                allocator,
-                rules,
-                entry.value_ptr.*,
-                input,
-                child_path,
-                false,
-                types,
-                allow_types,
-                budget,
-            );
+fn scheduleNodeContainer(
+    allocator: std.mem.Allocator,
+    work: NodeContainerWork,
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    const children = try allocator.create(std.json.Array);
+    children.* = std.json.Array.init(allocator);
+    try stack.append(allocator, .{ .finish_container = .{
+        .operator = work.operator,
+        .input = work.parent.input,
+        .path = work.parent.path,
+        .rules = work.parent.rules,
+        .children = children,
+    } });
+    try stack.append(allocator, .{ .lower = .{
+        .raw = work.source,
+        .input = null,
+        .path = "",
+        .suppress_presence = false,
+        .types = work.parent.types,
+        .allow_types = work.parent.allow_types,
+        .rules = children,
+    } });
+}
+
+fn finishNodeContainer(
+    allocator: std.mem.Allocator,
+    work: NodeFinishWork,
+    budget: *ExpansionBudget,
+) !void {
+    var config = std.json.ObjectMap.empty;
+    try config.put(allocator, "rules", .{ .array = work.children.* });
+    try appendRule(
+        budget,
+        work.rules,
+        try makeRule(
+            allocator,
+            work.operator,
+            work.input,
+            work.path,
+            .{ .object = config },
+        ),
+    );
+}
+
+fn scheduleNodeOneOf(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "one_of"),
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    const children = try allocator.alloc(*std.json.Array, work.variants.items.len);
+    for (children) |*child| {
+        child.* = try allocator.create(std.json.Array);
+        child.*.* = std.json.Array.init(allocator);
+    }
+    try stack.append(allocator, .{ .finish_one_of = .{
+        .parent = work.parent,
+        .variants = children,
+    } });
+    var index = work.variants.items.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .lower = .{
+            .raw = work.variants.items[index],
+            .input = null,
+            .path = "",
+            .suppress_presence = false,
+            .types = work.parent.types,
+            .allow_types = work.parent.allow_types,
+            .rules = children[index],
+        } });
+    }
+}
+
+fn finishNodeOneOf(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "finish_one_of"),
+    budget: *ExpansionBudget,
+) !void {
+    var lowered = std.json.Array.init(allocator);
+    for (work.variants) |rules| {
+        if (rules.items.len != 1) return error.InvalidOneOfDocumentVariant;
+        try lowered.append(rules.items[0]);
+    }
+    var config = std.json.ObjectMap.empty;
+    try config.put(allocator, "rules", .{ .array = lowered });
+    try appendRule(
+        budget,
+        work.parent.rules,
+        try makeRule(
+            allocator,
+            "one-of",
+            work.parent.input,
+            work.parent.path,
+            .{ .object = config },
+        ),
+    );
+}
+
+fn scheduleNodeTagged(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "tagged"),
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    const tagged = try definition_core.json.object(work.raw);
+    try definition_core.json.requireExactKeys(tagged, &.{ "tag", "variants" });
+    const raw_variants = try definition_core.json.array(
+        try definition_core.json.field(tagged, "variants"),
+    );
+    const variants = try allocator.alloc(TaggedVariantWork, raw_variants.items.len);
+    for (raw_variants.items, variants) |raw_variant, *variant| {
+        const object = try definition_core.json.object(raw_variant);
+        try definition_core.json.requireExactKeys(object, &.{
+            "value",
+            "kind",
+            "node",
+        });
+        const value = object.get("value");
+        const kind = object.get("kind");
+        if ((value == null) == (kind == null)) {
+            return error.InvalidTaggedDocumentVariant;
         }
+        variant.* = .{
+            .value = value,
+            .kind = kind,
+            .rules = try allocator.create(std.json.Array),
+        };
+        variant.rules.* = std.json.Array.init(allocator);
+    }
+    try stack.append(allocator, .{ .finish_tagged = .{
+        .parent = work.parent,
+        .tag = tagged.get("tag"),
+        .variants = variants,
+    } });
+    try scheduleTaggedVariantNodes(allocator, raw_variants, work.parent, variants, stack);
+}
+
+fn scheduleTaggedVariantNodes(
+    allocator: std.mem.Allocator,
+    raw: std.json.Array,
+    parent: NodeWork,
+    variants: []TaggedVariantWork,
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    var index = raw.items.len;
+    while (index > 0) {
+        index -= 1;
+        const object = try definition_core.json.object(raw.items[index]);
+        try stack.append(allocator, .{ .lower = .{
+            .raw = try definition_core.json.field(object, "node"),
+            .input = null,
+            .path = "",
+            .suppress_presence = false,
+            .types = parent.types,
+            .allow_types = parent.allow_types,
+            .rules = variants[index].rules,
+        } });
+    }
+}
+
+fn finishNodeTagged(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "finish_tagged"),
+    budget: *ExpansionBudget,
+) !void {
+    var variants = std.json.Array.init(allocator);
+    for (work.variants) |variant| {
+        var lowered = std.json.ObjectMap.empty;
+        if (variant.value) |value| try lowered.put(allocator, "value", value);
+        if (variant.kind) |kind| try lowered.put(allocator, "kind", kind);
+        try lowered.put(allocator, "rules", .{ .array = variant.rules.* });
+        try variants.append(.{ .object = lowered });
+    }
+    var config = std.json.ObjectMap.empty;
+    if (work.tag) |tag| try config.put(allocator, "tag", tag);
+    try config.put(allocator, "variants", .{ .array = variants });
+    try appendRule(
+        budget,
+        work.parent.rules,
+        try makeRule(
+            allocator,
+            "tagged-union",
+            work.parent.input,
+            work.parent.path,
+            .{ .object = config },
+        ),
+    );
+}
+
+fn appendNodeLaws(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "laws"),
+    budget: *ExpansionBudget,
+) !void {
+    var lowered = try lowerExpressions(
+        allocator,
+        try definition_core.json.array(work.raw),
+        work.parent.input,
+        work.parent.path,
+        null,
+        false,
+        budget,
+    );
+    defer lowered.deinit();
+    try work.parent.rules.appendSlice(lowered.items);
+}
+
+fn scheduleNodeFields(
+    allocator: std.mem.Allocator,
+    work: @FieldType(NodeTask, "fields"),
+    stack: *std.ArrayList(NodeTask),
+) !void {
+    var children: std.ArrayList(NodeWork) = .empty;
+    defer children.deinit(allocator);
+    var iterator = work.fields.iterator();
+    while (iterator.next()) |entry| {
+        try children.append(allocator, .{
+            .raw = entry.value_ptr.*,
+            .input = work.parent.input,
+            .path = try joinPointer(
+                allocator,
+                work.parent.path,
+                entry.key_ptr.*,
+            ),
+            .suppress_presence = false,
+            .types = work.parent.types,
+            .allow_types = work.parent.allow_types,
+            .rules = work.parent.rules,
+        });
+    }
+    var index = children.items.len;
+    while (index > 0) {
+        index -= 1;
+        try stack.append(allocator, .{ .lower = children.items[index] });
     }
 }
 
@@ -848,39 +1170,21 @@ fn lowerEventLog(
         "genesis",
         "kinds",
     });
-    var sequence = std.json.ObjectMap.empty;
-    try sequence.put(
+    try appendConfiguredRule(
         allocator,
+        rules,
+        budget,
+        "sequence",
         "start",
         try definition_core.json.field(event_log, "start"),
     );
-    try appendRule(
-        budget,
-        rules,
-        try makeRule(
-            allocator,
-            "sequence",
-            null,
-            null,
-            .{ .object = sequence },
-        ),
-    );
-    var previous_digest = std.json.ObjectMap.empty;
-    try previous_digest.put(
+    try appendConfiguredRule(
         allocator,
+        rules,
+        budget,
+        "previous-digest",
         "genesis",
         try definition_core.json.field(event_log, "genesis"),
-    );
-    try appendRule(
-        budget,
-        rules,
-        try makeRule(
-            allocator,
-            "previous-digest",
-            null,
-            null,
-            .{ .object = previous_digest },
-        ),
     );
     try appendRule(
         budget,
@@ -892,22 +1196,30 @@ fn lowerEventLog(
         rules,
         try makeRule(allocator, "event-digest", null, null, null),
     );
-    var kinds = std.json.ObjectMap.empty;
-    try kinds.put(
+    try appendConfiguredRule(
         allocator,
+        rules,
+        budget,
+        "event-kinds",
         "values",
         try definition_core.json.field(event_log, "kinds"),
     );
+}
+
+fn appendConfiguredRule(
+    allocator: std.mem.Allocator,
+    rules: *std.json.Array,
+    budget: *ExpansionBudget,
+    operator: []const u8,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    var config = std.json.ObjectMap.empty;
+    try config.put(allocator, key, value);
     try appendRule(
         budget,
         rules,
-        try makeRule(
-            allocator,
-            "event-kinds",
-            null,
-            null,
-            .{ .object = kinds },
-        ),
+        try makeRule(allocator, operator, null, null, .{ .object = config }),
     );
 }
 
@@ -943,10 +1255,47 @@ fn lowerState(
         "event_kind",
         try definition_core.json.field(state, "event_kind"),
     );
+    try reducer.put(
+        allocator,
+        "registers",
+        .{ .array = try lowerStateRegisters(
+            allocator,
+            try definition_core.json.field(state, "registers"),
+        ) },
+    );
+    try reducer.put(
+        allocator,
+        "sets",
+        .{ .array = try lowerStateSets(
+            allocator,
+            try definition_core.json.field(state, "sets"),
+        ) },
+    );
+    try reducer.put(
+        allocator,
+        "admissions",
+        .{ .array = try lowerStateAdmissions(
+            allocator,
+            try definition_core.json.field(state, "admissions"),
+            terms,
+            budget,
+        ) },
+    );
+    return makeRule(
+        allocator,
+        "reducer",
+        null,
+        null,
+        .{ .object = reducer },
+    );
+}
+
+fn lowerStateRegisters(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !std.json.Array {
     var registers = std.json.Array.init(allocator);
-    var register_iterator = (try definition_core.json.object(
-        try definition_core.json.field(state, "registers"),
-    )).iterator();
+    var register_iterator = (try definition_core.json.object(raw)).iterator();
     while (register_iterator.next()) |entry| {
         var register = std.json.ObjectMap.empty;
         try register.put(
@@ -957,12 +1306,15 @@ fn lowerState(
         try register.put(allocator, "max_bytes", entry.value_ptr.*);
         try registers.append(.{ .object = register });
     }
-    try reducer.put(allocator, "registers", .{ .array = registers });
+    return registers;
+}
 
+fn lowerStateSets(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+) !std.json.Array {
     var sets = std.json.Array.init(allocator);
-    var set_iterator = (try definition_core.json.object(
-        try definition_core.json.field(state, "sets"),
-    )).iterator();
+    var set_iterator = (try definition_core.json.object(raw)).iterator();
     while (set_iterator.next()) |entry| {
         const limits = try definition_core.json.array(entry.value_ptr.*);
         if (limits.items.len != 3) return error.InvalidStateSetLimits;
@@ -973,11 +1325,16 @@ fn lowerState(
         try set.put(allocator, "max_bytes", limits.items[2]);
         try sets.append(.{ .object = set });
     }
-    try reducer.put(allocator, "sets", .{ .array = sets });
+    return sets;
+}
 
-    const raw_admissions = try definition_core.json.array(
-        try definition_core.json.field(state, "admissions"),
-    );
+fn lowerStateAdmissions(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    terms: ?std.json.ObjectMap,
+    budget: *ExpansionBudget,
+) !std.json.Array {
+    const raw_admissions = try definition_core.json.array(raw);
     var admissions = std.json.Array.init(allocator);
     for (raw_admissions.items) |raw_admission| {
         const admission = try definition_core.json.object(raw_admission);
@@ -1032,14 +1389,7 @@ fn lowerState(
         });
         try admissions.append(.{ .object = lowered });
     }
-    try reducer.put(allocator, "admissions", .{ .array = admissions });
-    return makeRule(
-        allocator,
-        "reducer",
-        null,
-        null,
-        .{ .object = reducer },
-    );
+    return admissions;
 }
 
 fn lowerStateActions(
@@ -1129,133 +1479,180 @@ fn lowerEventOperations(
     var lowered_plans = std.json.ObjectMap.empty;
     var iterator = plans.iterator();
     while (iterator.next()) |entry| {
-        try budget.reserve(1);
-        const kind = switch (entry.value_ptr.*) {
-            .string => |value| value,
-            .object => |plan| try definition_core.json.requiredString(
-                plan,
-                "kind",
-            ),
-            else => return error.InvalidEventOperationPlan,
-        };
-        const plan = switch (entry.value_ptr.*) {
-            .string => std.json.ObjectMap.empty,
-            .object => |value| value,
-            else => unreachable,
-        };
-        try definition_core.json.requireExactKeys(plan, &.{
-            "effect",
-            "input",
-            "kind",
-            "request",
-            "generate",
-            "body",
-            "forbid",
-            "fields",
-        });
-        var raw_effect = std.json.ObjectMap.empty;
-        try raw_effect.put(
-            allocator,
-            "op",
-            plan.get("effect") orelse
-                try definition_core.json.field(event, "effect"),
-        );
-        try raw_effect.put(
-            allocator,
-            "slot",
-            try definition_core.json.field(event, "slot"),
-        );
-        try raw_effect.put(
-            allocator,
-            "input",
-            plan.get("input") orelse
-                try definition_core.json.field(event, "input"),
-        );
-        var event_plan = std.json.ObjectMap.empty;
-        try event_plan.put(
-            allocator,
-            "mode",
-            try definition_core.json.field(event, "mode"),
-        );
-        try event_plan.put(
-            allocator,
-            "body_input_field",
-            try definition_core.json.field(event, "body_input"),
-        );
-        try event_plan.put(allocator, "fields", .{
-            .array = try lowerEventFields(
-                allocator,
-                try definition_core.json.object(
-                    try definition_core.json.field(event, "fields"),
-                ),
-                if (plan.get("fields")) |fields|
-                    try definition_core.json.object(fields)
-                else
-                    null,
-                kind,
-                budget,
-            ),
-        });
-        const request_source = if (plan.get("request")) |request|
-            request
-        else
-            event.get("request") orelse .null;
-        if (request_source != .null) {
-            try event_plan.put(allocator, "request_literals", .{
-                .array = try lowerLiteralFields(
-                    allocator,
-                    try definition_core.json.object(request_source),
-                    kind,
-                    budget,
-                ),
-            });
-        }
-        if (plan.get("generate")) |generate| {
-            try event_plan.put(allocator, "generate", .{
-                .array = try lowerGeneratedFields(
-                    allocator,
-                    try definition_core.json.object(generate),
-                    budget,
-                ),
-            });
-        }
-        if (plan.get("body")) |body| {
-            try event_plan.put(allocator, "body_fields", .{
-                .array = try lowerConfiguredFields(
-                    allocator,
-                    try definition_core.json.object(body),
-                    budget,
-                ),
-            });
-        }
-        const forbidden = plan.get("forbid") orelse
-            event.get("forbid") orelse .null;
-        if (forbidden != .null) {
-            const values = try definition_core.json.array(forbidden);
-            if (values.items.len != 0) {
-                try event_plan.put(
-                    allocator,
-                    "forbidden_parameters",
-                    forbidden,
-                );
-            }
-        }
-        try raw_effect.put(
-            allocator,
-            "event",
-            .{ .object = event_plan },
-        );
-        var effects = std.json.Array.init(allocator);
-        try effects.append(.{ .object = raw_effect });
-        var operation = std.json.ObjectMap.empty;
-        try operation.put(allocator, "effects", .{ .array = effects });
         try lowered_plans.put(
             allocator,
             entry.key_ptr.*,
-            .{ .object = operation },
+            .{ .object = try lowerEventOperation(
+                allocator,
+                event,
+                entry.value_ptr.*,
+                budget,
+            ) },
         );
     }
     return lowered_plans;
+}
+
+fn lowerEventOperation(
+    allocator: std.mem.Allocator,
+    event: std.json.ObjectMap,
+    raw_plan: std.json.Value,
+    budget: *ExpansionBudget,
+) !std.json.ObjectMap {
+    try budget.reserve(1);
+    const kind = switch (raw_plan) {
+        .string => |value| value,
+        .object => |plan| try definition_core.json.requiredString(plan, "kind"),
+        else => return error.InvalidEventOperationPlan,
+    };
+    const plan = switch (raw_plan) {
+        .string => std.json.ObjectMap.empty,
+        .object => |value| value,
+        else => unreachable,
+    };
+    try definition_core.json.requireExactKeys(plan, &.{
+        "effect",
+        "input",
+        "kind",
+        "request",
+        "generate",
+        "body",
+        "forbid",
+        "fields",
+    });
+    var effect = std.json.ObjectMap.empty;
+    try effect.put(
+        allocator,
+        "op",
+        plan.get("effect") orelse
+            try definition_core.json.field(event, "effect"),
+    );
+    try effect.put(
+        allocator,
+        "slot",
+        try definition_core.json.field(event, "slot"),
+    );
+    try effect.put(
+        allocator,
+        "input",
+        plan.get("input") orelse try definition_core.json.field(event, "input"),
+    );
+    try effect.put(allocator, "event", .{
+        .object = try lowerEventPlan(allocator, event, plan, kind, budget),
+    });
+    var effects = std.json.Array.init(allocator);
+    try effects.append(.{ .object = effect });
+    var operation = std.json.ObjectMap.empty;
+    try operation.put(allocator, "effects", .{ .array = effects });
+    return operation;
+}
+
+fn lowerEventPlan(
+    allocator: std.mem.Allocator,
+    event: std.json.ObjectMap,
+    plan: std.json.ObjectMap,
+    kind: []const u8,
+    budget: *ExpansionBudget,
+) !std.json.ObjectMap {
+    var lowered = std.json.ObjectMap.empty;
+    try lowered.put(
+        allocator,
+        "mode",
+        try definition_core.json.field(event, "mode"),
+    );
+    try lowered.put(
+        allocator,
+        "body_input_field",
+        try definition_core.json.field(event, "body_input"),
+    );
+    const event_fields = try definition_core.json.object(
+        try definition_core.json.field(event, "fields"),
+    );
+    const overrides = if (plan.get("fields")) |fields|
+        try definition_core.json.object(fields)
+    else
+        null;
+    try lowered.put(allocator, "fields", .{
+        .array = try lowerEventFields(
+            allocator,
+            event_fields,
+            overrides,
+            kind,
+            budget,
+        ),
+    });
+    try putEventRequest(allocator, &lowered, event, plan, kind, budget);
+    try putEventGenerate(allocator, &lowered, plan, budget);
+    try putEventBody(allocator, &lowered, plan, budget);
+    try putEventForbidden(allocator, &lowered, event, plan);
+    return lowered;
+}
+
+fn putEventRequest(
+    allocator: std.mem.Allocator,
+    lowered: *std.json.ObjectMap,
+    event: std.json.ObjectMap,
+    plan: std.json.ObjectMap,
+    kind: []const u8,
+    budget: *ExpansionBudget,
+) !void {
+    const source = plan.get("request") orelse event.get("request") orelse .null;
+    if (source == .null) return;
+    try lowered.put(allocator, "request_literals", .{
+        .array = try lowerLiteralFields(
+            allocator,
+            try definition_core.json.object(source),
+            kind,
+            budget,
+        ),
+    });
+}
+
+fn putEventGenerate(
+    allocator: std.mem.Allocator,
+    lowered: *std.json.ObjectMap,
+    plan: std.json.ObjectMap,
+    budget: *ExpansionBudget,
+) !void {
+    const generate = plan.get("generate") orelse return;
+    try lowered.put(allocator, "generate", .{
+        .array = try lowerGeneratedFields(
+            allocator,
+            try definition_core.json.object(generate),
+            budget,
+        ),
+    });
+}
+
+fn putEventBody(
+    allocator: std.mem.Allocator,
+    lowered: *std.json.ObjectMap,
+    plan: std.json.ObjectMap,
+    budget: *ExpansionBudget,
+) !void {
+    const body = plan.get("body") orelse return;
+    try lowered.put(allocator, "body_fields", .{
+        .array = try lowerConfiguredFields(
+            allocator,
+            try definition_core.json.object(body),
+            budget,
+        ),
+    });
+}
+
+fn putEventForbidden(
+    allocator: std.mem.Allocator,
+    lowered: *std.json.ObjectMap,
+    event: std.json.ObjectMap,
+    plan: std.json.ObjectMap,
+) !void {
+    const forbidden = plan.get("forbid") orelse event.get("forbid") orelse
+        .null;
+    if (forbidden == .null) return;
+    const values = try definition_core.json.array(forbidden);
+    if (values.items.len != 0) {
+        try lowered.put(allocator, "forbidden_parameters", forbidden);
+    }
 }
 
 fn lowerEventFields(
@@ -1464,26 +1861,26 @@ fn lowerExpression(
     allow_terms: bool,
     budget: *ExpansionBudget,
 ) anyerror!std.json.Value {
-    const expression = try definition_core.json.array(raw);
-    if (expression.items.len == 0) return error.InvalidLawExpression;
-    const operator = try definition_core.json.string(expression.items[0]);
-    if (std.mem.eql(u8, operator, "use")) {
-        if (!allow_terms or expression.items.len != 2) {
+    var selected = raw;
+    var terms_allowed = allow_terms;
+    for (0..2) |_| {
+        const candidate = try definition_core.json.array(selected);
+        if (candidate.items.len == 0) return error.InvalidLawExpression;
+        const candidate_operator = try definition_core.json.string(
+            candidate.items[0],
+        );
+        if (!std.mem.eql(u8, candidate_operator, "use")) break;
+        if (!terms_allowed or candidate.items.len != 2) {
             return error.InvalidLawTerm;
         }
-        const name = try definition_core.json.string(expression.items[1]);
+        const name = try definition_core.json.string(candidate.items[1]);
         const term_map = terms orelse return error.UnknownLawTerm;
-        const term = term_map.get(name) orelse return error.UnknownLawTerm;
-        return lowerExpression(
-            allocator,
-            term,
-            inherited_input,
-            inherited_path,
-            terms,
-            false,
-            budget,
-        );
+        selected = term_map.get(name) orelse return error.UnknownLawTerm;
+        terms_allowed = false;
     }
+    const expression = try definition_core.json.array(selected);
+    if (expression.items.len == 0) return error.InvalidLawExpression;
+    const operator = try definition_core.json.string(expression.items[0]);
     if (expression.items.len > 2) {
         return lowerPositionalExpression(
             allocator,
@@ -1491,10 +1888,32 @@ fn lowerExpression(
             inherited_input,
             inherited_path,
             terms,
-            allow_terms,
+            terms_allowed,
             budget,
         );
     }
+    return lowerObjectExpression(
+        allocator,
+        expression,
+        operator,
+        inherited_input,
+        inherited_path,
+        terms,
+        terms_allowed,
+        budget,
+    );
+}
+
+fn lowerObjectExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    operator: []const u8,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) anyerror!std.json.Value {
     var result = std.json.ObjectMap.empty;
     try result.put(allocator, "op", .{ .string = operator });
     if (expression.items.len == 2) {
@@ -1537,57 +1956,184 @@ fn lowerNestedExpressions(
     allow_terms: bool,
     budget: *ExpansionBudget,
 ) anyerror!std.json.Value {
-    if (std.mem.eql(u8, key, "rules") or
-        std.mem.eql(u8, key, "target_rules") or
-        std.mem.eql(u8, key, "coverage_rules") or
-        std.mem.eql(u8, key, "match_rules"))
-    {
-        return .{
-            .array = try lowerNestedRuleList(
-                allocator,
-                try definition_core.json.array(raw),
-                terms,
-                allow_terms,
-                budget,
-            ),
-        };
+    const root = try allocator.create(std.json.Value);
+    var stack: std.ArrayList(NestedTask) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .transform = .{
+        .key = key,
+        .raw = raw,
+        .output = root,
+    } });
+    while (stack.pop()) |task| {
+        try runNestedTask(
+            allocator,
+            task,
+            terms,
+            allow_terms,
+            budget,
+            &stack,
+        );
+        if (stack.items.len > ExpansionBudget.max_emitted) {
+            return error.SourceGraphExpansionLimitExceeded;
+        }
     }
-    return switch (raw) {
-        .object => |object| result: {
-            var clone = std.json.ObjectMap.empty;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try clone.put(
-                    allocator,
-                    entry.key_ptr.*,
-                    try lowerNestedExpressions(
-                        allocator,
-                        entry.key_ptr.*,
-                        entry.value_ptr.*,
-                        terms,
-                        allow_terms,
-                        budget,
-                    ),
-                );
-            }
-            break :result .{ .object = clone };
-        },
-        .array => |array| result: {
-            var clone = std.json.Array.init(allocator);
-            for (array.items) |item| {
-                try clone.append(try lowerNestedExpressions(
-                    allocator,
-                    "",
-                    item,
-                    terms,
-                    allow_terms,
-                    budget,
-                ));
-            }
-            break :result .{ .array = clone };
-        },
-        else => raw,
-    };
+    return root.*;
+}
+
+const NestedTransform = struct {
+    key: []const u8,
+    raw: std.json.Value,
+    output: *std.json.Value,
+};
+
+const NestedObjectEntry = struct {
+    key: []const u8,
+    value: *std.json.Value,
+};
+
+const NestedTask = union(enum) {
+    transform: NestedTransform,
+    finish_object: struct {
+        output: *std.json.Value,
+        object: *std.json.ObjectMap,
+    },
+    put_object: struct {
+        object: *std.json.ObjectMap,
+        entry: NestedObjectEntry,
+    },
+    finish_array: struct {
+        output: *std.json.Value,
+        array: *std.json.Array,
+    },
+    append_array: struct {
+        array: *std.json.Array,
+        value: *std.json.Value,
+    },
+};
+
+fn runNestedTask(
+    allocator: std.mem.Allocator,
+    task: NestedTask,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+    stack: *std.ArrayList(NestedTask),
+) !void {
+    switch (task) {
+        .transform => |work| try transformNestedValue(
+            allocator,
+            work,
+            terms,
+            allow_terms,
+            budget,
+            stack,
+        ),
+        .finish_object => |work| work.output.* = .{ .object = work.object.* },
+        .put_object => |work| try work.object.put(
+            allocator,
+            work.entry.key,
+            work.entry.value.*,
+        ),
+        .finish_array => |work| work.output.* = .{ .array = work.array.* },
+        .append_array => |work| try work.array.append(work.value.*),
+    }
+}
+
+fn transformNestedValue(
+    allocator: std.mem.Allocator,
+    work: NestedTransform,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+    stack: *std.ArrayList(NestedTask),
+) !void {
+    if (isRuleListKey(work.key)) {
+        work.output.* = .{ .array = try lowerNestedRuleList(
+            allocator,
+            try definition_core.json.array(work.raw),
+            terms,
+            allow_terms,
+            budget,
+        ) };
+        return;
+    }
+    switch (work.raw) {
+        .object => |object| try scheduleNestedObject(
+            allocator,
+            work.output,
+            object,
+            stack,
+        ),
+        .array => |array| try scheduleNestedArray(
+            allocator,
+            work.output,
+            array,
+            stack,
+        ),
+        else => work.output.* = work.raw,
+    }
+}
+
+fn scheduleNestedObject(
+    allocator: std.mem.Allocator,
+    output: *std.json.Value,
+    source: std.json.ObjectMap,
+    stack: *std.ArrayList(NestedTask),
+) !void {
+    const object = try allocator.create(std.json.ObjectMap);
+    object.* = .empty;
+    try stack.append(allocator, .{ .finish_object = .{
+        .output = output,
+        .object = object,
+    } });
+    var entries: std.ArrayList(NestedTransform) = .empty;
+    defer entries.deinit(allocator);
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| {
+        try entries.append(allocator, .{
+            .key = entry.key_ptr.*,
+            .raw = entry.value_ptr.*,
+            .output = try allocator.create(std.json.Value),
+        });
+    }
+    var index = entries.items.len;
+    while (index > 0) {
+        index -= 1;
+        const entry = entries.items[index];
+        try stack.append(allocator, .{ .put_object = .{
+            .object = object,
+            .entry = .{ .key = entry.key, .value = entry.output },
+        } });
+        try stack.append(allocator, .{ .transform = entry });
+    }
+}
+
+fn scheduleNestedArray(
+    allocator: std.mem.Allocator,
+    output: *std.json.Value,
+    source: std.json.Array,
+    stack: *std.ArrayList(NestedTask),
+) !void {
+    const array = try allocator.create(std.json.Array);
+    array.* = std.json.Array.init(allocator);
+    try stack.append(allocator, .{ .finish_array = .{
+        .output = output,
+        .array = array,
+    } });
+    var index = source.items.len;
+    while (index > 0) {
+        index -= 1;
+        const value = try allocator.create(std.json.Value);
+        try stack.append(allocator, .{ .append_array = .{
+            .array = array,
+            .value = value,
+        } });
+        try stack.append(allocator, .{ .transform = .{
+            .key = "",
+            .raw = source.items[index],
+            .output = value,
+        } });
+    }
 }
 
 fn lowerNestedRuleList(
@@ -1694,142 +2240,29 @@ fn lowerPositionalExpression(
     budget: *ExpansionBudget,
 ) anyerror!std.json.Value {
     const operator = try definition_core.json.string(expression.items[0]);
-    if (isBinaryReferenceOperator(operator)) {
-        if (expression.items.len != 3) return error.InvalidLawExpression;
-        const left = try compactReference(expression.items[1]);
-        const right = try compactReference(expression.items[2]);
-        const left_input = resolvedInput(left, inherited_input) orelse
-            return error.InvalidCompactReference;
-        const right_input = resolvedInput(right, inherited_input) orelse
-            return error.InvalidCompactReference;
-        var result = std.json.ObjectMap.empty;
-        try result.put(allocator, "op", .{ .string = operator });
-        try result.put(allocator, "input", .{ .string = left_input });
-        if (!std.mem.eql(u8, operator, "field-equal") or
-            !std.mem.eql(u8, left_input, right_input))
-        {
-            try result.put(allocator, "left_input", .{ .string = left_input });
-            try result.put(allocator, "right_input", .{ .string = right_input });
-        }
-        try result.put(allocator, "left", .{
-            .string = try resolvedPath(
-                allocator,
-                left,
-                inherited_path,
-            ),
-        });
-        try result.put(allocator, "right", .{
-            .string = try resolvedPath(
-                allocator,
-                right,
-                inherited_path,
-            ),
-        });
-        return .{ .object = result };
-    }
-    if (std.mem.eql(u8, operator, "definition-ref")) {
-        if (expression.items.len != 3) return error.InvalidLawExpression;
-        const subject = try compactReference(expression.items[1]);
-        var result = std.json.ObjectMap.empty;
-        try result.put(allocator, "op", .{ .string = operator });
-        try putIfPresent(
+    if (isSimplePositionalOperator(operator)) {
+        return lowerSimplePositionalExpression(
             allocator,
-            &result,
-            "input",
-            resolvedInput(subject, inherited_input),
+            expression,
+            operator,
+            inherited_input,
+            inherited_path,
         );
-        try result.put(allocator, "path", .{
-            .string = try resolvedPath(
-                allocator,
-                subject,
-                inherited_path,
-            ),
-        });
-        try result.put(allocator, "definition", expression.items[2]);
-        return .{ .object = result };
-    }
-    if (std.mem.eql(u8, operator, "bounded-array") or
-        std.mem.eql(u8, operator, "bounded-number"))
-    {
-        if (expression.items.len != 4) return error.InvalidLawExpression;
-        const subject = try compactReference(expression.items[1]);
-        var result = std.json.ObjectMap.empty;
-        try result.put(allocator, "op", .{ .string = operator });
-        try putIfPresent(
-            allocator,
-            &result,
-            "input",
-            resolvedInput(subject, inherited_input),
-        );
-        try result.put(allocator, "path", .{
-            .string = try resolvedPath(
-                allocator,
-                subject,
-                inherited_path,
-            ),
-        });
-        if (expression.items[2] != .null) {
-            try result.put(allocator, "min", expression.items[2]);
-        }
-        if (expression.items[3] != .null) {
-            try result.put(allocator, "max", expression.items[3]);
-        }
-        return .{ .object = result };
-    }
-    if (std.mem.eql(u8, operator, "enum")) {
-        if (expression.items.len != 3) return error.InvalidLawExpression;
-        const subject = try compactReference(expression.items[1]);
-        var result = std.json.ObjectMap.empty;
-        try result.put(allocator, "op", .{ .string = operator });
-        try putIfPresent(
-            allocator,
-            &result,
-            "input",
-            resolvedInput(subject, inherited_input),
-        );
-        try result.put(allocator, "path", .{
-            .string = try resolvedPath(
-                allocator,
-                subject,
-                inherited_path,
-            ),
-        });
-        try result.put(allocator, "values", expression.items[2]);
-        return .{ .object = result };
     }
     if (std.mem.eql(u8, operator, "all") or
         std.mem.eql(u8, operator, "any") or
         std.mem.eql(u8, operator, "none"))
     {
-        if (expression.items.len != 3) return error.InvalidLawExpression;
-        const subject = try compactReference(expression.items[1]);
-        var result = std.json.ObjectMap.empty;
-        try result.put(allocator, "op", .{ .string = operator });
-        try putIfPresent(
+        return lowerQuantifiedExpression(
             allocator,
-            &result,
-            "input",
-            resolvedInput(subject, inherited_input),
+            expression,
+            operator,
+            inherited_input,
+            inherited_path,
+            terms,
+            allow_terms,
+            budget,
         );
-        try result.put(allocator, "path", .{
-            .string = try resolvedPath(
-                allocator,
-                subject,
-                inherited_path,
-            ),
-        });
-        try result.put(allocator, "rules", .{
-            .array = try lowerExpressions(
-                allocator,
-                try definition_core.json.array(expression.items[2]),
-                null,
-                null,
-                terms,
-                allow_terms,
-                budget,
-            ),
-        });
-        return .{ .object = result };
     }
     if (std.mem.eql(u8, operator, "implies")) {
         return lowerCompactImplication(
@@ -1854,6 +2287,201 @@ fn lowerPositionalExpression(
         );
     }
     return error.UnsupportedPositionalLaw;
+}
+
+fn isSimplePositionalOperator(operator: []const u8) bool {
+    return isBinaryReferenceOperator(operator) or
+        std.mem.eql(u8, operator, "definition-ref") or
+        std.mem.eql(u8, operator, "bounded-array") or
+        std.mem.eql(u8, operator, "bounded-number") or
+        std.mem.eql(u8, operator, "enum");
+}
+
+fn lowerSimplePositionalExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    operator: []const u8,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+) !std.json.Value {
+    if (isBinaryReferenceOperator(operator)) {
+        return lowerBinaryReferenceExpression(
+            allocator,
+            expression,
+            operator,
+            inherited_input,
+            inherited_path,
+        );
+    }
+    if (std.mem.eql(u8, operator, "definition-ref")) {
+        return lowerDefinitionReferenceExpression(
+            allocator,
+            expression,
+            inherited_input,
+            inherited_path,
+        );
+    }
+    if (std.mem.eql(u8, operator, "bounded-array") or
+        std.mem.eql(u8, operator, "bounded-number"))
+    {
+        return lowerBoundedExpression(
+            allocator,
+            expression,
+            operator,
+            inherited_input,
+            inherited_path,
+        );
+    }
+    return lowerEnumExpression(
+        allocator,
+        expression,
+        inherited_input,
+        inherited_path,
+    );
+}
+
+fn lowerBinaryReferenceExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    operator: []const u8,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+) !std.json.Value {
+    if (expression.items.len != 3) return error.InvalidLawExpression;
+    const left = try compactReference(expression.items[1]);
+    const right = try compactReference(expression.items[2]);
+    const left_input = resolvedInput(left, inherited_input) orelse
+        return error.InvalidCompactReference;
+    const right_input = resolvedInput(right, inherited_input) orelse
+        return error.InvalidCompactReference;
+    var result = std.json.ObjectMap.empty;
+    try result.put(allocator, "op", .{ .string = operator });
+    try result.put(allocator, "input", .{ .string = left_input });
+    if (!std.mem.eql(u8, operator, "field-equal") or
+        !std.mem.eql(u8, left_input, right_input))
+    {
+        try result.put(allocator, "left_input", .{ .string = left_input });
+        try result.put(allocator, "right_input", .{ .string = right_input });
+    }
+    try result.put(allocator, "left", .{
+        .string = try resolvedPath(allocator, left, inherited_path),
+    });
+    try result.put(allocator, "right", .{
+        .string = try resolvedPath(allocator, right, inherited_path),
+    });
+    return .{ .object = result };
+}
+
+fn lowerDefinitionReferenceExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+) !std.json.Value {
+    if (expression.items.len != 3) return error.InvalidLawExpression;
+    const subject = try compactReference(expression.items[1]);
+    var result = std.json.ObjectMap.empty;
+    try result.put(allocator, "op", .{ .string = "definition-ref" });
+    try putIfPresent(
+        allocator,
+        &result,
+        "input",
+        resolvedInput(subject, inherited_input),
+    );
+    try result.put(allocator, "path", .{
+        .string = try resolvedPath(allocator, subject, inherited_path),
+    });
+    try result.put(allocator, "definition", expression.items[2]);
+    return .{ .object = result };
+}
+
+fn lowerBoundedExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    operator: []const u8,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+) !std.json.Value {
+    if (expression.items.len != 4) return error.InvalidLawExpression;
+    const subject = try compactReference(expression.items[1]);
+    var result = std.json.ObjectMap.empty;
+    try result.put(allocator, "op", .{ .string = operator });
+    try putIfPresent(
+        allocator,
+        &result,
+        "input",
+        resolvedInput(subject, inherited_input),
+    );
+    try result.put(allocator, "path", .{
+        .string = try resolvedPath(allocator, subject, inherited_path),
+    });
+    if (expression.items[2] != .null) {
+        try result.put(allocator, "min", expression.items[2]);
+    }
+    if (expression.items[3] != .null) {
+        try result.put(allocator, "max", expression.items[3]);
+    }
+    return .{ .object = result };
+}
+
+fn lowerEnumExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+) !std.json.Value {
+    if (expression.items.len != 3) return error.InvalidLawExpression;
+    const subject = try compactReference(expression.items[1]);
+    var result = std.json.ObjectMap.empty;
+    try result.put(allocator, "op", .{ .string = "enum" });
+    try putIfPresent(
+        allocator,
+        &result,
+        "input",
+        resolvedInput(subject, inherited_input),
+    );
+    try result.put(allocator, "path", .{
+        .string = try resolvedPath(allocator, subject, inherited_path),
+    });
+    try result.put(allocator, "values", expression.items[2]);
+    return .{ .object = result };
+}
+
+fn lowerQuantifiedExpression(
+    allocator: std.mem.Allocator,
+    expression: std.json.Array,
+    operator: []const u8,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) !std.json.Value {
+    if (expression.items.len != 3) return error.InvalidLawExpression;
+    const subject = try compactReference(expression.items[1]);
+    var result = std.json.ObjectMap.empty;
+    try result.put(allocator, "op", .{ .string = operator });
+    try putIfPresent(
+        allocator,
+        &result,
+        "input",
+        resolvedInput(subject, inherited_input),
+    );
+    try result.put(allocator, "path", .{
+        .string = try resolvedPath(allocator, subject, inherited_path),
+    });
+    try result.put(allocator, "rules", .{
+        .array = try lowerExpressions(
+            allocator,
+            try definition_core.json.array(expression.items[2]),
+            null,
+            null,
+            terms,
+            allow_terms,
+            budget,
+        ),
+    });
+    return .{ .object = result };
 }
 
 fn isBinaryReferenceOperator(operator: []const u8) bool {
@@ -1907,7 +2535,30 @@ fn lowerCompactImplication(
     while (predicate_iterator.next()) |entry| {
         try result.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
     }
-    switch (expression.items[3]) {
+    try putCompactConsequence(
+        allocator,
+        &result,
+        expression.items[3],
+        inherited_input,
+        inherited_path,
+        terms,
+        allow_terms,
+        budget,
+    );
+    return .{ .object = result };
+}
+
+fn putCompactConsequence(
+    allocator: std.mem.Allocator,
+    result: *std.json.ObjectMap,
+    raw: std.json.Value,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) !void {
+    switch (raw) {
         .array => |rules| try result.put(allocator, "rules", .{
             .array = try lowerExpressions(
                 allocator,
@@ -1920,26 +2571,21 @@ fn lowerCompactImplication(
             ),
         }),
         .object => |consequence| {
-            try definition_core.json.requireExactKeys(consequence, &.{
-                "then",
-                "equals",
-                "nonempty",
-            });
+            try definition_core.json.requireExactKeys(
+                consequence,
+                &.{ "then", "equals", "nonempty" },
+            );
             const then = try compactReference(
                 try definition_core.json.field(consequence, "then"),
             );
             try putIfPresent(
                 allocator,
-                &result,
+                result,
                 "then_input",
                 resolvedInput(then, inherited_input),
             );
             try result.put(allocator, "then", .{
-                .string = try resolvedPath(
-                    allocator,
-                    then,
-                    inherited_path,
-                ),
+                .string = try resolvedPath(allocator, then, inherited_path),
             });
             if (consequence.get("equals")) |value| {
                 try result.put(allocator, "then_equals", value);
@@ -1950,7 +2596,6 @@ fn lowerCompactImplication(
         },
         else => return error.InvalidLawExpression,
     }
-    return .{ .object = result };
 }
 
 fn lowerCompactRelation(
@@ -1972,9 +2617,70 @@ fn lowerCompactRelation(
     }
     var result = std.json.ObjectMap.empty;
     try result.put(allocator, "op", .{ .string = "reference-exists" });
-    var sources = std.json.Array.init(allocator);
-    var source_input: ?[]const u8 = null;
-    for (raw_sources.items) |raw_endpoint| {
+    const sources = try lowerCompactSources(
+        allocator,
+        raw_sources,
+        inherited_input,
+        inherited_path,
+        terms,
+        allow_terms,
+        budget,
+    );
+    const targets = try lowerCompactTargets(
+        allocator,
+        raw_targets,
+        inherited_input,
+        inherited_path,
+        terms,
+        allow_terms,
+        budget,
+    );
+    try result.put(allocator, "input", .{ .string = sources.input });
+    if (!std.mem.eql(u8, sources.input, targets.input)) {
+        try result.put(allocator, "target_input", .{ .string = targets.input });
+    }
+    const single = if (expression.items.len == 4)
+        try applyCompactRelationOptions(
+            allocator,
+            &result,
+            expression.items[3],
+            terms,
+            allow_terms,
+            budget,
+        )
+    else
+        false;
+    if (single) {
+        try flattenCompactRelation(
+            allocator,
+            &result,
+            sources.values,
+            targets.values,
+        );
+    } else {
+        try result.put(allocator, "sources", .{ .array = sources.values });
+        try result.put(allocator, "targets", .{ .array = targets.values });
+    }
+    return .{ .object = result };
+}
+
+const CompactEndpoints = struct {
+    values: std.json.Array,
+    input: []const u8,
+};
+
+fn lowerCompactSources(
+    allocator: std.mem.Allocator,
+    raw: std.json.Array,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) !CompactEndpoints {
+    var values = std.json.Array.init(allocator);
+    var common_input: ?[]const u8 = null;
+    for (raw.items) |raw_endpoint| {
         const endpoint = try lowerCompactEndpoint(
             allocator,
             raw_endpoint,
@@ -1986,16 +2692,28 @@ fn lowerCompactRelation(
         );
         const input = resolvedInput(endpoint.reference, inherited_input) orelse
             return error.InvalidCompactReference;
-        if (source_input) |expected| {
+        if (common_input) |expected| {
             if (!std.mem.eql(u8, expected, input)) {
                 return error.MixedRelationSourceInputs;
             }
-        } else source_input = input;
-        try sources.append(.{ .object = endpoint.object });
+        } else common_input = input;
+        try values.append(.{ .object = endpoint.object });
     }
-    var targets = std.json.Array.init(allocator);
-    var target_input: ?[]const u8 = null;
-    for (raw_targets.items) |raw_endpoint| {
+    return .{ .values = values, .input = common_input.? };
+}
+
+fn lowerCompactTargets(
+    allocator: std.mem.Allocator,
+    raw: std.json.Array,
+    inherited_input: ?[]const u8,
+    inherited_path: ?[]const u8,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) !CompactEndpoints {
+    var values = std.json.Array.init(allocator);
+    var common_input: ?[]const u8 = null;
+    for (raw.items) |raw_endpoint| {
         const endpoint = try lowerCompactEndpoint(
             allocator,
             raw_endpoint,
@@ -2007,98 +2725,106 @@ fn lowerCompactRelation(
         );
         const input = resolvedInput(endpoint.reference, inherited_input) orelse
             return error.InvalidCompactReference;
-        if (target_input) |expected| {
+        if (common_input) |expected| {
             if (!std.mem.eql(u8, expected, input)) {
                 return error.MixedRelationTargetInputs;
             }
-        } else target_input = input;
-        try targets.append(.{ .object = endpoint.object });
+        } else common_input = input;
+        try values.append(.{ .object = endpoint.object });
     }
-    try result.put(allocator, "input", .{ .string = source_input.? });
-    if (!std.mem.eql(u8, source_input.?, target_input.?)) {
-        try result.put(allocator, "target_input", .{ .string = target_input.? });
-    }
+    return .{ .values = values, .input = common_input.? };
+}
+
+fn applyCompactRelationOptions(
+    allocator: std.mem.Allocator,
+    result: *std.json.ObjectMap,
+    raw: std.json.Value,
+    terms: ?std.json.ObjectMap,
+    allow_terms: bool,
+    budget: *ExpansionBudget,
+) !bool {
     var single = false;
-    if (expression.items.len == 4) {
-        const options = try definition_core.json.object(expression.items[3]);
-        var iterator = options.iterator();
-        while (iterator.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "single")) {
-                single = try definition_core.json.boolean(entry.value_ptr.*);
-                continue;
-            }
-            try putNonOverridingReserved(
+    const options = try definition_core.json.object(raw);
+    var iterator = options.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "single")) {
+            single = try definition_core.json.boolean(entry.value_ptr.*);
+            continue;
+        }
+        try putNonOverridingReserved(
+            allocator,
+            result,
+            entry.key_ptr.*,
+            try lowerNestedExpressions(
                 allocator,
-                &result,
                 entry.key_ptr.*,
-                try lowerNestedExpressions(
-                    allocator,
-                    entry.key_ptr.*,
-                    entry.value_ptr.*,
-                    terms,
-                    allow_terms,
-                    budget,
-                ),
-                &.{
-                    "path",
-                    "reference",
-                    "target",
-                    "target_input",
-                    "key",
-                    "sources",
-                    "targets",
-                },
-            );
-        }
+                entry.value_ptr.*,
+                terms,
+                allow_terms,
+                budget,
+            ),
+            &.{
+                "path",
+                "reference",
+                "target",
+                "target_input",
+                "key",
+                "sources",
+                "targets",
+            },
+        );
     }
-    if (single) {
-        if (sources.items.len != 1 or targets.items.len != 1) {
-            return error.InvalidCompactRelation;
-        }
-        const source = try definition_core.json.object(sources.items[0]);
-        const target = try definition_core.json.object(targets.items[0]);
-        try definition_core.json.requireExactKeys(
-            source,
-            &.{ "path", "reference" },
-        );
-        try definition_core.json.requireExactKeys(
-            target,
-            &.{ "path", "items", "key", "rules", "coverage_rules" },
-        );
-        try result.put(
-            allocator,
-            "path",
-            try definition_core.json.field(source, "path"),
-        );
-        try result.put(
-            allocator,
-            "reference",
-            try definition_core.json.field(source, "reference"),
-        );
-        try result.put(
-            allocator,
-            "target",
-            try definition_core.json.field(target, "path"),
-        );
-        try result.put(
-            allocator,
-            "key",
-            try definition_core.json.field(target, "key"),
-        );
-        if (target.get("items")) |items| {
-            try result.put(allocator, "target_items", items);
-        }
-        if (target.get("rules")) |rules| {
-            try result.put(allocator, "target_rules", rules);
-        }
-        if (target.get("coverage_rules")) |rules| {
-            try result.put(allocator, "coverage_rules", rules);
-        }
-    } else {
-        try result.put(allocator, "sources", .{ .array = sources });
-        try result.put(allocator, "targets", .{ .array = targets });
+    return single;
+}
+
+fn flattenCompactRelation(
+    allocator: std.mem.Allocator,
+    result: *std.json.ObjectMap,
+    sources: std.json.Array,
+    targets: std.json.Array,
+) !void {
+    if (sources.items.len != 1 or targets.items.len != 1) {
+        return error.InvalidCompactRelation;
     }
-    return .{ .object = result };
+    const source = try definition_core.json.object(sources.items[0]);
+    const target = try definition_core.json.object(targets.items[0]);
+    try definition_core.json.requireExactKeys(
+        source,
+        &.{ "path", "reference" },
+    );
+    try definition_core.json.requireExactKeys(
+        target,
+        &.{ "path", "items", "key", "rules", "coverage_rules" },
+    );
+    try result.put(
+        allocator,
+        "path",
+        try definition_core.json.field(source, "path"),
+    );
+    try result.put(
+        allocator,
+        "reference",
+        try definition_core.json.field(source, "reference"),
+    );
+    try result.put(
+        allocator,
+        "target",
+        try definition_core.json.field(target, "path"),
+    );
+    try result.put(
+        allocator,
+        "key",
+        try definition_core.json.field(target, "key"),
+    );
+    if (target.get("items")) |items| {
+        try result.put(allocator, "target_items", items);
+    }
+    if (target.get("rules")) |rules| {
+        try result.put(allocator, "target_rules", rules);
+    }
+    if (target.get("coverage_rules")) |rules| {
+        try result.put(allocator, "coverage_rules", rules);
+    }
 }
 
 const CompactEndpoint = struct {
@@ -2204,51 +2930,64 @@ fn collectDocumentTypeUses(
     used: *std.json.ObjectMap,
     depth: usize,
 ) anyerror!void {
-    if (depth > 64) return error.ArtifactRuleDepthExceeded;
-    if (raw == .array) {
-        const reference = try definition_core.json.array(raw);
-        if (reference.items.len == 2 and
-            reference.items[0] == .string and
-            std.mem.eql(u8, reference.items[0].string, "use"))
-        {
-            const name = try definition_core.json.string(reference.items[1]);
-            try definition_core.json.safeIdentifier(name, 128);
-            try used.put(allocator, name, .null);
-        }
-        return;
+    var stack: std.ArrayList(ValueDepth) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .value = raw, .depth = depth });
+    while (stack.pop()) |current| {
+        if (current.depth > 64) return error.ArtifactRuleDepthExceeded;
+        if (try recordDocumentTypeUse(allocator, current.value, used)) continue;
+        const node = try definition_core.json.object(current.value);
+        try appendDocumentNodeChildren(
+            allocator,
+            &stack,
+            node,
+            current.depth + 1,
+        );
     }
-    const node = try definition_core.json.object(raw);
+}
+
+const ValueDepth = struct {
+    value: std.json.Value,
+    depth: usize,
+};
+
+fn recordDocumentTypeUse(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    used: *std.json.ObjectMap,
+) !bool {
+    if (raw != .array) return false;
+    const reference = try definition_core.json.array(raw);
+    if (reference.items.len == 2 and reference.items[0] == .string and
+        std.mem.eql(u8, reference.items[0].string, "use"))
+    {
+        const name = try definition_core.json.string(reference.items[1]);
+        try definition_core.json.safeIdentifier(name, 128);
+        try used.put(allocator, name, .null);
+    }
+    return true;
+}
+
+fn appendDocumentNodeChildren(
+    allocator: std.mem.Allocator,
+    stack: *std.ArrayList(ValueDepth),
+    node: std.json.ObjectMap,
+    depth: usize,
+) !void {
     if (node.get("fields")) |raw_fields| {
-        var iterator = (try definition_core.json.object(
-            raw_fields,
-        )).iterator();
+        var iterator = (try definition_core.json.object(raw_fields)).iterator();
         while (iterator.next()) |entry| {
-            try collectDocumentTypeUses(
-                allocator,
-                entry.value_ptr.*,
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{ .value = entry.value_ptr.*, .depth = depth });
         }
     }
     inline for (.{ "items", "values" }) |name| {
         if (node.get(name)) |child| {
-            try collectDocumentTypeUses(
-                allocator,
-                child,
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{ .value = child, .depth = depth });
         }
     }
     if (node.get("one_of")) |raw_variants| {
         for ((try definition_core.json.array(raw_variants)).items) |variant| {
-            try collectDocumentTypeUses(
-                allocator,
-                variant,
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{ .value = variant, .depth = depth });
         }
     }
     if (node.get("tagged")) |raw_tagged| {
@@ -2258,13 +2997,14 @@ fn collectDocumentTypeUses(
         );
         for (variants.items) |raw_variant| {
             const variant = try definition_core.json.object(raw_variant);
-            try collectDocumentTypeUses(
-                allocator,
-                try definition_core.json.field(variant, "node"),
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{
+                .value = try definition_core.json.field(variant, "node"),
+                .depth = depth,
+            });
         }
+    }
+    if (stack.items.len > ExpansionBudget.max_emitted) {
+        return error.SourceGraphExpansionLimitExceeded;
     }
 }
 
@@ -2286,14 +3026,47 @@ fn collectLawTermUses(
     used: *std.json.ObjectMap,
     depth: usize,
 ) anyerror!void {
-    if (depth > 64) return error.ArtifactRuleDepthExceeded;
-    const laws = try definition_core.json.array(raw);
+    var stack: std.ArrayList(LawUseTask) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .laws = .{ .value = raw, .depth = depth } });
+    while (stack.pop()) |task| {
+        switch (task) {
+            .laws => |current| try inspectLawList(
+                allocator,
+                current,
+                used,
+                &stack,
+            ),
+            .nested => |current| try inspectNestedLawValue(
+                allocator,
+                current,
+                &stack,
+            ),
+        }
+        if (stack.items.len > ExpansionBudget.max_emitted) {
+            return error.SourceGraphExpansionLimitExceeded;
+        }
+    }
+}
+
+const LawUseTask = union(enum) {
+    laws: ValueDepth,
+    nested: ValueDepth,
+};
+
+fn inspectLawList(
+    allocator: std.mem.Allocator,
+    current: ValueDepth,
+    used: *std.json.ObjectMap,
+    stack: *std.ArrayList(LawUseTask),
+) !void {
+    if (current.depth > 64) return error.ArtifactRuleDepthExceeded;
+    const laws = try definition_core.json.array(current.value);
     for (laws.items) |raw_expression| {
         const expression = try definition_core.json.array(raw_expression);
         if (expression.items.len == 0) continue;
         const operator = try definition_core.json.string(expression.items[0]);
-        if (std.mem.eql(u8, operator, "use")) {
-            if (expression.items.len != 2) continue;
+        if (std.mem.eql(u8, operator, "use") and expression.items.len == 2) {
             const name = try definition_core.json.string(expression.items[1]);
             try definition_core.json.safeIdentifier(name, 128);
             try used.put(allocator, name, .null);
@@ -2304,77 +3077,65 @@ fn collectLawTermUses(
             std.mem.eql(u8, operator, "none")) and
             expression.items.len == 3)
         {
-            try collectLawTermUses(
-                allocator,
-                expression.items[2],
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{
+                .laws = .{
+                    .value = expression.items[2],
+                    .depth = current.depth + 1,
+                },
+            });
         }
         if (std.mem.eql(u8, operator, "implies") and
-            expression.items.len == 4 and
-            expression.items[3] == .array)
+            expression.items.len == 4 and expression.items[3] == .array)
         {
-            try collectLawTermUses(
-                allocator,
-                expression.items[3],
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{
+                .laws = .{
+                    .value = expression.items[3],
+                    .depth = current.depth + 1,
+                },
+            });
         }
         for (expression.items[1..]) |item| {
-            try collectNestedLawTermUses(
-                allocator,
-                item,
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{
+                .nested = .{ .value = item, .depth = current.depth + 1 },
+            });
         }
     }
 }
 
-fn collectNestedLawTermUses(
+fn inspectNestedLawValue(
     allocator: std.mem.Allocator,
-    raw: std.json.Value,
-    used: *std.json.ObjectMap,
-    depth: usize,
-) anyerror!void {
-    if (depth > 64) return error.ArtifactRuleDepthExceeded;
-    switch (raw) {
+    current: ValueDepth,
+    stack: *std.ArrayList(LawUseTask),
+) !void {
+    if (current.depth > 64) return error.ArtifactRuleDepthExceeded;
+    switch (current.value) {
         .object => |object| {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "rules") or
-                    std.mem.eql(u8, entry.key_ptr.*, "target_rules") or
-                    std.mem.eql(u8, entry.key_ptr.*, "coverage_rules") or
-                    std.mem.eql(u8, entry.key_ptr.*, "match_rules"))
-                {
-                    try collectLawTermUses(
-                        allocator,
-                        entry.value_ptr.*,
-                        used,
-                        depth + 1,
-                    );
-                    continue;
-                }
-                try collectNestedLawTermUses(
-                    allocator,
-                    entry.value_ptr.*,
-                    used,
-                    depth + 1,
-                );
+                const child = ValueDepth{
+                    .value = entry.value_ptr.*,
+                    .depth = current.depth + 1,
+                };
+                try stack.append(allocator, if (isRuleListKey(entry.key_ptr.*))
+                    .{ .laws = child }
+                else
+                    .{ .nested = child });
             }
         },
         .array => |array| for (array.items) |item| {
-            try collectNestedLawTermUses(
-                allocator,
-                item,
-                used,
-                depth + 1,
-            );
+            try stack.append(allocator, .{
+                .nested = .{ .value = item, .depth = current.depth + 1 },
+            });
         },
         else => {},
     }
+}
+
+fn isRuleListKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "rules") or
+        std.mem.eql(u8, key, "target_rules") or
+        std.mem.eql(u8, key, "coverage_rules") or
+        std.mem.eql(u8, key, "match_rules");
 }
 
 fn putNonOverriding(
@@ -2465,33 +3226,16 @@ fn joinPointer(
     return result.toOwnedSlice(allocator);
 }
 
+const structural_graph_source =
+    \\{"documents":{"record":{"object":"closed","fields":{"id":{"identifier":{"max":32}},"status":{"enum":["open","closed"]},"note":{"optional":"nullable","string":{"max":128}},"required_note":{"if_present":"nullable","string":{"max":128}}}}}}
+;
+
 test "structural graph lowers to bounded native rules" {
     const allocator = std.testing.allocator;
-    const source =
-        \\{
-        \\  "documents": {
-        \\    "record": {
-        \\      "object": "closed",
-        \\      "fields": {
-        \\        "id": {"identifier": {"max": 32}},
-        \\        "status": {"enum": ["open", "closed"]},
-        \\        "note": {
-        \\          "optional": "nullable",
-        \\          "string": {"max": 128}
-        \\        },
-        \\        "required_note": {
-        \\          "if_present": "nullable",
-        \\          "string": {"max": 128}
-        \\        }
-        \\      }
-        \\    }
-        \\  }
-        \\}
-    ;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
-        source,
+        structural_graph_source,
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();
@@ -2683,18 +3427,7 @@ test "structural graph closes declarations and bounds expansion" {
 test "law expressions lower nested rules without executable hooks" {
     const allocator = std.testing.allocator;
     const source =
-        \\{
-        \\  "laws": [
-        \\    ["implies", {
-        \\      "input": "record",
-        \\      "if": "/status",
-        \\      "equals": "closed",
-        \\      "rules": [
-        \\        ["bounded-string", {"path": "/note", "min": 1}]
-        \\      ]
-        \\    }]
-        \\  ]
-        \\}
+        \\{"laws":[["implies",{"input":"record","if":"/status","equals":"closed","rules":[["bounded-string",{"path":"/note","min":1}]]}]]}
     ;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -2752,52 +3485,16 @@ test "literal values do not satisfy law term closure" {
     );
 }
 
+const compact_protocol_source =
+    \\{"terms":{"same-id":["cross-input-equal","#/id","prior#/id"]},"scope":{"input":"event","path":"/body"},"laws":[["use","same-id"],["reference-exists",[["#/refs",""]],[["prior#/items","/id"]],{"single":true}]],"event_log":{"start":1,"genesis":null,"kinds":["created"]},"state":{"mode":"retained","event_kind":"/kind","registers":{"current":4096},"sets":{},"admissions":[{"on":"created","forbids":["current"],"actions":[["set","current","event#/body"]]}]}}
+;
+
 test "compact terms scope protocol and retained state lower once" {
     const allocator = std.testing.allocator;
-    const source =
-        \\{
-        \\  "terms": {
-        \\    "same-id": [
-        \\      "cross-input-equal",
-        \\      "#/id",
-        \\      "prior#/id"
-        \\    ]
-        \\  },
-        \\  "scope": {
-        \\    "input": "event",
-        \\    "path": "/body"
-        \\  },
-        \\  "laws": [
-        \\    ["use", "same-id"],
-        \\    [
-        \\      "reference-exists",
-        \\      [["#/refs", ""]],
-        \\      [["prior#/items", "/id"]],
-        \\      {"single": true}
-        \\    ]
-        \\  ],
-        \\  "event_log": {
-        \\    "start": 1,
-        \\    "genesis": null,
-        \\    "kinds": ["created"]
-        \\  },
-        \\  "state": {
-        \\    "mode": "retained",
-        \\    "event_kind": "/kind",
-        \\    "registers": {"current": 4096},
-        \\    "sets": {},
-        \\    "admissions": [{
-        \\      "on": "created",
-        \\      "forbids": ["current"],
-        \\      "actions": [["set", "current", "event#/body"]]
-        \\    }]
-        \\  }
-        \\}
-    ;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
-        source,
+        compact_protocol_source,
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();
@@ -2893,42 +3590,16 @@ test "compact relation options cannot redirect the declared target input" {
     );
 }
 
+const shared_event_source =
+    \\{"$event":{"slot":"events","effect":"compare-and-append","input":"request","mode":"chained","body_input":"body","request":{"schema":"example-request/v1","kind":"$kind"},"forbid":["capability"],"fields":{"event_id":["sequence","e-"],"kind":["literal","$kind"],"recorded_at":"unix-seconds"}},"capture":"created","bind":{"effect":"bind-existing","input":"existing","kind":"input","request":null,"forbid":[],"fields":{"kind":"input"}}}
+;
+
 test "shared event template lowers passive operation plans" {
     const allocator = std.testing.allocator;
-    const source =
-        \\{
-        \\  "$event": {
-        \\    "slot": "events",
-        \\    "effect": "compare-and-append",
-        \\    "input": "request",
-        \\    "mode": "chained",
-        \\    "body_input": "body",
-        \\    "request": {
-        \\      "schema": "example-request/v1",
-        \\      "kind": "$kind"
-        \\    },
-        \\    "forbid": ["capability"],
-        \\    "fields": {
-        \\      "event_id": ["sequence", "e-"],
-        \\      "kind": ["literal", "$kind"],
-        \\      "recorded_at": "unix-seconds"
-        \\    }
-        \\  },
-        \\  "capture": "created",
-        \\  "bind": {
-        \\    "effect": "bind-existing",
-        \\    "input": "existing",
-        \\    "kind": "input",
-        \\    "request": null,
-        \\    "forbid": [],
-        \\    "fields": {"kind": "input"}
-        \\  }
-        \\}
-    ;
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
-        source,
+        shared_event_source,
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();

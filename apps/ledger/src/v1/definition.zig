@@ -631,6 +631,78 @@ const DefinitionBody = struct {
     }
 };
 
+const LoweredDefinitionSources = struct {
+    shape_rules: std.json.Value,
+    constraint_rules: std.json.Value,
+    operation_plans: std.json.Value,
+};
+
+fn lowerDefinitionSources(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    inputs: []const Input,
+    budget: *source_graph.ExpansionBudget,
+) !LoweredDefinitionSources {
+    const input_names = try allocator.alloc([]const u8, inputs.len);
+    for (inputs, input_names) |input, *name| name.* = input.name;
+    return .{
+        .shape_rules = try source_graph.lowerShape(
+            allocator,
+            try definition_core.json.field(root, "shape"),
+            input_names,
+            budget,
+        ),
+        .constraint_rules = try source_graph.lowerConstraints(
+            allocator,
+            try definition_core.json.field(root, "constraints"),
+            input_names,
+            budget,
+        ),
+        .operation_plans = try source_graph.lowerOperations(
+            allocator,
+            try definition_core.json.field(root, "operations"),
+            budget,
+        ),
+    };
+}
+
+const DefinitionJson = struct {
+    canonicalization: []u8,
+    identity: []u8,
+    storage: []u8,
+
+    fn deinit(self: *DefinitionJson, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
+        allocator.free(self.identity);
+        allocator.free(self.canonicalization);
+        self.* = undefined;
+    }
+};
+
+fn copyDefinitionJson(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+) !DefinitionJson {
+    const canonicalization = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        try definition_core.json.field(root, "canonicalization"),
+    );
+    errdefer allocator.free(canonicalization);
+    const identity = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        try definition_core.json.field(root, "identity"),
+    );
+    errdefer allocator.free(identity);
+    return .{
+        .canonicalization = canonicalization,
+        .identity = identity,
+        .storage = try definition_core.canonical_json.canonicalJsonAlloc(
+            allocator,
+            try definition_core.json.field(root, "storage"),
+        ),
+    };
+}
+
 fn compileDefinitionBody(
     allocator: std.mem.Allocator,
     root: std.json.ObjectMap,
@@ -641,24 +713,11 @@ fn compileDefinitionBody(
     var source_arena = std.heap.ArenaAllocator.init(allocator);
     defer source_arena.deinit();
     const source_allocator = source_arena.allocator();
-    const input_names = try source_allocator.alloc([]const u8, inputs.len);
-    for (inputs, input_names) |input, *name| name.* = input.name;
     var expansion_budget: source_graph.ExpansionBudget = .{};
-    const shape_rules = try source_graph.lowerShape(
+    const lowered = try lowerDefinitionSources(
         source_allocator,
-        try definition_core.json.field(root, "shape"),
-        input_names,
-        &expansion_budget,
-    );
-    const constraint_rules = try source_graph.lowerConstraints(
-        source_allocator,
-        try definition_core.json.field(root, "constraints"),
-        input_names,
-        &expansion_budget,
-    );
-    const operation_plans = try source_graph.lowerOperations(
-        source_allocator,
-        try definition_core.json.field(root, "operations"),
+        root,
+        inputs,
         &expansion_budget,
     );
     var compiler = Compiler{
@@ -668,8 +727,8 @@ fn compileDefinitionBody(
     };
     errdefer compiler.deinit();
     try compiler.compileValue(try definition_core.json.field(root, "canonicalization"), 0);
-    try compiler.compileValue(shape_rules, 0);
-    try compiler.compileValue(constraint_rules, 0);
+    try compiler.compileValue(lowered.shape_rules, 0);
+    try compiler.compileValue(lowered.constraint_rules, 0);
     try compiler.compileValue(try definition_core.json.field(root, "identity"), 0);
     try compiler.compileValue(try definition_core.json.field(root, "storage"), 0);
 
@@ -677,7 +736,7 @@ fn compileDefinitionBody(
         allocator,
         &compiler,
         try definition_core.json.object(
-            operation_plans,
+            lowered.operation_plans,
         ),
     );
     errdefer deinitNamedPlans(allocator, operations);
@@ -691,25 +750,8 @@ fn compileDefinitionBody(
     errdefer deinitNamedPlans(allocator, projections);
     if (root.get("diagnostics")) |diagnostics| try compiler.compileValue(diagnostics, 0);
 
-    const canonicalization_json =
-        try definition_core.canonical_json.canonicalJsonAlloc(
-            allocator,
-            try definition_core.json.field(root, "canonicalization"),
-        );
-    errdefer allocator.free(canonicalization_json);
-    const identity_json =
-        try definition_core.canonical_json.canonicalJsonAlloc(
-            allocator,
-            try definition_core.json.field(root, "identity"),
-        );
-    errdefer allocator.free(identity_json);
-    const storage_json =
-        try definition_core.canonical_json.canonicalJsonAlloc(
-            allocator,
-            try definition_core.json.field(root, "storage"),
-        );
-    errdefer allocator.free(storage_json);
-
+    var definition_json = try copyDefinitionJson(allocator, root);
+    errdefer definition_json.deinit(allocator);
     const pointers = try compiler.pointers.toOwnedSlice(allocator);
     errdefer deinitPointers(allocator, pointers);
     const rules = try compiler.rules.toOwnedSlice(allocator);
@@ -717,9 +759,9 @@ fn compileDefinitionBody(
     return .{
         .operations = operations,
         .projections = projections,
-        .canonicalization_json = canonicalization_json,
-        .identity_json = identity_json,
-        .storage_json = storage_json,
+        .canonicalization_json = definition_json.canonicalization,
+        .identity_json = definition_json.identity,
+        .storage_json = definition_json.storage,
         .pointers = pointers,
         .rules = rules,
     };
@@ -1838,7 +1880,7 @@ test "artifact definition compiles structural rules and effect plans" {
     try std.testing.expectEqual(plan.projections.len, cached.projections.len);
 }
 
-test "artifact definition rejects executable hooks and undeclared operators" {
+test "artifact definition rejects executable hooks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -1872,7 +1914,11 @@ test "artifact definition rejects executable hooks and undeclared operators" {
         error.ExecutableDefinitionField,
         compile(std.testing.allocator, &nested_hook_closure, "nested-hook.json"),
     );
+}
 
+test "artifact definition rejects undeclared operators and unused terms" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "operator.json",
         .data = undeclared_operator_definition_json,

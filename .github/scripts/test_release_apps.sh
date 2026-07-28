@@ -38,6 +38,21 @@ assert_affected() {
   fi
 }
 
+assert_ci_affected() {
+  local expected=$1
+  shift
+  git reset --hard -q "$base"
+  git clean -fdq
+  "$@"
+  git add -A
+  git commit -qm case
+  actual=$(bash "$classifier" ci-affected "$base" HEAD | paste -sd, -)
+  if [[ "$actual" != "$expected" ]]; then
+    echo "expected ci-affected=$expected actual=$actual" >&2
+    exit 1
+  fi
+}
+
 write_seq() {
   mkdir -p apps/seq/src
   printf 'seq\n' >apps/seq/src/main.zig
@@ -87,6 +102,21 @@ write_readme() {
   printf '# docs only\n' >apps/seq/README.md
 }
 
+write_definition_guard() {
+  mkdir -p scripts/guards
+  printf '#!/usr/bin/env bash\n' >scripts/guards/definition-core-domain.sh
+}
+
+write_seq_smoke() {
+  mkdir -p scripts
+  printf '#!/usr/bin/env bash\n' >scripts/test-seq-cli.sh
+}
+
+write_ledger_smoke() {
+  mkdir -p scripts
+  printf '#!/usr/bin/env bash\n' >scripts/test-ledger-cli.sh
+}
+
 assert_affected seq write_seq
 assert_affected seq,ledger write_definition_core
 assert_affected seq,cas write_trace_core
@@ -98,6 +128,9 @@ assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_c
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
 assert_affected "" write_readme
+assert_ci_affected seq,ledger write_definition_guard
+assert_ci_affected seq write_seq_smoke
+assert_ci_affected ledger write_ledger_smoke
 
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION

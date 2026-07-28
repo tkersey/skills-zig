@@ -321,6 +321,7 @@ fn runRelation(
 
     try writer.writeByte('[');
     var first = true;
+    var matched_sessions: usize = 0;
     for (paths.items) |path| {
         var trace = if (relation == .sessions)
             try trace_core.parseSessionSummaryTrace(
@@ -336,12 +337,14 @@ fn runRelation(
             );
         defer trace.deinit(allocator);
         if (!sessionPasses(trace.session, options)) continue;
+        if (options.limit != 0 and matched_sessions == options.limit) break;
         _ = try trace_adapter.writeRelationRowsJson(
             writer,
             &trace,
             relation,
             &first,
         );
+        matched_sessions += 1;
     }
     try writer.writeAll("]\n");
 }
@@ -385,6 +388,7 @@ fn runSessionGraph(
     var paths = try resolveTargetPaths(allocator, io, options, false);
     defer freePaths(allocator, &paths);
     try writer.writeAll("digraph codex_sessions {\n");
+    var matched_sessions: usize = 0;
     for (paths.items) |path| {
         var trace = try trace_core.parseSessionTrace(
             allocator,
@@ -392,6 +396,8 @@ fn runSessionGraph(
             traceOptions(.session_edges),
         );
         defer trace.deinit(allocator);
+        if (!sessionPasses(trace.session, options)) continue;
+        if (options.limit != 0 and matched_sessions == options.limit) break;
         for (trace.graph_edges.items) |edge| {
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse continue;
@@ -401,6 +407,7 @@ fn runSessionGraph(
             try definition_core.canonical_json.writeCanonicalString(writer, worker);
             try writer.writeAll(";\n");
         }
+        matched_sessions += 1;
     }
     try writer.writeAll("}\n");
 }
@@ -444,6 +451,7 @@ fn runFindSession(
 
     try writer.writeByte('[');
     var first = true;
+    var matched_sessions: usize = 0;
     for (paths.items) |path| {
         var trace = try trace_core.parseSessionTrace(
             allocator,
@@ -459,12 +467,14 @@ fn runFindSession(
             if (!traceContainsPrompt(&trace, needle)) continue;
         }
         if (!sessionPasses(trace.session, options)) continue;
+        if (options.limit != 0 and matched_sessions == options.limit) break;
         _ = try trace_adapter.writeRelationRowsJson(
             writer,
             &trace,
             .sessions,
             &first,
         );
+        matched_sessions += 1;
     }
     try writer.writeAll("]\n");
 }
@@ -1228,16 +1238,6 @@ pub fn resolveTargetPaths(
         paths.items.len = write_index;
     } else if (options.current) {
         try retainCurrentPath(allocator, &paths);
-    }
-    if (options.limit > 0 and paths.items.len > options.limit) {
-        const remove_count = paths.items.len - options.limit;
-        for (paths.items[0..remove_count]) |path| allocator.free(path);
-        std.mem.copyForwards(
-            []u8,
-            paths.items[0..options.limit],
-            paths.items[remove_count..],
-        );
-        paths.items.len = options.limit;
     }
     if (require_single) {
         if (paths.items.len == 0) return error.SessionNotFound;

@@ -18,6 +18,7 @@ on:
       - "libs/durable_store/**"
       - "libs/jsonl_core/**"
       - "libs/trace_core/**"
+      - "scripts/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"

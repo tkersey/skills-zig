@@ -124,19 +124,61 @@ fn duplicateUtf8(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 }
 
 fn validateTimestamp(text: []const u8) !void {
-    if (text.len < 20 or text[4] != '-' or text[7] != '-' or text[10] != 'T' or
-        text[13] != ':' or text[16] != ':' or
-        (text[text.len - 1] != 'Z' and
-            std.mem.lastIndexOfAny(u8, text, "+-") == null))
+    if (text.len < 20 or text[4] != '-' or text[7] != '-' or
+        text[10] != 'T' or text[13] != ':' or text[16] != ':')
     {
         return error.InvalidTimestamp;
     }
-    for (text[0..4]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
-    for (text[5..7]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
-    for (text[8..10]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
-    for (text[11..13]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
-    for (text[14..16]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
-    for (text[17..19]) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
+    const year = try decimalComponent(text[0..4]);
+    const month = try decimalComponent(text[5..7]);
+    const day = try decimalComponent(text[8..10]);
+    const hour = try decimalComponent(text[11..13]);
+    const minute = try decimalComponent(text[14..16]);
+    const second = try decimalComponent(text[17..19]);
+    if (month == 0 or month > 12 or day == 0 or
+        day > daysInMonth(year, month) or hour > 23 or minute > 59 or
+        second > 60)
+    {
+        return error.InvalidTimestamp;
+    }
+
+    var offset_index: usize = 19;
+    if (text[offset_index] == '.') {
+        offset_index += 1;
+        const fraction_start = offset_index;
+        while (offset_index < text.len and
+            std.ascii.isDigit(text[offset_index])) : (offset_index += 1)
+        {}
+        if (offset_index == fraction_start) return error.InvalidTimestamp;
+    }
+    if (offset_index == text.len - 1 and text[offset_index] == 'Z') return;
+    if (offset_index + 6 != text.len or
+        (text[offset_index] != '+' and text[offset_index] != '-') or
+        text[offset_index + 3] != ':')
+    {
+        return error.InvalidTimestamp;
+    }
+    const offset_hour = try decimalComponent(text[offset_index + 1 .. offset_index + 3]);
+    const offset_minute = try decimalComponent(text[offset_index + 4 ..]);
+    if (offset_hour > 23 or offset_minute > 59) return error.InvalidTimestamp;
+}
+
+fn decimalComponent(text: []const u8) !u16 {
+    if (text.len == 0) return error.InvalidTimestamp;
+    var value: u16 = 0;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte)) return error.InvalidTimestamp;
+        value = value * 10 + byte - '0';
+    }
+    return value;
+}
+
+fn daysInMonth(year: u16, month: u16) u16 {
+    return switch (month) {
+        2 => if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
 }
 
 test "typed scalar parsing rejects ambiguous values" {
@@ -154,4 +196,22 @@ test "typed scalar parsing rejects ambiguous values" {
         error.InvalidRelativePath,
         parseAlloc(std.testing.allocator, .relative_path, "../escape"),
     );
+    for ([_][]const u8{
+        "2026-99-99T99:99:99Z",
+        "2026-01-01T00:00:00garbage",
+        "2025-02-29T00:00:00Z",
+        "2026-01-01T00:00:00+24:00",
+        "2026-01-01T00:00:00.",
+    }) |invalid| {
+        try std.testing.expectError(
+            error.InvalidTimestamp,
+            parseAlloc(std.testing.allocator, .timestamp, invalid),
+        );
+    }
+    var timestamp = try parseAlloc(
+        std.testing.allocator,
+        .timestamp,
+        "2024-02-29T23:59:60.125-07:30",
+    );
+    defer timestamp.deinit(std.testing.allocator);
 }

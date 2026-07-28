@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
+const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
@@ -1075,13 +1076,46 @@ fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
     defer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
+    try verifyDcpContentIdentity(allocator, parsed.value);
     return dcpFromValue(allocator, parsed.value);
 }
 
+fn verifyDcpContentIdentity(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.NotObject,
+    };
+    const packet = rootObject(root, "decision_context_packet") orelse root;
+    const claimed = try requiredString(packet, "packet_id");
+    const canonical = try definition_core.canonical_json.canonicalJsonOmittingKeyAlloc(
+        allocator,
+        value,
+        "packet_id",
+    );
+    defer allocator.free(canonical);
+    const digest = try definition_core.canonical_json.digestBytesAlloc(
+        allocator,
+        canonical,
+    );
+    defer allocator.free(digest);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "DCP-{s}",
+        .{digest["sha256:".len..]},
+    );
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, claimed, expected)) {
+        return error.DcpContentIdentityMismatch;
+    }
+}
+
 fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
-    // Retrace owns DCP structure and validates the canonical packet through
-    // Ledger before CAS receives it. CAS parses only the carriers needed to
-    // bind its inquiry effects and independently checks their live source.
+    // Ledger validates the DCP before this boundary. CAS independently binds
+    // every consumed carrier to the materialized content identity and live
+    // source so a substituted packet cannot inherit a validated identity.
     const root = switch (value) {
         .object => |obj| obj,
         else => return error.NotObject,
@@ -4523,6 +4557,21 @@ const test_dcp_json =
     \\  }
     \\}
 ;
+
+test "CAS rejects a DCP identity that does not bind its content" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        test_dcp_json,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.DcpContentIdentityMismatch,
+        verifyDcpContentIdentity(allocator, parsed.value),
+    );
+}
 
 test "CAS consumes the explicit DCP-v2 source episode identity" {
     const allocator = std.testing.allocator;

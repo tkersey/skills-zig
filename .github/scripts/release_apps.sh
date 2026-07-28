@@ -77,6 +77,15 @@ case "$mode" in
         libs/durable_store/*|libs/jsonl_core/*)
           mark_store_consumers
           ;;
+        scripts/guards/definition-core-domain.sh)
+          mark_definition_consumers
+          ;;
+        scripts/test-seq-cli.sh)
+          mark_app seq
+          ;;
+        scripts/test-ledger-cli.sh)
+          mark_app ledger
+          ;;
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;
