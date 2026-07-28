@@ -441,14 +441,33 @@ pub const Effect = struct {
     input_index: u8,
     expected_revision_parameter: ?[]u8,
     idempotency_parameter: ?[]u8,
+    parameter_bindings: []ParameterBinding,
     event: ?EventMaterialization,
     document: ?document.Plan,
 
     fn deinit(self: *Effect, allocator: std.mem.Allocator) void {
         if (self.expected_revision_parameter) |name| allocator.free(name);
         if (self.idempotency_parameter) |name| allocator.free(name);
+        for (self.parameter_bindings) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(self.parameter_bindings);
         if (self.event) |*event| event.deinit(allocator);
         if (self.document) |*plan| plan.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ParameterBinding = struct {
+    parameter: []u8,
+    input_pointer: definition_core.json_pointer.Pointer,
+
+    fn deinit(
+        self: *ParameterBinding,
+        allocator: std.mem.Allocator,
+    ) void {
+        allocator.free(self.parameter);
+        self.input_pointer.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -655,7 +674,7 @@ pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(12);
+    try encoder.writeU16(13);
     try encoder.writeEnum(plan.storage_kind);
     try encodeCacheSlots(plan.slots, encoder);
     try encodeCacheOperations(plan.operations, encoder);
@@ -704,6 +723,11 @@ fn encodeCacheEffect(
     try encoder.writeByte(effect.input_index);
     try encoder.writeOptionalBytes(effect.expected_revision_parameter);
     try encoder.writeOptionalBytes(effect.idempotency_parameter);
+    try encoder.writeCount(effect.parameter_bindings.len);
+    for (effect.parameter_bindings) |binding| {
+        try encoder.writeBytes(binding.parameter);
+        try encoder.writeBytes(binding.input_pointer.raw);
+    }
     try encoder.writeBool(effect.event != null);
     if (effect.event) |event| {
         try encodeEventMaterialization(event, encoder);
@@ -799,7 +823,7 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 12) {
+    if (try decoder.readU16() != 13) {
         return error.LedgerStorageCacheVersionMismatch;
     }
     const storage_kind = try decoder.readEnum(definition.StorageKind);
@@ -909,6 +933,11 @@ fn validateCacheEffect(
         return error.CacheStoragePlanMismatch;
     }
     try validateCacheEffectCodec(effect, slot, input);
+    if (effect.parameter_bindings.len != 0 and
+        (slot.kind != .document or input.codec != .json))
+    {
+        return error.CacheStoragePlanMismatch;
+    }
     try validateCacheEffectParameters(effect, definition_plan);
     if (effect.event) |*event| {
         try validateCacheEvent(effect, event, definition_plan);
@@ -961,6 +990,27 @@ fn validateCacheEffectParameters(
             declaration.kind != .safe_identifier)
         {
             return error.CacheStoragePlanMismatch;
+        }
+    }
+    if (effect.parameter_bindings.len != 0 and
+        !definition_plan.requires(.path_format))
+    {
+        return error.CacheStoragePlanMismatch;
+    }
+    try validateParameterBindings(effect.parameter_bindings);
+    for (effect.parameter_bindings) |binding| {
+        const declaration =
+            definition_plan.parameter_declarations.find(
+                binding.parameter,
+            ) orelse return error.CacheStoragePlanMismatch;
+        switch (declaration.kind) {
+            .string,
+            .digest,
+            .timestamp,
+            .safe_identifier,
+            .relative_path,
+            => {},
+            .integer, .boolean => return error.CacheStoragePlanMismatch,
         }
     }
 }
@@ -1234,6 +1284,11 @@ fn decodeCacheEffect(
     if (idempotency_parameter) |value| {
         try definition_core.json.safeIdentifier(value, 128);
     }
+    const parameter_bindings = try decodeParameterBindings(
+        allocator,
+        decoder,
+    );
+    errdefer deinitParameterBindings(allocator, parameter_bindings);
     var event = if (try decoder.readBool())
         try decodeEventMaterialization(allocator, decoder)
     else
@@ -1249,6 +1304,7 @@ fn decodeCacheEffect(
         slots[slot_index],
         expected_revision_parameter,
         idempotency_parameter,
+        parameter_bindings,
         event,
         document_plan,
     );
@@ -1258,6 +1314,7 @@ fn decodeCacheEffect(
         .input_index = input_index,
         .expected_revision_parameter = expected_revision_parameter,
         .idempotency_parameter = idempotency_parameter,
+        .parameter_bindings = parameter_bindings,
         .event = event,
         .document = document_plan,
     };
@@ -1271,6 +1328,7 @@ fn validateDecodedEffect(
     slot: Slot,
     expected_revision_parameter: ?[]const u8,
     idempotency_parameter: ?[]const u8,
+    parameter_bindings: []const ParameterBinding,
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
@@ -1293,6 +1351,10 @@ fn validateDecodedEffect(
     if (document_plan != null and event != null) {
         return error.DuplicateEffectMaterialization;
     }
+    try validateParameterBindings(parameter_bindings);
+    if (parameter_bindings.len != 0 and slot.kind != .document) {
+        return error.EffectParameterBindingsRequireJsonDocument;
+    }
     if (document_plan) |value| {
         if (slot.kind != .document or slot.codec != .text) {
             return error.DocumentMaterializationRequiresTextSlot;
@@ -1304,6 +1366,66 @@ fn validateDecodedEffect(
             .edit => if (kind != .compare_replace) {
                 return error.EditMaterializationRequiresReplace;
             },
+        }
+    }
+}
+
+fn decodeParameterBindings(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]ParameterBinding {
+    const count = try decoder.readCount(64);
+    const bindings = try allocator.alloc(ParameterBinding, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (bindings[0..initialized]) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(bindings);
+    }
+    for (bindings) |*binding| {
+        const parameter = try decoder.readBytesAlloc(allocator, 128);
+        errdefer allocator.free(parameter);
+        try definition_core.json.safeIdentifier(parameter, 128);
+        const raw_pointer = try decoder.readBytesAlloc(allocator, 1024);
+        defer allocator.free(raw_pointer);
+        binding.* = .{
+            .parameter = parameter,
+            .input_pointer = try definition_core.json_pointer.compile(
+                allocator,
+                raw_pointer,
+            ),
+        };
+        initialized += 1;
+    }
+    try validateParameterBindings(bindings);
+    return bindings;
+}
+
+fn deinitParameterBindings(
+    allocator: std.mem.Allocator,
+    bindings: []ParameterBinding,
+) void {
+    for (bindings) |*binding| binding.deinit(allocator);
+    allocator.free(bindings);
+}
+
+fn validateParameterBindings(
+    bindings: []const ParameterBinding,
+) !void {
+    for (bindings, 0..) |binding, index| {
+        try definition_core.json.safeIdentifier(binding.parameter, 128);
+        if (binding.input_pointer.raw.len > 1024) {
+            return error.InvalidEffectParameterBinding;
+        }
+        if (index != 0 and
+            std.mem.order(
+                u8,
+                bindings[index - 1].parameter,
+                binding.parameter,
+            ) != .lt)
+        {
+            return error.EffectParameterBindingsNotSorted;
         }
     }
 }
@@ -2323,22 +2445,8 @@ fn compileEffect(
     raw: std.json.Value,
 ) !Effect {
     const object = try definition_core.json.object(raw);
-    try definition_core.json.requireExactKeys(object, &.{
-        "op",
-        "slot",
-        "input",
-        "expected_revision_param",
-        "idempotency_param",
-        "event",
-        "event_from_operation",
-        "document",
-    });
-    try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
-    const target = try compileEffectTarget(
-        definition_plan,
-        slots,
-        object,
-    );
+    try validateEffectObject(object);
+    const target = try compileEffectTarget(definition_plan, slots, object);
     const expected_revision_parameter = try optionalParameterName(
         allocator,
         definition_plan,
@@ -2353,6 +2461,12 @@ fn compileEffect(
         "idempotency_param",
     );
     errdefer if (idempotency_parameter) |name| allocator.free(name);
+    const parameter_bindings = try compileParameterBindings(
+        allocator,
+        definition_plan,
+        object,
+    );
+    errdefer deinitParameterBindings(allocator, parameter_bindings);
     var event = try compileEffectEvent(
         allocator,
         definition_plan,
@@ -2371,18 +2485,41 @@ fn compileEffect(
         target.kind,
         expected_revision_parameter,
         idempotency_parameter,
+        parameter_bindings,
         event,
         document_plan,
     );
+    if (parameter_bindings.len != 0 and
+        (slots[target.slot_index].kind != .document or
+            definition_plan.inputs[target.input_index].codec != .json))
+    {
+        return error.EffectParameterBindingsRequireJsonDocument;
+    }
     return .{
         .kind = target.kind,
         .slot_index = @intCast(target.slot_index),
         .input_index = @intCast(target.input_index),
         .expected_revision_parameter = expected_revision_parameter,
         .idempotency_parameter = idempotency_parameter,
+        .parameter_bindings = parameter_bindings,
         .event = event,
         .document = document_plan,
     };
+}
+
+fn validateEffectObject(object: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(object, &.{
+        "op",
+        "slot",
+        "input",
+        "expected_revision_param",
+        "idempotency_param",
+        "parameter_bindings",
+        "event",
+        "event_from_operation",
+        "document",
+    });
+    try definition_core.json.requireFields(object, &.{ "op", "slot", "input" });
 }
 
 fn compileEffectTarget(
@@ -2495,6 +2632,7 @@ fn validateCompiledEffectSources(
     kind: EffectKind,
     expected_revision_parameter: ?[]const u8,
     idempotency_parameter: ?[]const u8,
+    parameter_bindings: []const ParameterBinding,
     event: ?EventMaterialization,
     document_plan: ?document.Plan,
 ) !void {
@@ -2517,6 +2655,7 @@ fn validateCompiledEffectSources(
     if (document_plan != null and event != null) {
         return error.DuplicateEffectMaterialization;
     }
+    try validateParameterBindings(parameter_bindings);
 }
 
 fn slotPathUsesParameter(slot: Slot, name: []const u8) bool {
@@ -4729,6 +4868,89 @@ fn optionalParameterName(
     return try allocator.dupe(u8, name);
 }
 
+fn compileParameterBindings(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) ![]ParameterBinding {
+    const raw = object.get("parameter_bindings") orelse
+        return allocator.alloc(ParameterBinding, 0);
+    if (!definition_plan.requires(.path_format)) {
+        return error.UndeclaredArtifactOperator;
+    }
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > 64) {
+        return error.TooManyEffectParameterBindings;
+    }
+    const bindings = try allocator.alloc(ParameterBinding, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (bindings[0..initialized]) |*binding| {
+            binding.deinit(allocator);
+        }
+        allocator.free(bindings);
+    }
+    for (values.items) |value| {
+        bindings[initialized] = try compileParameterBinding(
+            allocator,
+            definition_plan,
+            try definition_core.json.object(value),
+        );
+        initialized += 1;
+    }
+    std.sort.heap(ParameterBinding, bindings, {}, parameterBindingLessThan);
+    try validateParameterBindings(bindings);
+    return bindings;
+}
+
+fn compileParameterBinding(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    binding: std.json.ObjectMap,
+) !ParameterBinding {
+    try definition_core.json.requireExactKeys(
+        binding,
+        &.{ "parameter", "path" },
+    );
+    try definition_core.json.requireFields(
+        binding,
+        &.{ "parameter", "path" },
+    );
+    const parameter_name =
+        try definition_core.json.requiredString(binding, "parameter");
+    const declaration =
+        definition_plan.parameter_declarations.find(parameter_name) orelse
+        return error.UnknownOperationParameter;
+    switch (declaration.kind) {
+        .string,
+        .digest,
+        .timestamp,
+        .safe_identifier,
+        .relative_path,
+        => {},
+        .integer, .boolean => {
+            return error.EffectParameterBindingRequiresText;
+        },
+    }
+    const parameter = try allocator.dupe(u8, parameter_name);
+    errdefer allocator.free(parameter);
+    return .{
+        .parameter = parameter,
+        .input_pointer = try definition_core.json_pointer.compile(
+            allocator,
+            try definition_core.json.requiredString(binding, "path"),
+        ),
+    };
+}
+
+fn parameterBindingLessThan(
+    _: void,
+    left: ParameterBinding,
+    right: ParameterBinding,
+) bool {
+    return std.mem.lessThan(u8, left.parameter, right.parameter);
+}
+
 fn compilePathSegments(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -5157,7 +5379,10 @@ fn advanceParameterPathEnumeration(
             storageIo(),
             entry.name,
             .{ .follow_symlinks = false },
-        ) catch continue;
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
         if (stat.kind == .sym_link) return error.SymlinkStorageSlot;
         const last = frame.segment_index + 1 == segments.len;
         if (last and stat.kind != .file) continue;

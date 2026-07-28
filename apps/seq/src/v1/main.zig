@@ -598,10 +598,11 @@ fn executePhysicalObservation(
         false,
     );
     defer seq.native.freePaths(allocator, &paths);
-    var runner = try seq.execution.Runner.initOwnedAlloc(
+    var runner = try seq.execution.Runner.initOwnedAllocBounded(
         allocator,
         program,
         output,
+        context.definition_plan.bounds.max_output_bytes,
     );
     errdefer runner.deinit();
     var metrics = PhysicalMetrics{};

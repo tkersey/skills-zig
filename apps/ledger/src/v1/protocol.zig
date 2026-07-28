@@ -300,11 +300,13 @@ fn compileReducerPlans(
     }
     var keyed = try reducer.compile(
         allocator,
+        definition_plan,
         rules.transition_table.?,
         reducer_rule,
         definition_plan.bounds,
     );
     errdefer keyed.deinit(allocator);
+    try reducer.validateEventKinds(&keyed, event_kinds);
     if (mode == .plain and keyed.event_kind == null) {
         return error.PlainKeyedReducerRequiresEventKind;
     }
@@ -687,6 +689,8 @@ pub fn validateCachePlan(
         {
             return error.CacheProtocolPlanMismatch;
         }
+        try reducer.validateCachePlan(compiled, definition_plan);
+        try reducer.validateEventKinds(compiled, plan.event_kinds);
     }
     if (plan.state_reducer_plan) |*compiled| {
         try state_reducer.validatePlan(
@@ -4742,6 +4746,31 @@ const retained_protocol_definition =
     protocol_test_append_operation ++ "\"projections\":{}," ++
     protocol_test_bounds_4;
 
+const guarded_keyed_protocol_definition =
+    "{" ++ protocol_test_schema ++
+    "\"id\":\"example/guarded-keyed-protocol\"," ++ protocol_test_owner ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"append-only-log\",\"compare-and-append\",\"cross-input-equal\"," ++
+    "\"event-kinds\",\"reducer\",\"replay\",\"transition-table\"]}," ++
+    protocol_test_event_input ++
+    "\"shape\":{\"documents\":{\"event\":{}}}," ++
+    "\"constraints\":{\"laws\":[[\"append-only-log\",{" ++
+    "\"input\":\"event\"}],[\"event-kinds\",{\"values\":[" ++
+    "\"capture\",\"status\"]}],[\"transition-table\",{\"states\":[" ++
+    "\"closed\",\"open\"],\"transitions\":[{\"from\":null," ++
+    "\"on\":\"open\",\"to\":\"open\"},{\"from\":\"open\"," ++
+    "\"on\":\"closed\",\"to\":\"closed\"}]}],[\"reducer\",{" ++
+    "\"key\":\"/id\",\"on\":\"/status\",\"event_kind\":\"/kind\"," ++
+    "\"retain_once\":\"/record\",\"guards\":[{\"event_kind\":\"status\"," ++
+    "\"on\":\"closed\",\"rules\":[[\"cross-input-equal\",{" ++
+    "\"input\":\"event\",\"left_input\":\"event\",\"left\":\"/claim\"," ++
+    "\"right_input\":\"retained\",\"right\":\"/id\"}]]}]}]]}," ++
+    "\"identity\":{},\"storage\":{\"kind\":\"event-log\",\"slots\":{" ++
+    "\"events\":{\"path\":\"example/guarded.jsonl\",\"kind\":\"event-log\"," ++
+    "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
+    protocol_test_append_operation ++ "\"projections\":{}," ++
+    protocol_test_bounds_4;
+
 const invalid_protocol_definition =
     "{" ++ protocol_test_schema ++
     "\"id\":\"example/protocol-errors\"," ++ protocol_test_owner ++
@@ -5027,6 +5056,39 @@ test "retained reducer validates events against compiled current state" {
         apply(std.testing.allocator, &cached, &state, stale),
     );
     try std.testing.expectEqual(@as(usize, 2), state.records);
+}
+
+test "keyed reducer guards validate transitions against retained values" {
+    var plans = try ProtocolTestPlans.init(guarded_keyed_protocol_definition);
+    defer plans.deinit();
+    var cached = try plans.cacheProtocol();
+    defer cached.deinit(std.testing.allocator);
+    var state = ReplayState.init(&cached);
+    defer state.deinit(std.testing.allocator);
+    try apply(
+        std.testing.allocator,
+        &cached,
+        &state,
+        "{\"id\":\"item-1\",\"kind\":\"capture\"," ++
+            "\"record\":{\"id\":\"expected\"},\"status\":\"open\"}",
+    );
+    try std.testing.expectError(
+        error.ReducerTransitionGuardRejected,
+        apply(
+            std.testing.allocator,
+            &cached,
+            &state,
+            "{\"claim\":\"wrong\",\"id\":\"item-1\"," ++
+                "\"kind\":\"status\",\"status\":\"closed\"}",
+        ),
+    );
+    try apply(
+        std.testing.allocator,
+        &cached,
+        &state,
+        "{\"claim\":\"expected\",\"id\":\"item-1\"," ++
+            "\"kind\":\"status\",\"status\":\"closed\"}",
+    );
 }
 
 test "event materialization reconstructs validated request literals" {

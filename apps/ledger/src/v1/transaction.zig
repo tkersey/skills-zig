@@ -205,6 +205,11 @@ fn transactResolved(
             &execution,
         );
     }
+    try validateOperationParameterBindings(
+        operation,
+        &execution,
+        parameters,
+    );
     return transactValidated(
         allocator,
         definition_plan,
@@ -930,6 +935,12 @@ fn validateExistingContent(
             validation_plan,
             input.name,
             content,
+        );
+        try validateEffectParameterBindingsBytes(
+            allocator,
+            effect,
+            content,
+            parameters,
         );
         return null;
     }
@@ -2891,6 +2902,67 @@ fn parameterText(
     return null;
 }
 
+fn validateOperationParameterBindings(
+    operation: *const storage.Operation,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    for (operation.effects) |effect| {
+        if (effect.parameter_bindings.len == 0) continue;
+        const input = execution.inputJson(effect.input_index) orelse
+            return error.EffectParameterBindingRequiresJsonInput;
+        try validateEffectParameterBindingsValue(
+            effect,
+            input,
+            parameters,
+        );
+    }
+}
+
+fn validateEffectParameterBindingsBytes(
+    allocator: std.mem.Allocator,
+    effect: storage.Effect,
+    bytes: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    if (effect.parameter_bindings.len == 0) return;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    try validateEffectParameterBindingsValue(
+        effect,
+        parsed.value,
+        parameters,
+    );
+}
+
+fn validateEffectParameterBindingsValue(
+    effect: storage.Effect,
+    input: std.json.Value,
+    parameters: *const definition_core.parameters.Bindings,
+) !void {
+    for (effect.parameter_bindings) |binding| {
+        const expected = parameterText(parameters, binding.parameter) orelse
+            return error.MissingOperationParameter;
+        const value = definition_core.json_pointer.lookup(
+            input,
+            binding.input_pointer,
+        ) orelse return error.EffectParameterBindingValueMissing;
+        if (value != .string or
+            !std.mem.eql(u8, expected, value.string))
+        {
+            return error.EffectParameterBindingMismatch;
+        }
+    }
+}
+
 fn parameterBoolean(
     bindings: *const definition_core.parameters.Bindings,
     name: []const u8,
@@ -4202,6 +4274,62 @@ const document_history_definition =
     "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":4096," ++
     "\"max_records\":10,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
     "\"max_reducer_states\":4}}";
+
+const parameter_bound_document_definition =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/parameter-bound-document\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
+    "\"create-new\",\"exact-object\",\"path-format\"]}," ++
+    "\"parameters\":{\"id\":{\"type\":\"safe_identifier\"," ++
+    "\"required\":true}},\"inputs\":{\"record\":{\"codec\":\"json\"," ++
+    "\"max_bytes\":4096}},\"canonicalization\":{}," ++
+    "\"shape\":{\"documents\":{\"record\":{\"object\":\"exact\"," ++
+    "\"fields\":{\"id\":{},\"value\":{}}}}},\"constraints\":{\"laws\":[]}," ++
+    "\"identity\":{},\"storage\":{\"kind\":\"addressed-document\"," ++
+    "\"slots\":{\"current\":{\"path\":\"example/{id}/record.json\"," ++
+    "\"kind\":\"document\",\"codec\":\"json\",\"max_bytes\":4096}}}," ++
+    "\"operations\":{\"create\":{\"effects\":[{\"op\":\"create-new\"," ++
+    "\"slot\":\"current\",\"input\":\"record\",\"parameter_bindings\":[" ++
+    "{\"parameter\":\"id\",\"path\":\"/id\"}]}]}},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":4096," ++
+    "\"max_records\":10,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++
+    "\"max_reducer_states\":4}}";
+
+test "transaction binds logical path parameters to validated input fields" {
+    var plans = try TransactionTestPlans.init(
+        parameter_bound_document_definition,
+        "document.json",
+    );
+    defer plans.deinit();
+    var wrong = try plans.bind(&.{
+        .{ .name = "id", .raw_value = "wrong" },
+    });
+    defer wrong.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.EffectParameterBindingMismatch,
+        plans.execute(
+            null,
+            "create",
+            &.{.{ .name = "record", .bytes = "{\"id\":\"expected\",\"value\":1}" }},
+            &wrong,
+        ),
+    );
+    var expected = try plans.bind(&.{
+        .{ .name = "id", .raw_value = "expected" },
+    });
+    defer expected.deinit(std.testing.allocator);
+    var created = try plans.execute(
+        null,
+        "create",
+        &.{.{ .name = "record", .bytes = "{\"id\":\"expected\",\"value\":1}" }},
+        &expected,
+    );
+    defer created.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "example/expected/record.json",
+        created.effects[0].logical_ref,
+    );
+}
 
 fn createAndReplaceDocument(
     plans: *const TransactionTestPlans,

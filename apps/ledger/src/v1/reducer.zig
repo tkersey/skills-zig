@@ -1,6 +1,7 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
+const validation = @import("validation.zig");
 
 const max_text_bytes = 256;
 const max_states = 65_536;
@@ -24,9 +25,23 @@ const Transition = struct {
     }
 };
 
+const Guard = struct {
+    event_kind: []u8,
+    on: []u8,
+    validation_plan: validation.Plan,
+
+    fn deinit(self: *Guard, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_kind);
+        allocator.free(self.on);
+        self.validation_plan.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const Plan = struct {
     states: [][]u8,
     transitions: []Transition,
+    guards: []Guard,
     key: definition_core.json_pointer.Pointer,
     on: definition_core.json_pointer.Pointer,
     event_kind: ?definition_core.json_pointer.Pointer,
@@ -42,6 +57,8 @@ pub const Plan = struct {
         deinitStringSet(allocator, self.states);
         for (self.transitions) |*transition| transition.deinit(allocator);
         allocator.free(self.transitions);
+        for (self.guards) |*guard| guard.deinit(allocator);
+        allocator.free(self.guards);
         self.key.deinit(allocator);
         self.on.deinit(allocator);
         if (self.event_kind) |*pointer| pointer.deinit(allocator);
@@ -285,6 +302,7 @@ fn writeProjectionRow(
 
 pub fn compile(
     allocator: std.mem.Allocator,
+    definition_plan: ?*const definition.Plan,
     table_rule: definition.Rule,
     reducer_rule: definition.Rule,
     bounds: definition.Bounds,
@@ -295,11 +313,16 @@ pub fn compile(
     }
     var table = try compileTransitionConfig(allocator, table_rule);
     errdefer table.deinit(allocator);
-    var reducer = try compileReducerConfig(allocator, reducer_rule);
+    var reducer = try compileReducerConfig(
+        allocator,
+        definition_plan,
+        reducer_rule,
+    );
     errdefer reducer.deinit(allocator);
     const result: Plan = .{
         .states = table.states,
         .transitions = table.transitions,
+        .guards = reducer.guards,
         .key = reducer.key,
         .on = reducer.on,
         .event_kind = reducer.event_kind,
@@ -365,6 +388,7 @@ const ReducerConfig = struct {
     assert_from: ?definition_core.json_pointer.Pointer,
     assert_to: ?definition_core.json_pointer.Pointer,
     assertion_presence: AssertionPresence,
+    guards: []Guard,
 
     fn deinit(self: *ReducerConfig, allocator: std.mem.Allocator) void {
         self.key.deinit(allocator);
@@ -373,31 +397,21 @@ const ReducerConfig = struct {
         if (self.retain_once) |*pointer| pointer.deinit(allocator);
         if (self.assert_from) |*pointer| pointer.deinit(allocator);
         if (self.assert_to) |*pointer| pointer.deinit(allocator);
+        for (self.guards) |*guard| guard.deinit(allocator);
+        allocator.free(self.guards);
         self.* = undefined;
     }
 };
 
 fn compileReducerConfig(
     allocator: std.mem.Allocator,
+    definition_plan: ?*const definition.Plan,
     reducer_rule: definition.Rule,
 ) !ReducerConfig {
     var reducer_parsed = try parseRule(allocator, reducer_rule);
     defer reducer_parsed.deinit();
     const reducer = reducer_parsed.value.object;
-    try definition_core.json.requireExactKeys(
-        reducer,
-        &.{
-            "op",
-            "key",
-            "on",
-            "event_kind",
-            "retain_once",
-            "from",
-            "to",
-            "assertion_presence",
-        },
-    );
-    try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
+    try validateReducerConfigObject(reducer);
     try requireOperator(reducer, .reducer);
     var key = try compilePointer(
         allocator,
@@ -425,6 +439,19 @@ fn compileReducerConfig(
     errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
     var assert_to = try compileOptionalPointer(allocator, reducer, "to");
     errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
+    const guards = if (reducer.get("guards") != null)
+        try compileGuards(
+            allocator,
+            definition_plan orelse
+                return error.ReducerGuardsRequireDefinitionPlan,
+            reducer,
+        )
+    else
+        try allocator.alloc(Guard, 0);
+    errdefer {
+        for (guards) |*guard| guard.deinit(allocator);
+        allocator.free(guards);
+    }
     return .{
         .key = key,
         .on = on,
@@ -433,20 +460,159 @@ fn compileReducerConfig(
         .assert_from = assert_from,
         .assert_to = assert_to,
         .assertion_presence = try compileAssertionPresence(reducer),
+        .guards = guards,
     };
+}
+
+fn validateReducerConfigObject(reducer: std.json.ObjectMap) !void {
+    try definition_core.json.requireExactKeys(
+        reducer,
+        &.{
+            "op",
+            "key",
+            "on",
+            "event_kind",
+            "retain_once",
+            "from",
+            "to",
+            "assertion_presence",
+            "guards",
+        },
+    );
+    try definition_core.json.requireFields(reducer, &.{ "op", "key", "on" });
+}
+
+fn compileGuards(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    reducer: std.json.ObjectMap,
+) ![]Guard {
+    const raw = reducer.get("guards") orelse return allocator.alloc(Guard, 0);
+    const values = try definition_core.json.array(raw);
+    if (values.items.len > max_transitions) {
+        return error.InvalidReducerGuardCount;
+    }
+    const guards = try allocator.alloc(Guard, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (guards[0..initialized]) |*guard| guard.deinit(allocator);
+        allocator.free(guards);
+    }
+    for (values.items) |value| {
+        guards[initialized] = try compileGuard(
+            allocator,
+            definition_plan,
+            try definition_core.json.object(value),
+        );
+        initialized += 1;
+    }
+    std.sort.heap(Guard, guards, {}, guardLessThan);
+    for (guards[1..], 1..) |guard, index| {
+        if (!guardLessThan({}, guards[index - 1], guard)) {
+            return error.DuplicateReducerGuard;
+        }
+    }
+    return guards;
+}
+
+fn compileGuard(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    object: std.json.ObjectMap,
+) !Guard {
+    try definition_core.json.requireExactKeys(
+        object,
+        &.{ "event_kind", "on", "rules" },
+    );
+    try definition_core.json.requireFields(
+        object,
+        &.{ "event_kind", "on", "rules" },
+    );
+    const event_kind_text =
+        try definition_core.json.requiredString(object, "event_kind");
+    try validateIdentifier(event_kind_text);
+    const event_kind = try allocator.dupe(u8, event_kind_text);
+    errdefer allocator.free(event_kind);
+    const on_text = try definition_core.json.requiredString(object, "on");
+    try validateIdentifier(on_text);
+    const on = try allocator.dupe(u8, on_text);
+    errdefer allocator.free(on);
+    const inputs = try guardInputsAlloc(
+        allocator,
+        definition_plan.bounds.max_input_bytes,
+    );
+    defer deinitGuardInputs(allocator, inputs);
+    var validation_plan = try validation.compileEmbedded(
+        allocator,
+        definition_plan,
+        inputs,
+        try definition_core.json.field(object, "rules"),
+        definition_plan.bounds.max_input_bytes,
+        definition_plan.bounds.max_records,
+        definition_plan.bounds.max_diagnostics,
+    );
+    errdefer validation_plan.deinit(allocator);
+    return .{
+        .event_kind = event_kind,
+        .on = on,
+        .validation_plan = validation_plan,
+    };
+}
+
+fn guardInputsAlloc(
+    allocator: std.mem.Allocator,
+    max_bytes: usize,
+) ![]definition.Input {
+    const inputs = try allocator.alloc(definition.Input, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (inputs[0..initialized]) |*input| input.deinit(allocator);
+        allocator.free(inputs);
+    }
+    const names = [_][]const u8{ "event", "retained" };
+    for (names) |name| {
+        inputs[initialized] = .{
+            .name = try allocator.dupe(u8, name),
+            .codec = .json,
+            .required = true,
+            .max_bytes = max_bytes,
+        };
+        initialized += 1;
+    }
+    return inputs;
+}
+
+fn deinitGuardInputs(
+    allocator: std.mem.Allocator,
+    inputs: []definition.Input,
+) void {
+    for (inputs) |*input| input.deinit(allocator);
+    allocator.free(inputs);
+}
+
+fn guardLessThan(_: void, left: Guard, right: Guard) bool {
+    const event_order = std.mem.order(u8, left.event_kind, right.event_kind);
+    if (event_order != .eq) return event_order == .lt;
+    return std.mem.lessThan(u8, left.on, right.on);
 }
 
 pub fn encodeCache(
     plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(3);
+    try encoder.writeU16(4);
     try encodeStringSet(plan.states, encoder);
     try encoder.writeCount(plan.transitions.len);
     for (plan.transitions) |transition| {
         try encoder.writeOptionalBytes(transition.from);
         try encoder.writeBytes(transition.on);
         try encoder.writeBytes(transition.to);
+    }
+    try encoder.writeCount(plan.guards.len);
+    for (plan.guards) |guard| {
+        try encoder.writeBytes(guard.event_kind);
+        try encoder.writeBytes(guard.on);
+        try validation.encodeCache(&guard.validation_plan, encoder);
     }
     try encoder.writeBytes(plan.key.raw);
     try encoder.writeBytes(plan.on.raw);
@@ -476,17 +642,56 @@ pub fn decodeCache(
     allocator: std.mem.Allocator,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 3) {
+    if (try decoder.readU16() != 4) {
         return error.LedgerReducerCacheVersionMismatch;
     }
     const states = try decodeStringSet(allocator, decoder, max_states);
     errdefer deinitStringSet(allocator, states);
-    const transition_count = try decoder.readCount(max_transitions);
-    if (transition_count == 0) return error.InvalidTransitionTable;
-    const transitions = try allocator.alloc(Transition, transition_count);
-    var transition_initialized: usize = 0;
+    const transitions = try decodeTransitions(allocator, decoder);
+    errdefer deinitTransitions(allocator, transitions);
+    const guards = try decodeGuards(allocator, decoder);
+    errdefer deinitGuards(allocator, guards);
+    var key = try decodePointer(allocator, decoder);
+    errdefer key.deinit(allocator);
+    var on = try decodePointer(allocator, decoder);
+    errdefer on.deinit(allocator);
+    var event_kind = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
+    var retain_once = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
+    var assert_from = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
+    var assert_to = try decodeOptionalPointer(allocator, decoder);
+    errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
+    const result: Plan = .{
+        .states = states,
+        .transitions = transitions,
+        .guards = guards,
+        .key = key,
+        .on = on,
+        .event_kind = event_kind,
+        .retain_once = retain_once,
+        .assert_from = assert_from,
+        .assert_to = assert_to,
+        .assertion_presence = try decoder.readEnum(AssertionPresence),
+        .max_entries = try decoder.readUsize(),
+        .max_retained_value_bytes = try decoder.readUsize(),
+        .max_retained_total_bytes = try decoder.readUsize(),
+    };
+    try validatePlan(&result);
+    return result;
+}
+
+fn decodeTransitions(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Transition {
+    const count = try decoder.readCount(max_transitions);
+    if (count == 0) return error.InvalidTransitionTable;
+    const transitions = try allocator.alloc(Transition, count);
+    var initialized: usize = 0;
     errdefer {
-        for (transitions[0..transition_initialized]) |*transition| {
+        for (transitions[0..initialized]) |*transition| {
             transition.deinit(allocator);
         }
         allocator.free(transitions);
@@ -504,36 +709,51 @@ pub fn decodeCache(
         transition.on = try decoder.readBytesAlloc(allocator, max_text_bytes);
         errdefer allocator.free(transition.on);
         transition.to = try decoder.readBytesAlloc(allocator, max_text_bytes);
-        transition_initialized += 1;
+        initialized += 1;
     }
-    var key = try decodePointer(allocator, decoder);
-    errdefer key.deinit(allocator);
-    var on = try decodePointer(allocator, decoder);
-    errdefer on.deinit(allocator);
-    var event_kind = try decodeOptionalPointer(allocator, decoder);
-    errdefer if (event_kind) |*pointer| pointer.deinit(allocator);
-    var retain_once = try decodeOptionalPointer(allocator, decoder);
-    errdefer if (retain_once) |*pointer| pointer.deinit(allocator);
-    var assert_from = try decodeOptionalPointer(allocator, decoder);
-    errdefer if (assert_from) |*pointer| pointer.deinit(allocator);
-    var assert_to = try decodeOptionalPointer(allocator, decoder);
-    errdefer if (assert_to) |*pointer| pointer.deinit(allocator);
-    const result: Plan = .{
-        .states = states,
-        .transitions = transitions,
-        .key = key,
-        .on = on,
-        .event_kind = event_kind,
-        .retain_once = retain_once,
-        .assert_from = assert_from,
-        .assert_to = assert_to,
-        .assertion_presence = try decoder.readEnum(AssertionPresence),
-        .max_entries = try decoder.readUsize(),
-        .max_retained_value_bytes = try decoder.readUsize(),
-        .max_retained_total_bytes = try decoder.readUsize(),
-    };
-    try validatePlan(&result);
-    return result;
+    return transitions;
+}
+
+fn deinitTransitions(
+    allocator: std.mem.Allocator,
+    transitions: []Transition,
+) void {
+    for (transitions) |*transition| transition.deinit(allocator);
+    allocator.free(transitions);
+}
+
+fn decodeGuards(
+    allocator: std.mem.Allocator,
+    decoder: *definition_core.cache.Decoder,
+) ![]Guard {
+    const count = try decoder.readCount(max_transitions);
+    const guards = try allocator.alloc(Guard, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (guards[0..initialized]) |*guard| guard.deinit(allocator);
+        allocator.free(guards);
+    }
+    for (guards) |*guard| {
+        guard.* = .{
+            .event_kind = try decoder.readBytesAlloc(
+                allocator,
+                max_text_bytes,
+            ),
+            .on = undefined,
+            .validation_plan = undefined,
+        };
+        errdefer allocator.free(guard.event_kind);
+        guard.on = try decoder.readBytesAlloc(allocator, max_text_bytes);
+        errdefer allocator.free(guard.on);
+        guard.validation_plan = try validation.decodeCache(allocator, decoder);
+        initialized += 1;
+    }
+    return guards;
+}
+
+fn deinitGuards(allocator: std.mem.Allocator, guards: []Guard) void {
+    for (guards) |*guard| guard.deinit(allocator);
+    allocator.free(guards);
 }
 
 pub fn apply(
@@ -544,6 +764,7 @@ pub fn apply(
 ) !void {
     const context = try resolveReducerTransition(plan, state, event);
     try validateTransitionAssertions(plan, event, context);
+    try validateTransitionGuard(allocator, plan, event, context);
     var retained_value = try retainedValueAlloc(
         allocator,
         plan,
@@ -558,6 +779,86 @@ pub fn apply(
         context,
         &retained_value,
     );
+}
+
+fn validateTransitionGuard(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    event: std.json.Value,
+    context: ReducerTransition,
+) !void {
+    if (plan.guards.len == 0) return;
+    const event_kind_pointer = plan.event_kind orelse
+        return error.ReducerGuardRequiresEventKind;
+    const event_kind_value = definition_core.json_pointer.lookup(
+        event,
+        event_kind_pointer,
+    ) orelse return error.ReducerEventKindMissing;
+    const event_kind = try boundedIdentifier(
+        event_kind_value,
+        error.InvalidReducerEventKind,
+    );
+    const guard = findGuard(
+        plan.guards,
+        event_kind,
+        context.transition.on,
+    ) orelse return;
+    const prior = context.prior orelse
+        return error.ReducerGuardRetainedValueMissing;
+    const retained = prior.retained orelse
+        return error.ReducerGuardRetainedValueMissing;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        retained,
+        .{
+            .allocate = .alloc_always,
+            .duplicate_field_behavior = .@"error",
+        },
+    );
+    defer parsed.deinit();
+    const values = &.{
+        validation.InputValue{ .name = "event", .value = event },
+        validation.InputValue{
+            .name = "retained",
+            .value = parsed.value,
+        },
+    };
+    var execution = try validation.executeValues(
+        allocator,
+        &guard.validation_plan,
+        values,
+    );
+    defer execution.deinit();
+    if (!execution.isValid()) return error.ReducerTransitionGuardRejected;
+}
+
+fn findGuard(
+    guards: []const Guard,
+    event_kind: []const u8,
+    on: []const u8,
+) ?*const Guard {
+    var low: usize = 0;
+    var high = guards.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = &guards[middle];
+        const event_order = std.mem.order(
+            u8,
+            event_kind,
+            candidate.event_kind,
+        );
+        const order = if (event_order == .eq)
+            std.mem.order(u8, on, candidate.on)
+        else
+            event_order;
+        switch (order) {
+            .lt => high = middle,
+            .gt => low = middle + 1,
+            .eq => return candidate,
+        }
+    }
+    return null;
 }
 
 const ReducerTransition = struct {
@@ -804,6 +1105,16 @@ pub fn validatePlan(plan: *const Plan) !void {
             return error.CacheReducerTransitionsNotSorted;
         }
     }
+    for (plan.guards, 0..) |*guard, index| {
+        try validateIdentifier(guard.event_kind);
+        try validateIdentifier(guard.on);
+        if (findTransitionOn(plan.transitions, guard.on) == null or
+            (index != 0 and
+                !guardLessThan({}, plan.guards[index - 1], guard.*)))
+        {
+            return error.InvalidReducerGuard;
+        }
+    }
     try validatePointer(plan.key);
     try validatePointer(plan.on);
     if (plan.event_kind) |pointer| try validatePointer(pointer);
@@ -815,6 +1126,62 @@ pub fn validatePlan(plan: *const Plan) !void {
     {
         return error.RedundantReducerAssertionPresence;
     }
+}
+
+pub fn validateCachePlan(
+    plan: *const Plan,
+    definition_plan: *const definition.Plan,
+) !void {
+    try validatePlan(plan);
+    for (plan.guards) |*guard| {
+        try validation.validateEmbeddedCachePlan(
+            &guard.validation_plan,
+            definition_plan,
+        );
+        try validateGuardInputs(
+            &guard.validation_plan,
+            definition_plan.bounds.max_input_bytes,
+        );
+    }
+}
+
+pub fn validateEventKinds(
+    plan: *const Plan,
+    event_kinds: []const []u8,
+) !void {
+    for (plan.guards) |guard| {
+        if (!containsSorted(event_kinds, guard.event_kind)) {
+            return error.UnknownReducerGuardEventKind;
+        }
+    }
+}
+
+fn validateGuardInputs(
+    validation_plan: *const validation.Plan,
+    max_bytes: usize,
+) !void {
+    if (validation_plan.inputs.len != 2) {
+        return error.CacheReducerGuardInputsMismatch;
+    }
+    for (validation_plan.inputs, 0..) |input, index| {
+        const expected = if (index == 0) "event" else "retained";
+        if (!std.mem.eql(u8, input.name, expected) or
+            input.codec != .json or !input.required or
+            input.max_bytes != max_bytes)
+        {
+            return error.CacheReducerGuardInputsMismatch;
+        }
+    }
+}
+
+fn findTransitionOn(
+    transitions: []const Transition,
+    on: []const u8,
+) ?*const Transition {
+    for (transitions) |*transition| {
+        if (std.mem.eql(u8, transition.on, on)) return transition;
+    }
+    return null;
 }
 
 fn parseRule(
@@ -1258,6 +1625,7 @@ fn expectReducerBounds(
 ) !void {
     var constrained_plan = try compile(
         std.testing.allocator,
+        null,
         table_rule,
         reducer_rule,
         testBounds(1),
@@ -1343,6 +1711,7 @@ test "compiled reducer admits deterministic keyed transitions" {
     const reducer_rule = testRule(.reducer, deterministic_reducer);
     var plan = try compile(
         std.testing.allocator,
+        null,
         table_rule,
         reducer_rule,
         testBounds(2),
@@ -1360,6 +1729,7 @@ test "keyed reducer checks transition assertions when rows carry them" {
     const reducer_rule = testRule(.reducer, assertion_reducer);
     var compiled = try compile(
         std.testing.allocator,
+        null,
         table_rule,
         reducer_rule,
         testBounds(2),
