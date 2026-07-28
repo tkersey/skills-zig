@@ -726,27 +726,8 @@ fn feedOpenCodeFile(
     {
         return error.OpenCodePromptHistorySelectorUnavailable;
     }
-    if (args.selectors.session_id) |wanted| {
-        var session_id_buffer: [64]u8 = undefined;
-        const session_id = try seq.opencode_adapter.sessionId(
-            &session_id_buffer,
-            path,
-        );
-        if (!std.mem.eql(
-            u8,
-            wanted,
-            session_id,
-        )) return .continue_scanning;
-    }
-    if (seq.execution.excludedSessionId(program)) |excluded| {
-        var session_id_buffer: [64]u8 = undefined;
-        const session_id = try seq.opencode_adapter.sessionId(
-            &session_id_buffer,
-            path,
-        );
-        if (std.mem.eql(u8, excluded, session_id)) {
-            return .continue_scanning;
-        }
+    if (!try openCodeSessionPasses(args, program, path)) {
+        return .continue_scanning;
     }
     const remaining_bytes = if (metrics.corpus_bytes < bounds.max_input_bytes)
         bounds.max_input_bytes - metrics.corpus_bytes
@@ -780,6 +761,25 @@ fn feedOpenCodeFile(
     metrics.sessions += 1;
     digest_set.add(path, &observed.digest);
     return if (runner.stopped) .stop else .continue_scanning;
+}
+
+fn openCodeSessionPasses(
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    path: []const u8,
+) !bool {
+    const wanted = args.selectors.session_id;
+    const excluded = seq.execution.excludedSessionId(program);
+    if (wanted == null and excluded == null) return true;
+    var buffer: [64]u8 = undefined;
+    const actual = try seq.opencode_adapter.sessionId(&buffer, path);
+    if (wanted) |value| {
+        if (!std.mem.eql(u8, value, actual)) return false;
+    }
+    if (excluded) |value| {
+        if (std.mem.eql(u8, value, actual)) return false;
+    }
+    return true;
 }
 
 fn feedCodexFile(

@@ -122,56 +122,78 @@ fn scanRecords(
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |untrimmed| {
         result.source_records += 1;
-        const line = std.mem.trim(u8, untrimmed, " \t\r");
-        if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            line,
-            .{ .parse_numbers = false },
-        ) catch {
-            result.warnings += 1;
-            continue;
-        };
-        defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |value| value,
-            else => {
-                result.warnings += 1;
-                continue;
-            },
-        };
-        if (stringField(object, "input") == null) {
-            result.warnings += 1;
-            continue;
-        }
-        result.records += 1;
-        result.session_matches = result.session_matches or
-            (selection.contains != null and
-                containsIgnoreCase(
-                    stringField(object, "input"),
-                    selection.contains.?,
-                ));
-        result.tools += toolCount(object);
-        if (relation == .sessions) continue;
-        if (relation == .turns and !turnPasses(object, path, selection)) {
-            continue;
-        }
-        const feed = try feedRecord(
+        const feed = try scanRecordLine(
             allocator,
             program,
             runner,
             relation,
             session_id,
             path,
-            line,
-            result.records,
-            result.source_records,
-            object,
+            untrimmed,
+            selection,
+            &result,
         );
         if (feed == .stop) break;
     }
     return result;
+}
+
+fn scanRecordLine(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    runner: *execution.Runner,
+    relation: physical.Relation,
+    session_id: []const u8,
+    path: []const u8,
+    untrimmed: []const u8,
+    selection: Selection,
+    result: *ScanResult,
+) !execution.Feed {
+    const line = std.mem.trim(u8, untrimmed, " \t\r");
+    if (line.len == 0) return .continue_scanning;
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        line,
+        .{ .parse_numbers = false },
+    ) catch {
+        result.warnings += 1;
+        return .continue_scanning;
+    };
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => {
+            result.warnings += 1;
+            return .continue_scanning;
+        },
+    };
+    if (stringField(object, "input") == null) {
+        result.warnings += 1;
+        return .continue_scanning;
+    }
+    result.records += 1;
+    result.session_matches = result.session_matches or
+        (selection.contains != null and
+            containsIgnoreCase(stringField(object, "input"), selection.contains.?));
+    result.tools += toolCount(object);
+    if (relation == .sessions or
+        (relation == .turns and !turnPasses(object, path, selection)))
+    {
+        return .continue_scanning;
+    }
+    return feedRecord(
+        allocator,
+        program,
+        runner,
+        relation,
+        session_id,
+        path,
+        line,
+        result.records,
+        result.source_records,
+        object,
+    );
 }
 
 fn turnPasses(

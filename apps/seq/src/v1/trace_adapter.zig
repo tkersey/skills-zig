@@ -84,19 +84,12 @@ pub fn parseFileSelected(
     if (!supported(relation)) return error.UnsupportedTracePhysicalRelation;
     if (selection) |selected| {
         if (!canonicalPathPassesSessionSelection(path, selected)) {
-            return .{
-                .parsed = null,
-                .discovery_bytes_read = 0,
-                .file_opened = false,
-            };
+            return skippedSelection(false, 0);
         }
     }
 
     const io = std.Io.Threaded.global_single_threaded.io();
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(io, path, .{})
-    else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+    const file = try openTraceFile(io, path);
     defer file.close(io);
     const stat = try file.stat(io);
     var file_reader = file.reader(io, &.{});
@@ -118,11 +111,7 @@ pub fn parseFileSelected(
     else
         Preselection{};
     if (!preselection.passes) {
-        return .{
-            .parsed = null,
-            .discovery_bytes_read = preselection.bytes_read,
-            .file_opened = true,
-        };
+        return skippedSelection(true, preselection.bytes_read);
     }
     if (stat.size > options.max_input_bytes) {
         return error.ObservationInputByteBoundExceeded;
@@ -147,6 +136,21 @@ pub fn parseFileSelected(
         ),
         .discovery_bytes_read = 0,
         .file_opened = true,
+    };
+}
+
+fn openTraceFile(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        std.Io.Dir.cwd().openFile(io, path, .{});
+}
+
+fn skippedSelection(file_opened: bool, bytes_read: usize) SelectedParse {
+    return .{
+        .parsed = null,
+        .discovery_bytes_read = bytes_read,
+        .file_opened = file_opened,
     };
 }
 

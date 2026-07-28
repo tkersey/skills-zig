@@ -535,6 +535,15 @@ test "observation result preserves identities provenance limits and no authority
     );
     const rendered = try renderJsonAlloc(std.testing.allocator, envelope);
     defer std.testing.allocator.free(rendered);
+    try expectResultEnvelope(rendered);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        renderForAllocationFailure,
+        .{testEnvelope(&fixture.plan, &bindings.values_digest, &values, .{})},
+    );
+}
+
+fn expectResultEnvelope(rendered: []const u8) !void {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -572,11 +581,6 @@ test "observation result preserves identities provenance limits and no authority
             rendered,
             "\"a\":9007199254740992.1",
         ) != null,
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        renderForAllocationFailure,
-        .{testEnvelope(&fixture.plan, &bindings.values_digest, &values, .{})},
     );
 }
 
