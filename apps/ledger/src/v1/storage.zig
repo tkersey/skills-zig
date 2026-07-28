@@ -5315,7 +5315,7 @@ const storage_protocol_definition =
     "\"parameters\":{\"revision\":{\"type\":\"digest\",\"required\":false}}," ++
     "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}," ++
     "\"document\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
-    "\"canonicalization\":{\"steps\":[]},\"shape\":{},\"constraints\":[]," ++
+    "\"canonicalization\":{\"steps\":[]},\"shape\":{},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{},\"storage\":{\"kind\":\"event-log\",\"slots\":{" ++
     "\"events\":{\"path\":\"example/events.jsonl\",\"kind\":\"event-log\"," ++
     "\"codec\":\"jsonl\",\"max_bytes\":65536},\"document\":{" ++
@@ -5336,7 +5336,7 @@ const storage_parameterized_definition =
     "\"parameters\":{\"stream\":{" ++
     "\"type\":\"safe_identifier\",\"required\":true}},\"inputs\":{" ++
     "\"event\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
-    "\"canonicalization\":{},\"shape\":{},\"constraints\":[],\"identity\":{}," ++
+    "\"canonicalization\":{},\"shape\":{},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"{stream}/events.jsonl\",\"codec\":\"jsonl\"," ++
     "\"max_bytes\":4096}}},\"operations\":{},\"projections\":{}," ++
@@ -5350,7 +5350,7 @@ const storage_reserved_definition =
     "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
     "\"parameters\":{},\"inputs\":{\"event\":{" ++
     "\"codec\":\"json\",\"max_bytes\":1024}},\"canonicalization\":{}," ++
-    "\"shape\":{},\"constraints\":[],\"identity\":{}," ++
+    "\"shape\":{},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\".definitions/events.jsonl\",\"codec\":\"jsonl\"," ++
     "\"max_bytes\":1024}}},\"operations\":{},\"projections\":{}," ++

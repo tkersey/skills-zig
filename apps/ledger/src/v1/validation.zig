@@ -10355,376 +10355,75 @@ fn checkEmbeddedValidationCases(
 }
 
 const validation_test_definition_01 =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/record",
-    \\  "owner":"example",
-    \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object",
-    \\"field-absent","optional-field","scalar-type","enum","safe-identifier",
-    \\"regex","tagged-union","unique","sorted","field-equal","keyed-unique",
-    \\"reference-exists","declared-field-values","disjoint","implies",
-    \\"total-partition","total-mapping","path-format","all","any","none",
-    \\"object-values"]},
-    \\  "inputs":{"record":{"codec":"json","max_bytes":4096}},
-    \\  "canonicalization":{},
-    \\  "shape":{"rules":[
-    \\    {"op":"exact-object","path":"","keys":["schema","record_id","status",
-    \\"tags","mirror","items","groups","links","optional_links","containers",
-    \\"selected","checks","more_checks","guards","changes","meta","universe",
-    \\"ordering","accepted","rejected","targets","mappings","declarations",
-    \\"scored"],"allow_additional":true},
-    \\    {"op":"field-absent","path":"/forbidden"},
-    \\    {"op":"optional-field","path":"/nullable","allow_null":true,"rules":[{
-    \\"op":"scalar-type","type":"string"}]},
-    \\    {"op":"object-values","path":"/meta","rules":[{"op":"tagged-union",
-    \\"path":"","variants":[{"kind":"string","rules":[]},{"kind":"object","rules":[
-    \\{"op":"exact-object","keys":["value"]},{"op":"scalar-type","path":"/value",
-    \\"type":"string"}]}]}]},
-    \\    {"op":"scalar-type","path":"/record_id","type":"string"},
-    \\    {"op":"safe-identifier","path":"/record_id","max":64},
-    \\    {"op":"regex","path":"/record_id","patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64},
-    \\    {"op":"enum","path":"/status","values":["open","closed"]},
-    \\    {"op":"unique","path":"/tags"},
-    \\    {"op":"sorted","path":"/tags"},
-    \\    {"op":"unique","path":"/ordering"},
-    \\    {"op":"keyed-unique","path":"/items","key":"/id"},
-    \\    {"op":"reference-exists","path":"/links","reference":"/item_refs",
-    \\"target":"/items","key":"/id"},
-    \\    {"op":"reference-exists","path":"/links","reference":"/optional_target",
-    \\"target":"/items","key":"/id","ignore_null":true},
-    \\    {"op":"reference-exists","path":"/optional_links",
-    \\"reference":"/item_refs","target":"/items","key":"/id"},
-    \\    {"op":"reference-exists","path":"/items","reference":"/related_ids",
-    \\"target":"/items","key":"/id","self_reference":"reject"},
-    \\    {"op":"reference-exists","path":"/selected","reference":"",
-    \\"target":"/containers","target_items":"/entries","target_rules":[{
-    \\"op":"enum","path":"/status","values":["active","inactive"]}],
-    \\"coverage_rules":[{"op":"enum","path":"/status","values":["active"]}],
-    \\"key":"/id","coverage":"all-targets"},
-    \\    {"op":"path-format","path":"/groups","items":"/members",
-    \\"target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{
-    \\"item":"/name"}]},
-    \\    {"op":"optional-field","path":"/meta/closure","rules":[{"op":"enum",
-    \\"values":["confirmed"]}]},
-    \\    {"op":"all","path":"/items","rules":[
-    \\      {"op":"exact-object","keys":["id","kind","state","labels","related_ids"]},
-    \\      {"op":"scalar-type","path":"/id","type":"string"},
-    \\      {"op":"all","path":"/labels","rules":[{"op":"scalar-type","type":"string"}]},
-    \\      {"op":"none","path":"/labels","rules":[{"op":"enum","values":["forbidden"]}]}
-    \\    ]},
-    \\    {"op":"any","path":"/items","rules":[{"op":"enum","path":"/id","values":["item-2"]}]},
-    \\    {"op":"none","path":"/items","rules":[{"op":"enum","path":"/id",
-    \\"values":["forbidden"]}]}
-    \\  ]},
-    \\  "constraints":[
-    \\    {"op":"field-equal","left":"/status","right":"/mirror"},
-    \\    {"op":"disjoint","path":"/links","left":"/expected","right":"/prohibited"},
-    \\    {"op":"implies","if":"/status","equals":"closed","then":"/meta/closure",
-    \\"then_nonempty":true},
-    \\    {"op":"implies","if":"/changes","nonempty":true,"then":"/meta/transport"},
-    \\    {"op":"reference-exists","path":"/accepted","reference":"",
-    \\"target":"/universe","key":""},
-    \\    {"op":"reference-exists","path":"/ordering","reference":"",
-    \\"target":"/universe","key":"","coverage":"all-targets"},
-    \\    {"op":"reference-exists","sources":[{"path":"/checks","reference":""},{
-    \\"path":"/more_checks","reference":""},{"path":"/groups","items":"/members",
-    \\"reference":"/target_id"},{"path":"/missing_checks","reference":"",
-    \\"optional":true}],"targets":[
-    \\      {"path":"/items","key":"/id"},
-    \\      {"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},
-    \\{"literal":":"},{"item":"/name"}]},
-    \\      {"path":"/missing_groups","key":"","optional":true}
-    \\    ]},
-    \\    {"op":"reference-exists","sources":[
-    \\      {"path":"/guards","reference":"/ids","rules":[{"op":"enum",
-    \\"path":"/mode","values":["active"]}],"fragments":[{"literal":"id:"},{
-    \\"value":true}]},
-    \\      {"path":"/guards","reference":"/kinds","rules":[{"op":"enum",
-    \\"path":"/mode","values":["active"]}],"fragments":[{"literal":"kind:"},{
-    \\"value":true}]}
-    \\    ],"targets":[
-    \\      {"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],
-    \\"coverage_key":"/id"},
-    \\      {"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],
-    \\"coverage_key":"/id","match_rules":[{"op":"enum","path":"/state","values":[
-    \\"ready"]}]}
-    \\    ],"coverage":"all-targets"},
-    \\    {"op":"declared-field-values","path":"/scored","object":"/values",
-    \\"declarations":"/declarations","declaration_paths":["/increase","/decrease"],
-    \\"type":"integer","min":0,"max":100},
-    \\    {"op":"total-partition","universe":"/universe","parts":["/accepted","/rejected"]},
-    \\    {"op":"total-mapping","source":"/universe","target":"/targets",
-    \\"mapping":"/mappings","from":"/from","to":"/to"}
-    \\  ],
-    \\  "identity":{},
-    \\  "storage":{"kind":"pure"},
-    \\  "operations":{},
-    \\  "projections":{},
-    \\  "bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,
-    \\"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/record","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","field-absent","optional-field","scalar-type","enum","safe-identifier","regex","tagged-union","unique","sorted","field-equal","keyed-unique","reference-exists","declared-field-values","disjoint","implies","total-partition","total-mapping","path-format","all","any","none","object-values"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"open","fields":{"schema":{},"record_id":{"scalar":"string","identifier":{"max":64},"regex":{"patterns":["^record-[A-Za-z0-9_.-]+$"],"max":64}},"status":{"enum":["open","closed"]},"tags":{"unique":true,"sorted":true},"mirror":{},"items":{"key":"/id","laws":[["reference-exists",{"path":"/items","reference":"/related_ids","target":"/items","key":"/id","self_reference":"reject"}],["any",{"path":"/items","rules":[["enum",{"path":"/id","values":["item-2"]}]]}],["none",{"path":"/items","rules":[["enum",{"path":"/id","values":["forbidden"]}]]}]],"items":{"object":"exact","fields":{"id":{"scalar":"string"},"kind":{},"state":{},"labels":{"items":{"scalar":"string"},"laws":[["none",{"path":"/labels","rules":[["enum",{"values":["forbidden"]}]]}]]},"related_ids":{}}}},"groups":{"laws":[["path-format",{"path":"/groups","items":"/members","target":"/label","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]}]]},"links":{"laws":[["reference-exists",{"path":"/links","reference":"/item_refs","target":"/items","key":"/id"}],["reference-exists",{"path":"/links","reference":"/optional_target","target":"/items","key":"/id","ignore_null":true}]]},"optional_links":{"laws":[["reference-exists",{"path":"/optional_links","reference":"/item_refs","target":"/items","key":"/id"}]]},"containers":{},"selected":{"laws":[["reference-exists",{"path":"/selected","reference":"","target":"/containers","target_items":"/entries","target_rules":[{"op":"enum","path":"/status","values":["active","inactive"]}],"coverage_rules":[["enum",{"path":"/status","values":["active"]}]],"key":"/id","coverage":"all-targets"}]]},"checks":{},"more_checks":{},"guards":{},"changes":{},"meta":{"values":{"tagged":{"variants":[{"kind":"string","node":{}},{"kind":"object","node":{"object":"exact","fields":{"value":{"scalar":"string"}}}}]}},"fields":{"closure":{"if_present":true,"enum":["confirmed"]}}},"universe":{},"ordering":{"unique":true},"accepted":{},"rejected":{},"targets":{},"mappings":{},"declarations":{},"scored":{},"forbidden":{"forbidden":true},"nullable":{"optional":"nullable","scalar":"string"}}}}},"constraints":{"laws":[["field-equal",{"left":"/status","right":"/mirror"}],["disjoint",{"path":"/links","left":"/expected","right":"/prohibited"}],["implies",{"if":"/status","equals":"closed","then":"/meta/closure","then_nonempty":true}],["implies",{"if":"/changes","nonempty":true,"then":"/meta/transport"}],["reference-exists",{"path":"/accepted","reference":"","target":"/universe","key":""}],["reference-exists",{"path":"/ordering","reference":"","target":"/universe","key":"","coverage":"all-targets"}],["reference-exists",{"sources":[{"path":"/checks","reference":""},{"path":"/more_checks","reference":""},{"path":"/groups","items":"/members","reference":"/target_id"},{"path":"/missing_checks","reference":"","optional":true}],"targets":[{"path":"/items","key":"/id"},{"path":"/groups","items":"/members","fragments":[{"parent":"/prefix"},{"literal":":"},{"item":"/name"}]},{"path":"/missing_groups","key":"","optional":true}]}],["reference-exists",{"sources":[{"path":"/guards","reference":"/ids","rules":[["enum",{"path":"/mode","values":["active"]}]],"fragments":[{"literal":"id:"},{"value":true}]},{"path":"/guards","reference":"/kinds","rules":[["enum",{"path":"/mode","values":["active"]}]],"fragments":[{"literal":"kind:"},{"value":true}]}],"targets":[{"path":"/items","fragments":[{"literal":"id:"},{"item":"/id"}],"coverage_key":"/id"},{"path":"/items","fragments":[{"literal":"kind:"},{"item":"/kind"}],"coverage_key":"/id","match_rules":[["enum",{"path":"/state","values":["ready"]}]]}],"coverage":"all-targets"}],["declared-field-values",{"path":"/scored","object":"/values","declarations":"/declarations","declaration_paths":["/increase","/decrease"],"type":"integer","min":0,"max":100}],["total-partition",{"universe":"/universe","parts":["/accepted","/rejected"]}],["total-mapping",{"source":"/universe","target":"/targets","mapping":"/mappings","from":"/from","to":"/to"}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
 ;
 
 const validation_test_definition_02 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper",
-    \\"owner":"example","imports":[{"id":"example/record","path":"artifact.json"}],
-    \\"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},
-    \\"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},
-    \\"shape":{"rules":[{"op":"definition-ref","path":"",
-    \\"definition":"example/record"}]},"constraints":[],"identity":{},"storage":{
-    \\"kind":"pure"},"operations":{},"projections":{},"bounds":{
-    \\"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,
-    \\"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record","path":"artifact.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"definition":"example/record"}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":10,"max_output_bytes":4096,"max_diagnostics":16,"max_reducer_states":16}}
 ;
 
 const validation_test_definition_03 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"all","bounded-string","digest","enum","exact-object","one-of",
-    \\"safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json",
-    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"exact-object","path":"","keys":["identity","label","paths",
-    \\"record_id"]},{"op":"safe-identifier","path":"/record_id","max":128,
-    \\"style":"lowercase-component"},{"op":"bounded-string","path":"/label",
-    \\"trimmed_min":1,"max":128},{"op":"one-of","path":"/identity","rules":[{
-    \\"op":"enum","values":[null]},{"op":"digest"}]},{"op":"all","path":"/paths",
-    \\"rules":[{"op":"safe-relative-path","allow_root":true,"reserved_roots":[
-    \\".git",".ledger"],"case_insensitive_reserved":true}]}]},"constraints":[],
-    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
-    \\"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,
-    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-policy","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["all","bounded-string","digest","enum","exact-object","one-of","safe-identifier","safe-relative-path"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"exact","fields":{"identity":{"one_of":[{"enum":[null]},{"format":"digest"}]},"label":{"string":{"trimmed_min":1,"max":128}},"paths":{"items":{"relative_path":{"allow_root":true,"reserved_roots":[".git",".ledger"],"case_insensitive_reserved":true}}},"record_id":{"identifier":{"max":128,"style":"lowercase-component"}}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_04 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"exact-object","member-of","not-member-of","path-scope-disjoint",
-    \\"path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},
-    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
-    \\"keys":["allowed","choices","paths","prohibited","selection"]}]},
-    \\"constraints":[{"op":"path-scope-subset","left":"/paths","right":"/allowed"},
-    \\{"op":"path-scope-disjoint","left":"/paths","right":"/prohibited"},{
-    \\"op":"member-of","left":"/selection","right":"/choices"},{
-    \\"op":"not-member-of","left":"/selection","right":"/prohibited"}],"identity":{
-    \\},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{
-    \\"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,
-    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/path-scopes","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","member-of","not-member-of","path-scope-disjoint","path-scope-subset"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"exact","fields":{"allowed":{},"choices":{},"paths":{},"prohibited":{},"selection":{}}}}},"constraints":{"laws":[["path-scope-subset",{"left":"/paths","right":"/allowed"}],["path-scope-disjoint",{"left":"/paths","right":"/prohibited"}],["member-of",{"left":"/selection","right":"/choices"}],["not-member-of",{"left":"/selection","right":"/prohibited"}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_05 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/input",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},
-    \\"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},
-    \\"shape":{},"constraints":[],"identity":{},"storage":{"kind":"pure"},
-    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,
-    \\"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,
-    \\"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/input","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":1,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_06 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/field-count",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"at-least-one","enum","exactly-one"]},"inputs":{"record":{"codec":"json",
-    \\"max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"at-least-one","paths":["/first","/second","/third"],"rules":[{
-    \\"op":"enum","values":["blocked"]}]},{"op":"exactly-one","paths":["/left",
-    \\"/right"],"rules":[{"op":"enum","values":["selected"]}]}]},"constraints":[],
-    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
-    \\"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,
-    \\"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/field-count","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"documents":{"record":{"laws":[["at-least-one",{"paths":["/first","/second","/third"],"rules":[["enum",{"values":["blocked"]}]]}],["exactly-one",{"paths":["/left","/right"],"rules":[["enum",{"values":["selected"]}]]}]]}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_07 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/correspondence",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"at-least-one","enum","exactly-one","keyed-join","predecessor-successor",
-    \\"sorted"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},
-    \\"canonicalization":{},"shape":{"rules":[
-    \\{"op":"sorted","path":"/successors","key":"/id"},
-    \\{"op":"exactly-one","path":"/candidates","rules":[{"op":"enum",
-    \\"path":"/status","values":["selected"]}]},
-    \\{"op":"at-least-one","path":"/candidates","rules":[{"op":"enum",
-    \\"path":"/derivation","values":["independent"]}]}
-    \\]},"constraints":[
-    \\{"op":"keyed-join","collection":"/candidates","key":"/id",
-    \\"selector":"/selected_id","value":"/factors","equals":"/surface","rules":[{
-    \\"op":"enum","path":"/status","values":["selected"]}]},
-    \\{"op":"predecessor-successor","predecessor":"/predecessors",
-    \\"predecessor_key":"/id","successor":"/successors","successor_key":"/id",
-    \\"preserved":"/preserved","retired":"/retired","introduced":"/introduced",
-    \\"mappings":"/mappings","mapping_predecessors":"/from",
-    \\"mapping_successors":"/to"}
-    \\],"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
-    \\"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":32,
-    \\"max_output_bytes":8192,"max_diagnostics":16,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/correspondence","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["at-least-one","enum","exactly-one","keyed-join","predecessor-successor","sorted"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"documents":{"record":{"fields":{"successors":{"sorted":{"key":"/id"}},"candidates":{"laws":[["exactly-one",{"path":"/candidates","rules":[["enum",{"path":"/status","values":["selected"]}]]}],["at-least-one",{"path":"/candidates","rules":[["enum",{"path":"/derivation","values":["independent"]}]]}]]}}}}},"constraints":{"laws":[["keyed-join",{"collection":"/candidates","key":"/id","selector":"/selected_id","value":"/factors","equals":"/surface","rules":[["enum",{"path":"/status","values":["selected"]}]]}],["predecessor-successor",{"predecessor":"/predecessors","predecessor_key":"/id","successor":"/successors","successor_key":"/id","preserved":"/preserved","retired":"/retired","introduced":"/introduced","mappings":"/mappings","mapping_predecessors":"/from","mapping_successors":"/to"}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":32,"max_output_bytes":8192,"max_diagnostics":16,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_08 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/namespaces",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"keyed-unique","reference-exists","tagged-union"]},"inputs":{"record":{
-    \\"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[
-    \\{"op":"keyed-unique","sources":[{"path":"/first","key":"/id"},{
-    \\"path":"/second","key":"/name"}]},
-    \\{"op":"tagged-union","path":"","tag":"/mode","variants":[{"value":"expanded",
-    \\"rules":[{"op":"reference-exists","path":"/introduced","reference":"",
-    \\"target":"/additions","key":"/id","coverage":"all-targets"}]},{
-    \\"value":"plain","rules":[]}]}
-    \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
-    \\"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/namespaces","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["keyed-unique","reference-exists","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"laws":[["keyed-unique",{"sources":[{"path":"/first","key":"/id"},{"path":"/second","key":"/name"}]}]],"tagged":{"tag":"/mode","variants":[{"value":"expanded","node":{"fields":{"introduced":{"laws":[["reference-exists",{"path":"/introduced","reference":"","target":"/additions","key":"/id","coverage":"all-targets"}]]}}}},{"value":"plain","node":{}}]}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_09 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/digests",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"object-values","sha256"]},"inputs":{"record":{"codec":"json",
-    \\"max_bytes":8192}},"canonicalization":{},"shape":{"rules":[
-    \\{"op":"sha256","path":"/document","mode":"canonical-json-null",
-    \\"field":"/digest","null":"/digest","max_bytes":4096},
-    \\{"op":"object-values","path":"/groups","rules":[{"op":"sha256",
-    \\"mode":"framed-items","field":"/digest","items":"/entries",
-    \\"prefix":"group/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},
-    \\{"item":"/checksum"},{"literal":"\u0000"}],"max_bytes":4096}]},
-    \\{"op":"sha256","path":"/bundle","mode":"framed-fields","field":"/digest",
-    \\"prefix":"bundle/v1\u0000","fragments":[{"parent":"/owner_id"},{
-    \\"literal":"\u0000"},{"parent":"/parent_ref"},{"literal":"\u0000"},{
-    \\"parent":"/subject_ref"},{"literal":"\u0000"},{"parent":"/document_digest"}],
-    \\"max_bytes":4096},
-    \\{"op":"sha256","path":"/transport","mode":"framed-fields",
-    \\"field":"/fingerprint","prefix":"","fragments":[{"parent":"/channel"},{
-    \\"literal":"\n"},{"parent":"/type"},{"literal":"\n"},{"parent":"/payload"}],
-    \\"max_bytes":4096}
-    \\]},"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,
-    \\"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/digests","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["object-values","sha256"]},"inputs":{"record":{"codec":"json","max_bytes":8192}},"canonicalization":{},"shape":{"documents":{"record":{"fields":{"document":{"sha256":{"mode":"canonical-json-null","field":"/digest","null":"/digest","max_bytes":4096}},"groups":{"values":{"sha256":{"mode":"framed-items","field":"/digest","items":"/entries","prefix":"group/v1\u0000","fragments":[{"item":"/path"},{"literal":"\u0000"},{"item":"/checksum"},{"literal":"\u0000"}],"max_bytes":4096}}},"bundle":{"sha256":{"mode":"framed-fields","field":"/digest","prefix":"bundle/v1\u0000","fragments":[{"parent":"/owner_id"},{"literal":"\u0000"},{"parent":"/parent_ref"},{"literal":"\u0000"},{"parent":"/subject_ref"},{"literal":"\u0000"},{"parent":"/document_digest"}],"max_bytes":4096}},"transport":{"sha256":{"mode":"framed-fields","field":"/fingerprint","prefix":"","fragments":[{"parent":"/channel"},{"literal":"\n"},{"parent":"/type"},{"literal":"\n"},{"parent":"/payload"}],"max_bytes":4096}}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":16,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_10 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"bounded-string","compare-and-append","exact-object","enum","scalar-type",
-    \\"tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},
-    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
-    \\"keys":["count","parent","status"]},{"op":"scalar-type","path":"/count",
-    \\"type":"integer"},{"op":"enum","path":"/status","values":["complete"]},{
-    \\"op":"tagged-union","path":"/parent","variants":[{"kind":"null","rules":[]},{
-    \\"kind":"object","rules":[{"op":"exact-object","keys":["value"]},{
-    \\"op":"bounded-string","path":"/value","trimmed_min":1,"max":128}]}]}]},
-    \\"constraints":[],"identity":{},"storage":{"kind":"event-log","slots":{
-    \\"events":{"path":"example/receipts.jsonl","kind":"event-log","codec":"jsonl",
-    \\"max_bytes":4096}}},"operations":{"append":{"effects":[{
-    \\"op":"compare-and-append","slot":"events","input":"receipt"}]}},
-    \\"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,
-    \\"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/receipt","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","compare-and-append","exact-object","enum","scalar-type","tagged-union"]},"inputs":{"receipt":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"documents":{"receipt":{"object":"exact","fields":{"count":{"scalar":"integer"},"parent":{"tagged":{"variants":[{"kind":"null","node":{}},{"kind":"object","node":{"object":"exact","fields":{"value":{"string":{"trimmed_min":1,"max":128}}}}}]}},"status":{"enum":["complete"]}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/receipts.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"receipt"}]}},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":4,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_11 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/packet",
-    \\"owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],
-    \\"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref",
-    \\"exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},
-    \\"canonicalization":{},"shape":{"rules":[{"op":"exact-object","path":"",
-    \\"required_keys":["receipt"],"optional_keys":["metadata"]},{
-    \\"op":"definition-ref","path":"/receipt","definition":"example/receipt"}]},
-    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,
-    \\"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/packet","owner":"example","imports":[{"id":"example/receipt","path":"receipt.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"packet":{"codec":"json","max_bytes":2048}},"canonicalization":{},"shape":{"documents":{"packet":{"object":"closed","fields":{"receipt":{"definition":"example/receipt"},"metadata":{"optional":true}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":2048,"max_store_bytes":2048,"max_records":4,"max_output_bytes":2048,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_12 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"bounded-string"]},"inputs":{"value":{"codec":"json","max_bytes":16}},
-    \\"canonicalization":{},"shape":{"rules":[{"op":"bounded-string","path":"",
-    \\"min":3,"max":3}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},
-    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":16,
-    \\"max_store_bytes":16,"max_records":1,"max_output_bytes":16,
-    \\"max_diagnostics":4,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string"]},"inputs":{"value":{"codec":"json","max_bytes":16}},"canonicalization":{},"shape":{"documents":{"value":{"string":{"min":3,"max":3}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":16,"max_store_bytes":16,"max_records":1,"max_output_bytes":16,"max_diagnostics":4,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_13 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier-list",
-    \\"owner":"example","imports":[{"id":"example/identifier",
-    \\"path":"identifier.json"}],"requires":{"abi":"ledger-artifact-abi/v1",
-    \\"operators":["all","definition-ref"]},"inputs":{"values":{"codec":"json",
-    \\"max_bytes":128}},"canonicalization":{},"shape":{"rules":[{"op":"all",
-    \\"path":"","rules":[{"op":"definition-ref","path":"",
-    \\"definition":"example/identifier"}]}]},"constraints":[],"identity":{},
-    \\"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{
-    \\"max_input_bytes":128,"max_store_bytes":128,"max_records":8,
-    \\"max_output_bytes":128,"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/identifier-list","owner":"example","imports":[{"id":"example/identifier","path":"identifier.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["all","definition-ref"]},"inputs":{"values":{"codec":"json","max_bytes":128}},"canonicalization":{},"shape":{"documents":{"values":{"items":{"definition":"example/identifier"}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":128,"max_store_bytes":128,"max_records":8,"max_output_bytes":128,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_14 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/record-set",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"exact-object","keyed-unique"]},"inputs":{"record":{"codec":"json",
-    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"exact-object","path":"","keys":["left","right"]}]},"constraints":[{
-    \\"op":"keyed-unique","sources":[{"path":"/left","key":"/id"},{"path":"/right",
-    \\"key":"/id"}]}],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
-    \\"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/record-set","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","keyed-unique"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"exact","fields":{"left":{},"right":{}}}}},"constraints":{"laws":[["keyed-unique",{"sources":[{"path":"/left","key":"/id"},{"path":"/right","key":"/id"}]}]]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_15 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper",
-    \\"owner":"example","imports":[{"id":"example/record-set",
-    \\"path":"record.json"}],"requires":{"abi":"ledger-artifact-abi/v1",
-    \\"operators":["definition-ref","exact-object"]},"inputs":{"wrapper":{
-    \\"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"exact-object","path":"","keys":["record"]},{"op":"definition-ref",
-    \\"path":"/record","definition":"example/record-set"}]},"constraints":[],
-    \\"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},
-    \\"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,
-    \\"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/wrapper","owner":"example","imports":[{"id":"example/record-set","path":"record.json"}],"requires":{"abi":"ledger-artifact-abi/v1","operators":["definition-ref","exact-object"]},"inputs":{"wrapper":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"wrapper":{"object":"exact","fields":{"record":{"definition":"example/record-set"}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_16 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/no-sensitive-keys",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"exact-object","forbidden-object-keys"]},"inputs":{"record":{"codec":"json",
-    \\"max_bytes":4096}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"exact-object","path":"","keys":["payload"]},{
-    \\"op":"forbidden-object-keys","path":"","keys":["api_key","password",
-    \\"secret"],"case_insensitive":true,"max_depth":4,"max_nodes":16}]},
-    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,
-    \\"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,
-    \\"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/no-sensitive-keys","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["exact-object","forbidden-object-keys"]},"inputs":{"record":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"record":{"object":"exact","fields":{"payload":{}},"forbidden_keys":{"keys":["api_key","password","secret"],"case_insensitive":true,"max_depth":4,"max_nodes":16}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":16,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const validation_test_definition_17 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{
-    \\"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json",
-    \\"required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},
-    \\"constraints":[],"identity":{},"storage":{"kind":"pure"},"operations":{},
-    \\"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,
-    \\"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,
-    \\"max_reducer_states":2}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
 ;
 
 const validation_test_definition_18 =
-    \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication",
-    \\"owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[
-    \\"bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{
-    \\"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"rules":[{
-    \\"op":"tagged-union","path":"","tag":"/kind","variants":[{"value":"capture",
-    \\"rules":[{"op":"implies","if":"/status","equals":"active","rules":[{
-    \\"op":"bounded-string","path":"/proof","trimmed_min":1,"max":128}]}]},{
-    \\"value":"status","rules":[{"op":"enum","path":"/status","values":[
-    \\"closed"]}]}]}]},"constraints":[],"identity":{},"storage":{"kind":"pure"},
-    \\"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,
-    \\"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,
-    \\"max_diagnostics":8,"max_reducer_states":1}}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"documents":{"record":{"tagged":{"tag":"/kind","variants":[{"value":"capture","node":{"laws":[["implies",{"if":"/status","equals":"active","rules":[["bounded-string",{"path":"/proof","trimmed_min":1,"max":128}]]}]]}},{"value":"status","node":{"fields":{"status":{"enum":["closed"]}}}}]}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const path_scope_valid_cases = [_][]const u8{

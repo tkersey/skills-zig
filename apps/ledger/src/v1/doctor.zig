@@ -193,39 +193,7 @@ fn unhealthySlot(
 }
 
 const doctor_definition_json =
-    \\{
-    \\  "schema": "ledger-artifact-definition/v1",
-    \\  "id": "example/doctor",
-    \\  "owner": "example",
-    \\  "requires": {"abi": "ledger-artifact-abi/v1", "operators": []},
-    \\  "parameters": {},
-    \\  "inputs": {"event": {"codec": "json", "max_bytes": 1024}},
-    \\  "canonicalization": {},
-    \\  "shape": {},
-    \\  "constraints": [],
-    \\  "identity": {},
-    \\  "storage": {
-    \\    "kind": "event-log",
-    \\    "slots": {
-    \\      "events": {
-    \\        "path": "example/events.jsonl",
-    \\        "kind": "event-log",
-    \\        "codec": "jsonl",
-    \\        "max_bytes": 4096
-    \\      }
-    \\    }
-    \\  },
-    \\  "operations": {},
-    \\  "projections": {},
-    \\  "bounds": {
-    \\    "max_input_bytes": 1024,
-    \\    "max_store_bytes": 4096,
-    \\    "max_records": 10,
-    \\    "max_output_bytes": 1024,
-    \\    "max_diagnostics": 8,
-    \\    "max_reducer_states": 1
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/doctor","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":[]},"parameters":{},"inputs":{"event":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":4096}}},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":4096,"max_records":10,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 test "missing declared storage is a healthy initial state" {

@@ -4685,12 +4685,12 @@ const protocol_test_event_input =
     "\"parameters\":{},\"inputs\":{\"event\":{\"codec\":\"json\"," ++
     "\"max_bytes\":4096}},\"canonicalization\":{},";
 const protocol_test_envelope_shape =
-    "\"shape\":{\"rules\":[{\"op\":\"event-envelope\",\"input\":\"event\"," ++
+    "\"shape\":{\"documents\":{\"event\":{\"event_envelope\":{" ++
     "\"keys\":[\"body\",\"body_digest\",\"event_digest\",\"kind\"," ++
     "\"previous_digest\",\"sequence\"],\"sequence\":\"/sequence\"," ++
     "\"kind\":\"/kind\",\"previous_digest\":\"/previous_digest\"," ++
     "\"body\":\"/body\",\"body_digest\":\"/body_digest\"," ++
-    "\"event_digest\":\"/event_digest\"}]},";
+    "\"event_digest\":\"/event_digest\"}}}},";
 const protocol_test_append_operation =
     "\"operations\":{\"append\":{\"effects\":[{\"op\":\"compare-and-append\"," ++
     "\"slot\":\"events\",\"input\":\"event\"}]}},";
@@ -4711,10 +4711,8 @@ const chained_protocol_definition =
     "\"event-envelope\",\"event-kinds\",\"previous-digest\",\"replay\"," ++
     "\"sequence\"]}," ++ protocol_test_event_input ++
     protocol_test_envelope_shape ++
-    "\"constraints\":[{\"op\":\"sequence\",\"start\":1}," ++
-    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
-    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
-    "\"values\":[\"created\",\"updated\"]}],\"identity\":{}," ++
+    "\"constraints\":{\"event_log\":{\"start\":1,\"genesis\":null," ++
+    "\"kinds\":[\"created\",\"updated\"]}},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"example/events.jsonl\",\"kind\":\"event-log\"," ++
     "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
@@ -4729,21 +4727,15 @@ const retained_protocol_definition =
     "\"event-digest\",\"event-envelope\",\"event-kinds\"," ++
     "\"previous-digest\",\"reducer\",\"replay\",\"sequence\"]}," ++
     protocol_test_event_input ++ protocol_test_envelope_shape ++
-    "\"constraints\":[{\"op\":\"sequence\",\"start\":1}," ++
-    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
-    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
-    "\"values\":[\"created\",\"updated\"]},{\"op\":\"reducer\"," ++
-    "\"mode\":\"retained\",\"event_kind\":\"/kind\"," ++
-    "\"registers\":[{\"name\":\"current\",\"max_bytes\":4096}]," ++
-    "\"admissions\":[{\"on\":\"created\",\"requires\":[]," ++
-    "\"forbids\":[\"current\"],\"rules\":[],\"actions\":[{\"op\":\"set\"," ++
-    "\"register\":\"current\",\"input\":\"event\",\"path\":\"/body\"}]}," ++
-    "{\"on\":\"updated\",\"requires\":[\"current\"],\"forbids\":[]," ++
-    "\"rules\":[{\"op\":\"cross-input-equal\",\"input\":\"event\"," ++
-    "\"left_input\":\"event\",\"left\":\"/body/id\"," ++
-    "\"right_input\":\"current\",\"right\":\"/id\"}]," ++
-    "\"actions\":[{\"op\":\"set\",\"register\":\"current\"," ++
-    "\"input\":\"event\",\"path\":\"/body\"}]}]}],\"identity\":{}," ++
+    "\"constraints\":{\"event_log\":{\"start\":1,\"genesis\":null," ++
+    "\"kinds\":[\"created\",\"updated\"]},\"state\":{\"mode\":\"retained\"," ++
+    "\"event_kind\":\"/kind\",\"registers\":{\"current\":4096},\"sets\":{}," ++
+    "\"admissions\":[{\"on\":\"created\",\"forbids\":[\"current\"]," ++
+    "\"actions\":[[\"set\",\"current\",\"event#/body\"]]}," ++
+    "{\"on\":\"updated\",\"requires\":[\"current\"],\"laws\":[[" ++
+    "\"cross-input-equal\",\"event#/body/id\",\"current#/id\"]]," ++
+    "\"actions\":[[\"set\",\"current\",\"event#/body\"]]}]}}," ++
+    "\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"example/retained.jsonl\",\"kind\":\"event-log\"," ++
     "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
@@ -4758,10 +4750,8 @@ const invalid_protocol_definition =
     "\"event-envelope\",\"event-kinds\",\"previous-digest\",\"replay\"," ++
     "\"sequence\"]}," ++ protocol_test_event_input ++
     protocol_test_envelope_shape ++
-    "\"constraints\":[{\"op\":\"sequence\",\"start\":0}," ++
-    "{\"op\":\"previous-digest\",\"genesis\":null},{\"op\":\"body-digest\"}," ++
-    "{\"op\":\"event-digest\"},{\"op\":\"event-kinds\"," ++
-    "\"values\":[\"accepted\"]}],\"identity\":{}," ++
+    "\"constraints\":{\"event_log\":{\"start\":0,\"genesis\":null," ++
+    "\"kinds\":[\"accepted\"]}},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"example/errors.jsonl\",\"kind\":\"event-log\"," ++
     "\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
@@ -4769,322 +4759,11 @@ const invalid_protocol_definition =
     protocol_test_bounds_4;
 
 const request_literals_definition =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/request-literals",
-    \\  "owner":"example",
-    \\  "requires":{
-    \\    "abi":"ledger-artifact-abi/v1",
-    \\    "operators":[
-    \\      "body-digest",
-    \\      "compare-and-append",
-    \\      "enum",
-    \\      "event-digest",
-    \\      "event-envelope",
-    \\      "event-kinds",
-    \\      "event-materialization",
-    \\      "exact-object",
-    \\      "path-format",
-    \\      "previous-digest",
-    \\      "replay",
-    \\      "sequence"
-    \\    ]
-    \\  },
-    \\  "parameters":{
-    \\    "stream":{"type":"safe_identifier","required":true}
-    \\  },
-    \\  "inputs":{
-    \\    "alternate":{"codec":"json","max_bytes":4096},
-    \\    "request":{"codec":"json","max_bytes":4096}
-    \\  },
-    \\  "canonicalization":{},
-    \\  "shape":{"rules":[
-    \\    {
-    \\      "op":"exact-object",
-    \\      "input":"alternate",
-    \\      "path":"",
-    \\      "keys":["body","kind","schema","stream_id"]
-    \\    },
-    \\    {
-    \\      "op":"enum",
-    \\      "input":"alternate",
-    \\      "path":"/schema",
-    \\      "values":["example-alternate/v1"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object",
-    \\      "input":"request",
-    \\      "path":"",
-    \\      "keys":["body","kind","schema","stream_id"]
-    \\    },
-    \\    {
-    \\      "op":"enum",
-    \\      "input":"request",
-    \\      "path":"/schema",
-    \\      "values":["example-request/v1"]
-    \\    },
-    \\    {
-    \\      "op":"event-envelope",
-    \\      "input":"request",
-    \\      "keys":[
-    \\        "body",
-    \\        "body_digest",
-    \\        "event_digest",
-    \\        "kind",
-    \\        "previous_digest",
-    \\        "schema",
-    \\        "sequence",
-    \\        "stream_id"
-    \\      ],
-    \\      "sequence":"/sequence",
-    \\      "kind":"/kind",
-    \\      "previous_digest":"/previous_digest",
-    \\      "body":"/body",
-    \\      "body_digest":"/body_digest",
-    \\      "event_digest":"/event_digest",
-    \\      "partition_bindings":[
-    \\        {"parameter":"stream","event_value":"/stream_id"}
-    \\      ]
-    \\    }
-    \\  ]},
-    \\  "constraints":[
-    \\    {"op":"sequence","start":1},
-    \\    {"op":"previous-digest","genesis":null},
-    \\    {"op":"body-digest"},
-    \\    {"op":"event-digest"},
-    \\    {"op":"event-kinds","values":["created"]}
-    \\  ],
-    \\  "identity":{},
-    \\  "storage":{
-    \\    "kind":"event-log",
-    \\    "slots":{
-    \\      "events":{
-    \\        "path":"example/{stream}/request-literals.jsonl",
-    \\        "kind":"event-log",
-    \\        "codec":"jsonl",
-    \\        "max_bytes":65536
-    \\      }
-    \\    }
-    \\  },
-    \\  "operations":{
-    \\    "append":{"effects":[{
-    \\      "op":"compare-and-append",
-    \\      "slot":"events",
-    \\      "input":"request",
-    \\      "event":{
-    \\        "mode":"chained",
-    \\        "body_input_field":"body",
-    \\        "fields":[
-    \\          {"field":"kind","input_field":"kind"},
-    \\          {"field":"schema","literal":"example-event/v1"},
-    \\          {"field":"stream_id","input_field":"stream_id"}
-    \\        ],
-    \\        "request_literals":[
-    \\          {"field":"schema","literal":"example-request/v1"}
-    \\        ],
-    \\        "body_fields":[
-    \\          {
-    \\            "field":"schema",
-    \\            "literal_mapping":{
-    \\              "request":"example-body-request/v1",
-    \\              "stored":"example-body-event/v1"
-    \\            }
-    \\          },
-    \\          {"field":"stream_id","request_input":"stream_id"}
-    \\        ]
-    \\      }
-    \\    }]},
-    \\    "append-alternate":{"effects":[{
-    \\      "op":"compare-and-append",
-    \\      "slot":"events",
-    \\      "input":"alternate",
-    \\      "event":{
-    \\        "mode":"chained",
-    \\        "body_input_field":"body",
-    \\        "fields":[
-    \\          {"field":"kind","input_field":"kind"},
-    \\          {"field":"schema","literal":"example-event/v1"},
-    \\          {"field":"stream_id","input_field":"stream_id"}
-    \\        ],
-    \\        "request_literals":[
-    \\          {"field":"schema","literal":"example-alternate/v1"}
-    \\        ]
-    \\      }
-    \\    }]}
-    \\  },
-    \\  "projections":{},
-    \\  "bounds":{
-    \\    "max_input_bytes":4096,
-    \\    "max_store_bytes":65536,
-    \\    "max_records":4,
-    \\    "max_output_bytes":4096,
-    \\    "max_diagnostics":8,
-    \\    "max_reducer_states":4
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/request-literals","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","enum","event-digest","event-envelope","event-kinds","event-materialization","exact-object","path-format","previous-digest","replay","sequence"]},"parameters":{"stream":{"type":"safe_identifier","required":true}},"inputs":{"alternate":{"codec":"json","max_bytes":4096},"request":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"alternate":{"object":"exact","fields":{"body":{},"kind":{},"schema":{"enum":["example-alternate/v1"]},"stream_id":{}}},"request":{"object":"exact","fields":{"body":{},"kind":{},"schema":{"enum":["example-request/v1"]},"stream_id":{}},"event_envelope":{"keys":["body","body_digest","event_digest","kind","previous_digest","schema","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}}}},"constraints":{"laws":[["sequence",{"start":1}],["previous-digest",{"genesis":null}],["body-digest"],["event-digest"],["event-kinds",{"values":["created"]}]]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/request-literals.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"request","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"kind","input_field":"kind"},{"field":"schema","literal":"example-event/v1"},{"field":"stream_id","input_field":"stream_id"}],"request_literals":[{"field":"schema","literal":"example-request/v1"}],"body_fields":[{"field":"schema","literal_mapping":{"request":"example-body-request/v1","stored":"example-body-event/v1"}},{"field":"stream_id","request_input":"stream_id"}]}}]},"append-alternate":{"effects":[{"op":"compare-and-append","slot":"events","input":"alternate","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"kind","input_field":"kind"},{"field":"schema","literal":"example-event/v1"},{"field":"stream_id","input_field":"stream_id"}],"request_literals":[{"field":"schema","literal":"example-alternate/v1"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
 ;
 
 const plain_derivation_definition =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/derived-events",
-    \\  "owner":"example",
-    \\  "requires":{
-    \\    "abi":"ledger-artifact-abi/v1",
-    \\    "operators":[
-    \\      "compare-and-append",
-    \\      "composite-identity",
-    \\      "event-materialization",
-    \\      "exact-object",
-    \\      "sha256",
-    \\      "timestamp"
-    \\    ]
-    \\  },
-    \\  "parameters":{},
-    \\  "inputs":{
-    \\    "submission":{"codec":"json","max_bytes":4096}
-    \\  },
-    \\  "canonicalization":{},
-    \\  "shape":{"rules":[
-    \\    {
-    \\      "op":"exact-object",
-    \\      "input":"submission",
-    \\      "path":"",
-    \\      "keys":["logical_kind","note","physical_kind"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object",
-    \\      "input":"submission",
-    \\      "path":"/note",
-    \\      "keys":["operation","summary","details"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object",
-    \\      "input":"submission",
-    \\      "path":"/note/details",
-    \\      "keys":["z","a"]
-    \\    }
-    \\  ]},
-    \\  "constraints":[],
-    \\  "identity":{},
-    \\  "storage":{
-    \\    "kind":"event-log",
-    \\    "slots":{
-    \\      "events":{
-    \\        "path":"example/derived-events.jsonl",
-    \\        "kind":"event-log",
-    \\        "codec":"jsonl",
-    \\        "max_bytes":65536
-    \\      }
-    \\    }
-    \\  },
-    \\  "operations":{"capture":{"effects":[{
-    \\    "op":"compare-and-append",
-    \\    "slot":"events",
-    \\    "input":"submission",
-    \\    "event":{
-    \\      "mode":"plain",
-    \\      "body_input_field":"note",
-    \\      "field_order":[
-    \\        "v",
-    \\        "source",
-    \\        "event",
-    \\        "record_id",
-    \\        "captured_at",
-    \\        "kind",
-    \\        "logical_kind",
-    \\        "operation",
-    \\        "note"
-    \\      ],
-    \\      "body_order":[
-    \\        "id",
-    \\        "captured_at",
-    \\        "logical_kind",
-    \\        "kind",
-    \\        "operation",
-    \\        "summary",
-    \\        "details",
-    \\        "fingerprint"
-    \\      ],
-    \\      "fields":[
-    \\        {"field":"v","literal":1},
-    \\        {"field":"source","literal":"example"},
-    \\        {"field":"event","literal":"example.capture"},
-    \\        {"field":"record_id","derived":"record_id"},
-    \\        {"field":"captured_at","derived":"captured_at"},
-    \\        {"field":"kind","input_field":"physical_kind"},
-    \\        {"field":"logical_kind","input_field":"logical_kind"},
-    \\        {"field":"operation","derived":"operation"}
-    \\      ],
-    \\      "derive":[
-    \\        {
-    \\          "name":"physical_kind",
-    \\          "op":"input-text",
-    \\          "pointer":"/physical_kind"
-    \\        },
-    \\        {
-    \\          "name":"logical_kind",
-    \\          "op":"input-text",
-    \\          "pointer":"/logical_kind"
-    \\        },
-    \\        {
-    \\          "name":"operation",
-    \\          "op":"input-text",
-    \\          "pointer":"/note/operation"
-    \\        },
-    \\        {
-    \\          "name":"captured_at",
-    \\          "op":"utc-timestamp",
-    \\          "format":"rfc3339-seconds"
-    \\        },
-    \\        {
-    \\          "name":"fingerprint",
-    \\          "op":"sha256",
-    \\          "encoding":"hex",
-    \\          "fragments":[
-    \\            {"literal":"example\n"},
-    \\            {"input_text":"/physical_kind"},
-    \\            {"literal":"\n"},
-    \\            {"input_text":"/logical_kind"},
-    \\            {"literal":"\n"},
-    \\            {"input_json":"/note"}
-    \\          ],
-    \\          "max_bytes":4096
-    \\        },
-    \\        {
-    \\          "name":"record_id",
-    \\          "op":"concat",
-    \\          "fragments":[
-    \\            {"literal":"EVT-"},
-    \\            {
-    \\              "derived":"captured_at",
-    \\              "transform":"compact-utc"
-    \\            },
-    \\            {"literal":"-"},
-    \\            {"derived":"fingerprint","prefix_bytes":16}
-    \\          ],
-    \\          "max_bytes":64
-    \\        }
-    \\      ],
-    \\      "body_fields":[
-    \\        {"field":"id","derived":"record_id"},
-    \\        {"field":"captured_at","derived":"captured_at"},
-    \\        {"field":"logical_kind","derived":"logical_kind"},
-    \\        {"field":"kind","derived":"physical_kind"},
-    \\        {"field":"fingerprint","derived":"fingerprint"}
-    \\      ]
-    \\    }
-    \\  }]}},
-    \\  "projections":{},
-    \\  "bounds":{
-    \\    "max_input_bytes":4096,
-    \\    "max_store_bytes":65536,
-    \\    "max_records":4,
-    \\    "max_output_bytes":4096,
-    \\    "max_diagnostics":8,
-    \\    "max_reducer_states":1
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/derived-events","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","composite-identity","event-materialization","exact-object","sha256","timestamp"]},"parameters":{},"inputs":{"submission":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"submission":{"object":"exact","fields":{"logical_kind":{},"note":{"object":"exact","fields":{"operation":{},"summary":{},"details":{"object":"exact","fields":{"z":{},"a":{}}}}},"physical_kind":{}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/derived-events.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{"mode":"plain","body_input_field":"note","field_order":["v","source","event","record_id","captured_at","kind","logical_kind","operation","note"],"body_order":["id","captured_at","logical_kind","kind","operation","summary","details","fingerprint"],"fields":[{"field":"v","literal":1},{"field":"source","literal":"example"},{"field":"event","literal":"example.capture"},{"field":"record_id","derived":"record_id"},{"field":"captured_at","derived":"captured_at"},{"field":"kind","input_field":"physical_kind"},{"field":"logical_kind","input_field":"logical_kind"},{"field":"operation","derived":"operation"}],"derive":[{"name":"physical_kind","op":"input-text","pointer":"/physical_kind"},{"name":"logical_kind","op":"input-text","pointer":"/logical_kind"},{"name":"operation","op":"input-text","pointer":"/note/operation"},{"name":"captured_at","op":"utc-timestamp","format":"rfc3339-seconds"},{"name":"fingerprint","op":"sha256","encoding":"hex","fragments":[{"literal":"example\n"},{"input_text":"/physical_kind"},{"literal":"\n"},{"input_text":"/logical_kind"},{"literal":"\n"},{"input_json":"/note"}],"max_bytes":4096},{"name":"record_id","op":"concat","fragments":[{"literal":"EVT-"},{"derived":"captured_at","transform":"compact-utc"},{"literal":"-"},{"derived":"fingerprint","prefix_bytes":16}],"max_bytes":64}],"body_fields":[{"field":"id","derived":"record_id"},{"field":"captured_at","derived":"captured_at"},{"field":"logical_kind","derived":"logical_kind"},{"field":"kind","derived":"physical_kind"},{"field":"fingerprint","derived":"fingerprint"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const request_literal_input =

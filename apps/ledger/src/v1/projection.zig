@@ -6482,7 +6482,7 @@ const cache_projection_definition =
     "\"filter\",\"latest\",\"limit\",\"select\"]}," ++
     "\"parameters\":{\"kind\":{\"type\":\"string\",\"required\":false}}," ++
     test_event_input ++
-    "\"constraints\":[]," ++
+    "\"constraints\":{\"laws\":[]}," ++
     test_event_storage ++
     test_empty_operations ++
     "\"projections\":{\"recent\":{\"slot\":\"events\",\"pipeline\":[" ++
@@ -6498,13 +6498,12 @@ const retained_projection_definition =
     "\"append-only-log\",\"compare-and-append\",\"event-kinds\",\"export\"," ++
     "\"fold\",\"reducer\",\"replay\"]},\"parameters\":{}," ++
     test_event_input ++
-    "\"constraints\":[{\"op\":\"append-only-log\",\"input\":\"event\"}," ++
-    "{\"op\":\"event-kinds\",\"values\":[\"created\"]}," ++
-    "{\"op\":\"reducer\",\"mode\":\"retained\",\"event_kind\":\"/kind\"," ++
-    "\"registers\":[{\"name\":\"current\",\"max_bytes\":4096}]," ++
-    "\"admissions\":[{\"on\":\"created\",\"requires\":[]," ++
-    "\"forbids\":[\"current\"],\"rules\":[],\"actions\":[{\"op\":\"set\"," ++
-    "\"register\":\"current\",\"input\":\"event\",\"path\":\"/body\"}]}]}]," ++
+    "\"constraints\":{\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]," ++
+    "[\"event-kinds\",{\"values\":[\"created\"]}]],\"state\":{" ++
+    "\"mode\":\"retained\",\"event_kind\":\"/kind\",\"registers\":{" ++
+    "\"current\":4096},\"sets\":{},\"admissions\":[{\"on\":\"created\"," ++
+    "\"forbids\":[\"current\"],\"actions\":[[\"set\",\"current\"," ++
+    "\"event#/body\"]]}]}}," ++
     test_event_storage ++
     test_append_operation ++
     "\"projections\":{\"facts\":{\"slot\":\"events\",\"pipeline\":[" ++
@@ -6524,13 +6523,13 @@ const history_projection_definition =
     "\"append-only-log\",\"compare-and-append\",\"event-kinds\",\"fold\"," ++
     "\"reducer\",\"replay\",\"sha256\",\"transition-table\"]}," ++
     "\"parameters\":{}," ++ test_event_input ++
-    "\"constraints\":[{\"op\":\"append-only-log\",\"input\":\"event\"}," ++
-    "{\"op\":\"event-kinds\",\"values\":[\"capture\",\"status\"]}," ++
-    "{\"op\":\"reducer\",\"key\":\"/id\",\"on\":\"/status\"," ++
-    "\"event_kind\":\"/kind\",\"retain_once\":\"/record\"}," ++
-    "{\"op\":\"transition-table\",\"states\":[\"active\",\"inactive\"]," ++
+    "\"constraints\":{\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]," ++
+    "[\"event-kinds\",{\"values\":[\"capture\",\"status\"]}]," ++
+    "[\"reducer\",{\"key\":\"/id\",\"on\":\"/status\"," ++
+    "\"event_kind\":\"/kind\",\"retain_once\":\"/record\"}]," ++
+    "[\"transition-table\",{\"states\":[\"active\",\"inactive\"]," ++
     "\"transitions\":[{\"from\":null,\"on\":\"active\",\"to\":\"active\"}," ++
-    "{\"from\":\"active\",\"on\":\"inactive\",\"to\":\"inactive\"}]}]," ++
+    "{\"from\":\"active\",\"on\":\"inactive\",\"to\":\"inactive\"}]}]]}," ++
     test_event_storage ++ test_append_operation ++
     "\"projections\":{\"current\":{\"slot\":\"events\",\"pipeline\":[" ++
     "{\"op\":\"fold\",\"key_field\":\"id\",\"state_field\":\"status\"," ++
@@ -6558,12 +6557,12 @@ const gate_projection_definition =
     "\"parameters\":{\"artifact\":{\"type\":\"string\",\"required\":true}," ++
     "\"identity\":{\"type\":\"string\",\"required\":true}}," ++
     test_event_input ++
-    "\"constraints\":[{\"op\":\"append-only-log\",\"input\":\"event\"}," ++
-    "{\"op\":\"event-kinds\",\"values\":[\"capture\"]}," ++
-    "{\"op\":\"reducer\",\"key\":\"/id\",\"on\":\"/status\"," ++
-    "\"event_kind\":\"/kind\",\"retain_once\":\"/record\"}," ++
-    "{\"op\":\"transition-table\",\"states\":[\"active\"]," ++
-    "\"transitions\":[{\"from\":null,\"on\":\"active\",\"to\":\"active\"}]}]," ++
+    "\"constraints\":{\"laws\":[[\"append-only-log\",{\"input\":\"event\"}]," ++
+    "[\"event-kinds\",{\"values\":[\"capture\"]}]," ++
+    "[\"reducer\",{\"key\":\"/id\",\"on\":\"/status\"," ++
+    "\"event_kind\":\"/kind\",\"retain_once\":\"/record\"}]," ++
+    "[\"transition-table\",{\"states\":[\"active\"]," ++
+    "\"transitions\":[{\"from\":null,\"on\":\"active\",\"to\":\"active\"}]}]]}," ++
     test_event_storage ++ test_append_operation ++
     "\"projections\":{\"gate\":{\"slot\":\"events\"," ++
     "\"required_parameters\":[\"artifact\",\"identity\"],\"pipeline\":[" ++
@@ -6587,7 +6586,7 @@ const exact_projection_definition =
     "\"export\",\"id-lookup\",\"latest\",\"limit\",\"relevance\",\"sort\"]}," ++
     "\"parameters\":{\"id\":{\"type\":\"string\",\"required\":false}," ++
     "\"query\":{\"type\":\"string\",\"required\":false}}," ++
-    test_event_input ++ "\"constraints\":[]," ++
+    test_event_input ++ "\"constraints\":{\"laws\":[]}," ++
     test_event_storage ++ test_empty_operations ++
     "\"projections\":{" ++
     "\"latest\":{\"slot\":\"events\",\"pipeline\":[" ++

@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const source_graph = @import("source_graph.zig");
 
 pub const schema = "ledger-artifact-definition/v1";
 pub const abi = "ledger-artifact-abi/v1";
@@ -469,6 +470,7 @@ fn compileAtDepth(
         root,
         header.operator_mask,
         header.imports,
+        header.inputs,
     );
     errdefer body.deinit(allocator);
     const owned_id = try allocator.dupe(u8, id);
@@ -634,7 +636,31 @@ fn compileDefinitionBody(
     root: std.json.ObjectMap,
     operator_mask: u128,
     imports: []const Plan,
+    inputs: []const Input,
 ) !DefinitionBody {
+    var source_arena = std.heap.ArenaAllocator.init(allocator);
+    defer source_arena.deinit();
+    const source_allocator = source_arena.allocator();
+    const input_names = try source_allocator.alloc([]const u8, inputs.len);
+    for (inputs, input_names) |input, *name| name.* = input.name;
+    var expansion_budget: source_graph.ExpansionBudget = .{};
+    const shape_rules = try source_graph.lowerShape(
+        source_allocator,
+        try definition_core.json.field(root, "shape"),
+        input_names,
+        &expansion_budget,
+    );
+    const constraint_rules = try source_graph.lowerConstraints(
+        source_allocator,
+        try definition_core.json.field(root, "constraints"),
+        input_names,
+        &expansion_budget,
+    );
+    const operation_plans = try source_graph.lowerOperations(
+        source_allocator,
+        try definition_core.json.field(root, "operations"),
+        &expansion_budget,
+    );
     var compiler = Compiler{
         .allocator = allocator,
         .operator_mask = operator_mask,
@@ -642,8 +668,8 @@ fn compileDefinitionBody(
     };
     errdefer compiler.deinit();
     try compiler.compileValue(try definition_core.json.field(root, "canonicalization"), 0);
-    try compiler.compileValue(try definition_core.json.field(root, "shape"), 0);
-    try compiler.compileValue(try definition_core.json.field(root, "constraints"), 0);
+    try compiler.compileValue(shape_rules, 0);
+    try compiler.compileValue(constraint_rules, 0);
     try compiler.compileValue(try definition_core.json.field(root, "identity"), 0);
     try compiler.compileValue(try definition_core.json.field(root, "storage"), 0);
 
@@ -651,7 +677,7 @@ fn compileDefinitionBody(
         allocator,
         &compiler,
         try definition_core.json.object(
-            try definition_core.json.field(root, "operations"),
+            operation_plans,
         ),
     );
     errdefer deinitNamedPlans(allocator, operations);
@@ -716,7 +742,7 @@ pub fn encodeCacheWithDetail(
     detail: CacheDetail,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(5);
+    try encoder.writeU16(6);
     try encoder.writeEnum(detail);
     try encodeCachePlan(plan, detail, encoder);
 }
@@ -826,7 +852,7 @@ pub fn decodeCacheWithDetail(
     expected_detail: CacheDetail,
     decoder: *definition_core.cache.Decoder,
 ) !Plan {
-    if (try decoder.readU16() != 5) return error.LedgerPlanCacheVersionMismatch;
+    if (try decoder.readU16() != 6) return error.LedgerPlanCacheVersionMismatch;
     if (try decoder.readEnum(CacheDetail) != expected_detail) {
         return error.LedgerPlanCacheDetailMismatch;
     }
@@ -1588,6 +1614,7 @@ fn rejectExecutableKeys(object: std.json.ObjectMap) !void {
 const ExecutableFieldNode = struct {
     value: std.json.Value,
     depth: usize,
+    keys_are_data: bool = false,
 };
 
 fn rejectExecutableFields(
@@ -1604,12 +1631,17 @@ fn rejectExecutableFields(
         if (node.depth > 64) return error.ArtifactRuleDepthExceeded;
         switch (node.value) {
             .object => |object| {
-                try rejectExecutableKeys(object);
+                if (!node.keys_are_data) try rejectExecutableKeys(object);
                 var iterator = object.iterator();
                 while (iterator.next()) |entry| {
                     try pending.append(allocator, .{
                         .value = entry.value_ptr.*,
                         .depth = node.depth + 1,
+                        .keys_are_data = std.mem.eql(
+                            u8,
+                            entry.key_ptr.*,
+                            "fields",
+                        ),
                     });
                 }
             },
@@ -1675,49 +1707,7 @@ fn deinitNamedPlans(allocator: std.mem.Allocator, plans: []NamedPlan) void {
 }
 
 const compiled_definition_json =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/record",
-    \\  "owner":"example",
-    \\  "requires":{
-    \\    "abi":"ledger-artifact-abi/v1",
-    \\    "operators":[
-    \\      "canonical-json","exact-object","scalar-type","enum",
-    \\      "content-address","immutable-document","create-new","select"
-    \\    ]
-    \\  },
-    \\  "inputs":{"record":{"codec":"json","max_bytes":1048576}},
-    \\  "canonicalization":{"steps":[
-    \\    {"op":"canonical-json","input":"record"}
-    \\  ]},
-    \\  "shape":{"rules":[
-    \\    {"op":"exact-object","path":"","keys":["schema","record_id","value"]},
-    \\    {"op":"scalar-type","path":"/schema","type":"string"},
-    \\    {"op":"enum","path":"/schema","values":["example-record/v1"]}
-    \\  ]},
-    \\  "constraints":[],
-    \\  "identity":{
-    \\    "op":"content-address","input":"record","exclude":"/record_id"
-    \\  },
-    \\  "storage":{"kind":"addressed-document","slots":[
-    \\    {"op":"immutable-document","name":"records"}
-    \\  ]},
-    \\  "operations":{"create":{"effects":[
-    \\    {"op":"create-new","slot":"records"}
-    \\  ]}},
-    \\  "projections":{"show":{"pipeline":[
-    \\    {"op":"select","fields":["record_id","value"]}
-    \\  ]}},
-    \\  "diagnostics":{},
-    \\  "bounds":{
-    \\    "max_input_bytes":1048576,
-    \\    "max_store_bytes":16777216,
-    \\    "max_records":10000,
-    \\    "max_output_bytes":1048576,
-    \\    "max_diagnostics":64,
-    \\    "max_reducer_states":256
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/record","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["canonical-json","exact-object","scalar-type","enum","content-address","immutable-document","create-new","select"]},"inputs":{"record":{"codec":"json","max_bytes":1048576}},"canonicalization":{"steps":[{"op":"canonical-json","input":"record"}]},"shape":{"documents":{"record":{"object":"exact","fields":{"schema":{"scalar":"string","enum":["example-record/v1"]},"record_id":{},"value":{}}}}},"constraints":{"laws":[]},"identity":{"op":"content-address","input":"record","exclude":"/record_id"},"storage":{"kind":"addressed-document","slots":[{"op":"immutable-document","name":"records"}]},"operations":{"create":{"effects":[{"op":"create-new","slot":"records"}]}},"projections":{"show":{"pipeline":[{"op":"select","fields":["record_id","value"]}]}},"diagnostics":{},"bounds":{"max_input_bytes":1048576,"max_store_bytes":16777216,"max_records":10000,"max_output_bytes":1048576,"max_diagnostics":64,"max_reducer_states":256}}
 ;
 
 const hook_definition_json =
@@ -1726,7 +1716,7 @@ const hook_definition_json =
     "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
     "\"canonicalization\":{},\"shape\":{\"hook\":\"run\"}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
     "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
@@ -1738,9 +1728,9 @@ const nested_hook_definition_json =
     "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
     "\"operators\":[\"exact-object\"]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
-    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"exact-object\"," ++
-    "\"path\":\"\",\"keys\":[],\"extension\":{\"hook\":\"run\"}}]}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"canonicalization\":{},\"shape\":{\"documents\":{\"record\":{" ++
+    "\"fields\":{\"value\":{\"hook\":\"run\"}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
     "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
@@ -1751,9 +1741,22 @@ const undeclared_operator_definition_json =
     "\"id\":\"example/operator\",\"owner\":\"example\"," ++
     "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
-    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"scalar-type\"," ++
-    "\"path\":\"/value\",\"type\":\"string\"}]}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"canonicalization\":{},\"shape\":{\"documents\":{\"record\":{" ++
+    "\"fields\":{\"value\":{\"scalar\":\"string\"}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"operations\":{},\"projections\":{}," ++
+    "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
+    "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
+    "\"max_reducer_states\":1}}";
+
+const unused_unsupported_term_definition_json =
+    "{\"schema\":\"ledger-artifact-definition/v1\"," ++
+    "\"id\":\"example/unused-term\",\"owner\":\"example\"," ++
+    "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[]}," ++
+    "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
+    "\"canonicalization\":{},\"shape\":{}," ++
+    "\"constraints\":{\"terms\":{\"bad\":[\"not-native\",{}]},\"laws\":[]}," ++
+    "\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
     "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
@@ -1765,7 +1768,7 @@ const unsupported_operator_definition_json =
     "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
     "\"operators\":[\"set-order\"]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
-    "\"canonicalization\":{},\"shape\":{},\"constraints\":[]," ++
+    "\"canonicalization\":{},\"shape\":{},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
@@ -1778,9 +1781,10 @@ const inert_command_definition_json =
     "\"requires\":{\"abi\":\"ledger-artifact-abi/v1\"," ++
     "\"operators\":[\"exact-object\"]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":1024}}," ++
-    "\"canonicalization\":{},\"shape\":{\"rules\":[{\"op\":\"exact-object\"," ++
-    "\"path\":\"\",\"keys\":[\"argv\",\"command\"]}]}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"canonicalization\":{},\"shape\":{\"documents\":{\"record\":{" ++
+    "\"object\":\"exact\",\"fields\":{\"argv\":{},\"command\":{}," ++
+    "\"executable\":{}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":1024,\"max_store_bytes\":1024," ++
     "\"max_records\":1,\"max_output_bytes\":1024,\"max_diagnostics\":1," ++
@@ -1883,6 +1887,26 @@ test "artifact definition rejects executable hooks and undeclared operators" {
     try std.testing.expectError(
         error.UndeclaredArtifactOperator,
         compile(std.testing.allocator, &operator_closure, "operator.json"),
+    );
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "unused-term.json",
+        .data = unused_unsupported_term_definition_json,
+    });
+    var unused_term_closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &tmp.dir,
+        "unused-term.json",
+        .{},
+    );
+    defer unused_term_closure.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.UnusedLawTerm,
+        compile(
+            std.testing.allocator,
+            &unused_term_closure,
+            "unused-term.json",
+        ),
     );
 }
 

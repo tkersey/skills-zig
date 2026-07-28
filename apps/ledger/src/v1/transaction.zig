@@ -3100,9 +3100,9 @@ const basic_event_definition =
     "\"idempotency-key\"]},\"parameters\":{\"request\":{" ++
     "\"type\":\"safe_identifier\",\"required\":true}},\"inputs\":{" ++
     "\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
-    "\"canonicalization\":{},\"shape\":{\"rules\":[{" ++
-    "\"op\":\"exact-object\",\"input\":\"event\",\"path\":\"\"," ++
-    "\"keys\":[\"kind\",\"value\"]}]},\"constraints\":[],\"identity\":{}," ++
+    "\"canonicalization\":{},\"shape\":{\"documents\":{\"event\":{" ++
+    "\"object\":\"exact\",\"fields\":{\"kind\":{},\"value\":{}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"example/events.jsonl\",\"codec\":\"jsonl\"," ++
     "\"max_bytes\":65536}}},\"operations\":{\"append\":{" ++
@@ -3361,20 +3361,17 @@ const chained_event_definition =
     "\"type\":\"safe_identifier\",\"required\":true}},\"inputs\":{" ++
     "\"request\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
-    "\"input\":\"request\"}]},\"shape\":{\"rules\":[{" ++
-    "\"op\":\"exact-object\",\"input\":\"request\",\"path\":\"\"," ++
-    "\"keys\":[\"body\",\"content_ref\",\"kind\",\"predecessor_ref\"," ++
-    "\"stream_id\"]},{\"op\":\"event-envelope\",\"input\":\"request\"," ++
-    "\"keys\":[\"body\",\"body_digest\",\"content_ref\",\"event_digest\"," ++
+    "\"input\":\"request\"}]},\"shape\":{\"documents\":{\"request\":{" ++
+    "\"object\":\"exact\",\"fields\":{\"body\":{},\"content_ref\":{}," ++
+    "\"kind\":{},\"predecessor_ref\":{},\"stream_id\":{}}," ++
+    "\"event_envelope\":{\"keys\":[\"body\",\"body_digest\",\"content_ref\",\"event_digest\"," ++
     "\"event_id\",\"kind\",\"predecessor_ref\",\"previous_digest\"," ++
     "\"recorded_at\",\"schema\",\"sequence\",\"stream_id\"]," ++
     "\"sequence\":\"/sequence\",\"kind\":\"/kind\"," ++
     "\"previous_digest\":\"/previous_digest\",\"body\":\"/body\"," ++
-    "\"body_digest\":\"/body_digest\",\"event_digest\":\"/event_digest\"}]}," ++
-    "\"constraints\":[{\"op\":\"sequence\",\"start\":1},{" ++
-    "\"op\":\"previous-digest\",\"genesis\":\"" ++ chained_genesis_digest ++
-    "\"},{\"op\":\"body-digest\"},{\"op\":\"event-digest\"},{" ++
-    "\"op\":\"event-kinds\",\"values\":[\"created\",\"updated\"]}]," ++
+    "\"body_digest\":\"/body_digest\",\"event_digest\":\"/event_digest\"}}}}," ++
+    "\"constraints\":{\"event_log\":{\"start\":1,\"genesis\":\"" ++
+    chained_genesis_digest ++ "\",\"kinds\":[\"created\",\"updated\"]}}," ++
     "\"identity\":{},\"storage\":{\"kind\":\"event-log\",\"slots\":{" ++
     "\"events\":{\"path\":\"example/materialized-events.jsonl\"," ++
     "\"kind\":\"event-log\",\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
@@ -3696,11 +3693,10 @@ const plain_event_definition =
     "\"event-materialization\",\"exact-object\"]},\"parameters\":{}," ++
     "\"inputs\":{\"request\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
-    "\"input\":\"request\"}]},\"shape\":{\"rules\":[{" ++
-    "\"op\":\"exact-object\",\"input\":\"request\",\"path\":\"\"," ++
-    "\"keys\":[\"record\"]},{\"op\":\"exact-object\",\"input\":\"request\"," ++
-    "\"path\":\"/record\",\"keys\":[\"id\",\"status\"]}]}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"event-log\"," ++
+    "\"input\":\"request\"}]},\"shape\":{\"documents\":{\"request\":{" ++
+    "\"object\":\"exact\",\"fields\":{\"record\":{\"object\":\"exact\"," ++
+    "\"fields\":{\"id\":{},\"status\":{}}}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"event-log\"," ++
     "\"slots\":{\"events\":{\"path\":\"example/plain-events.jsonl\"," ++
     "\"kind\":\"event-log\",\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
     "\"operations\":{\"append\":{\"effects\":[{" ++
@@ -3845,193 +3841,7 @@ test "plain event materialization preserves declared bytes through replay and bi
 }
 
 const capability_protocol_definition =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/capability-protocol",
-    \\  "owner":"example",
-    \\  "requires":{
-    \\    "abi":"ledger-artifact-abi/v1",
-    \\    "operators":[
-    \\      "body-digest","canonical-json","compare-and-append",
-    \\      "cross-input-equal","enum","event-digest","event-envelope",
-    \\      "event-kinds","event-materialization","exact-object","path-format",
-    \\      "previous-digest","reducer","replay","secure-token","sequence","sha256"
-    \\    ]
-    \\  },
-    \\  "parameters":{
-    \\    "capability":{"type":"string","required":false},
-    \\    "stream":{"type":"safe_identifier","required":true}
-    \\  },
-    \\  "inputs":{
-    \\    "abort":{"codec":"json","required":false,"max_bytes":4096},
-    \\    "consume":{"codec":"json","required":false,"max_bytes":4096},
-    \\    "prepare":{"codec":"json","required":false,"max_bytes":4096}
-    \\  },
-    \\  "canonicalization":{"steps":[
-    \\    {"op":"canonical-json","input":"abort"},
-    \\    {"op":"canonical-json","input":"consume"},
-    \\    {"op":"canonical-json","input":"prepare"}
-    \\  ]},
-    \\  "shape":{"rules":[
-    \\    {
-    \\      "op":"exact-object","input":"abort","path":"",
-    \\      "keys":["body","kind","stream_id"]
-    \\    },
-    \\    {"op":"enum","input":"abort","path":"/kind","values":["aborted"]},
-    \\    {
-    \\      "op":"exact-object","input":"abort","path":"/body",
-    \\      "keys":["step_id"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object","input":"consume","path":"",
-    \\      "keys":["body","kind","stream_id"]
-    \\    },
-    \\    {"op":"enum","input":"consume","path":"/kind","values":["consumed"]},
-    \\    {
-    \\      "op":"exact-object","input":"consume","path":"/body",
-    \\      "keys":["step_id"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object","input":"prepare","path":"",
-    \\      "keys":["body","kind","stream_id"]
-    \\    },
-    \\    {"op":"enum","input":"prepare","path":"/kind","values":["prepared"]},
-    \\    {
-    \\      "op":"exact-object","input":"prepare","path":"/body",
-    \\      "keys":["step_id"]
-    \\    },
-    \\    {
-    \\      "op":"event-envelope","input":"prepare",
-    \\      "keys":[
-    \\        "body","body_digest","event_digest","kind","previous_digest",
-    \\        "sequence","stream_id"
-    \\      ],
-    \\      "sequence":"/sequence","kind":"/kind",
-    \\      "previous_digest":"/previous_digest","body":"/body",
-    \\      "body_digest":"/body_digest","event_digest":"/event_digest",
-    \\      "partition_bindings":[
-    \\        {"parameter":"stream","event_value":"/stream_id"}
-    \\      ]
-    \\    }
-    \\  ]},
-    \\  "constraints":[
-    \\    {"op":"sequence","start":1},
-    \\    {"op":"previous-digest","genesis":null},
-    \\    {"op":"body-digest"},
-    \\    {"op":"event-digest"},
-    \\    {"op":"event-kinds","values":["aborted","consumed","prepared"]},
-    \\    {
-    \\      "op":"reducer","mode":"retained","event_kind":"/kind",
-    \\      "registers":[{"name":"pending","max_bytes":4096}],
-    \\      "admissions":[
-    \\        {
-    \\          "on":"prepared","requires":[],"forbids":["pending"],"rules":[],
-    \\          "actions":[
-    \\            {"op":"set","register":"pending","input":"event","path":"/body"}
-    \\          ]
-    \\        },
-    \\        {
-    \\          "on":"consumed","requires":["pending"],"forbids":[],
-    \\          "rules":[
-    \\            {
-    \\              "op":"cross-input-equal","input":"event",
-    \\              "left_input":"event","left":"/body/capability_digest",
-    \\              "right_input":"pending","right":"/capability_digest"
-    \\            },
-    \\            {
-    \\              "op":"cross-input-equal","input":"event",
-    \\              "left_input":"event","left":"/body/step_id",
-    \\              "right_input":"pending","right":"/step_id"
-    \\            }
-    \\          ],
-    \\          "actions":[{"op":"clear","register":"pending"}]
-    \\        },
-    \\        {
-    \\          "on":"aborted","requires":["pending"],"forbids":[],
-    \\          "rules":[
-    \\            {
-    \\              "op":"cross-input-equal","input":"event",
-    \\              "left_input":"event","left":"/body/capability_digest",
-    \\              "right_input":"pending","right":"/capability_digest"
-    \\            },
-    \\            {
-    \\              "op":"cross-input-equal","input":"event",
-    \\              "left_input":"event","left":"/body/step_id",
-    \\              "right_input":"pending","right":"/step_id"
-    \\            }
-    \\          ],
-    \\          "actions":[{"op":"clear","register":"pending"}]
-    \\        }
-    \\      ]
-    \\    }
-    \\  ],
-    \\  "identity":{},
-    \\  "storage":{
-    \\    "kind":"event-log",
-    \\    "slots":{"events":{
-    \\      "path":"example/{stream}/capabilities.jsonl",
-    \\      "kind":"event-log","codec":"jsonl","max_bytes":65536
-    \\    }}
-    \\  },
-    \\  "operations":{
-    \\    "abort":{"effects":[{
-    \\      "op":"compare-and-append","slot":"events","input":"abort",
-    \\      "event":{
-    \\        "mode":"chained","body_input_field":"body",
-    \\        "fields":[
-    \\          {"field":"kind","input_field":"kind"},
-    \\          {"field":"stream_id","input_field":"stream_id"}
-    \\        ],
-    \\        "body_fields":[{
-    \\          "field":"capability_digest",
-    \\          "state_value":{"register":"pending","path":"/capability_digest"}
-    \\        }],
-    \\        "forbidden_parameters":["capability"]
-    \\      }
-    \\    }]},
-    \\    "consume":{"effects":[{
-    \\      "op":"compare-and-append","slot":"events","input":"consume",
-    \\      "event":{
-    \\        "mode":"chained","body_input_field":"body",
-    \\        "fields":[
-    \\          {"field":"kind","input_field":"kind"},
-    \\          {"field":"stream_id","input_field":"stream_id"}
-    \\        ],
-    \\        "body_fields":[{
-    \\          "field":"capability_digest",
-    \\          "parameter_sha256":{
-    \\            "parameter":"capability",
-    \\            "expected_state":{
-    \\              "register":"pending","path":"/capability_digest"
-    \\            }
-    \\          }
-    \\        }]
-    \\      }
-    \\    }]},
-    \\    "prepare":{"effects":[{
-    \\      "op":"compare-and-append","slot":"events","input":"prepare",
-    \\      "event":{
-    \\        "mode":"chained","body_input_field":"body",
-    \\        "fields":[
-    \\          {"field":"kind","input_field":"kind"},
-    \\          {"field":"stream_id","input_field":"stream_id"}
-    \\        ],
-    \\        "generate":[{
-    \\          "name":"capability","op":"secure-token","prefix":"AKC2-","bytes":32
-    \\        }],
-    \\        "body_fields":[{
-    \\          "field":"capability_digest","generated_sha256":"capability"
-    \\        }],
-    \\        "forbidden_parameters":["capability"]
-    \\      }
-    \\    }]}
-    \\  },
-    \\  "projections":{},
-    \\  "bounds":{
-    \\    "max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,
-    \\    "max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/capability-protocol","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","canonical-json","compare-and-append","cross-input-equal","enum","event-digest","event-envelope","event-kinds","event-materialization","exact-object","path-format","previous-digest","reducer","replay","secure-token","sequence","sha256"]},"parameters":{"capability":{"type":"string","required":false},"stream":{"type":"safe_identifier","required":true}},"inputs":{"abort":{"codec":"json","required":false,"max_bytes":4096},"consume":{"codec":"json","required":false,"max_bytes":4096},"prepare":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"abort"},{"op":"canonical-json","input":"consume"},{"op":"canonical-json","input":"prepare"}]},"shape":{"documents":{"abort":{"object":"exact","fields":{"body":{"object":"exact","fields":{"step_id":{}}},"kind":{"enum":["aborted"]},"stream_id":{}}},"consume":{"object":"exact","fields":{"body":{"object":"exact","fields":{"step_id":{}}},"kind":{"enum":["consumed"]},"stream_id":{}}},"prepare":{"object":"exact","fields":{"body":{"object":"exact","fields":{"step_id":{}}},"kind":{"enum":["prepared"]},"stream_id":{}},"event_envelope":{"keys":["body","body_digest","event_digest","kind","previous_digest","sequence","stream_id"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/stream_id"}]}}}},"constraints":{"laws":[["sequence",{"start":1}],["previous-digest",{"genesis":null}],["body-digest"],["event-digest"],["event-kinds",{"values":["aborted","consumed","prepared"]}],["reducer",{"mode":"retained","event_kind":"/kind","registers":[{"name":"pending","max_bytes":4096}],"admissions":[{"on":"prepared","requires":[],"forbids":["pending"],"rules":[],"actions":[{"op":"set","register":"pending","input":"event","path":"/body"}]},{"on":"consumed","requires":["pending"],"forbids":[],"rules":[["cross-input-equal",{"input":"event","left_input":"event","left":"/body/capability_digest","right_input":"pending","right":"/capability_digest"}],["cross-input-equal",{"input":"event","left_input":"event","left":"/body/step_id","right_input":"pending","right":"/step_id"}]],"actions":[{"op":"clear","register":"pending"}]},{"on":"aborted","requires":["pending"],"forbids":[],"rules":[["cross-input-equal",{"input":"event","left_input":"event","left":"/body/capability_digest","right_input":"pending","right":"/capability_digest"}],["cross-input-equal",{"input":"event","left_input":"event","left":"/body/step_id","right_input":"pending","right":"/step_id"}]],"actions":[{"op":"clear","register":"pending"}]}]}]]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/capabilities.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"abort":{"effects":[{"op":"compare-and-append","slot":"events","input":"abort","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],"body_fields":[{"field":"capability_digest","state_value":{"register":"pending","path":"/capability_digest"}}],"forbidden_parameters":["capability"]}}]},"consume":{"effects":[{"op":"compare-and-append","slot":"events","input":"consume","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],"body_fields":[{"field":"capability_digest","parameter_sha256":{"parameter":"capability","expected_state":{"register":"pending","path":"/capability_digest"}}}]}}]},"prepare":{"effects":[{"op":"compare-and-append","slot":"events","input":"prepare","event":{"mode":"chained","body_input_field":"body","fields":[{"field":"kind","input_field":"kind"},{"field":"stream_id","input_field":"stream_id"}],"generate":[{"name":"capability","op":"secure-token","prefix":"AKC2-","bytes":32}],"body_fields":[{"field":"capability_digest","generated_sha256":"capability"}],"forbidden_parameters":["capability"]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
 ;
 
 const capability_prepare_input =
@@ -4201,19 +4011,16 @@ const definition_bound_event_definition =
     "\"event-envelope\",\"event-kinds\",\"exact-object\"," ++
     "\"previous-digest\",\"replay\",\"sequence\"]},\"parameters\":{}," ++
     "\"inputs\":{\"event\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
-    "\"canonicalization\":{},\"shape\":{\"rules\":[{" ++
-    "\"op\":\"exact-object\",\"input\":\"event\",\"path\":\"\"," ++
-    "\"keys\":[\"body\",\"body_digest\",\"event_digest\",\"kind\"," ++
-    "\"previous_digest\",\"sequence\"]},{\"op\":\"event-envelope\"," ++
-    "\"input\":\"event\",\"keys\":[\"body\",\"body_digest\"," ++
+    "\"canonicalization\":{},\"shape\":{\"documents\":{\"event\":{" ++
+    "\"object\":\"exact\",\"fields\":{\"body\":{},\"body_digest\":{}," ++
+    "\"event_digest\":{},\"kind\":{},\"previous_digest\":{},\"sequence\":{}}," ++
+    "\"event_envelope\":{\"keys\":[\"body\",\"body_digest\"," ++
     "\"event_digest\",\"kind\",\"previous_digest\",\"sequence\"]," ++
     "\"sequence\":\"/sequence\",\"kind\":\"/kind\"," ++
     "\"previous_digest\":\"/previous_digest\",\"body\":\"/body\"," ++
-    "\"body_digest\":\"/body_digest\",\"event_digest\":\"/event_digest\"}]}," ++
-    "\"constraints\":[{\"op\":\"sequence\",\"start\":1},{" ++
-    "\"op\":\"previous-digest\",\"genesis\":null},{" ++
-    "\"op\":\"body-digest\"},{\"op\":\"event-digest\"},{" ++
-    "\"op\":\"event-kinds\",\"values\":[\"created\",\"updated\"]}]," ++
+    "\"body_digest\":\"/body_digest\",\"event_digest\":\"/event_digest\"}}}}," ++
+    "\"constraints\":{\"event_log\":{\"start\":1,\"genesis\":null," ++
+    "\"kinds\":[\"created\",\"updated\"]}}," ++
     "\"identity\":{},\"storage\":{\"kind\":\"event-log\",\"slots\":{" ++
     "\"events\":{\"path\":\"example/chained-events.jsonl\"," ++
     "\"kind\":\"event-log\",\"codec\":\"jsonl\",\"max_bytes\":65536}}}," ++
@@ -4381,8 +4188,8 @@ const document_history_definition =
     "\"type\":\"safe_identifier\",\"required\":false},\"revision\":{" ++
     "\"type\":\"digest\",\"required\":false}},\"inputs\":{\"record\":{" ++
     "\"codec\":\"json\",\"max_bytes\":4096}},\"canonicalization\":{}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"record\"," ++
-    "\"path\":\"\",\"keys\":[\"value\"]}]},\"constraints\":[],\"identity\":{}," ++
+    "\"shape\":{\"documents\":{\"record\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"value\":{}}}}},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"addressed-document\",\"slots\":{\"current\":{" ++
     "\"path\":\"example/current.json\",\"kind\":\"document\"," ++
     "\"codec\":\"json\",\"max_bytes\":4096}}},\"operations\":{\"create\":{" ++
@@ -4576,7 +4383,7 @@ const unbound_store_definition =
     "\"abi\":\"ledger-artifact-abi/v1\",\"operators\":[" ++
     "\"compare-and-append\"]},\"parameters\":{},\"inputs\":{\"event\":{" ++
     "\"codec\":\"json\",\"max_bytes\":1024}},\"canonicalization\":{}," ++
-    "\"shape\":{},\"constraints\":[],\"identity\":{}," ++
+    "\"shape\":{},\"constraints\":{\"laws\":[]},\"identity\":{}," ++
     "\"storage\":{\"kind\":\"event-log\",\"slots\":{\"events\":{" ++
     "\"path\":\"example/events.jsonl\",\"codec\":\"jsonl\"," ++
     "\"max_bytes\":4096}}},\"operations\":{\"append\":{\"effects\":[{" ++
@@ -4615,94 +4422,7 @@ test "transaction fails closed for an unbound existing store" {
 }
 
 const content_idempotency_definition =
-    \\{
-    \\  "schema":"ledger-artifact-definition/v1",
-    \\  "id":"example/content-idempotency",
-    \\  "owner":"example",
-    \\  "requires":{
-    \\    "abi":"ledger-artifact-abi/v1",
-    \\    "operators":[
-    \\      "bind-existing","canonical-json","compare-and-append",
-    \\      "event-materialization","exact-object","idempotency-key","sha1"
-    \\    ]
-    \\  },
-    \\  "parameters":{
-    \\    "allow_duplicate":{
-    \\      "type":"boolean","required":false,"default":false
-    \\    }
-    \\  },
-    \\  "inputs":{"submission":{"codec":"json","max_bytes":4096}},
-    \\  "canonicalization":{"steps":[
-    \\    {"op":"canonical-json","input":"submission"}
-    \\  ]},
-    \\  "shape":{"rules":[
-    \\    {
-    \\      "op":"exact-object","input":"submission","path":"",
-    \\      "keys":["record"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object","input":"submission","path":"/record",
-    \\      "keys":["context","status","summary"]
-    \\    },
-    \\    {
-    \\      "op":"exact-object","input":"submission","path":"/record/context",
-    \\      "keys":["branch","paths","repo"]
-    \\    }
-    \\  ]},
-    \\  "constraints":[],
-    \\  "identity":{},
-    \\  "storage":{
-    \\    "kind":"event-log",
-    \\    "slots":{"events":{
-    \\      "path":"example/content-idempotency.jsonl",
-    \\      "kind":"event-log","codec":"jsonl","max_bytes":65536
-    \\    }}
-    \\  },
-    \\  "operations":{
-    \\    "bind":{"effects":[{
-    \\      "op":"bind-existing","slot":"events","input":"submission",
-    \\      "event_from_operation":"capture"
-    \\    }]},
-    \\    "capture":{"effects":[{
-    \\      "op":"compare-and-append","slot":"events","input":"submission",
-    \\      "event":{
-    \\        "mode":"plain",
-    \\        "body_input_field":"record",
-    \\        "field_order":["event","record"],
-    \\        "body_order":["status","summary","context","fingerprint"],
-    \\        "object_orders":[{
-    \\          "path":"/context","fields":["repo","branch","paths"]
-    \\        }],
-    \\        "escape_non_ascii":true,
-    \\        "fields":[{"field":"event","literal":"capture"}],
-    \\        "derive":[{
-    \\          "name":"fingerprint","op":"sha1","encoding":"hex",
-    \\          "prefix_bytes":16,
-    \\          "fragments":[
-    \\            {"input_text":"/record/status"},
-    \\            {"literal":"|"},
-    \\            {
-    \\              "input_text":"/record/summary",
-    \\              "transform":"ascii-lower"
-    \\            }
-    \\          ],
-    \\          "max_bytes":4096
-    \\        }],
-    \\        "idempotency":{
-    \\          "derived":"fingerprint","bypass_param":"allow_duplicate"
-    \\        },
-    \\        "body_fields":[
-    \\          {"field":"fingerprint","derived":"fingerprint"}
-    \\        ]
-    \\      }
-    \\    }]}
-    \\  },
-    \\  "projections":{},
-    \\  "bounds":{
-    \\    "max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,
-    \\    "max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/content-idempotency","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bind-existing","canonical-json","compare-and-append","event-materialization","exact-object","idempotency-key","sha1"]},"parameters":{"allow_duplicate":{"type":"boolean","required":false,"default":false}},"inputs":{"submission":{"codec":"json","max_bytes":4096}},"canonicalization":{"steps":[{"op":"canonical-json","input":"submission"}]},"shape":{"documents":{"submission":{"object":"exact","fields":{"record":{"object":"exact","fields":{"context":{"object":"exact","fields":{"branch":{},"paths":{},"repo":{}}},"status":{},"summary":{}}}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/content-idempotency.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"bind":{"effects":[{"op":"bind-existing","slot":"events","input":"submission","event_from_operation":"capture"}]},"capture":{"effects":[{"op":"compare-and-append","slot":"events","input":"submission","event":{"mode":"plain","body_input_field":"record","field_order":["event","record"],"body_order":["status","summary","context","fingerprint"],"object_orders":[{"path":"/context","fields":["repo","branch","paths"]}],"escape_non_ascii":true,"fields":[{"field":"event","literal":"capture"}],"derive":[{"name":"fingerprint","op":"sha1","encoding":"hex","prefix_bytes":16,"fragments":[{"input_text":"/record/status"},{"literal":"|"},{"input_text":"/record/summary","transform":"ascii-lower"}],"max_bytes":4096}],"idempotency":{"derived":"fingerprint","bypass_param":"allow_duplicate"},"body_fields":[{"field":"fingerprint","derived":"fingerprint"}]}}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":4,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const content_idempotency_request =

@@ -1685,8 +1685,8 @@ const materialized_definition_json =
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
     "\"input\":\"record\"}]}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"path\":\"\"," ++
-    "\"keys\":[\"record_id\",\"value\"]}]},\"constraints\":[]," ++
+    "\"shape\":{\"documents\":{\"record\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"record_id\":{},\"value\":{}}}}},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{\"op\":\"content-address\",\"input\":\"record\"," ++
     "\"exclude\":\"/record_id\"}," ++ pure_definition_tail_one;
 
@@ -1697,7 +1697,7 @@ const claimed_definition_json =
     "\"operators\":[\"canonical-json\",\"content-address\"]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
-    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":[]," ++
+    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{\"op\":\"content-address\",\"input\":\"record\"," ++
     "\"exclude\":\"/record_id\",\"field\":\"/record_id\"}," ++
     pure_definition_tail_one;
@@ -1710,10 +1710,10 @@ const prefixed_definition_json =
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
     "\"input\":\"record\"}]}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"path\":\"\"," ++
-    "\"keys\":[\"envelope\"]},{\"op\":\"exact-object\"," ++
-    "\"path\":\"/envelope\",\"keys\":[\"record_id\",\"value\"]}]}," ++
-    "\"constraints\":[],\"identity\":{\"op\":\"content-address\"," ++
+    "\"shape\":{\"documents\":{\"record\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"envelope\":{\"object\":\"exact\",\"fields\":{\"record_id\":{}," ++
+    "\"value\":{}}}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{\"op\":\"content-address\"," ++
     "\"input\":\"record\",\"exclude\":\"/record_id\"," ++
     "\"exclude_recursive\":true,\"prefix\":\"OBJ-\"," ++
     "\"field\":\"/envelope/record_id\"}," ++ pure_definition_tail_one;
@@ -1726,10 +1726,9 @@ const nested_draft_definition_json =
     "\"inputs\":{\"contract\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
     "\"input\":\"contract\"}]}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"contract\"," ++
-    "\"path\":\"\",\"keys\":[\"artifact\"]},{\"op\":\"exact-object\"," ++
-    "\"input\":\"contract\",\"path\":\"/artifact\"," ++
-    "\"keys\":[\"artifact_id\",\"value\"]}]},\"constraints\":[]," ++
+    "\"shape\":{\"documents\":{\"contract\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"artifact\":{\"object\":\"exact\",\"fields\":{\"artifact_id\":{}," ++
+    "\"value\":{}}}}}}},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{\"op\":\"content-address\",\"input\":\"contract\"," ++
     "\"basis_null\":\"/artifact/artifact_id\"," ++
     "\"field\":\"/artifact/artifact_id\"}," ++ pure_definition_tail_one;
@@ -1743,9 +1742,9 @@ const composite_definition_json =
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
     "\"input\":\"record\"}]}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"record\"," ++
-    "\"path\":\"\",\"keys\":[\"kind\",\"record_id\",\"sequence\"]}]}," ++
-    "\"constraints\":[],\"identity\":{\"op\":\"composite-identity\"," ++
+    "\"shape\":{\"documents\":{\"record\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"kind\":{},\"record_id\":{},\"sequence\":{}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{\"op\":\"composite-identity\"," ++
     "\"input\":\"record\",\"prefix\":\"REC\"," ++
     "\"fields\":[\"/kind\",\"/sequence\"],\"separator\":\"-\"," ++
     "\"field\":\"/record_id\",\"max_bytes\":128}," ++ pure_definition_tail_one;
@@ -1757,7 +1756,7 @@ const composite_bounds_definition_json =
     "\"operators\":[\"canonical-json\",\"composite-identity\"]}," ++
     "\"inputs\":{\"record\":{\"codec\":\"json\",\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
-    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":[]," ++
+    "\"input\":\"record\"}]},\"shape\":{},\"constraints\":{\"laws\":[]}," ++
     "\"identity\":{\"op\":\"composite-identity\",\"input\":\"record\"," ++
     "\"fields\":[\"/value\"],\"max_bytes\":3}," ++ pure_definition_tail_one;
 
@@ -1771,10 +1770,9 @@ const request_family_definition_json =
     "\"max_bytes\":4096}}," ++
     "\"canonicalization\":{\"steps\":[{\"op\":\"canonical-json\"," ++
     "\"input\":\"left\"},{\"op\":\"canonical-json\",\"input\":\"right\"}]}," ++
-    "\"shape\":{\"rules\":[{\"op\":\"exact-object\",\"input\":\"left\"," ++
-    "\"path\":\"\",\"keys\":[\"id\"]},{\"op\":\"exact-object\"," ++
-    "\"input\":\"right\",\"path\":\"\",\"keys\":[\"id\"]}]}," ++
-    "\"constraints\":[],\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
+    "\"shape\":{\"documents\":{\"left\":{\"object\":\"exact\",\"fields\":{" ++
+    "\"id\":{}}},\"right\":{\"object\":\"exact\",\"fields\":{\"id\":{}}}}}," ++
+    "\"constraints\":{\"laws\":[]},\"identity\":{},\"storage\":{\"kind\":\"pure\"}," ++
     "\"operations\":{},\"projections\":{}," ++
     "\"bounds\":{\"max_input_bytes\":4096,\"max_store_bytes\":4096," ++
     "\"max_records\":2,\"max_output_bytes\":4096,\"max_diagnostics\":8," ++

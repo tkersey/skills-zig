@@ -1201,35 +1201,7 @@ fn deinitFragments(
 }
 
 const document_test_definition =
-    \\{
-    \\  "schema": "ledger-artifact-definition/v1",
-    \\  "id": "example/documents",
-    \\  "owner": "example",
-    \\  "requires": {
-    \\    "abi": "ledger-artifact-abi/v1",
-    \\    "operators": ["text-render", "timestamp-ordinal"]
-    \\  },
-    \\  "parameters": {
-    \\    "decision_id": {"type": "safe_identifier", "required": false},
-    \\    "document_id": {"type": "safe_identifier", "required": false}
-    \\  },
-    \\  "inputs": {"text": {"codec": "text", "max_bytes": 4096}},
-    \\  "canonicalization": {},
-    \\  "shape": {},
-    \\  "constraints": [],
-    \\  "identity": {},
-    \\  "storage": {"kind": "pure"},
-    \\  "operations": {},
-    \\  "projections": {},
-    \\  "bounds": {
-    \\    "max_input_bytes": 4096,
-    \\    "max_store_bytes": 4096,
-    \\    "max_records": 1,
-    \\    "max_output_bytes": 4096,
-    \\    "max_diagnostics": 8,
-    \\    "max_reducer_states": 1
-    \\  }
-    \\}
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/documents","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["text-render","timestamp-ordinal"]},"parameters":{"decision_id":{"type":"safe_identifier","required":false},"document_id":{"type":"safe_identifier","required":false}},"inputs":{"text":{"codec":"text","max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":4096,"max_records":1,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
 
 const timestamp_template =

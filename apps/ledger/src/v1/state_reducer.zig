@@ -3380,11 +3380,11 @@ const retained_test_prefix =
     \\  "inputs":{"event":{"codec":"json","max_bytes":4096}},
     \\  "canonicalization":{},
     \\  "shape":{},
-    \\  "constraints":[
+    \\  "constraints":{"laws":[
 ;
 
 const retained_test_suffix =
-    \\  ],
+    \\  ]},
     \\  "identity":{},
     \\  "storage":{"kind":"pure"},
     \\  "operations":{},
@@ -3401,7 +3401,7 @@ const retained_test_suffix =
 ;
 
 const retained_upsert_suffix =
-    \\  ],
+    \\  ]},
     \\  "identity":{},
     \\  "storage":{"kind":"pure"},
     \\  "operations":{},
@@ -3419,8 +3419,7 @@ const retained_upsert_suffix =
 
 const retained_state_definition =
     retained_test_prefix ++
-    \\    {
-    \\      "op":"reducer",
+    \\    ["reducer",{
     \\      "mode":"retained",
     \\      "event_kind":"/kind",
     \\      "registers":[
@@ -3463,13 +3462,12 @@ const retained_state_definition =
     \\          ]
     \\        }
     \\      ]
-    \\    }
+    \\    }]
     ++ retained_test_suffix;
 
 const retained_sets_definition =
     retained_test_prefix ++
-    \\    {
-    \\      "op":"reducer",
+    \\    ["reducer",{
     \\      "mode":"retained",
     \\      "event_kind":"/kind",
     \\      "registers":[{"name":"current","max_bytes":4096}],
@@ -3546,13 +3544,12 @@ const retained_sets_definition =
     \\          ]
     \\        }
     \\      ]
-    \\    }
+    \\    }]
     ++ retained_test_suffix;
 
 const retained_upsert_definition =
     retained_test_prefix ++
-    \\    {
-    \\      "op":"reducer",
+    \\    ["reducer",{
     \\      "mode":"retained",
     \\      "event_kind":"/kind",
     \\      "registers":[{"name":"items","max_bytes":4096}],
@@ -3592,13 +3589,12 @@ const retained_upsert_definition =
     \\          ]
     \\        }
     \\      ]
-    \\    }
+    \\    }]
     ++ retained_upsert_suffix;
 
 const retained_evolution_first =
     retained_test_prefix ++
-    \\    {
-    \\      "op":"reducer",
+    \\    ["reducer",{
     \\      "mode":"retained",
     \\      "event_kind":"/kind",
     \\      "registers":[{"name":"current","max_bytes":4096}],
@@ -3618,13 +3614,12 @@ const retained_evolution_first =
     \\          ]
     \\        }
     \\      ]
-    \\    }
+    \\    }]
     ++ retained_test_suffix;
 
 const retained_evolution_second =
     retained_test_prefix ++
-    \\    {
-    \\      "op":"reducer",
+    \\    ["reducer",{
     \\      "mode":"retained",
     \\      "event_kind":"/kind",
     \\      "registers":[{"name":"current","max_bytes":4096}],
@@ -3666,7 +3661,7 @@ const retained_evolution_second =
     \\          ]
     \\        }
     \\      ]
-    \\    }
+    \\    }]
     ++ retained_test_suffix;
 
 const upsert_created_event =
