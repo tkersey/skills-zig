@@ -181,6 +181,7 @@ pub const Operator = enum {
             .exactly_one, .at_least_one => 3,
             .keyed_unique => 2,
             .regex => 3,
+            .digest => 2,
             .sha256 => 4,
             .event_materialization => 5,
             .idempotency_key => 2,

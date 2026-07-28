@@ -312,7 +312,7 @@ fn canonicalDefinitionAlloc(
         allocator,
         value,
     ) catch |err| switch (err) {
-        error.NumberOutOfRange,
+        error.InvalidNumber,
         error.NonFiniteNumber,
         error.InvalidUtf8,
         => return error.InvalidDefinitionJson,

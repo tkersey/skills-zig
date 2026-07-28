@@ -679,7 +679,18 @@ pub fn validateArtifact(
     materialization_plan: *const Plan,
     documents: []const validation.InputDocument,
 ) !validation.Result {
-    var execution = try validation.execute(allocator, validation_plan, documents);
+    var execution = if (!hasClaimedIdentity(materialization_plan.identity))
+        try validation.executeValidationOnly(
+            allocator,
+            validation_plan,
+            documents,
+        )
+    else
+        try validation.execute(
+            allocator,
+            validation_plan,
+            documents,
+        );
     defer execution.deinit();
     if (execution.isValid()) {
         try validateClaimedIdentity(
@@ -689,6 +700,14 @@ pub fn validateArtifact(
         );
     }
     return execution.takeResult(allocator, definition_plan);
+}
+
+fn hasClaimedIdentity(identity: Identity) bool {
+    return switch (identity) {
+        .none => false,
+        .content_address => |config| config.claimed != null,
+        .composite => |config| config.claimed != null,
+    };
 }
 
 fn validateClaimedIdentity(

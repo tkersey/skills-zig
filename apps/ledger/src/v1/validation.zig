@@ -220,6 +220,7 @@ const CompiledRule = struct {
     case_insensitive: bool = false,
     allow_additional: bool = false,
     allow_null: bool = false,
+    allow_bare_digest: bool = false,
     total_coverage: bool = false,
     reject_self_reference: bool = false,
     ignore_null_references: bool = false,
@@ -516,6 +517,8 @@ const Builder = struct {
             => try compileCountBoundRootRule(object, rule),
             .bounded_string => try compileStringBoundRootRule(object, rule),
             .regex => try compileRegexRootRule(self.allocator, object, rule),
+            .digest => try compileDigestRule(object, true, rule),
+            .timestamp => try requireRootPathOnly(object),
             .sha256 => try self.compileSha256Rule(object, true, rule),
             .safe_identifier => try compileIdentifierRootRule(object, rule),
             .safe_relative_path => try compileRelativePathRule(
@@ -1707,15 +1710,13 @@ const Builder = struct {
                 depth,
                 rule,
             ),
-            .required_field,
-            .field_absent,
-            .digest,
-            .timestamp,
-            .unique,
-            => try definition_core.json.requireExactKeys(
-                object,
-                &.{ "op", "path" },
-            ),
+            .required_field, .field_absent, .timestamp, .unique => {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "op", "path" },
+                );
+            },
+            .digest => try compileDigestRule(object, false, rule),
             .forbidden_object_keys => try compileForbiddenObjectKeysRule(
                 self.allocator,
                 object,
@@ -2764,6 +2765,7 @@ fn encodeCacheRuleHeader(
     try encoder.writeBool(rule.case_insensitive);
     try encoder.writeBool(rule.allow_additional);
     try encoder.writeBool(rule.allow_null);
+    try encoder.writeBool(rule.allow_bare_digest);
     try encoder.writeBool(rule.total_coverage);
     try encoder.writeBool(rule.reject_self_reference);
     try encoder.writeBool(rule.ignore_null_references);
@@ -3418,6 +3420,7 @@ const DecodedCacheRuleHeader = struct {
     case_insensitive: bool,
     allow_additional: bool,
     allow_null: bool,
+    allow_bare_digest: bool,
     total_coverage: bool,
     reject_self_reference: bool,
     ignore_null_references: bool,
@@ -3532,6 +3535,7 @@ fn decodeCacheRule(
         .case_insensitive = header.case_insensitive,
         .allow_additional = header.allow_additional,
         .allow_null = header.allow_null,
+        .allow_bare_digest = header.allow_bare_digest,
         .total_coverage = header.total_coverage,
         .reject_self_reference = header.reject_self_reference,
         .ignore_null_references = header.ignore_null_references,
@@ -3595,6 +3599,7 @@ fn decodeCacheRuleHeader(
         .case_insensitive = try context.decoder.readBool(),
         .allow_additional = try context.decoder.readBool(),
         .allow_null = try context.decoder.readBool(),
+        .allow_bare_digest = try context.decoder.readBool(),
         .total_coverage = try context.decoder.readBool(),
         .reject_self_reference = try context.decoder.readBool(),
         .ignore_null_references = try context.decoder.readBool(),
@@ -4075,6 +4080,9 @@ fn validateCachedRuleIndices(
 }
 
 fn validateCachedBasicRule(rule: CompiledRule) !void {
+    if (rule.allow_bare_digest and rule.operator != .digest) {
+        return error.CacheRuleConfigurationInvalid;
+    }
     switch (rule.operator) {
         .required_field, .field_absent => if (rule.pointer_id == null) {
             return error.CacheRuleConfigurationInvalid;
@@ -4518,7 +4526,7 @@ fn validateCachedExtensionFields(rule: CompiledRule) !void {
 }
 
 fn validateCachedChildRelations(rule: CompiledRule) !void {
-    for (rule.children) |child| {
+    for (rule.children) |*child| {
         if (rule.operator == .implies) {
             if (!isValidationOperator(child.operator)) {
                 return error.CacheRuleConfigurationInvalid;
@@ -4641,7 +4649,7 @@ fn validateCachedItemRuleGroup(
     rules: []const CompiledRule,
     input_index: u8,
 ) !void {
-    for (rules) |rule| {
+    for (rules) |*rule| {
         if (rule.input_index != input_index or
             !isItemOperator(rule.operator))
         {
@@ -4808,8 +4816,15 @@ fn normalizeParsedNumbers(
     while (values.pop()) |value| {
         switch (value.*) {
             .number_string => |text| {
+                if (exactIntegerFromNumberString(text)) |integer| {
+                    value.* = .{ .integer = integer };
+                    continue;
+                }
                 const parsed = std.json.Value.parseFromNumberSlice(text);
-                if (parsed != .number_string) value.* = parsed;
+                if (parsed != .number_string and exactNumbersEqual(
+                    .{ .number_string = text },
+                    parsed,
+                )) value.* = parsed;
             },
             .array => |*array| {
                 for (array.items) |*item| {
@@ -4828,6 +4843,11 @@ fn normalizeParsedNumbers(
             else => {},
         }
     }
+}
+
+fn exactIntegerFromNumberString(text: []const u8) ?i64 {
+    const number = definition_core.exact_number.parse(text) orelse return null;
+    return definition_core.exact_number.toI64(number);
 }
 
 pub const Execution = struct {
@@ -4916,6 +4936,33 @@ pub fn execute(
     validation_plan: *const Plan,
     documents: []const InputDocument,
 ) !Execution {
+    return executeInternal(
+        allocator,
+        validation_plan,
+        documents,
+        true,
+    );
+}
+
+pub fn executeValidationOnly(
+    allocator: std.mem.Allocator,
+    validation_plan: *const Plan,
+    documents: []const InputDocument,
+) !Execution {
+    return executeInternal(
+        allocator,
+        validation_plan,
+        documents,
+        false,
+    );
+}
+
+fn executeInternal(
+    allocator: std.mem.Allocator,
+    validation_plan: *const Plan,
+    documents: []const InputDocument,
+    normalize_numbers: bool,
+) !Execution {
     var diagnostics = definition_core.diagnostics.Collector.init(allocator, .{
         .max_count = validation_plan.max_diagnostics,
         .max_total_bytes = 64 * 1024,
@@ -4960,14 +5007,7 @@ pub fn execute(
         validation_plan.rules,
         &diagnostics,
     );
-    for (loaded) |*input| {
-        if (input.parsed_json) |*parsed| {
-            try normalizeParsedNumbers(
-                allocator,
-                &parsed.value,
-            );
-        }
-    }
+    if (normalize_numbers) try normalizeLoadedNumbers(allocator, loaded);
     std.sort.heap(InputDigest, digests.items, {}, struct {
         fn lessThan(_: void, left: InputDigest, right: InputDigest) bool {
             return std.mem.lessThan(u8, left.name, right.name);
@@ -4980,6 +5020,20 @@ pub fn execute(
         .input_digests = input_digests,
         .diagnostics = diagnostics,
     };
+}
+
+fn normalizeLoadedNumbers(
+    allocator: std.mem.Allocator,
+    loaded: []LoadedInput,
+) !void {
+    for (loaded) |*input| {
+        if (input.parsed_json) |*parsed| {
+            try normalizeParsedNumbers(
+                allocator,
+                &parsed.value,
+            );
+        }
+    }
 }
 
 fn loadInputDocument(
@@ -5054,7 +5108,7 @@ fn parseLoadedInput(
             allocator,
             document.bytes,
             .{
-                .allocate = .alloc_always,
+                .allocate = .alloc_if_needed,
                 .duplicate_field_behavior = .@"error",
                 .parse_numbers = false,
             },
@@ -5164,33 +5218,47 @@ fn applyRules(
     rules: []const CompiledRule,
     diagnostics: *definition_core.diagnostics.Collector,
 ) !void {
-    var pending: std.ArrayList(*const CompiledRule) = .empty;
-    defer pending.deinit(allocator);
-    try pushExecutionRules(&pending, allocator, rules);
-    while (pending.pop()) |rule| {
+    try applyRuleSequence(
+        allocator,
+        plan,
+        loaded,
+        rules,
+        diagnostics,
+        0,
+    );
+}
+
+fn applyRuleSequence(
+    allocator: std.mem.Allocator,
+    plan: *const Plan,
+    loaded: []const LoadedInput,
+    rules: []const CompiledRule,
+    diagnostics: *definition_core.diagnostics.Collector,
+    depth: usize,
+) !void {
+    if (depth > 16) return error.ConditionalRuleDepthExceeded;
+    for (rules) |*rule| {
         if (rule.operator == .implies and rule.children.len != 0) {
             const root = loaded[rule.input_index].json() orelse continue;
-            if (implicationPredicateHolds(plan, root, rule.*)) {
-                try pushExecutionRules(&pending, allocator, rule.children);
+            if (implicationPredicateHolds(plan, root, rule)) {
+                try applyRuleSequence(
+                    allocator,
+                    plan,
+                    loaded,
+                    rule.children,
+                    diagnostics,
+                    depth + 1,
+                );
             }
             continue;
         }
-        try applyRule(allocator, plan, loaded, rule.*, diagnostics);
-    }
-}
-
-fn pushExecutionRules(
-    pending: *std.ArrayList(*const CompiledRule),
-    allocator: std.mem.Allocator,
-    rules: []const CompiledRule,
-) !void {
-    if (rules.len > 65_535 - pending.items.len) {
-        return error.TooManyItemRules;
-    }
-    var index = rules.len;
-    while (index > 0) {
-        index -= 1;
-        try pending.append(allocator, &rules[index]);
+        try applyRule(
+            allocator,
+            plan,
+            loaded,
+            rule,
+            diagnostics,
+        );
     }
 }
 
@@ -5198,7 +5266,7 @@ fn applyRule(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     loaded: []const LoadedInput,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     diagnostics: *definition_core.diagnostics.Collector,
 ) !void {
     const root = loaded[rule.input_index].json() orelse return;
@@ -5228,7 +5296,7 @@ const RuleEvaluationContext = struct {
     allocator: std.mem.Allocator,
     plan: *const Plan,
     loaded: []const LoadedInput,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     root: std.json.Value,
     target: ?std.json.Value,
 };
@@ -5308,7 +5376,10 @@ fn evaluatePrimitiveRule(context: RuleEvaluationContext) anyerror!bool {
         else
             false,
         .enum_value => if (target) |value| enumContains(rule.values, value) else false,
-        .digest => if (target) |value| validateScalar(value, .digest) else false,
+        .digest => if (target) |value|
+            digestHolds(value, rule.allow_bare_digest)
+        else
+            false,
         .timestamp => if (target) |value|
             validateScalar(value, .timestamp)
         else
@@ -5486,7 +5557,7 @@ fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
 fn collectionRuleHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) anyerror!bool {
     const items = switch (value) {
@@ -5526,7 +5597,7 @@ fn collectionRuleHolds(
 fn objectValuesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) anyerror!bool {
     const object = switch (value) {
@@ -5551,7 +5622,7 @@ fn objectValuesHold(
 fn forbiddenObjectKeysHold(
     allocator: std.mem.Allocator,
     value: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     var pending: std.ArrayList(ForbiddenValueTask) = .empty;
     defer pending.deinit(allocator);
@@ -5581,7 +5652,7 @@ fn inspectForbiddenValue(
     allocator: std.mem.Allocator,
     pending: *std.ArrayList(ForbiddenValueTask),
     task: ForbiddenValueTask,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     visited: usize,
 ) !bool {
     switch (task.value) {
@@ -5623,7 +5694,7 @@ fn pushForbiddenValue(
     pending: *std.ArrayList(ForbiddenValueTask),
     value: std.json.Value,
     depth: usize,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     visited: usize,
 ) !bool {
     if (depth > rule.min_count.?) return false;
@@ -5637,7 +5708,7 @@ fn pushForbiddenValue(
     return true;
 }
 
-fn forbiddenKeyMatches(key: []const u8, rule: CompiledRule) bool {
+fn forbiddenKeyMatches(key: []const u8, rule: *const CompiledRule) bool {
     for (rule.keys) |forbidden| {
         const matches = if (rule.case_insensitive)
             std.ascii.eqlIgnoreCase(key, forbidden)
@@ -5651,11 +5722,11 @@ fn forbiddenKeyMatches(key: []const u8, rule: CompiledRule) bool {
 fn oneOfRulesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) anyerror!bool {
     var matches: usize = 0;
-    for (rule.children) |child| {
+    for (rule.children) |*child| {
         if (try itemRuleHolds(allocator, plan, child, value)) {
             matches += 1;
             if (matches > 1) return false;
@@ -5666,7 +5737,7 @@ fn oneOfRulesHold(
 
 fn formattedFieldsHold(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) bool {
     const parents = switch (value) {
@@ -5701,7 +5772,7 @@ fn formattedFieldsHold(
 
 fn formattedItemTargetHolds(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     parent: std.json.Value,
     item: std.json.Value,
 ) bool {
@@ -5765,7 +5836,7 @@ fn formattedFieldFragment(
 fn taggedUnionHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) anyerror!bool {
     if (rule.other_pointer_id) |tag_pointer_id| {
@@ -5804,7 +5875,7 @@ fn itemRulesHold(
     rules: []const CompiledRule,
     root: std.json.Value,
 ) anyerror!bool {
-    for (rules) |rule| {
+    for (rules) |*rule| {
         if (!try itemRuleHolds(allocator, plan, rule, root)) return false;
     }
     return true;
@@ -5813,7 +5884,7 @@ fn itemRulesHold(
 fn itemRuleHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     root: std.json.Value,
 ) anyerror!bool {
     const target = if (rule.pointer_id) |pointer_id|
@@ -6002,7 +6073,7 @@ fn importedPlanHolds(
 fn compareRule(
     plan: *const Plan,
     loaded: []const LoadedInput,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) bool {
     const left_root = loaded[rule.input_index].json() orelse return false;
     const right_root = loaded[rule.other_input_index.?].json() orelse return false;
@@ -6011,7 +6082,7 @@ fn compareRule(
 
 fn compareRuleRoots(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     left_root: std.json.Value,
     right_root: std.json.Value,
 ) bool {
@@ -6082,7 +6153,7 @@ fn compareValues(
     };
 }
 
-fn countPresent(plan: *const Plan, root: std.json.Value, rule: CompiledRule) bool {
+fn countPresent(plan: *const Plan, root: std.json.Value, rule: *const CompiledRule) bool {
     var count: usize = 0;
     for (rule.path_ids) |pointer_id| {
         if (resolve(root, plan.pointers[pointer_id]) != null) count += 1;
@@ -6094,7 +6165,7 @@ fn countMatchingFields(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     var count: usize = 0;
     for (rule.path_ids) |pointer_id| {
@@ -6112,7 +6183,7 @@ fn countMatching(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     const items = switch (resolve(
         root,
@@ -6137,7 +6208,7 @@ fn implicationHolds(
     plan: *const Plan,
     condition_root: std.json.Value,
     consequent_root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) bool {
     if (!implicationPredicateHolds(plan, condition_root, rule)) return true;
     const consequent = resolve(
@@ -6160,7 +6231,7 @@ fn implicationHolds(
 fn implicationPredicateHolds(
     plan: *const Plan,
     condition_root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) bool {
     const condition = resolve(
         condition_root,
@@ -6194,7 +6265,7 @@ fn totalPartition(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     const universe_value = resolve(
         root,
@@ -6269,7 +6340,7 @@ fn totalMapping(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     const collections = resolveMappingCollections(
         plan,
@@ -6315,7 +6386,7 @@ fn totalMapping(
 fn resolveMappingCollections(
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) ?MappingCollections {
     const sources = switch (resolve(
         root,
@@ -6393,7 +6464,7 @@ fn indexMappingTargets(
 fn mappingsHold(
     mappings: []const std.json.Value,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source_index: *std.AutoHashMapUnmanaged([32]u8, MappingSource),
     target_index: *std.AutoHashMapUnmanaged([32]u8, std.json.Value),
 ) !bool {
@@ -6427,7 +6498,7 @@ fn resolve(root: std.json.Value, pointer: Pointer) ?std.json.Value {
     return definition_core.json_pointer.lookup(root, pointer);
 }
 
-fn exactObject(value: std.json.Value, rule: CompiledRule) bool {
+fn exactObject(value: std.json.Value, rule: *const CompiledRule) bool {
     const object = switch (value) {
         .object => |object| object,
         else => return false,
@@ -6467,7 +6538,7 @@ fn valueHasKind(value: std.json.Value, kind: JsonKind) bool {
     };
 }
 
-fn boundedString(value: std.json.Value, rule: CompiledRule) bool {
+fn boundedString(value: std.json.Value, rule: *const CompiledRule) bool {
     const text = switch (value) {
         .string => |text| text,
         else => return false,
@@ -6479,7 +6550,7 @@ fn boundedString(value: std.json.Value, rule: CompiledRule) bool {
     return true;
 }
 
-fn regexHolds(value: std.json.Value, rule: CompiledRule) bool {
+fn regexHolds(value: std.json.Value, rule: *const CompiledRule) bool {
     const text = switch (value) {
         .string => |text| text,
         else => return false,
@@ -6494,7 +6565,7 @@ fn regexHolds(value: std.json.Value, rule: CompiledRule) bool {
 fn sha256Holds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
 ) !bool {
     if (plan.pointers[rule.other_pointer_id.?].raw.len == 0) return false;
@@ -6536,7 +6607,7 @@ fn sha256Holds(
 fn hashCanonicalJsonNull(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
     hasher: *std.crypto.hash.sha2.Sha256,
 ) !bool {
@@ -6564,7 +6635,7 @@ fn hashCanonicalJsonNull(
 
 fn hashFramedItems(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
     hasher: *std.crypto.hash.sha2.Sha256,
 ) bool {
@@ -6600,7 +6671,7 @@ fn hashFramedItems(
 
 fn hashFramedFields(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     value: std.json.Value,
     hasher: *std.crypto.hash.sha2.Sha256,
 ) bool {
@@ -6623,7 +6694,7 @@ fn hashFramedFields(
 
 fn hashFormattedParts(
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     key: FormattedReferenceKey,
     total_bytes: *usize,
     hasher: *std.crypto.hash.sha2.Sha256,
@@ -6715,7 +6786,7 @@ fn regexStateContains(states: [4]u64, state: usize) bool {
     return states[word] & (@as(u64, 1) << bit) != 0;
 }
 
-fn boundedNumber(value: std.json.Value, rule: CompiledRule) bool {
+fn boundedNumber(value: std.json.Value, rule: *const CompiledRule) bool {
     if (rule.min_number) |minimum| {
         const order = exactNumberOrder(
             value,
@@ -6737,7 +6808,7 @@ fn declaredFieldValuesHold(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     target_value: std.json.Value,
 ) !bool {
     const targets = switch (target_value) {
@@ -6804,7 +6875,7 @@ fn declaredFieldValuesHold(
     return true;
 }
 
-fn boundedCount(value: std.json.Value, kind: JsonKind, rule: CompiledRule) bool {
+fn boundedCount(value: std.json.Value, kind: JsonKind, rule: *const CompiledRule) bool {
     const count = switch (kind) {
         .array => switch (value) {
             .array => |array| array.items.len,
@@ -6819,7 +6890,7 @@ fn boundedCount(value: std.json.Value, kind: JsonKind, rule: CompiledRule) bool 
     return withinCount(count, rule);
 }
 
-fn withinCount(count: usize, rule: CompiledRule) bool {
+fn withinCount(count: usize, rule: *const CompiledRule) bool {
     if (rule.min_count) |minimum| if (count < minimum) return false;
     if (rule.max_count) |maximum| if (count > maximum) return false;
     return true;
@@ -6866,7 +6937,18 @@ fn validateScalar(value: std.json.Value, kind: definition_core.scalar.Kind) bool
     return true;
 }
 
-fn safeIdentifier(value: std.json.Value, rule: CompiledRule) bool {
+fn digestHolds(value: std.json.Value, allow_bare: bool) bool {
+    const text = switch (value) {
+        .string => |text| text,
+        else => return false,
+    };
+    if (definition_core.canonical_json.isFingerprint(text)) return true;
+    if (!allow_bare or text.len != 64) return false;
+    for (text) |byte| if (!std.ascii.isHex(byte)) return false;
+    return true;
+}
+
+fn safeIdentifier(value: std.json.Value, rule: *const CompiledRule) bool {
     const text = switch (value) {
         .string => |text| text,
         else => return false,
@@ -6896,7 +6978,7 @@ fn safeIdentifier(value: std.json.Value, rule: CompiledRule) bool {
     };
 }
 
-fn safeRelativePath(value: std.json.Value, rule: CompiledRule) bool {
+fn safeRelativePath(value: std.json.Value, rule: *const CompiledRule) bool {
     const text = switch (value) {
         .string => |text| text,
         else => return false,
@@ -6989,7 +7071,7 @@ fn keyedUniqueSources(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     var seen: std.AutoHashMapUnmanaged([32]u8, std.json.Value) = .empty;
     defer seen.deinit(allocator);
@@ -7029,7 +7111,7 @@ fn selectedKeyedJoin(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     const collection = switch (resolve(
         root,
@@ -7098,7 +7180,7 @@ fn predecessorSuccessorHolds(
     allocator: std.mem.Allocator,
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
 ) !bool {
     var predecessors: std.AutoHashMapUnmanaged(
         [32]u8,
@@ -7153,7 +7235,7 @@ fn predecessorSuccessorHolds(
 fn markDirectCorrespondence(
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     predecessors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
     successors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
     reference_count: *usize,
@@ -7199,7 +7281,7 @@ fn markDirectCorrespondence(
 fn markMappedCorrespondence(
     plan: *const Plan,
     root: std.json.Value,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     predecessors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
     successors: *std.AutoHashMapUnmanaged([32]u8, CorrespondenceEntry),
     reference_count: *usize,
@@ -7388,7 +7470,7 @@ const ReferenceCoverageAlias = struct {
 fn referencesExist(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source_value: std.json.Value,
     source_root: std.json.Value,
     target_root: std.json.Value,
@@ -7453,7 +7535,7 @@ fn referencesExist(
 fn markSingleReferenceSource(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source_value: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     source_count: *usize,
@@ -7481,7 +7563,7 @@ fn markSingleReferenceSource(
 fn markDeclaredReferenceSources(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source_root: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     source_count: *usize,
@@ -7516,7 +7598,7 @@ fn markDeclaredReferenceSources(
 fn markDeclaredReferenceSource(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source: CompiledReferenceSource,
     items: []const std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
@@ -7561,7 +7643,7 @@ fn markDeclaredReferenceSource(
 fn addReferenceSourceItems(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source: CompiledReferenceSource,
     items: []const std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
@@ -7590,7 +7672,7 @@ fn addReferenceSourceItems(
 fn markReferencesFromItems(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     source_items: []const std.json.Value,
     reference_pointer_id: u16,
     source_rules: []const CompiledRule,
@@ -7687,7 +7769,7 @@ fn markSourceReference(
 fn indexSingleReferenceTargetSet(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     target_root: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
@@ -7750,7 +7832,7 @@ fn indexSingleReferenceTargetSet(
 fn indexReferenceTargetUnion(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     target_root: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
@@ -7876,7 +7958,7 @@ fn indexReferenceTargetSpec(
 fn indexReferenceTarget(
     allocator: std.mem.Allocator,
     plan: *const Plan,
-    rule: CompiledRule,
+    rule: *const CompiledRule,
     item: std.json.Value,
     index: *std.AutoHashMapUnmanaged([32]u8, ReferenceTarget),
     coverage_aliases: *std.ArrayList(ReferenceCoverageAlias),
@@ -8195,7 +8277,10 @@ fn scalarKeyDigest(value: std.json.Value) ?[32]u8 {
         },
         .integer, .float, .number_string => {
             var buffer: [128]u8 = undefined;
-            const number = exactNumber(value, &buffer) orelse return null;
+            const number = definition_core.exact_number.fromValue(
+                value,
+                &buffer,
+            ) orelse return null;
             hasher.update("number:");
             hasher.update(if (number.negative) "-" else "+");
             var scale_buffer: [32]u8 = undefined;
@@ -8491,225 +8576,19 @@ fn valueOrder(left: std.json.Value, right: std.json.Value) std.math.Order {
         if (isJsonNumber(left)) .lt else .gt;
 }
 
-const ExactNumber = struct {
-    raw: []const u8,
-    negative: bool,
-    digits_offset: usize,
-    integer_digits: usize,
-    significant_start: usize,
-    significant_len: usize,
-    scale: i64,
-
-    fn digit(self: ExactNumber, index: usize) u8 {
-        const ordinal = self.significant_start + index;
-        const dot_offset: usize = if (ordinal >= self.integer_digits and
-            self.integer_digits < self.raw.len and
-            self.raw[self.digits_offset + self.integer_digits] == '.')
-            1
-        else
-            0;
-        return self.raw[self.digits_offset + ordinal + dot_offset];
-    }
-};
-
 fn isJsonNumber(value: std.json.Value) bool {
     return value == .integer or value == .float or value == .number_string;
 }
 
 fn exactNumbersEqual(left: std.json.Value, right: std.json.Value) bool {
-    return exactNumberOrder(left, right) == .eq;
+    return definition_core.exact_number.valuesEqual(left, right);
 }
 
 fn exactNumberOrder(
     left: std.json.Value,
     right: std.json.Value,
 ) ?std.math.Order {
-    var left_buffer: [128]u8 = undefined;
-    var right_buffer: [128]u8 = undefined;
-    const left_number = exactNumber(left, &left_buffer) orelse return null;
-    const right_number = exactNumber(right, &right_buffer) orelse return null;
-    if (left_number.significant_len == 0 and
-        right_number.significant_len == 0)
-    {
-        return .eq;
-    }
-    if (left_number.negative != right_number.negative) {
-        return if (left_number.negative) .lt else .gt;
-    }
-    const magnitude_order = exactMagnitudeOrder(
-        left_number,
-        right_number,
-    );
-    return if (left_number.negative)
-        switch (magnitude_order) {
-            .lt => .gt,
-            .eq => .eq,
-            .gt => .lt,
-        }
-    else
-        magnitude_order;
-}
-
-fn exactMagnitudeOrder(
-    left: ExactNumber,
-    right: ExactNumber,
-) std.math.Order {
-    if (left.significant_len == 0) {
-        return if (right.significant_len == 0) .eq else .lt;
-    }
-    if (right.significant_len == 0) return .gt;
-    const left_width = @as(i128, @intCast(left.significant_len)) +
-        @as(i128, left.scale);
-    const right_width = @as(i128, @intCast(right.significant_len)) +
-        @as(i128, right.scale);
-    const width_order = std.math.order(left_width, right_width);
-    if (width_order != .eq) return width_order;
-    const digit_count = @max(
-        left.significant_len,
-        right.significant_len,
-    );
-    var index: usize = 0;
-    while (index < digit_count) : (index += 1) {
-        const left_digit = if (index < left.significant_len)
-            left.digit(index)
-        else
-            '0';
-        const right_digit = if (index < right.significant_len)
-            right.digit(index)
-        else
-            '0';
-        const digit_order = std.math.order(left_digit, right_digit);
-        if (digit_order != .eq) return digit_order;
-    }
-    return .eq;
-}
-
-fn exactNumber(
-    value: std.json.Value,
-    buffer: *[128]u8,
-) ?ExactNumber {
-    const text = switch (value) {
-        .integer => |number| std.fmt.bufPrint(
-            buffer,
-            "{d}",
-            .{number},
-        ) catch return null,
-        .float => |number| number: {
-            if (!std.math.isFinite(number)) return null;
-            break :number std.fmt.bufPrint(
-                buffer,
-                "{d}",
-                .{number},
-            ) catch return null;
-        },
-        .number_string => |number| number,
-        else => return null,
-    };
-    return parseExactNumber(text);
-}
-
-fn parseExactNumber(text: []const u8) ?ExactNumber {
-    if (text.len == 0) return null;
-    const negative = text[0] == '-';
-    const digits_offset: usize = if (negative) 1 else 0;
-    if (digits_offset == text.len) return null;
-    var cursor = digits_offset;
-    while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
-        cursor += 1;
-    }
-    const integer_digits = cursor - digits_offset;
-    if (integer_digits == 0) return null;
-    var fraction_digits: usize = 0;
-    if (cursor < text.len and text[cursor] == '.') {
-        cursor += 1;
-        const fraction_start = cursor;
-        while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
-            cursor += 1;
-        }
-        fraction_digits = cursor - fraction_start;
-        if (fraction_digits == 0) return null;
-    }
-    var exponent: i64 = 0;
-    if (cursor < text.len and
-        (text[cursor] == 'e' or text[cursor] == 'E'))
-    {
-        cursor += 1;
-        const exponent_negative = cursor < text.len and text[cursor] == '-';
-        if (cursor < text.len and
-            (text[cursor] == '-' or text[cursor] == '+'))
-        {
-            cursor += 1;
-        }
-        const exponent_start = cursor;
-        while (cursor < text.len and std.ascii.isDigit(text[cursor])) {
-            cursor += 1;
-        }
-        if (cursor == exponent_start) return null;
-        const magnitude = std.fmt.parseInt(
-            u64,
-            text[exponent_start..cursor],
-            10,
-        ) catch return null;
-        if (exponent_negative) {
-            if (magnitude > @as(u64, @intCast(std.math.maxInt(i64))) + 1) {
-                return null;
-            }
-            exponent = if (magnitude ==
-                @as(u64, @intCast(std.math.maxInt(i64))) + 1)
-                std.math.minInt(i64)
-            else
-                -@as(i64, @intCast(magnitude));
-        } else {
-            exponent = std.math.cast(i64, magnitude) orelse return null;
-        }
-    }
-    if (cursor != text.len) return null;
-    const total_digits = std.math.add(
-        usize,
-        integer_digits,
-        fraction_digits,
-    ) catch return null;
-    var number = ExactNumber{
-        .raw = text,
-        .negative = negative,
-        .digits_offset = digits_offset,
-        .integer_digits = integer_digits,
-        .significant_start = 0,
-        .significant_len = total_digits,
-        .scale = 0,
-    };
-    while (number.significant_start < total_digits and
-        number.digit(0) == '0')
-    {
-        number.significant_start += 1;
-        number.significant_len -= 1;
-    }
-    if (number.significant_len == 0) {
-        number.negative = false;
-        return number;
-    }
-    var trailing_zeros: usize = 0;
-    while (trailing_zeros < number.significant_len and
-        number.digit(number.significant_len - trailing_zeros - 1) == '0')
-    {
-        trailing_zeros += 1;
-    }
-    number.significant_len -= trailing_zeros;
-    const fraction_scale = std.math.cast(i64, fraction_digits) orelse
-        return null;
-    const trailing_scale = std.math.cast(i64, trailing_zeros) orelse
-        return null;
-    number.scale = std.math.sub(
-        i64,
-        exponent,
-        fraction_scale,
-    ) catch return null;
-    number.scale = std.math.add(
-        i64,
-        number.scale,
-        trailing_scale,
-    ) catch return null;
-    return number;
+    return definition_core.exact_number.orderValues(left, right);
 }
 
 fn jsonNumber(value: std.json.Value) ?f64 {
@@ -8749,6 +8628,26 @@ test "relational numbers preserve exact JSON values" {
         scalarKeyDigest(values[2]).?,
         scalarKeyDigest(values[4]).?,
     );
+}
+
+test "parsed-number normalization preserves exact integral decimals" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[9007199254740992.0,9007199254740993.0,1.0]",
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    try normalizeParsedNumbers(
+        std.testing.allocator,
+        &parsed.value,
+    );
+    const values = parsed.value.array.items;
+    try std.testing.expectEqual(
+        @as(i64, 9_007_199_254_740_993),
+        values[1].integer,
+    );
+    try std.testing.expect(valuesEqual(values[2], .{ .integer = 1 }));
 }
 
 test "compiled uniqueness distinguishes adjacent large JSON numbers" {
@@ -9498,6 +9397,8 @@ fn isPrimitiveRootOperator(operator: definition.Operator) bool {
         .bounded_object,
         .bounded_string,
         .regex,
+        .digest,
+        .timestamp,
         .sha256,
         .safe_identifier,
         .safe_relative_path,
@@ -9542,6 +9443,27 @@ fn requireRootPathOnly(object: std.json.ObjectMap) !void {
         &.{ "op", "input", "path" },
     );
     try definition_core.json.requireFields(object, &.{ "op", "path" });
+}
+
+fn compileDigestRule(
+    object: std.json.ObjectMap,
+    root: bool,
+    rule: *CompiledRule,
+) !void {
+    if (root) {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "path", "allow_bare" },
+        );
+    } else {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "path", "allow_bare" },
+        );
+    }
+    try definition_core.json.requireFields(object, &.{ "op", "path" });
+    rule.allow_bare_digest =
+        try optionalBoolean(object, "allow_bare") orelse false;
 }
 
 fn compileCountBoundRootRule(
@@ -10788,6 +10710,25 @@ const validation_test_definition_17 =
     \\{"schema":"ledger-artifact-definition/v1","id":"example/embedded","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-array","cross-input-equal","enum","implies"]},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"state":{"codec":"json","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":8192,"max_store_bytes":8192,"max_records":8,"max_output_bytes":8192,"max_diagnostics":8,"max_reducer_states":2}}
 ;
 
+const bare_digest_test_definition =
+    \\{
+    \\  "schema":"ledger-artifact-definition/v1",
+    \\  "id":"example/digest-representations",
+    \\  "owner":"example",
+    \\  "requires":{"abi":"ledger-artifact-abi/v1","operators":["digest","exact-object"]},
+    \\  "inputs":{"record":{"codec":"json","max_bytes":256}},
+    \\  "canonicalization":{},
+    \\  "shape":{"documents":{"record":{"object":"exact","fields":{
+    \\    "strict":{"format":"digest"},
+    \\    "flexible":{"format":{"kind":"digest","allow_bare":true}}
+    \\  }}}},
+    \\  "constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},
+    \\  "operations":{},"projections":{},
+    \\  "bounds":{"max_input_bytes":256,"max_store_bytes":256,"max_records":1,
+    \\    "max_output_bytes":256,"max_diagnostics":4,"max_reducer_states":1}
+    \\}
+;
+
 const validation_test_definition_18 =
     \\{"schema":"ledger-artifact-definition/v1","id":"example/item-implication","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["bounded-string","enum","implies","tagged-union"]},"inputs":{"record":{"codec":"json","max_bytes":1024}},"canonicalization":{},"shape":{"documents":{"record":{"tagged":{"tag":"/kind","variants":[{"value":"capture","node":{"laws":[["implies",{"if":"/status","equals":"active","rules":[["bounded-string",{"path":"/proof","trimmed_min":1,"max":128}]]}]]}},{"value":"status","node":{"fields":{"status":{"enum":["closed"]}}}}]}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"pure"},"operations":{},"projections":{},"bounds":{"max_input_bytes":1024,"max_store_bytes":1024,"max_records":8,"max_output_bytes":1024,"max_diagnostics":8,"max_reducer_states":1}}
 ;
@@ -11047,6 +10988,63 @@ test "compiled identifier and repository path policies preserve exact boundaries
         );
         defer rejected.deinit(std.testing.allocator);
         try std.testing.expect(!rejected.valid);
+    }
+}
+
+test "compiled digest representation policy accepts bare hex only when declared" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "artifact.json",
+        .data = bare_digest_test_definition,
+    });
+    var test_plan = try ValidationTestPlan.init(
+        std.testing.allocator,
+        &tmp.dir,
+        "artifact.json",
+        1024 * 1024,
+    );
+    defer test_plan.deinit();
+    const prefixed =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const bare =
+        "aA11111111111111111111111111111111111111111111111111111111111111";
+    const cases = [_]struct {
+        strict: []const u8,
+        flexible: []const u8,
+        valid: bool,
+    }{
+        .{ .strict = prefixed, .flexible = prefixed, .valid = true },
+        .{ .strict = prefixed, .flexible = bare, .valid = true },
+        .{ .strict = bare, .flexible = prefixed, .valid = false },
+        .{ .strict = prefixed, .flexible = bare[0..63], .valid = false },
+        .{
+            .strict = prefixed,
+            .flexible = "zA11111111111111111111111111111111111111111111111111111111111111",
+            .valid = false,
+        },
+    };
+    for (cases) |case| {
+        const bytes = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"strict\":\"{s}\",\"flexible\":\"{s}\"}}",
+            .{ case.strict, case.flexible },
+        );
+        defer std.testing.allocator.free(bytes);
+        try expectTestValidation(
+            &test_plan.definition_plan,
+            &test_plan.plan,
+            "record",
+            bytes,
+            case.valid,
+        );
+        try expectTestValidation(
+            &test_plan.definition_plan,
+            &test_plan.cached,
+            "record",
+            bytes,
+            case.valid,
+        );
     }
 }
 

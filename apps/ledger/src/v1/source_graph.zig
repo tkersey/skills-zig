@@ -57,6 +57,10 @@ pub fn lowerShape(
     if (shape.count() == 0) {
         return .{ .array = std.json.Array.init(allocator) };
     }
+    if (shape.get("rules")) |raw_rules| {
+        try definition_core.json.requireExactKeys(shape, &.{"rules"});
+        return copyNativeRules(allocator, raw_rules, budget);
+    }
     try definition_core.json.requireExactKeys(shape, &.{
         "types",
         "documents",
@@ -113,6 +117,9 @@ pub fn lowerConstraints(
     input_names: []const []const u8,
     budget: *ExpansionBudget,
 ) !std.json.Value {
+    if (raw == .array) {
+        return copyNativeRules(allocator, raw, budget);
+    }
     const constraints = try definition_core.json.object(raw);
     try definition_core.json.requireExactKeys(constraints, &.{
         "terms",
@@ -155,6 +162,18 @@ pub fn lowerConstraints(
             try lowerState(allocator, state, terms, budget),
         );
     }
+    return .{ .array = rules };
+}
+
+fn copyNativeRules(
+    allocator: std.mem.Allocator,
+    raw: std.json.Value,
+    budget: *ExpansionBudget,
+) !std.json.Value {
+    const source = try definition_core.json.array(raw);
+    try budget.reserve(source.items.len);
+    var rules = std.json.Array.init(allocator);
+    try rules.appendSlice(source.items);
     return .{ .array = rules };
 }
 
@@ -641,7 +660,32 @@ fn queueNodeFormatRules(
         );
     }
     if (node.get("format")) |raw| {
-        const format = try definition_core.json.string(raw);
+        var format: []const u8 = undefined;
+        var rule_config: ?std.json.Value = null;
+        switch (raw) {
+            .string => |value| format = value,
+            .object => |object| configured: {
+                try definition_core.json.requireExactKeys(
+                    object,
+                    &.{ "kind", "allow_bare" },
+                );
+                try definition_core.json.requireFields(object, &.{"kind"});
+                format = try definition_core.json.requiredString(
+                    object,
+                    "kind",
+                );
+                if (!std.mem.eql(u8, format, "digest")) {
+                    return error.UnsupportedDocumentFormat;
+                }
+                var config = std.json.ObjectMap.empty;
+                if (try optionalBool(object, "allow_bare", false)) {
+                    try config.put(allocator, "allow_bare", .{ .bool = true });
+                }
+                rule_config = .{ .object = config };
+                break :configured;
+            },
+            else => return error.UnsupportedDocumentFormat,
+        }
         if (!std.mem.eql(u8, format, "digest") and
             !std.mem.eql(u8, format, "timestamp"))
         {
@@ -651,7 +695,13 @@ fn queueNodeFormatRules(
             allocator,
             tasks,
             work.rules,
-            try makeRule(allocator, format, work.input, work.path, null),
+            try makeRule(
+                allocator,
+                format,
+                work.input,
+                work.path,
+                rule_config,
+            ),
         );
     }
 }
@@ -3279,6 +3329,50 @@ test "structural graph lowers to bounded native rules" {
     try std.testing.expect(
         (try definition_core.json.field(required_note, "allow_null")).bool,
     );
+}
+
+test "native rule form remains a bounded definition source" {
+    const allocator = std.testing.allocator;
+    var shape = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"rules":[{"op":"digest","input":"record","path":"/fingerprint"}]}
+    ,
+        .{ .allocate = .alloc_always },
+    );
+    defer shape.deinit();
+    var constraints = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\[{"op":"field-equal","input":"record","left":"/a","right":"/b"}]
+    ,
+        .{ .allocate = .alloc_always },
+    );
+    defer constraints.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var budget: ExpansionBudget = .{};
+    const shape_rules = try lowerShape(
+        arena.allocator(),
+        shape.value,
+        &.{"record"},
+        &budget,
+    );
+    const constraint_rules = try lowerConstraints(
+        arena.allocator(),
+        constraints.value,
+        &.{"record"},
+        &budget,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        (try definition_core.json.array(shape_rules)).items.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        (try definition_core.json.array(constraint_rules)).items.len,
+    );
+    try std.testing.expectEqual(@as(usize, 2), budget.emitted);
 }
 
 test "structural graph rejects redirected and nested rules" {

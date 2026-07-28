@@ -1268,17 +1268,21 @@ fn compareValues(left: Value, right: Value) std.math.Order {
                 left_number,
                 right_number,
             ),
-            .float => |right_number| compareFloat(
-                @floatFromInt(left_number),
+            .float => |right_number| compareIntegerFloat(
+                left_number,
                 right_number,
             ),
             else => compareValueTags(left, right),
         },
         .float => |left_number| switch (right) {
-            .integer => |right_number| compareFloat(
+            .integer => |right_number| switch (compareIntegerFloat(
+                right_number,
                 left_number,
-                @floatFromInt(right_number),
-            ),
+            )) {
+                .lt => .gt,
+                .eq => .eq,
+                .gt => .lt,
+            },
             .float => |right_number| compareFloat(
                 left_number,
                 right_number,
@@ -1307,6 +1311,19 @@ fn compareValues(left: Value, right: Value) std.math.Order {
 fn compareFloat(left: f64, right: f64) std.math.Order {
     if (left < right) return .lt;
     if (left > right) return .gt;
+    return .eq;
+}
+
+fn compareIntegerFloat(left: i64, right: f64) std.math.Order {
+    const integer_min: f64 = -9_223_372_036_854_775_808.0;
+    const integer_limit: f64 = 9_223_372_036_854_775_808.0;
+    if (right < integer_min) return .gt;
+    if (right >= integer_limit) return .lt;
+    const truncated: i64 = @intFromFloat(right);
+    const integer_order = std.math.order(left, truncated);
+    if (integer_order != .eq) return integer_order;
+    if (right > 0 and right != @trunc(right)) return .lt;
+    if (right < 0 and right != @trunc(right)) return .gt;
     return .eq;
 }
 
@@ -1444,13 +1461,17 @@ fn valuesEqual(left: Value, right: Value, case_insensitive: bool) bool {
         },
         .integer => |left_number| switch (right) {
             .integer => |right_number| left_number == right_number,
-            .float => |right_number| @as(f64, @floatFromInt(left_number)) ==
+            .float => |right_number| compareIntegerFloat(
+                left_number,
                 right_number,
+            ) == .eq,
             else => false,
         },
         .float => |left_number| switch (right) {
-            .integer => |right_number| left_number ==
-                @as(f64, @floatFromInt(right_number)),
+            .integer => |right_number| compareIntegerFloat(
+                right_number,
+                left_number,
+            ) == .eq,
             .float => |right_number| left_number == right_number,
             else => false,
         },
@@ -2111,6 +2132,36 @@ test "compiled aggregate streams bounded numeric summaries in one pass" {
         @as(f64, 0),
         empty_summary[6].float,
         0.000001,
+    );
+}
+
+test "integer and float comparison preserves large integer identity" {
+    const exact: i64 = 9_007_199_254_740_992;
+    const adjacent: i64 = 9_007_199_254_740_993;
+    const exact_float: f64 = 9_007_199_254_740_992.0;
+    try std.testing.expect(valuesEqual(
+        .{ .integer = exact },
+        .{ .float = exact_float },
+        false,
+    ));
+    try std.testing.expect(!valuesEqual(
+        .{ .integer = adjacent },
+        .{ .float = exact_float },
+        false,
+    ));
+    try std.testing.expectEqual(
+        std.math.Order.gt,
+        compareValues(
+            .{ .integer = adjacent },
+            .{ .float = exact_float },
+        ),
+    );
+    try std.testing.expectEqual(
+        std.math.Order.lt,
+        compareValues(
+            .{ .float = exact_float },
+            .{ .integer = adjacent },
+        ),
     );
 }
 

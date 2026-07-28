@@ -1,10 +1,11 @@
 const std = @import("std");
+const exact_number = @import("exact_number.zig");
 
 /// Canonical JSON support for bounded passive definitions and artifacts. This is not a claim
-/// of full RFC 8785 compatibility: integers retain their exact i64 value,
-/// object keys are ordered by their raw UTF-8 bytes rather than by UTF-16 code
-/// units, and an integer-shaped f64 outside the parser's i64 domain uses
-/// scientific notation so canonical JSON remains parse-closed.
+/// of full RFC 8785 compatibility: exact JSON number lexemes are preserved
+/// without binary-float rounding, object keys are ordered by their raw UTF-8
+/// bytes rather than by UTF-16 code units, and integer-shaped f64 values outside
+/// the parser's i64 domain use scientific notation so they remain parse-closed.
 const Omission = struct {
     key: ?[]const u8 = null,
     recursive: bool = false,
@@ -64,17 +65,7 @@ fn writeCanonicalJsonWithOmission(
         .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
         .integer => |number| try writer.print("{d}", .{number}),
         .float => |number| try writeCanonicalFloat(writer, number),
-        .number_string => |text| {
-            const parsed = std.json.Value.parseFromNumberSlice(text);
-            if (parsed == .number_string) return error.NumberOutOfRange;
-            try writeCanonicalJsonWithOmission(
-                allocator,
-                writer,
-                parsed,
-                omission,
-                depth,
-            );
-        },
+        .number_string => |text| try exact_number.writeCanonical(writer, text),
         .string => |text| try writeCanonicalString(writer, text),
         .array => |items| {
             try writer.writeByte('[');
@@ -365,14 +356,47 @@ test "canonical JSON remains parse closed and rejects unsupported values" {
         defer std.testing.allocator.free(encoded);
         try expectCanonicalParseClosure(encoded);
     }
+    const exact_integer = try canonicalJsonAlloc(
+        std.testing.allocator,
+        .{ .number_string = "9223372036854775808" },
+    );
+    defer std.testing.allocator.free(exact_integer);
+    try std.testing.expectEqualStrings("9223372036854775808", exact_integer);
+    try expectCanonicalParseClosure(exact_integer);
     try std.testing.expectError(
-        error.NumberOutOfRange,
-        canonicalJsonAlloc(std.testing.allocator, .{ .number_string = "9223372036854775808" }),
+        error.InvalidNumber,
+        canonicalJsonAlloc(std.testing.allocator, .{ .number_string = "01" }),
     );
     try std.testing.expectError(
         error.InvalidUtf8,
         canonicalJsonAlloc(std.testing.allocator, .{ .string = "\xff" }),
     );
+}
+
+test "canonical JSON preserves distinct exact fractional numbers" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "[9007199254740992.1,9007199254740992.2,1.2300e+2,-0.0000001]",
+        .{ .parse_numbers = false },
+    );
+    defer parsed.deinit();
+    const canonical = try canonicalJsonAlloc(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        "[9007199254740992.1,9007199254740992.2,123,-1e-7]",
+        canonical,
+    );
+    var reparsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        canonical,
+        .{ .parse_numbers = false },
+    );
+    defer reparsed.deinit();
+    const repeated = try canonicalJsonAlloc(std.testing.allocator, reparsed.value);
+    defer std.testing.allocator.free(repeated);
+    try std.testing.expectEqualStrings(canonical, repeated);
 }
 
 test "canonical omission modes preserve their declared depth" {

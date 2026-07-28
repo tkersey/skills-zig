@@ -1,4 +1,5 @@
 pub const canonical_json = @import("canonical_json.zig");
+pub const exact_number = @import("exact_number.zig");
 pub const closure = @import("closure.zig");
 pub const json = @import("json.zig");
 pub const json_pointer = @import("json_pointer.zig");
@@ -16,6 +17,7 @@ pub const loadClosure = closure.load;
 
 test {
     _ = canonical_json;
+    _ = exact_number;
     _ = closure;
     _ = json;
     _ = json_pointer;
