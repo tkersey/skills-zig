@@ -5,6 +5,7 @@ const definition = @import("definition.zig");
 const execution = @import("execution.zig");
 const physical = @import("physical.zig");
 const plan = @import("plan.zig");
+const seq_time = @import("seq_time");
 const structured = @import("structured.zig");
 
 pub const Options = struct {
@@ -315,6 +316,30 @@ pub fn writeRelationRowsJson(
     relation: physical.Relation,
     first: *bool,
 ) !usize {
+    return writeRelationRowsJsonSelected(
+        writer,
+        trace,
+        relation,
+        first,
+        .{},
+    );
+}
+
+pub const RowSelection = struct {
+    since_ms: ?i64 = null,
+    until_ms: ?i64 = null,
+    status: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
+    remaining: ?*usize = null,
+};
+
+pub fn writeRelationRowsJsonSelected(
+    writer: *std.Io.Writer,
+    trace: *const trace_core.CanonicalSessionTrace,
+    relation: physical.Relation,
+    first: *bool,
+    selection: RowSelection,
+) !usize {
     if (relation == .structured_documents or
         relation == .structured_values)
     {
@@ -333,6 +358,7 @@ pub fn writeRelationRowsJson(
         .indices = indices[0..fields.len],
         .values = values[0..fields.len],
         .first = first,
+        .selection = selection,
     };
     switch (relation) {
         .sessions, .source_events, .turns, .messages => {
@@ -356,9 +382,18 @@ const WriteContext = struct {
     indices: []const u16,
     values: []execution.Value,
     first: *bool,
+    selection: RowSelection,
     count: usize = 0,
 
-    fn write(self: *WriteContext) !void {
+    fn exhausted(self: WriteContext) bool {
+        return if (self.selection.remaining) |remaining|
+            remaining.* == 0
+        else
+            false;
+    }
+
+    fn write(self: *WriteContext) !bool {
+        if (self.exhausted()) return false;
         try writePhysicalRowJson(
             self.writer,
             self.fields,
@@ -366,6 +401,8 @@ const WriteContext = struct {
             self.first,
         );
         self.count += 1;
+        if (self.selection.remaining) |remaining| remaining.* -= 1;
+        return true;
     }
 
     fn writePrimary(
@@ -375,22 +412,25 @@ const WriteContext = struct {
         switch (relation) {
             .sessions => {
                 try fillSession(self.values, self.indices, self.trace.session);
-                try self.write();
+                _ = try self.write();
             },
             .source_events => for (self.trace.occurrences.items) |*occurrence| {
+                if (self.exhausted()) break;
                 try fillSourceEvent(
                     self.values,
                     self.indices,
                     self.trace.session,
                     occurrence,
                 );
-                try self.write();
+                _ = try self.write();
             },
             .turns => for (self.trace.turns.items) |turn| {
+                if (!turnPassesSelection(turn, self.selection)) continue;
                 try fillTurn(self.values, self.indices, turn);
-                try self.write();
+                if (!try self.write()) break;
             },
             .messages => for (self.trace.occurrences.items) |*occurrence| {
+                if (self.exhausted()) break;
                 if (!occurrence.message_visible or
                     occurrence.role == null or
                     occurrence.text == null)
@@ -403,7 +443,7 @@ const WriteContext = struct {
                     self.trace.session,
                     occurrence,
                 );
-                try self.write();
+                _ = try self.write();
             },
             else => unreachable,
         }
@@ -415,6 +455,7 @@ const WriteContext = struct {
     ) !void {
         switch (relation) {
             .tool_invocations => for (self.trace.tools.items) |tool| {
+                if (self.exhausted()) break;
                 if (tool.declared_line == null) continue;
                 try fillToolInvocation(
                     self.values,
@@ -422,9 +463,10 @@ const WriteContext = struct {
                     tool,
                     occurrenceAtLine(self.trace, tool.declared_line.?),
                 );
-                try self.write();
+                _ = try self.write();
             },
             .tool_results => for (self.trace.tools.items) |tool| {
+                if (self.exhausted()) break;
                 if (tool.finalized_line == null) continue;
                 try fillToolResult(
                     self.values,
@@ -432,15 +474,17 @@ const WriteContext = struct {
                     tool,
                     occurrenceAtLine(self.trace, tool.finalized_line.?),
                 );
-                try self.write();
+                _ = try self.write();
             },
             .tool_lifecycle => for (self.trace.tools.items) |tool| {
+                if (self.exhausted()) break;
                 try fillToolLifecycle(self.values, self.indices, tool);
-                try self.write();
+                _ = try self.write();
             },
             .session_edges => for (self.trace.graph_edges.items) |edge| {
+                if (self.exhausted()) break;
                 try fillSessionEdge(self.values, self.indices, edge);
-                try self.write();
+                _ = try self.write();
             },
             else => unreachable,
         }
@@ -448,6 +492,7 @@ const WriteContext = struct {
 
     fn writeTokenEvents(self: *WriteContext) !void {
         for (self.trace.token_events.items) |event| {
+            if (self.exhausted()) break;
             if (event.occurrence_index >= self.trace.occurrences.items.len) {
                 return error.TokenEventOccurrenceMissing;
             }
@@ -458,10 +503,60 @@ const WriteContext = struct {
                 &self.trace.occurrences.items[event.occurrence_index],
                 event,
             );
-            try self.write();
+            _ = try self.write();
         }
     }
 };
+
+fn turnPassesSelection(
+    turn: trace_core.TurnRecord,
+    selection: RowSelection,
+) bool {
+    const timestamp = turn.started_at orelse turn.completed_at;
+    if (selection.since_ms) |since| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual < since) return false;
+    }
+    if (selection.until_ms) |until| {
+        const actual = seq_time.parseIsoTimestampMillis(
+            timestamp orelse return false,
+        ) orelse return false;
+        if (actual > until) return false;
+    }
+    if (selection.status) |status| {
+        if (!std.mem.eql(u8, @tagName(turn.status), status)) return false;
+    }
+    if (selection.contains) |needle| {
+        if (!containsIgnoreCase(turn.user_message, needle) and
+            !containsIgnoreCase(turn.user_preview, needle) and
+            !containsIgnoreCase(turn.final_answer, needle) and
+            !containsIgnoreCase(turn.assistant_preview, needle) and
+            !containsIgnoreCase(turn.model, needle) and
+            !containsIgnoreCase(turn.path, needle))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn containsIgnoreCase(
+    haystack: ?[]const u8,
+    needle: []const u8,
+) bool {
+    const text = haystack orelse return false;
+    if (needle.len == 0) return true;
+    if (text.len < needle.len) return false;
+    for (0..text.len - needle.len + 1) |index| {
+        if (std.ascii.eqlIgnoreCase(
+            text[index .. index + needle.len],
+            needle,
+        )) return true;
+    }
+    return false;
+}
 
 pub fn writeTraceDetailJson(
     writer: *std.Io.Writer,

@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
-const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
@@ -1090,16 +1089,9 @@ fn verifyDcpContentIdentity(
     };
     const packet = rootObject(root, "decision_context_packet") orelse root;
     const claimed = try requiredString(packet, "packet_id");
-    const canonical = try definition_core.canonical_json.canonicalJsonOmittingKeyAlloc(
-        allocator,
-        value,
-        "packet_id",
-    );
+    const canonical = try canonicalDcpV2JsonAlloc(allocator, value, true);
     defer allocator.free(canonical);
-    const digest = try definition_core.canonical_json.digestBytesAlloc(
-        allocator,
-        canonical,
-    );
+    const digest = try sha256HexAlloc(allocator, canonical);
     defer allocator.free(digest);
     const expected = try std.fmt.allocPrint(
         allocator,
@@ -1109,6 +1101,96 @@ fn verifyDcpContentIdentity(
     defer allocator.free(expected);
     if (!std.mem.eql(u8, claimed, expected)) {
         return error.DcpContentIdentityMismatch;
+    }
+}
+
+// DCP-v2 identity is a released wire contract. Keep this private writer
+// byte-compatible with the original DCP implementation instead of changing
+// historical identities when the generic canonical-JSON profile evolves.
+fn canonicalDcpV2JsonAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    omit_packet_id: bool,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try writeCanonicalDcpV2Json(
+        allocator,
+        &output.writer,
+        value,
+        omit_packet_id,
+    );
+    return output.toOwnedSlice();
+}
+
+fn writeCanonicalDcpV2Json(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+    omit_packet_id: bool,
+) !void {
+    switch (value) {
+        .object => |object| {
+            const keys = try allocator.alloc([]const u8, object.count());
+            defer allocator.free(keys);
+            var key_count: usize = 0;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (omit_packet_id and
+                    std.mem.eql(u8, key, "packet_id"))
+                {
+                    continue;
+                }
+                keys[key_count] = key;
+                key_count += 1;
+            }
+            std.mem.sort(
+                []const u8,
+                keys[0..key_count],
+                {},
+                struct {
+                    fn lessThan(
+                        _: void,
+                        left: []const u8,
+                        right: []const u8,
+                    ) bool {
+                        return std.mem.lessThan(u8, left, right);
+                    }
+                }.lessThan,
+            );
+            try writer.writeByte('{');
+            for (keys[0..key_count], 0..) |key, index| {
+                if (index != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(
+                    std.json.Value{ .string = key },
+                    .{},
+                    writer,
+                );
+                try writer.writeByte(':');
+                try writeCanonicalDcpV2Json(
+                    allocator,
+                    writer,
+                    object.get(key).?,
+                    omit_packet_id,
+                );
+            }
+            try writer.writeByte('}');
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeCanonicalDcpV2Json(
+                    allocator,
+                    writer,
+                    item,
+                    omit_packet_id,
+                );
+            }
+            try writer.writeByte(']');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
     }
 }
 
@@ -4571,6 +4653,28 @@ test "CAS rejects a DCP identity that does not bind its content" {
         error.DcpContentIdentityMismatch,
         verifyDcpContentIdentity(allocator, parsed.value),
     );
+}
+
+test "CAS preserves the released DCP-v2 canonical identity profile" {
+    const text =
+        \\{"packet_id":"root","float":1e23,"fraction":333333333.33333325,"negative_zero":-0.0,"escape":"\b\t\n\f\r\u0000\"\\/","nested":{"packet_id":"nested","value":1e-7}}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const canonical = try canonicalDcpV2JsonAlloc(
+        std.testing.allocator,
+        parsed.value,
+        true,
+    );
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        \\{"escape":"\b\t\n\f\r\u0000\"\\/","float":100000000000000000000000,"fraction":333333333.33333325,"negative_zero":-0,"nested":{"value":0.0000001}}
+    , canonical);
 }
 
 test "CAS consumes the explicit DCP-v2 source episode identity" {

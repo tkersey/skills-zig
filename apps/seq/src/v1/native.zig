@@ -233,6 +233,9 @@ fn parseOptions(command: Command, argv: []const []const u8) !Options {
     }
     while (index < argv.len) : (index += 1) {
         const option = try NativeOption.parse(argv[index]);
+        if (!optionAllowed(command, option)) {
+            return error.UnsupportedNativeOption;
+        }
         const value = if (option.requiresValue())
             try optionValue(argv, &index)
         else
@@ -241,6 +244,67 @@ fn parseOptions(command: Command, argv: []const []const u8) !Options {
     }
     try validateNativeSelectors(&options);
     return options;
+}
+
+fn optionAllowed(command: Command, option: NativeOption) bool {
+    return switch (option) {
+        .current, .once => command == .tail,
+        .root => switch (command) {
+            .sessions,
+            .turns,
+            .session_detail,
+            .tool_lifecycle,
+            .session_graph,
+            .tail,
+            .find_session,
+            .query,
+            .index,
+            => true,
+            .datasets, .dataset_schema => false,
+        },
+        .path => switch (command) {
+            .turns,
+            .session_detail,
+            .tool_lifecycle,
+            .session_graph,
+            .tail,
+            .query,
+            => true,
+            else => false,
+        },
+        .session_id => switch (command) {
+            .turns,
+            .session_detail,
+            .tool_lifecycle,
+            .session_graph,
+            .tail,
+            .find_session,
+            .query,
+            => true,
+            else => false,
+        },
+        .prompt => command == .find_session,
+        .contains => command == .sessions or command == .turns,
+        .repo => command == .sessions or command == .query,
+        .since, .until, .last => switch (command) {
+            .sessions, .turns, .find_session, .query => true,
+            else => false,
+        },
+        .status => command == .turns,
+        .dataset => command == .dataset_schema,
+        .spec => command == .query,
+        .limit => switch (command) {
+            .sessions,
+            .turns,
+            .tool_lifecycle,
+            .session_graph,
+            .tail,
+            .find_session,
+            => true,
+            else => false,
+        },
+        .format => true,
+    };
 }
 
 pub fn resolveTemporalBounds(options: *Options) !void {
@@ -321,8 +385,18 @@ fn runRelation(
 
     try writer.writeByte('[');
     var first = true;
-    var matched_sessions: usize = 0;
+    var remaining = options.limit;
+    var selection = trace_adapter.RowSelection{
+        .remaining = if (options.limit == 0) null else &remaining,
+    };
+    if (relation == .turns) {
+        selection.since_ms = options.since_ms;
+        selection.until_ms = options.until_ms;
+        selection.status = options.status;
+        selection.contains = options.contains;
+    }
     for (paths.items) |path| {
+        if (selection.remaining != null and remaining == 0) break;
         var trace = if (relation == .sessions)
             try trace_core.parseSessionSummaryTrace(
                 allocator,
@@ -336,15 +410,18 @@ fn runRelation(
                 traceOptions(relation),
             );
         defer trace.deinit(allocator);
-        if (!sessionPasses(trace.session, options)) continue;
-        if (options.limit != 0 and matched_sessions == options.limit) break;
-        _ = try trace_adapter.writeRelationRowsJson(
+        if (relation == .sessions and
+            !sessionPasses(trace.session, options))
+        {
+            continue;
+        }
+        _ = try trace_adapter.writeRelationRowsJsonSelected(
             writer,
             &trace,
             relation,
             &first,
+            selection,
         );
-        matched_sessions += 1;
     }
     try writer.writeAll("]\n");
 }
@@ -388,17 +465,17 @@ fn runSessionGraph(
     var paths = try resolveTargetPaths(allocator, io, options, false);
     defer freePaths(allocator, &paths);
     try writer.writeAll("digraph codex_sessions {\n");
-    var matched_sessions: usize = 0;
+    var remaining = options.limit;
     for (paths.items) |path| {
+        if (options.limit != 0 and remaining == 0) break;
         var trace = try trace_core.parseSessionTrace(
             allocator,
             path,
             traceOptions(.session_edges),
         );
         defer trace.deinit(allocator);
-        if (!sessionPasses(trace.session, options)) continue;
-        if (options.limit != 0 and matched_sessions == options.limit) break;
         for (trace.graph_edges.items) |edge| {
+            if (options.limit != 0 and remaining == 0) break;
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse continue;
             try writer.writeAll("  ");
@@ -406,8 +483,8 @@ fn runSessionGraph(
             try writer.writeAll(" -> ");
             try definition_core.canonical_json.writeCanonicalString(writer, worker);
             try writer.writeAll(";\n");
+            if (options.limit != 0) remaining -= 1;
         }
-        matched_sessions += 1;
     }
     try writer.writeAll("}\n");
 }
@@ -451,8 +528,12 @@ fn runFindSession(
 
     try writer.writeByte('[');
     var first = true;
-    var matched_sessions: usize = 0;
+    var remaining = options.limit;
+    const selection = trace_adapter.RowSelection{
+        .remaining = if (options.limit == 0) null else &remaining,
+    };
     for (paths.items) |path| {
+        if (selection.remaining != null and remaining == 0) break;
         var trace = try trace_core.parseSessionTrace(
             allocator,
             path,
@@ -467,14 +548,13 @@ fn runFindSession(
             if (!traceContainsPrompt(&trace, needle)) continue;
         }
         if (!sessionPasses(trace.session, options)) continue;
-        if (options.limit != 0 and matched_sessions == options.limit) break;
-        _ = try trace_adapter.writeRelationRowsJson(
+        _ = try trace_adapter.writeRelationRowsJsonSelected(
             writer,
             &trace,
             .sessions,
             &first,
+            selection,
         );
-        matched_sessions += 1;
     }
     try writer.writeAll("]\n");
 }
@@ -1376,7 +1456,7 @@ pub fn sessionPasses(
         const actual = seq_time.parseIsoTimestampMillis(
             timestamp orelse return false,
         ) orelse return false;
-        if (actual >= until) return false;
+        if (actual > until) return false;
     }
     if (options.repo) |repo| {
         const cwd = session.cwd orelse return false;
@@ -1472,5 +1552,16 @@ test "native options reject conflicting session selectors" {
             "--session-id",
             "session",
         }),
+    );
+}
+
+test "native options reject ignored command modifiers" {
+    try std.testing.expectError(
+        error.UnsupportedNativeOption,
+        parseOptions(.datasets, &.{ "--root", "/tmp/sessions" }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedNativeOption,
+        parseOptions(.query, &.{ "--limit", "1" }),
     );
 }

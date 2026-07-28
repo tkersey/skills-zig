@@ -93,6 +93,33 @@ grep -Fq '"session_id":"fixture-session"' <<<"$sessions_output"
 turns_output=$("$binary" turns --path "$rollout" --format json)
 grep -Fq '"turn_id":"turn-1"' <<<"$turns_output"
 
+two_turn_rollout=libs/trace_core/testdata/old_2025_08_root_meta.jsonl
+limited_turns=$("$binary" turns \
+  --path "$two_turn_rollout" \
+  --limit 1 \
+  --format json)
+test "$(grep -o '"turn_index":' <<<"$limited_turns" | wc -l | tr -d ' ')" = 1
+
+selected_turn=$("$binary" turns \
+  --path "$two_turn_rollout" \
+  --since 2025-08-01T10:01:01Z \
+  --contains SECOND \
+  --status complete \
+  --format json)
+grep -Fq '"turn_index":2' <<<"$selected_turn"
+if grep -Fq '"turn_index":1' <<<"$selected_turn"; then
+  exit 1
+fi
+
+inclusive_turn=$("$binary" turns \
+  --path "$two_turn_rollout" \
+  --until 2025-08-01T10:00:01Z \
+  --format json)
+grep -Fq '"turn_index":1' <<<"$inclusive_turn"
+if grep -Fq '"turn_index":2' <<<"$inclusive_turn"; then
+  exit 1
+fi
+
 detail_output=$("$binary" session-detail --path "$rollout" --format json)
 grep -Fq '"authority_granted":false' <<<"$detail_output"
 grep -Fq '"final_answer":"Observed FAILURE evidence"' <<<"$detail_output"
@@ -117,6 +144,9 @@ if grep -Eq 'actuat|universal|learnings|negative-ledger|synesthesia' \
 then
   exit 1
 fi
+if "$binary" datasets --root apps/seq/src/v1/fixtures >/dev/null 2>&1; then
+  exit 1
+fi
 
 schema_output=$("$binary" dataset-schema \
   --dataset structured_values \
@@ -129,6 +159,13 @@ query_output=$("$binary" query \
 grep -Fq \
   '{"session_id":"fixture-session","role":"assistant","text":"Observed FAILURE evidence"}' \
   <<<"$query_output"
+if "$binary" query \
+  --limit 1 \
+  --spec '{"dataset":"sessions","select":["session_id"]}' \
+  >/dev/null 2>&1
+then
+  exit 1
+fi
 
 mkdir -p "$cache_dir/sessions"
 cp "$rollout" "$cache_dir/sessions/rollout.jsonl"
