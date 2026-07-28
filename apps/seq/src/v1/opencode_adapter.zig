@@ -142,21 +142,30 @@ fn feedRecord(
             record_index,
             object,
         ),
-        .structured_documents => {
-            try fillStructuredDocument(
-                row,
-                program.source_field_indices,
-                raw,
-                record_index,
-            );
-            return runner.feed(row);
-        },
+        .structured_documents => return feedStructuredDocument(
+            runner,
+            row,
+            program.source_field_indices,
+            raw,
+            record_index,
+        ),
         .sessions,
         .session_edges,
         .token_events,
         .structured_values,
         => return .continue_scanning,
     }
+}
+
+fn feedStructuredDocument(
+    runner: *execution.Runner,
+    row: []execution.Value,
+    fields: []const u16,
+    raw: []const u8,
+    record_index: usize,
+) !execution.Feed {
+    try fillStructuredDocument(row, fields, raw, record_index);
+    return runner.feed(row);
 }
 
 fn feedTools(
@@ -191,13 +200,19 @@ fn feedTools(
         else
             null;
         defer if (input_json) |value| allocator.free(value);
+        var id_buffer: [96]u8 = undefined;
+        const fallback_call_id = try std.fmt.bufPrint(
+            &id_buffer,
+            "opencode:{d}:tool:{d}",
+            .{ record_index, part_index + 1 },
+        );
         try fillTool(
             row,
             program.source_field_indices,
             relation,
             path,
             record_index,
-            part_index,
+            fallback_call_id,
             part_object,
             state,
             input_json,
@@ -316,107 +331,105 @@ fn fillTool(
     relation: physical.Relation,
     path: []const u8,
     record_index: usize,
-    part_index: usize,
+    fallback_call_id: []const u8,
     part: std.json.ObjectMap,
     state: ?std.json.ObjectMap,
     input_json: ?[]const u8,
 ) !void {
-    var id_buffer: [96]u8 = undefined;
-    const fallback_id = try std.fmt.bufPrint(
-        &id_buffer,
-        "opencode:{d}:tool:{d}",
-        .{ record_index, part_index + 1 },
-    );
-    const call_id = stringField(part, "callID") orelse fallback_id;
-    const tool = stringField(part, "tool");
-    const status = if (state) |value| stringField(value, "status") else null;
-    const output = if (state) |value| stringField(value, "output") else null;
-    const command = if (state) |value|
-        if (objectField(value, "input")) |input|
-            stringField(input, "command")
-        else
-            null
-    else
-        null;
-    const exit_code = if (state) |value|
-        if (objectField(value, "metadata")) |metadata|
-            integerField(metadata, "exit")
-        else
-            null
-    else
-        null;
-    const start = if (state) |value|
-        if (objectField(value, "time")) |time|
-            integerField(time, "start")
-        else
-            null
-    else
-        null;
-    const end = if (state) |value|
-        if (objectField(value, "time")) |time|
-            integerField(time, "end")
-        else
-            null
-    else
-        null;
+    const values = ToolValues{
+        .call_id = stringField(part, "callID") orelse fallback_call_id,
+        .tool = stringField(part, "tool"),
+        .status = optionalObjectString(state, "status"),
+        .output = optionalObjectString(state, "output"),
+        .command = nestedObjectString(state, "input", "command"),
+        .exit_code = nestedObjectInteger(state, "metadata", "exit"),
+        .start = nestedObjectInteger(state, "time", "start"),
+        .end = nestedObjectInteger(state, "time", "end"),
+        .input_json = input_json,
+        .path = path,
+        .record_index = record_index,
+    };
     for (fields, 0..) |field, index| {
-        row[index] = switch (relation) {
-            .tool_invocations => switch (field) {
-                0 => .{ .string = call_id },
-                1 => .{ .string = session_id },
-                2 => .null,
-                3 => try usizeInteger(record_index - 1),
-                4 => .null,
-                5 => .{ .string = "tool" },
-                6 => optionalString(tool),
-                7 => .{ .string = "opencode" },
-                8 => optionalJson(input_json),
-                9 => optionalString(command),
-                10 => optionalString(command),
-                11 => .null,
-                12 => .null,
-                13 => .{ .string = path },
-                else => return error.InvalidOpenCodePhysicalFieldIndex,
-            },
-            .tool_results => switch (field) {
-                0 => .{ .string = call_id },
-                1 => .{ .string = session_id },
-                2 => .null,
-                3 => try usizeInteger(record_index - 1),
-                4 => .null,
-                5 => optionalString(output),
-                6 => optionalInteger(exit_code),
-                7 => optionalDuration(start, end),
-                8, 9 => .null,
-                10 => .null,
-                11 => .{ .string = path },
-                else => return error.InvalidOpenCodePhysicalFieldIndex,
-            },
-            .tool_lifecycle => switch (field) {
-                0 => .{ .string = call_id },
-                1 => .{ .string = session_id },
-                2 => .null,
-                3 => try usizeInteger(record_index - 1),
-                4, 5 => .null,
-                6 => .{ .string = "tool" },
-                7 => optionalString(tool),
-                8 => .{ .string = "opencode" },
-                9 => optionalJson(input_json),
-                10 => optionalString(command),
-                11 => optionalString(output),
-                12 => optionalString(command),
-                13 => .null,
-                14 => optionalInteger(exit_code),
-                15 => optionalDuration(start, end),
-                16 => optionalString(status),
-                17 => try usizeInteger(record_index),
-                18 => try usizeInteger(record_index),
-                19 => .{ .string = path },
-                else => return error.InvalidOpenCodePhysicalFieldIndex,
-            },
-            else => unreachable,
-        };
+        row[index] = try toolValue(relation, field, values);
     }
+}
+
+const ToolValues = struct {
+    call_id: []const u8,
+    tool: ?[]const u8,
+    status: ?[]const u8,
+    output: ?[]const u8,
+    command: ?[]const u8,
+    exit_code: ?i64,
+    start: ?i64,
+    end: ?i64,
+    input_json: ?[]const u8,
+    path: []const u8,
+    record_index: usize,
+};
+
+fn toolValue(
+    relation: physical.Relation,
+    field: u16,
+    values: ToolValues,
+) !execution.Value {
+    return switch (relation) {
+        .tool_invocations => toolInvocationValue(field, values),
+        .tool_results => toolResultValue(field, values),
+        .tool_lifecycle => toolLifecycleValue(field, values),
+        else => unreachable,
+    };
+}
+
+fn toolInvocationValue(field: u16, values: ToolValues) !execution.Value {
+    return switch (field) {
+        0 => .{ .string = values.call_id },
+        1 => .{ .string = session_id },
+        2, 4, 11, 12 => .null,
+        3 => try usizeInteger(values.record_index - 1),
+        5 => .{ .string = "tool" },
+        6 => optionalString(values.tool),
+        7 => .{ .string = "opencode" },
+        8 => optionalJson(values.input_json),
+        9, 10 => optionalString(values.command),
+        13 => .{ .string = values.path },
+        else => return error.InvalidOpenCodePhysicalFieldIndex,
+    };
+}
+
+fn toolResultValue(field: u16, values: ToolValues) !execution.Value {
+    return switch (field) {
+        0 => .{ .string = values.call_id },
+        1 => .{ .string = session_id },
+        2, 4, 8...10 => .null,
+        3 => try usizeInteger(values.record_index - 1),
+        5 => optionalString(values.output),
+        6 => optionalInteger(values.exit_code),
+        7 => optionalDuration(values.start, values.end),
+        11 => .{ .string = values.path },
+        else => return error.InvalidOpenCodePhysicalFieldIndex,
+    };
+}
+
+fn toolLifecycleValue(field: u16, values: ToolValues) !execution.Value {
+    return switch (field) {
+        0 => .{ .string = values.call_id },
+        1 => .{ .string = session_id },
+        2, 4, 5, 13 => .null,
+        3 => try usizeInteger(values.record_index - 1),
+        6 => .{ .string = "tool" },
+        7 => optionalString(values.tool),
+        8 => .{ .string = "opencode" },
+        9 => optionalJson(values.input_json),
+        10, 12 => optionalString(values.command),
+        11 => optionalString(values.output),
+        14 => optionalInteger(values.exit_code),
+        15 => optionalDuration(values.start, values.end),
+        16 => optionalString(values.status),
+        17, 18 => try usizeInteger(values.record_index),
+        19 => .{ .string = values.path },
+        else => return error.InvalidOpenCodePhysicalFieldIndex,
+    };
 }
 
 fn fillStructuredDocument(
@@ -533,6 +546,33 @@ fn integerField(
         .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
         else => null,
     };
+}
+
+fn optionalObjectString(
+    object: ?std.json.ObjectMap,
+    name: []const u8,
+) ?[]const u8 {
+    return if (object) |value| stringField(value, name) else null;
+}
+
+fn nestedObjectString(
+    object: ?std.json.ObjectMap,
+    child: []const u8,
+    name: []const u8,
+) ?[]const u8 {
+    const parent = object orelse return null;
+    const nested = objectField(parent, child) orelse return null;
+    return stringField(nested, name);
+}
+
+fn nestedObjectInteger(
+    object: ?std.json.ObjectMap,
+    child: []const u8,
+    name: []const u8,
+) ?i64 {
+    const parent = object orelse return null;
+    const nested = objectField(parent, child) orelse return null;
+    return integerField(nested, name);
 }
 
 fn optionalString(value: ?[]const u8) execution.Value {

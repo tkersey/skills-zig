@@ -675,35 +675,87 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     }
     const gate = validateInquiryInputs(allocator, dcp, rip, options);
     if (!gate.valid) {
-        try persistInvalidRunArtifacts(allocator, bound_options, dcp, rip, receipt_dir, gate, detached);
-        try printFailureJson(allocator, gate.failure_code orelse FailureCode.receipt_invalid, gate.hint);
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            gate,
+            detached,
+        );
+        try printFailureJson(
+            allocator,
+            gate.failure_code orelse FailureCode.receipt_invalid,
+            gate.hint,
+        );
         std.process.exit(2);
     }
 
     const preflight_allocator = std.heap.page_allocator;
     const preflight = runPreflight(preflight_allocator, bound_options) catch |err| {
-        const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = @errorName(err) };
-        try persistInvalidRunArtifacts(allocator, bound_options, dcp, rip, receipt_dir, failed, detached);
+        const failed = GateResult{
+            .valid = false,
+            .failure_code = .codex_incompatible,
+            .hint = @errorName(err),
+        };
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         try printFailureJson(allocator, FailureCode.codex_incompatible, @errorName(err));
         std.process.exit(1);
     };
     defer deinitPreflightResult(preflight_allocator, preflight);
     if (!preflight.inquiry_allowed) {
-        const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = "installed Codex app-server lacks required fork/rollback/read/turn capabilities" };
-        try persistInvalidRunArtifacts(allocator, bound_options, dcp, rip, receipt_dir, failed, detached);
+        const failed = GateResult{
+            .valid = false,
+            .failure_code = .codex_incompatible,
+            .hint = "installed Codex app-server lacks required " ++
+                "fork/rollback/read/turn capabilities",
+        };
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         try printFailureJson(allocator, FailureCode.codex_incompatible, failed.hint);
         std.process.exit(2);
     }
 
     const run_allocator = std.heap.page_allocator;
     if (detached) {
-        const result = startDetachedInquiry(run_allocator, bound_options, dcp, rip, receipt_dir, preflight) catch |err| blk: {
+        const result = startDetachedInquiry(
+            run_allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            preflight,
+        ) catch |err| blk: {
             const failed = GateResult{
                 .valid = false,
                 .failure_code = failureCodeForError(err),
                 .hint = @errorName(err),
             };
-            try persistInvalidRunArtifacts(allocator, bound_options, dcp, rip, receipt_dir, failed, detached);
+            try persistInvalidRunArtifacts(
+                allocator,
+                bound_options,
+                dcp,
+                rip,
+                receipt_dir,
+                failed,
+                detached,
+            );
             break :blk RunOutput{
                 .inquiry_id = rip.inquiry_id,
                 .state = @tagName(InquiryState.failed),
@@ -721,13 +773,29 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         return;
     }
 
-    const result = executeLiveInquiry(run_allocator, bound_options, dcp, rip, receipt_dir, preflight, false) catch |err| blk: {
+    const result = executeLiveInquiry(
+        run_allocator,
+        bound_options,
+        dcp,
+        rip,
+        receipt_dir,
+        preflight,
+        false,
+    ) catch |err| blk: {
         const failed = GateResult{
             .valid = false,
             .failure_code = failureCodeForError(err),
             .hint = @errorName(err),
         };
-        try persistInvalidRunArtifacts(allocator, bound_options, dcp, rip, receipt_dir, failed, detached);
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         break :blk RunOutput{
             .inquiry_id = rip.inquiry_id,
             .state = @tagName(InquiryState.failed),

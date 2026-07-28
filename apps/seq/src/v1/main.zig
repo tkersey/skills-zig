@@ -672,47 +672,93 @@ fn feedPhysicalFile(
     metrics: *PhysicalMetrics,
 ) !seq.execution.Feed {
     if (seq.opencode_adapter.recognizes(path)) {
-        if (args.selectors.repo != null or
-            args.selectors.since_ms != null or
-            args.selectors.until_ms != null)
-        {
-            return error.OpenCodePromptHistorySelectorUnavailable;
-        }
-        if (args.selectors.session_id) |wanted| {
-            if (!std.mem.eql(
-                u8,
-                wanted,
-                seq.opencode_adapter.session_id,
-            )) return .continue_scanning;
-        }
-        const remaining_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
-            bounds.max_input_bytes - metrics.bytes_read
-        else
-            return error.ObservationInputByteBoundExceeded;
-        const observed = try seq.opencode_adapter.feedFile(
+        return feedOpenCodeFile(
             allocator,
+            args,
             program,
-            runner,
             path,
-            remaining_bytes,
+            bounds,
+            runner,
+            digest_set,
+            metrics,
         );
-        try metrics.admitAdapter(seq.opencode_adapter.adapter_id);
-        metrics.opened += 1;
-        metrics.bytes_read = try std.math.add(
-            usize,
-            metrics.bytes_read,
-            observed.bytes_read,
-        );
-        metrics.warnings = try std.math.add(
-            usize,
-            metrics.warnings,
-            observed.warnings,
-        );
-        metrics.files += 1;
-        metrics.sessions += 1;
-        digest_set.add(path, &observed.digest);
-        return if (runner.stopped) .stop else .continue_scanning;
     }
+    return feedCodexFile(
+        allocator,
+        args,
+        program,
+        relation,
+        path,
+        bounds,
+        runner,
+        digest_set,
+        metrics,
+    );
+}
+
+fn feedOpenCodeFile(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    path: []const u8,
+    bounds: seq.definition.Bounds,
+    runner: *seq.execution.Runner,
+    digest_set: *CorpusSetHasher,
+    metrics: *PhysicalMetrics,
+) !seq.execution.Feed {
+    if (args.selectors.repo != null or
+        args.selectors.since_ms != null or
+        args.selectors.until_ms != null)
+    {
+        return error.OpenCodePromptHistorySelectorUnavailable;
+    }
+    if (args.selectors.session_id) |wanted| {
+        if (!std.mem.eql(
+            u8,
+            wanted,
+            seq.opencode_adapter.session_id,
+        )) return .continue_scanning;
+    }
+    const remaining_bytes = if (metrics.bytes_read < bounds.max_input_bytes)
+        bounds.max_input_bytes - metrics.bytes_read
+    else
+        return error.ObservationInputByteBoundExceeded;
+    const observed = try seq.opencode_adapter.feedFile(
+        allocator,
+        program,
+        runner,
+        path,
+        remaining_bytes,
+    );
+    try metrics.admitAdapter(seq.opencode_adapter.adapter_id);
+    metrics.opened += 1;
+    metrics.bytes_read = try std.math.add(
+        usize,
+        metrics.bytes_read,
+        observed.bytes_read,
+    );
+    metrics.warnings = try std.math.add(
+        usize,
+        metrics.warnings,
+        observed.warnings,
+    );
+    metrics.files += 1;
+    metrics.sessions += 1;
+    digest_set.add(path, &observed.digest);
+    return if (runner.stopped) .stop else .continue_scanning;
+}
+
+fn feedCodexFile(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    relation: seq.physical.Relation,
+    path: []const u8,
+    bounds: seq.definition.Bounds,
+    runner: *seq.execution.Runner,
+    digest_set: *CorpusSetHasher,
+    metrics: *PhysicalMetrics,
+) !seq.execution.Feed {
     var parsed = try seq.trace_adapter.parseFile(
         allocator,
         program,
@@ -751,6 +797,26 @@ fn feedPhysicalFile(
     metrics.files += 1;
     metrics.sessions += 1;
     digest_set.add(path, &parsed.corpus_digest);
+    return feedCodexRows(
+        allocator,
+        args,
+        program,
+        relation,
+        bounds,
+        runner,
+        &parsed,
+    );
+}
+
+fn feedCodexRows(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    program: *const seq.execution.Program,
+    relation: seq.physical.Relation,
+    bounds: seq.definition.Bounds,
+    runner: *seq.execution.Runner,
+    parsed: *const seq.trace_adapter.ParsedTrace,
+) !seq.execution.Feed {
     return switch (relation) {
         .structured_documents, .structured_values => result: {
             var index = try seq.structured.build(
