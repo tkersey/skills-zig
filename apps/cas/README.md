@@ -41,7 +41,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied text as fresh-parent `developerInstructions` and sends the Git selector separately as `review/start.target`; the selector remains the source of base/head/fingerprint identity.
 - Review waits default to `2700000` ms. Detached `start` defaults to `300000` ms unless `--wait` is supplied. An explicit positive `--timeout-ms` value always wins.
 - On Codex 0.145 and newer, CAS sets `excludeTurns:true` on metadata-only `thread/resume` requests. Older runtimes retain the prior parameter shape.
-- `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It validates DCP-v2/RIP-v1 inputs, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. It never calls `thread/shellCommand`.
+- `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It requires the packaged Ledger runtime plus Ledger-validated DCP-v2/RIP-v1 inputs, snapshots and revalidates the exact inquiry carriers before initial or resumed execution, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. Release archives include the required `ledger` sibling; package managers must declare Ledger as a runtime dependency. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
 - Thread-backed inquiry rejects paginated source history before `thread/fork`, which Codex 0.145 does not support. Use a legacy-history thread or the verified `rollout_transcript` lineage.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
@@ -125,7 +125,11 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Run a bounded inquiry from DCP/RIP inputs.
 ./zig-out/bin/cas session_inquiry run \
   --capsule capsule.json \
+  --capsule-definition capsule.definition.json \
+  --capsule-validation capsule.validation.json \
   --plan plan.json \
+  --plan-definition plan.definition.json \
+  --plan-validation plan.validation.json \
   --receipt-dir .retrace/INQ-001 \
   --sandbox read-only \
   --json
@@ -133,7 +137,11 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Start detached state and inspect the persisted handle.
 ./zig-out/bin/cas session_inquiry start \
   --capsule capsule.json \
+  --capsule-definition capsule.definition.json \
+  --capsule-validation capsule.validation.json \
   --plan plan.json \
+  --plan-definition plan.definition.json \
+  --plan-validation plan.validation.json \
   --receipt-dir .retrace/INQ-001 \
   --json
 ./zig-out/bin/cas session_inquiry status --inquiry-id INQ-001 --json

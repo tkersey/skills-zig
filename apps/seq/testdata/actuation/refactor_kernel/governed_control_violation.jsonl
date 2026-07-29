@@ -1,5 +1,0 @@
-{"type":"session_meta","timestamp":"2026-07-05T12:30:00Z","payload":{"id":"rk-governed-control-violation","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"rk-audit","commit_hash":"head-rk-violation"}}}
-{"type":"event_msg","timestamp":"2026-07-05T12:30:01Z","payload":{"type":"task_started","turn_id":"t1"}}
-{"type":"event_msg","timestamp":"2026-07-05T12:30:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating run governed compression with failed governance."}}
-{"type":"event_msg","timestamp":"2026-07-05T12:30:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"actuation_escalation_receipt:\n  version: AER-v1\n  selected_route: refactor-kernel\nrefactor_kernel_outcome:\n  version: RKO-v1\n  governance.graph_bypass: yes\n  mutations_without_graph_control_receipt: 2"}}
-{"type":"event_msg","timestamp":"2026-07-05T12:30:04Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":4000}}

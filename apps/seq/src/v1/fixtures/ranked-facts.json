@@ -1,0 +1,30 @@
+{
+  "schema": "example-ranked-facts/v1",
+  "rows": [
+    {
+      "id": "a",
+      "group": "x",
+      "score": 2
+    },
+    {
+      "id": "b",
+      "group": "y",
+      "score": null
+    },
+    {
+      "id": "c",
+      "group": "x",
+      "score": 3
+    },
+    {
+      "id": "d",
+      "group": "x",
+      "score": 3
+    },
+    {
+      "id": "e",
+      "group": "z",
+      "score": 1
+    }
+  ]
+}

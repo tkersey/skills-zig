@@ -47,6 +47,10 @@ Ordinary work loops must be structurally bounded.
 Production algorithms must not use recursion. Replace recursive traversal with
 an explicit stack or queue whose capacity is visible and checked.
 
+Source lines are limited to 100 columns. Zig multiline-string data lines are
+exempt because wrapping passive JSON or text changes data layout and inflates
+fixtures without making executable code clearer.
+
 ### Distinguish programmer errors from operating errors
 
 Programmer errors violate an invariant and should be asserted. Operating errors

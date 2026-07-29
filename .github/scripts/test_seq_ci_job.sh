@@ -73,21 +73,37 @@ expect_count() {
   fi
 }
 
-expect_count 1 "zig build build-seq -Doptimize=Debug --summary all"
-expect_count 0 "ReleaseFast"
+expect_count 1 "zig build build-seq -Doptimize=ReleaseFast --summary all"
+expect_count 0 "zig build build-seq -Doptimize=Debug"
 expect_count 0 "working-directory: apps/seq"
-expect_count 1 "zig build test-seq --summary all"
-expect_count 1 "zig build test-retrace-core --summary all"
+expect_count 1 "zig build test-seq test-seq-core test-seq-cli-smoke -Doptimize=ReleaseFast --summary all"
+expect_count 1 "zig build test-definition-core test-definition-core-guard -Doptimize=ReleaseFast --summary all"
+expect_count 1 "zig build test-trace-core -Doptimize=ReleaseFast --summary all"
 expect_count 1 "zig build test-jsonl-core --summary all"
 expect_count 1 "zig build test-durable-store --summary all"
 expect_count 1 "zig build test-durable-store-perf --summary all"
 expect_count 1 "apps/seq/scripts/release/command_surface_gate.sh zig-out/bin/seq"
 
 for token in \
-  '--dep jsonl_core -Mretrace_core=../../libs/retrace_core/src/lib.zig' \
-  '-Mjsonl_core=../../libs/jsonl_core/src/lib.zig'; do
+  'Fuzz passive definition parsing (Linux)' \
+  'zig test -Mroot=libs/definition_core/src/root.zig -ffuzz --test-filter "fuzz "'; do
   if ! grep -Fq -- "$token" <<<"$seq_fuzz_job"; then
-    echo "Seq fuzz dependency token missing: $token" >&2
+    echo "Seq fuzz proof token missing: $token" >&2
+    exit 1
+  fi
+done
+
+for token in \
+  '"libs/definition_compat/**"' \
+  '"tools/perf_contract.zig"' \
+  'perf=${selected[seq]:-false}' \
+  '${selected[cron]:-false}' \
+  "grep -Fxq 'build.zig'" \
+  "grep -Fxq 'tools/perf_contract.zig'" \
+  "if: needs.changes.outputs.perf == 'true'" \
+  "run: zig build test-perf-hub"; do
+  if ! grep -Fq -- "$token" "$workflow"; then
+    echo "Performance CI ownership token missing: $token" >&2
     exit 1
   fi
 done

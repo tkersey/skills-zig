@@ -1,299 +1,233 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
-script_source="$repo_root/.github/scripts/release_apps.sh"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+classifier="$repo_root/.github/scripts/release_apps.sh"
+temp_root=$(mktemp -d "${TMPDIR:-/tmp}/release-apps.XXXXXX")
+trap 'rm -rf -- "$temp_root"' EXIT
 
-for removed_surface in \
-  test-hylo \
-  test-cas-trial \
-  release-hylo-qualification \
-  cas_trial; do
-  if grep -R -Fq -- "$removed_surface" \
-    "$repo_root/build.zig" \
-    "$repo_root/.github/workflows" \
-    "$repo_root/apps/seq/src" \
-    "$repo_root/apps/cas/scripts" \
-    "$repo_root/apps/ledger/scripts"; then
-    echo "removed surface remains live: $removed_surface" >&2
-    exit 1
-  fi
+cd "$temp_root"
+git init -q
+git config user.email test@example.invalid
+git config user.name release-apps-test
+
+apps=(seq lift cas cron ledger memory-note img)
+for app in "${apps[@]}"; do
+  mkdir -p "apps/$app"
+  printf '1.0.0\n' >"apps/$app/VERSION"
+  printf '# %s\n' "$app" >"apps/$app/README.md"
 done
+printf 'const img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+printf '.{}\n' >build.zig.zon
+mkdir -p libs/core/src
+printf 'legacy contract\n' >libs/core/src/perf_contract.zig
+git add .
+git commit -qm base
+base=$(git rev-parse HEAD)
 
-for app in seq cas ledger; do
-  workflow="$repo_root/.github/workflows/release-${app}.yml"
-  for token in \
-    'zig_target:' \
-    '-Dtarget=${{ matrix.zig_target }}' \
-    '-Dcpu=baseline' \
-    '-Doptimize=ReleaseFast'; do
-    if ! grep -Fq -- "$token" "$workflow"; then
-      echo "release workflow missing target-bound release token for $app: $token" >&2
-      exit 1
-    fi
-  done
-  if grep -Fq 'qualification_run_id' "$workflow"; then
-    echo "release workflow retains removed qualification coupling: $app" >&2
-    exit 1
-  fi
-done
-
-seq_version="$(tr -d '[:space:]' < "$repo_root/apps/seq/VERSION")"
-seq_manifest_version="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",$/\1/p' "$repo_root/apps/seq/build.zig.zon")"
-if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]; then
-  echo "Seq release metadata mismatch: VERSION=$seq_version build.zig.zon=$seq_manifest_version" >&2
-  exit 1
-fi
-
-pr_workflow="$repo_root/.github/workflows/pr-ci.yml"
-auto_release_workflow="$repo_root/.github/workflows/auto-release.yml"
-root_build="$repo_root/build.zig"
-for token in \
-  'cancel-in-progress: true' \
-  '.github/scripts/release_apps.sh affected' \
-  '      - "tools/durable_store_perf.zig"' \
-  'zig build test-perf-hub'; do
-  if ! grep -Fq "$token" "$pr_workflow"; then
-    echo "PR CI orchestration token missing: $token" >&2
-    exit 1
-  fi
-done
-
-jsonl_release_block="$(
-  sed -n '/const jsonl_stream_release_fast = b.createModule/,/^    });/p' "$root_build"
-)"
-durable_release_block="$(
-  sed -n '/const durable_store_release_fast = b.createModule/,/^    });/p' "$root_build"
-)"
-durable_perf_block="$(
-  sed -n '/const durable_store_perf_root = b.createModule/,/^    });/p' "$root_build"
-)"
-for requirement in \
-  'jsonl_release_block|.optimize = .ReleaseFast' \
-  'durable_release_block|.optimize = .ReleaseFast' \
-  'durable_release_block|.{ .name = "jsonl_core", .module = jsonl_stream_release_fast }' \
-  'durable_perf_block|.optimize = .ReleaseFast' \
-  'durable_perf_block|.{ .name = "durable_store", .module = durable_store_release_fast }'; do
-  block_name="${requirement%%|*}"
-  token="${requirement#*|}"
-  block="${!block_name}"
-  if ! grep -Fq -- "$token" <<<"$block"; then
-    echo "Durable-store ReleaseFast build graph missing token: $token" >&2
-    exit 1
-  fi
-done
-
-for workflow in "$pr_workflow" "$auto_release_workflow"; do
-  if ! grep -Fq '      - "libs/jsonl_core/**"' "$workflow"; then
-    echo "Shared JSONL workflow trigger missing from $workflow" >&2
-    exit 1
-  fi
-done
-
-git -C "$tmp" init --quiet
-git -C "$tmp" config user.name "Release Classifier Test"
-git -C "$tmp" config user.email "release-classifier@example.invalid"
-mkdir -p "$tmp/.github/scripts"
-cp "$script_source" "$tmp/.github/scripts/release_apps.sh"
-chmod +x "$tmp/.github/scripts/release_apps.sh"
-printf 'baseline\n' > "$tmp/README.md"
-printf '%s\n' \
-  'const TestStepOptions = struct {' \
-  '    link_libc: bool = false,' \
-  '};' \
-  'fn addTestStepWithOptions() void {' \
-  '    const root_module = undefined;' \
-  '    const tests = b.addTest(.{ .root_module = root_module });' \
-  '    _ = tests;' \
-  '}' > "$tmp/build.zig"
-git -C "$tmp" add .
-git -C "$tmp" commit --quiet -m baseline
-base="$(git -C "$tmp" rev-parse HEAD)"
-
-assert_observed() {
-  local label="$1"
-  local expected="$2"
-  local mode="${3:-affected}"
-  local observed
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh "$mode" "$base" HEAD | paste -sd, -)"
-  if [[ "$observed" != "$expected" ]]; then
-    echo "classifier mismatch for $mode $label: expected $expected; observed $observed" >&2
+assert_affected() {
+  local expected=$1
+  shift
+  git reset --hard -q "$base"
+  git clean -fdq
+  "$@"
+  git add -A
+  git commit -qm case
+  actual=$(bash "$classifier" affected "$base" HEAD | paste -sd, -)
+  if [[ "$actual" != "$expected" ]]; then
+    echo "expected affected=$expected actual=$actual" >&2
     exit 1
   fi
 }
 
-assert_case() {
-  local path="$1"
-  local expected="$2"
-  local mode="${3:-affected}"
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  mkdir -p "$(dirname "$tmp/$path")"
-  printf 'changed\n' > "$tmp/$path"
-  git -C "$tmp" add "$path"
-  git -C "$tmp" commit --quiet -m "change $path"
-  assert_observed "$path" "$expected" "$mode"
-}
-
-assert_version_case() {
-  local path="$1"
-  local expected="$2"
-  local observed
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  mkdir -p "$(dirname "$tmp/$path")"
-  printf '0.1.1\n' > "$tmp/$path"
-  git -C "$tmp" add "$path"
-  git -C "$tmp" commit --quiet -m "bump $path"
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh version-changed "$base" HEAD | paste -sd, -)"
-  if [[ "$observed" != "$expected" ]]; then
-    echo "version classifier mismatch for $path: expected $expected; observed $observed" >&2
+assert_ci_affected() {
+  local expected=$1
+  shift
+  git reset --hard -q "$base"
+  git clean -fdq
+  "$@"
+  git add -A
+  git commit -qm case
+  actual=$(bash "$classifier" ci-affected "$base" HEAD | paste -sd, -)
+  if [[ "$actual" != "$expected" ]]; then
+    echo "expected ci-affected=$expected actual=$actual" >&2
     exit 1
   fi
 }
 
-assert_ambiguous_build_diff() {
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  printf '%s\n' 'const shared_release_behavior = changed_without_owner_context;' >> "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "ambiguous shared build change"
-  assert_observed "ambiguous shared build diff" "seq,lift,cas,cron,ledger,memory-note,img"
+write_seq() {
+  mkdir -p apps/seq/src
+  printf 'seq\n' >apps/seq/src/main.zig
 }
 
-assert_owned_durable_store_build_diff() {
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  printf '%s\n' \
-    'const jsonl_core = b.createModule(.{' \
-    '    .root_source_file = b.path("libs/jsonl_core/src/lib.zig"),' \
-    '});' \
-    'addBenchStep(' \
-    '    b,' \
-    '    durable_store_perf,' \
-    '    "perf-durable-store-local",' \
-    '    "Measure durable_store scan and append resource use",' \
-    ');' >> "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "add durable store build wiring"
-  assert_observed "owned durable store build diff" "seq,cas,ledger,memory-note"
+write_ledger() {
+  mkdir -p apps/ledger/src
+  printf 'ledger\n' >apps/ledger/src/main.zig
 }
 
-assert_execution_policy_context_reset() {
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  printf '%s\n' \
-    'const durable_store = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const execution_policy_core = b.createModule(.{' \
-    '    .target = target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "add adjacent shared modules"
-  local context_base
-  context_base="$(git -C "$tmp" rev-parse HEAD)"
-  printf '%s\n' \
-    'const durable_store = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const execution_policy_core = b.createModule(.{' \
-    '    .target = changed_target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "change execution policy target"
-  local observed
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
-  if [[ "$observed" != "seq" ]]; then
-    echo "classifier retained stale durable-store context: expected seq; observed $observed" >&2
-    exit 1
-  fi
+write_definition_core() {
+  mkdir -p libs/definition_core
+  printf 'definition\n' >libs/definition_core/root.zig
 }
 
-assert_durable_release_fast_context_reset() {
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  printf '%s\n' \
-    'const jsonl_stream_release_fast = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const durable_store_release_fast = b.createModule(.{' \
-    '    .target = target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "add adjacent ReleaseFast modules"
-  local context_base
-  context_base="$(git -C "$tmp" rev-parse HEAD)"
-  printf '%s\n' \
-    'const jsonl_stream_release_fast = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const durable_store_release_fast = b.createModule(.{' \
-    '    .target = changed_target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "change ReleaseFast durable store target"
-  local observed
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
-  if [[ "$observed" != "seq,cas,ledger,memory-note" ]]; then
-    echo "classifier retained stale retrace context: expected seq,cas,ledger,memory-note; observed $observed" >&2
-    exit 1
-  fi
+write_definition_compat() {
+  mkdir -p libs/definition_compat
+  printf 'compatibility\n' >libs/definition_compat/root.zig
 }
 
-assert_retrace_core_context_reset() {
-  git -C "$tmp" reset --hard --quiet "$base"
-  git -C "$tmp" clean -fdq
-  printf '%s\n' \
-    'const durable_store = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const retrace_core = b.createModule(.{' \
-    '    .target = target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "add adjacent durable and retrace modules"
-  local context_base
-  context_base="$(git -C "$tmp" rev-parse HEAD)"
-  printf '%s\n' \
-    'const durable_store = b.createModule(.{' \
-    '    .target = target,' \
-    '});' \
-    'const retrace_core = b.createModule(.{' \
-    '    .target = changed_target,' \
-    '});' > "$tmp/build.zig"
-  git -C "$tmp" add build.zig
-  git -C "$tmp" commit --quiet -m "change retrace core target"
-  local observed
-  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$context_base" HEAD | paste -sd, -)"
-  if [[ "$observed" != "seq,cas" ]]; then
-    echo "classifier retained stale durable-store context: expected seq,cas; observed $observed" >&2
-    exit 1
-  fi
+write_trace_core() {
+  mkdir -p libs/trace_core
+  printf 'trace\n' >libs/trace_core/root.zig
 }
 
-assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
-assert_case "libs/jsonl_core/src/lib.zig" "seq,cas,ledger,memory-note"
-assert_case "libs/execution_policy_core/src/root.zig" "seq"
-assert_case "libs/retrace_core/src/lib.zig" "seq,cas"
-assert_case "apps/ledger/scripts/actuation.zig" "seq,ledger"
-assert_case "apps/lift/src/main.zig" "lift"
-assert_case "apps/img/src/main.zig" "img"
-assert_case ".github/workflows/release-img.yml" "img"
-assert_case ".github/scripts/verify_cas_archive.sh" "cas"
-assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
-assert_case ".github/workflows/pr-ci.yml" ""
-assert_case ".github/workflows/pr-ci.yml" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
-assert_case ".github/scripts/ci_orchestration.sh" "seq,lift,cas,cron,ledger,memory-note,img" "ci-affected"
-assert_case "tools/durable_store_perf.zig" ""
-assert_case "tools/durable_store_perf.zig" "seq" "ci-affected"
-assert_version_case "apps/img/VERSION" "img"
-assert_owned_durable_store_build_diff
-assert_execution_policy_context_reset
-assert_durable_release_fast_context_reset
-assert_retrace_core_context_reset
-assert_ambiguous_build_diff
+write_store_core() {
+  mkdir -p libs/durable_store
+  printf 'store\n' >libs/durable_store/root.zig
+}
 
-echo "release app classifier: 21/21 cases passed"
+write_jsonl_core() {
+  mkdir -p libs/jsonl_core
+  printf 'jsonl\n' >libs/jsonl_core/root.zig
+}
+
+change_shared_perf_contract() {
+  printf 'shared contract\n' >libs/core/src/perf_contract.zig
+}
+
+move_perf_contract_to_tools() {
+  mkdir -p tools
+  mv libs/core/src/perf_contract.zig tools/perf_contract.zig
+}
+
+write_tool_perf_contract() {
+  mkdir -p tools
+  printf 'tool contract\n' >tools/perf_contract.zig
+}
+
+write_perf_hub_build() {
+  printf 'const img_meta = "apps/img/VERSION";\nconst core_perf_contract = b.createModule(.{});\npub fn build() void {\n  addRunStepPrefixed(\n    b,\n    perf_hub,\n    "perf-report-local",\n    &.{"report"},\n  );\n}\n' >build.zig
+}
+
+write_build_only() {
+  printf 'const img_meta = "apps/img/VERSION";\npub fn build() void { @panic("changed"); }\n' >build.zig
+}
+
+write_seq_build() {
+  printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+write_ledger_build() {
+  printf 'const ledger_root = "apps/ledger/src/v2/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+write_ledger_module_build() {
+  printf 'const ledger_v1_core = b.createModule(.{ .optimize = .ReleaseFast });\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+write_universalist_build() {
+  printf 'const universalist_plan = b.createModule(.{});\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
+write_seq_strip_build() {
+  printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void { _ = .{ .strip = optimize == .ReleaseFast, seq_root }; }\n' >build.zig
+}
+
+move_build_line() {
+  printf 'pub fn build() void {}\nconst img_meta = "apps/img/VERSION";\n' >build.zig
+}
+
+write_mixed_seq_unknown_build() {
+  printf 'const seq_root = "apps/seq/src/v1/main.zig";\npub fn build() void { @panic("changed"); }\n' >build.zig
+}
+
+write_definition_package_path() {
+  printf '.{ .paths = .{"libs/definition_core/src"}, }\n' >build.zig.zon
+}
+
+write_ledger_package_path() {
+  printf '.{ .paths = .{"apps/ledger/src/v2"}, }\n' >build.zig.zon
+}
+
+write_learnings_package_path() {
+  printf '.{ .paths = .{"apps/learnings/src"}, }\n' >build.zig.zon
+}
+
+write_synesthesia_package_path() {
+  printf '.{ .paths = .{"apps/synesthesia/src"}, }\n' >build.zig.zon
+}
+
+write_unknown_package_change() {
+  printf '.{ .dependencies = .{ .unknown = .{} }, }\n' >build.zig.zon
+}
+
+write_unknown_app() {
+  mkdir -p apps/new-runtime
+  printf 'new\n' >apps/new-runtime/main.zig
+}
+
+write_readme() {
+  printf '# docs only\n' >apps/seq/README.md
+}
+
+write_definition_guard() {
+  mkdir -p scripts/guards
+  printf '#!/usr/bin/env bash\n' >scripts/guards/definition-core-domain.sh
+}
+
+write_seq_smoke() {
+  mkdir -p scripts
+  printf '#!/usr/bin/env bash\n' >scripts/test-seq-cli.sh
+}
+
+write_ledger_smoke() {
+  mkdir -p scripts
+  printf '#!/usr/bin/env bash\n' >scripts/test-ledger-cli.sh
+}
+
+write_durable_store_perf() {
+  mkdir -p tools
+  printf 'pub fn main() void {}\n' >tools/durable_store_perf.zig
+}
+
+write_ci_helper() {
+  mkdir -p .github/scripts
+  printf '#!/usr/bin/env bash\n' >.github/scripts/ci-helper.sh
+}
+
+assert_affected seq write_seq
+assert_affected cas,ledger write_ledger
+assert_affected seq,cas,ledger write_definition_core
+assert_affected seq,cas,ledger write_definition_compat
+assert_affected seq,cas write_trace_core
+assert_affected seq,cas,ledger,memory-note write_store_core
+assert_affected seq,cas,ledger,memory-note write_jsonl_core
+assert_affected seq,lift,cas,cron,ledger,memory-note,img change_shared_perf_contract
+assert_affected "" move_perf_contract_to_tools
+assert_affected "" write_tool_perf_contract
+assert_affected "" write_perf_hub_build
+assert_affected seq write_seq_build
+assert_affected cas,ledger write_ledger_build
+assert_affected cas,ledger write_ledger_module_build
+assert_affected cas,ledger write_universalist_build
+assert_affected seq write_seq_strip_build
+assert_affected img move_build_line
+assert_affected seq,lift,cas,cron,ledger,memory-note,img write_mixed_seq_unknown_build
+assert_affected seq,cas,ledger write_definition_package_path
+assert_affected cas,ledger write_ledger_package_path
+assert_affected cas,ledger write_learnings_package_path
+assert_affected cas,ledger write_synesthesia_package_path
+assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_change
+assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
+assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
+assert_affected "" write_readme
+assert_affected seq write_durable_store_perf
+assert_ci_affected seq,cas,ledger write_definition_guard
+assert_ci_affected seq write_seq_smoke
+assert_ci_affected ledger write_ledger_smoke
+assert_ci_affected seq,lift,cas,cron,ledger,memory-note,img write_ci_helper
+
+git reset --hard -q "$base"
+printf '1.0.1\n' >apps/ledger/VERSION
+git add apps/ledger/VERSION
+git commit -qm version
+test "$(bash "$classifier" version-changed "$base" HEAD)" = ledger

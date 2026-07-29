@@ -58,18 +58,8 @@ jobs:
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build ledger binary
         run: zig build build-ledger -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
-      - name: Verify removed Ledger product stays absent
-        shell: bash
-        run: |
-          set -euo pipefail
-          if ./zig-out/bin/ledger --source hylo --help >/dev/null 2>&1; then
-            echo "Ledger exposes removed source namespace" >&2
-            exit 1
-          fi
-          if ./zig-out/bin/ledger validate hylo-trial --input /dev/null >/dev/null 2>&1; then
-            echo "Ledger exposes removed validation contract" >&2
-            exit 1
-          fi
+      - name: Verify Ledger 1.0 command and capability surface
+        run: apps/ledger/scripts/release/command_surface_gate.sh zig-out/bin/ledger
       - name: Package ledger artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"

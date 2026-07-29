@@ -4,11 +4,11 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 
 ## CLIs
 
-- `seq` (session/memory mining)
+- `seq` (passive observation definitions over execution/session evidence)
 - `lift` (`bench_stats`, `perf_report`)
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`)
 - `cron` (`cron`)
-- `ledger` (`ledger`, including uniform source-memory namespaces, `ledger --source actuation`, and pure `ledger validate` governance and source-memory checkpoint checks)
+- `ledger` (passive artifact definitions, validation, transactions, replay, and projections)
 - `memory-note` (`memory-note`)
 - `img` (pure-Zig document and source-code PNG rendering)
 
@@ -20,21 +20,23 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/lift`
 - `apps/cas`
 - `apps/cron`
-- `apps/learnings` (ledger-owned internal learning source)
-- `apps/synesthesia` (ledger-owned internal Synesthesia source)
-- `apps/ledger` (including the internal actuation kernel and stateless governance validators)
+- `apps/ledger`
 - `apps/memory-note`
 - `apps/img`
 - `libs/core`
+- `libs/definition_core`
 - `libs/durable_store`
+- `libs/trace_core`
 - `.github/workflows`
 - `docs/release`
 
 ## Shared Libraries
 
-`libs/durable_store` provides the backend-neutral `EventStore` contract for stateful Ledger sources. Migrated callers observe logical records, opaque revisions, compare-and-append receipts, stable store identities, and exclusive sessions for effectful transitions; they do not parse lines, manage storage locks, or choose a storage format. `PersistentEventStore` is the stable construction surface. Its current compatibility adapter stores JSONL at the established paths, while `MemoryEventStore` proves the same caller contract without a filesystem. Replacing the persistent adapter therefore changes the storage boundary, not migrated Ledger source logic or CLI behavior.
-
-Legacy file helpers remain available for explicit import, export, repair, and unrelated single-file workflows. Coordinated multi-record mutation still uses lease, fencing, CAS, snapshot, and DTX-v1 transaction APIs.
+`libs/definition_core` owns bounded passive-definition closure loading,
+canonical JSON, closure digests, parameters, cache headers, and shared result
+metadata. `libs/trace_core` owns physical execution-trace normalization.
+`libs/durable_store` owns bounded custody, revision, and atomic store mechanics.
+None of these shared libraries contains skill or workflow semantics.
 
 ## Build
 
@@ -73,20 +75,25 @@ zig build perf-list-local
 zig build perf-manifest-local
 zig build perf-audit-local
 zig build perf-doctor-local
-zig build perf-capture-local
-zig build perf-compare-local
-zig build perf-report-local
-zig build perf-accept-local
-
-# Optional filter by binary or case id substring.
-zig build perf-capture-local -- --target seq
-zig build perf-compare-local -- --target cron
+PERF_SEQ_BASE_BINARY=/path/to/base/seq \
+PERF_LEDGER_BASE_BINARY=/path/to/base/ledger \
+PERF_SEQ_BINARY=/path/to/candidate/seq \
+PERF_LEDGER_BINARY=/path/to/candidate/ledger \
+PERF_EXPECT_BASE_SHA=<base-revision> \
+PERF_EXPECT_CANDIDATE_SHA=<candidate-revision> \
+PERF_ZIG_BINARY=/absolute/path/to/zig \
+  zig build perf-compare-local -- --target cutover
+PERF_EXPECT_BASE_SHA=<base-revision> \
+PERF_EXPECT_CANDIDATE_SHA=<candidate-revision> \
+  zig build perf-report-local
 ```
 
-Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
-Accepted baseline snapshots and compare summaries are stored under the same machine-local root.
-`perf-report-local` also writes `latest-report.json` and `cutover-status.json` under the machine-local reports directory.
-Checked-in fixtures remain under app-local `perf/` directories.
+Content-addressed performance capsules live under the ignored
+`.perf-local/<machine-id>/capsules/` root. A successful paired comparison
+atomically updates `reports/current-capsule.json`, the non-authoritative
+locator verified by `perf-report-local`. Interrupted runs leave that locator
+incomplete; unmatched targets preserve the prior locator.
+Representative native qualification inputs remain beside the owning runtime.
 
 ## Release Model
 
@@ -100,8 +107,18 @@ Per-app VERSION files are the source of truth:
 - `apps/memory-note/VERSION`
 - `apps/img/VERSION`
 
-PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app; `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; `build.zig` changes are classified by their affected app or shared-library context and fail closed to every shipped CLI when ownership is ambiguous; broad shared shipped surfaces such as `build.zig.zon` and `libs/core/**` count for every shipped CLI; `libs/durable_store/**` counts for `seq`, `cas`, `ledger`, and `memory-note`; `libs/execution_policy_core/**` counts for `seq`; and `libs/retrace_core/**` counts for its remaining consumers, `seq` and `cas`.
+PRs that touch release-relevant CLI surfaces must bump the corresponding
+`VERSION` file. The check is conservative: app-local changes count for that
+app, and Ledger app changes also count for CAS because its archive ships
+Ledger; `build.zig` and `build.zig.zon` changes are classified by their
+affected app or shared-library context and fail closed to every shipped CLI
+when ownership is ambiguous; broad shared shipped surfaces such as
+`libs/core/**` count for every shipped CLI;
+`libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
+`cas`, and `ledger`;
+`libs/durable_store/**` and `libs/jsonl_core/**` count for `seq`, `cas`,
+`ledger`, and `memory-note`; and
+`libs/trace_core/**` counts for `seq` and `cas`.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 

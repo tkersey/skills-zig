@@ -1,0 +1,2 @@
+{"input":"inspect the adapter","mode":"normal","parts":[{"type":"text","text":"inspect"}]}
+{"input":"run the verifier","mode":"build","parts":[{"type":"tool","callID":"call-1","tool":"shell","state":{"status":"completed","input":{"command":"zig build check"},"output":"ok","metadata":{"exit":0},"time":{"start":1000,"end":1015}}}]}

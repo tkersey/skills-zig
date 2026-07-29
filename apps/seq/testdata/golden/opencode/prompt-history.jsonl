@@ -1,3 +1,0 @@
-{"input":"one","parts":[],"mode":"normal"}
-{"input":"second with file","parts":[{"type":"file","filename":"a.txt"},{"type":"text","text":"hi"}],"mode":"normal"}
-{"input":"third search","parts":[{"type":"text","text":"query"}],"mode":"review"}

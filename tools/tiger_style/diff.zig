@@ -41,6 +41,7 @@ fn gitDiffAlloc(
         "--no-ext-diff",
         "--no-textconv",
         "--ignore-submodules=all",
+        "--diff-algorithm=histogram",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--unified=0",

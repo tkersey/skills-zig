@@ -1,0 +1,11 @@
+{
+  "body": {
+    "id": "item-1",
+    "status": "open"
+  },
+  "body_digest": "sha256:564ded1e20da3157f815a9629a230dbd526966774471a53ebc8d5bf54762165c",
+  "event_digest": "sha256:3f1f0aafbd3400010d5462b2d414c4daf20e766d80a4b4bc5c7c0bccf5073731",
+  "kind": "created",
+  "previous_digest": null,
+  "sequence": 1
+}

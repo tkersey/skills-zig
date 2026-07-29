@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"fixture-session","model":"gpt-test","cwd":"/repo"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Observed FAILURE evidence"}}
+{"timestamp":"2026-07-26T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}

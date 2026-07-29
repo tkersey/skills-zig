@@ -24,13 +24,12 @@ Release contract:
 
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
-   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
-   - `build.zig` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
-   - broad shared shipped surfaces (`build.zig.zon`, `libs/core/**`) count for every shipped CLI.
-   - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
-   - `libs/durable_store/**` counts for its shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
-   - `libs/execution_policy_core/**` counts for its shipped consumer: `seq`.
-   - `libs/retrace_core/**` counts for its shipped consumers: `seq` and `cas`.
+   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI. Ledger app changes also count for `cas` because the CAS archive ships Ledger.
+   - `build.zig` and `build.zig.zon` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
+   - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
+   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
+   - `libs/durable_store/**` and `libs/jsonl_core/**` count for their shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
+   - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` dispatches the matching release workflows. For Seq, Auto Release dispatches `release-seq.yml` from `main` with the exact merged `commit_sha`; the workflow qualifies both release targets before its dependent publish job creates a missing tag. Other CLI workflows retain tag-first dispatch. A manual release dispatch normally selects the existing release tag as its workflow ref and passes the same `tag_name`, for example `gh workflow run release-<cli>.yml --ref <tag> -f tag_name=<tag>`. A deliberate tagless Seq dispatch must also pass the exact commit with `-f commit_sha=<sha>`.
@@ -47,7 +46,7 @@ Release tags must match file versions:
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
 
-Each workflow builds only binaries from its own CLI path and publishes two release archives. The `img` archives also carry `apps/img/LICENSES/**` beside the binary so the embedded-font and upstream notices survive distribution:
+Each workflow publishes two release archives for its independently versioned CLI. The CAS archives also carry Ledger because CAS exposes Ledger-backed commands; the `img` archives carry `apps/img/LICENSES/**` beside the binary so the embedded-font and upstream notices survive distribution:
 
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`

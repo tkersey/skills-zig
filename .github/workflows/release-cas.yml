@@ -49,7 +49,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Build cas binaries
-        run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
+        run: zig build build-cas build-ledger -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Verify removed CAS product stays absent
         shell: bash
         run: |
@@ -85,6 +85,7 @@ jobs:
           cp zig-out/bin/cas_goal dist/cas/cas_goal
           cp zig-out/bin/cas_goal dist/cas/cas-goal
           cp zig-out/bin/cas-perf-budget-governor dist/cas/cas-perf-budget-governor
+          cp zig-out/bin/ledger dist/cas/ledger
           tar -czf "${TAR_NAME}" -C dist/cas .
       - name: Verify platform-specific cas archive contents
         run: .github/scripts/verify_cas_archive.sh "${{ matrix.target }}" "${TAR_NAME}"

@@ -1,1 +1,0 @@
-{"receipt_id":"t1","policy_id":"linear","revision":1,"policy_digest":"sha256:policy","decision_id":"d1","action_id":"step","result":"success","predicted_effects":["fact:done"],"observed":{"facts":["fact:done"],"potential":[0]},"state_after":{"state_id":"s2","state_digest":"sha256:s2","potential":[0]}}

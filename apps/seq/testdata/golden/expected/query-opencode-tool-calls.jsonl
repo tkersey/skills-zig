@@ -1,1 +1,0 @@
-{"source_kind":"jsonl","source_record_index":1,"event_index":1,"mode":"build","tool_name":"bash","tool_status":"completed","call_id":"c1","tool_command":"ls -F","tool_duration_ms":15,"tool_exit_code":0}

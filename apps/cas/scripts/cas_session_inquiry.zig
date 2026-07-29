@@ -4,17 +4,19 @@ const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
 const durable_store = @import("durable_store");
-const retrace_core = @import("retrace_core");
+const trace_core = @import("trace_core");
 const app_meta = @import("app_meta");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
-const canonical_trace = retrace_core.canonical_trace;
-const decision_anchor = retrace_core.decision_anchor;
-const dcp_schema = retrace_core.dcp_schema;
+const canonical_trace = trace_core;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxInputBytes = 8 * 1024 * 1024;
 const MaxSchemaBytes = 64 * 1024 * 1024;
+const MaxInquiryForks: u64 = 4;
+const MaxInquiryLanes: usize = 16;
+const MaxInquiryTokens: u64 = 1_000_000;
+const MaxInquiryTimeoutMs: u64 = 2_700_000;
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "cas_session_inquiry",
@@ -28,8 +30,8 @@ const UsageText =
     \\
     \\Usage:
     \\  cas_session_inquiry preflight [--cwd PATH] [--transport auto|stdio|websocket] [--json]
-    \\  cas_session_inquiry run --capsule FILE --plan FILE --receipt-dir PATH [--json]
-    \\  cas_session_inquiry start --capsule FILE --plan FILE --receipt-dir PATH [--json]
+    \\  cas_session_inquiry run --capsule FILE --capsule-definition FILE --capsule-validation FILE --plan FILE --plan-definition FILE --plan-validation FILE --receipt-dir PATH [--json]
+    \\  cas_session_inquiry start --capsule FILE --capsule-definition FILE --capsule-validation FILE --plan FILE --plan-definition FILE --plan-validation FILE --receipt-dir PATH [--json]
     \\  cas_session_inquiry status --inquiry-id ID [--json]
     \\  cas_session_inquiry wait --inquiry-id ID [--timeout-ms N] [--json]
     \\  cas_session_inquiry interrupt --inquiry-id ID [--json]
@@ -38,7 +40,11 @@ const UsageText =
     \\
     \\Common flags:
     \\  --capsule FILE
+    \\  --capsule-definition FILE
+    \\  --capsule-validation FILE
     \\  --plan FILE
+    \\  --plan-definition FILE
+    \\  --plan-validation FILE
     \\  --receipt-dir PATH
     \\  --inquiry-id ID
     \\  --cwd PATH
@@ -51,6 +57,7 @@ const UsageText =
     \\  --timeout-ms N
     \\  --max-total-tokens N
     \\  --transport auto|stdio|websocket
+    \\  --ledger-path PATH
     \\  --store-root DIR
     \\  --json
     \\  --verdict-only
@@ -129,7 +136,11 @@ const InquiryState = enum {
 const Options = struct {
     command: Command,
     capsule_path: ?[]const u8 = null,
+    capsule_definition_path: ?[]const u8 = null,
+    capsule_validation_path: ?[]const u8 = null,
     plan_path: ?[]const u8 = null,
+    plan_definition_path: ?[]const u8 = null,
+    plan_validation_path: ?[]const u8 = null,
     receipt_dir: ?[]const u8 = null,
     inquiry_id: ?[]const u8 = null,
     cwd: []const u8 = ".",
@@ -148,9 +159,31 @@ const Options = struct {
     receipt_format: []const u8 = "table",
     receipt_summary: bool = false,
     codex_path: []const u8 = "codex",
+    ledger_path: ?[]const u8 = null,
     store_root: ?[]const u8 = null,
     home: []const u8 = "",
     path_env: []const u8 = "",
+    capsule_bytes: ?[]const u8 = null,
+    capsule_validation_bytes: ?[]const u8 = null,
+    capsule_revalidation_bytes: ?[]const u8 = null,
+    plan_bytes: ?[]const u8 = null,
+    plan_validation_bytes: ?[]const u8 = null,
+    plan_revalidation_bytes: ?[]const u8 = null,
+};
+
+const ValidatedInput = struct {
+    input: []const u8,
+    receipt: []const u8,
+    revalidation: []const u8,
+    definition_digest: []const u8,
+
+    fn deinit(self: *ValidatedInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.input);
+        allocator.free(self.receipt);
+        allocator.free(self.revalidation);
+        allocator.free(self.definition_digest);
+        self.* = undefined;
+    }
 };
 
 const Dcp = struct {
@@ -437,8 +470,16 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.receipt_summary = true;
         } else if (std.mem.eql(u8, arg, "--capsule")) {
             options.capsule_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--capsule-definition")) {
+            options.capsule_definition_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--capsule-validation")) {
+            options.capsule_validation_path = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--plan")) {
             options.plan_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--plan-definition")) {
+            options.plan_definition_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--plan-validation")) {
+            options.plan_validation_path = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--receipt-dir")) {
             options.receipt_dir = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--inquiry-id")) {
@@ -477,6 +518,8 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.receipt_format = value;
         } else if (std.mem.eql(u8, arg, "--codex-path")) {
             options.codex_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--ledger-path")) {
+            options.ledger_path = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--store-root")) {
             const value = try takeValue(argv, &i, arg);
             if (value.len == 0) return error.InvalidStoreRoot;
@@ -537,58 +580,201 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     const capsule_path = options.capsule_path orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--capsule");
     };
+    const capsule_validation_path = options.capsule_validation_path orelse {
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "MissingFlag",
+            "--capsule-validation",
+        );
+    };
+    const capsule_definition_path = options.capsule_definition_path orelse {
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "MissingFlag",
+            "--capsule-definition",
+        );
+    };
     const plan_path = options.plan_path orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--plan");
+    };
+    const plan_validation_path = options.plan_validation_path orelse {
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "MissingFlag",
+            "--plan-validation",
+        );
+    };
+    const plan_definition_path = options.plan_definition_path orelse {
+        core_cli.exitUsageFailure(
+            HelpSurface,
+            Version,
+            "MissingFlag",
+            "--plan-definition",
+        );
     };
     const receipt_dir = options.receipt_dir orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "MissingFlag", "--receipt-dir");
     };
 
-    const dcp = loadDcp(allocator, capsule_path) catch |err| {
+    const capsule_definition_absolute = absoluteLexicalPathAlloc(
+        allocator,
+        capsule_definition_path,
+    ) catch |err| {
+        try printFailureJson(allocator, FailureCode.capsule_invalid, @errorName(err));
+        std.process.exit(2);
+    };
+    defer allocator.free(capsule_definition_absolute);
+    var capsule_input = validateLedgerInput(
+        allocator,
+        options,
+        capsule_definition_absolute,
+        capsule_path,
+        capsule_validation_path,
+        "retrace/decision-context-packet",
+        "packet",
+    ) catch |err| {
+        try printFailureJson(
+            allocator,
+            FailureCode.capsule_invalid,
+            @errorName(err),
+        );
+        std.process.exit(2);
+    };
+    defer capsule_input.deinit(allocator);
+    const dcp = loadDcpBytes(allocator, capsule_input.input) catch |err| {
         try printFailureJson(allocator, FailureCode.capsule_invalid, @errorName(err));
         std.process.exit(2);
     };
     defer deinitDcp(allocator, dcp);
-    const rip = loadRip(allocator, plan_path) catch |err| {
+    const plan_definition_absolute = absoluteLexicalPathAlloc(
+        allocator,
+        plan_definition_path,
+    ) catch |err| {
+        try printFailureJson(allocator, FailureCode.plan_invalid, @errorName(err));
+        std.process.exit(2);
+    };
+    defer allocator.free(plan_definition_absolute);
+    var plan_input = validateLedgerInput(
+        allocator,
+        options,
+        plan_definition_absolute,
+        plan_path,
+        plan_validation_path,
+        "retrace/retrace-inquiry-plan",
+        "plan",
+    ) catch |err| {
+        try printFailureJson(
+            allocator,
+            FailureCode.plan_invalid,
+            @errorName(err),
+        );
+        std.process.exit(2);
+    };
+    defer plan_input.deinit(allocator);
+    const rip = loadRipBytes(allocator, plan_input.input) catch |err| {
         try printFailureJson(allocator, FailureCode.plan_invalid, @errorName(err));
         std.process.exit(2);
     };
     defer deinitRip(allocator, rip);
+    var bound_options = options;
+    bound_options.capsule_definition_path = capsule_definition_absolute;
+    bound_options.capsule_bytes = capsule_input.input;
+    bound_options.capsule_validation_bytes = capsule_input.receipt;
+    bound_options.capsule_revalidation_bytes = capsule_input.revalidation;
+    bound_options.plan_definition_path = plan_definition_absolute;
+    bound_options.plan_bytes = plan_input.input;
+    bound_options.plan_validation_bytes = plan_input.receipt;
+    bound_options.plan_revalidation_bytes = plan_input.revalidation;
     if (!std.mem.eql(u8, rip.plan_id, dcp.packet_id)) {
         try printFailureJson(allocator, FailureCode.plan_invalid, "RIP source_capsule does not match DCP packet_id");
         std.process.exit(2);
     }
     const gate = validateInquiryInputs(allocator, dcp, rip, options);
     if (!gate.valid) {
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, gate, detached);
-        try printFailureJson(allocator, gate.failure_code orelse FailureCode.receipt_invalid, gate.hint);
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            gate,
+            detached,
+        );
+        try printFailureJson(
+            allocator,
+            gate.failure_code orelse FailureCode.receipt_invalid,
+            gate.hint,
+        );
         std.process.exit(2);
     }
 
     const preflight_allocator = std.heap.page_allocator;
-    const preflight = runPreflight(preflight_allocator, options) catch |err| {
-        const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = @errorName(err) };
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
+    const preflight = runPreflight(preflight_allocator, bound_options) catch |err| {
+        const failed = GateResult{
+            .valid = false,
+            .failure_code = .codex_incompatible,
+            .hint = @errorName(err),
+        };
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         try printFailureJson(allocator, FailureCode.codex_incompatible, @errorName(err));
         std.process.exit(1);
     };
     defer deinitPreflightResult(preflight_allocator, preflight);
     if (!preflight.inquiry_allowed) {
-        const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = "installed Codex app-server lacks required fork/rollback/read/turn capabilities" };
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
+        const failed = GateResult{
+            .valid = false,
+            .failure_code = .codex_incompatible,
+            .hint = "installed Codex app-server lacks required " ++
+                "fork/rollback/read/turn capabilities",
+        };
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         try printFailureJson(allocator, FailureCode.codex_incompatible, failed.hint);
         std.process.exit(2);
     }
 
     const run_allocator = std.heap.page_allocator;
     if (detached) {
-        const result = startDetachedInquiry(run_allocator, options, dcp, rip, receipt_dir, preflight) catch |err| blk: {
+        const result = startDetachedInquiry(
+            run_allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            preflight,
+        ) catch |err| blk: {
             const failed = GateResult{
                 .valid = false,
                 .failure_code = failureCodeForError(err),
                 .hint = @errorName(err),
             };
-            try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
+            try persistInvalidRunArtifacts(
+                allocator,
+                bound_options,
+                dcp,
+                rip,
+                receipt_dir,
+                failed,
+                detached,
+            );
             break :blk RunOutput{
                 .inquiry_id = rip.inquiry_id,
                 .state = @tagName(InquiryState.failed),
@@ -606,13 +792,29 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         return;
     }
 
-    const result = executeLiveInquiry(run_allocator, options, dcp, rip, receipt_dir, preflight, false) catch |err| blk: {
+    const result = executeLiveInquiry(
+        run_allocator,
+        bound_options,
+        dcp,
+        rip,
+        receipt_dir,
+        preflight,
+        false,
+    ) catch |err| blk: {
         const failed = GateResult{
             .valid = false,
             .failure_code = failureCodeForError(err),
             .hint = @errorName(err),
         };
-        try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
+        try persistInvalidRunArtifacts(
+            allocator,
+            bound_options,
+            dcp,
+            rip,
+            receipt_dir,
+            failed,
+            detached,
+        );
         break :blk RunOutput{
             .inquiry_id = rip.inquiry_id,
             .state = @tagName(InquiryState.failed),
@@ -968,6 +1170,23 @@ fn spawnAndWaitOkPosix(allocator: std.mem.Allocator, cwd: []const u8, argv: []co
     var actions: std.c.posix_spawn_file_actions_t = undefined;
     if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
     defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+    const write_null = @as(c_int, @bitCast(std.posix.O{
+        .ACCMODE = .WRONLY,
+    }));
+    if (std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        std.posix.STDOUT_FILENO,
+        "/dev/null",
+        write_null,
+        0,
+    ) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        std.posix.STDERR_FILENO,
+        "/dev/null",
+        write_null,
+        0,
+    ) != 0) return error.SpawnFileActionsFailed;
 
     var cwd_storage: ?[:0]u8 = null;
     defer if (cwd_storage) |path| allocator.free(path);
@@ -1033,6 +1252,171 @@ fn statusToExitCode(status: u32) u8 {
     return 1;
 }
 
+fn validateLedgerInput(
+    allocator: std.mem.Allocator,
+    options: Options,
+    definition_path: []const u8,
+    input_path: []const u8,
+    receipt_path: []const u8,
+    definition_id: []const u8,
+    input_name: []const u8,
+) !ValidatedInput {
+    const input = try readFileAlloc(allocator, input_path, MaxInputBytes);
+    errdefer allocator.free(input);
+    const receipt = try readFileAlloc(allocator, receipt_path, MaxInputBytes);
+    errdefer allocator.free(receipt);
+    const revalidation = try runLedgerValidation(
+        allocator,
+        options,
+        definition_path,
+        input,
+        input_name,
+    );
+    errdefer allocator.free(revalidation);
+    const definition_digest = try validateLedgerReceiptBytes(
+        allocator,
+        input,
+        revalidation,
+        definition_id,
+        null,
+        input_name,
+    );
+    errdefer allocator.free(definition_digest);
+    const receipt_digest = try validateLedgerReceiptBytes(
+        allocator,
+        input,
+        receipt,
+        definition_id,
+        definition_digest,
+        input_name,
+    );
+    allocator.free(receipt_digest);
+    return .{
+        .input = input,
+        .receipt = receipt,
+        .revalidation = revalidation,
+        .definition_digest = definition_digest,
+    };
+}
+
+fn runLedgerValidation(
+    allocator: std.mem.Allocator,
+    options: Options,
+    definition_path: []const u8,
+    input: []const u8,
+    input_name: []const u8,
+) ![]u8 {
+    const ledger_path = try resolveLedgerExecutableAlloc(
+        allocator,
+        options,
+    );
+    defer allocator.free(ledger_path);
+    const snapshot_root = try makeLedgerSnapshotRoot(allocator);
+    defer {
+        std.Io.Dir.cwd().deleteTree(
+            std.Io.Threaded.global_single_threaded.io(),
+            snapshot_root,
+        ) catch |err| std.log.warn(
+            "could not remove Ledger validation snapshot {s}: {s}",
+            .{ snapshot_root, @errorName(err) },
+        );
+        allocator.free(snapshot_root);
+    }
+    const snapshot_path = try std.fs.path.join(
+        allocator,
+        &.{ snapshot_root, "input.json" },
+    );
+    defer allocator.free(snapshot_path);
+    try durable_store.writeTextAtomic(
+        allocator,
+        snapshot_path,
+        input,
+    );
+    const input_spec = try std.fmt.allocPrint(
+        allocator,
+        "{s}={s}",
+        .{ input_name, snapshot_path },
+    );
+    defer allocator.free(input_spec);
+    const argv = [_][]const u8{
+        ledger_path,
+        "validate",
+        "--definition",
+        definition_path,
+        "--input",
+        input_spec,
+        "--format",
+        "json",
+    };
+    const result = std.process.run(
+        allocator,
+        std.Io.Threaded.global_single_threaded.io(),
+        .{
+            .argv = &argv,
+            .stdout_limit = .limited(MaxInputBytes),
+            .stderr_limit = .limited(64 * 1024),
+        },
+    ) catch return error.LedgerRevalidationFailed;
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    if (!(result.term == .exited and result.term.exited == 0)) {
+        return error.LedgerRevalidationFailed;
+    }
+    return result.stdout;
+}
+
+fn resolveLedgerExecutableAlloc(
+    allocator: std.mem.Allocator,
+    options: Options,
+) ![]u8 {
+    if (options.ledger_path) |explicit| {
+        return resolveExecutablePathAlloc(
+            allocator,
+            explicit,
+            options.path_env,
+        ) catch return error.LedgerUnavailable;
+    }
+    const executable_dir = std.process.executableDirPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    ) catch null;
+    if (executable_dir) |dir| {
+        defer allocator.free(dir);
+        const sibling = try std.fs.path.join(
+            allocator,
+            &.{ dir, "ledger" },
+        );
+        if (fileExists(sibling)) return sibling;
+        allocator.free(sibling);
+    }
+    return resolveExecutablePathAlloc(
+        allocator,
+        "ledger",
+        options.path_env,
+    ) catch return error.LedgerUnavailable;
+}
+
+fn makeLedgerSnapshotRoot(allocator: std.mem.Allocator) ![]u8 {
+    var random_bytes: [16]u8 = undefined;
+    std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
+    const suffix = std.fmt.bytesToHex(random_bytes, .lower);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/cas-ledger-validation-{s}",
+        .{suffix},
+    );
+    errdefer allocator.free(root);
+    std.Io.Dir.createDirAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        root,
+        @enumFromInt(0o700),
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.TempDirCreationFailed,
+        else => return err,
+    };
+    return root;
+}
+
 fn shellQuoteAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1075,38 +1459,275 @@ fn contains(haystack: []const u8, needle: []const u8) bool {
 fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
     const raw = try readFileAlloc(allocator, path, MaxInputBytes);
     defer allocator.free(raw);
+    return loadDcpBytes(allocator, raw);
+}
+
+fn loadDcpBytes(allocator: std.mem.Allocator, raw: []const u8) !Dcp {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
+    try verifyDcpContentIdentity(allocator, parsed.value);
     return dcpFromValue(allocator, parsed.value);
 }
 
-fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
-    var validation = try dcp_schema.validateValue(allocator, value);
-    defer validation.deinit(allocator);
-    if (!validation.valid) return error.InvalidDcp;
-
-    var source_episode_resolution = try dcp_schema.resolveSourceEpisodeIdentity(allocator, value);
-    defer source_episode_resolution.deinit(allocator);
-    const source_episode_id = switch (source_episode_resolution.state) {
-        .explicit_exact, .derived_session_turn => try allocator.dupe(u8, source_episode_resolution.source_episode_id.?),
-        .mismatch => return error.SourceEpisodeIdentityMismatch,
-        .unavailable => null,
+fn validateLedgerInputReceipt(
+    allocator: std.mem.Allocator,
+    receipt_path: []const u8,
+    input_path: []const u8,
+    definition_id: []const u8,
+    expected_definition_digest: []const u8,
+    input_name: []const u8,
+) !ValidatedInput {
+    const input = try readFileAlloc(allocator, input_path, MaxInputBytes);
+    errdefer allocator.free(input);
+    const receipt = try readFileAlloc(allocator, receipt_path, MaxInputBytes);
+    errdefer allocator.free(receipt);
+    const definition_digest = try validateLedgerReceiptBytes(
+        allocator,
+        input,
+        receipt,
+        definition_id,
+        expected_definition_digest,
+        input_name,
+    );
+    errdefer allocator.free(definition_digest);
+    return .{
+        .input = input,
+        .receipt = receipt,
+        .revalidation = try allocator.dupe(u8, receipt),
+        .definition_digest = definition_digest,
     };
-    errdefer if (source_episode_id) |owned| allocator.free(owned);
+}
 
+fn validateLedgerReceiptBytes(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    receipt: []const u8,
+    definition_id: []const u8,
+    expected_definition_digest: ?[]const u8,
+    input_name: []const u8,
+) ![]u8 {
+    const expected_input_digest = try sha256HexAlloc(allocator, input);
+    defer allocator.free(expected_input_digest);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        receipt,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.LedgerValidationReceiptNotObject,
+    };
+    if (!std.mem.eql(
+        u8,
+        try requiredString(root, "schema"),
+        "ledger-validation-result/v1",
+    )) return error.LedgerValidationReceiptSchemaMismatch;
+    const definition_receipt = rootObject(root, "definition") orelse
+        return error.LedgerValidationDefinitionMissing;
+    if (!std.mem.eql(
+        u8,
+        try requiredString(definition_receipt, "id"),
+        definition_id,
+    )) return error.LedgerValidationDefinitionMismatch;
+    if (!std.mem.eql(
+        u8,
+        try requiredString(definition_receipt, "abi"),
+        "ledger-artifact-abi/v1",
+    )) return error.LedgerValidationAbiMismatch;
+    const definition_digest = try requiredString(
+        definition_receipt,
+        "digest",
+    );
+    if (definition_digest.len != 71 or
+        !std.mem.startsWith(u8, definition_digest, "sha256:"))
+    {
+        return error.LedgerValidationDefinitionDigestInvalid;
+    }
+    if (expected_definition_digest) |expected| {
+        if (!std.mem.eql(
+            u8,
+            definition_digest,
+            expected,
+        )) return error.LedgerValidationDefinitionDigestMismatch;
+    }
+    if (!try requiredBool(root, "valid")) {
+        return error.LedgerValidationFailed;
+    }
+    if (try requiredBool(root, "authority_granted") or
+        try requiredBool(root, "storage_mutated"))
+    {
+        return error.LedgerValidationReceiptAuthorityInvalid;
+    }
+    const errors = switch (root.get("errors") orelse
+        return error.LedgerValidationErrorsMissing) {
+        .array => |items| items,
+        else => return error.LedgerValidationErrorsInvalid,
+    };
+    if (errors.items.len != 0) return error.LedgerValidationErrorsPresent;
+    const input_digests = rootObject(root, "input_digests") orelse
+        return error.LedgerValidationInputDigestsMissing;
+    if (!std.mem.eql(
+        u8,
+        try requiredString(input_digests, input_name),
+        expected_input_digest,
+    )) return error.LedgerValidationInputDigestMismatch;
+    return allocator.dupe(u8, definition_digest);
+}
+
+fn verifyDcpContentIdentity(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !void {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.NotObject,
+    };
+    const packet = rootObject(root, "decision_context_packet") orelse root;
+    const claimed = try requiredString(packet, "packet_id");
+    const canonical = try canonicalDcpV2JsonAlloc(allocator, value, true);
+    defer allocator.free(canonical);
+    const digest = try sha256HexAlloc(allocator, canonical);
+    defer allocator.free(digest);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "DCP-{s}",
+        .{digest["sha256:".len..]},
+    );
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, claimed, expected)) {
+        return error.DcpContentIdentityMismatch;
+    }
+}
+
+// DCP-v2 identity is a released wire contract. Keep this private writer
+// byte-compatible with the original DCP implementation instead of changing
+// historical identities when the generic canonical-JSON profile evolves.
+fn canonicalDcpV2JsonAlloc(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    omit_packet_id: bool,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try writeCanonicalDcpV2Json(
+        allocator,
+        &output.writer,
+        value,
+        omit_packet_id,
+    );
+    return output.toOwnedSlice();
+}
+
+fn writeCanonicalDcpV2Json(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    value: std.json.Value,
+    omit_packet_id: bool,
+) !void {
+    switch (value) {
+        .object => |object| {
+            const keys = try allocator.alloc([]const u8, object.count());
+            defer allocator.free(keys);
+            var key_count: usize = 0;
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (omit_packet_id and
+                    std.mem.eql(u8, key, "packet_id"))
+                {
+                    continue;
+                }
+                keys[key_count] = key;
+                key_count += 1;
+            }
+            std.mem.sort(
+                []const u8,
+                keys[0..key_count],
+                {},
+                struct {
+                    fn lessThan(
+                        _: void,
+                        left: []const u8,
+                        right: []const u8,
+                    ) bool {
+                        return std.mem.lessThan(u8, left, right);
+                    }
+                }.lessThan,
+            );
+            try writer.writeByte('{');
+            for (keys[0..key_count], 0..) |key, index| {
+                if (index != 0) try writer.writeByte(',');
+                try std.json.Stringify.value(
+                    std.json.Value{ .string = key },
+                    .{},
+                    writer,
+                );
+                try writer.writeByte(':');
+                try writeCanonicalDcpV2Json(
+                    allocator,
+                    writer,
+                    object.get(key).?,
+                    omit_packet_id,
+                );
+            }
+            try writer.writeByte('}');
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, index| {
+                if (index != 0) try writer.writeByte(',');
+                try writeCanonicalDcpV2Json(
+                    allocator,
+                    writer,
+                    item,
+                    omit_packet_id,
+                );
+            }
+            try writer.writeByte(']');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
+}
+
+fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
+    // Ledger validates the DCP before this boundary. CAS independently binds
+    // every consumed carrier to the materialized content identity and live
+    // source so a substituted packet cannot inherit a validated identity.
     const root = switch (value) {
         .object => |obj| obj,
         else => return error.NotObject,
     };
     const packet = rootObject(root, "decision_context_packet") orelse root;
-    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), dcp_schema.version)) return error.BadVersion;
+    if (!std.mem.eql(
+        u8,
+        try requiredString(packet, "packet_version"),
+        "DCP-v2",
+    )) return error.BadVersion;
     const packet_id = try requiredString(packet, "packet_id");
     const source = rootObject(packet, "source") orelse return error.MissingSource;
     const artifact = rootObject(packet, "artifact_state") orelse return error.MissingArtifactState;
     const turns = rootObject(packet, "turns") orelse return error.MissingTurns;
+    const source_episode_id = try sourceEpisodeIdFromDcpAlloc(
+        allocator,
+        source,
+        turns,
+    );
+    errdefer if (source_episode_id) |owned| allocator.free(owned);
     const anchors_obj = rootObject(packet, "anchors") orelse return error.MissingAnchors;
     const total = try requiredU64(turns, "total_turns");
     const decision = try requiredU64(turns, "decision_turn_index");
+    const reconstructability = try requiredString(
+        artifact,
+        "reconstructability",
+    );
+    if (!isOneOf(reconstructability, &.{
+        "exact",
+        "head_only",
+        "transcript_only",
+        "unavailable",
+    })) return error.BadReconstructability;
     var anchors = [_]Anchor{
         try parseAnchor(allocator, anchors_obj, .pre_decision, total),
         try parseAnchor(allocator, anchors_obj, .post_decision_pre_outcome, total),
@@ -1122,12 +1743,39 @@ fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
         .source_model = try dupeOptionalString(allocator, optionalString(source, "source_model")),
         .source_model_provider = try dupeOptionalString(allocator, optionalString(source, "source_model_provider")),
         .source_codex_version = try dupeOptionalString(allocator, optionalString(source, "source_codex_version")),
-        .reconstructability = try allocator.dupe(u8, try requiredString(artifact, "reconstructability")),
+        .reconstructability = try allocator.dupe(
+            u8,
+            reconstructability,
+        ),
         .total_turns = total,
         .decision_turn_index = decision,
         .first_outcome_turn_index = optionalU64(turns, "first_outcome_turn_index"),
         .anchors = anchors,
     };
+}
+
+fn sourceEpisodeIdFromDcpAlloc(
+    allocator: std.mem.Allocator,
+    source: std.json.ObjectMap,
+    turns: std.json.ObjectMap,
+) !?[]u8 {
+    if (source.get("source_episode_id")) |value| {
+        return switch (value) {
+            .string => |text| if (text.len == 0)
+                error.SourceEpisodeIdentityMismatch
+            else
+                try allocator.dupe(u8, text),
+            else => error.SourceEpisodeIdentityMismatch,
+        };
+    }
+    const session_id = optionalString(source, "session_id") orelse return null;
+    const turn_id = optionalString(turns, "decision_turn_id") orelse return null;
+    if (session_id.len == 0 or turn_id.len == 0) return null;
+    return @as(?[]u8, try std.fmt.allocPrint(
+        allocator,
+        "session:{s}#turn:{s}",
+        .{ session_id, turn_id },
+    ));
 }
 
 fn parseAnchor(allocator: std.mem.Allocator, anchors_obj: std.json.ObjectMap, name: AnchorName, total_turns: u64) !Anchor {
@@ -1178,6 +1826,10 @@ fn deinitDcp(allocator: std.mem.Allocator, dcp: Dcp) void {
 fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
     const raw = try readFileAlloc(allocator, path, MaxInputBytes);
     defer allocator.free(raw);
+    return loadRipBytes(allocator, raw);
+}
+
+fn loadRipBytes(allocator: std.mem.Allocator, raw: []const u8) !Rip {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -1192,6 +1844,7 @@ fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
         else => return error.MissingLanes,
     };
     if (lanes_arr.items.len == 0) return error.MissingLanes;
+    if (lanes_arr.items.len > MaxInquiryLanes) return error.TooManyLanes;
     var lanes = try allocator.alloc(Lane, lanes_arr.items.len);
     var total_forks: u64 = 0;
     for (lanes_arr.items, 0..) |value, index| {
@@ -1200,7 +1853,12 @@ fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
             else => return error.BadLane,
         };
         const fork_count = try requiredU64(obj, "fork_count");
-        total_forks += fork_count;
+        if (fork_count > MaxInquiryForks) return error.MaxForksExceeded;
+        total_forks = std.math.add(
+            u64,
+            total_forks,
+            fork_count,
+        ) catch return error.MaxForksExceeded;
         lanes[index] = .{
             .lane_id = try allocator.dupe(u8, try requiredString(obj, "lane_id")),
             .temporal_horizon = try allocator.dupe(u8, try requiredString(obj, "temporal_horizon")),
@@ -1215,9 +1873,21 @@ fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
     const permissions = rootObject(plan, "permission_policy") orelse return error.MissingPermissionPolicy;
     const budgets = rootObject(plan, "budgets") orelse return error.MissingBudgets;
     const max_forks = try requiredU64(budgets, "max_forks");
+    if (max_forks > MaxInquiryForks) return error.MaxForksExceeded;
     if (total_forks > max_forks) return error.MaxForksExceeded;
     const max_turns = try requiredU64(budgets, "max_turns_per_fork");
     if (max_turns < 1) return error.BadBudget;
+    const max_total_tokens = try requiredU64(
+        budgets,
+        "max_total_tokens",
+    );
+    if (max_total_tokens > MaxInquiryTokens) {
+        return error.MaxTotalTokensExceeded;
+    }
+    const timeout_ms = try requiredU64(budgets, "timeout_ms");
+    if (timeout_ms > MaxInquiryTimeoutMs) {
+        return error.InquiryTimeoutExceeded;
+    }
     return .{
         .plan_id = try allocator.dupe(u8, try requiredString(plan, "source_capsule")),
         .inquiry_id = try allocator.dupe(u8, try requiredString(plan, "inquiry_id")),
@@ -1228,8 +1898,8 @@ fn loadRip(allocator: std.mem.Allocator, path: []const u8) !Rip {
         .permission_network = try requiredBool(permissions, "network"),
         .max_forks = max_forks,
         .max_turns_per_fork = max_turns,
-        .max_total_tokens = try requiredU64(budgets, "max_total_tokens"),
-        .timeout_ms = try requiredU64(budgets, "timeout_ms"),
+        .max_total_tokens = max_total_tokens,
+        .timeout_ms = timeout_ms,
         .lanes = lanes,
     };
 }
@@ -1333,14 +2003,18 @@ fn resolveSourceLineage(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip) !Sourc
     defer trace.deinit(allocator);
 
     if (trace.turns.items.len != dcp.total_turns) return error.SourceStale;
-    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const source_digest = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(source_digest);
     if (!std.mem.eql(u8, source_digest, dcp.source_turn_digest)) return error.SourceDigestMismatch;
 
     for (rip.lanes) |lane| {
         const anchor = anchorForHorizon(dcp, lane.temporal_horizon) orelse return error.AnchorDigestMismatch;
         if (!anchor.available) return error.AnchorDigestMismatch;
-        const observed = try decision_anchor.digestRetained(allocator, trace, @intCast(anchor.keep_through_turn_index));
+        const observed = try trace_core.retainedTraceDigest(
+            allocator,
+            trace,
+            @intCast(anchor.keep_through_turn_index),
+        );
         defer allocator.free(observed);
         if (!std.mem.eql(u8, observed, anchor.anchor_digest orelse "")) return error.AnchorDigestMismatch;
     }
@@ -1655,7 +2329,9 @@ fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inqui
     defer allocator.free(self_exe);
     const timeout_text = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
     defer allocator.free(timeout_text);
-    const argv = [_][]const u8{
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{
         self_exe,
         "wait",
         "--inquiry-id",
@@ -1664,9 +2340,20 @@ fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inqui
         timeout_text,
         "--store-root",
         store_root,
-        "--json",
-    };
-    _ = try cas_websocket.spawnDetachedProcess(allocator, ".", &argv, io);
+    });
+    if (options.ledger_path) |ledger_path| {
+        try argv.appendSlice(
+            allocator,
+            &.{ "--ledger-path", ledger_path },
+        );
+    }
+    try argv.append(allocator, "--json");
+    _ = try cas_websocket.spawnDetachedProcess(
+        allocator,
+        ".",
+        argv.items,
+        io,
+    );
 }
 
 fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_id: []const u8) !RunOutput {
@@ -1688,6 +2375,73 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
             .failure_hint = record.failure_hint,
         };
     }
+    const capsule_path = try inquiryPathJoin(
+        allocator,
+        options.home,
+        inquiry_id,
+        "capsule.json",
+    );
+    defer allocator.free(capsule_path);
+    const capsule_receipt_path = try inquiryPathJoin(
+        allocator,
+        options.home,
+        inquiry_id,
+        "capsule.validation.json",
+    );
+    defer allocator.free(capsule_receipt_path);
+    const capsule_definition_path = try persistedDefinitionPathAlloc(
+        allocator,
+        options.home,
+        inquiry_id,
+        "capsule.definition.path",
+    );
+    defer allocator.free(capsule_definition_path);
+    var capsule_input = try validateLedgerInput(
+        allocator,
+        options,
+        capsule_definition_path,
+        capsule_path,
+        capsule_receipt_path,
+        "retrace/decision-context-packet",
+        "packet",
+    );
+    defer capsule_input.deinit(allocator);
+    const plan_path = try inquiryPathJoin(
+        allocator,
+        options.home,
+        inquiry_id,
+        "plan.json",
+    );
+    defer allocator.free(plan_path);
+    const plan_receipt_path = try inquiryPathJoin(
+        allocator,
+        options.home,
+        inquiry_id,
+        "plan.validation.json",
+    );
+    defer allocator.free(plan_receipt_path);
+    const plan_definition_path = try persistedDefinitionPathAlloc(
+        allocator,
+        options.home,
+        inquiry_id,
+        "plan.definition.path",
+    );
+    defer allocator.free(plan_definition_path);
+    var plan_input = try validateLedgerInput(
+        allocator,
+        options,
+        plan_definition_path,
+        plan_path,
+        plan_receipt_path,
+        "retrace/retrace-inquiry-plan",
+        "plan",
+    );
+    defer plan_input.deinit(allocator);
+    const dcp = try loadDcpBytes(allocator, capsule_input.input);
+    defer deinitDcp(allocator, dcp);
+    const rip = try loadRipBytes(allocator, plan_input.input);
+    defer deinitRip(allocator, rip);
+
     const managed_runtime_alive = cas_websocket.processAlive(record.managed_server_pid);
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
     var recovery_server: ?cas_websocket.ManagedServer = null;
@@ -1705,15 +2459,6 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
         );
         break :blk recovery_server.?.listen_url;
     };
-
-    const capsule_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "capsule.json");
-    defer allocator.free(capsule_path);
-    const plan_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "plan.json");
-    defer allocator.free(plan_path);
-    const dcp = try loadDcp(allocator, capsule_path);
-    defer deinitDcp(allocator, dcp);
-    const rip = try loadRip(allocator, plan_path);
-    defer deinitRip(allocator, rip);
 
     var client = try cas_client.Client.start(allocator, .{
         .cwd = record.cwd,
@@ -3378,7 +4123,11 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
         try trace.turns.append(allocator, record);
         try appendToolRecordsFromThreadItems(allocator, &trace, turn, @intCast(index + 1));
     }
-    const digest = try decision_anchor.digestRetained(allocator, trace, @intCast(turns.items.len));
+    const digest = try trace_core.retainedTraceDigest(
+        allocator,
+        trace,
+        @intCast(turns.items.len),
+    );
     return .{
         .count = turns.items.len,
         .digest = digest,
@@ -3688,20 +4437,135 @@ fn persistInvalidRunArtifacts(
 }
 
 fn persistInputCopies(allocator: std.mem.Allocator, options: Options, inquiry_id: []const u8) !void {
+    if (options.capsule_definition_path) |source| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "capsule.definition.path",
+            source,
+            source,
+        );
+    }
     if (options.capsule_path) |source| {
-        const raw = try readFileAlloc(allocator, source, MaxInputBytes);
-        defer allocator.free(raw);
-        const target = try inquiryPathJoin(allocator, options.home, inquiry_id, "capsule.json");
-        defer allocator.free(target);
-        try durable_store.writeTextAtomic(allocator, target, raw);
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "capsule.json",
+            options.capsule_bytes,
+            source,
+        );
+    }
+    if (options.capsule_validation_path) |source| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "capsule.validation.json",
+            options.capsule_validation_bytes,
+            source,
+        );
+    }
+    if (options.capsule_revalidation_bytes) |validated| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "capsule.revalidation.json",
+            validated,
+            "",
+        );
+    }
+    if (options.plan_definition_path) |source| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "plan.definition.path",
+            source,
+            source,
+        );
     }
     if (options.plan_path) |source| {
-        const raw = try readFileAlloc(allocator, source, MaxInputBytes);
-        defer allocator.free(raw);
-        const target = try inquiryPathJoin(allocator, options.home, inquiry_id, "plan.json");
-        defer allocator.free(target);
-        try durable_store.writeTextAtomic(allocator, target, raw);
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "plan.json",
+            options.plan_bytes,
+            source,
+        );
     }
+    if (options.plan_validation_path) |source| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "plan.validation.json",
+            options.plan_validation_bytes,
+            source,
+        );
+    }
+    if (options.plan_revalidation_bytes) |validated| {
+        try persistInputCopy(
+            allocator,
+            options.home,
+            inquiry_id,
+            "plan.revalidation.json",
+            validated,
+            "",
+        );
+    }
+}
+
+fn persistInputCopy(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    inquiry_id: []const u8,
+    name: []const u8,
+    validated: ?[]const u8,
+    source: []const u8,
+) !void {
+    const owned = if (validated == null)
+        try readFileAlloc(allocator, source, MaxInputBytes)
+    else
+        null;
+    defer if (owned) |bytes| allocator.free(bytes);
+    const target = try inquiryPathJoin(
+        allocator,
+        home,
+        inquiry_id,
+        name,
+    );
+    defer allocator.free(target);
+    try durable_store.writeTextAtomic(
+        allocator,
+        target,
+        validated orelse owned.?,
+    );
+}
+
+fn persistedDefinitionPathAlloc(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    inquiry_id: []const u8,
+    name: []const u8,
+) ![]u8 {
+    const path = try inquiryPathJoin(
+        allocator,
+        home,
+        inquiry_id,
+        name,
+    );
+    defer allocator.free(path);
+    const raw = try readFileAlloc(allocator, path, MaxInputBytes);
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or !std.fs.path.isAbsolute(trimmed)) {
+        return error.InvalidDefinitionPath;
+    }
+    return allocator.dupe(u8, trimmed);
 }
 
 fn inquiryWorkspaceCwdAlloc(allocator: std.mem.Allocator, options: Options, rip: Rip) ![]const u8 {
@@ -3944,6 +4808,22 @@ fn absoluteDirPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const
     var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
     defer dir.close(io);
     return dir.realPathFileAlloc(io, ".", allocator);
+}
+
+fn absoluteLexicalPathAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        allocator,
+    );
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
@@ -4320,14 +5200,17 @@ test "validateInquiryInputs rejects unavailable workspace" {
 
 test "validateInquiryInputs accepts verified rollout transcript lineage only" {
     const allocator = std.testing.allocator;
-    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    const rollout_path = try repoTestPathAlloc(
+        allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer allocator.free(rollout_path);
 
     var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
     defer trace.deinit(allocator);
-    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const source_digest = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(source_digest);
-    const post_digest = try decision_anchor.digestRetained(allocator, trace, 1);
+    const post_digest = try trace_core.retainedTraceDigest(allocator, trace, 1);
     defer allocator.free(post_digest);
 
     const dcp = Dcp{
@@ -4396,7 +5279,10 @@ test "validateInquiryInputs accepts verified rollout transcript lineage only" {
 
 test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained horizon" {
     const allocator = std.testing.allocator;
-    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    const rollout_path = try repoTestPathAlloc(
+        allocator,
+        "libs/trace_core/testdata/new_044_plus.jsonl",
+    );
     defer allocator.free(rollout_path);
     const dcp = Dcp{
         .packet_id = "CAP",
@@ -4447,59 +5333,164 @@ test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained hori
     try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_historical_context") != null);
 }
 
-test "CAS admits the shared-valid Seq DCP-v2 source episode identity" {
+const test_dcp_json =
+    \\{
+    \\  "decision_context_packet": {
+    \\    "packet_version": "DCP-v2",
+    \\    "packet_id": "DCP-test",
+    \\    "source": {
+    \\      "source_episode_id": "session:dcp-basic#turn:turn-decision",
+    \\      "session_id": "dcp-basic"
+    \\    },
+    \\    "artifact_state": {"reconstructability": "head_only"},
+    \\    "turns": {
+    \\      "total_turns": 3,
+    \\      "decision_turn_index": 2,
+    \\      "decision_turn_id": "turn-decision",
+    \\      "first_outcome_turn_index": 3,
+    \\      "source_turn_digest": "sha256:source"
+    \\    },
+    \\    "anchors": {
+    \\      "pre_decision": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 1,
+    \\        "drop_last_n_turns": 2,
+    \\        "anchor_digest": "sha256:pre"
+    \\      },
+    \\      "post_decision_pre_outcome": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 2,
+    \\        "drop_last_n_turns": 1,
+    \\        "anchor_digest": "sha256:post"
+    \\      },
+    \\      "outcome_aware": {
+    \\        "available": true,
+    \\        "keep_through_turn_index": 3,
+    \\        "drop_last_n_turns": 0,
+    \\        "anchor_digest": "sha256:full"
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "CAS rejects a DCP identity that does not bind its content" {
     const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/decision-capsule/valid-basic.json");
-    defer allocator.free(capsule_path);
-
-    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
-    defer allocator.free(raw);
-    var report = try dcp_schema.validateText(allocator, raw);
-    defer report.deinit(allocator);
-    try std.testing.expect(report.valid);
-
-    const dcp = try loadDcp(allocator, capsule_path);
-    defer deinitDcp(allocator, dcp);
-    try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        test_dcp_json,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.DcpContentIdentityMismatch,
+        verifyDcpContentIdentity(allocator, parsed.value),
+    );
 }
 
-test "CAS derives identity from frozen released DCP-v2 bytes" {
-    const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(
-        allocator,
-        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+test "CAS preserves the released DCP-v2 canonical identity profile" {
+    const text =
+        \\{"packet_id":"root","float":1e23,"fraction":333333333.33333325,"negative_zero":-0.0,"escape":"\b\t\n\f\r\u0000\"\\/","nested":{"packet_id":"nested","value":1e-7}}
+    ;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        text,
+        .{},
     );
-    defer allocator.free(capsule_path);
+    defer parsed.deinit();
+    const canonical = try canonicalDcpV2JsonAlloc(
+        std.testing.allocator,
+        parsed.value,
+        true,
+    );
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        \\{"escape":"\b\t\n\f\r\u0000\"\\/","float":100000000000000000000000,"fraction":333333333.33333325,"negative_zero":-0,"nested":{"value":0.0000001}}
+    , canonical);
+}
 
-    const dcp = try loadDcp(allocator, capsule_path);
+test "CAS consumes the explicit DCP-v2 source episode identity" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        test_dcp_json,
+        .{},
+    );
+    defer parsed.deinit();
+    const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
     try std.testing.expectEqualStrings(
-        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
-        dcp.packet_id,
+        "session:dcp-basic#turn:turn-decision",
+        dcp.source_episode_id.?,
     );
+}
+
+test "CAS rejects unsupported DCP reconstructability before inquiry" {
+    const allocator = std.testing.allocator;
+    const unsupported = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        test_dcp_json,
+        "\"reconstructability\": \"head_only\"",
+        "\"reconstructability\": \"invented\"",
+    );
+    defer allocator.free(unsupported);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        unsupported,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectError(
+        error.BadReconstructability,
+        dcpFromValue(allocator, parsed.value),
+    );
+}
+
+test "CAS derives DCP-v2 source episode identity from canonical locators" {
+    const allocator = std.testing.allocator;
+    const without_explicit = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        test_dcp_json,
+        "      \"source_episode_id\": \"session:dcp-basic#turn:turn-decision\",\n",
+        "",
+    );
+    defer allocator.free(without_explicit);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        without_explicit,
+        .{},
+    );
+    defer parsed.deinit();
+    const dcp = try dcpFromValue(allocator, parsed.value);
+    defer deinitDcp(allocator, dcp);
     try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
 }
 
-test "CAS preserves ordinary DCP-v2 loading when source episode identity is unavailable" {
+test "CAS accepts a validated DCP without a source episode projection" {
     const allocator = std.testing.allocator;
-    const capsule_path = try repoTestPathAlloc(
+    const without_explicit = try std.mem.replaceOwned(
+        u8,
         allocator,
-        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+        test_dcp_json,
+        "      \"source_episode_id\": \"session:dcp-basic#turn:turn-decision\",\n",
+        "",
     );
-    defer allocator.free(capsule_path);
-    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
-    defer allocator.free(raw);
-
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "      \"session_id\": \"dcp-basic\",\n"));
+    defer allocator.free(without_explicit);
     const without_session = try std.mem.replaceOwned(
         u8,
         allocator,
-        raw,
-        "      \"session_id\": \"dcp-basic\",\n",
+        without_explicit,
+        "      \"session_id\": \"dcp-basic\"\n",
         "",
     );
     defer allocator.free(without_session);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, without_session, "      \"decision_turn_id\": \"turn-decision\",\n"));
     const without_identity_inputs = try std.mem.replaceOwned(
         u8,
         allocator,
@@ -4508,18 +5499,12 @@ test "CAS preserves ordinary DCP-v2 loading when source episode identity is unav
         "",
     );
     defer allocator.free(without_identity_inputs);
-    const packet_id = try dcp_schema.packetIdForTextExcludingPacketId(allocator, without_identity_inputs);
-    defer allocator.free(packet_id);
-    const rewritten = try std.mem.replaceOwned(
-        u8,
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
         allocator,
         without_identity_inputs,
-        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
-        packet_id,
+        .{},
     );
-    defer allocator.free(rewritten);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rewritten, .{});
     defer parsed.deinit();
     const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
@@ -4583,6 +5568,91 @@ test "sha256HexAlloc prefixes digest" {
     const digest = try sha256HexAlloc(allocator, "abc");
     defer allocator.free(digest);
     try std.testing.expectEqualStrings("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", digest);
+}
+
+test "Ledger validation receipts bind exact inquiry inputs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "{}";
+    const input_digest = try sha256HexAlloc(allocator, input);
+    defer allocator.free(input_digest);
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"ledger-validation-result/v1\"," ++
+            "\"definition\":{{\"id\":\"retrace/decision-context-packet\"," ++
+            "\"digest\":\"sha256:" ++
+            "0000000000000000000000000000000000000000000000000000000000000000\"," ++
+            "\"abi\":\"ledger-artifact-abi/v1\"}}," ++
+            "\"input_digests\":{{\"packet\":\"{s}\"}}," ++
+            "\"valid\":true,\"errors\":[],\"claims\":[]," ++
+            "\"authority_granted\":false,\"storage_mutated\":false}}",
+        .{input_digest},
+    );
+    defer allocator.free(receipt);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "capsule.json",
+        .data = input,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "validation.json",
+        .data = receipt,
+    });
+    const input_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "capsule.json",
+        allocator,
+    );
+    defer allocator.free(input_path);
+    const receipt_path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "validation.json",
+        allocator,
+    );
+    defer allocator.free(receipt_path);
+    const definition_digest =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    var validated = try validateLedgerInputReceipt(
+        allocator,
+        receipt_path,
+        input_path,
+        "retrace/decision-context-packet",
+        definition_digest,
+        "packet",
+    );
+    defer validated.deinit(allocator);
+    try std.testing.expectEqualStrings(input, validated.input);
+    try std.testing.expectEqualStrings(receipt, validated.receipt);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "capsule.json",
+        .data = "{\"changed\":true}",
+    });
+    try std.testing.expectError(
+        error.LedgerValidationInputDigestMismatch,
+        validateLedgerInputReceipt(
+            allocator,
+            receipt_path,
+            input_path,
+            "retrace/decision-context-packet",
+            definition_digest,
+            "packet",
+        ),
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "capsule.json",
+        .data = input,
+    });
+    try std.testing.expectError(
+        error.LedgerValidationDefinitionDigestMismatch,
+        validateLedgerInputReceipt(
+            allocator,
+            receipt_path,
+            input_path,
+            "retrace/decision-context-packet",
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "packet",
+        ),
+    );
 }
 
 test "codexVersionFromInstallPathAlloc reads Homebrew cask version" {
@@ -4893,7 +5963,7 @@ test "turnDigestFromThreadRead includes live function call records" {
         .exit_code = 0,
         .lifecycle_status = .completed,
     });
-    const expected = try decision_anchor.sourceTurnDigest(allocator, trace);
+    const expected = try trace_core.completeTraceDigest(allocator, trace);
     defer allocator.free(expected);
     try std.testing.expectEqual(@as(usize, 1), observed.count);
     try std.testing.expectEqualStrings(expected, observed.digest);

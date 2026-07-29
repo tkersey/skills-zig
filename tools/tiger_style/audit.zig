@@ -118,7 +118,13 @@ fn lineLayout(
     source_line: []const u8,
     audit: *Audit,
 ) !void {
-    if (source_line.len > limits.line_columns_max) {
+    var content_start: usize = 0;
+    while (content_start < source_line.len and
+        source_line[content_start] == ' ') : (content_start += 1)
+    {}
+    const trimmed = source_line[content_start..];
+    const is_multiline_data = std.mem.startsWith(u8, trimmed, "\\\\");
+    if (source_line.len > limits.line_columns_max and !is_multiline_data) {
         try audit.record(writer, path, line_number, "line-length", "line exceeds 100 columns");
     }
     if (std.mem.indexOfScalar(u8, source_line, '\t') != null) {
@@ -292,6 +298,7 @@ test "strings and justified event loops do not trigger code rules" {
     try source(&output.writer, "strings.zig",
         \\fn server() void {
         \\    const example = "while (true) catch {}";
+        \\    \\{"passive_definition":"compact machine data is exempt from source layout width because it is not executable Zig"}
         \\    _ = example;
         \\    while (true) {} // tiger: event-loop
         \\}

@@ -1,14 +1,9 @@
 .{
     .name = .seq,
-    .version = "0.5.4",
+    .version = "1.0.0",
     .fingerprint = 0x967ed153543a90ec,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .sqlite = .{
-            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530300.zip",
-            .hash = "N-V-__8AAE9krgByKNN5S4cuFUqn5FS8FvM4S3K1qQ-3sEHC",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

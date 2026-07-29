@@ -1,0 +1,28 @@
+pub const canonical_json = @import("canonical_json.zig");
+pub const exact_number = @import("exact_number.zig");
+pub const closure = @import("closure.zig");
+pub const json = @import("json.zig");
+pub const json_pointer = @import("json_pointer.zig");
+pub const scalar = @import("scalar.zig");
+pub const parameters = @import("parameters.zig");
+pub const cache = @import("cache.zig");
+pub const diagnostics = @import("diagnostics.zig");
+pub const result = @import("result.zig");
+
+pub const Closure = closure.Closure;
+pub const ClosureFile = closure.ClosureFile;
+pub const ClosureLimits = closure.Limits;
+pub const loadClosure = closure.load;
+
+test {
+    _ = canonical_json;
+    _ = exact_number;
+    _ = closure;
+    _ = json;
+    _ = json_pointer;
+    _ = scalar;
+    _ = parameters;
+    _ = cache;
+    _ = diagnostics;
+    _ = result;
+}

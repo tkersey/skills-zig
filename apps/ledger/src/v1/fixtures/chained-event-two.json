@@ -1,0 +1,11 @@
+{
+  "body": {
+    "id": "item-1",
+    "status": "closed"
+  },
+  "body_digest": "sha256:047228e65f14a331003b9b5c444cd36c8d38dd135eac9f95e3a886de99f2dcee",
+  "event_digest": "sha256:5792b5a1534f163c5b2c9733315b4f3b909abd5d62fff0345ec1073359b16d6c",
+  "kind": "updated",
+  "previous_digest": "sha256:3f1f0aafbd3400010d5462b2d414c4daf20e766d80a4b4bc5c7c0bccf5073731",
+  "sequence": 2
+}
