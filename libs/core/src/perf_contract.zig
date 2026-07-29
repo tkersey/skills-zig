@@ -82,10 +82,8 @@ pub fn writeManifestJson(
     stdout: anytype,
     manifests: []const BinaryManifest,
 ) !void {
-    var rows: std.ArrayList(u8) = .empty;
-    defer rows.deinit(allocator);
-    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &rows);
-    const writer = &writer_alloc.writer;
+    _ = allocator;
+    const writer = stdout;
     try writer.writeAll("{\"binaries\":[");
     for (manifests, 0..) |manifest, idx| {
         if (idx > 0) try writer.writeByte(',');
@@ -127,7 +125,6 @@ pub fn writeManifestJson(
         try writer.writeAll("]}");
     }
     try writer.writeAll("]}\n");
-    try stdout.writeAll(rows.items);
 }
 
 fn writeJsonString(writer: anytype, text: []const u8) !void {

@@ -9,7 +9,7 @@ const perf_contract = @import("perf_contract");
 const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
-const paired_comparison_rounds: usize = 4;
+const paired_comparison_rounds: usize = 8;
 const accepted_generic_deep_schema1_sha =
     "4ff01f5e6f2fa5bd4c945f5b6a92bb6d22ca8389";
 const deep_measurement_schema = "perf-deep-measurement/v1";
@@ -53,6 +53,7 @@ const UsageText =
     \\  PERF_EXPECT_BASE_SHA  Required source SHA for a paired baseline
     \\  PERF_EXPECT_CANDIDATE_SHA
     \\                        Required source SHA for the paired candidate
+    \\  PERF_ZIG_BINARY       Approved absolute Zig compiler for paired drivers
 ;
 
 const Command = enum {
@@ -494,6 +495,7 @@ fn cmdList(target: ?[]const u8) !void {
 fn cmdManifest(allocator: std.mem.Allocator) !void {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try perf_contract.writeManifestJson(allocator, &stdout_writer.interface, allManifests());
+    try stdout_writer.interface.flush();
 }
 
 fn cmdAudit() !void {
@@ -519,17 +521,65 @@ fn cmdAudit() !void {
     }
 }
 
-const BuiltDriver = struct {
+const SealedFile = struct {
     path: [:0]u8,
     sha256: [64]u8,
+
+    fn clone(self: SealedFile, allocator: std.mem.Allocator) !SealedFile {
+        return .{
+            .path = try allocator.dupeZ(u8, self.path),
+            .sha256 = self.sha256,
+        };
+    }
+
+    fn deinit(self: *SealedFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
+const CompilerEvidence = struct {
+    approved_path: []u8,
+    file: SealedFile,
+    version: []u8,
+
+    fn clone(
+        self: CompilerEvidence,
+        allocator: std.mem.Allocator,
+    ) !CompilerEvidence {
+        const approved_path = try allocator.dupe(u8, self.approved_path);
+        errdefer allocator.free(approved_path);
+        var file = try self.file.clone(allocator);
+        errdefer file.deinit(allocator);
+        const version = try allocator.dupe(u8, self.version);
+        return .{
+            .approved_path = approved_path,
+            .file = file,
+            .version = version,
+        };
+    }
+
+    fn deinit(self: *CompilerEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.approved_path);
+        self.file.deinit(allocator);
+        allocator.free(self.version);
+        self.* = undefined;
+    }
+};
+
+const BuiltDriver = struct {
+    file: SealedFile,
     source_sha: []u8,
-    receipt_path: []u8,
-    receipt_sha256: [64]u8,
+    source_tree_sha: []u8,
+    source_archive: SealedFile,
+    compiler: CompilerEvidence,
 
     fn deinit(self: *BuiltDriver, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
+        self.file.deinit(allocator);
         allocator.free(self.source_sha);
-        allocator.free(self.receipt_path);
+        allocator.free(self.source_tree_sha);
+        self.source_archive.deinit(allocator);
+        self.compiler.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -582,6 +632,12 @@ const CompareRow = struct {
     binary: []const u8,
     detail: []const u8,
     tuple_bound: bool = false,
+    evidence_json: ?[]u8 = null,
+
+    fn deinit(self: *CompareRow, allocator: std.mem.Allocator) void {
+        if (self.evidence_json) |json| allocator.free(json);
+        self.evidence_json = null;
+    }
 };
 
 const ReportCounts = struct {
@@ -639,16 +695,18 @@ fn cmdCapture(allocator: std.mem.Allocator, target: ?[]const u8) !void {
 }
 
 fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
-    const machine_dir = try ensureCurrentMachineDir(allocator);
-    defer allocator.free(machine_dir);
-    try invalidateCompareSummary(allocator, machine_dir);
     const expected_rows = matchingCaseCount(target);
     if (expected_rows == 0) return error.NoMatchingPerfCases;
+    const machine_dir = try ensureCurrentMachineDir(allocator);
+    defer allocator.free(machine_dir);
     var built = BuiltState.init(allocator);
     defer built.deinit();
 
     var rows: std.ArrayList(CompareRow) = .empty;
-    defer rows.deinit(allocator);
+    defer {
+        for (rows.items) |*row| row.deinit(allocator);
+        rows.deinit(allocator);
+    }
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     var any_fail = false;
@@ -678,7 +736,6 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
         try stdout.print("{s}\t{s}\t{s}\n", .{ result.status, result.case_id, result.detail });
         if (comparisonStatusFailed(result.status)) any_fail = true;
     }
-
     if (!comparisonSummaryComplete(
         target,
         expected_rows,
@@ -692,30 +749,6 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
         rows.items,
     );
     if (any_fail) std.process.exit(1);
-}
-
-fn invalidateCompareSummary(
-    allocator: std.mem.Allocator,
-    machine_dir: []const u8,
-) !void {
-    for ([_][]const u8{
-        "latest-compare.json",
-        "latest-report.json",
-        "cutover-status.json",
-    }) |name| {
-        const path = try std.fs.path.join(
-            allocator,
-            &.{ machine_dir, "reports", name },
-        );
-        defer allocator.free(path);
-        std.Io.Dir.cwd().deleteFile(
-            std.Io.Threaded.global_single_threaded.io(),
-            path,
-        ) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-    }
 }
 
 fn comparisonStatusFailed(status: []const u8) bool {
@@ -843,23 +876,30 @@ fn compareCompatCase(
             );
             if (std.mem.eql(
                 u8,
-                &baseline_evidence.sha256,
-                &candidate_evidence.sha256,
+                &baseline_evidence.file.sha256,
+                &candidate_evidence.file.sha256,
             )) {
+                const evidence = try writePairedDispositionArtifact(
+                    allocator,
+                    case_cfg,
+                    baseline_evidence,
+                    candidate_evidence,
+                    "byte-identical-products",
+                );
                 return .{
                     .status = "FAIL",
                     .case_id = case_cfg.descriptor.case_id,
                     .binary = case_cfg.descriptor.binary,
                     .detail = "base and candidate binaries are byte-identical",
                     .tuple_bound = true,
+                    .evidence_json = evidence,
                 };
             }
             if (isPreCutoverBinary(baseline_evidence.version) and
                 !preCutoverCaseCompatible(case_cfg.setup))
             {
-                try writeIncompatiblePairedArtifact(
+                const evidence = try writeIncompatiblePairedArtifact(
                     allocator,
-                    latest_path,
                     case_cfg,
                     baseline_evidence,
                     candidate_evidence,
@@ -870,14 +910,22 @@ fn compareCompatCase(
                     .binary = case_cfg.descriptor.binary,
                     .detail = "incompatible-base-surface",
                     .tuple_bound = true,
+                    .evidence_json = evidence,
                 };
             }
+            base_case.binary_path = baseline_evidence.file.path;
+            var candidate_case = case_cfg;
+            candidate_case.binary_path = candidate_evidence.file.path;
+            try requireBinaryUnchanged(baseline_evidence);
+            try requireBinaryUnchanged(candidate_evidence);
             var paired = try runPairedMeasuredCases(
                 allocator,
                 base_case,
-                case_cfg,
+                candidate_case,
             );
             defer paired.deinit(allocator);
+            try requireBinaryUnchanged(baseline_evidence);
+            try requireBinaryUnchanged(candidate_evidence);
             const compare = try compareMeasuredMetrics(
                 case_cfg,
                 paired.baseline,
@@ -885,9 +933,8 @@ fn compareCompatCase(
             );
             var evidence_case = case_cfg;
             evidence_case.samples = paired.candidate.samples.items.len;
-            try writePairedMetricsArtifact(
+            const evidence = try writePairedMetricsArtifact(
                 allocator,
-                latest_path,
                 evidence_case,
                 baseline_evidence,
                 candidate_evidence,
@@ -910,6 +957,7 @@ fn compareCompatCase(
                 .binary = case_cfg.descriptor.binary,
                 .detail = compare.detail,
                 .tuple_bound = true,
+                .evidence_json = evidence,
             };
         }
     }
@@ -1001,17 +1049,8 @@ fn compareDeepCase(
                 candidate_evidence,
             );
             if (isPreCutoverBinary(baseline_evidence.version)) {
-                const latest_path = try compatBaselinePath(
+                const evidence = try writeIncompatiblePairedArtifact(
                     allocator,
-                    machine_dir,
-                    case_cfg.descriptor.binary,
-                    case_cfg.descriptor.case_id,
-                    true,
-                );
-                defer allocator.free(latest_path);
-                try writeIncompatiblePairedArtifact(
-                    allocator,
-                    latest_path,
                     compat_case,
                     baseline_evidence,
                     candidate_evidence,
@@ -1022,6 +1061,7 @@ fn compareDeepCase(
                     .binary = case_cfg.descriptor.binary,
                     .detail = "incompatible-base-surface",
                     .tuple_bound = true,
+                    .evidence_json = evidence,
                 };
             }
             var paired = try runPairedDeepCases(
@@ -1057,17 +1097,8 @@ fn compareDeepCase(
                 paired.baseline,
                 paired.candidate,
             );
-            const latest_path = try compatBaselinePath(
+            const evidence = try writePairedMetricsArtifact(
                 allocator,
-                machine_dir,
-                case_cfg.descriptor.binary,
-                case_cfg.descriptor.case_id,
-                true,
-            );
-            defer allocator.free(latest_path);
-            try writePairedMetricsArtifact(
-                allocator,
-                latest_path,
                 comparison_case,
                 baseline_evidence,
                 candidate_evidence,
@@ -1090,6 +1121,7 @@ fn compareDeepCase(
                 .binary = case_cfg.descriptor.binary,
                 .detail = compare.detail,
                 .tuple_bound = true,
+                .evidence_json = evidence,
             };
         }
     }
@@ -1147,16 +1179,19 @@ fn writeCompareSummaryRows(
     expected_rows: usize,
     rows: []const CompareRow,
 ) !void {
-    const reports_dir = try std.fs.path.join(allocator, &.{ machine_dir, "reports" });
+    const reports_dir = try std.fs.path.join(
+        allocator,
+        &.{ machine_dir, "reports" },
+    );
     defer allocator.free(reports_dir);
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(reports_dir);
-    const latest_path = try std.fs.path.join(allocator, &.{ reports_dir, "latest-compare.json" });
-    defer allocator.free(latest_path);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     const writer = &output.writer;
-    try writer.writeAll("{\"target\":");
+    try writer.writeAll(
+        "{\"schema\":\"performance-capsule/v1\",\"target\":",
+    );
     if (target) |selected| {
         try std.json.Stringify.value(selected, .{}, writer);
     } else {
@@ -1205,13 +1240,41 @@ fn writeCompareSummaryRows(
             .{row.tuple_bound},
         );
         try writeJsonString(writer, row.detail);
+        try writer.writeAll(",\"evidence\":");
+        if (row.evidence_json) |json| {
+            if (json.len == 0) return error.IncompletePerfEvidence;
+            try writer.writeAll(json);
+        } else {
+            if (row.tuple_bound) return error.IncompletePerfEvidence;
+            try writer.writeAll("null");
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("]}\n");
+    var capsule = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "capsule.json",
+        output.written(),
+        0o600,
+    );
+    defer capsule.deinit(allocator);
+    var locator_output: std.Io.Writer.Allocating = .init(allocator);
+    defer locator_output.deinit();
+    try locator_output.writer.writeAll(
+        "{\"schema\":\"performance-capsule-ref/v1\",\"capsule\":",
+    );
+    try writeSealedFile(&locator_output.writer, capsule);
+    try locator_output.writer.writeAll("}\n");
+    const locator_path = try std.fs.path.join(
+        allocator,
+        &.{ reports_dir, "current-capsule.json" },
+    );
+    defer allocator.free(locator_path);
     try writeEvidenceFileAtomic(
         allocator,
-        latest_path,
-        output.written(),
+        locator_path,
+        locator_output.written(),
         0o600,
     );
 }
@@ -1614,32 +1677,37 @@ const MeasuredOutputEvidence = struct {
 };
 
 const BinaryEvidence = struct {
-    path: [:0]u8,
-    sha256: [64]u8,
+    file: SealedFile,
     version: []u8,
     source_sha: []u8,
+    source_tree_sha: []u8,
+    source_root: []u8,
     build_step: []const u8,
 
     fn deinit(self: *BinaryEvidence, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
+        self.file.deinit(allocator);
         allocator.free(self.version);
         allocator.free(self.source_sha);
+        allocator.free(self.source_tree_sha);
+        allocator.free(self.source_root);
         self.* = undefined;
     }
 };
 
 const DriverEvidence = struct {
-    path: [:0]u8,
-    sha256: [64]u8,
+    file: SealedFile,
     source_sha: []u8,
-    build_receipt_path: []u8,
-    build_receipt_sha256: [64]u8,
+    source_tree_sha: []u8,
+    source_archive: SealedFile,
+    compiler: CompilerEvidence,
     configuration_digest: [64]u8,
 
     fn deinit(self: *DriverEvidence, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
+        self.file.deinit(allocator);
         allocator.free(self.source_sha);
-        allocator.free(self.build_receipt_path);
+        allocator.free(self.source_tree_sha);
+        self.source_archive.deinit(allocator);
+        self.compiler.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -1650,46 +1718,89 @@ fn binaryEvidence(
 ) !BinaryEvidence {
     const resolved = try resolveBinaryExecPath(allocator, case_cfg);
     defer allocator.free(resolved);
-    const path = try std.Io.Dir.cwd().realPathFileAlloc(
+    const original_path = try std.Io.Dir.cwd().realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         resolved,
         allocator,
     );
-    errdefer allocator.free(path);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        path,
+    defer allocator.free(original_path);
+    const bytes = try readBuildOutputAlloc(
         allocator,
-        .limited(16 * 1024 * 1024),
+        original_path,
+        16 * 1024 * 1024,
     );
     defer allocator.free(bytes);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const sha256 = std.fmt.bytesToHex(digest, .lower);
-    const source_root = try sourceRootForBinaryAlloc(allocator, path);
-    defer allocator.free(source_root);
+    const source_root = try sourceRootForBinaryAlloc(
+        allocator,
+        original_path,
+    );
+    errdefer allocator.free(source_root);
     try requireCleanSourceRoot(allocator, source_root);
     const source_sha = try sourceShaForRootAlloc(
         allocator,
         source_root,
     );
     errdefer allocator.free(source_sha);
+    const source_tree_sha = try sourceTreeShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    errdefer allocator.free(source_tree_sha);
+    const machine_dir_relative = try ensureCurrentMachineDir(allocator);
+    defer allocator.free(machine_dir_relative);
+    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        machine_dir_relative,
+        allocator,
+    );
+    defer allocator.free(machine_dir);
+    var file = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        case_cfg.descriptor.binary,
+        bytes,
+        0o500,
+    );
+    errdefer file.deinit(allocator);
     const result = try runChildCaptureOutput(
         allocator,
         ".",
-        &.{ path, "version" },
+        &.{ file.path, "version" },
     );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.BinaryVersionFailed;
+    const version = try allocator.dupe(
+        u8,
+        std.mem.trim(u8, result.stdout, " \t\r\n"),
+    );
+    errdefer allocator.free(version);
+    const current_original_sha = try sha256BuildOutput(original_path);
+    if (!std.mem.eql(u8, &current_original_sha, &file.sha256)) {
+        return error.ProductBinaryChanged;
+    }
+    try requireCleanSourceRoot(allocator, source_root);
+    const current_source_sha = try sourceShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(current_source_sha);
+    const current_tree_sha = try sourceTreeShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(current_tree_sha);
+    if (!std.mem.eql(u8, current_source_sha, source_sha) or
+        !std.mem.eql(u8, current_tree_sha, source_tree_sha))
+    {
+        return error.ProductSourceChanged;
+    }
     return .{
-        .path = path,
-        .sha256 = sha256,
-        .version = try allocator.dupe(
-            u8,
-            std.mem.trim(u8, result.stdout, " \t\r\n"),
-        ),
+        .file = file,
+        .version = version,
         .source_sha = source_sha,
+        .source_tree_sha = source_tree_sha,
+        .source_root = source_root,
         .build_step = case_cfg.build_step orelse "default",
     };
 }
@@ -1699,38 +1810,103 @@ fn driverEvidence(
     built: BuiltDriver,
     case_cfg: DeepCase,
 ) !DriverEvidence {
-    const path = try allocator.dupeZ(u8, built.path);
-    errdefer allocator.free(path);
+    var file = try built.file.clone(allocator);
+    errdefer file.deinit(allocator);
     const source_sha = try allocator.dupe(u8, built.source_sha);
     errdefer allocator.free(source_sha);
-    const receipt_path = try allocator.dupe(
+    const source_tree_sha = try allocator.dupe(
         u8,
-        built.receipt_path,
+        built.source_tree_sha,
     );
-    errdefer allocator.free(receipt_path);
+    errdefer allocator.free(source_tree_sha);
+    var source_archive = try built.source_archive.clone(allocator);
+    errdefer source_archive.deinit(allocator);
+    var compiler = try built.compiler.clone(allocator);
+    errdefer compiler.deinit(allocator);
     return .{
-        .path = path,
-        .sha256 = built.sha256,
+        .file = file,
         .source_sha = source_sha,
-        .build_receipt_path = receipt_path,
-        .build_receipt_sha256 = built.receipt_sha256,
+        .source_tree_sha = source_tree_sha,
+        .source_archive = source_archive,
+        .compiler = compiler,
         .configuration_digest = try deepConfigurationDigest(case_cfg),
     };
 }
 
 fn requireDriverUnchanged(driver: DriverEvidence) !void {
-    const current = try sha256File(driver.path);
-    if (!std.mem.eql(u8, &current, &driver.sha256)) {
-        return error.DriverBinaryChanged;
+    verifySealedFile(driver.file) catch return error.DriverBinaryChanged;
+}
+
+fn requireBinaryUnchanged(evidence: BinaryEvidence) !void {
+    verifySealedFile(evidence.file) catch return error.ProductBinaryChanged;
+}
+
+fn approvedCompilerEvidence(
+    allocator: std.mem.Allocator,
+) !CompilerEvidence {
+    const environment = process_environment orelse
+        return error.ApprovedZigBinaryRequired;
+    const configured = environment.get("PERF_ZIG_BINARY") orelse
+        return error.ApprovedZigBinaryRequired;
+    if (!std.fs.path.isAbsolute(configured)) {
+        return error.ApprovedZigBinaryRequired;
     }
-    const receipt = try sha256File(driver.build_receipt_path);
-    if (!std.mem.eql(u8, &receipt, &driver.build_receipt_sha256)) {
-        return error.DriverBuildReceiptChanged;
+    const approved_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        configured,
+        allocator,
+    );
+    errdefer allocator.free(approved_path);
+    var file: SealedFile = .{
+        .path = try allocator.dupeZ(u8, approved_path),
+        .sha256 = try sha256FileBounded(
+            approved_path,
+            64 * 1024 * 1024,
+        ),
+    };
+    errdefer file.deinit(allocator);
+    const result = try runChildCaptureOutput(
+        allocator,
+        ".",
+        &.{ file.path, "version" },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CompilerVersionFailed;
+    try verifySealedFile(file);
+    const version = try allocator.dupe(
+        u8,
+        std.mem.trim(u8, result.stdout, " \t\r\n"),
+    );
+    errdefer allocator.free(version);
+    if (!std.mem.eql(u8, version, builtin.zig_version_string)) {
+        return error.CompilerVersionMismatch;
     }
+    return .{
+        .approved_path = approved_path,
+        .file = file,
+        .version = version,
+    };
 }
 
 fn sha256File(path: []const u8) ![64]u8 {
+    return sha256FileBounded(path, 16 * 1024 * 1024);
+}
+
+fn sha256FileBounded(path: []const u8, max_bytes: usize) ![64]u8 {
     const bytes = try readRegularFileAlloc(
+        std.heap.page_allocator,
+        path,
+        max_bytes,
+    );
+    defer std.heap.page_allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn sha256BuildOutput(path: []const u8) ![64]u8 {
+    const bytes = try readBuildOutputAlloc(
         std.heap.page_allocator,
         path,
         16 * 1024 * 1024,
@@ -1741,10 +1917,115 @@ fn sha256File(path: []const u8) ![64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
+const max_sealed_evidence_bytes = 64 * 1024 * 1024;
+
+fn evidenceDigest(bytes: []const u8) [64]u8 {
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
+    return std.fmt.bytesToHex(raw, .lower);
+}
+
+fn sealEvidenceBytes(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    label: []const u8,
+    bytes: []const u8,
+    mode: u32,
+) !SealedFile {
+    if (bytes.len == 0 or bytes.len > max_sealed_evidence_bytes or
+        label.len == 0 or
+        !std.mem.eql(u8, label, std.fs.path.basename(label)) or
+        std.mem.eql(u8, label, ".") or std.mem.eql(u8, label, ".."))
+    {
+        return error.InvalidPerfEvidenceFile;
+    }
+    const digest = evidenceDigest(bytes);
+    const blob_dir = try std.fs.path.join(
+        allocator,
+        &.{ machine_dir, "capsules", "blobs", &digest },
+    );
+    defer allocator.free(blob_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(blob_dir);
+    const blob_path = try std.fs.path.join(
+        allocator,
+        &.{ blob_dir, label },
+    );
+    defer allocator.free(blob_path);
+    if (pathExists(blob_path)) {
+        const retained = try sha256FileBounded(
+            blob_path,
+            max_sealed_evidence_bytes,
+        );
+        if (!std.mem.eql(u8, &retained, &digest)) {
+            return error.PerfEvidenceDigestMismatch;
+        }
+    } else {
+        try writeEvidenceFileAtomic(allocator, blob_path, bytes, mode);
+    }
+    const real_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        blob_path,
+        allocator,
+    );
+    defer allocator.free(real_path);
+    return .{
+        .path = try allocator.dupeZ(u8, real_path),
+        .sha256 = digest,
+    };
+}
+
+fn sealEvidenceFile(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    label: []const u8,
+    path: []const u8,
+    max_bytes: usize,
+    mode: u32,
+) !SealedFile {
+    if (max_bytes > max_sealed_evidence_bytes) {
+        return error.InvalidPerfEvidenceFile;
+    }
+    const bytes = try readStableFileAlloc(
+        allocator,
+        path,
+        max_bytes,
+        false,
+    );
+    defer allocator.free(bytes);
+    return sealEvidenceBytes(allocator, machine_dir, label, bytes, mode);
+}
+
+fn verifySealedFile(file: SealedFile) !void {
+    const retained = try sha256FileBounded(
+        file.path,
+        64 * 1024 * 1024,
+    );
+    if (!std.mem.eql(u8, &retained, &file.sha256)) {
+        return error.PerfEvidenceDigestMismatch;
+    }
+}
+
 fn readRegularFileAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
     max_bytes: usize,
+) ![]u8 {
+    return readStableFileAlloc(allocator, path, max_bytes, true);
+}
+
+fn readBuildOutputAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    return readStableFileAlloc(allocator, path, max_bytes, false);
+}
+
+fn readStableFileAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+    require_single_link: bool,
 ) ![]u8 {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(
@@ -1760,7 +2041,8 @@ fn readRegularFileAlloc(
         );
     defer file.close(std.Io.Threaded.global_single_threaded.io());
     const before = try file.stat(std.Io.Threaded.global_single_threaded.io());
-    if (before.kind != .file or before.nlink != 1 or
+    if (before.kind != .file or
+        (require_single_link and before.nlink != 1) or
         before.size > max_bytes)
     {
         return error.InvalidPerfEvidenceFile;
@@ -1776,7 +2058,8 @@ fn readRegularFileAlloc(
     );
     if (count != size) return error.PerfEvidenceFileChanged;
     const after = try file.stat(std.Io.Threaded.global_single_threaded.io());
-    if (after.kind != .file or after.nlink != 1 or
+    if (after.kind != .file or
+        (require_single_link and after.nlink != 1) or
         after.size != before.size or
         after.mtime.nanoseconds != before.mtime.nanoseconds)
     {
@@ -2331,40 +2614,36 @@ fn runPairedDeepCases(
     baseline_evidence: BinaryEvidence,
     candidate_evidence: BinaryEvidence,
 ) !PairedMetrics {
-    const baseline_root = try sourceRootForBinaryAlloc(
-        allocator,
-        baseline_evidence.path,
-    );
-    defer allocator.free(baseline_root);
-    const candidate_root = try sourceRootForBinaryAlloc(
-        allocator,
-        candidate_evidence.path,
-    );
-    defer allocator.free(candidate_root);
-    const baseline_built = try ensureSourcePerfHubBuilt(
+    const baseline_root = baseline_evidence.source_root;
+    const candidate_root = candidate_evidence.source_root;
+    try requireBinaryUnchanged(baseline_evidence);
+    try requireBinaryUnchanged(candidate_evidence);
+    const baseline_built = ensureSourcePerfHubBuilt(
         allocator,
         built,
         baseline_root,
         baseline_evidence.source_sha,
-    );
+    ) catch |err| return deepStageError("baseline-driver-build", err);
     var baseline_driver = try driverEvidence(
         allocator,
         baseline_built.*,
         case_cfg,
     );
     errdefer baseline_driver.deinit(allocator);
-    const candidate_built = try ensureSourcePerfHubBuilt(
+    const candidate_built = ensureSourcePerfHubBuilt(
         allocator,
         built,
         candidate_root,
         candidate_evidence.source_sha,
-    );
+    ) catch |err| return deepStageError("candidate-driver-build", err);
     var candidate_driver = try driverEvidence(
         allocator,
         candidate_built.*,
         case_cfg,
     );
     errdefer candidate_driver.deinit(allocator);
+    try requireBinaryUnchanged(baseline_evidence);
+    try requireBinaryUnchanged(candidate_evidence);
     const baseline_workload = deepWorkloadDigestForRoot(
         allocator,
         baseline_root,
@@ -2383,12 +2662,12 @@ fn runPairedDeepCases(
     // component of a separately verified physical source-event identity.
     const baseline_semantic = productDeepSemanticOutputEvidence(
         allocator,
-        baseline_evidence.path,
+        baseline_evidence.file.path,
         baseline_root,
     ) catch |err| return deepStageError("baseline-semantic", err);
     const candidate_semantic = productDeepSemanticOutputEvidence(
         allocator,
-        candidate_evidence.path,
+        candidate_evidence.file.path,
         candidate_root,
     ) catch |err| return deepStageError("candidate-semantic", err);
     if (!std.mem.eql(
@@ -2526,6 +2805,8 @@ fn runPairedDeepCases(
     );
     candidate_samples = .empty;
     candidate_allocs = .empty;
+    try requireBinaryUnchanged(baseline_evidence);
+    try requireBinaryUnchanged(candidate_evidence);
     return .{
         .baseline = baseline,
         .candidate = candidate,
@@ -2617,12 +2898,12 @@ fn ensureSourcePerfHubBuilt(
         allocator,
     );
     defer allocator.free(machine_dir);
-    const drivers_dir = try std.fs.path.join(
+    const staging_root = try std.fs.path.join(
         allocator,
-        &.{ machine_dir, "drivers" },
+        &.{ machine_dir, "capsules", "staging" },
     );
-    defer allocator.free(drivers_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(drivers_dir);
+    defer allocator.free(staging_root);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(staging_root);
     const nonce = try std.fmt.allocPrint(
         allocator,
         "{d}",
@@ -2635,7 +2916,7 @@ fn ensureSourcePerfHubBuilt(
         allocator,
         "{s}/.build-{s}-{s}",
         .{
-            drivers_dir,
+            staging_root,
             expected_source_sha[0..@min(expected_source_sha.len, 12)],
             nonce,
         },
@@ -2651,9 +2932,62 @@ fn ensureSourcePerfHubBuilt(
             .{@errorName(err)},
         );
     };
+    var compiler = try approvedCompilerEvidence(allocator);
+    var compiler_owned = true;
+    defer if (compiler_owned) compiler.deinit(allocator);
+    const archive_path = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, "source.tar" },
+    );
+    defer allocator.free(archive_path);
+    const source_snapshot = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, "source" },
+    );
+    defer allocator.free(source_snapshot);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(source_snapshot);
+    const archive_result = try runChildCapture(
+        allocator,
+        source_root,
+        &.{
+            "git",
+            "archive",
+            "--format=tar",
+            "--output",
+            archive_path,
+            expected_source_sha,
+        },
+    );
+    defer allocator.free(archive_result.stdout);
+    defer allocator.free(archive_result.stderr);
+    if (archive_result.exit_code != 0) return error.SourceSnapshotFailed;
+    var source_archive = try sealEvidenceFile(
+        allocator,
+        machine_dir,
+        "source.tar",
+        archive_path,
+        max_sealed_evidence_bytes,
+        0o600,
+    );
+    var source_archive_owned = true;
+    defer if (source_archive_owned) source_archive.deinit(allocator);
+    const extract_result = try runChildCapture(
+        allocator,
+        staging_dir,
+        &.{
+            "/usr/bin/tar",
+            "-xf",
+            source_archive.path,
+            "-C",
+            source_snapshot,
+        },
+    );
+    defer allocator.free(extract_result.stdout);
+    defer allocator.free(extract_result.stderr);
+    if (extract_result.exit_code != 0) return error.SourceSnapshotFailed;
     const prefix_dir = try std.fs.path.join(
         allocator,
-        &.{ source_root, "zig-out" },
+        &.{ source_snapshot, "zig-out" },
     );
     defer allocator.free(prefix_dir);
     const cache_dir = try std.fs.path.join(
@@ -2671,9 +3005,9 @@ fn ensureSourcePerfHubBuilt(
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(global_cache_dir);
     const result = try runChildCapture(
         allocator,
-        source_root,
+        source_snapshot,
         &.{
-            "zig",
+            compiler.file.path,
             "build",
             "-Doptimize=ReleaseFast",
             "--prefix",
@@ -2687,132 +3021,78 @@ fn ensureSourcePerfHubBuilt(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.BuildFailed;
+    try requireCleanSourceRoot(allocator, source_root);
+    const post_source_sha = try sourceShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(post_source_sha);
+    const post_tree_sha = try sourceTreeShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(post_tree_sha);
+    if (!std.mem.eql(u8, post_source_sha, expected_source_sha) or
+        !std.mem.eql(u8, post_tree_sha, source_tree_sha))
+    {
+        return error.DriverSourceChangedDuringBuild;
+    }
+    try verifySealedFile(compiler.file);
+    const post_compiler_sha = try sha256FileBounded(
+        compiler.approved_path,
+        64 * 1024 * 1024,
+    );
+    if (!std.mem.eql(
+        u8,
+        &post_compiler_sha,
+        &compiler.file.sha256,
+    )) {
+        return error.CompilerBinaryChanged;
+    }
     const built_path = try std.fs.path.join(
         allocator,
         &.{ prefix_dir, "bin", "perf_hub" },
     );
     defer allocator.free(built_path);
-    const built_bytes = try readRegularFileAlloc(
+    const built_bytes = try readBuildOutputAlloc(
         allocator,
         built_path,
         16 * 1024 * 1024,
     );
     defer allocator.free(built_bytes);
-    var driver_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(
+    var driver_file = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "perf_hub",
         built_bytes,
-        &driver_digest,
-        .{},
+        0o500,
     );
-    const driver_sha256 = std.fmt.bytesToHex(driver_digest, .lower);
-    const revision_dir = try std.fs.path.join(
-        allocator,
-        &.{ drivers_dir, expected_source_sha },
-    );
-    defer allocator.free(revision_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(revision_dir);
-    const snapshot_dir = try std.fs.path.join(
-        allocator,
-        &.{ revision_dir, &driver_sha256 },
-    );
-    defer allocator.free(snapshot_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(snapshot_dir);
-    const snapshot_path = try std.fs.path.join(
-        allocator,
-        &.{ snapshot_dir, "perf_hub" },
-    );
-    errdefer allocator.free(snapshot_path);
-    if (pathExists(snapshot_path)) {
-        const retained_sha = try sha256File(snapshot_path);
-        if (!std.mem.eql(
-            u8,
-            &retained_sha,
-            &driver_sha256,
-        )) return error.DriverSnapshotDigestMismatch;
-    } else {
-        try writeEvidenceFileAtomic(
-            allocator,
-            snapshot_path,
-            built_bytes,
-            0o700,
-        );
-    }
-    const retained_sha = try sha256File(snapshot_path);
-    if (!std.mem.eql(
-        u8,
-        &retained_sha,
-        &driver_sha256,
-    )) return error.DriverSnapshotDigestMismatch;
-
-    var receipt_output: std.Io.Writer.Allocating = .init(allocator);
-    defer receipt_output.deinit();
-    const receipt = &receipt_output.writer;
-    try receipt.writeAll(
-        "{\"schema\":\"perf-driver-build-receipt/v1\"," ++
-            "\"source_sha\":",
-    );
-    try writeJsonString(receipt, expected_source_sha);
-    try receipt.writeAll(",\"source_tree_sha\":");
-    try writeJsonString(receipt, source_tree_sha);
-    try receipt.writeAll(",\"source_clean\":true,\"zig_version\":");
-    try writeJsonString(receipt, builtin.zig_version_string);
-    try receipt.writeAll(
-        ",\"optimize\":\"ReleaseFast\",\"build_step\":\"install\"," ++
-            "\"repo_local_prefix\":true,\"isolated_caches\":true," ++
-            "\"driver_sha256\":\"sha256:",
-    );
-    try receipt.writeAll(&driver_sha256);
-    try receipt.writeAll("\"}\n");
-    const receipt_path = try std.fs.path.join(
-        allocator,
-        &.{ snapshot_dir, "build-receipt.json" },
-    );
-    var receipt_transferred = false;
-    errdefer if (!receipt_transferred) allocator.free(receipt_path);
-    if (pathExists(receipt_path)) {
-        const retained_receipt = try readRegularFileAlloc(
-            allocator,
-            receipt_path,
-            64 * 1024,
-        );
-        defer allocator.free(retained_receipt);
-        if (!std.mem.eql(
-            u8,
-            retained_receipt,
-            receipt_output.written(),
-        )) return error.DriverBuildReceiptMismatch;
-    } else {
-        try writeEvidenceFileAtomic(
-            allocator,
-            receipt_path,
-            receipt_output.written(),
-            0o600,
-        );
-    }
-    const receipt_sha256 = try sha256File(receipt_path);
+    var driver_file_owned = true;
+    defer if (driver_file_owned) driver_file.deinit(allocator);
 
     const owned_key = try allocator.dupe(u8, key);
     errdefer allocator.free(owned_key);
-    var driver_constructed = false;
-    const owned_path = try allocator.dupeZ(u8, snapshot_path);
-    errdefer if (!driver_constructed) allocator.free(owned_path);
     const owned_source_sha = try allocator.dupe(
         u8,
         expected_source_sha,
     );
-    errdefer if (!driver_constructed) allocator.free(owned_source_sha);
-    var owned_driver: BuiltDriver = .{
-        .path = owned_path,
-        .sha256 = driver_sha256,
+    errdefer allocator.free(owned_source_sha);
+    const owned_source_tree_sha = try allocator.dupe(
+        u8,
+        source_tree_sha,
+    );
+    errdefer allocator.free(owned_source_tree_sha);
+    const owned_driver: BuiltDriver = .{
+        .file = driver_file,
         .source_sha = owned_source_sha,
-        .receipt_path = receipt_path,
-        .receipt_sha256 = receipt_sha256,
+        .source_tree_sha = owned_source_tree_sha,
+        .source_archive = source_archive,
+        .compiler = compiler,
     };
-    receipt_transferred = true;
-    driver_constructed = true;
-    errdefer owned_driver.deinit(allocator);
     try built.drivers.put(owned_key, owned_driver);
-    allocator.free(snapshot_path);
+    driver_file_owned = false;
+    source_archive_owned = false;
+    compiler_owned = false;
     return built.drivers.getPtr(key) orelse unreachable;
 }
 
@@ -2928,7 +3208,7 @@ fn appendSourceDeepMetrics(
         allocator,
         source_root,
         &.{
-            driver.path,
+            driver.file.path,
             "capture",
             "--target",
             case_cfg.descriptor.case_id,
@@ -2956,7 +3236,7 @@ fn appendSourceDeepMetrics(
             .{
                 artifact_path,
                 source_root,
-                driver.path,
+                driver.file.path,
                 @errorName(err),
             },
         );
@@ -4104,19 +4384,33 @@ fn writeMetricsObject(
     try writer.writeByte('}');
 }
 
+fn writeSealedFile(
+    writer: *std.Io.Writer,
+    file: SealedFile,
+) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(writer, file.path);
+    try writer.writeAll(",\"sha256\":\"sha256:");
+    try writer.writeAll(&file.sha256);
+    try writer.writeAll("\"}");
+}
+
 fn writeBinaryEvidence(
     writer: *std.Io.Writer,
     evidence: BinaryEvidence,
 ) !void {
-    try writer.writeAll("{\"path\":");
-    try writeJsonString(writer, evidence.path);
-    try writer.writeAll(",\"sha256\":\"sha256:");
-    try writer.writeAll(&evidence.sha256);
-    try writer.writeAll("\",\"version\":");
+    try writer.writeAll("{\"file\":");
+    try writeSealedFile(writer, evidence.file);
+    try writer.writeAll(",\"version\":");
     try writeJsonString(writer, evidence.version);
-    try writer.writeAll(",\"source_sha\":");
+    try writer.writeAll(",\"source\":{\"revision\":");
     try writeJsonString(writer, evidence.source_sha);
-    try writer.writeAll(",\"source_clean\":true,\"zig_version\":");
+    try writer.writeAll(",\"tree\":");
+    try writeJsonString(writer, evidence.source_tree_sha);
+    try writer.writeAll(",\"root\":");
+    try writeJsonString(writer, evidence.source_root);
+    try writer.writeAll(",\"clean\":true}");
+    try writer.writeAll(",\"compiler_version\":");
     try writeJsonString(writer, builtin.zig_version_string);
     try writer.writeAll(",\"optimize\":\"ReleaseFast\",\"build_step\":");
     try writeJsonString(writer, evidence.build_step);
@@ -4127,21 +4421,25 @@ fn writeDriverEvidence(
     writer: *std.Io.Writer,
     evidence: DriverEvidence,
 ) !void {
-    try writer.writeAll("{\"path\":");
-    try writeJsonString(writer, evidence.path);
-    try writer.writeAll(",\"sha256\":\"sha256:");
-    try writer.writeAll(&evidence.sha256);
-    try writer.writeAll("\",\"source_sha\":");
+    try writer.writeAll("{\"file\":");
+    try writeSealedFile(writer, evidence.file);
+    try writer.writeAll(",\"source\":{\"revision\":");
     try writeJsonString(writer, evidence.source_sha);
-    try writer.writeAll(",\"source_clean\":true,\"zig_version\":");
-    try writeJsonString(writer, builtin.zig_version_string);
-    try writer.writeAll(",\"build_receipt\":{\"path\":");
-    try writeJsonString(writer, evidence.build_receipt_path);
-    try writer.writeAll(",\"sha256\":\"sha256:");
-    try writer.writeAll(&evidence.build_receipt_sha256);
-    try writer.writeAll("\"}");
+    try writer.writeAll(",\"tree\":");
+    try writeJsonString(writer, evidence.source_tree_sha);
+    try writer.writeAll(",\"clean\":true,\"archive\":");
+    try writeSealedFile(writer, evidence.source_archive);
+    try writer.writeAll("},\"compiler\":{\"approved_path\":");
+    try writeJsonString(writer, evidence.compiler.approved_path);
+    try writer.writeAll(",\"version\":");
+    try writeJsonString(writer, evidence.compiler.version);
+    try writer.writeAll(",\"file\":");
+    try writeSealedFile(writer, evidence.compiler.file);
+    try writer.writeByte('}');
     try writer.writeAll(
-        ",\"optimize\":\"ReleaseFast\",\"build_step\":\"install\"," ++
+        ",\"build\":{\"optimize\":\"ReleaseFast\",\"step\":\"install\"," ++
+            "\"repo_local_prefix\":true,\"isolated_caches\":true," ++
+            "\"product_output_isolated\":true}," ++
             "\"configuration_digest\":\"sha256:",
     );
     try writer.writeAll(&evidence.configuration_digest);
@@ -4150,7 +4448,6 @@ fn writeDriverEvidence(
 
 fn writePairedMetricsArtifact(
     allocator: std.mem.Allocator,
-    path: []const u8,
     case_cfg: CompatCase,
     baseline_evidence: BinaryEvidence,
     candidate_evidence: BinaryEvidence,
@@ -4163,9 +4460,9 @@ fn writePairedMetricsArtifact(
     candidate_execution: MeasuredOutputEvidence,
     compare_status: []const u8,
     compare_detail: []const u8,
-) !void {
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
-    defer output.deinit();
+    errdefer output.deinit();
     const writer = &output.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
@@ -4253,12 +4550,7 @@ fn writePairedMetricsArtifact(
     try writer.writeAll(",\"compare_detail\":");
     try writeJsonString(writer, compare_detail);
     try writer.writeAll("}\n");
-    try writeEvidenceFileAtomic(
-        allocator,
-        path,
-        output.written(),
-        0o600,
-    );
+    return output.toOwnedSlice();
 }
 
 fn writeMeasuredOutputEvidence(
@@ -4298,19 +4590,35 @@ fn writeMeasuredOutputEvidence(
 
 fn writeIncompatiblePairedArtifact(
     allocator: std.mem.Allocator,
-    path: []const u8,
     case_cfg: CompatCase,
     baseline_evidence: BinaryEvidence,
     candidate_evidence: BinaryEvidence,
-) !void {
+) ![]u8 {
+    return writePairedDispositionArtifact(
+        allocator,
+        case_cfg,
+        baseline_evidence,
+        candidate_evidence,
+        "incompatible-base-surface",
+    );
+}
+
+fn writePairedDispositionArtifact(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+    disposition: []const u8,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
-    defer output.deinit();
+    errdefer output.deinit();
     const writer = &output.writer;
     try writer.writeAll(
         "{\"schema_version\":2,\"evidence_kind\":" ++
-            "\"paired-disposition\",\"disposition\":" ++
-            "\"incompatible-base-surface\",\"case_id\":",
+            "\"paired-disposition\",\"disposition\":",
     );
+    try writeJsonString(writer, disposition);
+    try writer.writeAll(",\"case_id\":");
     try writeJsonString(writer, case_cfg.descriptor.case_id);
     try writer.writeAll(",\"binary\":");
     try writeJsonString(writer, case_cfg.descriptor.binary);
@@ -4325,12 +4633,7 @@ fn writeIncompatiblePairedArtifact(
     try writer.writeAll(",\"candidate\":");
     try writeBinaryEvidence(writer, candidate_evidence);
     try writer.writeAll("}\n");
-    try writeEvidenceFileAtomic(
-        allocator,
-        path,
-        output.written(),
-        0o600,
-    );
+    return output.toOwnedSlice();
 }
 
 fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, raw_json: []const u8, compare_status: []const u8, compare_detail: []const u8) !void {
@@ -5010,45 +5313,120 @@ fn jsonValueU64(value: std.json.Value, _: []const u8) !u64 {
     };
 }
 
+fn compareObject(value: std.json.Value) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |object| object,
+        else => error.InvalidCompareSummary,
+    };
+}
+
+fn compareString(
+    object: std.json.ObjectMap,
+    key: []const u8,
+    max_len: usize,
+) ![]const u8 {
+    const value = switch (object.get(key) orelse
+        return error.InvalidCompareSummary) {
+        .string => |string| string,
+        else => return error.InvalidCompareSummary,
+    };
+    if (value.len == 0 or value.len > max_len or
+        !std.unicode.utf8ValidateSlice(value))
+    {
+        return error.InvalidCompareSummary;
+    }
+    return value;
+}
+
+fn compareBool(object: std.json.ObjectMap, key: []const u8) !bool {
+    return switch (object.get(key) orelse
+        return error.InvalidCompareSummary) {
+        .bool => |value| value,
+        else => error.InvalidCompareSummary,
+    };
+}
+
+fn compareRows(object: std.json.ObjectMap) !std.json.Array {
+    return switch (object.get("rows") orelse
+        return error.InvalidCompareSummary) {
+        .array => |rows| rows,
+        else => error.InvalidCompareSummary,
+    };
+}
+
 fn cmdReport(allocator: std.mem.Allocator) !void {
     const machine_dir = try resolveMachineDir(allocator, ".perf-local");
     defer allocator.free(machine_dir);
-    const reports_dir = try std.fs.path.join(allocator, &.{ machine_dir, "reports" });
-    defer allocator.free(reports_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(reports_dir);
-    const latest_path = try std.fs.path.join(allocator, &.{ machine_dir, "reports", "latest-compare.json" });
-    defer allocator.free(latest_path);
-    const data = readRegularFileAlloc(
+    const locator_path = try std.fs.path.join(
         allocator,
-        latest_path,
-        4 * 1024 * 1024,
+        &.{ machine_dir, "reports", "current-capsule.json" },
+    );
+    defer allocator.free(locator_path);
+    const locator_data = readRegularFileAlloc(
+        allocator,
+        locator_path,
+        64 * 1024,
     ) catch |err| switch (err) {
         error.FileNotFound => return error.MissingCompareSummary,
         else => return err,
     };
+    defer allocator.free(locator_data);
+    var locator = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        locator_data,
+        .{},
+    );
+    defer locator.deinit();
+    const locator_object = try compareObject(locator.value);
+    const locator_schema = try compareString(
+        locator_object,
+        "schema",
+        64,
+    );
+    if (!std.mem.eql(
+        u8,
+        locator_schema,
+        "performance-capsule-ref/v1",
+    )) return error.InvalidCompareSummary;
+    const capsule_ref = try compareObject(
+        locator_object.get("capsule") orelse
+            return error.InvalidCompareSummary,
+    );
+    const data = try loadSealedReferenceAlloc(
+        allocator,
+        capsule_ref,
+        4 * 1024 * 1024,
+    );
     defer allocator.free(data);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        data,
+        .{},
+    );
     defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidCompareSummary,
-    };
+    const object = try compareObject(parsed.value);
+    const schema = try compareString(object, "schema", 64);
+    if (!std.mem.eql(
+        u8,
+        schema,
+        "performance-capsule/v1",
+    )) return error.InvalidCompareSummary;
+    var verified = std.AutoHashMap([64]u8, void).init(allocator);
+    defer verified.deinit();
+    try verifySealedClosure(allocator, parsed.value, &verified);
     const target: ?[]const u8 = switch (object.get("target") orelse
         return error.InvalidCompareSummary) {
         .string => |value| value,
         .null => null,
         else => return error.InvalidCompareSummary,
     };
-    const complete = switch (object.get("complete") orelse
-        return error.InvalidCompareSummary) {
-        .bool => |value| value,
-        else => return error.InvalidCompareSummary,
-    };
+    const complete = try compareBool(object, "complete");
     if (!complete) return error.IncompleteComparison;
     const cutover = target != null and
         std.mem.eql(u8, target.?, "cutover");
-    const tuple: ?ReportTuple = if (cutover) cutover_tuple: {
+    if (cutover) {
         const value = try validateCutoverCompareSummary(parsed.value);
         const environment = process_environment orelse
             return error.ExpectedSourceShaRequired;
@@ -5056,17 +5434,9 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         defer allocator.free(current_sha);
         try requireCutoverReportTuple(environment, value, current_sha);
         try requireCleanSourceRoot(allocator, ".");
-        break :cutover_tuple value;
-    } else null;
+    }
     const rows = try validateComparisonRows(parsed.value);
-    try verifyRetainedDriverEvidence(
-        allocator,
-        machine_dir,
-        rows,
-    );
-    var summary_raw_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data, &summary_raw_digest, .{});
-    const summary_digest = std.fmt.bytesToHex(summary_raw_digest, .lower);
+    try validateRetainedTuplePayloads(rows);
 
     var totals = std.StringHashMap(ReportCounts).init(allocator);
     defer totals.deinit();
@@ -5095,33 +5465,6 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         const counts = totals.get(key).?;
         try stdout.print("{s}\tpass={d}\tfail={d}\n", .{ key, counts.pass, counts.fail });
     }
-
-    const latest_report_path = try std.fs.path.join(allocator, &.{ reports_dir, "latest-report.json" });
-    defer allocator.free(latest_report_path);
-    try writeLatestReport(
-        allocator,
-        latest_report_path,
-        row_keys.items,
-        totals,
-        target,
-        tuple,
-        summary_digest,
-    );
-
-    if (tuple) |cutover_tuple| {
-        const cutover_path = try std.fs.path.join(
-            allocator,
-            &.{ reports_dir, "cutover-status.json" },
-        );
-        defer allocator.free(cutover_path);
-        try writeCutoverStatus(
-            allocator,
-            cutover_path,
-            rows,
-            cutover_tuple,
-            summary_digest,
-        );
-    }
 }
 
 const ReportTuple = struct {
@@ -5130,25 +5473,14 @@ const ReportTuple = struct {
 };
 
 fn validateComparisonRows(value: std.json.Value) !std.json.Array {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return error.InvalidCompareSummary,
-    };
-    const rows = switch (object.get("rows") orelse
-        return error.InvalidCompareSummary) {
-        .array => |rows| rows,
-        else => return error.InvalidCompareSummary,
-    };
+    const rows = try compareRows(try compareObject(value));
     if (rows.items.len > SeqCases.len + LedgerCases.len +
         CronCases.len + MiscCases.len)
     {
         return error.InvalidCompareSummary;
     }
     for (rows.items) |row_value| {
-        const row = switch (row_value) {
-            .object => |row| row,
-            else => return error.InvalidCompareSummary,
-        };
+        const row = try compareObject(row_value);
         for ([_]struct {
             name: []const u8,
             max_len: usize,
@@ -5158,16 +5490,7 @@ fn validateComparisonRows(value: std.json.Value) !std.json.Array {
             .{ .name = "status", .max_len = 32 },
             .{ .name = "detail", .max_len = 4096 },
         }) |field| {
-            const string = switch (row.get(field.name) orelse
-                return error.InvalidCompareSummary) {
-                .string => |string| string,
-                else => return error.InvalidCompareSummary,
-            };
-            if (string.len == 0 or string.len > field.max_len or
-                !std.unicode.utf8ValidateSlice(string))
-            {
-                return error.InvalidCompareSummary;
-            }
+            _ = try compareString(row, field.name, field.max_len);
         }
         const status = row.get("status").?.string;
         const case_id = row.get("case_id").?.string;
@@ -5183,10 +5506,19 @@ fn validateComparisonRows(value: std.json.Value) !std.json.Array {
         {
             return error.InvalidCompareSummary;
         }
-        switch (row.get("tuple_bound") orelse
-            return error.InvalidCompareSummary) {
-            .bool => {},
-            else => return error.InvalidCompareSummary,
+        const tuple_bound = try compareBool(row, "tuple_bound");
+        const evidence = row.get("evidence") orelse
+            return error.InvalidCompareSummary;
+        if (tuple_bound) {
+            switch (evidence) {
+                .object => {},
+                else => return error.InvalidCompareSummary,
+            }
+        } else {
+            switch (evidence) {
+                .null => {},
+                else => return error.InvalidCompareSummary,
+            }
         }
     }
     return rows;
@@ -5210,70 +5542,76 @@ fn expectedBinaryForCase(case_id: []const u8) ?[]const u8 {
     return null;
 }
 
-fn verifyRetainedDriverEvidence(
-    allocator: std.mem.Allocator,
-    machine_dir: []const u8,
+fn validateRetainedTuplePayloads(
     rows: std.json.Array,
 ) !void {
     for (rows.items) |row_value| {
         const row = row_value.object;
         if (!row.get("tuple_bound").?.bool) continue;
-        const file_name = try std.fmt.allocPrint(
-            allocator,
-            "{s}.latest.json",
-            .{row.get("case_id").?.string},
-        );
-        defer allocator.free(file_name);
-        const path = try std.fs.path.join(
-            allocator,
-            &.{
-                machine_dir,
-                "baselines",
-                row.get("binary").?.string,
-                file_name,
-            },
-        );
-        defer allocator.free(path);
-        const data = try readRegularFileAlloc(
-            allocator,
-            path,
-            4 * 1024 * 1024,
-        );
-        defer allocator.free(data);
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            data,
-            .{},
-        );
-        defer parsed.deinit();
-        const artifact = switch (parsed.value) {
+        const artifact = switch (row.get("evidence").?) {
             .object => |object| object,
             else => return error.InvalidPerfEvidenceFile,
         };
+        const evidence_kind = switch (artifact.get("evidence_kind") orelse
+            return error.InvalidPerfEvidenceFile) {
+            .string => |string| string,
+            else => return error.InvalidPerfEvidenceFile,
+        };
+        const paired = std.mem.eql(u8, evidence_kind, "paired");
+        const disposition = std.mem.eql(
+            u8,
+            evidence_kind,
+            "paired-disposition",
+        );
+        if (!paired and !disposition) {
+            return error.InvalidPerfEvidenceFile;
+        }
+        const deep = isDeepCaseId(row.get("case_id").?.string);
         for ([_][]const u8{ "baseline", "candidate" }) |side_name| {
             const side = switch (artifact.get(side_name) orelse
                 return error.InvalidPerfEvidenceFile) {
                 .object => |object| object,
                 else => return error.InvalidPerfEvidenceFile,
             };
-            const driver_value = side.get("driver") orelse continue;
-            const driver = switch (driver_value) {
+            const binary = if (paired) switch (side.get("binary") orelse
+                return error.InvalidPerfEvidenceFile) {
                 .object => |object| object,
                 else => return error.InvalidPerfEvidenceFile,
-            };
-            try verifyRetainedDigestObject(driver);
-            const receipt = switch (driver.get("build_receipt") orelse
+            } else side;
+            _ = switch (binary.get("file") orelse
                 return error.InvalidPerfEvidenceFile) {
                 .object => |object| object,
                 else => return error.InvalidPerfEvidenceFile,
             };
-            try verifyRetainedDigestObject(receipt);
+            const driver_value = side.get("driver") orelse {
+                if (deep and paired) {
+                    return error.IncompletePerfDriverEvidence;
+                }
+                continue;
+            };
+            const driver = switch (driver_value) {
+                .object => |object| object,
+                else => return error.InvalidPerfEvidenceFile,
+            };
+            _ = switch (driver.get("file") orelse
+                return error.InvalidPerfEvidenceFile) {
+                .object => |object| object,
+                else => return error.InvalidPerfEvidenceFile,
+            };
         }
     }
 }
 
-fn verifyRetainedDigestObject(object: std.json.ObjectMap) !void {
+fn isDeepCaseId(case_id: []const u8) bool {
+    for (DeepCases) |case_cfg| {
+        if (std.mem.eql(u8, case_id, case_cfg.descriptor.case_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sealedReferencePath(object: std.json.ObjectMap) ![]const u8 {
     const path = switch (object.get("path") orelse
         return error.InvalidPerfEvidenceFile) {
         .string => |string| string,
@@ -5291,38 +5629,118 @@ fn verifyRetainedDigestObject(object: std.json.ObjectMap) !void {
     ) or expected_prefixed.len != "sha256:".len + 64) {
         return error.InvalidPerfEvidenceFile;
     }
-    const observed = try sha256File(path);
+    return path;
+}
+
+fn loadSealedReferenceAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    max_bytes: usize,
+) ![]u8 {
+    const path = try sealedReferencePath(object);
+    const expected_prefixed = object.get("sha256").?.string;
+    const data = try readRegularFileAlloc(
+        allocator,
+        path,
+        max_bytes,
+    );
+    errdefer allocator.free(data);
+    const observed = evidenceDigest(data);
     if (!std.mem.eql(
         u8,
         &observed,
         expected_prefixed["sha256:".len..],
     )) return error.PerfEvidenceDigestMismatch;
+    return data;
+}
+
+fn verifySealedClosure(
+    allocator: std.mem.Allocator,
+    root: std.json.Value,
+    verified: *std.AutoHashMap([64]u8, void),
+) !void {
+    var pending: std.ArrayList(std.json.Value) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, root);
+    var visited: usize = 0;
+    while (pending.pop()) |value| {
+        visited += 1;
+        if (visited > 4096 or verified.count() > 256) {
+            return error.InvalidPerfEvidenceFile;
+        }
+        switch (value) {
+            .object => |object| {
+                const has_path = object.get("path") != null;
+                const has_digest = object.get("sha256") != null;
+                if (has_path or has_digest) {
+                    if (!has_path or !has_digest or object.count() != 2) {
+                        return error.InvalidPerfEvidenceFile;
+                    }
+                    const path = try sealedReferencePath(object);
+                    const expected = object.get("sha256").?.string;
+                    var key_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+                    key_hasher.update(path);
+                    key_hasher.update(&.{0});
+                    key_hasher.update(expected);
+                    var key: [32]u8 = undefined;
+                    key_hasher.final(&key);
+                    const reference_key = std.fmt.bytesToHex(key, .lower);
+                    if (verified.contains(reference_key)) continue;
+                    if (std.mem.endsWith(
+                        u8,
+                        std.fs.path.basename(path),
+                        ".json",
+                    )) return error.InvalidPerfEvidenceFile;
+                    const data = try loadSealedReferenceAlloc(
+                        allocator,
+                        object,
+                        max_sealed_evidence_bytes,
+                    );
+                    defer allocator.free(data);
+                    try verified.put(reference_key, {});
+                    continue;
+                }
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    switch (entry.value_ptr.*) {
+                        .object, .array => try pending.append(
+                            allocator,
+                            entry.value_ptr.*,
+                        ),
+                        else => {},
+                    }
+                }
+            },
+            .array => |array| for (array.items) |item| {
+                switch (item) {
+                    .object, .array => try pending.append(
+                        allocator,
+                        item,
+                    ),
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 fn validateCutoverCompareSummary(value: std.json.Value) !ReportTuple {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return error.InvalidCompareSummary,
-    };
-    const target = switch (object.get("target") orelse
-        return error.InvalidCompareSummary) {
-        .string => |target| target,
-        else => return error.InvalidCompareSummary,
-    };
+    const object = try compareObject(value);
+    const target = try compareString(object, "target", 64);
     if (!std.mem.eql(u8, target, "cutover")) {
         return error.IncompleteCutoverComparison;
     }
-    const expected_base = switch (object.get("expected_base_sha") orelse
-        return error.InvalidCompareSummary) {
-        .string => |sha| sha,
-        else => return error.InvalidCompareSummary,
-    };
-    const expected_candidate = switch (object.get(
+    const expected_base = try compareString(
+        object,
+        "expected_base_sha",
+        64,
+    );
+    const expected_candidate = try compareString(
+        object,
         "expected_candidate_sha",
-    ) orelse return error.InvalidCompareSummary) {
-        .string => |sha| sha,
-        else => return error.InvalidCompareSummary,
-    };
+        64,
+    );
     if (expected_base.len != 40 or expected_candidate.len != 40) {
         return error.InvalidCompareSummary;
     }
@@ -5334,32 +5752,17 @@ fn validateCutoverCompareSummary(value: std.json.Value) !ReportTuple {
     if (expected_rows != SeqCases.len + LedgerCases.len) {
         return error.IncompleteCutoverComparison;
     }
-    const complete = switch (object.get("complete") orelse
-        return error.InvalidCompareSummary) {
-        .bool => |complete| complete,
-        else => return error.InvalidCompareSummary,
-    };
+    const complete = try compareBool(object, "complete");
     if (!complete) return error.IncompleteCutoverComparison;
     const rows = try validateComparisonRows(value);
     if (rows.items.len != SeqCases.len + LedgerCases.len) {
         return error.IncompleteCutoverComparison;
     }
     for (rows.items, 0..) |row_value, index| {
-        const row = switch (row_value) {
-            .object => |row| row,
-            else => return error.InvalidCompareSummary,
-        };
-        const tuple_bound = switch (row.get("tuple_bound") orelse
-            return error.InvalidCompareSummary) {
-            .bool => |bound| bound,
-            else => return error.InvalidCompareSummary,
-        };
+        const row = try compareObject(row_value);
+        const tuple_bound = try compareBool(row, "tuple_bound");
         if (!tuple_bound) return error.UnboundCutoverComparison;
-        const case_id = switch (row.get("case_id") orelse
-            return error.InvalidCompareSummary) {
-            .string => |case_id| case_id,
-            else => return error.InvalidCompareSummary,
-        };
+        const case_id = try compareString(row, "case_id", 256);
         for (rows.items[0..index]) |prior_value| {
             const prior = prior_value.object.get("case_id").?.string;
             if (std.mem.eql(u8, prior, case_id)) {
@@ -5422,12 +5825,20 @@ fn cmdAccept(allocator: std.mem.Allocator) !void {
 
     const active_path = try std.fs.path.join(allocator, &.{ machine_dir, "active-baseline.json" });
     defer allocator.free(active_path);
-    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), active_path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try writer.interface.print(
-        "{{\"accepted_at\":\"{s}\",\"git_sha\":\"{s}\",\"snapshot_path\":\"{s}\"}}\n",
-        .{ ts, sha, snapshot_path },
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeAll("{\"accepted_at\":");
+    try writeJsonString(&output.writer, ts);
+    try output.writer.writeAll(",\"git_sha\":");
+    try writeJsonString(&output.writer, sha);
+    try output.writer.writeAll(",\"snapshot_path\":");
+    try writeJsonString(&output.writer, snapshot_path);
+    try output.writer.writeAll("}\n");
+    try writeEvidenceFileAtomic(
+        allocator,
+        active_path,
+        output.written(),
+        0o600,
     );
 }
 
@@ -5485,39 +5896,7 @@ fn inferBinary(case_id: []const u8) []const u8 {
 }
 
 fn gitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const head_data = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".git/HEAD", allocator, .limited(1024)) catch {
-        return allocator.dupe(u8, "unknown");
-    };
-    defer allocator.free(head_data);
-    const head = std.mem.trim(u8, head_data, " \t\r\n");
-    if (std.mem.startsWith(u8, head, "ref: ")) {
-        const ref_path = std.mem.trim(u8, head["ref: ".len..], " \t\r\n");
-        const loose_path = try std.fs.path.join(allocator, &.{ ".git", ref_path });
-        defer allocator.free(loose_path);
-        if (std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), loose_path, allocator, .limited(1024))) |ref_data| {
-            defer allocator.free(ref_data);
-            return shortShaAlloc(allocator, std.mem.trim(u8, ref_data, " \t\r\n"));
-        } else |_| {}
-
-        if (std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".git/packed-refs", allocator, .limited(1024 * 1024))) |packed_data| {
-            defer allocator.free(packed_data);
-            var lines = std.mem.splitScalar(u8, packed_data, '\n');
-            while (lines.next()) |line_raw| {
-                const line = std.mem.trim(u8, line_raw, " \t\r\n");
-                if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
-                var parts = std.mem.splitScalar(u8, line, ' ');
-                const sha = parts.next() orelse continue;
-                const name = parts.next() orelse continue;
-                if (std.mem.eql(u8, name, ref_path)) return shortShaAlloc(allocator, sha);
-            }
-        } else |_| {}
-        return allocator.dupe(u8, "unknown");
-    }
-    return shortShaAlloc(allocator, head);
-}
-
-fn shortShaAlloc(allocator: std.mem.Allocator, sha: []const u8) ![]u8 {
-    return allocator.dupe(u8, sha[0..@min(sha.len, 12)]);
+    return fullGitShaAlloc(allocator);
 }
 
 fn fullGitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -5582,147 +5961,6 @@ fn isKnownBinaryName(text: []const u8) bool {
         }
     }
     return false;
-}
-
-fn writeLatestReport(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    row_keys: []const []const u8,
-    totals: std.StringHashMap(ReportCounts),
-    target: ?[]const u8,
-    tuple: ?ReportTuple,
-    summary_digest: [64]u8,
-) !void {
-    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
-    defer writer_alloc.deinit();
-    const writer = &writer_alloc.writer;
-    try writer.writeAll("{\"target\":");
-    if (target) |value| {
-        try writeJsonString(writer, value);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"summary_digest\":\"sha256:");
-    try writer.writeAll(&summary_digest);
-    try writer.writeAll("\",\"expected_base_sha\":");
-    if (tuple) |value| {
-        try writeJsonString(writer, value.base_sha);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"expected_candidate_sha\":");
-    if (tuple) |value| {
-        try writeJsonString(writer, value.candidate_sha);
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\"rows\":[");
-    for (row_keys, 0..) |key, idx| {
-        const counts = totals.get(key).?;
-        if (idx > 0) try writer.writeByte(',');
-        try writer.writeAll("{\"binary\":");
-        try writeJsonString(writer, key);
-        try writer.print(
-            ",\"pass\":{d},\"fail\":{d}}}",
-            .{ counts.pass, counts.fail },
-        );
-    }
-    try writer.writeAll("]}\n");
-    try writeEvidenceFileAtomic(
-        allocator,
-        path,
-        writer_alloc.written(),
-        0o600,
-    );
-}
-
-fn writeCutoverStatus(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    rows: std.json.Array,
-    tuple: ReportTuple,
-    summary_digest: [64]u8,
-) !void {
-    var all_cases_pass = true;
-    for (rows.items) |row| {
-        if (!std.mem.eql(u8, row.object.get("status").?.string, "PASS")) {
-            all_cases_pass = false;
-            break;
-        }
-    }
-
-    const seq_status = coverageStatusFor("seq");
-    const ledger_status = coverageStatusFor("ledger");
-    const cron_status = coverageStatusFor("cron");
-
-    var residuals = std.ArrayList([]const u8).empty;
-    defer {
-        for (residuals.items) |item| allocator.free(item);
-        residuals.deinit(allocator);
-    }
-    for (allManifests()) |manifest| {
-        for (manifest.coverages) |coverage| {
-            if (coverage.coverage == .missing) {
-                try residuals.append(allocator, try std.fmt.allocPrint(allocator, "{s}:{s}", .{ manifest.binary, coverage.family }));
-            }
-        }
-        for (manifest.datasets) |dataset| {
-            if (dataset.coverage == .missing) {
-                try residuals.append(allocator, try std.fmt.allocPrint(allocator, "{s}:dataset:{s}", .{ manifest.binary, dataset.name }));
-            }
-        }
-    }
-
-    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
-    defer writer_alloc.deinit();
-    const writer = &writer_alloc.writer;
-    try writer.writeAll("{\"expected_base_sha\":");
-    try writeJsonString(writer, tuple.base_sha);
-    try writer.writeAll(",\"expected_candidate_sha\":");
-    try writeJsonString(writer, tuple.candidate_sha);
-    try writer.writeAll(",\"summary_digest\":\"sha256:");
-    try writer.writeAll(&summary_digest);
-    try writer.writeByte('"');
-    try writer.print(
-        ",\"native_public_ownership\":true,\"all_cases_pass\":{s}," ++
-            "\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\"," ++
-            "\"cron_status\":\"{s}\",\"residuals\":[",
-        .{
-            if (all_cases_pass) "true" else "false",
-            seq_status,
-            ledger_status,
-            cron_status,
-        },
-    );
-    for (residuals.items, 0..) |item, idx| {
-        if (idx > 0) try writer.writeByte(',');
-        try writeJsonString(writer, item);
-    }
-    try writer.writeAll("]}\n");
-    try writeEvidenceFileAtomic(
-        allocator,
-        path,
-        writer_alloc.written(),
-        0o600,
-    );
-}
-
-fn coverageStatusFor(binary: []const u8) []const u8 {
-    for (allManifests()) |manifest| {
-        if (!std.mem.eql(u8, manifest.binary, binary)) continue;
-        var saw_deep = false;
-        var saw_shallow = false;
-        for (manifest.coverages) |coverage| {
-            switch (coverage.coverage) {
-                .missing => return if (saw_deep) "partial" else "not_landed",
-                .deep => saw_deep = true,
-                .shallow => saw_shallow = true,
-                .excluded => {},
-            }
-        }
-        return if (saw_deep) "landed" else if (saw_shallow) "qualified" else "not_landed";
-    }
-    return "unknown";
 }
 
 fn writeArtifactFile(path: []const u8, data: []const u8) !void {
@@ -5894,7 +6132,7 @@ test "report errors clearly when compare summary is missing" {
     try std.testing.expectError(error.MissingCompareSummary, cmdReport(alloc));
 }
 
-test "comparison rejects an unmatched target without evidence artifacts" {
+test "unmatched comparison target preserves prior evidence artifacts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5915,34 +6153,47 @@ test "comparison rejects an unmatched target without evidence artifacts" {
         std.debug.panic("restore working directory: {s}", .{@errorName(err)});
     };
 
+    const machine_name = try currentMachineDirName(allocator);
+    defer allocator.free(machine_name);
+    const reports_path = try std.fs.path.join(
+        allocator,
+        &.{ ".perf-local", machine_name, "reports" },
+    );
+    defer allocator.free(reports_path);
+    try tmp.dir.createDirPath(
+        std.Io.Threaded.global_single_threaded.io(),
+        reports_path,
+    );
+    const sentinel = "{\"sentinel\":true}\n";
+    const locator_path = try std.fs.path.join(
+        allocator,
+        &.{
+            ".perf-local",
+            machine_name,
+            "reports",
+            "current-capsule.json",
+        },
+    );
+    defer allocator.free(locator_path);
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = locator_path, .data = sentinel },
+    );
     try std.testing.expectError(
         error.NoMatchingPerfCases,
         cmdCompare(allocator, "definitely-no-such-case"),
     );
-    const machine_name = try currentMachineDirName(allocator);
-    defer allocator.free(machine_name);
-    for ([_][]const u8{
-        "latest-compare.json",
-        "latest-report.json",
-        "cutover-status.json",
-    }) |name| {
-        const path = try std.fs.path.join(
-            allocator,
-            &.{ ".perf-local", machine_name, "reports", name },
-        );
-        defer allocator.free(path);
-        try std.testing.expectError(
-            error.FileNotFound,
-            std.Io.Dir.cwd().access(
-                std.Io.Threaded.global_single_threaded.io(),
-                path,
-                .{},
-            ),
-        );
-    }
+    const bytes = try tmp.dir.readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        locator_path,
+        allocator,
+        .limited(sentinel.len + 1),
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings(sentinel, bytes);
 }
 
-test "report rejects malformed rows before writing report artifacts" {
+test "report rejects malformed rows in a verified capsule" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5975,34 +6226,38 @@ test "report rejects malformed rows before writing report artifacts" {
         std.Io.Threaded.global_single_threaded.io(),
         reports_path,
     );
-    const summary_path = try std.fs.path.join(
+    const machine_dir = std.fs.path.dirname(reports_path).?;
+    var capsule = try sealEvidenceBytes(
         alloc,
-        &.{ reports_path, "latest-compare.json" },
+        machine_dir,
+        "capsule.json",
+        "{\"schema\":\"performance-capsule/v1\",\"target\":null," ++
+            "\"complete\":true,\"rows\":[{\"case_id\":\"case\"," ++
+            "\"binary\":7,\"status\":\"PASS\",\"tuple_bound\":false," ++
+            "\"detail\":\"bad\",\"evidence\":null}]}\n",
+        0o600,
     );
-    defer alloc.free(summary_path);
-    try std.Io.Dir.cwd().writeFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        .{
-            .sub_path = summary_path,
-            .data = "{\"target\":null,\"complete\":true,\"rows\":[{" ++
-                "\"case_id\":\"case\",\"binary\":7,\"status\":\"PASS\"," ++
-                "\"tuple_bound\":false,\"detail\":\"bad\"}]}\n",
-        },
+    defer capsule.deinit(alloc);
+    var locator: std.Io.Writer.Allocating = .init(alloc);
+    defer locator.deinit();
+    try locator.writer.writeAll(
+        "{\"schema\":\"performance-capsule-ref/v1\",\"capsule\":",
+    );
+    try writeSealedFile(&locator.writer, capsule);
+    try locator.writer.writeAll("}\n");
+    const locator_path = try std.fs.path.join(
+        alloc,
+        &.{ reports_path, "current-capsule.json" },
+    );
+    defer alloc.free(locator_path);
+    try writeEvidenceFileAtomic(
+        alloc,
+        locator_path,
+        locator.written(),
+        0o600,
     );
 
     try std.testing.expectError(error.InvalidCompareSummary, cmdReport(alloc));
-    for ([_][]const u8{ "latest-report.json", "cutover-status.json" }) |name| {
-        const path = try std.fs.path.join(alloc, &.{ reports_path, name });
-        defer alloc.free(path);
-        try std.testing.expectError(
-            error.FileNotFound,
-            std.Io.Dir.cwd().access(
-                std.Io.Threaded.global_single_threaded.io(),
-                path,
-                .{},
-            ),
-        );
-    }
 }
 
 test "report rows reject unknown or mismatched binary identities" {
@@ -6018,6 +6273,48 @@ test "report rows reject unknown or mismatched binary identities" {
         var parsed = try std.json.parseFromSlice(
             std.json.Value,
             allocator,
+            raw,
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidCompareSummary,
+            validateComparisonRows(parsed.value),
+        );
+    }
+}
+
+test "manifest serialization emits parseable output" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try perf_contract.writeManifestJson(
+        std.testing.allocator,
+        &output.writer,
+        allManifests(),
+    );
+    try std.testing.expect(output.written().len > 0);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        output.written(),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("binaries") != null);
+}
+
+test "tuple-bound rows require retained evidence identity" {
+    for ([_][]const u8{
+        "{\"rows\":[{\"case_id\":\"seq-definition-check\"," ++
+            "\"binary\":\"seq\",\"status\":\"PASS\",\"detail\":\"ok\"," ++
+            "\"tuple_bound\":true,\"evidence\":null}]}",
+        "{\"rows\":[{\"case_id\":\"seq-definition-check\"," ++
+            "\"binary\":\"seq\",\"status\":\"PASS\",\"detail\":\"ok\"," ++
+            "\"tuple_bound\":false,\"evidence\":{}}]}",
+    }) |raw| {
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            std.testing.allocator,
             raw,
             .{},
         );
@@ -6063,14 +6360,14 @@ test "evidence writer rejects symlink targets without changing referent" {
     try tmp.dir.symLink(
         std.testing.io,
         sentinel,
-        "reports/latest-report.json",
+        "reports/current-capsule.json",
         .{},
     );
     try std.testing.expectError(
         error.PerfEvidenceSymlink,
         writeEvidenceFileAtomic(
             allocator,
-            "reports/latest-report.json",
+            "reports/current-capsule.json",
             "{}\n",
             0o600,
         ),
@@ -6085,78 +6382,19 @@ test "evidence writer rejects symlink targets without changing referent" {
     try std.testing.expectEqualStrings("unchanged", bytes);
 }
 
-test "comparison invalidates a prior summary before measurement" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const alloc = std.testing.allocator;
-    const root = try tmp.dir.realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        ".",
-        alloc,
-    );
-    defer alloc.free(root);
-    const machine_dir = try std.fs.path.join(
-        alloc,
-        &.{ root, "machine" },
-    );
-    defer alloc.free(machine_dir);
-    const reports_dir = try std.fs.path.join(
-        alloc,
-        &.{ machine_dir, "reports" },
-    );
-    defer alloc.free(reports_dir);
-    try std.Io.Dir.cwd().createDirPath(
-        std.Io.Threaded.global_single_threaded.io(),
-        reports_dir,
-    );
-    for ([_][]const u8{
-        "latest-compare.json",
-        "latest-report.json",
-        "cutover-status.json",
-    }) |name| {
-        const path = try std.fs.path.join(
-            alloc,
-            &.{ reports_dir, name },
-        );
-        defer alloc.free(path);
-        try std.Io.Dir.cwd().writeFile(
-            std.Io.Threaded.global_single_threaded.io(),
-            .{ .sub_path = path, .data = "{}\n" },
-        );
-    }
-    try invalidateCompareSummary(alloc, machine_dir);
-    for ([_][]const u8{
-        "latest-compare.json",
-        "latest-report.json",
-        "cutover-status.json",
-    }) |name| {
-        const path = try std.fs.path.join(
-            alloc,
-            &.{ reports_dir, name },
-        );
-        defer alloc.free(path);
-        try std.testing.expectError(
-            error.FileNotFound,
-            std.Io.Dir.cwd().access(
-                std.Io.Threaded.global_single_threaded.io(),
-                path,
-                .{},
-            ),
-        );
-    }
-}
-
 test "balanced round ratios reject repeatable regressions not one noisy round" {
     const alloc = std.testing.allocator;
     var baseline_samples: std.ArrayList(u64) = .empty;
     var candidate_samples: std.ArrayList(u64) = .empty;
     var baseline_allocs: std.ArrayList(u64) = .empty;
     var candidate_allocs: std.ArrayList(u64) = .empty;
-    for (0..120) |index| {
+    const case_cfg = DeepCases[0];
+    const sample_count = case_cfg.samples * paired_comparison_rounds;
+    for (0..sample_count) |index| {
         try baseline_samples.append(alloc, 100);
         try candidate_samples.append(
             alloc,
-            if (index < 30) 110 else 100,
+            if (index < case_cfg.samples) 110 else 100,
         );
     }
     for (0..paired_comparison_rounds) |_| {
@@ -6175,7 +6413,6 @@ test "balanced round ratios reject repeatable regressions not one noisy round" {
         candidate_allocs,
     );
     defer candidate.deinit(alloc);
-    const case_cfg = DeepCases[0];
     const null_control = try compareBalancedDeepMetrics(
         case_cfg,
         baseline,
@@ -6200,7 +6437,9 @@ test "balanced round ratios reject repeatable regressions not one noisy round" {
         "PASS",
         one_noisy_allocation_round.status,
     );
-    candidate.alloc_samples.items[1] = 110;
+    for (1..paired_comparison_rounds / 2) |round| {
+        candidate.alloc_samples.items[round] = 110;
+    }
     const repeated_allocation_regression = try compareBalancedDeepMetrics(
         case_cfg,
         baseline,
@@ -6400,49 +6639,32 @@ test "semantic evidence hashes canonical observation data" {
     try std.testing.expect(!std.mem.eql(u8, &first, &changed));
 }
 
-test "driver evidence rejects executable substitution" {
+test "sealed evidence rejects content substitution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "perf_hub",
         .data = "first",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "build-receipt.json",
-        .data = "{}",
-    });
-    const path = try tmp.dir.realPathFileAlloc(
+    const real_path = try tmp.dir.realPathFileAlloc(
         std.testing.io,
         "perf_hub",
         std.testing.allocator,
     );
-    const receipt_real_path = try tmp.dir.realPathFileAlloc(
-        std.testing.io,
-        "build-receipt.json",
-        std.testing.allocator,
-    );
-    defer std.testing.allocator.free(receipt_real_path);
-    const receipt_path = try std.testing.allocator.dupe(
-        u8,
-        receipt_real_path,
-    );
-    var driver: DriverEvidence = .{
-        .path = path,
-        .sha256 = try sha256File(path),
-        .source_sha = try std.testing.allocator.dupe(u8, "source"),
-        .build_receipt_path = receipt_path,
-        .build_receipt_sha256 = try sha256File(receipt_path),
-        .configuration_digest = try deepConfigurationDigest(DeepCases[0]),
+    defer std.testing.allocator.free(real_path);
+    var file: SealedFile = .{
+        .path = try std.testing.allocator.dupeZ(u8, real_path),
+        .sha256 = try sha256File(real_path),
     };
-    defer driver.deinit(std.testing.allocator);
-    try requireDriverUnchanged(driver);
+    defer file.deinit(std.testing.allocator);
+    try verifySealedFile(file);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "perf_hub",
         .data = "second",
     });
     try std.testing.expectError(
-        error.DriverBinaryChanged,
-        requireDriverUnchanged(driver),
+        error.PerfEvidenceDigestMismatch,
+        verifySealedFile(file),
     );
 }
 
@@ -6454,12 +6676,6 @@ test "incompatible paired comparisons fail closed" {
     try std.testing.expect(!comparisonStatusFailed("PASS"));
     try std.testing.expect(comparisonStatusFailed("FAIL"));
     try std.testing.expect(comparisonStatusFailed("INCOMPATIBLE"));
-}
-
-test "coverageStatusFor reflects current manifest coverage" {
-    try std.testing.expectEqualStrings("landed", coverageStatusFor("seq"));
-    try std.testing.expectEqualStrings("qualified", coverageStatusFor("ledger"));
-    try std.testing.expectEqualStrings("landed", coverageStatusFor("cron"));
 }
 
 test "compareLatencyMetrics fails closed for incomplete allocation baselines" {
@@ -6650,5 +6866,5 @@ test "override builds bind to the canonical product output" {
         "/repo/zig-out/bin/ledger",
         path,
     );
-    try std.testing.expectEqual(@as(usize, 4), paired_comparison_rounds);
+    try std.testing.expectEqual(@as(usize, 8), paired_comparison_rounds);
 }
