@@ -86,6 +86,15 @@ pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     defer runtime_io = null;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (isHostSequenceInvocation(argv[1..])) {
+        const system_argv = try init.arena.allocator().alloc(
+            []const u8,
+            argv.len,
+        );
+        system_argv[0] = "/usr/bin/seq";
+        @memcpy(system_argv[1..], argv[1..]);
+        return std.process.replace(init.io, .{ .argv = system_argv });
+    }
     const code = runWithArgv(init.gpa, init.environ_map, argv) catch |err| blk: {
         emitCommandError(err) catch |write_err| {
             if (isClosedPipe(write_err)) return;
@@ -1704,6 +1713,31 @@ fn isVersion(token: []const u8) bool {
         std.mem.eql(u8, token, "--version");
 }
 
+fn isHostSequenceInvocation(argv: []const []const u8) bool {
+    if (!std.process.can_replace or argv.len == 0) return false;
+    const first = argv[0];
+    if (isHostSequenceOperand(first)) return true;
+    inline for (.{ "-f", "-s", "-t", "-w" }) |option| {
+        if (std.mem.startsWith(u8, first, option)) return true;
+    }
+    inline for (.{ "--format", "--separator", "--equal-width" }) |option| {
+        if (std.mem.eql(u8, first, option) or
+            (std.mem.startsWith(u8, first, option) and
+                first.len > option.len and first[option.len] == '='))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isHostSequenceOperand(raw: []const u8) bool {
+    if (raw.len == 0) return false;
+    const offset: usize = if (raw[0] == '+' or raw[0] == '-') 1 else 0;
+    if (offset == raw.len) return false;
+    return std.ascii.isDigit(raw[offset]) or raw[offset] == '.';
+}
+
 test "final command surface contains no skill or artifact commands" {
     try std.testing.expect(
         std.mem.indexOf(u8, Help, "skill-decision-audit") == null,
@@ -1715,6 +1749,21 @@ test "final command surface contains no skill or artifact commands" {
         std.mem.indexOf(u8, Help, "definition check") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, Help, "observe") != null);
+}
+
+test "host numeric seq syntax is disjoint from the product command surface" {
+    try std.testing.expect(isHostSequenceInvocation(&.{"1"}));
+    try std.testing.expect(isHostSequenceInvocation(&.{ "-1", "1" }));
+    try std.testing.expect(isHostSequenceInvocation(&.{ "-w", "1", "9" }));
+    try std.testing.expect(isHostSequenceInvocation(&.{
+        "--format=%02g",
+        "1",
+        "9",
+    }));
+    try std.testing.expect(!isHostSequenceInvocation(&.{"version"}));
+    try std.testing.expect(!isHostSequenceInvocation(&.{"sessions"}));
+    try std.testing.expect(!isHostSequenceInvocation(&.{"--help"}));
+    try std.testing.expect(!isHostSequenceInvocation(&.{"--future"}));
 }
 
 test "observe parser accepts explicit definition selectors and parameters" {

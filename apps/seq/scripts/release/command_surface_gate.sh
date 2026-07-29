@@ -35,6 +35,11 @@ if [[ "$actual" != "$expected" ]]; then
   exit 1
 fi
 
+if [[ "$("$bin_path" 1 3)" != "$(/usr/bin/seq 1 3)" ]]; then
+  echo "Seq does not preserve the host numeric sequence utility" >&2
+  exit 1
+fi
+
 capabilities=$("$bin_path" capabilities --format json)
 version=$(tr -d '[:space:]' < "$root_dir/apps/seq/VERSION")
 jq -e --arg version "$version" \
