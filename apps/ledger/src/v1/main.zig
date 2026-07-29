@@ -191,67 +191,86 @@ pub fn runWithArgv(
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    if (std.mem.eql(u8, argv[1], "capabilities")) {
-        if (isOnlyHelp(argv[2..])) {
+    return runSubcommand(allocator, environment, argv[1], argv[2..]);
+}
+
+fn runSubcommand(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    command: []const u8,
+    argv: []const []const u8,
+) !u8 {
+    if (std.mem.eql(u8, command, "capabilities")) {
+        if (isOnlyHelp(argv)) {
             try writeStdout(Help);
             return 0;
         }
-        return emitCapabilities(argv[2..]);
+        return emitCapabilities(argv);
     }
-    if (std.mem.eql(u8, argv[1], "definition")) {
-        if (argv.len < 3) return error.MissingDefinitionAction;
-        if (std.mem.eql(u8, argv[2], "check")) {
-            if (isOnlyHelp(argv[3..])) {
-                try writeStdout(Help);
-                return 0;
-            }
-            return runDefinitionCheck(allocator, environment, argv[3..]);
-        }
-        if (std.mem.eql(u8, argv[2], "describe")) {
-            if (isOnlyHelp(argv[3..])) {
-                try writeStdout(Help);
-                return 0;
-            }
-            return runDefinitionDescribe(allocator, environment, argv[3..]);
-        }
-        return error.UnknownDefinitionAction;
+    if (std.mem.eql(u8, command, "definition")) {
+        return runDefinitionCommand(allocator, environment, argv);
     }
-    if (std.mem.eql(u8, argv[1], "validate")) {
-        if (isOnlyHelp(argv[2..])) {
+    return runOperationCommand(allocator, environment, command, argv);
+}
+
+fn runDefinitionCommand(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    argv: []const []const u8,
+) !u8 {
+    if (argv.len == 0) return error.MissingDefinitionAction;
+    if (std.mem.eql(u8, argv[0], "check")) {
+        if (isOnlyHelp(argv[1..])) {
             try writeStdout(Help);
             return 0;
         }
-        return runValidate(allocator, environment, argv[2..]);
+        return runDefinitionCheck(allocator, environment, argv[1..]);
     }
-    if (std.mem.eql(u8, argv[1], "materialize")) {
-        if (isOnlyHelp(argv[2..])) {
+    if (std.mem.eql(u8, argv[0], "describe")) {
+        if (isOnlyHelp(argv[1..])) {
             try writeStdout(Help);
             return 0;
         }
-        return runMaterialize(allocator, environment, argv[2..]);
+        return runDefinitionDescribe(allocator, environment, argv[1..]);
     }
-    if (std.mem.eql(u8, argv[1], "transact")) {
-        if (isOnlyHelp(argv[2..])) {
-            try writeStdout(Help);
-            return 0;
-        }
-        return runTransact(allocator, environment, argv[2..]);
+    return error.UnknownDefinitionAction;
+}
+
+fn runOperationCommand(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    command: []const u8,
+    argv: []const []const u8,
+) !u8 {
+    if (!isOperationCommand(command)) return error.UnknownCommand;
+    if (isOnlyHelp(argv)) {
+        try writeStdout(Help);
+        return 0;
     }
-    if (std.mem.eql(u8, argv[1], "project")) {
-        if (isOnlyHelp(argv[2..])) {
-            try writeStdout(Help);
-            return 0;
-        }
-        return runProject(allocator, environment, argv[2..]);
+    if (std.mem.eql(u8, command, "validate")) {
+        return runValidate(allocator, environment, argv);
     }
-    if (std.mem.eql(u8, argv[1], "doctor")) {
-        if (isOnlyHelp(argv[2..])) {
-            try writeStdout(Help);
-            return 0;
-        }
-        return runDoctor(allocator, environment, argv[2..]);
+    if (std.mem.eql(u8, command, "materialize")) {
+        return runMaterialize(allocator, environment, argv);
+    }
+    if (std.mem.eql(u8, command, "transact")) {
+        return runTransact(allocator, environment, argv);
+    }
+    if (std.mem.eql(u8, command, "project")) {
+        return runProject(allocator, environment, argv);
+    }
+    if (std.mem.eql(u8, command, "doctor")) {
+        return runDoctor(allocator, environment, argv);
     }
     return error.UnknownCommand;
+}
+
+fn isOperationCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "validate") or
+        std.mem.eql(u8, command, "materialize") or
+        std.mem.eql(u8, command, "transact") or
+        std.mem.eql(u8, command, "project") or
+        std.mem.eql(u8, command, "doctor");
 }
 
 fn runTransact(
@@ -641,6 +660,7 @@ fn parseCommonArgs(
 ) !CommonArgs {
     var definition_path: ?[]const u8 = null;
     var format: Format = .json;
+    var format_seen = false;
     var inputs: std.ArrayList([]const u8) = .empty;
     errdefer inputs.deinit(allocator);
     var parameters: std.ArrayList([]const u8) = .empty;
@@ -658,6 +678,8 @@ fn parseCommonArgs(
         if (std.mem.eql(u8, token, "--format")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
+            if (format_seen) return error.DuplicateFormatOption;
+            format_seen = true;
             format = try Format.parse(argv[index]);
             continue;
         }
@@ -698,6 +720,7 @@ fn parseTransactionArgs(
     var operation: ?[]const u8 = null;
     var repo_path: ?[]const u8 = null;
     var format: Format = .json;
+    var format_seen = false;
     var inputs: std.ArrayList([]const u8) = .empty;
     errdefer inputs.deinit(allocator);
     var parameters: std.ArrayList([]const u8) = .empty;
@@ -729,6 +752,8 @@ fn parseTransactionArgs(
         if (std.mem.eql(u8, token, "--format")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
+            if (format_seen) return error.DuplicateFormatOption;
+            format_seen = true;
             format = try Format.parse(argv[index]);
             continue;
         }
@@ -859,6 +884,7 @@ fn parseDoctorArgs(
     var definition_path: ?[]const u8 = null;
     var repo_path: ?[]const u8 = null;
     var format: Format = .json;
+    var format_seen = false;
     var parameters: std.ArrayList([]const u8) = .empty;
     errdefer parameters.deinit(allocator);
     var index: usize = 0;
@@ -881,6 +907,8 @@ fn parseDoctorArgs(
         if (std.mem.eql(u8, token, "--format")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
+            if (format_seen) return error.DuplicateFormatOption;
+            format_seen = true;
             format = try Format.parse(argv[index]);
             continue;
         }
@@ -909,7 +937,10 @@ fn loadDefinition(
     const absolute = try absoluteDefinitionPathAlloc(allocator, path);
     defer allocator.free(absolute);
     const package_location =
-        try definition_core.closure.admittedPackageLocation(absolute);
+        try definition_core.closure.admittedPackageLocation(
+            absolute,
+            "skills",
+        );
     const cwd = if (package_location == null)
         try std.Io.Dir.cwd().realPathFileAlloc(
             defaultIo(),
@@ -920,7 +951,11 @@ fn loadDefinition(
         null;
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
-        try definition_core.closure.admittedLocation(absolute, cwd.?);
+        try definition_core.closure.admittedLocation(
+            absolute,
+            cwd.?,
+            "skills",
+        );
     const cache_dir = try ledgerCacheDirAlloc(allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return ledger.compiled_plan.load(
@@ -1108,7 +1143,7 @@ fn emitValidation(
     result: *const ledger.validation.Result,
     compile_stats: definition_core.result.CompileStats,
 ) !void {
-    switch (format) {
+    return switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
@@ -1131,7 +1166,7 @@ fn emitValidation(
                 },
             );
         },
-    }
+    };
 }
 
 fn emitMaterialization(
@@ -1140,7 +1175,7 @@ fn emitMaterialization(
     result: *const ledger.materialization.Result,
     compile_stats: definition_core.result.CompileStats,
 ) !void {
-    switch (format) {
+    return switch (format) {
         .json => {
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
@@ -1166,7 +1201,7 @@ fn emitMaterialization(
                 try stdout_writer.interface.writeAll("structurally invalid; not materialized\n");
             }
         },
-    }
+    };
 }
 
 fn emitTransaction(
@@ -1220,82 +1255,98 @@ fn emitProjection(
     compile_stats: definition_core.result.CompileStats,
 ) !void {
     if (payload_only) {
-        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
-        try stdout_writer.interface.writeAll(result.payload);
+        return emitProjectionPayload(result.payload);
+    }
+    return switch (format) {
+        .json => emitProjectionJson(allocator, result, compile_stats),
+        .text => emitProjectionText(allocator, result.payload),
+        .jsonl, .table, .markdown => emitRenderedProjection(
+            allocator,
+            format,
+            result,
+        ),
+    };
+}
+
+fn emitProjectionPayload(payload: []const u8) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(payload);
+    try stdout_writer.interface.writeByte('\n');
+}
+
+fn emitProjectionJson(
+    allocator: std.mem.Allocator,
+    result: *const ledger.projection.Result,
+    compile_stats: definition_core.result.CompileStats,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try ledger.envelope.writeProjectionJson(
+        &output.writer,
+        result,
+        compile_stats,
+    );
+    try output.writer.writeByte('\n');
+    try writeStdout(output.written());
+}
+
+fn emitProjectionText(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        payload,
+        .{ .duplicate_field_behavior = .@"error" },
+    ) catch {
+        try stdout_writer.interface.writeAll(payload);
         try stdout_writer.interface.writeByte('\n');
         return;
-    }
+    };
+    defer parsed.deinit();
+    const text = if (parsed.value == .string)
+        parsed.value.string
+    else
+        payload;
+    try stdout_writer.interface.writeAll(text);
+    try stdout_writer.interface.writeByte('\n');
+}
+
+fn emitRenderedProjection(
+    allocator: std.mem.Allocator,
+    format: ProjectionFormat,
+    result: *const ledger.projection.Result,
+) !void {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        result.payload,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
     switch (format) {
-        .json => {
-            var output: std.Io.Writer.Allocating = .init(allocator);
-            defer output.deinit();
-            try ledger.envelope.writeProjectionJson(
-                &output.writer,
-                result,
-                compile_stats,
-            );
-            try output.writer.writeByte('\n');
-            try writeStdout(output.written());
-        },
-        .text => {
-            var stdout_writer =
-                std.Io.File.stdout().writer(defaultIo(), &.{});
-            var parsed = std.json.parseFromSlice(
-                std.json.Value,
-                allocator,
-                result.payload,
-                .{ .duplicate_field_behavior = .@"error" },
-            ) catch {
-                try stdout_writer.interface.writeAll(result.payload);
-                try stdout_writer.interface.writeByte('\n');
-                return;
-            };
-            defer parsed.deinit();
-            if (parsed.value == .string) {
-                try stdout_writer.interface.writeAll(parsed.value.string);
-            } else {
-                try stdout_writer.interface.writeAll(result.payload);
-            }
-            try stdout_writer.interface.writeByte('\n');
-        },
-        .jsonl, .table, .markdown => {
-            var parsed = try std.json.parseFromSlice(
-                std.json.Value,
-                allocator,
-                result.payload,
-                .{ .duplicate_field_behavior = .@"error" },
-            );
-            defer parsed.deinit();
-            var output: std.Io.Writer.Allocating = .init(allocator);
-            defer output.deinit();
-            switch (format) {
-                .jsonl => try writeProjectionJsonl(
-                    allocator,
-                    &output.writer,
-                    parsed.value,
-                ),
-                .table => try writeProjectionTable(
-                    allocator,
-                    &output,
-                    parsed.value,
-                    false,
-                    result.max_output_bytes,
-                ),
-                .markdown => try writeProjectionTable(
-                    allocator,
-                    &output,
-                    parsed.value,
-                    true,
-                    result.max_output_bytes,
-                ),
-                else => unreachable,
-            }
-            if (output.written().len > result.max_output_bytes) {
-                return error.OutputBytesExceeded;
-            }
-            try writeStdout(output.written());
-        },
+        .jsonl => try writeProjectionJsonl(
+            allocator,
+            &output.writer,
+            parsed.value,
+        ),
+        .table, .markdown => try writeProjectionTable(
+            allocator,
+            &output,
+            parsed.value,
+            format == .markdown,
+            result.max_output_bytes,
+        ),
+        else => return error.InvalidFormat,
     }
+    if (output.written().len > result.max_output_bytes) {
+        return error.OutputBytesExceeded;
+    }
+    try writeStdout(output.written());
 }
 
 fn writeProjectionJsonl(
@@ -1330,88 +1381,21 @@ fn writeProjectionTable(
     max_output_bytes: usize,
 ) !void {
     switch (value) {
-        .array => |array| {
-            if (array.items.len == 0) return;
-            var object_rows = true;
-            for (array.items) |item| {
-                if (item == .object) continue;
-                object_rows = false;
-                break;
-            }
-            if (!object_rows) {
-                try validateTableCellCount(array.items.len, 1);
-                try writeTableHeader(
-                    output,
-                    &.{"value"},
-                    markdown,
-                    max_output_bytes,
-                );
-                for (array.items) |item| {
-                    try writeTableRow(
-                        allocator,
-                        output,
-                        &.{item},
-                        markdown,
-                        max_output_bytes,
-                    );
-                }
-                return;
-            }
-            const keys = try collectTableKeys(allocator, array.items);
-            defer allocator.free(keys);
-            try validateTableCellCount(array.items.len, keys.len);
-            try writeTableHeader(
-                output,
-                keys,
-                markdown,
-                max_output_bytes,
-            );
-            for (array.items) |item| {
-                try writeObjectTableRow(
-                    allocator,
-                    output,
-                    item.object,
-                    keys,
-                    markdown,
-                    max_output_bytes,
-                );
-            }
-        },
-        .object => |object| {
-            const keys = try collectTableKeys(allocator, &.{value});
-            defer allocator.free(keys);
-            try validateTableCellCount(keys.len, 2);
-            try writeTableHeader(
-                output,
-                &.{ "key", "value" },
-                markdown,
-                max_output_bytes,
-            );
-            for (keys) |key| {
-                if (markdown) {
-                    try writeBoundedAll(output, "| ", max_output_bytes);
-                }
-                try writeTableTextCell(
-                    output,
-                    key,
-                    markdown,
-                    max_output_bytes,
-                );
-                try writeTableSeparator(
-                    output,
-                    markdown,
-                    max_output_bytes,
-                );
-                try writeTableValueCell(
-                    allocator,
-                    output,
-                    object.get(key).?,
-                    markdown,
-                    max_output_bytes,
-                );
-                try writeTableRowEnd(output, markdown, max_output_bytes);
-            }
-        },
+        .array => |array| return writeProjectionArrayTable(
+            allocator,
+            output,
+            array.items,
+            markdown,
+            max_output_bytes,
+        ),
+        .object => |object| return writeProjectionObjectTable(
+            allocator,
+            output,
+            value,
+            object,
+            markdown,
+            max_output_bytes,
+        ),
         else => {
             try writeTableHeader(
                 output,
@@ -1427,6 +1411,84 @@ fn writeProjectionTable(
                 max_output_bytes,
             );
         },
+    }
+}
+
+fn writeProjectionArrayTable(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    items: []const std.json.Value,
+    markdown: bool,
+    max_output_bytes: usize,
+) !void {
+    if (items.len == 0) return;
+    const object_rows = for (items) |item| {
+        if (item != .object) break false;
+    } else true;
+    if (!object_rows) {
+        try validateTableCellCount(items.len, 1);
+        try writeTableHeader(
+            output,
+            &.{"value"},
+            markdown,
+            max_output_bytes,
+        );
+        for (items) |item| {
+            try writeTableRow(
+                allocator,
+                output,
+                &.{item},
+                markdown,
+                max_output_bytes,
+            );
+        }
+        return;
+    }
+    const keys = try collectTableKeys(allocator, items);
+    defer allocator.free(keys);
+    try validateTableCellCount(items.len, keys.len);
+    try writeTableHeader(output, keys, markdown, max_output_bytes);
+    for (items) |item| {
+        try writeObjectTableRow(
+            allocator,
+            output,
+            item.object,
+            keys,
+            markdown,
+            max_output_bytes,
+        );
+    }
+}
+
+fn writeProjectionObjectTable(
+    allocator: std.mem.Allocator,
+    output: *std.Io.Writer.Allocating,
+    value: std.json.Value,
+    object: std.json.ObjectMap,
+    markdown: bool,
+    max_output_bytes: usize,
+) !void {
+    const keys = try collectTableKeys(allocator, &.{value});
+    defer allocator.free(keys);
+    try validateTableCellCount(keys.len, 2);
+    try writeTableHeader(
+        output,
+        &.{ "key", "value" },
+        markdown,
+        max_output_bytes,
+    );
+    for (keys) |key| {
+        if (markdown) try writeBoundedAll(output, "| ", max_output_bytes);
+        try writeTableTextCell(output, key, markdown, max_output_bytes);
+        try writeTableSeparator(output, markdown, max_output_bytes);
+        try writeTableValueCell(
+            allocator,
+            output,
+            object.get(key).?,
+            markdown,
+            max_output_bytes,
+        );
+        try writeTableRowEnd(output, markdown, max_output_bytes);
     }
 }
 
@@ -1583,7 +1645,9 @@ fn writeTableTextCell(
     markdown: bool,
     max_output_bytes: usize,
 ) !void {
-    for (text) |byte| {
+    var index: usize = 0;
+    while (index < text.len) {
+        const byte = text[index];
         if (markdown and byte == '|') {
             try writeBoundedAll(output, "\\|", max_output_bytes);
         } else if (byte == '\n' or byte == '\r') {
@@ -1592,12 +1656,54 @@ fn writeTableTextCell(
                 if (markdown) "<br>" else " ",
                 max_output_bytes,
             );
-        } else if (!markdown and byte == '\t') {
+        } else if (byte == '\t') {
             try writeBoundedByte(output, ' ', max_output_bytes);
+        } else if (byte < 0x20 or byte == 0x7f) {
+            try writeEscapedControl(
+                output,
+                byte,
+                max_output_bytes,
+            );
+        } else if (byte >= 0x80) {
+            const sequence_len = try std.unicode.utf8ByteSequenceLength(byte);
+            if (index + sequence_len > text.len) return error.InvalidUtf8;
+            const codepoint = try std.unicode.utf8Decode(
+                text[index .. index + sequence_len],
+            );
+            if (codepoint >= 0x80 and codepoint <= 0x9f) {
+                try writeEscapedControl(
+                    output,
+                    codepoint,
+                    max_output_bytes,
+                );
+            } else {
+                try writeBoundedAll(
+                    output,
+                    text[index .. index + sequence_len],
+                    max_output_bytes,
+                );
+            }
+            index += sequence_len;
+            continue;
         } else {
             try writeBoundedByte(output, byte, max_output_bytes);
         }
+        index += 1;
     }
+}
+
+fn writeEscapedControl(
+    output: *std.Io.Writer.Allocating,
+    codepoint: u21,
+    max_output_bytes: usize,
+) !void {
+    var buffer: [6]u8 = undefined;
+    const escaped = try std.fmt.bufPrint(
+        &buffer,
+        "\\u{x:0>4}",
+        .{codepoint},
+    );
+    try writeBoundedAll(output, escaped, max_output_bytes);
 }
 
 fn writeTableSeparator(
@@ -1720,14 +1826,7 @@ fn emitDoctor(
 }
 
 fn emitCapabilities(argv: []const []const u8) !u8 {
-    var format: Format = .json;
-    var index: usize = 0;
-    while (index < argv.len) : (index += 1) {
-        if (!std.mem.eql(u8, argv[index], "--format")) return error.UnknownOption;
-        index += 1;
-        if (index >= argv.len) return error.MissingOptionValue;
-        format = try Format.parse(argv[index]);
-    }
+    const format = try parseCapabilitiesFormat(argv);
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     if (format == .text) {
         try stdout_writer.interface.print(
@@ -1736,36 +1835,64 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         );
         return 0;
     }
-    try stdout_writer.interface.print(
+    try emitCapabilitiesJson(&stdout_writer.interface);
+    return 0;
+}
+
+fn parseCapabilitiesFormat(argv: []const []const u8) !Format {
+    var format: Format = .json;
+    var format_seen = false;
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        if (!std.mem.eql(u8, argv[index], "--format")) return error.UnknownOption;
+        index += 1;
+        if (index >= argv.len) return error.MissingOptionValue;
+        if (format_seen) return error.DuplicateFormatOption;
+        format_seen = true;
+        format = try Format.parse(argv[index]);
+    }
+    return format;
+}
+
+fn emitCapabilitiesJson(writer: *std.Io.Writer) !void {
+    try writer.print(
         "{{\"schema\":\"ledger-capabilities/v1\",\"version\":\"{s}\"," ++
             "\"artifact_abis\":[\"{s}\"],\"operators\":[",
         .{ Version, ledger.definition.abi },
     );
+    try writeCapabilityOperators(writer);
+    try writeCapabilityTail(writer);
+}
+
+fn writeCapabilityOperators(writer: *std.Io.Writer) !void {
     var first = true;
     for (std.enums.values(ledger.definition.Operator)) |operator| {
         if (!operator.supported()) continue;
-        if (!first) try stdout_writer.interface.writeByte(',');
+        if (!first) try writer.writeByte(',');
         first = false;
-        try stdout_writer.interface.writeAll("{\"id\":");
+        try writer.writeAll("{\"id\":");
         try definition_core.canonical_json.writeCanonicalString(
-            &stdout_writer.interface,
+            writer,
             operator.id(),
         );
-        try stdout_writer.interface.print(
+        try writer.print(
             ",\"version\":{d}}}",
             .{operator.version()},
         );
     }
-    try stdout_writer.interface.writeAll(
+}
+
+fn writeCapabilityTail(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
         "],\"codecs\":[\"json\",\"jsonl\",\"text\"]," ++
             "\"storage_adapters\":[\"pure\",\"addressed-document\",\"event-log\"]," ++
             "\"cache_format\":",
     );
-    try stdout_writer.interface.print(
+    try writer.print(
         "{d}",
         .{definition_core.cache.format_version},
     );
-    try stdout_writer.interface.print(
+    try writer.print(
         ",\"bounds\":{{\"max_definition_files\":128," ++
             "\"max_definition_bytes\":4194304,\"max_import_depth\":32," ++
             "\"max_event_record_bytes\":{d}," ++
@@ -1792,7 +1919,6 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
             max_projection_table_columns,
         },
     );
-    return 0;
 }
 
 fn emitCommandError(err: anyerror) !void {
@@ -1876,4 +2002,49 @@ test "common parser accepts named inputs and parameters only on artifact command
     defer args.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), args.input_specs.len);
     try std.testing.expectEqual(@as(usize, 1), args.parameter_specs.len);
+}
+
+test "command parsers reject duplicate singleton format options" {
+    try std.testing.expectError(
+        error.DuplicateFormatOption,
+        parseCommonArgs(std.testing.allocator, &.{
+            "--definition",
+            "artifact.json",
+            "--format",
+            "json",
+            "--format",
+            "text",
+        }, false),
+    );
+}
+
+test "table renderers escape terminal control codepoints" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "\"prefix\\u001bmiddle\\u0085suffix\\npipe|\"",
+        .{},
+    );
+    defer parsed.deinit();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeProjectionTable(
+        std.testing.allocator,
+        &output,
+        parsed.value,
+        true,
+        4096,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.written(), "\\u001b") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.written(), "\\u0085") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOfScalar(u8, output.written(), 0x1b) == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, output.written(), "\xc2\x85") == null,
+    );
 }

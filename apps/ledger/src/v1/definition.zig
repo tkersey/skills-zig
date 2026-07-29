@@ -134,6 +134,12 @@ pub const Operator = enum {
             .monotonic_identity => "monotonic-identity",
             .path_format => "path-format",
             .set_order => "set-order",
+            else => self.storageAndQueryId(),
+        };
+    }
+
+    fn storageAndQueryId(self: Operator) []const u8 {
+        return switch (self) {
             .immutable_document => "immutable-document",
             .append_only_log => "append-only-log",
             .event_materialization => "event-materialization",

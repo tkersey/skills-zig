@@ -86,6 +86,10 @@ write_seq_build() {
   printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 }
 
+write_seq_strip_build() {
+  printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void { _ = .{ .strip = optimize == .ReleaseFast, seq_root }; }\n' >build.zig
+}
+
 move_build_line() {
   printf 'pub fn build() void {}\nconst img_meta = "apps/img/VERSION";\n' >build.zig
 }
@@ -142,6 +146,7 @@ assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq write_seq_build
+assert_affected seq write_seq_strip_build
 assert_affected img move_build_line
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_mixed_seq_unknown_build
 assert_affected seq,cas,ledger write_definition_package_path

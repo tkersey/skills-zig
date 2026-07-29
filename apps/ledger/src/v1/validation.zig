@@ -1526,60 +1526,74 @@ const Builder = struct {
             self.allocator.free(parts);
         }
         for (raw_fragments.items, 0..) |raw_fragment, index| {
-            const fragment = try definition_core.json.object(raw_fragment);
-            if (fragment.count() != 1) {
-                return error.PathFormatFragmentInvalid;
-            }
-            if (fragment.get("literal")) |raw_literal| {
-                const literal = try definition_core.json.string(raw_literal);
-                if (literal.len == 0) {
-                    return error.PathFormatLiteralEmpty;
-                }
-                literal_bytes = std.math.add(
-                    usize,
-                    literal_bytes,
-                    literal.len,
-                ) catch return error.PathFormatLiteralBytesExceeded;
-                if (literal_bytes > 4096) {
-                    return error.PathFormatLiteralBytesExceeded;
-                }
-                parts[index] = .{
-                    .literal = try self.allocator.dupe(u8, literal),
-                };
-            } else if (fragment.get("parent")) |raw_parent| {
-                parts[index] = .{
-                    .parent = try self.internPointer(
-                        try definition_core.json.string(raw_parent),
-                    ),
-                };
-            } else if (fragment.get("parent-json")) |raw_parent| {
-                if (!allow_parent_json) {
-                    return error.PathFormatFragmentInvalid;
-                }
-                parts[index] = .{
-                    .parent_json = try self.internPointer(
-                        try definition_core.json.string(raw_parent),
-                    ),
-                };
-            } else if (fragment.get("item")) |raw_item| {
-                parts[index] = .{
-                    .item = try self.internPointer(
-                        try definition_core.json.string(raw_item),
-                    ),
-                };
-            } else if (fragment.get("value")) |raw_value| {
-                if (!allow_value or
-                    !try definition_core.json.boolean(raw_value))
-                {
-                    return error.PathFormatFragmentInvalid;
-                }
-                parts[index] = .value;
-            } else {
-                return error.PathFormatFragmentInvalid;
-            }
+            parts[index] = try self.compileFormatPart(
+                raw_fragment,
+                allow_value,
+                allow_parent_json,
+                &literal_bytes,
+            );
             initialized += 1;
         }
         return parts;
+    }
+
+    fn compileFormatPart(
+        self: *Builder,
+        raw: std.json.Value,
+        allow_value: bool,
+        allow_parent_json: bool,
+        literal_bytes: *usize,
+    ) !CompiledFormatPart {
+        const fragment = try definition_core.json.object(raw);
+        if (fragment.count() != 1) return error.PathFormatFragmentInvalid;
+        if (fragment.get("literal")) |raw_literal| {
+            const literal = try definition_core.json.string(raw_literal);
+            if (literal.len == 0) return error.PathFormatLiteralEmpty;
+            literal_bytes.* = std.math.add(
+                usize,
+                literal_bytes.*,
+                literal.len,
+            ) catch return error.PathFormatLiteralBytesExceeded;
+            if (literal_bytes.* > 4096) {
+                return error.PathFormatLiteralBytesExceeded;
+            }
+            return .{
+                .literal = try self.allocator.dupe(u8, literal),
+            };
+        }
+        if (fragment.get("parent")) |raw_parent| {
+            return .{
+                .parent = try self.internPointer(
+                    try definition_core.json.string(raw_parent),
+                ),
+            };
+        }
+        if (fragment.get("parent-json")) |raw_parent| {
+            if (!allow_parent_json) {
+                return error.PathFormatFragmentInvalid;
+            }
+            return .{
+                .parent_json = try self.internPointer(
+                    try definition_core.json.string(raw_parent),
+                ),
+            };
+        }
+        if (fragment.get("item")) |raw_item| {
+            return .{
+                .item = try self.internPointer(
+                    try definition_core.json.string(raw_item),
+                ),
+            };
+        }
+        if (fragment.get("value")) |raw_value| {
+            if (!allow_value or
+                !try definition_core.json.boolean(raw_value))
+            {
+                return error.PathFormatFragmentInvalid;
+            }
+            return .value;
+        }
+        return error.PathFormatFragmentInvalid;
     }
 
     fn compileImplication(

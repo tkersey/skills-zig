@@ -306,6 +306,270 @@ fn streamReplaySupported(
     return true;
 }
 
+const EventHash = std.crypto.hash.sha2.Sha256;
+
+const ReplayObserver = struct {
+    context: *anyopaque,
+    observe_fn: *const fn (
+        context: *anyopaque,
+        value: std.json.Value,
+        raw: []const u8,
+        replay_state: ?*const protocol.ReplayState,
+    ) anyerror!void,
+
+    pub fn observeReplay(
+        self: *ReplayObserver,
+        value: std.json.Value,
+        raw: []const u8,
+        replay_state: ?*const protocol.ReplayState,
+    ) !void {
+        try self.observe_fn(self.context, value, raw, replay_state);
+    }
+};
+
+fn eraseReplayObserver(observer: anytype) ReplayObserver {
+    const Observer = @TypeOf(observer.*);
+    const Adapter = struct {
+        fn observe(
+            context: *anyopaque,
+            value: std.json.Value,
+            raw: []const u8,
+            replay_state: ?*const protocol.ReplayState,
+        ) !void {
+            const concrete: *Observer = @ptrCast(@alignCast(context));
+            if (@hasDecl(Observer, "observeReplay")) {
+                try concrete.observeReplay(value, raw, replay_state);
+            } else {
+                try concrete.observe(value);
+            }
+        }
+    };
+    return .{ .context = observer, .observe_fn = Adapter.observe };
+}
+
+const StreamEventValidator = struct {
+    allocator: std.mem.Allocator,
+    cache: *PlanCache,
+    slot: storage.ResolvedSlot,
+    rows: []const custody.BindingRow,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    max_records: usize,
+    observer: ReplayObserver,
+    row_index: usize = 0,
+    protocol_state: ?protocol.ReplayState = null,
+    row_hash: EventHash = EventHash.init(.{}),
+    raw_bytes_observed: usize = 0,
+    bound_prefix_hash: EventHash = EventHash.init(.{}),
+    bound_prefix_verified: bool = false,
+    historical_parameters: ?definition_core.parameters.Bindings = null,
+    historical_parameters_index: ?usize = null,
+    resolved_effect: ?ResolvedEffect = null,
+    row_parameters: ?*const definition_core.parameters.Bindings = null,
+
+    fn parametersForRow(
+        self: *StreamEventValidator,
+        resolved: ResolvedEffect,
+        row: custody.BindingRow,
+    ) !*const definition_core.parameters.Bindings {
+        const environment = row.parameter_environment orelse
+            return self.parameters;
+        if (self.historical_parameters_index != self.row_index) {
+            if (self.historical_parameters) |*prior| {
+                prior.deinit(self.allocator);
+            }
+            self.historical_parameters =
+                try definition_core.parameters.fromCanonicalJson(
+                    self.allocator,
+                    &resolved.archived.definition_plan.parameter_declarations,
+                    environment,
+                );
+            self.historical_parameters_index = self.row_index;
+        }
+        return &self.historical_parameters.?;
+    }
+
+    fn observeRaw(context: *anyopaque, bytes: []const u8) !void {
+        const self: *StreamEventValidator = @ptrCast(@alignCast(context));
+        const observed_after = std.math.add(
+            usize,
+            self.raw_bytes_observed,
+            bytes.len,
+        ) catch return error.CurrentStoreBoundsExceeded;
+        if (self.rows[0].kind == .existing_store_binding and
+            !self.bound_prefix_verified)
+        {
+            try self.observeBoundPrefix(bytes);
+        }
+        self.raw_bytes_observed = observed_after;
+    }
+
+    fn observeBoundPrefix(
+        self: *StreamEventValidator,
+        bytes: []const u8,
+    ) !void {
+        const row = self.rows[0];
+        const bound_end = row.extent_end;
+        if (row.extent_start != 0 or bound_end <= self.raw_bytes_observed) {
+            return error.StoreBindingExtentMismatch;
+        }
+        const remaining = bound_end - self.raw_bytes_observed;
+        const hashed = @min(remaining, bytes.len);
+        self.bound_prefix_hash.update(bytes[0..hashed]);
+        if (hashed != remaining) return;
+        var completed = self.bound_prefix_hash;
+        var digest: [EventHash.digest_length]u8 = undefined;
+        completed.final(&digest);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        var formatted: [71]u8 = undefined;
+        @memcpy(formatted[0..7], "sha256:");
+        @memcpy(formatted[7..], &hex);
+        if (!std.mem.eql(u8, &formatted, row.canonical_input_digest)) {
+            return error.HistoricalInputDigestMismatch;
+        }
+        self.bound_prefix_verified = true;
+    }
+
+    fn visit(
+        context: *anyopaque,
+        record: durable_store.EventRecordView,
+    ) !void {
+        const self: *StreamEventValidator = @ptrCast(@alignCast(context));
+        if (record.ordinal == 0) return error.StoreBindingRecordCountMismatch;
+        if (record.ordinal > self.max_records) {
+            return error.CurrentStoreRecordBoundsExceeded;
+        }
+        const record_index: usize = @intCast(record.ordinal - 1);
+        const row = try self.rowForRecord(record_index);
+        const start = row.record_start.?;
+        const end = row.record_end.?;
+        if (record_index == start) try self.beginRow(row, record);
+        const resolved = self.resolved_effect orelse
+            return error.StoreBindingRecordRangeMissing;
+        try self.verifyEffectRecord(resolved, row, start, end, record);
+        try validateEventInput(
+            self.allocator,
+            &self.protocol_state,
+            self.protocol_required,
+            resolved,
+            record.payload,
+            self.row_parameters orelse
+                return error.StoreBindingRecordRangeMissing,
+            row.kind == .admission,
+            &self.observer,
+        );
+        if (record_index + 1 == end) {
+            try self.finishRow(resolved, row, record);
+        }
+    }
+
+    fn rowForRecord(
+        self: *StreamEventValidator,
+        record_index: usize,
+    ) !custody.BindingRow {
+        if (self.row_index >= self.rows.len) {
+            return error.StoreBindingRecordCountMismatch;
+        }
+        const row = self.rows[self.row_index];
+        const start = row.record_start orelse
+            return error.StoreBindingRecordRangeMissing;
+        const end = row.record_end orelse
+            return error.StoreBindingRecordRangeMissing;
+        if (record_index < start or record_index >= end) {
+            return error.StoreBindingRecordCountMismatch;
+        }
+        return row;
+    }
+
+    fn beginRow(
+        self: *StreamEventValidator,
+        row: custody.BindingRow,
+        record: durable_store.EventRecordView,
+    ) !void {
+        self.row_hash = EventHash.init(.{});
+        if (row.extent_start != record.extent_start) {
+            return error.StoreBindingExtentMismatch;
+        }
+        self.resolved_effect = try resolveEffect(self.cache, self.slot, row);
+        self.row_parameters = try self.parametersForRow(
+            self.resolved_effect.?,
+            row,
+        );
+    }
+
+    fn verifyEffectRecord(
+        self: *StreamEventValidator,
+        resolved: ResolvedEffect,
+        row: custody.BindingRow,
+        start: usize,
+        end: usize,
+        record: durable_store.EventRecordView,
+    ) !void {
+        switch (resolved.effect.kind) {
+            .compare_append => {
+                if (row.kind != .admission) {
+                    return error.HistoricalEffectKindMismatch;
+                }
+                if (end != start + 1 or
+                    row.extent_start != record.extent_start or
+                    row.extent_end != record.extent_end)
+                {
+                    return error.StoreBindingExtentMismatch;
+                }
+                self.row_hash.update(record.payload);
+            },
+            .create_new => {
+                if (row.kind != .admission or self.row_index != 0 or
+                    start != 0 or self.protocol_required)
+                {
+                    return error.HistoricalEffectKindMismatch;
+                }
+                self.row_hash.update(record.payload);
+                self.row_hash.update("\n");
+            },
+            .bind_existing => if (row.kind != .existing_store_binding or
+                self.row_index != 0 or start != 0)
+            {
+                return error.HistoricalEffectKindMismatch;
+            },
+            .compare_replace => return error.HistoricalEffectKindMismatch,
+        }
+    }
+
+    fn finishRow(
+        self: *StreamEventValidator,
+        resolved: ResolvedEffect,
+        row: custody.BindingRow,
+        record: durable_store.EventRecordView,
+    ) !void {
+        if (resolved.effect.kind == .create_new and
+            row.extent_end != record.extent_end + 1)
+        {
+            return error.StoreBindingExtentMismatch;
+        }
+        if (resolved.effect.kind == .bind_existing) {
+            self.advanceRow();
+            return;
+        }
+        var digest: [EventHash.digest_length]u8 = undefined;
+        self.row_hash.final(&digest);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        var formatted: [71]u8 = undefined;
+        @memcpy(formatted[0..7], "sha256:");
+        @memcpy(formatted[7..], &hex);
+        if (!std.mem.eql(u8, &formatted, row.canonical_input_digest)) {
+            return error.HistoricalInputDigestMismatch;
+        }
+        self.advanceRow();
+    }
+
+    fn advanceRow(self: *StreamEventValidator) void {
+        self.resolved_effect = null;
+        self.row_parameters = null;
+        self.row_index += 1;
+    }
+};
+
 fn validateStreamedEventEpoch(
     allocator: std.mem.Allocator,
     cache: *PlanCache,
@@ -318,158 +582,16 @@ fn validateStreamedEventEpoch(
     protocol_required: bool,
     observer: anytype,
 ) !HistoryResult {
-    const Observer = @TypeOf(observer);
-    const EventHash = std.crypto.hash.sha2.Sha256;
-    const Validator = struct {
-        allocator: std.mem.Allocator,
-        cache: *PlanCache,
-        slot: storage.ResolvedSlot,
-        rows: []const custody.BindingRow,
-        parameters: *const definition_core.parameters.Bindings,
-        protocol_required: bool,
-        max_records: usize,
-        observer: Observer,
-        row_index: usize = 0,
-        protocol_state: ?protocol.ReplayState = null,
-        row_hash: EventHash = EventHash.init(.{}),
-        raw_bytes_observed: usize = 0,
-        bound_prefix_hash: EventHash = EventHash.init(.{}),
-        bound_prefix_verified: bool = false,
-
-        fn observeRaw(
-            context: *anyopaque,
-            bytes: []const u8,
-        ) !void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            const observed_after = std.math.add(
-                usize,
-                self.raw_bytes_observed,
-                bytes.len,
-            ) catch return error.CurrentStoreBoundsExceeded;
-            if (self.rows[0].kind == .existing_store_binding and
-                !self.bound_prefix_verified)
-            {
-                const bound_end = self.rows[0].extent_end;
-                if (self.rows[0].extent_start != 0 or
-                    bound_end <= self.raw_bytes_observed)
-                {
-                    return error.StoreBindingExtentMismatch;
-                }
-                const remaining = bound_end - self.raw_bytes_observed;
-                const hashed = @min(remaining, bytes.len);
-                self.bound_prefix_hash.update(bytes[0..hashed]);
-                if (hashed == remaining) {
-                    var completed = self.bound_prefix_hash;
-                    var digest: [EventHash.digest_length]u8 = undefined;
-                    completed.final(&digest);
-                    const hex = std.fmt.bytesToHex(digest, .lower);
-                    var formatted: [71]u8 = undefined;
-                    @memcpy(formatted[0..7], "sha256:");
-                    @memcpy(formatted[7..], &hex);
-                    if (!std.mem.eql(
-                        u8,
-                        &formatted,
-                        self.rows[0].canonical_input_digest,
-                    )) return error.HistoricalInputDigestMismatch;
-                    self.bound_prefix_verified = true;
-                }
-            }
-            self.raw_bytes_observed = observed_after;
-        }
-
-        fn visit(context: *anyopaque, record: durable_store.EventRecordView) !void {
-            const self: *@This() = @ptrCast(@alignCast(context));
-            if (record.ordinal == 0) return error.StoreBindingRecordCountMismatch;
-            if (record.ordinal > self.max_records) {
-                return error.CurrentStoreRecordBoundsExceeded;
-            }
-            const record_index: usize = @intCast(record.ordinal - 1);
-            if (self.row_index >= self.rows.len) {
-                return error.StoreBindingRecordCountMismatch;
-            }
-            const row = self.rows[self.row_index];
-            const start = row.record_start orelse
-                return error.StoreBindingRecordRangeMissing;
-            const end = row.record_end orelse
-                return error.StoreBindingRecordRangeMissing;
-            if (record_index < start or record_index >= end) {
-                return error.StoreBindingRecordCountMismatch;
-            }
-            if (record_index == start) {
-                self.row_hash = EventHash.init(.{});
-                if (row.extent_start != record.extent_start) {
-                    return error.StoreBindingExtentMismatch;
-                }
-            }
-            const resolved = try resolveEffect(self.cache, self.slot, row);
-            switch (resolved.effect.kind) {
-                .compare_append => {
-                    if (row.kind != .admission) {
-                        return error.HistoricalEffectKindMismatch;
-                    }
-                    if (end != start + 1 or
-                        row.extent_start != record.extent_start or
-                        row.extent_end != record.extent_end)
-                    {
-                        return error.StoreBindingExtentMismatch;
-                    }
-                    self.row_hash.update(record.payload);
-                },
-                .create_new => {
-                    if (row.kind != .admission or
-                        self.row_index != 0 or start != 0 or
-                        self.protocol_required)
-                    {
-                        return error.HistoricalEffectKindMismatch;
-                    }
-                    self.row_hash.update(record.payload);
-                    self.row_hash.update("\n");
-                },
-                .bind_existing => {
-                    if (row.kind != .existing_store_binding or
-                        self.row_index != 0 or start != 0)
-                    {
-                        return error.HistoricalEffectKindMismatch;
-                    }
-                },
-                .compare_replace => return error.HistoricalEffectKindMismatch,
-            }
-            try validateEventInput(
-                self.allocator,
-                &self.protocol_state,
-                self.protocol_required,
-                resolved,
-                record.payload,
-                self.parameters,
-                row.kind == .admission,
-                self.observer,
-            );
-            if (record_index + 1 == end) {
-                if (resolved.effect.kind == .create_new and
-                    row.extent_end != record.extent_end + 1)
-                {
-                    return error.StoreBindingExtentMismatch;
-                }
-                if (resolved.effect.kind == .bind_existing) {
-                    self.row_index += 1;
-                    return;
-                }
-                var digest: [EventHash.digest_length]u8 = undefined;
-                self.row_hash.final(&digest);
-                const hex = std.fmt.bytesToHex(digest, .lower);
-                var formatted: [71]u8 = undefined;
-                @memcpy(formatted[0..7], "sha256:");
-                @memcpy(formatted[7..], &hex);
-                if (!std.mem.eql(
-                    u8,
-                    &formatted,
-                    row.canonical_input_digest,
-                )) return error.HistoricalInputDigestMismatch;
-                self.row_index += 1;
-            }
-        }
-    };
-    var validator = Validator{
+    const binding_covered_by_store_revision =
+        rows.len == 1 and
+        rows[0].kind == .existing_store_binding and
+        rows[0].extent_start == 0 and
+        std.mem.eql(
+            u8,
+            rows[0].canonical_input_digest,
+            content_revision,
+        );
+    var validator = StreamEventValidator{
         .allocator = allocator,
         .cache = cache,
         .slot = current_slot,
@@ -477,7 +599,11 @@ fn validateStreamedEventEpoch(
         .parameters = parameters,
         .protocol_required = protocol_required,
         .max_records = current_max_records,
-        .observer = observer,
+        .observer = eraseReplayObserver(observer),
+        .bound_prefix_verified = binding_covered_by_store_revision,
+    };
+    defer if (validator.historical_parameters) |*bindings| {
+        bindings.deinit(allocator);
     };
     errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
     var backend = durable_store.PersistentEventStore.init(path);
@@ -486,11 +612,34 @@ fn validateStreamedEventEpoch(
         current_slot.max_bytes,
         .{
             .context = &validator,
-            .visitFn = Validator.visit,
-            .rawFn = Validator.observeRaw,
+            .visitFn = StreamEventValidator.visit,
+            .rawFn = StreamEventValidator.observeRaw,
         },
     );
     defer summary.deinit(allocator);
+    try validateStreamSummary(
+        &validator,
+        rows,
+        &summary,
+        content_revision,
+        current_max_records,
+        protocol_required,
+    );
+    return .{
+        .records_validated = summary.record_count,
+        .protocol_state = validator.protocol_state,
+        .append_context = summary.append_context,
+    };
+}
+
+fn validateStreamSummary(
+    validator: *const StreamEventValidator,
+    rows: []const custody.BindingRow,
+    summary: *const durable_store.EventScanSummary,
+    content_revision: []const u8,
+    current_max_records: usize,
+    protocol_required: bool,
+) !void {
     if (!summary.exists or summary.record_count == 0) {
         return error.HistoricalArtifactInvalid;
     }
@@ -513,11 +662,6 @@ fn validateStreamedEventEpoch(
     if (protocol_required and validator.protocol_state == null) {
         return error.HistoricalProtocolBindingMismatch;
     }
-    return .{
-        .records_validated = summary.record_count,
-        .protocol_state = validator.protocol_state,
-        .append_context = summary.append_context,
-    };
 }
 
 const HistoryResult = struct {
@@ -809,6 +953,19 @@ fn validateEventRow(
     }
     try validateBoundExtent(allocator, row, content, content_revision);
     const resolved = try resolveEffect(cache, current_slot, row);
+    var historical_parameters = if (row.parameter_environment) |environment|
+        try definition_core.parameters.fromCanonicalJson(
+            allocator,
+            &resolved.archived.definition_plan.parameter_declarations,
+            environment,
+        )
+    else
+        null;
+    defer if (historical_parameters) |*bindings| bindings.deinit(allocator);
+    const row_parameters = if (historical_parameters) |*bindings|
+        bindings
+    else
+        parameters;
     if (record_end > resolved.archived.definition_plan.bounds.max_records) {
         return error.HistoricalRecordBoundsExceeded;
     }
@@ -818,7 +975,7 @@ fn validateEventRow(
             resolved,
             index,
             records[record_start..record_end],
-            parameters,
+            row_parameters,
             protocol_required,
             protocol_state,
             observer,
@@ -832,7 +989,7 @@ fn validateEventRow(
             record_end,
             records.len,
             content,
-            parameters,
+            row_parameters,
             protocol_required,
             protocol_state,
             observer,

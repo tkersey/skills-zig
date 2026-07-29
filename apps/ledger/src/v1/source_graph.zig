@@ -1141,68 +1141,6 @@ fn lowerObjectRule(
     );
 }
 
-fn lowerTaggedRule(
-    allocator: std.mem.Allocator,
-    raw: std.json.Value,
-    input: ?[]const u8,
-    path: []const u8,
-    types: ?std.json.ObjectMap,
-    allow_types: bool,
-    budget: *ExpansionBudget,
-) anyerror!std.json.Value {
-    const tagged = try definition_core.json.object(raw);
-    try definition_core.json.requireExactKeys(tagged, &.{
-        "tag",
-        "variants",
-    });
-    var config = std.json.ObjectMap.empty;
-    if (tagged.get("tag")) |tag| {
-        try config.put(allocator, "tag", tag);
-    }
-    const raw_variants = try definition_core.json.array(
-        try definition_core.json.field(tagged, "variants"),
-    );
-    var variants = std.json.Array.init(allocator);
-    for (raw_variants.items) |raw_variant| {
-        const variant = try definition_core.json.object(raw_variant);
-        try definition_core.json.requireExactKeys(variant, &.{
-            "value",
-            "kind",
-            "node",
-        });
-        const value = variant.get("value");
-        const kind = variant.get("kind");
-        if ((value == null) == (kind == null)) {
-            return error.InvalidTaggedDocumentVariant;
-        }
-        var lowered_rules = std.json.Array.init(allocator);
-        try lowerNode(
-            allocator,
-            &lowered_rules,
-            try definition_core.json.field(variant, "node"),
-            null,
-            "",
-            false,
-            types,
-            allow_types,
-            budget,
-        );
-        var lowered_variant = std.json.ObjectMap.empty;
-        if (value) |item| try lowered_variant.put(allocator, "value", item);
-        if (kind) |item| try lowered_variant.put(allocator, "kind", item);
-        try lowered_variant.put(allocator, "rules", .{ .array = lowered_rules });
-        try variants.append(.{ .object = lowered_variant });
-    }
-    try config.put(allocator, "variants", .{ .array = variants });
-    return makeRule(
-        allocator,
-        "tagged-union",
-        input,
-        path,
-        .{ .object = config },
-    );
-}
-
 fn lowerEventLog(
     allocator: std.mem.Allocator,
     rules: *std.json.Array,

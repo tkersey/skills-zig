@@ -106,7 +106,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|\[\]const u8,|\.target = target,|\.optimize = optimize,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|pub fn build\(\) void \{\}|\[\]const u8,|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do

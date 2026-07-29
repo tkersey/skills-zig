@@ -147,6 +147,62 @@ pub fn bindProvided(
     return bindMode(allocator, declarations, inputs, false);
 }
 
+pub fn writeCanonicalObject(
+    bindings: *const Bindings,
+    writer: *std.Io.Writer,
+) !void {
+    try writer.writeByte('{');
+    for (bindings.items, 0..) |binding, index| {
+        if (index != 0) try writer.writeByte(',');
+        try canonical_json.writeCanonicalString(writer, binding.name);
+        try writer.writeByte(':');
+        try binding.value.writeCanonical(writer);
+    }
+    try writer.writeByte('}');
+}
+
+pub fn fromCanonicalJson(
+    allocator: std.mem.Allocator,
+    declarations: *const Declarations,
+    bytes: []const u8,
+) !Bindings {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const object = try json.object(parsed.value);
+    const items = try allocator.alloc(Binding, object.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (items[0..initialized]) |*item| item.deinit(allocator);
+        allocator.free(items);
+    }
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        const declaration = declarations.find(entry.key_ptr.*) orelse
+            return error.ParameterEnvironmentMismatch;
+        items[initialized] = .{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = undefined,
+        };
+        errdefer allocator.free(items[initialized].name);
+        items[initialized].value = try scalar.fromJsonAlloc(
+            allocator,
+            declaration.kind,
+            entry.value_ptr.*,
+        );
+        initialized += 1;
+    }
+    std.sort.heap(Binding, items, {}, lessThanBinding);
+    return .{
+        .items = items,
+        .values_digest = try digestBindings(items),
+    };
+}
+
 fn bindMode(
     allocator: std.mem.Allocator,
     declarations: *const Declarations,

@@ -126,6 +126,17 @@ pub const EventAppendContext = struct {
     extent_bytes: usize = 0,
     separator_bytes: usize = 0,
 
+    pub fn fromBytes(bytes: []const u8) EventAppendContext {
+        var raw_hash = EventHash.init(.{});
+        raw_hash.update(bytes);
+        return .{
+            .raw_hash = raw_hash,
+            .extent_bytes = bytes.len,
+            .separator_bytes = if (bytes.len != 0 and
+                bytes[bytes.len - 1] != '\n') 1 else 0,
+        };
+    }
+
     pub fn revisionWithSuffixAlloc(
         self: EventAppendContext,
         allocator: std.mem.Allocator,
@@ -1711,7 +1722,7 @@ fn digestRegularFileNoSymlinkAtAlloc(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var observed: usize = 0;
     var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
+    while (true) { // tiger: event-loop
         const count = try reader.interface.readSliceShort(&buffer);
         if (count == 0) break;
         observed = std.math.add(usize, observed, count) catch
@@ -1864,8 +1875,53 @@ fn pathRelativeToControlRoot(
         return error.TransactionPathOutsideControlRoot;
     }
     const relative = path[control_root.len + 1 ..];
-    if (relative.len == 0) return error.InvalidPath;
+    if (relative.len == 0 or relative[0] == '/' or relative[0] == '\\') {
+        return error.InvalidPath;
+    }
+    var components = std.mem.tokenizeAny(u8, relative, "/\\");
+    var observed: usize = 0;
+    while (components.next()) |component| {
+        observed += component.len;
+        if (std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, ".."))
+        {
+            return error.TransactionPathOutsideControlRoot;
+        }
+    }
+    if (observed == 0 or
+        std.mem.indexOf(u8, relative, "//") != null or
+        std.mem.indexOf(u8, relative, "\\\\") != null)
+    {
+        return error.InvalidPath;
+    }
     return relative;
+}
+
+test "transaction paths reject lexical escapes before recovery reads" {
+    try std.testing.expectEqualStrings(
+        "nested/record.json",
+        try pathRelativeToControlRoot(
+            "/tmp/control",
+            "/tmp/control/nested/record.json",
+        ),
+    );
+    for ([_][]const u8{
+        "/tmp/control/nested/../outside.json",
+        "/tmp/control/./record.json",
+        "/tmp/control-other/record.json",
+    }) |path| {
+        try std.testing.expectError(
+            error.TransactionPathOutsideControlRoot,
+            pathRelativeToControlRoot("/tmp/control", path),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidPath,
+        pathRelativeToControlRoot(
+            "/tmp/control",
+            "/tmp/control//record.json",
+        ),
+    );
 }
 
 pub fn commitTextTransaction(
@@ -1887,6 +1943,7 @@ pub fn commitTextTransaction(
     const transaction_dir = try std.fs.path.join(allocator, &.{ transactions_dir, transaction_id });
     errdefer allocator.free(transaction_dir);
     try ensureDirectoryPathNoSymlinks(transaction_dir);
+    try syncDirectoryPath(transactions_dir);
     var record_persisted = false;
     errdefer if (!record_persisted) {
         std.Io.Dir.cwd().deleteTree(
@@ -1988,17 +2045,50 @@ pub fn commitTextTransaction(
     for (ordered, targets, 0..) |mutation, *target, index| {
         try target.verifyPathIdentity();
         try rejectHardlinkedTargetAt(&target.dir, target.base);
-        const maybe_before = readTransactionSnapshotAt(
-            allocator,
-            &target.dir,
-            target.base,
-            mutation,
-        ) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        const append_fast_path = mutation.action == .append and
+            mutation.content_mode == .raw;
+        const maybe_before: ?TransactionSnapshot = if (append_fast_path)
+            null
+        else
+            readTransactionSnapshotAt(
+                allocator,
+                &target.dir,
+                target.base,
+                mutation,
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
         defer if (maybe_before) |before| before.deinit(allocator);
-        if (maybe_before) |before| {
+        const before_exists = if (append_fast_path)
+            try transactionTargetExistsAt(
+                &target.dir,
+                target.base,
+                mutation.max_bytes,
+            )
+        else
+            maybe_before != null;
+        if (append_fast_path) {
+            if (mutation.expectation.expected_exists) |expected_exists| {
+                if (expected_exists != before_exists) {
+                    return error.ExpectationMismatch;
+                }
+            }
+            if (before_exists and mutation.expectation.expected_digest == null) {
+                return error.DigestMismatch;
+            }
+            if (!before_exists and mutation.expectation.expected_digest != null) {
+                return error.DigestMismatch;
+            }
+            expected[expected_count] = .{
+                .path = try allocator.dupe(u8, mutation.path),
+                .digest = try allocator.dupe(
+                    u8,
+                    mutation.expectation.expected_digest orelse "",
+                ),
+                .sequence = 0,
+            };
+        } else if (maybe_before) |before| {
             if (mutation.expectation.expected_digest) |digest| {
                 if (!std.mem.eql(u8, digest, before.digest)) return error.DigestMismatch;
             }
@@ -2063,7 +2153,8 @@ pub fn commitTextTransaction(
                     allocator,
                     staged_path,
                     target,
-                    maybe_before != null,
+                    before_exists,
+                    mutation.expectation.expected_digest,
                     mutation.text,
                     mutation.max_bytes,
                 );
@@ -2092,7 +2183,9 @@ pub fn commitTextTransaction(
         write_count += 1;
     }
 
+    try syncDirectoryPath(transaction_dir);
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .prepared, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), true);
+    try syncDirectoryPath(transaction_dir);
     record_persisted = true;
 
     var publish_index: usize = 0;
@@ -2116,7 +2209,9 @@ pub fn commitTextTransaction(
     }
 
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .committed, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), false);
+    try syncDirectoryPath(transaction_dir);
     try writeTextCreateNew(allocator, commit_marker_path, "{\"commit_marker\":\"DTX-v1\",\"state\":\"committed\"}\n", .{});
+    try syncDirectoryPath(transaction_dir);
 
     return .{
         .transaction_id = transaction_id,
@@ -2132,6 +2227,7 @@ fn stageAppendedTransactionWrite(
     staged_path: []const u8,
     target: *TransactionTarget,
     before_exists: bool,
+    expected_before_digest: ?[]const u8,
     suffix: []const u8,
     max_bytes: usize,
 ) ![]u8 {
@@ -2170,6 +2266,21 @@ fn stageAppendedTransactionWrite(
             try staged.writeStreamingAll(Io.io(), buffer[0..count]);
             hash.update(buffer[0..count]);
         }
+        var prefix_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
+            undefined;
+        var prefix_hash = hash;
+        prefix_hash.final(&prefix_digest);
+        const prefix_hex = std.fmt.bytesToHex(prefix_digest, .lower);
+        var formatted: [71]u8 = undefined;
+        @memcpy(formatted[0..7], "sha256:");
+        @memcpy(formatted[7..], &prefix_hex);
+        if (!std.mem.eql(
+            u8,
+            &formatted,
+            expected_before_digest orelse return error.DigestMismatch,
+        )) return error.DigestMismatch;
+    } else if (expected_before_digest != null) {
+        return error.DigestMismatch;
     }
     const total = std.math.add(usize, copied, suffix.len) catch
         return error.FileTooBig;
@@ -2185,6 +2296,26 @@ fn stageAppendedTransactionWrite(
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
 }
 
+fn transactionTargetExistsAt(
+    dir: *std.Io.Dir,
+    base: []const u8,
+    max_bytes: usize,
+) !bool {
+    const stat = dir.statFile(
+        Io.io(),
+        base,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.nlink > 1) return error.HardlinkTarget;
+    if (stat.size > max_bytes) return error.FileTooBig;
+    return true;
+}
+
 fn publishStagedTransactionWrite(
     allocator: std.mem.Allocator,
     transaction_dir: []const u8,
@@ -2193,20 +2324,6 @@ fn publishStagedTransactionWrite(
     expectation: CasExpectation,
     target: *TransactionTarget,
 ) !void {
-    const staged_path = try std.fs.path.join(
-        allocator,
-        &.{ transaction_dir, write.staged_ref },
-    );
-    defer allocator.free(staged_path);
-    const staged_digest = try digestRegularFileNoSymlinkAlloc(
-        allocator,
-        staged_path,
-        mutation.max_bytes,
-    );
-    defer allocator.free(staged_digest);
-    if (!std.mem.eql(u8, staged_digest, write.digest_after)) {
-        return error.TransactionCorrupt;
-    }
     const sequence_after = switch (mutation.content_mode) {
         .jsonl_sequence_required => (try jsonlSequenceRequired(
             allocator,
@@ -2236,6 +2353,8 @@ fn publishStagedTransactionWrite(
         target.base,
         Io.io(),
     );
+    try syncDirectoryHandle(&staged_dir);
+    try syncDirectoryHandle(&target.dir);
     try target.verifyPathIdentity();
 }
 
@@ -2306,11 +2425,21 @@ pub fn inspectTransaction(allocator: std.mem.Allocator, transaction_dir: []const
         parsed.writes,
         parsed.expected,
     )) orelse
-        return makeRecoveryStatus(allocator, parsed.transaction_id, .manual_recovery_required, "published-digest-disagreement");
+        return makeRecoveryStatus(
+            allocator,
+            parsed.transaction_id,
+            .manual_recovery_required,
+            "published-digest-disagreement",
+        );
     if (published == parsed.writes.len) {
         return makeRecoveryStatus(allocator, parsed.transaction_id, .finish_commit, "all-digests-published");
     }
-    return makeRecoveryStatus(allocator, parsed.transaction_id, .finish_commit, "roll-forward-required");
+    return makeRecoveryStatus(
+        allocator,
+        parsed.transaction_id,
+        .finish_commit,
+        "roll-forward-required",
+    );
 }
 
 pub fn recoverTransaction(allocator: std.mem.Allocator, transaction_dir: []const u8) !RecoveryReceipt {
@@ -2341,16 +2470,19 @@ pub fn recoverTransaction(allocator: std.mem.Allocator, transaction_dir: []const
             const record = try renderParsedTransactionRecordAlloc(allocator, parsed, .committed);
             defer allocator.free(record);
             try writeTextAtomic(allocator, record_path, record);
+            try syncDirectoryPath(transaction_dir);
             writeTextCreateNew(allocator, commit_marker_path, "{\"commit_marker\":\"DTX-v1\",\"state\":\"committed\"}\n", .{}) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
+            try syncDirectoryPath(transaction_dir);
             return makeRecoveryReceipt(allocator, parsed.transaction_id, .finish_commit, "committed");
         },
         .roll_back_unpublished => {
             const record = try renderParsedTransactionRecordAlloc(allocator, parsed, .aborted);
             defer allocator.free(record);
             try writeTextAtomic(allocator, record_path, record);
+            try syncDirectoryPath(transaction_dir);
             return makeRecoveryReceipt(allocator, parsed.transaction_id, .roll_back_unpublished, "aborted");
         },
         .manual_recovery_required => return error.TransactionRecoveryRequired,
@@ -2411,6 +2543,7 @@ pub fn recoverAndCompactTransactions(
         var receipt = try recoverTransaction(allocator, transaction_dir);
         receipt.deinit(allocator);
         try std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir);
+        try syncDirectoryHandle(&dir);
     }
 }
 
@@ -2516,9 +2649,13 @@ fn rollForwardTransaction(
     parsed: ParsedTransactionRecord,
 ) !void {
     for (parsed.writes) |write| {
-        const current = digestRegularFileNoSymlinkAlloc(
+        var target = try TransactionTarget.init(control_root, write.path);
+        defer target.deinit();
+        try target.verifyPathIdentity();
+        const current = digestRegularFileNoSymlinkAtAlloc(
             allocator,
-            write.path,
+            &target.dir,
+            target.base,
             transaction_recovery_max_bytes,
         ) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -2549,9 +2686,6 @@ fn rollForwardTransaction(
         if (!std.mem.eql(u8, staged_digest, write.digest_after)) {
             return error.TransactionCorrupt;
         }
-        var target = try TransactionTarget.init(control_root, write.path);
-        defer target.deinit();
-        try target.verifyPathIdentity();
         try rejectHardlinkedTargetAt(&target.dir, target.base);
         var staged_dir = try std.Io.Dir.openDirAbsolute(
             Io.io(),
@@ -2565,6 +2699,8 @@ fn rollForwardTransaction(
             target.base,
             Io.io(),
         );
+        try syncDirectoryHandle(&staged_dir);
+        try syncDirectoryHandle(&target.dir);
         const published_digest = try digestRegularFileNoSymlinkAtAlloc(
             allocator,
             &target.dir,
@@ -2576,6 +2712,31 @@ fn rollForwardTransaction(
             return error.TransactionRecoveryRequired;
         }
     }
+}
+
+fn syncDirectoryPath(path: []const u8) !void {
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            path,
+            .{ .follow_symlinks = false },
+        )
+    else
+        try std.Io.Dir.cwd().openDir(
+            Io.io(),
+            path,
+            .{ .follow_symlinks = false },
+        );
+    defer dir.close(Io.io());
+    try syncDirectoryHandle(&dir);
+}
+
+fn syncDirectoryHandle(dir: *const std.Io.Dir) !void {
+    const file: std.Io.File = .{
+        .handle = dir.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try file.sync(Io.io());
 }
 
 fn expectedMissingBefore(
@@ -2829,9 +2990,13 @@ fn transactionPublishedCount(
     var published: usize = 0;
     for (writes) |write| {
         _ = try pathRelativeToControlRoot(control_root, write.path);
-        const digest = digestRegularFileNoSymlinkAlloc(
+        var target = try TransactionTarget.init(control_root, write.path);
+        defer target.deinit();
+        try target.verifyPathIdentity();
+        const digest = digestRegularFileNoSymlinkAtAlloc(
             allocator,
-            write.path,
+            &target.dir,
+            target.base,
             transaction_recovery_max_bytes,
         ) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -5007,7 +5172,12 @@ test "cas writes and jsonl snapshots reject stale expectations" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root, "state.jsonl" });
     defer std.testing.allocator.free(path);
 
-    var first = try writeTextAtomicCas(std.testing.allocator, path, "{\"seq\":1,\"ok\":true}\n", .{ .expected_exists = false });
+    var first = try writeTextAtomicCas(
+        std.testing.allocator,
+        path,
+        "{\"seq\":1,\"ok\":true}\n",
+        .{ .expected_exists = false },
+    );
     defer first.deinit(std.testing.allocator);
     try std.testing.expect(first.digest_before == null);
     try std.testing.expectEqual(@as(?u64, null), first.sequence_before);
@@ -5022,35 +5192,69 @@ test "cas writes and jsonl snapshots reject stale expectations" {
     try std.testing.expectEqual(@as(?u64, 1), second.sequence_before);
     try std.testing.expectEqual(@as(?u64, 2), second.sequence_after);
 
-    try std.testing.expectError(error.DigestMismatch, writeTextAtomicCas(std.testing.allocator, path, "{\"seq\":3}\n", .{
-        .expected_digest = first.digest_after,
-    }));
-    try std.testing.expectError(error.SequenceMismatch, writeTextAtomicCas(std.testing.allocator, path, "{\"seq\":3}\n", .{
-        .expected_sequence = 1,
-    }));
-    try std.testing.expectError(error.ExpectationMismatch, writeTextAtomicCas(std.testing.allocator, path, "{\"seq\":3}\n", .{
-        .expected_exists = false,
-    }));
+    try std.testing.expectError(
+        error.DigestMismatch,
+        writeTextAtomicCas(
+            std.testing.allocator,
+            path,
+            "{\"seq\":3}\n",
+            .{ .expected_digest = first.digest_after },
+        ),
+    );
+    try std.testing.expectError(
+        error.SequenceMismatch,
+        writeTextAtomicCas(
+            std.testing.allocator,
+            path,
+            "{\"seq\":3}\n",
+            .{ .expected_sequence = 1 },
+        ),
+    );
+    try std.testing.expectError(
+        error.ExpectationMismatch,
+        writeTextAtomicCas(
+            std.testing.allocator,
+            path,
+            "{\"seq\":3}\n",
+            .{ .expected_exists = false },
+        ),
+    );
 
     var snapshot = try readJsonlSnapshot(std.testing.allocator, path, 2);
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u64, 2), snapshot.sequence);
     try std.testing.expectEqualStrings(second.digest_after, snapshot.digest);
-    try std.testing.expectError(error.SequenceMismatch, readJsonlSnapshot(std.testing.allocator, path, 1));
+    try std.testing.expectError(
+        error.SequenceMismatch,
+        readJsonlSnapshot(std.testing.allocator, path, 1),
+    );
 
-    var committed = try commitJsonlSnapshotCas(std.testing.allocator, path, "{\"seq\":3,\"ok\":true}\n", .{
-        .expected_sequence = 2,
-        .expected_digest = second.digest_after,
-        .expected_exists = true,
-    }, "txn-cas-1");
+    var committed = try commitJsonlSnapshotCas(
+        std.testing.allocator,
+        path,
+        "{\"seq\":3,\"ok\":true}\n",
+        .{
+            .expected_sequence = 2,
+            .expected_digest = second.digest_after,
+            .expected_exists = true,
+        },
+        "txn-cas-1",
+    );
     defer committed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u64, 2), committed.sequence_before);
     try std.testing.expectEqual(@as(?u64, 3), committed.sequence_after);
     try std.testing.expectEqualStrings("txn-cas-1", committed.transaction_id.?);
 
-    try std.testing.expectError(error.InvalidJsonl, commitJsonlSnapshotCas(std.testing.allocator, path, "not-json\n", .{
-        .expected_sequence = 3,
-    }, null));
+    try std.testing.expectError(
+        error.InvalidJsonl,
+        commitJsonlSnapshotCas(
+            std.testing.allocator,
+            path,
+            "not-json\n",
+            .{ .expected_sequence = 3 },
+            null,
+        ),
+    );
 }
 
 const CasWorkerContext = struct {
@@ -5059,10 +5263,15 @@ const CasWorkerContext = struct {
 };
 
 fn runCasWorker(context: *CasWorkerContext) void {
-    var receipt = writeTextAtomicCas(std.heap.smp_allocator, context.path, "{\"seq\":2,\"worker\":true}\n", .{
-        .expected_sequence = 1,
-        .expected_exists = true,
-    }) catch |err| {
+    var receipt = writeTextAtomicCas(
+        std.heap.smp_allocator,
+        context.path,
+        "{\"seq\":2,\"worker\":true}\n",
+        .{
+            .expected_sequence = 1,
+            .expected_exists = true,
+        },
+    ) catch |err| {
         context.result = err;
         return;
     };
@@ -5085,7 +5294,7 @@ test "cas sidecar serializes comparison before write" {
 
     var context: CasWorkerContext = .{ .path = path };
     const thread = try std.Thread.spawn(.{}, runCasWorker, .{&context});
-    std.Io.sleep(Io.io(), .fromMilliseconds(10), .awake) catch {};
+    try std.Io.sleep(Io.io(), .fromMilliseconds(10), .awake);
     try writeTextAtomic(std.testing.allocator, path, "{\"seq\":2,\"main\":true}\n");
     held_lock.release(std.testing.allocator);
     thread.join();

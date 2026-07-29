@@ -29,13 +29,17 @@ pub const AdmittedLocation = struct {
 pub fn admittedLocation(
     absolute_path: []const u8,
     current_root: []const u8,
+    collection_basename: []const u8,
 ) !AdmittedLocation {
     if (!std.fs.path.isAbsolute(absolute_path) or
         !std.fs.path.isAbsolute(current_root))
     {
         return error.DefinitionRootNotAbsolute;
     }
-    const root = canonicalPackageRoot(absolute_path) orelse
+    const root = canonicalPackageRoot(
+        absolute_path,
+        collection_basename,
+    ) orelse
         if (pathWithin(absolute_path, current_root))
             current_root
         else
@@ -49,18 +53,30 @@ pub fn admittedLocation(
 
 pub fn admittedPackageLocation(
     absolute_path: []const u8,
+    collection_basename: []const u8,
 ) !?AdmittedLocation {
     if (!std.fs.path.isAbsolute(absolute_path)) {
         return error.DefinitionRootNotAbsolute;
     }
-    const root = canonicalPackageRoot(absolute_path) orelse return null;
+    const root = canonicalPackageRoot(
+        absolute_path,
+        collection_basename,
+    ) orelse return null;
     return .{
         .root = root,
         .entry = relativeWithin(absolute_path, root),
     };
 }
 
-fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
+fn canonicalPackageRoot(
+    absolute_path: []const u8,
+    collection_basename: []const u8,
+) ?[]const u8 {
+    if (collection_basename.len == 0 or
+        std.mem.indexOfScalar(u8, collection_basename, std.fs.path.sep) != null)
+    {
+        return null;
+    }
     var cursor = std.fs.path.dirname(absolute_path) orelse return null;
     for (0..package_ancestor_count_max) |_| {
         if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
@@ -70,7 +86,7 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
             if (!std.mem.eql(
                 u8,
                 std.fs.path.basename(collection),
-                "skills",
+                collection_basename,
             )) return null;
             if (std.mem.eql(
                 u8,
@@ -925,6 +941,7 @@ test "unrecognized definition folders do not widen the admitted root" {
     const external = try admittedLocation(
         "/opt/config/packages/first/definitions/artifacts/record.json",
         "/workspace/target",
+        "skills",
     );
     try std.testing.expectEqualStrings(
         "/opt/config/packages/first/definitions/artifacts",
@@ -936,10 +953,12 @@ test "unrecognized definition folders do not widen the admitted root" {
     );
     try std.testing.expect((try admittedPackageLocation(
         "/opt/config/packages/first/definitions/artifacts/record.json",
+        "skills",
     )) == null);
     const containing_cwd = try admittedLocation(
         "/opt/config/packages/first/definitions/artifacts/record.json",
         "/opt/config",
+        "skills",
     );
     try std.testing.expectEqualStrings("/opt/config", containing_cwd.root);
     try std.testing.expectEqualStrings(
@@ -949,6 +968,7 @@ test "unrecognized definition folders do not widen the admitted root" {
     const root_safe = try admittedLocation(
         "/tmp/definitions/standalone.json",
         "/workspace/target",
+        "skills",
     );
     try std.testing.expectEqualStrings(
         "/tmp/definitions",
@@ -958,6 +978,7 @@ test "unrecognized definition folders do not widen the admitted root" {
     const standalone = try admittedLocation(
         "/tmp/standalone.json",
         "/workspace/target",
+        "skills",
     );
     try std.testing.expectEqualStrings("/tmp", standalone.root);
     try std.testing.expectEqualStrings("standalone.json", standalone.entry);
@@ -968,30 +989,33 @@ test "manifested definition packages admit cross-package imports" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(
         std.testing.io,
-        "skills/first/definitions/artifacts",
+        "packages/first/definitions/artifacts",
     );
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "skills/first/definitions/manifest.json",
+        .sub_path = "packages/first/definitions/manifest.json",
         .data = "{}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "skills/first/definitions/artifacts/record.json",
+        .sub_path = "packages/first/definitions/artifacts/record.json",
         .data = "{}",
     });
     const absolute = try tmp.dir.realPathFileAlloc(
         std.testing.io,
-        "skills/first/definitions/artifacts/record.json",
+        "packages/first/definitions/artifacts/record.json",
         std.testing.allocator,
     );
     defer std.testing.allocator.free(absolute);
-    const location = (try admittedPackageLocation(absolute)).?;
-    const skills_root = try tmp.dir.realPathFileAlloc(
+    const location = (try admittedPackageLocation(
+        absolute,
+        "packages",
+    )).?;
+    const packages_root = try tmp.dir.realPathFileAlloc(
         std.testing.io,
-        "skills",
+        "packages",
         std.testing.allocator,
     );
-    defer std.testing.allocator.free(skills_root);
-    try std.testing.expectEqualStrings(skills_root, location.root);
+    defer std.testing.allocator.free(packages_root);
+    try std.testing.expectEqualStrings(packages_root, location.root);
     try std.testing.expectEqualStrings(
         "first/definitions/artifacts/record.json",
         location.entry,

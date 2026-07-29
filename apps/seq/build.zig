@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "definition_core", .module = definition_core },
             .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "jsonl_core", .module = jsonl_core },
             .{ .name = "trace_core", .module = trace_core },
             .{ .name = "seq_time", .module = seq_time },
         },

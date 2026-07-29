@@ -10,6 +10,8 @@ const structured = @import("structured.zig");
 const trace_adapter = @import("trace_adapter.zig");
 
 const query_output_bytes_max: usize = 16 * 1024 * 1024;
+const native_output_bytes_max: usize = 16 * 1024 * 1024;
+const native_output_rows_max: usize = 100_000;
 const session_candidate_max: usize = 1_000_000;
 const session_entry_visit_max: usize = 4_000_000;
 
@@ -42,6 +44,72 @@ pub const Command = enum {
     }
 };
 
+pub fn help(command: Command) []const u8 {
+    return switch (command) {
+        .sessions =>
+        \\usage: seq sessions [--root <dir>] [--repo <dir>]
+        \\  [--contains <text>] [--since <time>] [--until <time>]
+        \\  [--last <duration>] [--limit <rows>] [--format json]
+        \\
+        ,
+        .turns =>
+        \\usage: seq turns [--root <dir>] [--session-id <id> | --path <file>]
+        \\  [--contains <text>] [--status <status>] [--since <time>]
+        \\  [--until <time>] [--last <duration>] [--limit <rows>]
+        \\  [--format json]
+        \\
+        ,
+        .session_detail =>
+        \\usage: seq session-detail [--root <dir>]
+        \\  [--session-id <id> | --path <file>] [--format json]
+        \\
+        ,
+        .tool_lifecycle =>
+        \\usage: seq tool-lifecycle [--root <dir>]
+        \\  [--session-id <id> | --path <file>] [--limit <rows>]
+        \\  [--format json]
+        \\
+        ,
+        .session_graph =>
+        \\usage: seq session-graph [--root <dir>]
+        \\  [--session-id <id> | --path <file>] [--limit <rows>]
+        \\  [--format json|dot]
+        \\
+        ,
+        .tail =>
+        \\usage: seq tail --once [--root <dir>]
+        \\  [--current | --session-id <id> | --path <file>]
+        \\  [--limit <rows>] [--format json]
+        \\
+        ,
+        .find_session =>
+        \\usage: seq find-session (--prompt <text> | --session-id <id>)
+        \\  [--root <dir>] [--since <time>] [--until <time>]
+        \\  [--last <duration>] [--limit <rows>] [--format json]
+        \\
+        ,
+        .datasets =>
+        \\usage: seq datasets [--format json|text]
+        \\
+        ,
+        .dataset_schema =>
+        \\usage: seq dataset-schema --dataset <name> [--format json|text]
+        \\
+        ,
+        .query =>
+        \\usage: seq query --spec <json|@file> [--root <dir>]
+        \\  [--session-id <id> | --path <file>] [--repo <dir>]
+        \\  [--since <time>] [--until <time>] [--last <duration>]
+        \\  [--format json]
+        \\
+        ,
+        .index =>
+        \\usage: seq index [rebuild] [--root <dir>] [--format json|text]
+        \\
+        ,
+    };
+}
+
 const Format = enum {
     json,
     text,
@@ -73,7 +141,7 @@ pub const Options = struct {
     action: ?[]const u8 = null,
     current: bool = false,
     once: bool = false,
-    limit: usize = 0,
+    limit: usize = native_output_rows_max,
     format: Format = .json,
     environment: ?*const std.process.Environ.Map = null,
 };
@@ -94,6 +162,40 @@ pub fn run(
         null;
     defer if (normalized_repo) |repo| allocator.free(repo);
     if (normalized_repo) |repo| options.repo = repo;
+    var output_buffer: [8 * 1024]u8 = undefined;
+    var bounded = BoundedWriter.init(
+        writer,
+        native_output_bytes_max,
+        &output_buffer,
+    );
+    runCommand(
+        allocator,
+        &bounded.interface,
+        io,
+        command,
+        options,
+    ) catch |err| {
+        if (err == error.WriteFailed and bounded.exceeded) {
+            return error.NativeOutputByteBoundExceeded;
+        }
+        return err;
+    };
+    bounded.interface.flush() catch |err| {
+        if (err == error.WriteFailed and bounded.exceeded) {
+            return error.NativeOutputByteBoundExceeded;
+        }
+        return err;
+    };
+    return 0;
+}
+
+fn runCommand(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    io: std.Io,
+    command: Command,
+    options: Options,
+) !void {
     switch (command) {
         .sessions => try runRelation(
             allocator,
@@ -143,8 +245,86 @@ pub fn run(
         .query => try runQuery(allocator, writer, io, options),
         .index => try runIndex(allocator, writer, io, options),
     }
-    return 0;
 }
+
+const BoundedWriter = struct {
+    sink: *std.Io.Writer,
+    max_bytes: usize,
+    bytes_written: usize = 0,
+    exceeded: bool = false,
+    interface: std.Io.Writer,
+
+    fn init(
+        sink: *std.Io.Writer,
+        max_bytes: usize,
+        buffer: []u8,
+    ) BoundedWriter {
+        return .{
+            .sink = sink,
+            .max_bytes = max_bytes,
+            .interface = .{
+                .vtable = &.{ .drain = drain, .flush = flush },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn drain(
+        interface: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *BoundedWriter = @fieldParentPtr("interface", interface);
+        const buffered = interface.buffered();
+        var data_count: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            data_count = std.math.add(usize, data_count, bytes.len) catch {
+                self.exceeded = true;
+                return error.WriteFailed;
+            };
+        }
+        const repeated = std.math.mul(
+            usize,
+            data[data.len - 1].len,
+            splat,
+        ) catch {
+            self.exceeded = true;
+            return error.WriteFailed;
+        };
+        data_count = std.math.add(usize, data_count, repeated) catch {
+            self.exceeded = true;
+            return error.WriteFailed;
+        };
+        const count = std.math.add(
+            usize,
+            buffered.len,
+            data_count,
+        ) catch {
+            self.exceeded = true;
+            return error.WriteFailed;
+        };
+        if (count > self.max_bytes -| self.bytes_written) {
+            self.exceeded = true;
+            return error.WriteFailed;
+        }
+        try self.sink.writeAll(buffered);
+        interface.end = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.sink.writeAll(bytes);
+        }
+        for (0..splat) |_| {
+            try self.sink.writeAll(data[data.len - 1]);
+        }
+        self.bytes_written += count;
+        return data_count;
+    }
+
+    fn flush(interface: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *BoundedWriter = @fieldParentPtr("interface", interface);
+        try interface.defaultFlush();
+        try self.sink.flush();
+    }
+};
 
 const NativeOption = enum {
     current,
@@ -211,14 +391,18 @@ fn applyNativeOption(
         .status => options.status = value.?,
         .dataset => options.dataset = value.?,
         .spec => options.spec = value.?,
-        .limit => options.limit = try std.fmt.parseUnsigned(
-            usize,
-            value.?,
-            10,
-        ),
+        .limit => options.limit = try parseNativeLimit(value.?),
         .last => options.last = value.?,
         .format => options.format = try Format.parse(value.?),
     }
+}
+
+fn parseNativeLimit(raw: []const u8) !usize {
+    const limit = try std.fmt.parseUnsigned(usize, raw, 10);
+    if (limit == 0 or limit > native_output_rows_max) {
+        return error.InvalidNativeLimit;
+    }
+    return limit;
 }
 
 fn validateNativeSelectors(options: *Options) !void {
@@ -235,6 +419,7 @@ fn validateNativeSelectors(options: *Options) !void {
 
 fn parseOptions(command: Command, argv: []const []const u8) !Options {
     var options = Options{};
+    var seen_options: u32 = 0;
     var index: usize = 0;
     if (command == .index and argv.len > 0 and
         !std.mem.startsWith(u8, argv[0], "-"))
@@ -244,6 +429,11 @@ fn parseOptions(command: Command, argv: []const []const u8) !Options {
     }
     while (index < argv.len) : (index += 1) {
         const option = try NativeOption.parse(argv[index]);
+        const option_bit = @as(u32, 1) << @intFromEnum(option);
+        if (seen_options & option_bit != 0) {
+            return error.DuplicateNativeOption;
+        }
+        seen_options |= option_bit;
         if (!optionAllowed(command, option)) {
             return error.UnsupportedNativeOption;
         }
@@ -453,7 +643,7 @@ fn relationRowSelection(
     remaining: *usize,
 ) trace_adapter.RowSelection {
     var selection = trace_adapter.RowSelection{
-        .remaining = if (options.limit == 0) null else remaining,
+        .remaining = remaining,
     };
     if (relation == .turns) {
         selection.since_ms = options.since_ms;
@@ -508,7 +698,7 @@ fn runSessionGraph(
     try writer.writeAll("digraph codex_sessions {\n");
     var remaining = options.limit;
     for (paths.items) |path| {
-        if (options.limit != 0 and remaining == 0) break;
+        if (remaining == 0) break;
         var trace = try trace_core.parseSessionTrace(
             allocator,
             path,
@@ -516,7 +706,7 @@ fn runSessionGraph(
         );
         defer trace.deinit(allocator);
         for (trace.graph_edges.items) |edge| {
-            if (options.limit != 0 and remaining == 0) break;
+            if (remaining == 0) break;
             const parent = edge.parent_session_id orelse continue;
             const worker = edge.worker_session_id orelse continue;
             try writer.writeAll("  ");
@@ -524,7 +714,7 @@ fn runSessionGraph(
             try writer.writeAll(" -> ");
             try definition_core.canonical_json.writeCanonicalString(writer, worker);
             try writer.writeAll(";\n");
-            if (options.limit != 0) remaining -= 1;
+            remaining -= 1;
         }
     }
     try writer.writeAll("}\n");
@@ -571,7 +761,7 @@ fn runFindSession(
     var first = true;
     var remaining = options.limit;
     const selection = trace_adapter.RowSelection{
-        .remaining = if (options.limit == 0) null else &remaining,
+        .remaining = &remaining,
     };
     for (paths.items) |path| {
         if (selection.remaining != null and remaining == 0) break;
@@ -1331,7 +1521,7 @@ fn writeOpenCodeRelationRows(
     remaining: *usize,
 ) !void {
     if (!try openCodePathPasses(options, path)) return;
-    const limit = if (options.limit == 0) 100_000 else remaining.*;
+    const limit = remaining.*;
     var compilation = try compileAllFieldsQuery(
         allocator,
         relation,
@@ -1370,9 +1560,6 @@ fn writeOpenCodeRelationRows(
         },
     );
     if (metrics.warnings != 0) return error.PhysicalSourceWarningsPresent;
-    if (options.limit == 0 and runner.stopped) {
-        return error.OpenCodeNativeResultBoundExceeded;
-    }
     const result = try runner.finish();
     const rows = result.rows();
     const count = try writeOpenCodeQueryRows(
@@ -1381,7 +1568,7 @@ fn writeOpenCodeRelationRows(
         rows,
         first,
     );
-    if (options.limit != 0) remaining.* -|= count;
+    remaining.* -|= count;
 }
 
 fn openCodePathPasses(options: Options, path: []const u8) !bool {
@@ -1574,13 +1761,14 @@ pub fn resolveTargetPaths(
         options,
     );
     errdefer freePaths(allocator, &paths);
-    retainCanonicalRolloutWindow(allocator, &paths, options);
-
     const exact_session_id = options.session_id orelse if (options.current)
         environmentValue(options.environment, "CODEX_THREAD_ID") orelse
             return error.CurrentSessionUnavailable
     else
         null;
+    if (exact_session_id == null) {
+        retainCanonicalRolloutWindow(allocator, &paths, options);
+    }
     if (exact_session_id) |wanted| {
         retainSessionId(allocator, &paths, wanted);
     }
@@ -2377,4 +2565,54 @@ test "native queries reject unknown spec keys" {
         error.UnknownField,
         compileQuery(std.testing.allocator, clause.value.object),
     );
+}
+
+test "native parsing rejects duplicate singleton options and unbounded limits" {
+    try std.testing.expectError(
+        error.DuplicateNativeOption,
+        parseOptions(.sessions, &.{
+            "--format",
+            "json",
+            "--format",
+            "json",
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidNativeLimit,
+        parseOptions(.sessions, &.{ "--limit", "0" }),
+    );
+    try std.testing.expectError(
+        error.InvalidNativeLimit,
+        parseOptions(.sessions, &.{ "--limit", "100001" }),
+    );
+}
+
+test "native help exposes command-specific required options" {
+    try std.testing.expect(
+        std.mem.indexOf(u8, help(.query), "--spec") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, help(.dataset_schema), "--dataset") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, help(.tail), "--once") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, help(.find_session), "--prompt") != null,
+    );
+}
+
+test "native output writer fails closed at the aggregate byte bound" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var buffer: [16]u8 = undefined;
+    var bounded = BoundedWriter.init(&output.writer, 4, &buffer);
+    try bounded.interface.writeAll("1234");
+    try bounded.interface.writeByte('5');
+    try std.testing.expectError(
+        error.WriteFailed,
+        bounded.interface.flush(),
+    );
+    try std.testing.expect(bounded.exceeded);
+    try std.testing.expectEqualStrings("", output.written());
 }

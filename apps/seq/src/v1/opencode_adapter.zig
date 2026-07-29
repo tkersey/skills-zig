@@ -1,5 +1,6 @@
 const std = @import("std");
 const execution = @import("execution.zig");
+const jsonl_core = @import("jsonl_core");
 const physical = @import("physical.zig");
 
 pub const adapter_id = "opencode-prompt-history-jsonl/v1";
@@ -66,16 +67,35 @@ pub fn feedFileSelected(
     }
     var session_id_buffer: [64]u8 = undefined;
     const session_id = try sessionId(&session_id_buffer, path);
-    const raw = try readFileAlloc(allocator, path, max_input_bytes);
-    defer allocator.free(raw);
-    const scanned = try scanRecords(
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try openFile(io, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
+    var reader = file.reader(io, &.{});
+    var digest_observer = DigestObserver{ .max_bytes = max_input_bytes };
+    var stream = try jsonl_core.Stream.init(
+        allocator,
+        &reader.interface,
+        .{
+            .max_line_bytes = max_input_bytes,
+            .chunk_observer = .{
+                .context = &digest_observer,
+                .observeFn = DigestObserver.observe,
+            },
+        },
+    );
+    defer stream.deinit();
+    const scanned = try scanStream(
         allocator,
         program,
         runner,
         relation,
         session_id,
         path,
-        raw,
+        &stream,
         selection,
     );
     if (relation == .sessions and !runner.stopped and
@@ -94,11 +114,69 @@ pub fn feedFileSelected(
         _ = try runner.feed(row);
     }
     return .{
-        .bytes_read = raw.len,
+        .bytes_read = digest_observer.bytes_read,
         .records = scanned.records,
         .warnings = scanned.warnings,
-        .digest = digest(raw),
+        .digest = digest_observer.final(),
     };
+}
+
+const DigestObserver = struct {
+    max_bytes: usize,
+    bytes_read: usize = 0,
+    hasher: std.crypto.hash.sha2.Sha256 =
+        std.crypto.hash.sha2.Sha256.init(.{}),
+
+    fn observe(context: *anyopaque, bytes: []const u8) !void {
+        const self: *DigestObserver = @ptrCast(@alignCast(context));
+        self.bytes_read = std.math.add(
+            usize,
+            self.bytes_read,
+            bytes.len,
+        ) catch return error.ObservationInputByteBoundExceeded;
+        if (self.bytes_read > self.max_bytes) {
+            return error.ObservationInputByteBoundExceeded;
+        }
+        self.hasher.update(bytes);
+    }
+
+    fn final(self: DigestObserver) [71]u8 {
+        var mutable = self;
+        var bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        mutable.hasher.final(&bytes);
+        return encodeDigest(bytes);
+    }
+};
+
+fn scanStream(
+    allocator: std.mem.Allocator,
+    program: *const execution.Program,
+    runner: *execution.Runner,
+    relation: physical.Relation,
+    session_id: []const u8,
+    path: []const u8,
+    stream: *jsonl_core.Stream,
+    selection: Selection,
+) !ScanResult {
+    var result = initialScanResult(path, selection);
+    var emission_stopped = false;
+    while (try stream.next()) |line| {
+        result.source_records = line.number;
+        const feed = try scanRecordLine(
+            allocator,
+            program,
+            runner,
+            relation,
+            session_id,
+            path,
+            line.bytes,
+            selection,
+            &result,
+            !emission_stopped,
+        );
+        if (feed == .stop) emission_stopped = true;
+    }
+    return result;
 }
 
 fn scanRecords(
@@ -111,14 +189,7 @@ fn scanRecords(
     raw: []const u8,
     selection: Selection,
 ) !ScanResult {
-    var result = ScanResult{
-        .records = 0,
-        .source_records = 0,
-        .warnings = 0,
-        .tools = 0,
-        .session_matches = selection.contains == null or
-            containsIgnoreCase(path, selection.contains.?),
-    };
+    var result = initialScanResult(path, selection);
     var lines = std.mem.splitScalar(u8, raw, '\n');
     var emission_stopped = false;
     while (lines.next()) |untrimmed| {
@@ -138,6 +209,17 @@ fn scanRecords(
         if (feed == .stop) emission_stopped = true;
     }
     return result;
+}
+
+fn initialScanResult(path: []const u8, selection: Selection) ScanResult {
+    return .{
+        .records = 0,
+        .source_records = 0,
+        .warnings = 0,
+        .tools = 0,
+        .session_matches = selection.contains == null or
+            containsIgnoreCase(path, selection.contains.?),
+    };
 }
 
 fn scanRecordLine(
@@ -741,28 +823,14 @@ fn toolCount(object: std.json.ObjectMap) usize {
     return count;
 }
 
-fn readFileAlloc(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    max_bytes: usize,
-) ![]u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const file = if (std.fs.path.isAbsolute(path))
+fn openFile(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size > max_bytes) {
-        return error.ObservationInputByteBoundExceeded;
-    }
-    var reader = file.reader(io, &.{});
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes));
 }
 
-fn digest(raw: []const u8) [71]u8 {
-    var bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw, &bytes, .{});
+fn encodeDigest(bytes: [std.crypto.hash.sha2.Sha256.digest_length]u8) [71]u8 {
     const hex = std.fmt.bytesToHex(bytes, .lower);
     var encoded: [71]u8 = undefined;
     @memcpy(encoded[0..7], "sha256:");
@@ -933,9 +1001,168 @@ fn usizeInteger(value: usize) !execution.Value {
         return error.ObservationIntegerOverflow };
 }
 
+const MaxRequestAllocator = struct {
+    child: std.mem.Allocator,
+    max_request_bytes: usize = 0,
+
+    fn allocator(self: *MaxRequestAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn observe(self: *MaxRequestAllocator, bytes: usize) void {
+        self.max_request_bytes = @max(self.max_request_bytes, bytes);
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *MaxRequestAllocator = @ptrCast(@alignCast(context));
+        self.observe(len);
+        return self.child.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *MaxRequestAllocator = @ptrCast(@alignCast(context));
+        self.observe(new_len);
+        return self.child.rawResize(
+            memory,
+            alignment,
+            new_len,
+            return_address,
+        );
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *MaxRequestAllocator = @ptrCast(@alignCast(context));
+        self.observe(new_len);
+        return self.child.rawRemap(
+            memory,
+            alignment,
+            new_len,
+            return_address,
+        );
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *MaxRequestAllocator = @ptrCast(@alignCast(context));
+        self.child.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn writeLargePromptHistory(dir: std.Io.Dir) !usize {
+    const valid_line = "{\"input\":\"one\"}\n";
+    const invalid_prefix = "{malformed";
+    const invalid_padding = 4096 - invalid_prefix.len - 1;
+    const line_count = 512;
+    var file = try dir.createFile(
+        std.testing.io,
+        "prompt-history.jsonl",
+        .{},
+    );
+    defer file.close(std.testing.io);
+    var writer = file.writer(std.testing.io, &.{});
+    try writer.interface.writeAll(valid_line);
+    var index: usize = 1;
+    while (index < line_count) : (index += 1) {
+        try writer.interface.writeAll(invalid_prefix);
+        try writer.interface.splatByteAll('x', invalid_padding);
+        try writer.interface.writeByte('\n');
+    }
+    return valid_line.len + 4096 * (line_count - 1);
+}
+
+fn singleSourceEventProgram(
+    source_fields: []u16,
+    output_fields: []u16,
+) execution.Program {
+    return .{
+        .source = .{ .physical = .source_events },
+        .source_width = 1,
+        .source_field_indices = source_fields,
+        .materialized_field_indices = &.{},
+        .source_row_bound = null,
+        .operations = &.{},
+        .predicates = &.{},
+        .sort_keys = &.{},
+        .distinct_fields = &.{},
+        .aggregate_metrics = &.{},
+        .output_field_indices = output_fields,
+        .limit_state_count = 0,
+        .first_blocking_operation = null,
+        .max_rows = 1,
+    };
+}
+
 test "adapter recognizes only the OpenCode prompt-history source" {
     try std.testing.expect(recognizes("/tmp/prompt-history.jsonl"));
     try std.testing.expect(!recognizes("/tmp/rollout.jsonl"));
+}
+
+test "OpenCode prompt history streams aggregate input" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const line_count = 512;
+    const expected_bytes = try writeLargePromptHistory(temporary.dir);
+    const path = try temporary.dir.realPathFileAlloc(
+        std.testing.io,
+        "prompt-history.jsonl",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+    var source_fields = [_]u16{3};
+    var output_fields = [_]u16{0};
+    const program = singleSourceEventProgram(
+        &source_fields,
+        &output_fields,
+    );
+    var output: [1]execution.Value = undefined;
+    var runner = try execution.Runner.init(&program, &output);
+    defer runner.deinit();
+    var tracking = MaxRequestAllocator{
+        .child = std.testing.allocator,
+    };
+    const metrics = try feedFileSelected(
+        tracking.allocator(),
+        &program,
+        &runner,
+        path,
+        4 * 1024 * 1024,
+        .{},
+    );
+    const result = try runner.finish();
+    try std.testing.expectEqual(expected_bytes, metrics.bytes_read);
+    try std.testing.expectEqual(@as(usize, 1), metrics.records);
+    try std.testing.expectEqual(line_count - 1, metrics.warnings);
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expect(tracking.max_request_bytes < 128 * 1024);
 }
 
 test "OpenCode identities bind the immutable source path" {

@@ -231,6 +231,20 @@ const LedgerCases = [_]perf_contract.CaseDescriptor{
     latencyCase("ledger-project", "ledger", "project"),
     latencyCase("ledger-doctor", "ledger", "doctor"),
 };
+const ledger_perf_record_count: usize = 16_384;
+const ledger_perf_max_records: usize = 32_768;
+const ledger_perf_max_store_bytes: usize = 8 * 1024 * 1024;
+const seq_perf_corpus =
+    "{\"timestamp\":\"2026-07-26T10:00:00Z\",\"type\":\"session_meta\"," ++
+    "\"payload\":{\"id\":\"fixture-session\",\"model\":\"gpt-test\"," ++
+    "\"cwd\":\"/repo\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:01Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:02Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"agent_message\"," ++
+    "\"message\":\"Observed FAILURE evidence\"}}\n" ++
+    "{\"timestamp\":\"2026-07-26T10:00:03Z\",\"type\":\"event_msg\"," ++
+    "\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\"}}\n";
 
 const LedgerCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("definition", "definition compilation case"),
@@ -630,7 +644,13 @@ fn captureCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case
 fn captureDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_cfg: DeepCase) ![]const u8 {
     var metrics = try runDeepMeasuredCase(allocator, case_cfg);
     defer metrics.deinit(allocator);
-    const baseline_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, false);
+    const baseline_path = try compatBaselinePath(
+        allocator,
+        machine_dir,
+        case_cfg.descriptor.binary,
+        case_cfg.descriptor.case_id,
+        false,
+    );
     defer allocator.free(baseline_path);
     try writeMetricsArtifact(allocator, baseline_path, .{
         .descriptor = case_cfg.descriptor,
@@ -645,17 +665,60 @@ fn captureDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_c
     return "captured";
 }
 
-fn compareCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_cfg: CompatCase) !CompareRow {
-    const baseline_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, false);
+fn compareCompatCase(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+    case_cfg: CompatCase,
+) !CompareRow {
+    const baseline_path = try compatBaselinePath(
+        allocator,
+        machine_dir,
+        case_cfg.descriptor.binary,
+        case_cfg.descriptor.case_id,
+        false,
+    );
     defer allocator.free(baseline_path);
-    const latest_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, true);
+    const latest_path = try compatBaselinePath(
+        allocator,
+        machine_dir,
+        case_cfg.descriptor.binary,
+        case_cfg.descriptor.case_id,
+        true,
+    );
     defer allocator.free(latest_path);
     if (baseBinaryOverride(case_cfg)) |base_binary| {
         if (case_cfg.descriptor.case_kind == .subprocess or
             case_cfg.descriptor.case_kind == .native)
         {
+            const base_exec = try absolutePathForCwdRelative(
+                allocator,
+                base_binary,
+            );
+            defer allocator.free(base_exec);
             var base_case = case_cfg;
-            base_case.binary_path = base_binary;
+            base_case.binary_path = base_exec;
+            var baseline_evidence = try binaryEvidence(
+                allocator,
+                base_case,
+            );
+            defer baseline_evidence.deinit(allocator);
+            var candidate_evidence = try binaryEvidence(
+                allocator,
+                case_cfg,
+            );
+            defer candidate_evidence.deinit(allocator);
+            if (std.mem.eql(
+                u8,
+                &baseline_evidence.sha256,
+                &candidate_evidence.sha256,
+            )) {
+                return .{
+                    .status = "FAIL",
+                    .case_id = case_cfg.descriptor.case_id,
+                    .binary = case_cfg.descriptor.binary,
+                    .detail = "base and candidate binaries are byte-identical",
+                };
+            }
             var paired = try runPairedMeasuredCases(
                 allocator,
                 base_case,
@@ -667,10 +730,13 @@ fn compareCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case
                 paired.baseline,
                 paired.candidate,
             );
-            try writeMetricsArtifact(
+            try writePairedMetricsArtifact(
                 allocator,
                 latest_path,
                 case_cfg,
+                baseline_evidence,
+                candidate_evidence,
+                paired.baseline,
                 paired.candidate,
                 if (std.mem.eql(u8, compare.status, "PASS"))
                     "pass"
@@ -857,6 +923,9 @@ fn ensureBuilt(allocator: std.mem.Allocator, built: *BuiltState, case_cfg: Compa
 
 fn resolveBinaryPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
     _ = case_cfg.builder;
+    if (std.fs.path.isAbsolute(case_cfg.binary_path)) {
+        return allocator.dupe(u8, case_cfg.binary_path);
+    }
     const environment = process_environment;
     const override = if (environment != null and std.mem.eql(
         u8,
@@ -873,9 +942,6 @@ fn resolveBinaryPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
     else
         null;
     if (override) |path| return allocator.dupe(u8, path);
-    if (std.fs.path.isAbsolute(case_cfg.binary_path)) {
-        return allocator.dupe(u8, case_cfg.binary_path);
-    }
     return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
 }
 
@@ -1010,6 +1076,87 @@ const PairedMetrics = struct {
         self.* = undefined;
     }
 };
+
+const BinaryEvidence = struct {
+    path: [:0]u8,
+    sha256: [64]u8,
+    version: []u8,
+
+    fn deinit(self: *BinaryEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.version);
+        self.* = undefined;
+    }
+};
+
+fn binaryEvidence(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+) !BinaryEvidence {
+    const resolved = try resolveBinaryExecPath(allocator, case_cfg);
+    defer allocator.free(resolved);
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        resolved,
+        allocator,
+    );
+    errdefer allocator.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const sha256 = std.fmt.bytesToHex(digest, .lower);
+    const result = try runChildCaptureOutput(
+        allocator,
+        ".",
+        &.{ path, "version" },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.BinaryVersionFailed;
+    return .{
+        .path = path,
+        .sha256 = sha256,
+        .version = try allocator.dupe(
+            u8,
+            std.mem.trim(u8, result.stdout, " \t\r\n"),
+        ),
+    };
+}
+
+fn perfWorkloadDigest(case_cfg: CompatCase) ![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(case_cfg.descriptor.case_id);
+    hasher.update(@tagName(case_cfg.setup));
+    if (case_cfg.setup == .ledger_transact or
+        case_cfg.setup == .ledger_project or
+        case_cfg.setup == .ledger_doctor)
+    {
+        var buffer: [64]u8 = undefined;
+        const dimensions = try std.fmt.bufPrint(
+            &buffer,
+            "{d}:{d}:{d}",
+            .{
+                ledger_perf_record_count,
+                ledger_perf_max_records,
+                ledger_perf_max_store_bytes,
+            },
+        );
+        hasher.update(dimensions);
+        hasher.update("{\"kind\":\"one\",\"value\":1}\n");
+    }
+    if (case_cfg.setup == .seq_sessions or case_cfg.setup == .seq_query) {
+        hasher.update(seq_perf_corpus);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
 
 fn runPairedMeasuredCases(
     allocator: std.mem.Allocator,
@@ -1468,6 +1615,115 @@ fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg
     try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
+fn writeMetricsObject(
+    writer: *std.Io.Writer,
+    metrics: Metrics,
+    include_allocations: bool,
+) !void {
+    try writer.writeAll("{\"samples_ns\":[");
+    for (metrics.samples.items, 0..) |sample, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{d}", .{sample});
+    }
+    try writer.print(
+        "],\"p50_ns\":{d},\"p95_ns\":{d}",
+        .{ metrics.p50_ns, metrics.p95_ns },
+    );
+    if (include_allocations) {
+        try writer.print(
+            ",\"p50_alloc_calls\":{d}",
+            .{metrics.p50_alloc_calls},
+        );
+    }
+    try writer.writeByte('}');
+}
+
+fn writeBinaryEvidence(
+    writer: *std.Io.Writer,
+    evidence: BinaryEvidence,
+) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(writer, evidence.path);
+    try writer.writeAll(",\"sha256\":\"sha256:");
+    try writer.writeAll(&evidence.sha256);
+    try writer.writeAll("\",\"version\":");
+    try writeJsonString(writer, evidence.version);
+    try writer.writeByte('}');
+}
+
+fn writePairedMetricsArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    case_cfg: CompatCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+    baseline: Metrics,
+    candidate: Metrics,
+    compare_status: []const u8,
+    compare_detail: []const u8,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const writer = &output.writer;
+    const machine_name = try currentMachineDirName(allocator);
+    defer allocator.free(machine_name);
+    const git_sha = try gitShaAlloc(allocator);
+    defer allocator.free(git_sha);
+    const workload_digest = try perfWorkloadDigest(case_cfg);
+    try writer.print(
+        "{{\"schema_version\":2,\"evidence_kind\":\"paired\"," ++
+            "\"machine_id\":\"{s}\",\"git_sha\":\"{s}\"," ++
+            "\"zig_version\":\"{s}\",\"binary\":\"{s}\"," ++
+            "\"case_id\":\"{s}\",\"case_kind\":\"{s}\"," ++
+            "\"warmups\":{d},\"samples\":{d},\"tolerance_pct\":{d:.2}," ++
+            "\"workload\":{{\"setup\":\"{s}\",\"digest\":\"sha256:{s}\"," ++
+            "\"ledger_seed_records\":{d}}},\"baseline\":{{\"binary\":",
+        .{
+            machine_name,
+            git_sha,
+            builtin.zig_version_string,
+            case_cfg.descriptor.binary,
+            case_cfg.descriptor.case_id,
+            case_cfg.descriptor.case_kind.asString(),
+            case_cfg.warmups,
+            case_cfg.samples,
+            case_cfg.tolerance_pct,
+            @tagName(case_cfg.setup),
+            workload_digest,
+            if (case_cfg.setup == .ledger_transact or
+                case_cfg.setup == .ledger_project or
+                case_cfg.setup == .ledger_doctor)
+                ledger_perf_record_count
+            else
+                0,
+        },
+    );
+    try writeBinaryEvidence(writer, baseline_evidence);
+    try writer.writeAll(",\"metrics\":");
+    try writeMetricsObject(
+        writer,
+        baseline,
+        case_cfg.descriptor.measurement_mode == .latency_alloc,
+    );
+    try writer.writeAll("},\"candidate\":{\"binary\":");
+    try writeBinaryEvidence(writer, candidate_evidence);
+    try writer.writeAll(",\"metrics\":");
+    try writeMetricsObject(
+        writer,
+        candidate,
+        case_cfg.descriptor.measurement_mode == .latency_alloc,
+    );
+    try writer.writeAll("},\"compare_status\":");
+    try writeJsonString(writer, compare_status);
+    try writer.writeAll(",\"compare_detail\":");
+    try writeJsonString(writer, compare_detail);
+    try writer.writeAll("}\n");
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = path, .data = output.written() },
+    );
+}
+
 fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, raw_json: []const u8, compare_status: []const u8, compare_detail: []const u8) !void {
     var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer writer_alloc.deinit();
@@ -1493,6 +1749,9 @@ fn prepareCompatCase(
     temp_root: []const u8,
 ) !void {
     switch (case_cfg.setup) {
+        .seq_sessions, .seq_query => {
+            return prepareSeqPerfCorpus(allocator, temp_root);
+        },
         .ledger_transact, .ledger_project, .ledger_doctor => {},
         else => return,
     }
@@ -1502,21 +1761,152 @@ fn prepareCompatCase(
     );
     defer allocator.free(repo_path);
     try makeRepoAwarePath(allocator, repo_path);
+    const definition_path = try prepareLedgerPerfDefinition(
+        allocator,
+        temp_root,
+    );
+    defer allocator.free(definition_path);
+    try prepareLedgerPerfStore(
+        allocator,
+        repo_path,
+        definition_path,
+        case_cfg,
+    );
+}
+
+fn prepareSeqPerfCorpus(
+    allocator: std.mem.Allocator,
+    temp_root: []const u8,
+) !void {
+    const session_dir = try std.fs.path.join(
+        allocator,
+        &.{ temp_root, "seq-sessions/2026/07/26" },
+    );
+    defer allocator.free(session_dir);
+    try makeRepoAwarePath(allocator, session_dir);
+    const session_path = try std.fs.path.join(
+        allocator,
+        &.{
+            session_dir,
+            "rollout-2026-07-26T10-00-00-fixture-session.jsonl",
+        },
+    );
+    defer allocator.free(session_path);
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = session_path, .data = seq_perf_corpus },
+    );
+}
+
+fn prepareLedgerPerfDefinition(
+    allocator: std.mem.Allocator,
+    temp_root: []const u8,
+) ![]u8 {
+    const source = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "apps/ledger/src/v1/fixtures/event-definition.json",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(source);
+    const store_bytes = try std.fmt.allocPrint(
+        allocator,
+        "\"max_bytes\":{d}",
+        .{ledger_perf_max_store_bytes},
+    );
+    defer allocator.free(store_bytes);
+    const max_store_bytes = try std.fmt.allocPrint(
+        allocator,
+        "\"max_store_bytes\":{d}",
+        .{ledger_perf_max_store_bytes},
+    );
+    defer allocator.free(max_store_bytes);
+    const max_records = try std.fmt.allocPrint(
+        allocator,
+        "\"max_records\":{d}",
+        .{ledger_perf_max_records},
+    );
+    defer allocator.free(max_records);
+    const expanded_store = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        source,
+        "\"max_bytes\":65536",
+        store_bytes,
+    );
+    defer allocator.free(expanded_store);
+    const expanded_bounds = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        expanded_store,
+        "\"max_store_bytes\":65536",
+        max_store_bytes,
+    );
+    defer allocator.free(expanded_bounds);
+    const expanded_records = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        expanded_bounds,
+        "\"max_records\":100",
+        max_records,
+    );
+    defer allocator.free(expanded_records);
+    const definition_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_root, "ledger-event-definition.json" },
+    );
+    errdefer allocator.free(definition_path);
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = definition_path, .data = expanded_records },
+    );
+    return definition_path;
+}
+
+fn prepareLedgerPerfStore(
+    allocator: std.mem.Allocator,
+    repo_path: []const u8,
+    definition_path: []const u8,
+    case_cfg: CompatCase,
+) !void {
+    const event_dir = try std.fs.path.join(
+        allocator,
+        &.{ repo_path, ".ledger/example" },
+    );
+    defer allocator.free(event_dir);
+    try makeRepoAwarePath(allocator, event_dir);
+    const event_path = try std.fs.path.join(
+        allocator,
+        &.{ event_dir, "events.jsonl" },
+    );
+    defer allocator.free(event_path);
+    var file = try std.Io.Dir.cwd().createFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        event_path,
+        .{},
+    );
+    {
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        var writer = file.writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
+        var index: usize = 0;
+        while (index < ledger_perf_record_count) : (index += 1) {
+            try writer.interface.writeAll("{\"kind\":\"one\",\"value\":1}\n");
+        }
+    }
     const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
     defer allocator.free(binary_path);
     const argv = [_][]const u8{
         binary_path,
         "transact",
         "--definition",
-        "apps/ledger/src/v1/fixtures/event-definition.json",
+        definition_path,
         "--operation",
-        "append",
+        "bind-existing",
         "--repo",
         repo_path,
-        "--input",
-        "event=apps/ledger/src/v1/fixtures/event-one.json",
-        "--param",
-        "request=perf-seed",
         "--format",
         "json",
     };
@@ -1558,26 +1948,38 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
-        .seq_sessions => try args.appendSlice(allocator, &.{
-            binary_path,
-            "sessions",
-            "--root",
-            "apps/seq/src/v1/fixtures",
-            "--format",
-            "json",
-        }),
-        .seq_query => try args.appendSlice(allocator, &.{
-            binary_path,
-            "query",
-            "--root",
-            "apps/seq/src/v1/fixtures",
-            "--spec",
-            "{\"dataset\":\"messages\",\"where\":[{\"field\":\"text\"," ++
-                "\"op\":\"contains\",\"value\":\"failure\"," ++
-                "\"case_insensitive\":true}],\"select\":[" ++
-                "\"session_id\",\"role\",\"text\"],\"limit\":5," ++
-                "\"format\":\"json\"}",
-        }),
+        .seq_sessions => {
+            const root = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "seq-sessions" },
+            );
+            try args.appendSlice(allocator, &.{
+                binary_path,
+                "sessions",
+                "--root",
+                root,
+                "--format",
+                "json",
+            });
+        },
+        .seq_query => {
+            const root = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "seq-sessions" },
+            );
+            try args.appendSlice(allocator, &.{
+                binary_path,
+                "query",
+                "--root",
+                root,
+                "--spec",
+                "{\"dataset\":\"messages\",\"where\":[" ++
+                    "{\"field\":\"text\",\"op\":\"contains\"," ++
+                    "\"value\":\"failure\",\"case_insensitive\":true}]," ++
+                    "\"select\":[\"session_id\",\"role\",\"text\"]," ++
+                    "\"limit\":5,\"format\":\"json\"}",
+            });
+        },
         .ledger_definition_check => try args.appendSlice(allocator, &.{
             binary_path,
             "definition",
@@ -1615,6 +2017,10 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
                 allocator,
                 &.{ temp_root, "ledger-repo" },
             );
+            const definition_path = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "ledger-event-definition.json" },
+            );
             const request = try std.fmt.allocPrint(
                 allocator,
                 "request=perf-{d}",
@@ -1624,7 +2030,7 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
                 binary_path,
                 "transact",
                 "--definition",
-                "apps/ledger/src/v1/fixtures/event-definition.json",
+                definition_path,
                 "--operation",
                 "append",
                 "--repo",
@@ -1642,13 +2048,17 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
                 allocator,
                 &.{ temp_root, "ledger-repo" },
             );
+            const definition_path = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "ledger-event-definition.json" },
+            );
             try args.appendSlice(allocator, &.{
                 binary_path,
                 "project",
                 "--definition",
-                "apps/ledger/src/v1/fixtures/event-definition.json",
+                definition_path,
                 "--projection",
-                "all",
+                "latest",
                 "--repo",
                 repo_path,
                 "--format",
@@ -1660,11 +2070,15 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
                 allocator,
                 &.{ temp_root, "ledger-repo" },
             );
+            const definition_path = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "ledger-event-definition.json" },
+            );
             try args.appendSlice(allocator, &.{
                 binary_path,
                 "doctor",
                 "--definition",
-                "apps/ledger/src/v1/fixtures/event-definition.json",
+                definition_path,
                 "--repo",
                 repo_path,
                 "--format",
@@ -1718,7 +2132,9 @@ const ChildResult = struct {
 };
 
 fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
-    if (builtin.os.tag == .macos) return runChildCapturePosixSpawn(allocator, cwd, argv);
+    if (builtin.os.tag == .macos) {
+        return runChildCapturePosixSpawn(allocator, cwd, argv, false);
+    }
 
     const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = argv,
@@ -1736,7 +2152,23 @@ fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const 
     };
 }
 
-fn runChildCapturePosixSpawn(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
+fn runChildCaptureOutput(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+) !ChildResult {
+    if (builtin.os.tag == .macos) {
+        return runChildCapturePosixSpawn(allocator, cwd, argv, true);
+    }
+    return runChildCapture(allocator, cwd, argv);
+}
+
+fn runChildCapturePosixSpawn(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    capture_stdout: bool,
+) !ChildResult {
     if (argv.len == 0) return error.FileNotFound;
 
     var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
@@ -1762,12 +2194,47 @@ fn runChildCapturePosixSpawn(allocator: std.mem.Allocator, cwd: []const u8, argv
     if (init_rc != 0) return posixSpawnError(init_rc);
     defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
 
+    const capture_root = if (capture_stdout)
+        try makeTempRoot(allocator, "capture")
+    else
+        null;
+    defer if (capture_root) |path| {
+        cleanupTempRoot(path);
+        allocator.free(path);
+    };
+    const capture_path = if (capture_root) |root|
+        try std.fs.path.join(allocator, &.{ root, "stdout" })
+    else
+        null;
+    defer if (capture_path) |path| allocator.free(path);
+    const capture_path_z = if (capture_path) |path|
+        try allocator.dupeZ(u8, path)
+    else
+        null;
+    defer if (capture_path_z) |path| allocator.free(path);
     const dev_null = "/dev/null";
     const dev_null_flags: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .ACCMODE = .WRONLY })));
-    for ([_]std.c.fd_t{ 1, 2 }) |fd| {
-        const open_rc = std.c.posix_spawn_file_actions_addopen(&actions, fd, dev_null, dev_null_flags, 0);
-        if (open_rc != 0) return posixSpawnError(open_rc);
-    }
+    const stdout_flags: c_int = @intCast(@as(u32, @bitCast(std.c.O{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+    })));
+    const stdout_rc = std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        1,
+        if (capture_path_z) |path| path else dev_null,
+        if (capture_stdout) stdout_flags else dev_null_flags,
+        if (capture_stdout) 0o600 else 0,
+    );
+    if (stdout_rc != 0) return posixSpawnError(stdout_rc);
+    const stderr_rc = std.c.posix_spawn_file_actions_addopen(
+        &actions,
+        2,
+        dev_null,
+        dev_null_flags,
+        0,
+    );
+    if (stderr_rc != 0) return posixSpawnError(stderr_rc);
     const chdir_rc = std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z);
     if (chdir_rc != 0) return posixSpawnError(chdir_rc);
 
@@ -1778,10 +2245,21 @@ fn runChildCapturePosixSpawn(allocator: std.mem.Allocator, cwd: []const u8, argv
 
     var status: if (builtin.link_libc) c_int else u32 = undefined;
     while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS => return .{
-            .exit_code = statusToExitCode(@bitCast(status)),
-            .stdout = try allocator.dupe(u8, ""),
-            .stderr = try allocator.dupe(u8, ""),
+        .SUCCESS => {
+            const stdout = if (capture_path) |path|
+                try std.Io.Dir.cwd().readFileAlloc(
+                    std.Io.Threaded.global_single_threaded.io(),
+                    path,
+                    allocator,
+                    .limited(64 * 1024),
+                )
+            else
+                try allocator.dupe(u8, "");
+            return .{
+                .exit_code = statusToExitCode(@bitCast(status)),
+                .stdout = stdout,
+                .stderr = try allocator.dupe(u8, ""),
+            };
         },
         .INTR => continue,
         .CHILD => return error.NoChildProcess,
@@ -2363,4 +2841,21 @@ test "doctor counts compat and deep cases" {
     for (CompatCases) |_| count += 1;
     for (DeepCases) |_| count += 1;
     try std.testing.expectEqual(CompatCases.len + DeepCases.len, count);
+}
+
+test "paired baseline path outranks candidate environment override" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PERF_LEDGER_BINARY", "/candidate/ledger");
+    const prior = process_environment;
+    defer process_environment = prior;
+    process_environment = &environment;
+    var baseline_case = CompatCases[4];
+    baseline_case.binary_path = "/base/ledger";
+    const resolved = try resolveBinaryPath(
+        std.testing.allocator,
+        baseline_case,
+    );
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings("/base/ledger", resolved);
 }

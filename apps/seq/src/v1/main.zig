@@ -22,7 +22,7 @@ const Help =
     \\
     \\observation commands:
     \\  seq observe --definition <file> --projection <name>
-    \\    [--root <dir> | --session-id <id> | --path <file> | --repo <dir>]
+    \\    [--root <dir>] [--session-id <id> | --path <file>] [--repo <dir>]
     \\    [--since <time>] [--until <time>] [--last <duration>]
     \\    [--input <name>=<file|->]... [--param <name>=<value>]...
     \\    [--format json]
@@ -116,48 +116,42 @@ pub fn runWithArgv(
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    if (std.mem.eql(u8, argv[1], "capabilities")) {
-        if (isOnlyHelp(argv[2..])) {
+    return runSubcommand(allocator, environment, argv[1], argv[2..]);
+}
+
+fn runSubcommand(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    command_name: []const u8,
+    argv: []const []const u8,
+) !u8 {
+    if (std.mem.eql(u8, command_name, "capabilities")) {
+        if (isOnlyHelp(argv)) {
             try writeStdout(Help);
             return 0;
         }
-        return emitCapabilities(argv[2..]);
+        return emitCapabilities(argv);
     }
-    if (std.mem.eql(u8, argv[1], "definition")) {
-        if (argv.len < 3) return error.MissingDefinitionAction;
-        if (std.mem.eql(u8, argv[2], "check")) {
-            if (isOnlyHelp(argv[3..])) {
-                try writeStdout(Help);
-                return 0;
-            }
-            return runDefinitionCheck(allocator, environment, argv[3..]);
-        }
-        if (std.mem.eql(u8, argv[2], "describe")) {
-            if (isOnlyHelp(argv[3..])) {
-                try writeStdout(Help);
-                return 0;
-            }
-            return runDefinitionDescribe(allocator, environment, argv[3..]);
-        }
-        return error.UnknownDefinitionAction;
+    if (std.mem.eql(u8, command_name, "definition")) {
+        return runDefinitionCommand(allocator, environment, argv);
     }
-    if (std.mem.eql(u8, argv[1], "observe")) {
-        if (isOnlyHelp(argv[2..])) {
+    if (std.mem.eql(u8, command_name, "observe")) {
+        if (isOnlyHelp(argv)) {
             try writeStdout(Help);
             return 0;
         }
-        return runObserve(allocator, environment, argv[2..]);
+        return runObserve(allocator, environment, argv);
     }
-    if (std.mem.eql(u8, argv[1], "explain")) {
-        if (isOnlyHelp(argv[2..])) {
+    if (std.mem.eql(u8, command_name, "explain")) {
+        if (isOnlyHelp(argv)) {
             try writeStdout(Help);
             return 0;
         }
-        return runExplain(allocator, environment, argv[2..]);
+        return runExplain(allocator, environment, argv);
     }
-    if (seq.native.Command.parse(argv[1])) |command| {
-        if (isOnlyHelp(argv[2..])) {
-            try writeStdout(Help);
+    if (seq.native.Command.parse(command_name)) |command| {
+        if (isOnlyHelp(argv)) {
+            try writeStdout(seq.native.help(command));
             return 0;
         }
         var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
@@ -165,12 +159,35 @@ pub fn runWithArgv(
             allocator,
             environment,
             command,
-            argv[2..],
+            argv,
             &stdout_writer.interface,
             defaultIo(),
         );
     }
     return error.UnknownCommand;
+}
+
+fn runDefinitionCommand(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+    argv: []const []const u8,
+) !u8 {
+    if (argv.len == 0) return error.MissingDefinitionAction;
+    if (std.mem.eql(u8, argv[0], "check")) {
+        if (isOnlyHelp(argv[1..])) {
+            try writeStdout(Help);
+            return 0;
+        }
+        return runDefinitionCheck(allocator, environment, argv[1..]);
+    }
+    if (std.mem.eql(u8, argv[0], "describe")) {
+        if (isOnlyHelp(argv[1..])) {
+            try writeStdout(Help);
+            return 0;
+        }
+        return runDefinitionDescribe(allocator, environment, argv[1..]);
+    }
+    return error.UnknownDefinitionAction;
 }
 
 fn runExplain(
@@ -1095,6 +1112,7 @@ fn renderObservationAlloc(
 fn parseDefinitionArgs(argv: []const []const u8) !DefinitionArgs {
     var definition_path: ?[]const u8 = null;
     var format: Format = .json;
+    var format_seen = false;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         const token = argv[index];
@@ -1108,6 +1126,8 @@ fn parseDefinitionArgs(argv: []const []const u8) !DefinitionArgs {
         if (std.mem.eql(u8, token, "--format")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
+            if (format_seen) return error.DuplicateFormatOption;
+            format_seen = true;
             format = try Format.parse(argv[index]);
             continue;
         }
@@ -1156,6 +1176,7 @@ const ObserveParseState = struct {
     projection: ?[]const u8 = null,
     selectors: seq.native.Options = .{},
     format: Format = .json,
+    format_seen: bool = false,
     inputs: std.ArrayList([]const u8) = .empty,
     parameters: std.ArrayList([]const u8) = .empty,
 
@@ -1219,7 +1240,11 @@ const ObserveParseState = struct {
             ),
             .input => try self.inputs.append(allocator, value),
             .parameter => try self.parameters.append(allocator, value),
-            .format => self.format = try Format.parse(value),
+            .format => {
+                if (self.format_seen) return error.DuplicateFormatOption;
+                self.format_seen = true;
+                self.format = try Format.parse(value);
+            },
         }
     }
 
@@ -1359,7 +1384,10 @@ fn loadDefinition(
     const absolute = try absoluteDefinitionPathAlloc(allocator, path);
     defer allocator.free(absolute);
     const package_location =
-        try definition_core.closure.admittedPackageLocation(absolute);
+        try definition_core.closure.admittedPackageLocation(
+            absolute,
+            "skills",
+        );
     const cwd = if (package_location == null)
         try std.Io.Dir.cwd().realPathFileAlloc(
             defaultIo(),
@@ -1370,7 +1398,11 @@ fn loadDefinition(
         null;
     defer if (cwd) |owned| allocator.free(owned);
     const location = package_location orelse
-        try definition_core.closure.admittedLocation(absolute, cwd.?);
+        try definition_core.closure.admittedLocation(
+            absolute,
+            cwd.?,
+            "skills",
+        );
     const cache_dir = try seqCacheDirAlloc(allocator, environment);
     defer if (cache_dir) |owned| allocator.free(owned);
     return seq.compiled_plan.load(
@@ -1503,6 +1535,7 @@ fn bindParameters(
 
 fn emitCapabilities(argv: []const []const u8) !u8 {
     var format: Format = .json;
+    var format_seen = false;
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         if (!std.mem.eql(u8, argv[index], "--format")) {
@@ -1510,6 +1543,8 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         }
         index += 1;
         if (index >= argv.len) return error.MissingOptionValue;
+        if (format_seen) return error.DuplicateFormatOption;
+        format_seen = true;
         format = try Format.parse(argv[index]);
     }
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});

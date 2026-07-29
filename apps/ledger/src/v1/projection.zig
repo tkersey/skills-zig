@@ -286,6 +286,7 @@ const KeyedFold = struct {
     key_field: []u8,
     state_field: []u8,
     retained_field: ?[]u8,
+    retained_unwrap_path: ?definition_core.json_pointer.Pointer,
     event_count_field: ?[]u8,
     history: KeyedHistory,
 
@@ -293,6 +294,7 @@ const KeyedFold = struct {
         allocator.free(self.key_field);
         allocator.free(self.state_field);
         if (self.retained_field) |field| allocator.free(field);
+        if (self.retained_unwrap_path) |*pointer| pointer.deinit(allocator);
         if (self.event_count_field) |field| allocator.free(field);
         self.history.deinit(allocator);
         self.* = undefined;
@@ -1263,6 +1265,10 @@ fn encodeProjectionFold(
             try encoder.writeBytes(keyed.key_field);
             try encoder.writeBytes(keyed.state_field);
             try encoder.writeOptionalBytes(keyed.retained_field);
+            try encoder.writeOptionalBytes(if (keyed.retained_unwrap_path) |pointer|
+                pointer.raw
+            else
+                null);
             try encoder.writeOptionalBytes(keyed.event_count_field);
             try encodeKeyedHistory(&keyed.history, encoder);
         },
@@ -1602,6 +1608,9 @@ fn validateCachedKeyedFold(
         keyed_plan.retain_once == null and
         keyed_plan.retain_latest == null)
     {
+        return error.CacheProjectionPlanMismatch;
+    }
+    if (keyed.retained_unwrap_path != null and keyed.retained_field == null) {
         return error.CacheProjectionPlanMismatch;
     }
     try validateKeyedFoldFields(
@@ -2152,6 +2161,17 @@ fn decodeKeyedFold(
     try definition_core.json.safeIdentifier(state_field, 128);
     const retained_field = try decoder.readOptionalBytesAlloc(allocator, 128);
     errdefer if (retained_field) |field| allocator.free(field);
+    const retained_unwrap_raw = try decoder.readOptionalBytesAlloc(
+        allocator,
+        1024,
+    );
+    defer if (retained_unwrap_raw) |raw| allocator.free(raw);
+    var retained_unwrap_path =
+        if (retained_unwrap_raw) |raw|
+            try definition_core.json_pointer.compile(allocator, raw)
+        else
+            null;
+    errdefer if (retained_unwrap_path) |*pointer| pointer.deinit(allocator);
     const event_count_field =
         try decoder.readOptionalBytesAlloc(allocator, 128);
     errdefer if (event_count_field) |field| allocator.free(field);
@@ -2169,6 +2189,7 @@ fn decodeKeyedFold(
         .key_field = key_field,
         .state_field = state_field,
         .retained_field = retained_field,
+        .retained_unwrap_path = retained_unwrap_path,
         .event_count_field = event_count_field,
         .history = history,
     };
@@ -2713,12 +2734,13 @@ const ProjectionCompiler = struct {
         );
         try definition_core.json.safeIdentifier(key_field, 128);
         try definition_core.json.safeIdentifier(state_field, 128);
-        const retained_field = try compileOptionalFieldName(
-            self.allocator,
-            step,
-            "retained_field",
-        );
+        const retained = try self.compileKeyedRetained(step);
+        const retained_field = retained.field;
         errdefer if (retained_field) |field| self.allocator.free(field);
+        var retained_unwrap_path = retained.unwrap_path;
+        errdefer if (retained_unwrap_path) |*pointer| {
+            pointer.deinit(self.allocator);
+        };
         const event_count_field = try compileOptionalFieldName(
             self.allocator,
             step,
@@ -2758,9 +2780,41 @@ const ProjectionCompiler = struct {
             key_field,
             state_field,
             retained_field,
+            retained_unwrap_path,
             event_count_field,
             history,
         );
+    }
+
+    const KeyedRetained = struct {
+        field: ?[]u8,
+        unwrap_path: ?definition_core.json_pointer.Pointer,
+    };
+
+    fn compileKeyedRetained(
+        self: *ProjectionCompiler,
+        step: std.json.ObjectMap,
+    ) !KeyedRetained {
+        const field = try compileOptionalFieldName(
+            self.allocator,
+            step,
+            "retained_field",
+        );
+        errdefer if (field) |value| self.allocator.free(value);
+        var unwrap_path = if (step.get("retained_unwrap_path")) |raw|
+            try definition_core.json_pointer.compile(
+                self.allocator,
+                try definition_core.json.string(raw),
+            )
+        else
+            null;
+        errdefer if (unwrap_path) |*pointer| {
+            pointer.deinit(self.allocator);
+        };
+        if (unwrap_path != null and field == null) {
+            return error.FoldUnwrapRequiresRetainedField;
+        }
+        return .{ .field = field, .unwrap_path = unwrap_path };
     }
 
     fn ownKeyedFold(
@@ -2768,6 +2822,7 @@ const ProjectionCompiler = struct {
         key_field: []const u8,
         state_field: []const u8,
         retained_field: ?[]u8,
+        retained_unwrap_path: ?definition_core.json_pointer.Pointer,
         event_count_field: ?[]u8,
         history: KeyedHistory,
     ) !KeyedFold {
@@ -2778,6 +2833,7 @@ const ProjectionCompiler = struct {
             .key_field = owned_key,
             .state_field = owned_state,
             .retained_field = retained_field,
+            .retained_unwrap_path = retained_unwrap_path,
             .event_count_field = event_count_field,
             .history = history,
         };
@@ -3028,6 +3084,7 @@ fn requireKeyedFoldStep(step: std.json.ObjectMap) !void {
             "key_field",
             "state_field",
             "retained_field",
+            "retained_unwrap_path",
             "event_count_field",
             "event_kind_counts",
             "event_chain",
@@ -4543,11 +4600,41 @@ fn executeResolvedProjection(
         };
         if (streamed) |result| return result;
     }
+    return executeMaterializedProjection(
+        allocator,
+        definition_plan,
+        event_protocol,
+        plan,
+        compiled,
+        projection_name,
+        repo_root,
+        &slot,
+        parameters,
+        effective_limit,
+        &fold_history,
+        &fused_sorted,
+    );
+}
+
+fn executeMaterializedProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    slot: *const storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    fold_history: *?FoldHistoryAccumulator,
+    fused_sorted: *?SortedAccumulator,
+) !Result {
     var snapshot = try custody.readSlotOrMissing(
         allocator,
         repo_root,
         definition_plan.id,
-        slot,
+        slot.*,
     );
     defer snapshot.deinit(allocator);
     var replay_stats = try validateProjectionReplay(
@@ -4556,11 +4643,11 @@ fn executeResolvedProjection(
         event_protocol,
         compiled,
         repo_root,
-        &slot,
+        slot,
         &snapshot,
         parameters,
-        if (fold_history) |*value| value else null,
-        if (fused_sorted) |*value| value else null,
+        if (fold_history.*) |*value| value else null,
+        if (fused_sorted.*) |*value| value else null,
     );
     defer replay_stats.deinit(allocator);
     return executeValidatedProjection(
@@ -4570,13 +4657,13 @@ fn executeResolvedProjection(
         plan,
         compiled,
         projection_name,
-        &slot,
+        slot,
         &snapshot,
         parameters,
         effective_limit,
         &replay_stats,
-        &fold_history,
-        &fused_sorted,
+        fold_history,
+        fused_sorted,
     );
 }
 
@@ -4603,13 +4690,72 @@ fn executeResolvedStreamProjection(
     if (!snapshot.exists) return null;
     const protocol_required = event_protocol != null and
         event_protocol.?.target_slot_index == compiled.slot_index;
-    var replay_stats = if (fold_history.*) |*accumulator|
+    var replay_stats = try validateStreamProjectionReplay(
+        allocator,
+        definition_plan,
+        repo_root,
+        slot,
+        &snapshot,
+        parameters,
+        protocol_required,
+        fold_history,
+        fused_sorted,
+    );
+    defer replay_stats.deinit(allocator);
+    const effective_limit =
+        try resolveLimit(compiled.limit, parameters, plan.max_records);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = replay_stats.records_validated,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    try writeStreamProjection(
+        allocator,
+        event_protocol,
+        compiled,
+        parameters,
+        effective_limit,
+        plan.max_output_bytes,
+        &replay_stats,
+        fold_history,
+        fused_sorted,
+        &output,
+        &stats,
+    );
+    if (output.written().len > plan.max_output_bytes)
+        return error.ProjectionOutputBoundsExceeded;
+    return try buildProjectionResult(
+        allocator,
+        definition_plan,
+        compiled,
+        projection_name,
+        slot.relative_path,
+        snapshot.revision,
+        &output,
+        stats,
+    );
+}
+
+fn validateStreamProjectionReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    repo_root: []const u8,
+    slot: *const storage.ResolvedSlot,
+    snapshot: *const custody.ReplaySlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+    fold_history: *?FoldHistoryAccumulator,
+    fused_sorted: *?SortedAccumulator,
+) !replay.Stats {
+    return if (fold_history.*) |*accumulator|
         try replay.validateReplaySlotObserved(
             allocator,
             repo_root,
             definition_plan.id,
             slot.*,
-            &snapshot,
+            snapshot,
             parameters,
             definition_plan.bounds.max_records,
             protocol_required,
@@ -4621,7 +4767,7 @@ fn executeResolvedStreamProjection(
             repo_root,
             definition_plan.id,
             slot.*,
-            &snapshot,
+            snapshot,
             parameters,
             definition_plan.bounds.max_records,
             protocol_required,
@@ -4629,53 +4775,48 @@ fn executeResolvedStreamProjection(
         )
     else
         return error.StreamProjectionAccumulatorMissing;
-    defer replay_stats.deinit(allocator);
-    const effective_limit =
-        try resolveLimit(compiled.limit, parameters, plan.max_records);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    var stats: Stats = .{
-        .records_scanned = replay_stats.records_validated,
-        .records_matched = 0,
-        .records_emitted = 0,
-    };
+}
+
+fn writeStreamProjection(
+    allocator: std.mem.Allocator,
+    event_protocol: ?*const protocol.Plan,
+    compiled: *const Projection,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    max_output_bytes: usize,
+    replay_stats: *replay.Stats,
+    fold_history: *?FoldHistoryAccumulator,
+    fused_sorted: *?SortedAccumulator,
+    output: *std.Io.Writer.Allocating,
+    stats: *Stats,
+) !void {
     if (compiled.fold != null) {
         try executeFoldProjection(
             allocator,
             event_protocol,
             compiled,
-            &replay_stats,
+            replay_stats,
             if (fold_history.*) |*value| value else null,
             parameters,
             effective_limit,
-            plan.max_output_bytes,
-            &output,
-            &stats,
+            max_output_bytes,
+            output,
+            stats,
         );
     } else {
-        const accumulator = if (fused_sorted.*) |*value| value else return error.StreamProjectionAccumulatorMissing;
+        const accumulator = if (fused_sorted.*) |*value|
+            value
+        else
+            return error.StreamProjectionAccumulatorMissing;
         if (accumulator.records_seen != replay_stats.records_validated) {
             return error.StreamProjectionRecordCountMismatch;
         }
         try accumulator.write(
             &output.writer,
             effective_limit,
-            &stats,
+            stats,
         );
     }
-    if (output.written().len > plan.max_output_bytes) {
-        return error.ProjectionOutputBoundsExceeded;
-    }
-    return try buildProjectionResult(
-        allocator,
-        definition_plan,
-        compiled,
-        projection_name,
-        slot.relative_path,
-        snapshot.revision,
-        &output,
-        stats,
-    );
 }
 
 fn initSortedAccumulator(
@@ -5579,10 +5720,12 @@ fn writeFilteredKeyedFold(
         if (emitted == limit) continue;
         if (emitted != 0) try output.writer.writeByte(',');
         try writeKeyedHistoryRow(
+            allocator,
             &output.writer,
             fields,
             view,
             history,
+            if (keyed.retained_unwrap_path) |*pointer| pointer else null,
         );
         emitted += 1;
         if (output.written().len > max_output_bytes) {
@@ -5828,10 +5971,12 @@ fn writeKeyedHistoryRows(
         else
             null;
         try writeKeyedHistoryRow(
+            allocator,
             &output.writer,
             fields,
             view,
             history,
+            if (keyed.retained_unwrap_path) |*pointer| pointer else null,
         );
         if (output.written().len > max_output_bytes) {
             return error.ProjectionOutputBoundsExceeded;
@@ -5913,10 +6058,12 @@ fn keyedHistoryFields(
 }
 
 fn writeKeyedHistoryRow(
+    allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     fields: []const KeyedHistoryField,
     view: reducer.EntryView,
     history: ?*const FoldHistoryEntry,
+    retained_unwrap_path: ?*const definition_core.json_pointer.Pointer,
 ) !void {
     try writer.writeByte('{');
     for (fields, 0..) |field, field_index| {
@@ -5931,9 +6078,12 @@ fn writeKeyedHistoryRow(
                 .writeCanonicalString(writer, view.key),
             .state => try definition_core.canonical_json
                 .writeCanonicalString(writer, view.state),
-            .retained => try writer.writeAll(
+            .retained => try writeKeyedRetainedValue(
+                allocator,
+                writer,
                 view.retained orelse
                     return error.ReducerRetainedValueMissing,
+                retained_unwrap_path,
             ),
             .event_count => try writer.print("{d}", .{view.event_count}),
             .event_kind_count => |index| try writer.print(
@@ -5976,6 +6126,31 @@ fn writeKeyedHistoryRow(
         }
     }
     try writer.writeByte('}');
+}
+
+fn writeKeyedRetainedValue(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    retained: []const u8,
+    unwrap_path: ?*const definition_core.json_pointer.Pointer,
+) !void {
+    const pointer = unwrap_path orelse return writer.writeAll(retained);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        retained,
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const value = definition_core.json_pointer.lookup(
+        parsed.value,
+        pointer.*,
+    ) orelse return writer.writeAll(retained);
+    try definition_core.canonical_json.writeCanonicalJson(
+        allocator,
+        writer,
+        value,
+    );
 }
 
 fn writeRetainedProjection(

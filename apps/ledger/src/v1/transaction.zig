@@ -876,7 +876,45 @@ fn prepareExistingBinding(
         source.slot_content,
         parameters,
     );
-    const binding_after = try custody.appendBindingRowAlloc(
+    const replay_parameter_names = try replayParameterNamesAlloc(
+        allocator,
+        event_protocol,
+        effect.slot_index,
+    );
+    defer allocator.free(replay_parameter_names);
+    const binding_after = try appendExistingBindingAlloc(
+        allocator,
+        definition_plan,
+        slot,
+        operation_name,
+        &source,
+        record_count,
+        parameters,
+        replay_parameter_names,
+    );
+    source.before.deinit(allocator);
+    return .{
+        .slot_index = effect.slot_index,
+        .input_index = effect.input_index,
+        .slot_path = source.slot_path,
+        .slot_content = source.slot_content,
+        .slot_digest = source.slot_digest,
+        .binding_path = source.binding_path,
+        .binding_after = binding_after,
+    };
+}
+
+fn appendExistingBindingAlloc(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    operation_name: []const u8,
+    source: *const ExistingBindingSource,
+    record_count: ?usize,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_parameter_names: []const []const u8,
+) ![]u8 {
+    return custody.appendBindingRowAlloc(
         allocator,
         source.before.bytes,
         definition_plan,
@@ -894,17 +932,9 @@ fn prepareExistingBinding(
         null,
         source.slot_digest,
         null,
+        parameters,
+        replay_parameter_names,
     );
-    source.before.deinit(allocator);
-    return .{
-        .slot_index = effect.slot_index,
-        .input_index = effect.input_index,
-        .slot_path = source.slot_path,
-        .slot_content = source.slot_content,
-        .slot_digest = source.slot_digest,
-        .binding_path = source.binding_path,
-        .binding_after = binding_after,
-    };
 }
 
 fn readExistingBindingSource(
@@ -1367,7 +1397,7 @@ fn prepareEffectWithBinding(
     parameters: *const definition_core.parameters.Bindings,
     transaction_generated: []const protocol.GeneratedOutput,
     slot: storage.ResolvedSlot,
-    source: *const EffectSlotSource,
+    source: *EffectSlotSource,
     binding_before: *custody.BindingSnapshot,
     idempotency: *const EffectIdempotency,
 ) !PreparedEffect {
@@ -1662,7 +1692,7 @@ fn prepareEffectReplay(
     slot: storage.ResolvedSlot,
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
-    source: *const EffectSlotSource,
+    source: *EffectSlotSource,
     binding_before: custody.BindingSnapshot,
     derived_key: ?[]const u8,
 ) !EffectReplayContext {
@@ -1677,69 +1707,22 @@ fn prepareEffectReplay(
             derived_key,
         );
         defer derived_observer.deinit();
-        var stats = if (source.stream_event_log) stream: {
-            const snapshot: custody.ReplaySlot = .{
-                .exists = true,
-                .path = source.slot_path,
-                .revision = source.before_digest.?,
-                .binding = binding_before,
-            };
-            break :stream if (derived_observer.active())
-                try replay.validateReplaySlotObserved(
-                    allocator,
-                    repo_root,
-                    definition_plan.id,
-                    slot,
-                    &snapshot,
-                    parameters,
-                    definition_plan.bounds.max_records,
-                    protocol_required,
-                    &derived_observer,
-                )
-            else
-                try replay.validateReplaySlot(
-                    allocator,
-                    repo_root,
-                    definition_plan.id,
-                    slot,
-                    &snapshot,
-                    parameters,
-                    definition_plan.bounds.max_records,
-                    protocol_required,
-                );
-        } else materialized: {
-            const snapshot: custody.SlotSnapshot = .{
-                .exists = true,
-                .path = source.slot_path,
-                .content = source.before.?,
-                .revision = source.before_digest.?,
-                .binding = binding_before,
-            };
-            break :materialized if (derived_observer.active())
-                try replay.validateSlotObserved(
-                    allocator,
-                    repo_root,
-                    definition_plan.id,
-                    slot,
-                    &snapshot,
-                    parameters,
-                    definition_plan.bounds.max_records,
-                    protocol_required,
-                    &derived_observer,
-                )
-            else
-                try replay.validateSlot(
-                    allocator,
-                    repo_root,
-                    definition_plan.id,
-                    slot,
-                    &snapshot,
-                    parameters,
-                    definition_plan.bounds.max_records,
-                    protocol_required,
-                );
-        };
+        var stats = try validateExistingEffectReplay(
+            allocator,
+            definition_plan,
+            slot,
+            repo_root,
+            parameters,
+            source,
+            binding_before,
+            protocol_required,
+            &derived_observer,
+        );
         defer stats.deinit(allocator);
+        if (source.stream_event_log and stats.append_context == null) {
+            stats.append_context =
+                durable_store.EventAppendContext.fromBytes(source.before.?);
+        }
         return .{
             .existing_records = if (slot.kind == .event_log)
                 stats.records_validated
@@ -1759,6 +1742,149 @@ fn prepareEffectReplay(
         else
             null,
     };
+}
+
+fn validateExistingEffectReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    source: *EffectSlotSource,
+    binding_before: custody.BindingSnapshot,
+    protocol_required: bool,
+    observer: *DerivedMatchObserver,
+) !replay.Stats {
+    if (!source.stream_event_log) {
+        return validateMaterializedEffectReplay(
+            allocator,
+            definition_plan,
+            slot,
+            repo_root,
+            parameters,
+            source,
+            binding_before,
+            protocol_required,
+            observer,
+        );
+    }
+    const streamed = validateStreamedEffectReplay(
+        allocator,
+        definition_plan,
+        slot,
+        repo_root,
+        parameters,
+        source,
+        binding_before,
+        protocol_required,
+        observer,
+    );
+    return streamed catch |err| switch (err) {
+        error.ReplayRequiresMaterializedHistory => {
+            source.before = try durable_store.readRegularFileNoSymlink(
+                allocator,
+                source.slot_path,
+                slot.max_bytes,
+            );
+            return validateMaterializedEffectReplay(
+                allocator,
+                definition_plan,
+                slot,
+                repo_root,
+                parameters,
+                source,
+                binding_before,
+                protocol_required,
+                observer,
+            );
+        },
+        else => return err,
+    };
+}
+
+fn validateStreamedEffectReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    source: *const EffectSlotSource,
+    binding_before: custody.BindingSnapshot,
+    protocol_required: bool,
+    observer: *DerivedMatchObserver,
+) !replay.Stats {
+    const snapshot: custody.ReplaySlot = .{
+        .exists = true,
+        .path = source.slot_path,
+        .revision = source.before_digest.?,
+        .binding = binding_before,
+    };
+    if (observer.active()) {
+        return replay.validateReplaySlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            observer,
+        );
+    }
+    return replay.validateReplaySlot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        &snapshot,
+        parameters,
+        definition_plan.bounds.max_records,
+        protocol_required,
+    );
+}
+
+fn validateMaterializedEffectReplay(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    repo_root: []const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    source: *const EffectSlotSource,
+    binding_before: custody.BindingSnapshot,
+    protocol_required: bool,
+    observer: anytype,
+) !replay.Stats {
+    const snapshot: custody.SlotSnapshot = .{
+        .exists = true,
+        .path = source.slot_path,
+        .content = source.before.?,
+        .revision = source.before_digest.?,
+        .binding = binding_before,
+    };
+    return if (observer.active())
+        replay.validateSlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            observer,
+        )
+    else
+        replay.validateSlot(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+        );
 }
 
 const DerivedMatchObserver = struct {
@@ -1834,6 +1960,22 @@ fn protocolTargetsSlot(
         event_protocol.?.target_slot_index == slot_index;
 }
 
+fn replayParameterNamesAlloc(
+    allocator: std.mem.Allocator,
+    event_protocol: ?*const protocol.Plan,
+    slot_index: u16,
+) ![][]const u8 {
+    if (!protocolTargetsSlot(event_protocol, slot_index)) {
+        return allocator.alloc([]const u8, 0);
+    }
+    const bindings = event_protocol.?.envelope.partition_bindings;
+    const names = try allocator.alloc([]const u8, bindings.len);
+    for (bindings, 0..) |binding, index| {
+        names[index] = binding.parameter;
+    }
+    return names;
+}
+
 fn prepareEffectAfterReplay(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
@@ -1873,6 +2015,7 @@ fn prepareEffectAfterReplay(
     return finishPreparedEffect(
         allocator,
         definition_plan,
+        event_protocol,
         effect,
         operation_name,
         repo_root,
@@ -1883,6 +2026,7 @@ fn prepareEffectAfterReplay(
         idempotency_key,
         input_digest,
         idempotency_match,
+        parameters,
         &input,
     );
 }
@@ -1946,6 +2090,36 @@ fn materializeEffectInputAlloc(
             replay_context,
         );
     }
+    return materializeNonEventEffectInput(
+        allocator,
+        definition_plan,
+        event_protocol,
+        effect,
+        execution,
+        parameters,
+        transaction_generated,
+        slot,
+        source,
+        replay_context,
+        request,
+        idempotency_match,
+    );
+}
+
+fn materializeNonEventEffectInput(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    effect: storage.Effect,
+    execution: *const validation.Execution,
+    parameters: *const definition_core.parameters.Bindings,
+    transaction_generated: []const protocol.GeneratedOutput,
+    slot: storage.ResolvedSlot,
+    source: *const EffectSlotSource,
+    replay_context: *EffectReplayContext,
+    request: []const u8,
+    idempotency_match: bool,
+) !EffectMaterializedInput {
     if (effect.document) |*document_plan| {
         return materializeDocumentEffectInput(
             allocator,
@@ -2236,6 +2410,7 @@ fn materializeRawEffectInput(
 fn finishPreparedEffect(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
     effect: storage.Effect,
     operation_name: []const u8,
     repo_root: []const u8,
@@ -2246,14 +2421,9 @@ fn finishPreparedEffect(
     idempotency_key: ?[]const u8,
     input_digest: []const u8,
     idempotency_match: bool,
+    parameters: *const definition_core.parameters.Bindings,
     input: *const EffectMaterializedInput,
 ) !PreparedEffect {
-    const canonical_digest =
-        try definition_core.canonical_json.digestBytesAlloc(
-            allocator,
-            input.canonical,
-        );
-    defer allocator.free(canonical_digest);
     const slot_after = try prepareSlotAfter(
         allocator,
         definition_plan,
@@ -2275,18 +2445,21 @@ fn finishPreparedEffect(
         repo_root,
     );
     errdefer if (revision) |*candidate| candidate.deinit(allocator);
-    const binding_after = try prepareEffectBindingAfter(
+    const binding_after = try prepareEffectBindingForInput(
         allocator,
         definition_plan,
+        event_protocol,
+        effect,
         operation_name,
         slot,
         source,
         binding_before,
         input_digest,
-        canonical_digest,
         &slot_after,
         idempotency_key,
         idempotency_match,
+        parameters,
+        input.canonical,
     );
     return assembledPreparedEffect(
         effect,
@@ -2297,6 +2470,51 @@ fn finishPreparedEffect(
         input,
         revision,
         idempotency_match,
+    );
+}
+
+fn prepareEffectBindingForInput(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    effect: storage.Effect,
+    operation_name: []const u8,
+    slot: storage.ResolvedSlot,
+    source: *const EffectSlotSource,
+    binding_before: *const custody.BindingSnapshot,
+    input_digest: []const u8,
+    slot_after: *const SlotAfter,
+    idempotency_key: ?[]const u8,
+    idempotency_match: bool,
+    parameters: *const definition_core.parameters.Bindings,
+    canonical_input: []const u8,
+) ![]u8 {
+    const canonical_digest =
+        try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            canonical_input,
+        );
+    defer allocator.free(canonical_digest);
+    const replay_parameter_names = try replayParameterNamesAlloc(
+        allocator,
+        event_protocol,
+        effect.slot_index,
+    );
+    defer allocator.free(replay_parameter_names);
+    return prepareEffectBindingAfter(
+        allocator,
+        definition_plan,
+        operation_name,
+        slot,
+        source,
+        binding_before,
+        input_digest,
+        canonical_digest,
+        slot_after,
+        idempotency_key,
+        idempotency_match,
+        parameters,
+        replay_parameter_names,
     );
 }
 
@@ -2356,60 +2574,13 @@ fn prepareSlotAfter(
         };
     }
     if (source.stream_event_log and effect.kind == .compare_append) {
-        const append_context = replay_context.append_context orelse
-            return error.StreamingAppendContextMissing;
-        const existing_records = replay_context.existing_records orelse
-            return error.ExistingEventRecordCountMissing;
-        if (existing_records >= definition_plan.bounds.max_records) {
-            return error.TransactionRecordBoundsExceeded;
-        }
-        const separator = append_context.separator_bytes;
-        if (separator > 1) return error.InvalidEventAppendSeparator;
-        const suffix_size = std.math.add(
-            usize,
-            separator,
-            canonical_input.len,
-        ) catch return error.StorageSlotBoundsExceeded;
-        const final_size = std.math.add(
-            usize,
-            suffix_size,
-            1,
-        ) catch return error.StorageSlotBoundsExceeded;
-        const after_size = std.math.add(
-            usize,
-            append_context.extent_bytes,
-            final_size,
-        ) catch return error.StorageSlotBoundsExceeded;
-        if (after_size > slot.max_bytes) {
-            return error.StorageSlotBoundsExceeded;
-        }
-        const suffix = try allocator.alloc(u8, final_size);
-        errdefer allocator.free(suffix);
-        var cursor: usize = 0;
-        if (separator != 0) {
-            suffix[cursor] = '\n';
-            cursor += 1;
-        }
-        @memcpy(suffix[cursor .. cursor + canonical_input.len], canonical_input);
-        const extent_start = append_context.extent_bytes + separator;
-        cursor += canonical_input.len;
-        suffix[cursor] = '\n';
-        const digest = try append_context.revisionWithSuffixAlloc(
+        return prepareStreamAppendSlotAfter(
             allocator,
-            suffix,
+            definition_plan,
+            slot,
+            replay_context,
+            canonical_input,
         );
-        return .{
-            .bytes = suffix,
-            .digest = digest,
-            .extent = .{
-                .kind = .admission,
-                .record_start = existing_records,
-                .record_end = existing_records + 1,
-                .extent_start = extent_start,
-                .extent_end = extent_start + canonical_input.len,
-            },
-            .append_only = true,
-        };
     }
     const content = try slotContentAfter(
         allocator,
@@ -2437,6 +2608,63 @@ fn prepareSlotAfter(
         .digest = digest,
         .extent = content.extent,
         .append_only = false,
+    };
+}
+
+fn prepareStreamAppendSlotAfter(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    slot: storage.ResolvedSlot,
+    replay_context: *const EffectReplayContext,
+    canonical_input: []const u8,
+) !SlotAfter {
+    const append_context = replay_context.append_context orelse
+        return error.StreamingAppendContextMissing;
+    const existing_records = replay_context.existing_records orelse
+        return error.ExistingEventRecordCountMissing;
+    if (existing_records >= definition_plan.bounds.max_records) {
+        return error.TransactionRecordBoundsExceeded;
+    }
+    const separator = append_context.separator_bytes;
+    if (separator > 1) return error.InvalidEventAppendSeparator;
+    const suffix_size = std.math.add(
+        usize,
+        separator,
+        canonical_input.len,
+    ) catch return error.StorageSlotBoundsExceeded;
+    const final_size = std.math.add(
+        usize,
+        suffix_size,
+        1,
+    ) catch return error.StorageSlotBoundsExceeded;
+    const after_size = std.math.add(
+        usize,
+        append_context.extent_bytes,
+        final_size,
+    ) catch return error.StorageSlotBoundsExceeded;
+    if (after_size > slot.max_bytes) return error.StorageSlotBoundsExceeded;
+    const suffix = try allocator.alloc(u8, final_size);
+    errdefer allocator.free(suffix);
+    var cursor: usize = 0;
+    if (separator != 0) {
+        suffix[cursor] = '\n';
+        cursor += 1;
+    }
+    @memcpy(suffix[cursor .. cursor + canonical_input.len], canonical_input);
+    const extent_start = append_context.extent_bytes + separator;
+    cursor += canonical_input.len;
+    suffix[cursor] = '\n';
+    return .{
+        .bytes = suffix,
+        .digest = try append_context.revisionWithSuffixAlloc(allocator, suffix),
+        .extent = .{
+            .kind = .admission,
+            .record_start = existing_records,
+            .record_end = existing_records + 1,
+            .extent_start = extent_start,
+            .extent_end = extent_start + canonical_input.len,
+        },
+        .append_only = true,
     };
 }
 
@@ -2485,6 +2713,8 @@ fn prepareEffectBindingAfter(
     slot_after: *const SlotAfter,
     idempotency_key: ?[]const u8,
     idempotency_match: bool,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_parameter_names: []const []const u8,
 ) ![]u8 {
     if (idempotency_match) {
         return allocator.dupe(u8, binding_before.bytes);
@@ -2501,6 +2731,8 @@ fn prepareEffectBindingAfter(
         source.before_digest,
         slot_after.digest,
         idempotency_key,
+        parameters,
+        replay_parameter_names,
     );
 }
 
@@ -4479,6 +4711,141 @@ test "transaction admits and replays a definition-bound event chain" {
     );
 }
 
+const renamed_partition_definition =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/renamed-partition","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["body-digest","compare-and-append","event-digest","event-envelope","event-kinds","exact-object","path-format","previous-digest","replay","sequence"]},"parameters":{"stream":{"type":"safe_identifier","required":true}},"inputs":{"event":{"codec":"json","max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"event":{"object":"exact","fields":{"body":{},"body_digest":{},"event_digest":{},"kind":{},"previous_digest":{},"sequence":{}},"event_envelope":{"keys":["body","body_digest","event_digest","kind","previous_digest","sequence"],"sequence":"/sequence","kind":"/kind","previous_digest":"/previous_digest","body":"/body","body_digest":"/body_digest","event_digest":"/event_digest","partition_bindings":[{"parameter":"stream","event_value":"/body/partition_id"}]}}}},"constraints":{"event_log":{"start":1,"genesis":null,"kinds":["created","updated"]}},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/{stream}/renamed.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":3,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":4}}
+;
+
+fn renamedPartitionDefinitionV2Alloc(
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const parameter = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        renamed_partition_definition,
+        "\"stream\"",
+        "\"topic\"",
+    );
+    defer allocator.free(parameter);
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        parameter,
+        "{stream}",
+        "{topic}",
+    );
+}
+
+fn appendWithRenamedPartition(
+    plans: *TransactionTestPlans,
+    source: []const u8,
+    event: []const u8,
+) !Result {
+    try plans.definition_tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = plans.entry_path,
+        .data = source,
+    });
+    var closure = try definition_core.closure.loadFromDir(
+        std.testing.allocator,
+        &plans.definition_tmp.dir,
+        plans.entry_path,
+        .{},
+    );
+    defer closure.deinit(std.testing.allocator);
+    var definition_plan = try definition.compile(
+        std.testing.allocator,
+        &closure,
+        plans.entry_path,
+    );
+    defer definition_plan.deinit(std.testing.allocator);
+    var validation_plan = try validation.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer validation_plan.deinit(std.testing.allocator);
+    var storage_plan = try storage.compile(
+        std.testing.allocator,
+        &definition_plan,
+    );
+    defer storage_plan.deinit(std.testing.allocator);
+    var event_protocol = (try protocol.compile(
+        std.testing.allocator,
+        &definition_plan,
+        &storage_plan,
+    )).?;
+    defer event_protocol.deinit(std.testing.allocator);
+    var parameters = try definition_core.parameters.bind(
+        std.testing.allocator,
+        &definition_plan.parameter_declarations,
+        &.{.{ .name = "topic", .raw_value = "alpha" }},
+    );
+    defer parameters.deinit(std.testing.allocator);
+    return transact(
+        std.testing.allocator,
+        &definition_plan,
+        &closure,
+        plans.entry_path,
+        &validation_plan,
+        &storage_plan,
+        &event_protocol,
+        "append",
+        plans.repo_root,
+        &.{.{ .name = "event", .bytes = event }},
+        &parameters,
+    );
+}
+
+test "historical replay uses the parameter names archived with each row" {
+    var plans = try TransactionTestPlans.init(
+        renamed_partition_definition,
+        "renamed.json",
+    );
+    defer plans.deinit();
+    var old_protocol = (try protocol.compile(
+        std.testing.allocator,
+        &plans.definition_plan,
+        &plans.storage_plan,
+    )).?;
+    defer old_protocol.deinit(std.testing.allocator);
+    var old_parameters = try plans.bind(&.{
+        .{ .name = "stream", .raw_value = "alpha" },
+    });
+    defer old_parameters.deinit(std.testing.allocator);
+    var first_event = try chainedEventAlloc(
+        std.testing.allocator,
+        1,
+        "created",
+        null,
+        "{\"partition_id\":\"alpha\",\"status\":\"open\"}",
+    );
+    defer first_event.deinit(std.testing.allocator);
+    var first = try plans.execute(
+        &old_protocol,
+        "append",
+        &.{.{ .name = "event", .bytes = first_event.bytes }},
+        &old_parameters,
+    );
+    defer first.deinit(std.testing.allocator);
+    var second_event = try chainedEventAlloc(
+        std.testing.allocator,
+        2,
+        "updated",
+        first_event.digest,
+        "{\"partition_id\":\"alpha\",\"status\":\"closed\"}",
+    );
+    defer second_event.deinit(std.testing.allocator);
+    const updated = try renamedPartitionDefinitionV2Alloc(
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(updated);
+    var second = try appendWithRenamedPartition(
+        &plans,
+        updated,
+        second_event.bytes,
+    );
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(second.storage_mutated);
+}
+
 const document_history_definition =
     "{\"schema\":\"ledger-artifact-definition/v1\"," ++
     "\"id\":\"example/document-history\",\"owner\":\"example\",\"requires\":{" ++
@@ -4730,6 +5097,65 @@ test "document replacements replay from immutable prior revisions" {
         &plans,
         &parameters,
         &duplicate_parameters,
+    );
+}
+
+const replaced_event_log_definition =
+    \\{"schema":"ledger-artifact-definition/v1","id":"example/replaced-log","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","compare-and-replace","exact-object"]},"parameters":{"revision":{"type":"digest","required":false}},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"snapshot":{"codec":"jsonl","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"event":{"object":"exact","fields":{"kind":{}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/replaced-log.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]},"replace":{"effects":[{"op":"compare-and-replace","slot":"events","input":"snapshot","expected_revision_param":"revision"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
+;
+
+test "append falls back to materialized replay after an event-log replacement" {
+    var plans = try TransactionTestPlans.init(
+        replaced_event_log_definition,
+        "replaced-log.json",
+    );
+    defer plans.deinit();
+    var empty = try plans.bind(&.{});
+    defer empty.deinit(std.testing.allocator);
+    var first = try plans.execute(
+        null,
+        "append",
+        &.{.{ .name = "event", .bytes = "{\"kind\":\"first\"}" }},
+        &empty,
+    );
+    defer first.deinit(std.testing.allocator);
+    var replacement_parameters = try plans.bind(&.{.{
+        .name = "revision",
+        .raw_value = first.effects[0].revision_after,
+    }});
+    defer replacement_parameters.deinit(std.testing.allocator);
+    var replaced = try plans.execute(
+        null,
+        "replace",
+        &.{.{
+            .name = "snapshot",
+            .bytes = "{\"kind\":\"replacement\"}\n",
+        }},
+        &replacement_parameters,
+    );
+    defer replaced.deinit(std.testing.allocator);
+    var appended = try plans.execute(
+        null,
+        "append",
+        &.{.{ .name = "event", .bytes = "{\"kind\":\"last\"}" }},
+        &empty,
+    );
+    defer appended.deinit(std.testing.allocator);
+    try std.testing.expect(appended.storage_mutated);
+    const store_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ plans.repo_root, ".ledger", "example", "replaced-log.jsonl" },
+    );
+    defer std.testing.allocator.free(store_path);
+    const content = try durable_store.readRegularFileNoSymlink(
+        std.testing.allocator,
+        store_path,
+        65536,
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"replacement\"}\n{\"kind\":\"last\"}\n",
+        content,
     );
 }
 

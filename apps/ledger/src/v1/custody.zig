@@ -48,6 +48,7 @@ pub const BindingRow = struct {
     operation: []u8,
     input_digest: []u8,
     canonical_input_digest: []u8,
+    parameter_environment: ?[]u8,
     revision_before: ?[]u8,
     revision_after: []u8,
     idempotency_key: ?[]u8,
@@ -61,6 +62,7 @@ pub const BindingRow = struct {
         allocator.free(self.operation);
         allocator.free(self.input_digest);
         allocator.free(self.canonical_input_digest);
+        if (self.parameter_environment) |environment| allocator.free(environment);
         if (self.revision_before) |revision| allocator.free(revision);
         allocator.free(self.revision_after);
         if (self.idempotency_key) |key| allocator.free(key);
@@ -143,23 +145,7 @@ pub fn readReplaySlotOrMissing(
                 repo_root,
                 slot.relative_path,
             );
-            return .{
-                .exists = false,
-                .path = path,
-                .revision = try definition_core.canonical_json.digestBytesAlloc(
-                    allocator,
-                    "",
-                ),
-                .binding = .{
-                    .exists = false,
-                    .bytes = try allocator.alloc(u8, 0),
-                    .digest = null,
-                    .last_revision = null,
-                    .rows = try allocator.alloc(BindingRow, 0),
-                    .idempotency_match = false,
-                    .idempotency_match_index = null,
-                },
-            };
+            return missingReplaySlot(allocator, path);
         },
         else => return err,
     };
@@ -192,6 +178,29 @@ pub fn readReplaySlotOrMissing(
         .path = path,
         .revision = revision,
         .binding = binding,
+    };
+}
+
+fn missingReplaySlot(
+    allocator: std.mem.Allocator,
+    path: []u8,
+) !ReplaySlot {
+    return .{
+        .exists = false,
+        .path = path,
+        .revision = try definition_core.canonical_json.digestBytesAlloc(
+            allocator,
+            "",
+        ),
+        .binding = .{
+            .exists = false,
+            .bytes = try allocator.alloc(u8, 0),
+            .digest = null,
+            .last_revision = null,
+            .rows = try allocator.alloc(BindingRow, 0),
+            .idempotency_match = false,
+            .idempotency_match_index = null,
+        },
     };
 }
 
@@ -418,15 +427,7 @@ fn readBindingSnapshotInternal(
         path,
         binding_max_bytes,
     ) catch |err| switch (err) {
-        error.FileNotFound => return .{
-            .exists = false,
-            .bytes = try allocator.alloc(u8, 0),
-            .digest = null,
-            .last_revision = null,
-            .rows = try allocator.alloc(BindingRow, 0),
-            .idempotency_match = false,
-            .idempotency_match_index = null,
-        },
+        error.FileNotFound => return missingBindingSnapshot(allocator),
         else => return err,
     };
     errdefer allocator.free(bytes);
@@ -442,17 +443,7 @@ fn readBindingSnapshotInternal(
         .slot_name = slot_name,
         .logical_path = logical_path,
     };
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line_with_cr| {
-        const line = std.mem.trim(u8, line_with_cr, " \t\r");
-        if (line.len == 0) continue;
-        try parseAndAppendBindingRow(
-            &accumulator,
-            line,
-            context,
-            idempotency,
-        );
-    }
+    try accumulateBindingRows(&accumulator, bytes, context, idempotency);
     if (accumulator.rows.items.len == 0 or accumulator.last_revision == null) {
         return error.InvalidStoreBinding;
     }
@@ -476,6 +467,39 @@ fn readBindingSnapshotInternal(
     };
 }
 
+fn missingBindingSnapshot(
+    allocator: std.mem.Allocator,
+) !BindingSnapshot {
+    return .{
+        .exists = false,
+        .bytes = try allocator.alloc(u8, 0),
+        .digest = null,
+        .last_revision = null,
+        .rows = try allocator.alloc(BindingRow, 0),
+        .idempotency_match = false,
+        .idempotency_match_index = null,
+    };
+}
+
+fn accumulateBindingRows(
+    accumulator: *BindingAccumulator,
+    bytes: []const u8,
+    context: BindingContext,
+    idempotency: ?IdempotencyQuery,
+) !void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_with_cr| {
+        const line = std.mem.trim(u8, line_with_cr, " \t\r");
+        if (line.len == 0) continue;
+        try parseAndAppendBindingRow(
+            accumulator,
+            line,
+            context,
+            idempotency,
+        );
+    }
+}
+
 const BindingContext = struct {
     definition_id: []const u8,
     slot_name: []const u8,
@@ -488,6 +512,7 @@ const BorrowedBindingRow = struct {
     operation: []const u8,
     input_digest: []const u8,
     canonical_input_digest: []const u8,
+    parameter_environment: ?[]const u8,
     revision_before: ?[]const u8,
     revision_after: []const u8,
     idempotency_key: ?[]const u8,
@@ -547,6 +572,16 @@ fn parseAndAppendBindingRow(
     defer parsed.deinit();
     const object = try definition_core.json.object(parsed.value);
     try validateBindingKeys(object);
+    const parameter_environment = if (object.get("parameters")) |raw| value: {
+        _ = try definition_core.json.object(raw);
+        break :value try definition_core.canonical_json.canonicalJsonAlloc(
+            accumulator.allocator,
+            raw,
+        );
+    } else null;
+    defer if (parameter_environment) |environment| {
+        accumulator.allocator.free(environment);
+    };
     const row = try bindingIdentity(object, context);
     const extent = try bindingExtent(object, row.kind);
     try accumulator.append(.{
@@ -555,6 +590,7 @@ fn parseAndAppendBindingRow(
         .operation = row.operation,
         .input_digest = row.input_digest,
         .canonical_input_digest = row.canonical_input_digest,
+        .parameter_environment = parameter_environment,
         .revision_before = row.revision_before,
         .revision_after = row.revision_after,
         .idempotency_key = row.idempotency_key,
@@ -563,7 +599,7 @@ fn parseAndAppendBindingRow(
 }
 
 fn validateBindingKeys(object: std.json.ObjectMap) !void {
-    const keys = [_][]const u8{
+    const legacy_keys = [_][]const u8{
         "schema",                 "binding_kind",    "slot",
         "logical_path",           "definition_id",   "definition_digest",
         "abi",                    "operation",       "input_digest",
@@ -571,8 +607,14 @@ fn validateBindingKeys(object: std.json.ObjectMap) !void {
         "record_start",           "record_end",      "revision_before",
         "revision_after",         "idempotency_key",
     };
-    try definition_core.json.requireExactKeys(object, &keys);
-    try definition_core.json.requireFields(object, &keys);
+    const current_keys = legacy_keys ++ .{"parameters"};
+    if (object.get("parameters") == null) {
+        try definition_core.json.requireExactKeys(object, &legacy_keys);
+        try definition_core.json.requireFields(object, &legacy_keys);
+    } else {
+        try definition_core.json.requireExactKeys(object, &current_keys);
+        try definition_core.json.requireFields(object, &current_keys);
+    }
 }
 
 fn bindingIdentity(
@@ -607,6 +649,7 @@ fn bindingIdentity(
         .operation = operation,
         .input_digest = input_digest,
         .canonical_input_digest = canonical_digest,
+        .parameter_environment = null,
         .revision_before = revision_before,
         .revision_after = revision_after,
         .idempotency_key = idempotency_key,
@@ -730,6 +773,7 @@ fn ownBindingRow(
         .operation = undefined,
         .input_digest = undefined,
         .canonical_input_digest = undefined,
+        .parameter_environment = null,
         .revision_before = null,
         .revision_after = undefined,
         .idempotency_key = null,
@@ -748,6 +792,13 @@ fn ownBindingRow(
         row.canonical_input_digest,
     );
     errdefer allocator.free(owned.canonical_input_digest);
+    owned.parameter_environment = if (row.parameter_environment) |environment|
+        try allocator.dupe(u8, environment)
+    else
+        null;
+    errdefer if (owned.parameter_environment) |environment| {
+        allocator.free(environment);
+    };
     owned.revision_before = if (row.revision_before) |revision|
         try allocator.dupe(u8, revision)
     else
@@ -774,6 +825,8 @@ pub fn appendBindingRowAlloc(
     revision_before: ?[]const u8,
     revision_after: []const u8,
     idempotency_key: ?[]const u8,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_parameter_names: []const []const u8,
 ) ![]u8 {
     if ((extent.record_start == null) != (extent.record_end == null) or
         (extent.record_start != null and
@@ -795,6 +848,8 @@ pub fn appendBindingRowAlloc(
         definition_plan,
         canonical_input_digest,
         extent.kind,
+        parameters,
+        replay_parameter_names,
     );
     try writeBindingEffectFields(
         &output.writer,
@@ -817,6 +872,8 @@ fn writeBindingDefinitionFields(
     definition_plan: *const definition.Plan,
     canonical_input_digest: []const u8,
     kind: BindingKind,
+    parameters: *const definition_core.parameters.Bindings,
+    replay_parameter_names: []const []const u8,
 ) !void {
     try writer.writeAll(
         "{\"abi\":\"ledger-artifact-abi/v1\",\"binding_kind\":",
@@ -840,6 +897,17 @@ fn writeBindingDefinitionFields(
         writer,
         definition_plan.id,
     );
+    try writer.writeAll(",\"parameters\":");
+    try writer.writeByte('{');
+    for (replay_parameter_names, 0..) |name, index| {
+        const binding = parameters.find(name) orelse
+            return error.ReplayParameterMissing;
+        if (index != 0) try writer.writeByte(',');
+        try definition_core.canonical_json.writeCanonicalString(writer, name);
+        try writer.writeByte(':');
+        try binding.value.writeCanonical(writer);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeBindingEffectFields(
