@@ -8,7 +8,7 @@ const perf_contract = @import("perf_contract");
 const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
-const paired_comparison_rounds: usize = 3;
+const paired_comparison_rounds: usize = 4;
 var process_environment: ?*const std.process.Environ.Map = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
@@ -608,6 +608,7 @@ fn cmdCapture(allocator: std.mem.Allocator, target: ?[]const u8) !void {
 fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
     const machine_dir = try ensureCurrentMachineDir(allocator);
     defer allocator.free(machine_dir);
+    try invalidateCompareSummary(allocator, machine_dir);
     var built = BuiltState.init(allocator);
     defer built.deinit();
 
@@ -657,6 +658,24 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
         rows.items,
     );
     if (any_fail) std.process.exit(1);
+}
+
+fn invalidateCompareSummary(
+    allocator: std.mem.Allocator,
+    machine_dir: []const u8,
+) !void {
+    const latest_path = try std.fs.path.join(
+        allocator,
+        &.{ machine_dir, "reports", "latest-compare.json" },
+    );
+    defer allocator.free(latest_path);
+    std.Io.Dir.cwd().deleteFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        latest_path,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 fn comparisonStatusFailed(status: []const u8) bool {
@@ -959,13 +978,23 @@ fn compareDeepCase(
                 candidate_evidence,
             );
             defer paired.deinit(allocator);
+            const driver_warmups = try std.math.mul(
+                usize,
+                case_cfg.warmups,
+                paired_comparison_rounds + 1,
+            );
+            const effective_warmups = try std.math.add(
+                usize,
+                driver_warmups,
+                case_cfg.samples,
+            );
             const comparison_case = CompatCase{
                 .descriptor = case_cfg.descriptor,
                 .builder = .root,
                 .build_step = "build-seq",
                 .binary_path = "zig-out/bin/seq",
                 .setup = .seq_observe,
-                .warmups = case_cfg.warmups * paired_comparison_rounds,
+                .warmups = effective_warmups,
                 .samples = paired.candidate.samples.items.len,
                 .tolerance_pct = case_cfg.tolerance_pct,
             };
@@ -2108,6 +2137,7 @@ fn runPairedDeepCases(
     );
     defer allocator.free(candidate_root);
     try ensureSourcePerfHubBuilt(allocator, built, baseline_root);
+    try ensureSourcePerfHubBuilt(allocator, built, candidate_root);
     const baseline_workload = try deepWorkloadDigestForRoot(
         allocator,
         baseline_root,
@@ -2143,6 +2173,9 @@ fn runPairedDeepCases(
         paired_comparison_rounds,
     );
 
+    try primeSourceDeepCase(allocator, baseline_root, case_cfg);
+    try primeSourceDeepCase(allocator, candidate_root, case_cfg);
+
     var round: usize = 0;
     while (round < paired_comparison_rounds) : (round += 1) {
         if (round % 2 == 0) {
@@ -2153,15 +2186,17 @@ fn runPairedDeepCases(
                 &baseline_samples,
                 &baseline_allocs,
             );
-            try appendCandidateDeepMetrics(
+            try appendSourceDeepMetrics(
                 allocator,
+                candidate_root,
                 case_cfg,
                 &candidate_samples,
                 &candidate_allocs,
             );
         } else {
-            try appendCandidateDeepMetrics(
+            try appendSourceDeepMetrics(
                 allocator,
+                candidate_root,
                 case_cfg,
                 &candidate_samples,
                 &candidate_allocs,
@@ -2201,6 +2236,24 @@ fn runPairedDeepCases(
             .output_sha256 = candidate_workload,
         },
     };
+}
+
+fn primeSourceDeepCase(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    case_cfg: DeepCase,
+) !void {
+    var samples: std.ArrayList(u64) = .empty;
+    defer samples.deinit(allocator);
+    var alloc_samples: std.ArrayList(u64) = .empty;
+    defer alloc_samples.deinit(allocator);
+    try appendSourceDeepMetrics(
+        allocator,
+        source_root,
+        case_cfg,
+        &samples,
+        &alloc_samples,
+    );
 }
 
 fn ensureSourcePerfHubBuilt(
@@ -2359,18 +2412,6 @@ fn appendSourceDeepMetrics(
         allocator,
         batch_allocs / case_cfg.batch_iterations,
     );
-}
-
-fn appendCandidateDeepMetrics(
-    allocator: std.mem.Allocator,
-    case_cfg: DeepCase,
-    samples: *std.ArrayList(u64),
-    alloc_samples: *std.ArrayList(u64),
-) !void {
-    var metrics = try runDeepMeasuredCase(allocator, case_cfg);
-    defer metrics.deinit(allocator);
-    try samples.appendSlice(allocator, metrics.samples.items);
-    try alloc_samples.appendSlice(allocator, metrics.alloc_samples.items);
 }
 
 fn retainPairedWorkloads() bool {
@@ -2562,7 +2603,7 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         try samples.append(allocator, @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1)));
         try alloc_samples.append(
             allocator,
-            counting.stats.totalCalls() / case_cfg.batch_iterations,
+            counting.stats.totalCalls(),
         );
     }
 
@@ -3713,7 +3754,13 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
-    try validateCutoverCompareSummary(parsed.value);
+    const tuple = try validateCutoverCompareSummary(parsed.value);
+    const environment = process_environment orelse
+        return error.ExpectedSourceShaRequired;
+    const current_sha = try sourceShaForRootAlloc(allocator, ".");
+    defer allocator.free(current_sha);
+    try requireCutoverReportTuple(environment, tuple, current_sha);
+    try requireCleanSourceRoot(allocator, ".");
     const rows_val = parsed.value.object.get("rows") orelse return error.InvalidData;
     const rows = rows_val.array;
 
@@ -3747,14 +3794,25 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
 
     const latest_report_path = try std.fs.path.join(allocator, &.{ reports_dir, "latest-report.json" });
     defer allocator.free(latest_report_path);
-    try writeLatestReport(allocator, latest_report_path, row_keys.items, totals);
+    try writeLatestReport(
+        allocator,
+        latest_report_path,
+        row_keys.items,
+        totals,
+        tuple,
+    );
 
     const cutover_path = try std.fs.path.join(allocator, &.{ reports_dir, "cutover-status.json" });
     defer allocator.free(cutover_path);
-    try writeCutoverStatus(allocator, cutover_path, rows);
+    try writeCutoverStatus(allocator, cutover_path, rows, tuple);
 }
 
-fn validateCutoverCompareSummary(value: std.json.Value) !void {
+const ReportTuple = struct {
+    base_sha: []const u8,
+    candidate_sha: []const u8,
+};
+
+fn validateCutoverCompareSummary(value: std.json.Value) !ReportTuple {
     const object = switch (value) {
         .object => |object| object,
         else => return error.InvalidCompareSummary,
@@ -3828,6 +3886,25 @@ fn validateCutoverCompareSummary(value: std.json.Value) !void {
         if (!isExpectedCutoverCase(case_id)) {
             return error.UnexpectedCutoverCase;
         }
+    }
+    return .{
+        .base_sha = expected_base,
+        .candidate_sha = expected_candidate,
+    };
+}
+
+fn requireCutoverReportTuple(
+    environment: *const std.process.Environ.Map,
+    tuple: ReportTuple,
+    current_sha: []const u8,
+) !void {
+    try requireExpectedSourceShas(
+        environment,
+        tuple.base_sha,
+        tuple.candidate_sha,
+    );
+    if (!std.mem.eql(u8, current_sha, tuple.candidate_sha)) {
+        return error.CandidateSourceShaMismatch;
     }
 }
 
@@ -4015,11 +4092,16 @@ fn writeLatestReport(
     path: []const u8,
     row_keys: []const []const u8,
     totals: std.StringHashMap(ReportCounts),
+    tuple: ReportTuple,
 ) !void {
     var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
-    try writer.writeAll("{\"rows\":[");
+    try writer.writeAll("{\"expected_base_sha\":");
+    try writeJsonString(writer, tuple.base_sha);
+    try writer.writeAll(",\"expected_candidate_sha\":");
+    try writeJsonString(writer, tuple.candidate_sha);
+    try writer.writeAll(",\"rows\":[");
     for (row_keys, 0..) |key, idx| {
         const counts = totals.get(key).?;
         if (idx > 0) try writer.writeByte(',');
@@ -4029,7 +4111,12 @@ fn writeLatestReport(
     try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
-fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.json.Array) !void {
+fn writeCutoverStatus(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    rows: std.json.Array,
+    tuple: ReportTuple,
+) !void {
     var all_cases_pass = true;
     for (rows.items) |row| {
         if (!std.mem.eql(u8, row.object.get("status").?.string, "PASS")) {
@@ -4063,8 +4150,12 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
+    try writer.writeAll("{\"expected_base_sha\":");
+    try writeJsonString(writer, tuple.base_sha);
+    try writer.writeAll(",\"expected_candidate_sha\":");
+    try writeJsonString(writer, tuple.candidate_sha);
     try writer.print(
-        "{{\"native_public_ownership\":true,\"all_cases_pass\":{s}," ++
+        ",\"native_public_ownership\":true,\"all_cases_pass\":{s}," ++
             "\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\"," ++
             "\"cron_status\":\"{s}\",\"residuals\":[",
         .{
@@ -4169,6 +4260,50 @@ test "report errors clearly when compare summary is missing" {
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), reports_path);
 
     try std.testing.expectError(error.MissingCompareSummary, cmdReport(alloc));
+}
+
+test "comparison invalidates a prior summary before measurement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const alloc = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        alloc,
+    );
+    defer alloc.free(root);
+    const machine_dir = try std.fs.path.join(
+        alloc,
+        &.{ root, "machine" },
+    );
+    defer alloc.free(machine_dir);
+    const reports_dir = try std.fs.path.join(
+        alloc,
+        &.{ machine_dir, "reports" },
+    );
+    defer alloc.free(reports_dir);
+    try std.Io.Dir.cwd().createDirPath(
+        std.Io.Threaded.global_single_threaded.io(),
+        reports_dir,
+    );
+    const latest_path = try std.fs.path.join(
+        alloc,
+        &.{ reports_dir, "latest-compare.json" },
+    );
+    defer alloc.free(latest_path);
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = latest_path,
+        .data = "{}\n",
+    });
+    try invalidateCompareSummary(alloc, machine_dir);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(
+            std.Io.Threaded.global_single_threaded.io(),
+            latest_path,
+            .{},
+        ),
+    );
 }
 
 test "inferBinary maps lift driver case to bench_stats" {
@@ -4333,6 +4468,36 @@ test "paired evidence requires the requested source tuple" {
     );
 }
 
+test "cutover report tuple must match the request and current source" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put(
+        "PERF_EXPECT_BASE_SHA",
+        "0000000000000000000000000000000000000000",
+    );
+    try environment.put(
+        "PERF_EXPECT_CANDIDATE_SHA",
+        "1111111111111111111111111111111111111111",
+    );
+    const tuple = ReportTuple{
+        .base_sha = "0000000000000000000000000000000000000000",
+        .candidate_sha = "1111111111111111111111111111111111111111",
+    };
+    try requireCutoverReportTuple(
+        &environment,
+        tuple,
+        "1111111111111111111111111111111111111111",
+    );
+    try std.testing.expectError(
+        error.CandidateSourceShaMismatch,
+        requireCutoverReportTuple(
+            &environment,
+            tuple,
+            "2222222222222222222222222222222222222222",
+        ),
+    );
+}
+
 test "override builds bind to the canonical product output" {
     const path = try canonicalBuildOutputPathAlloc(
         std.testing.allocator,
@@ -4344,5 +4509,5 @@ test "override builds bind to the canonical product output" {
         "/repo/zig-out/bin/ledger",
         path,
     );
-    try std.testing.expectEqual(@as(usize, 3), paired_comparison_rounds);
+    try std.testing.expectEqual(@as(usize, 4), paired_comparison_rounds);
 }

@@ -4106,7 +4106,7 @@ pub fn acquireCasReadLockPair(
         if (index == 1 and std.mem.eql(u8, paths[0], path)) break;
         result.files[result.count] =
             (try openCasAdvisorySharedIfExists(allocator, path)) orelse
-            return error.MissingCasAdvisoryLock;
+            continue;
         result.count += 1;
     }
     return result;
@@ -8247,7 +8247,7 @@ test "CAS read custody excludes writers across a canonical path pair" {
     );
 }
 
-test "CAS read custody fails closed on a partial advisory pair" {
+test "CAS read custody holds the existing member of a partial advisory pair" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(
@@ -8274,13 +8274,16 @@ test "CAS read custody fails closed on a partial advisory pair" {
     );
     binding_writer.close(Io.io());
 
+    var read_custody = try acquireCasReadLockPair(
+        std.testing.allocator,
+        slot_path,
+        binding_path,
+    );
+    defer read_custody.deinit();
+    try std.testing.expectEqual(@as(u2, 1), read_custody.count);
     try std.testing.expectError(
-        error.MissingCasAdvisoryLock,
-        acquireCasReadLockPair(
-            std.testing.allocator,
-            slot_path,
-            binding_path,
-        ),
+        error.LockBusy,
+        acquireCasAdvisoryLock(std.testing.allocator, binding_path),
     );
 }
 

@@ -162,8 +162,9 @@ pub fn readReplaySlotOrMissing(
                 slot.relative_path,
                 path,
                 binding_path,
+                read_custody != null,
             );
-            return missingReplaySlot(allocator, path);
+            return missingReplaySlot(allocator, path, read_custody);
         },
         else => return err,
     };
@@ -222,6 +223,7 @@ fn finishReplaySlotRead(
 fn missingReplaySlot(
     allocator: std.mem.Allocator,
     path: []u8,
+    read_custody: ?durable_store.CasReadLockPair,
 ) !ReplaySlot {
     return .{
         .exists = false,
@@ -239,6 +241,7 @@ fn missingReplaySlot(
             .idempotency_match = false,
             .idempotency_match_index = null,
         },
+        .read_custody = read_custody,
     };
 }
 
@@ -288,6 +291,7 @@ pub fn readSlot(
         null,
     );
     errdefer binding.deinit(allocator);
+    if (!binding.exists) return error.StoreSlotWithoutBinding;
     if (read_custody == null and try slotReadCustodyAppeared(
         allocator,
         path,
@@ -316,28 +320,56 @@ pub fn readSlotOrMissing(
         slot,
     ) catch |err| switch (err) {
         error.FileNotFound => {
-            const path = try std.fs.path.join(
-                allocator,
-                &.{ repo_root, ".ledger", slot.relative_path },
-            );
-            defer allocator.free(path);
-            const binding_path = try bindingPathAlloc(
+            return readMissingSlot(
                 allocator,
                 repo_root,
-                slot.relative_path,
+                slot,
             );
-            defer allocator.free(binding_path);
-            try requireStableMissingSlot(
-                allocator,
-                repo_root,
-                slot.relative_path,
-                path,
-                binding_path,
-            );
-            return missingSlot(allocator, repo_root, slot);
         },
         else => err,
     };
+}
+
+fn readMissingSlot(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+) !SlotSnapshot {
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", slot.relative_path },
+    );
+    errdefer allocator.free(path);
+    const binding_path = try bindingPathAlloc(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer allocator.free(binding_path);
+    var read_custody = try acquireSlotReadCustody(
+        allocator,
+        path,
+        binding_path,
+    );
+    errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
+    const stat: ?std.Io.File.Stat = std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (stat != null) return error.EventStoreBusy;
+    try requireStableMissingSlot(
+        allocator,
+        repo_root,
+        slot.relative_path,
+        path,
+        binding_path,
+        read_custody != null,
+    );
+    return missingSlot(allocator, path, read_custody);
 }
 
 fn acquireSlotReadCustody(
@@ -345,28 +377,14 @@ fn acquireSlotReadCustody(
     slot_path: []const u8,
     binding_path: []const u8,
 ) !?durable_store.CasReadLockPair {
-    return durable_store.acquireCasReadLockPair(
+    var read_custody = try durable_store.acquireCasReadLockPair(
         allocator,
         slot_path,
         binding_path,
-    ) catch |err| switch (err) {
-        error.MissingCasAdvisoryLock => {
-            const slot_lock_exists = try durable_store.casAdvisoryLockExists(
-                allocator,
-                slot_path,
-            );
-            const binding_lock_exists =
-                try durable_store.casAdvisoryLockExists(
-                    allocator,
-                    binding_path,
-                );
-            if (slot_lock_exists or binding_lock_exists) {
-                return error.TransactionRecoveryRequired;
-            }
-            return null;
-        },
-        else => return err,
-    };
+    );
+    if (read_custody.count > 0) return read_custody;
+    read_custody.deinit();
+    return null;
 }
 
 fn requireStableMissingSlot(
@@ -375,6 +393,7 @@ fn requireStableMissingSlot(
     logical_path: []const u8,
     slot_path: []const u8,
     binding_path: []const u8,
+    read_custody_held: bool,
 ) !void {
     rejectOrphanedBinding(
         allocator,
@@ -382,7 +401,7 @@ fn requireStableMissingSlot(
         logical_path,
     ) catch |err| switch (err) {
         error.StoreBindingWithoutSlot => {
-            if (try slotReadCustodyAppeared(
+            if (!read_custody_held and try slotReadCustodyAppeared(
                 allocator,
                 slot_path,
                 binding_path,
@@ -391,7 +410,7 @@ fn requireStableMissingSlot(
         },
         else => return err,
     };
-    if (try slotReadCustodyAppeared(
+    if (!read_custody_held and try slotReadCustodyAppeared(
         allocator,
         slot_path,
         binding_path,
@@ -437,18 +456,9 @@ fn rejectOrphanedBinding(
 
 fn missingSlot(
     allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    slot: storage.ResolvedSlot,
+    path: []u8,
+    read_custody: ?durable_store.CasReadLockPair,
 ) !SlotSnapshot {
-    if (!std.fs.path.isAbsolute(repo_root)) {
-        return error.RepositoryRootNotAbsolute;
-    }
-    const path = try std.fs.path.join(
-        allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
-    );
-    errdefer allocator.free(path);
-    try durable_store.rejectSymlinkComponents(path);
     const content = try allocator.dupe(u8, "");
     errdefer allocator.free(content);
     const revision = try definition_core.canonical_json.digestBytesAlloc(
@@ -474,6 +484,7 @@ fn missingSlot(
             .idempotency_match = false,
             .idempotency_match_index = null,
         },
+        .read_custody = read_custody,
     };
 }
 
@@ -1236,6 +1247,22 @@ fn writeTestBoundSlot(
     });
 }
 
+fn writeTestAdvisory(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+) !void {
+    const advisory_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.cas.lock.advisory",
+        .{store_path},
+    );
+    defer allocator.free(advisory_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = advisory_path,
+        .data = "",
+    });
+}
+
 test "sidecar-free bound slot remains materialization readable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1275,4 +1302,96 @@ test "sidecar-free bound slot remains materialization readable" {
     );
     defer replay_snapshot.deinit(std.testing.allocator);
     try std.testing.expect(replay_snapshot.read_custody == null);
+}
+
+test "idle custody sidecars preserve stable missing slots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/.bindings");
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "example/events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    const slot_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".ledger", slot.relative_path },
+    );
+    defer std.testing.allocator.free(slot_path);
+    const binding_path = try bindingPathAlloc(
+        std.testing.allocator,
+        root,
+        slot.relative_path,
+    );
+    defer std.testing.allocator.free(binding_path);
+    try writeTestAdvisory(std.testing.allocator, slot_path);
+    try writeTestAdvisory(std.testing.allocator, binding_path);
+
+    var materialized = try readSlotOrMissing(
+        std.testing.allocator,
+        root,
+        "example/events",
+        slot,
+    );
+    defer materialized.deinit(std.testing.allocator);
+    try std.testing.expect(!materialized.exists);
+    try std.testing.expect(materialized.read_custody != null);
+
+    var streamed = try readReplaySlotOrMissing(
+        std.testing.allocator,
+        root,
+        "example/events",
+        slot,
+    );
+    defer streamed.deinit(std.testing.allocator);
+    try std.testing.expect(!streamed.exists);
+    try std.testing.expect(streamed.read_custody != null);
+}
+
+test "existing slot without a binding fails custody integrity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".ledger/example");
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const slot = storage.ResolvedSlot{
+        .name = "events",
+        .relative_path = "example/events.jsonl",
+        .owned_path = null,
+        .kind = .event_log,
+        .codec = .jsonl,
+        .max_bytes = 4096,
+    };
+    const slot_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, ".ledger", slot.relative_path },
+    );
+    defer std.testing.allocator.free(slot_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = slot_path,
+        .data = "{}\n",
+    });
+    try std.testing.expectError(
+        error.StoreSlotWithoutBinding,
+        readSlotOrMissing(
+            std.testing.allocator,
+            root,
+            "example/events",
+            slot,
+        ),
+    );
 }
