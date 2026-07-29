@@ -226,6 +226,12 @@ assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,cron,ledger,memory-note,img write_ci_helper
 
+grep -Fq -- '      - "libs/definition_compat/**"' \
+  "$repo_root/.github/workflows/auto-release.yml" || {
+  echo "auto-release paths omit libs/definition_compat/**" >&2
+  exit 1
+}
+
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION
 git add apps/ledger/VERSION

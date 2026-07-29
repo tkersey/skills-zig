@@ -2714,10 +2714,13 @@ pub fn inspectTransaction(
     defer allocator.free(commit_marker_path);
     const parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
+    const require_current_stage_refs =
+        parsed.state != .committed or !fileExists(commit_marker_path);
     try validateTransactionRecordScope(
         control_root,
         transaction_dir,
         parsed,
+        require_current_stage_refs,
     );
     if (parsed.state == .preparing) {
         return makeRecoveryStatus(
@@ -2788,10 +2791,13 @@ pub fn recoverTransaction(
     defer allocator.free(commit_marker_path);
     var parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
+    const require_current_stage_refs =
+        parsed.state != .committed or !fileExists(commit_marker_path);
     try validateTransactionRecordScope(
         control_root,
         transaction_dir,
         parsed,
+        require_current_stage_refs,
     );
     var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
@@ -2921,6 +2927,7 @@ fn validateTransactionRecordScope(
     control_root: []const u8,
     transaction_dir: []const u8,
     parsed: ParsedTransactionRecord,
+    require_current_stage_refs: bool,
 ) !void {
     if (!isGeneratedTransactionId(parsed.transaction_id) or
         !std.mem.eql(
@@ -2936,6 +2943,7 @@ fn validateTransactionRecordScope(
     }
     for (parsed.writes, 0..) |row, write_index| {
         _ = try pathRelativeToControlRoot(control_root, row.path);
+        if (!require_current_stage_refs) continue;
         var expected_name_buffer: [96]u8 = undefined;
         const expected_name = try transactionStageName(
             &expected_name_buffer,
@@ -6884,6 +6892,80 @@ test "transaction recovery removes an empty pre-record journal directory" {
     try std.testing.expect(!fileExists(incomplete_dir));
 }
 
+test "committed legacy journals compact without staging reinterpretation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_id = "dtx-1-00000000000000000000000000000010";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const commit_marker_path = try transactionCommitMarkerPathAlloc(
+        allocator,
+        transaction_dir,
+    );
+    defer allocator.free(commit_marker_path);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const content = "{\"seq\":1}\n";
+    try writeTextAtomic(allocator, target_path, content);
+    const content_digest = try digestBytesAlloc(allocator, content);
+    defer allocator.free(content_digest);
+    const expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = content_digest,
+        .sequence = 1,
+    }};
+    const writes = [_]TransactionWrite{.{
+        .path = target_path,
+        .staged_ref = "write-0.staged",
+        .digest_after = content_digest,
+        .sequence_after = 1,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 906,
+            .session_id = "legacy-committed-compatibility",
+            .executor = "test",
+        },
+        .committed,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+    try writeCommittedTransactionMarker(allocator, commit_marker_path);
+
+    try recoverAndCompactTransactions(allocator, transactions_dir);
+    try std.testing.expect(!fileExists(transaction_dir));
+    const after = try tryReadForTest(target_path);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(content, after);
+}
+
 test "journal lock prevents live recordless directory reclamation" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6952,6 +7034,25 @@ test "transaction records reject non-reserved and target-aliased stages" {
                 .created_at = "1",
                 .updated_at = "2",
             },
+            true,
+        ),
+    );
+    invalid[0].staged_ref = "write-0.staged";
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        validateTransactionRecordScope(
+            "/repo/.ledger",
+            "/repo/.ledger/transactions/dtx-1-00000000000000000000000000000002",
+            .{
+                .transaction_id = transaction_id,
+                .owner = owner,
+                .state = .preparing,
+                .expected = &expected,
+                .writes = &invalid,
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            true,
         ),
     );
 }
