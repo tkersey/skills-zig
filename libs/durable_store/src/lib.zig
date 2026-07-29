@@ -2320,7 +2320,7 @@ pub fn commitTextTransaction(
         false,
     );
     try syncDirectoryPath(transaction_dir);
-    try writeTextCreateNew(allocator, commit_marker_path, "{\"commit_marker\":\"DTX-v1\",\"state\":\"committed\"}\n", .{});
+    try writeCommittedTransactionMarker(allocator, commit_marker_path);
     try syncDirectoryPath(transaction_dir);
 
     return .{
@@ -2675,6 +2675,28 @@ fn transactionIdAlloc(allocator: std.mem.Allocator) ![]u8 {
     );
 }
 
+fn transactionCommitMarkerPathAlloc(
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+) ![]u8 {
+    return std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "commit.json" },
+    );
+}
+
+fn writeCommittedTransactionMarker(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !void {
+    try writeTextCreateNew(
+        allocator,
+        path,
+        "{\"commit_marker\":\"DTX-v1\",\"state\":\"committed\"}\n",
+        .{},
+    );
+}
+
 pub fn inspectTransaction(
     allocator: std.mem.Allocator,
     transaction_dir: []const u8,
@@ -2759,7 +2781,10 @@ pub fn recoverTransaction(
         &.{ transaction_dir, "transaction.json" },
     );
     defer allocator.free(record_path);
-    const commit_marker_path = try std.fs.path.join(allocator, &.{ transaction_dir, "commit.json" });
+    const commit_marker_path = try transactionCommitMarkerPathAlloc(
+        allocator,
+        transaction_dir,
+    );
     defer allocator.free(commit_marker_path);
     var parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);

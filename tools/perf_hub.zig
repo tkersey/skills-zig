@@ -3968,7 +3968,7 @@ fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg:
     try writer.print(",\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
     try writeJsonString(writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
+    try writeArtifactFile(path, writer_alloc.written());
 }
 
 fn prepareCompatCase(
@@ -5188,6 +5188,13 @@ fn coverageStatusFor(binary: []const u8) []const u8 {
         return if (saw_deep) "landed" else if (saw_shallow) "qualified" else "not_landed";
     }
     return "unknown";
+}
+
+fn writeArtifactFile(path: []const u8, data: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = path, .data = data },
+    );
 }
 
 fn writeJsonString(writer: anytype, text: []const u8) !void {

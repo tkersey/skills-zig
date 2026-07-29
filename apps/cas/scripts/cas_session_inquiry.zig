@@ -5422,7 +5422,10 @@ test "CAS consumes the explicit DCP-v2 source episode identity" {
     defer parsed.deinit();
     const dcp = try dcpFromValue(allocator, parsed.value);
     defer deinitDcp(allocator, dcp);
-    try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
+    try std.testing.expectEqualStrings(
+        "session:dcp-basic#turn:turn-decision",
+        dcp.source_episode_id.?,
+    );
 }
 
 test "CAS rejects unsupported DCP reconstructability before inquiry" {

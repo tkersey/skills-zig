@@ -5948,6 +5948,9 @@ test "storage paths reserve generated CAS control suffixes" {
             &ancestor_segments,
         ),
     );
+}
+
+test "dynamic storage paths reject generated CAS control suffixes" {
     try std.testing.expect(!pathTemplateMatches(
         .{
             .name = @constCast("state"),
