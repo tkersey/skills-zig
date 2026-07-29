@@ -2746,11 +2746,6 @@ fn ensureSourceBuilt(
         &overlaid_driver_source_sha,
         &driver_source_file.sha256,
     )) return error.DriverSourceChangedDuringBuild;
-    const driver_prefix_dir = try std.fs.path.join(
-        allocator,
-        &.{ staging_dir, "driver-prefix" },
-    );
-    defer allocator.free(driver_prefix_dir);
     const driver_cache_dir = try std.fs.path.join(
         allocator,
         &.{ staging_dir, "driver-cache" },
@@ -2761,9 +2756,6 @@ fn ensureSourceBuilt(
         &.{ staging_dir, "driver-global-cache" },
     );
     defer allocator.free(driver_global_cache_dir);
-    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
-        driver_prefix_dir,
-    );
     try durable_store.ensurePrivateDirectoryPathNoSymlinks(
         driver_cache_dir,
     );
@@ -2778,7 +2770,7 @@ fn ensureSourceBuilt(
             "build",
             "-Doptimize=ReleaseFast",
             "--prefix",
-            driver_prefix_dir,
+            prefix_dir,
             "--cache-dir",
             driver_cache_dir,
             "--global-cache-dir",
@@ -2791,7 +2783,7 @@ fn ensureSourceBuilt(
     try verifySealedFile(driver_source_file);
     const built_driver_path = try std.fs.path.join(
         allocator,
-        &.{ driver_prefix_dir, "bin", "perf_hub" },
+        &.{ prefix_dir, "bin", "perf_hub" },
     );
     defer allocator.free(built_driver_path);
     executables[2] = try sealEvidenceFile(
