@@ -2663,7 +2663,7 @@ fn ensureSourceBuilt(
         allocator,
         source_snapshot,
         &.{
-            compiler.file.path,
+            compiler.approved_path,
             "build",
             "-Doptimize=ReleaseFast",
             "--prefix",
@@ -2695,7 +2695,7 @@ fn ensureSourceBuilt(
     }
     try verifySealedFile(compiler.file);
     const post_compiler_sha = try sha256FileBounded(
-        compiler.file.path,
+        compiler.approved_path,
         64 * 1024 * 1024,
     );
     if (!std.mem.eql(
@@ -2774,7 +2774,7 @@ fn ensureSourceBuilt(
         allocator,
         source_snapshot,
         &.{
-            compiler.file.path,
+            compiler.approved_path,
             "build",
             "-Doptimize=ReleaseFast",
             "--prefix",
