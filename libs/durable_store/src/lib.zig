@@ -2714,13 +2714,16 @@ pub fn inspectTransaction(
     defer allocator.free(commit_marker_path);
     const parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
-    const require_current_stage_refs =
-        parsed.state != .committed or !fileExists(commit_marker_path);
+    const scope_mode: TransactionRecordScopeMode =
+        if (parsed.state == .committed and fileExists(commit_marker_path))
+            .committed_legacy_compatible
+        else
+            .current;
     try validateTransactionRecordScope(
         control_root,
         transaction_dir,
         parsed,
-        require_current_stage_refs,
+        scope_mode,
     );
     if (parsed.state == .preparing) {
         return makeRecoveryStatus(
@@ -2791,13 +2794,16 @@ pub fn recoverTransaction(
     defer allocator.free(commit_marker_path);
     var parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
-    const require_current_stage_refs =
-        parsed.state != .committed or !fileExists(commit_marker_path);
+    const scope_mode: TransactionRecordScopeMode =
+        if (parsed.state == .committed and fileExists(commit_marker_path))
+            .committed_legacy_compatible
+        else
+            .current;
     try validateTransactionRecordScope(
         control_root,
         transaction_dir,
         parsed,
-        require_current_stage_refs,
+        scope_mode,
     );
     var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
@@ -2923,13 +2929,22 @@ fn transactionControlRoot(transaction_dir: []const u8) ![]const u8 {
         return error.InvalidPath;
 }
 
+const TransactionRecordScopeMode = enum {
+    current,
+    committed_legacy_compatible,
+};
+
 fn validateTransactionRecordScope(
     control_root: []const u8,
     transaction_dir: []const u8,
     parsed: ParsedTransactionRecord,
-    require_current_stage_refs: bool,
+    mode: TransactionRecordScopeMode,
 ) !void {
-    if (!isGeneratedTransactionId(parsed.transaction_id) or
+    const valid_transaction_id =
+        isGeneratedTransactionId(parsed.transaction_id) or
+        (mode == .committed_legacy_compatible and
+            isLegacyTransactionId(parsed.transaction_id));
+    if (!valid_transaction_id or
         !std.mem.eql(
             u8,
             std.fs.path.basename(transaction_dir),
@@ -2943,7 +2958,7 @@ fn validateTransactionRecordScope(
     }
     for (parsed.writes, 0..) |row, write_index| {
         _ = try pathRelativeToControlRoot(control_root, row.path);
-        if (!require_current_stage_refs) continue;
+        if (mode == .committed_legacy_compatible) continue;
         var expected_name_buffer: [96]u8 = undefined;
         const expected_name = try transactionStageName(
             &expected_name_buffer,
@@ -2988,6 +3003,19 @@ fn isGeneratedTransactionId(transaction_id: []const u8) bool {
     }
     for (transaction_id[suffix_separator + 1 ..]) |byte| {
         if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return false;
+    }
+    return true;
+}
+
+fn isLegacyTransactionId(transaction_id: []const u8) bool {
+    const prefix = "dtx-";
+    if (!std.mem.startsWith(u8, transaction_id, prefix) or
+        transaction_id.len == prefix.len)
+    {
+        return false;
+    }
+    for (transaction_id[prefix.len..]) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
     }
     return true;
 }
@@ -6903,7 +6931,7 @@ test "committed legacy journals compact without staging reinterpretation" {
         &.{ root, "transactions" },
     );
     defer allocator.free(transactions_dir);
-    const transaction_id = "dtx-1-00000000000000000000000000000010";
+    const transaction_id = "dtx-1";
     const transaction_dir = try std.fs.path.join(
         allocator,
         &.{ transactions_dir, transaction_id },
@@ -7034,7 +7062,7 @@ test "transaction records reject non-reserved and target-aliased stages" {
                 .created_at = "1",
                 .updated_at = "2",
             },
-            true,
+            .current,
         ),
     );
     invalid[0].staged_ref = "write-0.staged";
@@ -7052,7 +7080,30 @@ test "transaction records reject non-reserved and target-aliased stages" {
                 .created_at = "1",
                 .updated_at = "2",
             },
-            true,
+            .current,
+        ),
+    );
+    var legacy_stage_buffer: [96]u8 = undefined;
+    invalid[0].staged_ref = try transactionStageName(
+        &legacy_stage_buffer,
+        "dtx-1",
+        0,
+    );
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        validateTransactionRecordScope(
+            "/repo/.ledger",
+            "/repo/.ledger/transactions/dtx-1",
+            .{
+                .transaction_id = "dtx-1",
+                .owner = owner,
+                .state = .preparing,
+                .expected = &expected,
+                .writes = &invalid,
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            .current,
         ),
     );
 }
