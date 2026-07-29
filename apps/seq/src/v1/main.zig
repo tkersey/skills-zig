@@ -16,11 +16,20 @@ const Help =
     \\
     \\usage: seq <command> [options]
     \\
-    \\commands:
-    \\  definition check
-    \\  definition describe
-    \\  observe
-    \\  explain
+    \\definition commands:
+    \\  seq definition check --definition <file> [--format json|text]
+    \\  seq definition describe --definition <file> [--format json|text]
+    \\
+    \\observation commands:
+    \\  seq observe --definition <file> --projection <name>
+    \\    [--root <dir> | --session-id <id> | --path <file> | --repo <dir>]
+    \\    [--since <time>] [--until <time>] [--last <count>]
+    \\    [--input <name>=<file|->]... [--param <name>=<value>]...
+    \\    [--format json|text]
+    \\  seq explain --definition <file> --projection <name>
+    \\    [--param <name>=<value>]... [--format json|text]
+    \\
+    \\physical commands:
     \\  sessions
     \\  turns
     \\  session-detail
@@ -32,8 +41,10 @@ const Help =
     \\  dataset-schema
     \\  query
     \\  index
-    \\  capabilities
-    \\  version
+    \\
+    \\metadata commands:
+    \\  seq capabilities [--format json|text]
+    \\  seq version
     \\
     \\Definitions are passive JSON. Seq reports observations and limitations
     \\without granting authority.
@@ -90,13 +101,23 @@ pub fn runWithArgv(
     environment: *const std.process.Environ.Map,
     argv: []const []const u8,
 ) !u8 {
-    if (argv.len < 2 or isHelp(argv[1])) {
+    if (argv.len < 2) {
+        try writeStdout(Help);
+        return 0;
+    }
+    if (isHelp(argv[1])) {
+        if (argv.len != 2) return error.UnexpectedArgument;
         try writeStdout(Help);
         return 0;
     }
     if (std.mem.eql(u8, argv[1], "version") or isVersion(argv[1])) {
+        if (argv.len != 2) return error.UnexpectedArgument;
         var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
         try stdout_writer.interface.print("{s}\n", .{Version});
+        return 0;
+    }
+    if (containsHelp(argv[2..])) {
+        try writeStdout(Help);
         return 0;
     }
     if (std.mem.eql(u8, argv[1], "capabilities")) {
@@ -295,12 +316,15 @@ fn runDefinitionCheck(
     argv: []const []const u8,
 ) !u8 {
     const args = try parseDefinitionArgs(argv);
-    var context = try loadDefinition(
+    var context = loadDefinition(
         allocator,
         environment,
         args.definition_path,
         .{},
-    );
+    ) catch |err| {
+        try emitDefinitionCheckFailure(args.format, err);
+        return 2;
+    };
     defer context.deinit(allocator);
     switch (args.format) {
         .json => {
@@ -338,6 +362,26 @@ fn runDefinitionCheck(
         },
     }
     return 0;
+}
+
+fn emitDefinitionCheckFailure(format: Format, err: anyerror) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    if (format == .text) {
+        try stdout_writer.interface.print(
+            "structurally invalid definition: {s}\n",
+            .{@errorName(err)},
+        );
+        return;
+    }
+    try stdout_writer.interface.writeAll(
+        "{\"schema\":\"seq-definition-check-result/v1\"," ++
+            "\"definition\":null,\"valid\":false,\"errors\":[{\"code\":",
+    );
+    try writeString(&stdout_writer.interface, @errorName(err));
+    try stdout_writer.interface.writeAll(
+        "}],\"compile_stats\":null,\"passive\":false," ++
+            "\"authority_granted\":false}\n",
+    );
 }
 
 fn runDefinitionDescribe(
@@ -1577,6 +1621,11 @@ fn isClosedPipe(err: anyerror) bool {
 fn isHelp(token: []const u8) bool {
     return std.mem.eql(u8, token, "-h") or
         std.mem.eql(u8, token, "--help");
+}
+
+fn containsHelp(argv: []const []const u8) bool {
+    for (argv) |token| if (isHelp(token)) return true;
+    return false;
 }
 
 fn isVersion(token: []const u8) bool {

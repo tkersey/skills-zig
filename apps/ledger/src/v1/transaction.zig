@@ -294,6 +294,10 @@ const TransactionPaths = struct {
         if (require_revisions) {
             try durable_store.ensureDirectoryPathNoSymlinks(self.revisions);
         }
+        try durable_store.recoverAndCompactTransactions(
+            allocator,
+            self.transactions,
+        );
         try durable_store.ensureNoPendingTransactions(
             allocator,
             self.transactions,
@@ -393,6 +397,7 @@ fn transactValidated(
         transaction_generated,
     );
     defer deinitPreparedEffects(allocator, prepared);
+    try validateReturnedContentBound(definition_plan, prepared);
     const duplicate_count = try validateIdempotencyDisposition(
         prepared,
         archive.exists,
@@ -416,6 +421,18 @@ fn transactValidated(
         transaction_id,
         duplicate_count != 0,
     );
+}
+
+fn validateReturnedContentBound(
+    definition_plan: *const definition.Plan,
+    prepared: []const PreparedEffect,
+) !void {
+    if (prepared.len == 1 and
+        prepared[0].canonical_input.len >
+            definition_plan.bounds.max_output_bytes)
+    {
+        return error.OutputLimitExceeded;
+    }
 }
 
 fn deinitPreparedEffects(
@@ -1378,21 +1395,16 @@ fn prepareEffectWithBinding(
         allocator,
         definition_plan,
         event_protocol,
+        effect,
         effect.slot_index,
         slot,
         repo_root,
         parameters,
         source,
         binding_before.*,
-    );
-    defer replay_context.deinit(allocator);
-    const derived_match = try findDerivedEffectMatchAlloc(
-        allocator,
-        effect,
-        source.before,
         idempotency.derived,
     );
-    defer if (derived_match) |content| allocator.free(content);
+    defer replay_context.deinit(allocator);
     return prepareEffectAfterReplay(
         allocator,
         definition_plan,
@@ -1409,7 +1421,7 @@ fn prepareEffectWithBinding(
         &replay_context,
         idempotency.key(),
         idempotency.input_digest,
-        derived_match,
+        replay_context.derived_match,
     );
 }
 
@@ -1611,12 +1623,14 @@ fn readEffectBindingSnapshot(
 const EffectReplayContext = struct {
     existing_records: ?usize,
     state: ?protocol.ReplayState,
+    derived_match: ?[]u8,
 
     fn deinit(
         self: *EffectReplayContext,
         allocator: std.mem.Allocator,
     ) void {
         if (self.state) |*state| state.deinit(allocator);
+        if (self.derived_match) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -1625,12 +1639,14 @@ fn prepareEffectReplay(
     allocator: std.mem.Allocator,
     definition_plan: *const definition.Plan,
     event_protocol: ?*const protocol.Plan,
+    effect: storage.Effect,
     slot_index: u16,
     slot: storage.ResolvedSlot,
     repo_root: []const u8,
     parameters: *const definition_core.parameters.Bindings,
     source: *const EffectSlotSource,
     binding_before: custody.BindingSnapshot,
+    derived_key: ?[]const u8,
 ) !EffectReplayContext {
     const protocol_required = protocolTargetsSlot(
         event_protocol,
@@ -1644,16 +1660,35 @@ fn prepareEffectReplay(
             .revision = source.before_digest.?,
             .binding = binding_before,
         };
-        var stats = try replay.validateSlot(
+        var derived_observer = try DerivedMatchObserver.init(
             allocator,
-            repo_root,
-            definition_plan.id,
-            slot,
-            &snapshot,
-            parameters,
-            definition_plan.bounds.max_records,
-            protocol_required,
+            effect,
+            derived_key,
         );
+        defer derived_observer.deinit();
+        var stats = if (derived_observer.active())
+            try replay.validateSlotObserved(
+                allocator,
+                repo_root,
+                definition_plan.id,
+                slot,
+                &snapshot,
+                parameters,
+                definition_plan.bounds.max_records,
+                protocol_required,
+                &derived_observer,
+            )
+        else
+            try replay.validateSlot(
+                allocator,
+                repo_root,
+                definition_plan.id,
+                slot,
+                &snapshot,
+                parameters,
+                definition_plan.bounds.max_records,
+                protocol_required,
+            );
         defer stats.deinit(allocator);
         return .{
             .existing_records = if (slot.kind == .event_log)
@@ -1661,13 +1696,80 @@ fn prepareEffectReplay(
             else
                 null,
             .state = stats.takeProtocolState(),
+            .derived_match = derived_observer.takeMatch(),
         };
     }
     return .{
         .existing_records = if (slot.kind == .event_log) 0 else null,
         .state = null,
+        .derived_match = null,
     };
 }
+
+const DerivedMatchObserver = struct {
+    allocator: std.mem.Allocator,
+    event: ?storage.EventMaterialization,
+    derived_name: ?[]const u8,
+    expected: ?[]const u8,
+    match: ?[]u8 = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        effect: storage.Effect,
+        expected: ?[]const u8,
+    ) !DerivedMatchObserver {
+        if (expected == null) {
+            return .{
+                .allocator = allocator,
+                .event = null,
+                .derived_name = null,
+                .expected = null,
+            };
+        }
+        const event = effect.event orelse
+            return error.EventIdempotencyRequiresMaterialization;
+        const idempotency = event.idempotency orelse
+            return error.EventIdempotencyConfigurationMissing;
+        return .{
+            .allocator = allocator,
+            .event = event,
+            .derived_name = idempotency.derived,
+            .expected = expected,
+        };
+    }
+
+    fn active(self: DerivedMatchObserver) bool {
+        return self.expected != null;
+    }
+
+    fn deinit(self: *DerivedMatchObserver) void {
+        if (self.match) |value| self.allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn takeMatch(self: *DerivedMatchObserver) ?[]u8 {
+        const result = self.match;
+        self.match = null;
+        return result;
+    }
+
+    pub fn observeReplay(
+        self: *DerivedMatchObserver,
+        value: std.json.Value,
+        raw: []const u8,
+        _: ?*const protocol.ReplayState,
+    ) !void {
+        if (self.match != null) return;
+        const event = self.event orelse return;
+        const actual = try protocol.storedPlainDerivedValue(
+            &event,
+            value,
+            self.derived_name.?,
+        ) orelse return error.EventIdempotencyStoredValueMissing;
+        if (!std.mem.eql(u8, actual, self.expected.?)) return;
+        self.match = try self.allocator.dupe(u8, raw);
+    }
+};
 
 fn protocolTargetsSlot(
     event_protocol: ?*const protocol.Plan,
@@ -1675,27 +1777,6 @@ fn protocolTargetsSlot(
 ) bool {
     return event_protocol != null and
         event_protocol.?.target_slot_index == slot_index;
-}
-
-fn findDerivedEffectMatchAlloc(
-    allocator: std.mem.Allocator,
-    effect: storage.Effect,
-    before: ?[]const u8,
-    derived_key: ?[]const u8,
-) !?[]u8 {
-    const key = derived_key orelse return null;
-    const content = before orelse return null;
-    const event = effect.event orelse
-        return error.EventIdempotencyRequiresMaterialization;
-    const idempotency = event.idempotency orelse
-        return error.EventIdempotencyConfigurationMissing;
-    return findPlainDerivedIdempotencyMatchAlloc(
-        allocator,
-        content,
-        &event,
-        idempotency.derived,
-        key,
-    );
 }
 
 fn prepareEffectAfterReplay(
@@ -2868,39 +2949,6 @@ fn deinitGeneratedOutputs(
 ) void {
     for (outputs) |*output| output.deinit(allocator);
     allocator.free(outputs);
-}
-
-fn findPlainDerivedIdempotencyMatchAlloc(
-    allocator: std.mem.Allocator,
-    content: []const u8,
-    event_materialization: *const storage.EventMaterialization,
-    name: []const u8,
-    expected: []const u8,
-) !?[]u8 {
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line_with_cr| {
-        const line = std.mem.trim(u8, line_with_cr, " \t\r");
-        if (line.len == 0) continue;
-        var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            line,
-            .{
-                .allocate = .alloc_always,
-                .duplicate_field_behavior = .@"error",
-            },
-        );
-        defer parsed.deinit();
-        const actual = try protocol.storedPlainDerivedValue(
-            event_materialization,
-            parsed.value,
-            name,
-        ) orelse return error.EventIdempotencyStoredValueMissing;
-        if (!std.mem.eql(u8, actual, expected)) continue;
-        const match = try allocator.dupe(u8, line);
-        return match;
-    }
-    return null;
 }
 
 fn parameterText(

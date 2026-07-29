@@ -64,6 +64,7 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
     var cursor = std.fs.path.dirname(absolute_path) orelse return null;
     for (0..package_ancestor_count_max) |_| {
         if (std.mem.eql(u8, std.fs.path.basename(cursor), "definitions")) {
+            if (!hasRegularPackageManifest(cursor)) return null;
             const package = std.fs.path.dirname(cursor) orelse return null;
             const collection = std.fs.path.dirname(package) orelse return null;
             if (std.mem.eql(
@@ -78,6 +79,20 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
         cursor = parent;
     }
     return null;
+}
+
+fn hasRegularPackageManifest(definitions_root: []const u8) bool {
+    const manifest_path = std.fs.path.join(
+        std.heap.page_allocator,
+        &.{ definitions_root, "manifest.json" },
+    ) catch return false;
+    defer std.heap.page_allocator.free(manifest_path);
+    const stat = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        manifest_path,
+        .{ .follow_symlinks = false },
+    ) catch return false;
+    return stat.kind == .file;
 }
 
 fn pathWithin(path: []const u8, root: []const u8) bool {
@@ -852,7 +867,7 @@ fn rejectAbsoluteSymlinkComponents(path: []const u8) !void {
 
 pub fn digestFiles(files: []const ClosureFile) [71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("skill-definition-closure/v1\x00");
+    hasher.update("definition-closure/v1\x00");
     var length_bytes: [8]u8 = undefined;
     for (files) |file| {
         std.mem.writeInt(u64, &length_bytes, @intCast(file.path.len), .big);
@@ -899,41 +914,30 @@ test "canonical definition archives preserve exact JSON numbers" {
     );
 }
 
-test "canonical definition packages admit cross-package imports" {
+test "unrecognized definition folders do not widen the admitted root" {
     const external = try admittedLocation(
-        "/opt/config/packages/first/definitions/ledger/record.json",
+        "/opt/config/packages/first/definitions/artifacts/record.json",
         "/workspace/target",
     );
     try std.testing.expectEqualStrings(
-        "/opt/config/packages",
+        "/opt/config/packages/first/definitions/artifacts",
         external.root,
     );
     try std.testing.expectEqualStrings(
-        "first/definitions/ledger/record.json",
+        "record.json",
         external.entry,
     );
-    const package_only = (try admittedPackageLocation(
-        "/opt/config/packages/first/definitions/ledger/record.json",
-    )).?;
-    try std.testing.expectEqualStrings(external.root, package_only.root);
-    try std.testing.expectEqualStrings(external.entry, package_only.entry);
+    try std.testing.expect((try admittedPackageLocation(
+        "/opt/config/packages/first/definitions/artifacts/record.json",
+    )) == null);
     const containing_cwd = try admittedLocation(
-        "/opt/config/packages/first/definitions/ledger/record.json",
+        "/opt/config/packages/first/definitions/artifacts/record.json",
         "/opt/config",
     );
-    try std.testing.expectEqualStrings(external.root, containing_cwd.root);
-    try std.testing.expectEqualStrings(external.entry, containing_cwd.entry);
-    const local_package = try admittedLocation(
-        "/workspace/packages/target/definitions/ledger/local.json",
-        "/workspace/target",
-    );
+    try std.testing.expectEqualStrings("/opt/config", containing_cwd.root);
     try std.testing.expectEqualStrings(
-        "/workspace/packages",
-        local_package.root,
-    );
-    try std.testing.expectEqualStrings(
-        "target/definitions/ledger/local.json",
-        local_package.entry,
+        "packages/first/definitions/artifacts/record.json",
+        containing_cwd.entry,
     );
     const root_safe = try admittedLocation(
         "/tmp/definitions/standalone.json",
@@ -952,25 +956,60 @@ test "canonical definition packages admit cross-package imports" {
     try std.testing.expectEqualStrings("standalone.json", standalone.entry);
 }
 
+test "manifested definition packages admit cross-package imports" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        std.testing.io,
+        "packages/first/definitions/artifacts",
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/first/definitions/manifest.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "packages/first/definitions/artifacts/record.json",
+        .data = "{}",
+    });
+    const absolute = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "packages/first/definitions/artifacts/record.json",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(absolute);
+    const location = (try admittedPackageLocation(absolute)).?;
+    const packages_root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "packages",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(packages_root);
+    try std.testing.expectEqualStrings(packages_root, location.root);
+    try std.testing.expectEqualStrings(
+        "first/definitions/artifacts/record.json",
+        location.entry,
+    );
+}
+
 test "closure resolves explicit imports across admitted packages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(
         std.testing.io,
-        "first/definitions/ledger",
+        "first/definitions/artifacts",
     );
     try tmp.dir.createDirPath(
         std.testing.io,
-        "second/definitions/ledger",
+        "second/definitions/artifacts",
     );
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "first/definitions/ledger/root.json",
+        .sub_path = "first/definitions/artifacts/root.json",
         .data =
         \\{
         \\  "imports": [
         \\    {
         \\      "id": "second/child",
-        \\      "path": "../../../second/definitions/ledger/child.json"
+        \\      "path": "../../../second/definitions/artifacts/child.json"
         \\    }
         \\  ],
         \\  "schema": "example/v1"
@@ -978,7 +1017,7 @@ test "closure resolves explicit imports across admitted packages" {
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "second/definitions/ledger/child.json",
+        .sub_path = "second/definitions/artifacts/child.json",
         .data =
         \\{"schema":"example-child/v1"}
         ,
@@ -986,13 +1025,13 @@ test "closure resolves explicit imports across admitted packages" {
     var closure = try loadFromDir(
         std.testing.allocator,
         &tmp.dir,
-        "first/definitions/ledger/root.json",
+        "first/definitions/artifacts/root.json",
         .{},
     );
     defer closure.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), closure.files.len);
     try std.testing.expect(
-        closure.find("second/definitions/ledger/child.json") != null,
+        closure.find("second/definitions/artifacts/child.json") != null,
     );
 }
 

@@ -92,6 +92,8 @@ pub const Operator = enum {
     not_member_of,
     forbidden_object_keys,
     sha1,
+    array_count_equal,
+    array_integer_sum_lte,
 
     pub fn id(self: Operator) []const u8 {
         return switch (self) {
@@ -159,6 +161,8 @@ pub const Operator = enum {
             .member_of => "member-of",
             .not_member_of => "not-member-of",
             .forbidden_object_keys => "forbidden-object-keys",
+            .array_count_equal => "array-count-equal",
+            .array_integer_sum_lte => "array-integer-sum-lte",
             else => @tagName(self),
         };
     }
@@ -204,7 +208,7 @@ pub const Operator = enum {
     pub fn supported(self: Operator) bool {
         comptime {
             const fields = @typeInfo(Operator).@"enum".fields;
-            if (fields.len != 86 or
+            if (fields.len != 88 or
                 !std.mem.eql(u8, fields[46].name, "set_order"))
             {
                 @compileError("update the explicit operator admission set");

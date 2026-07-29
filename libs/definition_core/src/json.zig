@@ -147,7 +147,7 @@ test "exact keys and common scalar boundaries fail closed" {
     try std.testing.expectError(error.UnknownField, requireExactKeys(map, &.{"known"}));
     try safeIdentifier("owner/artifact-v1", 128);
     try std.testing.expectError(error.InvalidIdentifier, safeIdentifier("../escape", 128));
-    try repositoryRelativePath("definitions/ledger/a.json", false);
+    try repositoryRelativePath("definitions/artifacts/a.json", false);
     try std.testing.expectError(
         error.InvalidRelativePath,
         repositoryRelativePath("definitions/../a.json", false),

@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_perf = @import("core_perf");
 const cron_cli = @import("cron_cli");
+const definition_core = @import("definition_core");
 const perf_contract = @import("perf_contract");
+const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
 const HelpSurface = core_cli.HelpSurface{
@@ -60,6 +62,9 @@ const CompatSetup = enum {
     ledger_definition_check,
     ledger_validate,
     ledger_materialize,
+    ledger_transact,
+    ledger_project,
+    ledger_doctor,
     bench_stats_help,
     bench_stats_parse,
     perf_report_help,
@@ -87,6 +92,7 @@ const CompatCase = struct {
 };
 
 const DeepSetup = enum {
+    seq_observe,
     cron_show,
     cron_create,
     cron_update,
@@ -147,12 +153,27 @@ const SeqCases = [_]perf_contract.CaseDescriptor{
     latencyCase("seq-observe", "seq", "observe"),
     latencyCase("seq-sessions", "seq", "sessions"),
     latencyCase("seq-query", "seq", "query"),
+    .{
+        .case_id = "seq-observe-deep",
+        .binary = "seq",
+        .family = "observe",
+        .case_kind = .native,
+        .measurement_mode = .latency_alloc,
+    },
 };
 
 const SeqCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("definition", "definition compilation case"),
-    shallowCoverage("observe", "compiled observation case"),
-    shallowCoverage("explain", "shares definition compiler"),
+    .{
+        .family = "observe",
+        .coverage = .deep,
+        .reason = "native compiled-plan plus physical trace execution case",
+    },
+    .{
+        .family = "explain",
+        .coverage = .deep,
+        .reason = "shares the measured definition compiler",
+    },
     shallowCoverage("sessions", "physical corpus case"),
     shallowCoverage("turns", "physical trace case"),
     shallowCoverage("session-detail", "physical trace case"),
@@ -183,15 +204,18 @@ const LedgerCases = [_]perf_contract.CaseDescriptor{
     latencyCase("ledger-definition-check", "ledger", "definition"),
     latencyCase("ledger-validate", "ledger", "validate"),
     latencyCase("ledger-materialize", "ledger", "materialize"),
+    latencyCase("ledger-transact", "ledger", "transact"),
+    latencyCase("ledger-project", "ledger", "project"),
+    latencyCase("ledger-doctor", "ledger", "doctor"),
 };
 
 const LedgerCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("definition", "definition compilation case"),
     shallowCoverage("validate", "compiled validation case"),
     shallowCoverage("materialize", "canonicalization and identity case"),
-    shallowCoverage("transact", "durable protocol qualification lane"),
-    shallowCoverage("project", "durable protocol qualification lane"),
-    shallowCoverage("doctor", "durable protocol qualification lane"),
+    shallowCoverage("transact", "measured ReleaseFast append transaction case"),
+    shallowCoverage("project", "measured ReleaseFast streaming projection case"),
+    shallowCoverage("doctor", "measured ReleaseFast streaming replay case"),
     shallowCoverage("capabilities", "command-surface gate"),
     shallowCoverage("version", "command-surface gate"),
 };
@@ -259,6 +283,24 @@ const CompatCases = [_]CompatCase{
         "zig-out/bin/ledger",
         .ledger_materialize,
     ),
+    rootCompat(
+        LedgerCases[4],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_transact,
+    ),
+    rootCompat(
+        LedgerCases[5],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_project,
+    ),
+    rootCompat(
+        LedgerCases[6],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_doctor,
+    ),
     .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
@@ -275,6 +317,7 @@ const CompatCases = [_]CompatCase{
 };
 
 const DeepCases = [_]DeepCase{
+    .{ .descriptor = SeqCases[5], .setup = .seq_observe, .tolerance_pct = 5.0 },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
@@ -807,6 +850,7 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
     defer cleanupTempRoot(temp_root);
     defer allocator.free(temp_root);
+    try prepareCompatCase(allocator, case_cfg, temp_root);
     var samples: std.ArrayList(u64) = .empty;
     var alloc_samples: std.ArrayList(u64) = .empty;
     try samples.ensureTotalCapacity(allocator, case_cfg.samples);
@@ -902,6 +946,7 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
 
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
     switch (setup) {
+        .seq_observe => try executeSeqObserveDeep(allocator),
         .cron_show => try cron_cli.runPerfCase(allocator, .show, temp_root),
         .cron_create => try cron_cli.runPerfCase(allocator, .create, temp_root),
         .cron_update => try cron_cli.runPerfCase(allocator, .update, temp_root),
@@ -910,6 +955,75 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
         .cron_run_now => try cron_cli.runPerfCase(allocator, .run_now, temp_root),
         .cron_delete => try cron_cli.runPerfCase(allocator, .delete, temp_root),
         .cron_run_due => try cron_cli.runPerfCase(allocator, .run_due, temp_root),
+    }
+}
+
+fn executeSeqObserveDeep(allocator: std.mem.Allocator) !void {
+    const cwd = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
+    defer allocator.free(cwd);
+    const definition_root = try std.fs.path.join(
+        allocator,
+        &.{ cwd, "apps/seq/src/v1/fixtures" },
+    );
+    defer allocator.free(definition_root);
+    const projection_names = [_][]const u8{"rows"};
+    var plans = try seq_v1.compiled_plan.load(
+        allocator,
+        definition_root,
+        "message-observation.json",
+        .{ .projection_names = &projection_names },
+        "1.0.0",
+        "seq-source-adapter/v1",
+        .{},
+    );
+    defer plans.deinit(allocator);
+    const parameter_inputs = [_]definition_core.parameters.Input{.{
+        .name = "needle",
+        .raw_value = "failure",
+    }};
+    var parameters = try definition_core.parameters.bind(
+        allocator,
+        &plans.definition_plan.parameter_declarations,
+        &parameter_inputs,
+    );
+    defer parameters.deinit(allocator);
+    var program = try seq_v1.execution.compile(
+        allocator,
+        &plans.definition_plan,
+        &plans.native_plan,
+        &parameters,
+        "rows",
+    );
+    defer program.deinit(allocator);
+    const output_cells = try std.math.mul(
+        usize,
+        program.max_rows,
+        program.output_field_indices.len,
+    );
+    const output = try allocator.alloc(seq_v1.execution.Value, output_cells);
+    defer allocator.free(output);
+    const trace_path = try std.fs.path.join(
+        allocator,
+        &.{ definition_root, "rollout.jsonl" },
+    );
+    defer allocator.free(trace_path);
+    var observation = try seq_v1.trace_adapter.observeFile(
+        allocator,
+        &program,
+        trace_path,
+        .{
+            .max_input_bytes = plans.definition_plan.bounds.max_input_bytes,
+        },
+        output,
+    );
+    defer observation.deinit(allocator);
+    if (observation.result.row_count != 1 or
+        observation.metrics.bytes_read == 0)
+    {
+        return error.InvalidPerfObservation;
     }
 }
 
@@ -1031,6 +1145,45 @@ fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg:
     try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
+fn prepareCompatCase(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    temp_root: []const u8,
+) !void {
+    switch (case_cfg.setup) {
+        .ledger_project, .ledger_doctor => {},
+        else => return,
+    }
+    const repo_path = try std.fs.path.join(
+        allocator,
+        &.{ temp_root, "ledger-repo" },
+    );
+    defer allocator.free(repo_path);
+    try makeRepoAwarePath(allocator, repo_path);
+    const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
+    defer allocator.free(binary_path);
+    const argv = [_][]const u8{
+        binary_path,
+        "transact",
+        "--definition",
+        "apps/ledger/src/v1/fixtures/event-definition.json",
+        "--operation",
+        "append",
+        "--repo",
+        repo_path,
+        "--input",
+        "event=apps/ledger/src/v1/fixtures/event-one.json",
+        "--param",
+        "request=perf-seed",
+        "--format",
+        "json",
+    };
+    const result = try runChildCapture(allocator, ".", &argv);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.PerfSetupFailed;
+}
+
 fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root: []const u8) !CommandRun {
     const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
     errdefer allocator.free(binary_path);
@@ -1114,6 +1267,72 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             "--format",
             "json",
         }),
+        .ledger_transact => {
+            const stamp = std.Io.Clock.awake.now(
+                std.Io.Threaded.global_single_threaded.io(),
+            ).nanoseconds;
+            const repo_path = try std.fmt.allocPrint(
+                allocator,
+                "{s}/ledger-txn-{d}",
+                .{ temp_root, stamp },
+            );
+            try makeRepoAwarePath(allocator, repo_path);
+            const request = try std.fmt.allocPrint(
+                allocator,
+                "request=perf-{d}",
+                .{stamp},
+            );
+            try args.appendSlice(allocator, &.{
+                binary_path,
+                "transact",
+                "--definition",
+                "apps/ledger/src/v1/fixtures/event-definition.json",
+                "--operation",
+                "append",
+                "--repo",
+                repo_path,
+                "--input",
+                "event=apps/ledger/src/v1/fixtures/event-one.json",
+                "--param",
+                request,
+                "--format",
+                "json",
+            });
+        },
+        .ledger_project => {
+            const repo_path = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "ledger-repo" },
+            );
+            try args.appendSlice(allocator, &.{
+                binary_path,
+                "project",
+                "--definition",
+                "apps/ledger/src/v1/fixtures/event-definition.json",
+                "--projection",
+                "all",
+                "--repo",
+                repo_path,
+                "--format",
+                "json",
+            });
+        },
+        .ledger_doctor => {
+            const repo_path = try std.fs.path.join(
+                allocator,
+                &.{ temp_root, "ledger-repo" },
+            );
+            try args.appendSlice(allocator, &.{
+                binary_path,
+                "doctor",
+                "--definition",
+                "apps/ledger/src/v1/fixtures/event-definition.json",
+                "--repo",
+                repo_path,
+                "--format",
+                "json",
+            });
+        },
         .bench_stats_help,
         .perf_report_help,
         .cas_smoke_check_help,
@@ -1364,18 +1583,6 @@ fn jsonValueU64(value: std.json.Value, _: []const u8) !u64 {
         .float => |v| if (v >= 0) @intFromFloat(v) else error.InvalidData,
         else => error.InvalidData,
     };
-}
-
-fn jsonValueF64(value: std.json.Value, _: []const u8) !f64 {
-    return switch (value) {
-        .integer => |v| @floatFromInt(v),
-        .float => |v| v,
-        else => error.InvalidData,
-    };
-}
-
-fn jsonObjectFieldF64(value: std.json.Value, key: []const u8) !f64 {
-    return jsonValueF64(value.object.get(key) orelse return error.InvalidData, key);
 }
 
 fn cmdReport(allocator: std.mem.Allocator) !void {
@@ -1767,7 +1974,7 @@ test "inferBinary maps lift driver case to bench_stats" {
 }
 
 test "coverageStatusFor reflects current manifest coverage" {
-    try std.testing.expectEqualStrings("qualified", coverageStatusFor("seq"));
+    try std.testing.expectEqualStrings("landed", coverageStatusFor("seq"));
     try std.testing.expectEqualStrings("qualified", coverageStatusFor("ledger"));
     try std.testing.expectEqualStrings("landed", coverageStatusFor("cron"));
 }

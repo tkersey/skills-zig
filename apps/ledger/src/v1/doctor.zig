@@ -127,6 +127,16 @@ fn inspectSlot(
     parameters: *const definition_core.parameters.Bindings,
     protocol_required: bool,
 ) !SlotStatus {
+    if (slot.kind == .event_log) {
+        return inspectEventSlot(
+            allocator,
+            definition_plan,
+            repo_root,
+            slot,
+            parameters,
+            protocol_required,
+        );
+    }
     var snapshot = try custody.readSlotOrMissing(
         allocator,
         repo_root,
@@ -145,6 +155,73 @@ fn inspectSlot(
         definition_plan.bounds.max_records,
         protocol_required,
     );
+    defer replay_stats.deinit(allocator);
+    const name = try allocator.dupe(u8, slot.name);
+    errdefer allocator.free(name);
+    const logical_ref = try allocator.dupe(u8, slot.relative_path);
+    errdefer allocator.free(logical_ref);
+    const revision = try allocator.dupe(u8, snapshot.revision);
+    return .{
+        .name = name,
+        .logical_ref = logical_ref,
+        .state = .current,
+        .revision = revision,
+        .binding_rows = snapshot.binding.rows.len,
+        .healthy = true,
+        .error_code = null,
+    };
+}
+
+fn inspectEventSlot(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    repo_root: []const u8,
+    slot: storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    protocol_required: bool,
+) !SlotStatus {
+    var snapshot = try custody.readReplaySlotOrMissing(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+    );
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) return error.StoreSlotMissing;
+    var replay_stats = replay.validateReplaySlot(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+        &snapshot,
+        parameters,
+        definition_plan.bounds.max_records,
+        protocol_required,
+    ) catch |err| switch (err) {
+        error.ReplayRequiresMaterializedHistory => materialized_replay: {
+            var materialized = try custody.readSlot(
+                allocator,
+                repo_root,
+                definition_plan.id,
+                slot,
+            );
+            defer materialized.deinit(allocator);
+            break :materialized_replay try replay.validateSlot(
+                allocator,
+                repo_root,
+                definition_plan.id,
+                slot,
+                &materialized,
+                parameters,
+                definition_plan.bounds.max_records,
+                protocol_required,
+            );
+        },
+        error.HistoricalInputDigestMismatch,
+        error.HistoricalRevisionMismatch,
+        => return error.StoreBindingRevisionMismatch,
+        else => return err,
+    };
     defer replay_stats.deinit(allocator);
     const name = try allocator.dupe(u8, slot.name);
     errdefer allocator.free(name);

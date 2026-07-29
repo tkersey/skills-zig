@@ -162,6 +162,29 @@ projection_payload=$("$binary" project \
   --format json)
 test "$projection_payload" = '{"kind":"one","value":1}'
 
+projection_jsonl=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format jsonl)
+test "$projection_jsonl" = '{"kind":"one","value":1}'
+
+projection_table=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format table)
+grep -Fq $'kind\tvalue' <<<"$projection_table"
+grep -Fq $'one\t1' <<<"$projection_table"
+
+projection_markdown=$("$binary" project \
+  --definition "$event_definition" \
+  --projection all \
+  --repo "$repo_dir" \
+  --format markdown)
+grep -Fq '| kind | value |' <<<"$projection_markdown"
+grep -Fq '| one | 1 |' <<<"$projection_markdown"
+
 doctor_output=$("$binary" doctor \
   --definition "$event_definition" \
   --repo "$repo_dir" \

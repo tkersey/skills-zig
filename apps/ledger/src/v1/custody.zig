@@ -103,6 +103,98 @@ pub const SlotSnapshot = struct {
     }
 };
 
+pub const ReplaySlot = struct {
+    exists: bool,
+    path: []u8,
+    revision: []u8,
+    binding: BindingSnapshot,
+
+    pub fn deinit(self: *ReplaySlot, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.revision);
+        self.binding.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn readReplaySlotOrMissing(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+) !ReplaySlot {
+    if (!std.fs.path.isAbsolute(repo_root)) {
+        return error.RepositoryRootNotAbsolute;
+    }
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ repo_root, ".ledger", slot.relative_path },
+    );
+    errdefer allocator.free(path);
+    try durable_store.rejectSymlinkComponents(path);
+    const stat = std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            try rejectOrphanedBinding(
+                allocator,
+                repo_root,
+                slot.relative_path,
+            );
+            return .{
+                .exists = false,
+                .path = path,
+                .revision = try definition_core.canonical_json.digestBytesAlloc(
+                    allocator,
+                    "",
+                ),
+                .binding = .{
+                    .exists = false,
+                    .bytes = try allocator.alloc(u8, 0),
+                    .digest = null,
+                    .last_revision = null,
+                    .rows = try allocator.alloc(BindingRow, 0),
+                    .idempotency_match = false,
+                    .idempotency_match_index = null,
+                },
+            };
+        },
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > slot.max_bytes) return error.FileTooBig;
+    const binding_path = try bindingPathAlloc(
+        allocator,
+        repo_root,
+        slot.relative_path,
+    );
+    defer allocator.free(binding_path);
+    var binding = try readBindingSnapshotInternal(
+        allocator,
+        binding_path,
+        definition_id,
+        slot.name,
+        slot.relative_path,
+        null,
+        null,
+        false,
+    );
+    errdefer binding.deinit(allocator);
+    const revision = try allocator.dupe(
+        u8,
+        binding.last_revision orelse return error.InvalidStoreBinding,
+    );
+    return .{
+        .exists = true,
+        .path = path,
+        .revision = revision,
+        .binding = binding,
+    };
+}
+
 pub fn readSlot(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
@@ -277,6 +369,28 @@ pub fn readBindingSnapshot(
     current_revision: ?[]const u8,
     idempotency: ?IdempotencyQuery,
 ) !BindingSnapshot {
+    return readBindingSnapshotInternal(
+        allocator,
+        path,
+        definition_id,
+        slot_name,
+        logical_path,
+        current_revision,
+        idempotency,
+        true,
+    );
+}
+
+fn readBindingSnapshotInternal(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    current_revision: ?[]const u8,
+    idempotency: ?IdempotencyQuery,
+    verify_current_revision: bool,
+) !BindingSnapshot {
     const bytes = durable_store.readRegularFileNoSymlink(
         allocator,
         path,
@@ -320,8 +434,9 @@ pub fn readBindingSnapshot(
     if (accumulator.rows.items.len == 0 or accumulator.last_revision == null) {
         return error.InvalidStoreBinding;
     }
-    if (current_revision == null or
-        !std.mem.eql(u8, current_revision.?, accumulator.last_revision.?))
+    if (verify_current_revision and
+        (current_revision == null or
+            !std.mem.eql(u8, current_revision.?, accumulator.last_revision.?)))
     {
         return error.StoreBindingRevisionMismatch;
     }

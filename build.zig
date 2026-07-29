@@ -358,8 +358,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "core_perf", .module = core_perf },
+            .{ .name = "definition_core", .module = definition_core },
             .{ .name = "perf_contract", .module = core_perf_contract },
             .{ .name = "cron_cli", .module = cron_root },
+            .{ .name = "seq_v1_core", .module = seq_v1_core },
         },
     });
     const durable_store_perf_root = b.createModule(.{

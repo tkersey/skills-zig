@@ -74,6 +74,8 @@ pub const EventRecordView = struct {
     payload: []const u8,
     ordinal: u64,
     diagnostic_position: ?usize = null,
+    extent_start: usize,
+    extent_end: usize,
 };
 
 pub const EventRecordVisitor = struct {
@@ -1609,26 +1611,62 @@ fn readTransactionSnapshot(
     allocator: std.mem.Allocator,
     mutation: TransactionMutation,
 ) !Snapshot {
+    const parent = std.fs.path.dirname(mutation.path) orelse
+        return error.InvalidPath;
+    var dir = try std.Io.Dir.openDirAbsolute(
+        Io.io(),
+        parent,
+        .{ .follow_symlinks = false },
+    );
+    defer dir.close(Io.io());
+    return readTransactionSnapshotAt(
+        allocator,
+        &dir,
+        std.fs.path.basename(mutation.path),
+        mutation,
+    );
+}
+
+fn readTransactionSnapshotAt(
+    allocator: std.mem.Allocator,
+    dir: *std.Io.Dir,
+    base: []const u8,
+    mutation: TransactionMutation,
+) !Snapshot {
+    const data = try readRegularFileNoSymlinkAt(
+        allocator,
+        dir,
+        base,
+        mutation.max_bytes,
+    );
+    errdefer allocator.free(data);
+    const digest = try digestBytesAlloc(allocator, data);
+    errdefer allocator.free(digest);
+    const path = try allocator.dupe(u8, mutation.path);
+    errdefer allocator.free(path);
     return switch (mutation.content_mode) {
-        .jsonl_sequence_required => readJsonlSnapshot(
-            allocator,
-            mutation.path,
-            mutation.expectation.expected_sequence,
-        ),
+        .jsonl_sequence_required => jsonl: {
+            const validation = validateJsonlBytes(allocator, data);
+            if (!validation.ok()) return error.InvalidJsonl;
+            const sequence = try jsonlSequenceRequired(allocator, data);
+            if (mutation.expectation.expected_sequence) |expected| {
+                if (sequence == null or sequence.? != expected) {
+                    return error.SequenceMismatch;
+                }
+            }
+            break :jsonl .{
+                .path = path,
+                .data = data,
+                .digest = digest,
+                .sequence = sequence,
+            };
+        },
         .raw => blk: {
             if (mutation.expectation.expected_sequence) |sequence| {
                 if (sequence != 0) return error.SequenceMismatch;
             }
-            const data = try readRegularFileNoSymlink(
-                allocator,
-                mutation.path,
-                mutation.max_bytes,
-            );
-            errdefer allocator.free(data);
-            const digest = try digestBytesAlloc(allocator, data);
-            errdefer allocator.free(digest);
             break :blk .{
-                .path = try allocator.dupe(u8, mutation.path),
+                .path = path,
                 .data = data,
                 .digest = digest,
                 .sequence = null,
@@ -1637,11 +1675,46 @@ fn readTransactionSnapshot(
     };
 }
 
-fn rejectHardlinkedTarget(path: []const u8) !void {
-    const stat = try statRegularFileNoSymlink(path);
+fn rejectHardlinkedTargetAt(dir: *std.Io.Dir, base: []const u8) !void {
+    const stat = dir.statFile(
+        Io.io(),
+        base,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
     if (stat) |value| {
+        if (value.kind == .sym_link) return error.SymlinkComponent;
+        if (value.kind != .file) return error.NotFile;
         if (value.nlink > 1) return error.HardlinkTarget;
     }
+}
+
+fn readRegularFileNoSymlinkAt(
+    allocator: std.mem.Allocator,
+    dir: *std.Io.Dir,
+    base: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    const stat = try dir.statFile(
+        Io.io(),
+        base,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > max_bytes) return error.FileTooBig;
+    var file = try dir.openFile(
+        Io.io(),
+        base,
+        .{ .allow_directory = false, .follow_symlinks = false },
+    );
+    defer file.close(Io.io());
+    const opened = try file.stat(Io.io());
+    if (opened.kind != .file or opened.nlink > 1) return error.HardlinkTarget;
+    var reader = file.reader(Io.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
 }
 
 pub fn commitJsonlSnapshotCas(
@@ -1665,6 +1738,59 @@ pub fn commitJsonlSnapshotCas(
         .result = try allocator.dupe(u8, receipt.result),
     };
 }
+
+const TransactionTarget = struct {
+    dir: std.Io.Dir,
+    parent: []const u8,
+    base: []const u8,
+    inode: std.Io.File.INode,
+
+    fn init(path: []const u8) !TransactionTarget {
+        const parent = std.fs.path.dirname(path) orelse
+            return error.InvalidPath;
+        try ensureDirectoryPathNoSymlinks(parent);
+        var dir = try std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        );
+        errdefer dir.close(Io.io());
+        const stat = try dir.statFile(
+            Io.io(),
+            ".",
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind != .directory) return error.NotDir;
+        return .{
+            .dir = dir,
+            .parent = parent,
+            .base = std.fs.path.basename(path),
+            .inode = stat.inode,
+        };
+    }
+
+    fn deinit(self: *TransactionTarget) void {
+        self.dir.close(Io.io());
+        self.* = undefined;
+    }
+
+    fn verifyPathIdentity(self: *TransactionTarget) !void {
+        var current = try std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            self.parent,
+            .{ .follow_symlinks = false },
+        );
+        defer current.close(Io.io());
+        const stat = try current.statFile(
+            Io.io(),
+            ".",
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind != .directory or stat.inode != self.inode) {
+            return error.TransactionTargetChanged;
+        }
+    }
+};
 
 pub fn commitTextTransaction(
     allocator: std.mem.Allocator,
@@ -1726,7 +1852,6 @@ pub fn commitTextTransaction(
         allocator.free(cas_locks);
     }
     for (ordered) |mutation| {
-        if (mutation.action != .check_only) continue;
         const cas_lock_path = try casLockPathAlloc(allocator, mutation.path);
         cas_locks[cas_lock_count] = acquireExclusiveLockPathRetry(
             allocator,
@@ -1739,6 +1864,17 @@ pub fn commitTextTransaction(
         };
         allocator.free(cas_lock_path);
         cas_lock_count += 1;
+    }
+
+    var targets = try allocator.alloc(TransactionTarget, ordered.len);
+    var target_count: usize = 0;
+    defer {
+        for (targets[0..target_count]) |*target| target.deinit();
+        allocator.free(targets);
+    }
+    for (ordered) |mutation| {
+        targets[target_count] = try TransactionTarget.init(mutation.path);
+        target_count += 1;
     }
 
     const now_ms = clockMillis(.real);
@@ -1755,10 +1891,13 @@ pub fn commitTextTransaction(
         allocator.free(writes);
     }
 
-    for (ordered, 0..) |mutation, index| {
-        try rejectHardlinkedTarget(mutation.path);
-        const maybe_before = readTransactionSnapshot(
+    for (ordered, targets, 0..) |mutation, *target, index| {
+        try target.verifyPathIdentity();
+        try rejectHardlinkedTargetAt(&target.dir, target.base);
+        const maybe_before = readTransactionSnapshotAt(
             allocator,
+            &target.dir,
+            target.base,
             mutation,
         ) catch |err| switch (err) {
             error.FileNotFound => null,
@@ -1829,7 +1968,8 @@ pub fn commitTextTransaction(
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .prepared, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), true);
     record_persisted = true;
 
-    for (ordered) |mutation| {
+    var publish_index: usize = 0;
+    for (ordered, targets) |mutation, *target| {
         if (mutation.action == .check_only) continue;
         var expectation = mutation.expectation;
         if (mutation.content_mode == .raw and
@@ -1837,14 +1977,15 @@ pub fn commitTextTransaction(
         {
             expectation.expected_sequence = null;
         }
-        var receipt = try writeTextAtomicCasBounded(
+        try publishStagedTransactionWrite(
             allocator,
-            mutation.path,
-            mutation.text,
+            transaction_dir,
+            writes[publish_index],
+            mutation,
             expectation,
-            mutation.max_bytes,
+            target,
         );
-        receipt.deinit(allocator);
+        publish_index += 1;
     }
 
     try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .committed, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), false);
@@ -1857,6 +1998,97 @@ pub fn commitTextTransaction(
         .commit_marker_path = commit_marker_path,
         .state = .committed,
     };
+}
+
+fn publishStagedTransactionWrite(
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+    write: TransactionWrite,
+    mutation: TransactionMutation,
+    expectation: CasExpectation,
+    target: *TransactionTarget,
+) !void {
+    const staged_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, write.staged_ref },
+    );
+    defer allocator.free(staged_path);
+    const staged = try readRegularFileNoSymlink(
+        allocator,
+        staged_path,
+        mutation.max_bytes,
+    );
+    defer allocator.free(staged);
+    const staged_digest = try digestBytesAlloc(allocator, staged);
+    defer allocator.free(staged_digest);
+    if (!std.mem.eql(u8, staged_digest, write.digest_after)) {
+        return error.TransactionCorrupt;
+    }
+    const sequence_after = switch (mutation.content_mode) {
+        .jsonl_sequence_required => (try jsonlSequenceRequired(
+            allocator,
+            staged,
+        )) orelse return error.SequenceMismatch,
+        .raw => 0,
+    };
+    if (sequence_after != write.sequence_after) {
+        return error.TransactionCorrupt;
+    }
+    try target.verifyPathIdentity();
+    try validateTransactionExpectationAt(
+        allocator,
+        mutation,
+        expectation,
+        target,
+    );
+    var staged_dir = try std.Io.Dir.openDirAbsolute(
+        Io.io(),
+        transaction_dir,
+        .{ .follow_symlinks = false },
+    );
+    defer staged_dir.close(Io.io());
+    try staged_dir.rename(
+        write.staged_ref,
+        target.dir,
+        target.base,
+        Io.io(),
+    );
+    try target.verifyPathIdentity();
+}
+
+fn validateTransactionExpectationAt(
+    allocator: std.mem.Allocator,
+    mutation: TransactionMutation,
+    expectation: CasExpectation,
+    target: *TransactionTarget,
+) !void {
+    const current = readTransactionSnapshotAt(
+        allocator,
+        &target.dir,
+        target.base,
+        mutation,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (current) |*snapshot| snapshot.deinit(allocator);
+    if (expectation.expected_exists) |expected_exists| {
+        if (expected_exists != (current != null)) {
+            return error.ExpectationMismatch;
+        }
+    }
+    if (expectation.expected_digest) |expected_digest| {
+        const actual = if (current) |snapshot| snapshot.digest else return error.DigestMismatch;
+        if (!std.mem.eql(u8, expected_digest, actual)) {
+            return error.DigestMismatch;
+        }
+    }
+    if (expectation.expected_sequence) |expected_sequence| {
+        const actual = if (current) |snapshot| snapshot.sequence else return error.SequenceMismatch;
+        if (actual == null or actual.? != expected_sequence) {
+            return error.SequenceMismatch;
+        }
+    }
 }
 
 fn transactionIdAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -1925,6 +2157,76 @@ pub fn recoverTransaction(allocator: std.mem.Allocator, transaction_dir: []const
     }
 }
 
+pub fn recoverAndCompactTransactions(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+) !void {
+    const max_entries: usize = 4096;
+    const max_record_bytes: usize = 16 * 1024 * 1024;
+    var dir = if (std.fs.path.isAbsolute(transactions_dir))
+        try std.Io.Dir.openDirAbsolute(Io.io(), transactions_dir, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), transactions_dir, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+    defer dir.close(Io.io());
+
+    var entries: usize = 0;
+    var record_bytes: usize = 0;
+    var iter = dir.iterate();
+    while (try iter.next(Io.io())) |entry| {
+        if (entry.kind == .sym_link) return error.SymlinkComponent;
+        if (entry.kind != .directory) continue;
+        entries = std.math.add(usize, entries, 1) catch
+            return error.TooManyFiles;
+        if (entries > max_entries) return error.TooManyFiles;
+        const transaction_dir = try std.fs.path.join(
+            allocator,
+            &.{ transactions_dir, entry.name },
+        );
+        defer allocator.free(transaction_dir);
+        const record_path = try std.fs.path.join(
+            allocator,
+            &.{ transaction_dir, "transaction.json" },
+        );
+        defer allocator.free(record_path);
+        const stat = try std.Io.Dir.cwd().statFile(
+            Io.io(),
+            record_path,
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+        if (stat.kind != .file) return error.TransactionCorrupt;
+        record_bytes = std.math.add(
+            usize,
+            record_bytes,
+            std.math.cast(usize, stat.size) orelse return error.FileTooBig,
+        ) catch return error.FileTooBig;
+        if (record_bytes > max_record_bytes) return error.FileTooBig;
+
+        var status = try inspectTransaction(allocator, transaction_dir);
+        defer status.deinit(allocator);
+        switch (status.decision) {
+            .already_committed => {},
+            .finish_commit, .roll_back_unpublished => {
+                var receipt = try recoverTransaction(
+                    allocator,
+                    transaction_dir,
+                );
+                receipt.deinit(allocator);
+            },
+            .manual_recovery_required => {
+                return error.TransactionRecoveryRequired;
+            },
+        }
+        try std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir);
+    }
+}
+
 fn makeRecoveryStatus(
     allocator: std.mem.Allocator,
     transaction_id: []const u8,
@@ -1968,9 +2270,21 @@ fn normalizeTransactionMutations(
         }
     }.lessThan);
     for (ordered[1..], 1..) |mutation, index| {
-        if (std.mem.eql(u8, ordered[index - 1].path, mutation.path)) return error.InvalidPath;
+        const prior = ordered[index - 1].path;
+        if (pathsAliasOrOverlap(prior, mutation.path)) {
+            return error.InvalidPath;
+        }
     }
     return ordered;
+}
+
+fn pathsAliasOrOverlap(left: []const u8, right: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(left, right)) return true;
+    const shorter = if (left.len < right.len) left else right;
+    const longer = if (left.len < right.len) right else left;
+    return longer.len > shorter.len and
+        std.ascii.startsWithIgnoreCase(longer, shorter) and
+        longer[shorter.len] == std.fs.path.sep;
 }
 
 fn rejectTransactionPath(path: []const u8, reject_symlinks: bool) !void {
@@ -2405,10 +2719,15 @@ fn scanJsonlEventStore(
         record_count += 1;
         canonical_hash.update(payload);
         canonical_hash.update("\n");
+        const leading = std.mem.trimStart(u8, line.bytes, " \t\r\n");
+        const payload_start = line.start_offset +
+            (line.bytes.len - leading.len);
         try visitor.visit(.{
             .payload = payload,
             .ordinal = @intCast(record_count),
             .diagnostic_position = line.number,
+            .extent_start = payload_start,
+            .extent_end = payload_start + payload.len,
         });
     }
     return finishEventScanSummary(
@@ -2444,22 +2763,29 @@ fn scanMemoryEventStore(
     var canonical_hash = EventHash.init(.{});
     var record_count: usize = 0;
     var blank_entries: usize = 0;
+    var raw_offset: usize = 0;
     for (store.records.items) |payload| {
         const canonical_payload = std.mem.trim(u8, payload, " \t\r\n");
         raw_hash.update(payload);
         raw_hash.update("\n");
         if (canonical_payload.len == 0) {
             blank_entries += 1;
+            raw_offset += payload.len + 1;
             continue;
         }
         record_count += 1;
         canonical_hash.update(canonical_payload);
         canonical_hash.update("\n");
+        const leading = std.mem.trimStart(u8, payload, " \t\r\n");
+        const payload_start = raw_offset + (payload.len - leading.len);
         try visitor.visit(.{
             .payload = canonical_payload,
             .ordinal = @intCast(record_count),
             .diagnostic_position = null,
+            .extent_start = payload_start,
+            .extent_end = payload_start + canonical_payload.len,
         });
+        raw_offset += payload.len + 1;
     }
     return finishEventScanSummary(
         allocator,
@@ -2842,6 +3168,33 @@ pub fn ensureDirectoryPathNoSymlinks(path: []const u8) !void {
     }
 }
 
+pub fn ensurePrivateDirectoryPathNoSymlinks(path: []const u8) !void {
+    try ensureDirectoryPathNoSymlinks(path);
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
+    try std.Io.Dir.cwd().setFilePermissions(
+        Io.io(),
+        path,
+        std.Io.File.Permissions.fromMode(0o700),
+        .{ .follow_symlinks = false },
+    );
+    try validatePrivateDirectoryPathNoSymlinks(path);
+}
+
+pub fn validatePrivateDirectoryPathNoSymlinks(path: []const u8) !void {
+    const stat = try std.Io.Dir.cwd().statFile(
+        Io.io(),
+        path,
+        .{ .follow_symlinks = false },
+    );
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .directory) return error.NotDir;
+    if (@hasDecl(std.Io.File.Permissions, "toMode") and
+        stat.permissions.toMode() & 0o077 != 0)
+    {
+        return error.InsecurePrivateDirectory;
+    }
+}
+
 fn statRegularFileNoSymlink(path: []const u8) !?std.Io.File.Stat {
     const stat = std.Io.Dir.cwd().statFile(
         Io.io(),
@@ -2879,6 +3232,37 @@ pub fn readRegularFileNoSymlink(
         );
     defer file.close(Io.io());
 
+    var reader = file.reader(Io.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
+}
+
+pub fn readPrivateRegularFileNoSymlink(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(
+            Io.io(),
+            path,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        )
+    else
+        try std.Io.Dir.cwd().openFile(
+            Io.io(),
+            path,
+            .{ .allow_directory = false, .follow_symlinks = false },
+        );
+    defer file.close(Io.io());
+    const stat = try file.stat(Io.io());
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.nlink != 1) return error.HardlinkTarget;
+    if (@hasDecl(std.Io.File.Permissions, "toMode") and
+        stat.permissions.toMode() & 0o077 != 0)
+    {
+        return error.InsecurePrivateFile;
+    }
+    if (stat.size > max_bytes) return error.FileTooBig;
     var reader = file.reader(Io.io(), &.{});
     return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
 }
@@ -3040,6 +3424,23 @@ pub fn writeTextCreateNewAtomic(
 }
 
 pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
+    return writeTextAtomicMode(allocator, path, text, null);
+}
+
+pub fn writeTextAtomicPrivate(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+) !void {
+    return writeTextAtomicMode(allocator, path, text, 0o600);
+}
+
+fn writeTextAtomicMode(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    file_mode: ?u32,
+) !void {
     const base = std.fs.path.basename(path);
     const parent = std.fs.path.dirname(path) orelse ".";
     try ensureDirectoryPathNoSymlinks(parent);
@@ -3053,13 +3454,13 @@ pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []c
     if (std.fs.path.isAbsolute(path)) {
         var dir = try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{});
         defer dir.close(Io.io());
-        try writeTempAndRename(&dir, tmp_name, base, text);
+        try writeTempAndRename(&dir, tmp_name, base, text, file_mode);
         return;
     }
 
     var dir = try std.Io.Dir.cwd().openDir(Io.io(), parent, .{});
     defer dir.close(Io.io());
-    try writeTempAndRename(&dir, tmp_name, base, text);
+    try writeTempAndRename(&dir, tmp_name, base, text, file_mode);
 }
 
 fn writeTempAndRename(
@@ -3067,8 +3468,13 @@ fn writeTempAndRename(
     tmp_name: []const u8,
     base: []const u8,
     text: []const u8,
+    file_mode: ?u32,
 ) !void {
-    var file = try dir.createFile(Io.io(), tmp_name, .{ .truncate = true, .read = true });
+    var file = try dir.createFile(Io.io(), tmp_name, .{
+        .truncate = true,
+        .read = true,
+        .permissions = filePermissionsFromMode(file_mode),
+    });
     var close_file = true;
     errdefer if (close_file) file.close(Io.io());
     try file.writeStreamingAll(Io.io(), text);
@@ -3280,6 +3686,7 @@ pub fn countPendingTransactions(
         allocator,
         transactions_dir,
         4096,
+        8192,
     );
 }
 
@@ -3287,6 +3694,7 @@ fn countPendingTransactionsBounded(
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
     max_pending: usize,
+    max_entries: usize,
 ) !usize {
     const dir_stat = std.Io.Dir.cwd().statFile(Io.io(), transactions_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -3302,8 +3710,12 @@ fn countPendingTransactionsBounded(
     defer dir.close(Io.io());
 
     var pending: usize = 0;
+    var entries: usize = 0;
     var iter = dir.iterate();
     while (try iter.next(Io.io())) |entry| {
+        entries = std.math.add(usize, entries, 1) catch
+            return error.TooManyFiles;
+        if (entries > max_entries) return error.TooManyFiles;
         if (entry.kind == .sym_link) return error.SymlinkComponent;
         if (entry.kind != .file and entry.kind != .directory) continue;
 
@@ -4471,6 +4883,7 @@ test "pending transaction bounds exclude committed flat journals" {
             std.testing.allocator,
             root,
             0,
+            16,
         ),
     );
     try tmp.dir.writeFile(std.testing.io, .{
@@ -4483,6 +4896,7 @@ test "pending transaction bounds exclude committed flat journals" {
             std.testing.allocator,
             root,
             0,
+            16,
         ),
     );
 }
@@ -4997,6 +5411,48 @@ test "listSortedRegularFilesNoSymlink sorts and rejects symlink entries" {
     defer dir.close(Io.io());
     try dir.symLink(Io.io(), "a.md", "link.md", .{});
     try std.testing.expectError(error.SymlinkComponent, listSortedRegularFilesNoSymlink(std.testing.allocator, dir_path, 10, 10));
+}
+
+test "private cache paths reject shared permissions" {
+    if (!@hasDecl(std.Io.File.Permissions, "fromMode")) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    const private_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "private" },
+    );
+    defer allocator.free(private_dir);
+    try ensurePrivateDirectoryPathNoSymlinks(private_dir);
+    const private_path = try std.fs.path.join(
+        allocator,
+        &.{ private_dir, "entry.bin" },
+    );
+    defer allocator.free(private_path);
+    try writeTextAtomicPrivate(allocator, private_path, "plan");
+    const bytes = try readPrivateRegularFileNoSymlink(
+        allocator,
+        private_path,
+        16,
+    );
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("plan", bytes);
+    try std.Io.Dir.cwd().setFilePermissions(
+        std.testing.io,
+        private_path,
+        std.Io.File.Permissions.fromMode(0o644),
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectError(
+        error.InsecurePrivateFile,
+        readPrivateRegularFileNoSymlink(allocator, private_path, 16),
+    );
 }
 
 test "appendLineAtomic appends newline-delimited records" {

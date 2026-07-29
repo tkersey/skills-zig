@@ -237,6 +237,7 @@ fn loadLocator(
     admitted_root: []const u8,
     closure_limits: definition_core.closure.Limits,
 ) !?Locator {
+    try validatePrivateCacheNamespace(allocator, cache_dir, "locators");
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -244,7 +245,7 @@ fn loadLocator(
         locator_key,
     );
     defer allocator.free(locator_path);
-    const locator_entry = durable_store.readRegularFileNoSymlink(
+    const locator_entry = durable_store.readPrivateRegularFileNoSymlink(
         allocator,
         locator_path,
         locator_limits.max_entry_bytes,
@@ -279,6 +280,7 @@ fn loadCachedPlan(
     locator: *const Locator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
+    try validatePrivateCacheNamespace(allocator, cache_dir, "plans");
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -286,7 +288,7 @@ fn loadCachedPlan(
         locator.plan_key,
     );
     defer allocator.free(plan_path);
-    const plan_entry = try durable_store.readRegularFileNoSymlink(
+    const plan_entry = try durable_store.readPrivateRegularFileNoSymlink(
         allocator,
         plan_path,
         cache_limits.max_entry_bytes,
@@ -342,9 +344,9 @@ fn writeCache(
         &.{ cache_dir, "locators" },
     );
     defer allocator.free(locators_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(plans_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(locators_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(plans_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(locators_dir);
 
     const plan_key = try writePlanEntry(
         allocator,
@@ -402,7 +404,7 @@ fn writePlanEntry(
         plan_key,
     );
     defer allocator.free(plan_path);
-    try durable_store.writeTextAtomic(allocator, plan_path, plan_entry);
+    try durable_store.writeTextAtomicPrivate(allocator, plan_path, plan_entry);
     return plan_key;
 }
 
@@ -445,7 +447,7 @@ fn writeLocatorEntry(
         locator_key,
     );
     defer allocator.free(locator_path);
-    try durable_store.writeTextAtomic(
+    try durable_store.writeTextAtomicPrivate(
         allocator,
         locator_path,
         locator_entry,
@@ -758,6 +760,20 @@ fn projectionSetDigest(request: Request) [32]u8 {
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
+}
+
+fn validatePrivateCacheNamespace(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    namespace: []const u8,
+) !void {
+    try durable_store.validatePrivateDirectoryPathNoSymlinks(cache_dir);
+    const namespace_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, namespace },
+    );
+    defer allocator.free(namespace_path);
+    try durable_store.validatePrivateDirectoryPathNoSymlinks(namespace_path);
 }
 
 fn cachePathAlloc(

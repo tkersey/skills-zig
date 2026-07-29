@@ -712,6 +712,7 @@ pub const Result = struct {
     payload: []u8,
     stats: Stats,
     limitations: [][]u8,
+    max_output_bytes: usize,
     exit_code: u8,
     authority_granted: bool = false,
     storage_mutated: bool = false,
@@ -4446,13 +4447,6 @@ fn executeResolvedProjection(
         try storage.resolve(allocator, storage_plan, parameters);
     defer resolved_storage.deinit(allocator);
     const slot = resolved_storage.slot(compiled.slot_index);
-    var snapshot = try custody.readSlotOrMissing(
-        allocator,
-        repo_root,
-        definition_plan.id,
-        slot,
-    );
-    defer snapshot.deinit(allocator);
     var fused_sorted = try initSortedAccumulator(
         allocator,
         compiled,
@@ -4463,6 +4457,34 @@ fn executeResolvedProjection(
     var fold_history =
         try initFoldHistory(allocator, compiled, event_protocol);
     defer if (fold_history) |*accumulator| accumulator.deinit();
+    if (slot.kind == .event_log and
+        (fold_history != null or fused_sorted != null))
+    {
+        const streamed = executeResolvedStreamProjection(
+            allocator,
+            definition_plan,
+            event_protocol,
+            plan,
+            compiled,
+            projection_name,
+            repo_root,
+            &slot,
+            parameters,
+            &fold_history,
+            &fused_sorted,
+        ) catch |err| switch (err) {
+            error.ReplayRequiresMaterializedHistory => null,
+            else => return err,
+        };
+        if (streamed) |result| return result;
+    }
+    var snapshot = try custody.readSlotOrMissing(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot,
+    );
+    defer snapshot.deinit(allocator);
     var replay_stats = try validateProjectionReplay(
         allocator,
         definition_plan,
@@ -4492,6 +4514,104 @@ fn executeResolvedProjection(
         &replay_stats,
         &fold_history,
         &fused_sorted,
+    );
+}
+
+fn executeResolvedStreamProjection(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    repo_root: []const u8,
+    slot: *const storage.ResolvedSlot,
+    parameters: *const definition_core.parameters.Bindings,
+    fold_history: *?FoldHistoryAccumulator,
+    fused_sorted: *?SortedAccumulator,
+) !?Result {
+    var snapshot = try custody.readReplaySlotOrMissing(
+        allocator,
+        repo_root,
+        definition_plan.id,
+        slot.*,
+    );
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) return null;
+    const protocol_required = event_protocol != null and
+        event_protocol.?.target_slot_index == compiled.slot_index;
+    var replay_stats = if (fold_history.*) |*accumulator|
+        try replay.validateReplaySlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot.*,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            accumulator,
+        )
+    else if (fused_sorted.*) |*accumulator|
+        try replay.validateReplaySlotObserved(
+            allocator,
+            repo_root,
+            definition_plan.id,
+            slot.*,
+            &snapshot,
+            parameters,
+            definition_plan.bounds.max_records,
+            protocol_required,
+            accumulator,
+        )
+    else
+        return error.StreamProjectionAccumulatorMissing;
+    defer replay_stats.deinit(allocator);
+    const effective_limit =
+        try resolveLimit(compiled.limit, parameters, plan.max_records);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    var stats: Stats = .{
+        .records_scanned = replay_stats.records_validated,
+        .records_matched = 0,
+        .records_emitted = 0,
+    };
+    if (compiled.fold != null) {
+        try executeFoldProjection(
+            allocator,
+            event_protocol,
+            compiled,
+            &replay_stats,
+            if (fold_history.*) |*value| value else null,
+            parameters,
+            effective_limit,
+            plan.max_output_bytes,
+            &output,
+            &stats,
+        );
+    } else {
+        const accumulator = if (fused_sorted.*) |*value| value else return error.StreamProjectionAccumulatorMissing;
+        if (accumulator.records_seen != replay_stats.records_validated) {
+            return error.StreamProjectionRecordCountMismatch;
+        }
+        try accumulator.write(
+            &output.writer,
+            effective_limit,
+            &stats,
+        );
+    }
+    if (output.written().len > plan.max_output_bytes) {
+        return error.ProjectionOutputBoundsExceeded;
+    }
+    return try buildProjectionResult(
+        allocator,
+        definition_plan,
+        compiled,
+        projection_name,
+        slot.relative_path,
+        snapshot.revision,
+        &output,
+        stats,
     );
 }
 
@@ -4951,6 +5071,7 @@ fn buildProjectionResult(
         .payload = payload,
         .stats = stats,
         .limitations = limitations,
+        .max_output_bytes = definition_plan.bounds.max_output_bytes,
         .exit_code = if (stats.records_matched != 0)
             compiled.exit_policy.matched
         else
@@ -5205,6 +5326,7 @@ fn emptyMatchingResult(
             .records_emitted = 0,
         },
         .limitations = limitations,
+        .max_output_bytes = definition_plan.bounds.max_output_bytes,
         .exit_code = compiled.exit_policy.unmatched,
     };
 }

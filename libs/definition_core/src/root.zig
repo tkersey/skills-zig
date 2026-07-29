@@ -5,7 +5,6 @@ pub const json = @import("json.zig");
 pub const json_pointer = @import("json_pointer.zig");
 pub const scalar = @import("scalar.zig");
 pub const parameters = @import("parameters.zig");
-pub const manifest = @import("manifest.zig");
 pub const cache = @import("cache.zig");
 pub const diagnostics = @import("diagnostics.zig");
 pub const result = @import("result.zig");
@@ -23,7 +22,6 @@ test {
     _ = json_pointer;
     _ = scalar;
     _ = parameters;
-    _ = manifest;
     _ = cache;
     _ = diagnostics;
     _ = result;

@@ -473,6 +473,11 @@ pub fn materialize(
             &canonical_digest,
             &artifact_id,
         );
+        if (canonical_content != null and
+            canonical_content.?.len > definition_plan.bounds.max_output_bytes)
+        {
+            return error.OutputLimitExceeded;
+        }
     }
     const validation_result = try execution.takeResult(allocator, definition_plan);
     return .{

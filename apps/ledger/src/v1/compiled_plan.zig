@@ -8,7 +8,7 @@ const projection = @import("projection.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
-const payload_version: u16 = 31;
+const payload_version: u16 = 32;
 const locator_version: u16 = 1;
 const cache_limits: definition_core.cache.Limits = .{};
 const locator_max_payload_bytes: usize = 2 * 1024 * 1024;
@@ -366,6 +366,7 @@ fn tryLoadLocator(
     locator_key: [32]u8,
     closure_limits: definition_core.closure.Limits,
 ) !?VerifiedLocator {
+    try validatePrivateCacheNamespace(allocator, cache_dir, "locators");
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -373,7 +374,7 @@ fn tryLoadLocator(
         locator_key,
     );
     defer allocator.free(locator_path);
-    const locator_entry = durable_store.readRegularFileNoSymlink(
+    const locator_entry = durable_store.readPrivateRegularFileNoSymlink(
         allocator,
         locator_path,
         locator_limits.max_entry_bytes,
@@ -408,6 +409,7 @@ fn loadCachedPlan(
     locator: *const VerifiedLocator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
+    try validatePrivateCacheNamespace(allocator, cache_dir, "plans");
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -415,7 +417,7 @@ fn loadCachedPlan(
         locator.value.plan_key,
     );
     defer allocator.free(plan_path);
-    const plan_entry = try durable_store.readRegularFileNoSymlink(
+    const plan_entry = try durable_store.readPrivateRegularFileNoSymlink(
         allocator,
         plan_path,
         cache_limits.max_entry_bytes,
@@ -502,9 +504,9 @@ fn ensureCacheDirectories(
         &.{ cache_dir, "locators" },
     );
     defer allocator.free(locators_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(cache_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(plans_dir);
-    try durable_store.ensureDirectoryPathNoSymlinks(locators_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(cache_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(plans_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(locators_dir);
 }
 
 fn writePlanCache(
@@ -536,7 +538,7 @@ fn writePlanCache(
         plan_key,
     );
     defer allocator.free(plan_path);
-    try durable_store.writeTextAtomic(allocator, plan_path, plan_entry);
+    try durable_store.writeTextAtomicPrivate(allocator, plan_path, plan_entry);
 }
 
 fn writeLocatorCache(
@@ -576,7 +578,7 @@ fn writeLocatorCache(
         locator_key,
     );
     defer allocator.free(locator_path);
-    try durable_store.writeTextAtomic(
+    try durable_store.writeTextAtomicPrivate(
         allocator,
         locator_path,
         locator_entry,
@@ -1107,6 +1109,20 @@ fn locatorKey(
         @tagName(route.kind),
         route.name orelse "",
     });
+}
+
+fn validatePrivateCacheNamespace(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    namespace: []const u8,
+) !void {
+    try durable_store.validatePrivateDirectoryPathNoSymlinks(cache_dir);
+    const namespace_path = try std.fs.path.join(
+        allocator,
+        &.{ cache_dir, namespace },
+    );
+    defer allocator.free(namespace_path);
+    try durable_store.validatePrivateDirectoryPathNoSymlinks(namespace_path);
 }
 
 fn cachePathAlloc(

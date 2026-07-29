@@ -7,6 +7,7 @@ const max_regex_atoms_per_pattern: usize = 255;
 const max_regex_total_atoms: usize =
     max_regex_patterns * max_regex_atoms_per_pattern;
 const max_regex_subject_bytes: usize = 16 * 1024 * 1024;
+const max_regex_work: usize = 256 * 1024 * 1024;
 const max_sha256_subject_bytes: usize = 16 * 1024 * 1024;
 const max_cache_rule_tasks: usize = 128 * 65_535;
 const max_value_equality_pairs: usize = 1_000_000;
@@ -111,6 +112,7 @@ const CompiledVariant = struct {
 const CompiledFormatPart = union(enum) {
     literal: []u8,
     parent: u16,
+    parent_json: u16,
     item: u16,
     value,
 
@@ -667,8 +669,62 @@ const Builder = struct {
                 object,
                 rule,
             ),
+            .array_count_equal => try self.compileArrayCountEqualRule(
+                object,
+                rule,
+            ),
+            .array_integer_sum_lte => try self.compileArrayIntegerSumLteRule(
+                object,
+                rule,
+            ),
             else => unreachable,
         }
+    }
+
+    fn compileArrayCountEqualRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "array", "count" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "array", "count" },
+        );
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "array"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "count"),
+        );
+    }
+
+    fn compileArrayIntegerSumLteRule(
+        self: *Builder,
+        object: std.json.ObjectMap,
+        rule: *CompiledRule,
+    ) !void {
+        try definition_core.json.requireExactKeys(
+            object,
+            &.{ "op", "input", "array", "value", "limit" },
+        );
+        try definition_core.json.requireFields(
+            object,
+            &.{ "op", "array", "value", "limit" },
+        );
+        rule.pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "array"),
+        );
+        rule.other_pointer_id = try self.internPointer(
+            try definition_core.json.requiredString(object, "limit"),
+        );
+        rule.path_ids = try self.allocator.alloc(u16, 1);
+        rule.path_ids[0] = try self.internPointer(
+            try definition_core.json.requiredString(object, "value"),
+        );
     }
 
     fn compileNestedProtocolRootRule(
@@ -1239,6 +1295,7 @@ const Builder = struct {
             source.format_parts = try self.compileFormatParts(
                 raw_fragments,
                 true,
+                false,
             );
         }
         return source;
@@ -1372,6 +1429,7 @@ const Builder = struct {
             target.format_parts = try self.compileFormatParts(
                 raw_fragments,
                 false,
+                false,
             );
         }
         return target;
@@ -1439,6 +1497,7 @@ const Builder = struct {
         rule.format_parts = try self.compileFormatParts(
             try definition_core.json.field(object, "fragments"),
             false,
+            false,
         );
     }
 
@@ -1446,6 +1505,7 @@ const Builder = struct {
         self: *Builder,
         raw: std.json.Value,
         allow_value: bool,
+        allow_parent_json: bool,
     ) anyerror![]CompiledFormatPart {
         const raw_fragments = try definition_core.json.array(raw);
         if (raw_fragments.items.len == 0 or
@@ -1489,6 +1549,15 @@ const Builder = struct {
             } else if (fragment.get("parent")) |raw_parent| {
                 parts[index] = .{
                     .parent = try self.internPointer(
+                        try definition_core.json.string(raw_parent),
+                    ),
+                };
+            } else if (fragment.get("parent-json")) |raw_parent| {
+                if (!allow_parent_json) {
+                    return error.PathFormatFragmentInvalid;
+                }
+                parts[index] = .{
+                    .parent_json = try self.internPointer(
                         try definition_core.json.string(raw_parent),
                     ),
                 };
@@ -2382,7 +2451,7 @@ const Builder = struct {
         rule.path_ids[0] = try self.internPointer(
             try definition_core.json.requiredString(object, "items"),
         );
-        try self.compileSha256Framing(object, rule);
+        try self.compileSha256Framing(object, rule, false);
     }
 
     fn compileSha256Fields(
@@ -2397,9 +2466,9 @@ const Builder = struct {
         if (object.get("null") != null or object.get("items") != null) {
             return error.ConflictingSha256ModeFields;
         }
-        try self.compileSha256Framing(object, rule);
+        try self.compileSha256Framing(object, rule, true);
         for (rule.format_parts) |part| switch (part) {
-            .literal, .parent => {},
+            .literal, .parent, .parent_json => {},
             .item, .value => return error.InvalidSha256FieldFragment,
         };
     }
@@ -2408,6 +2477,7 @@ const Builder = struct {
         self: *Builder,
         object: std.json.ObjectMap,
         rule: *CompiledRule,
+        allow_parent_json: bool,
     ) !void {
         const prefix = (try definition_core.json.optionalString(
             object,
@@ -2420,6 +2490,7 @@ const Builder = struct {
         rule.format_parts = try self.compileFormatParts(
             try definition_core.json.field(object, "fragments"),
             false,
+            allow_parent_json,
         );
     }
 
@@ -3513,6 +3584,10 @@ fn encodeCompiledFormatParts(
                 try encoder.writeByte(1);
                 try encoder.writeU16(pointer_id);
             },
+            .parent_json => |pointer_id| {
+                try encoder.writeByte(4);
+                try encoder.writeU16(pointer_id);
+            },
             .item => |pointer_id| {
                 try encoder.writeByte(2);
                 try encoder.writeU16(pointer_id);
@@ -4105,6 +4180,7 @@ fn decodeCompiledFormatParts(
             1 => .{ .parent = try decoder.readU16() },
             2 => .{ .item = try decoder.readU16() },
             3 => .value,
+            4 => .{ .parent_json = try decoder.readU16() },
             else => return error.CachePathFormatPartInvalid,
         };
         initialized += 1;
@@ -4262,7 +4338,14 @@ fn validateCachedRule(
     try validateCachedOwnershipFields(rule);
     try validateCachedPayloadFields(rule);
     try validateCachedExtensionFields(rule);
-    try validateCachedFormatParts(rule.format_parts, pointer_count, false);
+    try validateCachedFormatParts(
+        rule.format_parts,
+        pointer_count,
+        false,
+        rule.operator == .sha256 and
+            rule.sha256_mode != null and
+            rule.sha256_mode.? == .framed_fields,
+    );
     try validateCachedChildRelations(rule);
     try validateCachedReferenceRelations(rule, pointer_count);
     try validateCachedVariantRelations(rule);
@@ -4398,6 +4481,8 @@ fn validateCachedRegexRule(rule: CompiledRule) !void {
             }
         }
     }
+    validateRegexWorkBound(rule) catch
+        return error.CacheRuleConfigurationInvalid;
 }
 
 fn validateCachedSha256Rule(rule: CompiledRule) !void {
@@ -4439,7 +4524,7 @@ fn validateCachedSha256Rule(rule: CompiledRule) !void {
                 return error.CacheRuleConfigurationInvalid;
             }
             for (rule.format_parts) |part| switch (part) {
-                .literal, .parent => {},
+                .literal, .parent, .parent_json => {},
                 .item, .value => return error.CacheRuleConfigurationInvalid,
             };
         },
@@ -4825,6 +4910,7 @@ fn validateCachedReferenceRelations(
             source.format_parts,
             pointer_count,
             true,
+            false,
         );
         try validateCachedItemRuleGroup(source.rules, rule.input_index);
     }
@@ -4895,6 +4981,7 @@ fn validateCachedReferenceTarget(
         target.format_parts,
         pointer_count,
         false,
+        false,
     );
     try validateCachedItemRuleGroup(target.rules, input_index);
     try validateCachedItemRuleGroup(target.match_rules, input_index);
@@ -4918,6 +5005,7 @@ fn validateCachedFormatParts(
     parts: []const CompiledFormatPart,
     pointer_count: usize,
     allow_value: bool,
+    allow_parent_json: bool,
 ) !void {
     if (parts.len > 32) return error.CacheRuleConfigurationInvalid;
     var literal_bytes: usize = 0;
@@ -4939,6 +5027,14 @@ fn validateCachedFormatParts(
             .parent, .item => |pointer_id| {
                 if (pointer_id >= pointer_count) {
                     return error.CacheRuleIndexInvalid;
+                }
+            },
+            .parent_json => |pointer_id| {
+                if (pointer_id >= pointer_count) {
+                    return error.CacheRuleIndexInvalid;
+                }
+                if (!allow_parent_json) {
+                    return error.CacheRuleConfigurationInvalid;
                 }
             },
             .value => if (!allow_value) {
@@ -5706,6 +5802,8 @@ inline fn evaluateRule(context: RuleEvaluationContext) anyerror!?bool {
         .total_mapping,
         .predecessor_successor,
         .path_format,
+        .array_count_equal,
+        .array_integer_sum_lte,
         => try evaluateProtocolRule(context),
         else => try evaluateCompositeRule(context),
     };
@@ -5891,8 +5989,66 @@ inline fn evaluateProtocolRule(context: RuleEvaluationContext) anyerror!bool {
             formattedFieldsHold(context.plan, rule, value)
         else
             false,
+        .array_count_equal => arrayCountEqual(
+            context.plan,
+            context.root,
+            rule,
+        ),
+        .array_integer_sum_lte => arrayIntegerSumLte(
+            context.plan,
+            context.root,
+            rule,
+        ),
         else => unreachable,
     };
+}
+
+fn arrayCountEqual(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: *const CompiledRule,
+) bool {
+    const items = switch (resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false) {
+        .array => |value| value.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records) return false;
+    const declared = definition_core.json.unsigned(resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return false) catch return false;
+    return items.len == declared;
+}
+
+fn arrayIntegerSumLte(
+    plan: *const Plan,
+    root: std.json.Value,
+    rule: *const CompiledRule,
+) bool {
+    const items = switch (resolve(
+        root,
+        plan.pointers[rule.pointer_id.?],
+    ) orelse return false) {
+        .array => |value| value.items,
+        else => return false,
+    };
+    if (items.len > plan.max_records or rule.path_ids.len != 1) return false;
+    const value_pointer = plan.pointers[rule.path_ids[0]];
+    var sum: usize = 0;
+    for (items) |item| {
+        const value = definition_core.json.unsigned(
+            resolve(item, value_pointer) orelse return false,
+        ) catch return false;
+        sum = std.math.add(usize, sum, value) catch return false;
+    }
+    const limit = definition_core.json.unsigned(resolve(
+        root,
+        plan.pointers[rule.other_pointer_id.?],
+    ) orelse return false) catch return false;
+    return sum <= limit;
 }
 
 inline fn evaluateCompositeRule(context: RuleEvaluationContext) anyerror!bool {
@@ -6230,6 +6386,7 @@ fn formattedFieldFragment(
             .string => |text| text,
             else => null,
         },
+        .parent_json => null,
         .item => |pointer_id| switch (resolve(
             item,
             plan.pointers[pointer_id],
@@ -6447,6 +6604,8 @@ fn isProtocolExecutionOperator(operator: definition.Operator) bool {
         .total_mapping,
         .predecessor_successor,
         .path_format,
+        .array_count_equal,
+        .array_integer_sum_lte,
         => true,
         else => false,
     };
@@ -7026,13 +7185,15 @@ fn sha256Holds(
             value,
             &hasher,
         )) return false,
-        .framed_items => if (!hashFramedItems(
+        .framed_items => if (!try hashFramedItems(
+            allocator,
             plan,
             rule,
             value,
             &hasher,
         )) return false,
-        .framed_fields => if (!hashFramedFields(
+        .framed_fields => if (!try hashFramedFields(
+            allocator,
             plan,
             rule,
             value,
@@ -7095,11 +7256,12 @@ fn hashCanonicalJsonNull(
 }
 
 fn hashFramedItems(
+    allocator: std.mem.Allocator,
     plan: *const Plan,
     rule: *const CompiledRule,
     value: std.json.Value,
     hasher: *std.crypto.hash.sha2.Sha256,
-) bool {
+) !bool {
     if (plan.pointers[rule.path_ids[0]].raw.len == 0) return false;
     const items = switch (resolve(
         value,
@@ -7119,7 +7281,8 @@ fn hashFramedItems(
             .value = item,
             .parts = rule.format_parts,
         };
-        if (!hashFormattedParts(
+        if (!try hashFormattedParts(
+            allocator,
             plan,
             rule,
             key,
@@ -7131,15 +7294,17 @@ fn hashFramedItems(
 }
 
 fn hashFramedFields(
+    allocator: std.mem.Allocator,
     plan: *const Plan,
     rule: *const CompiledRule,
     value: std.json.Value,
     hasher: *std.crypto.hash.sha2.Sha256,
-) bool {
+) !bool {
     var total_bytes = rule.sha256_prefix.?.len;
     if (total_bytes > rule.max_count.?) return false;
     hasher.update(rule.sha256_prefix.?);
     return hashFormattedParts(
+        allocator,
         plan,
         rule,
         .{
@@ -7154,13 +7319,47 @@ fn hashFramedFields(
 }
 
 fn hashFormattedParts(
+    allocator: std.mem.Allocator,
     plan: *const Plan,
     rule: *const CompiledRule,
     key: FormattedReferenceKey,
     total_bytes: *usize,
     hasher: *std.crypto.hash.sha2.Sha256,
-) bool {
+) !bool {
     for (rule.format_parts) |part| {
+        switch (part) {
+            .parent_json => |pointer_id| {
+                const selected = resolve(
+                    key.parent,
+                    plan.pointers[pointer_id],
+                ) orelse return false;
+                const canonical =
+                    definition_core.canonical_json.canonicalJsonAlloc(
+                        allocator,
+                        selected,
+                    ) catch |err| switch (err) {
+                        error.WriteFailed => return error.OutOfMemory,
+                        else => return err,
+                    };
+                const updated_total = std.math.add(
+                    usize,
+                    total_bytes.*,
+                    canonical.len,
+                ) catch {
+                    allocator.free(canonical);
+                    return false;
+                };
+                if (updated_total > rule.max_count.?) {
+                    allocator.free(canonical);
+                    return false;
+                }
+                total_bytes.* = updated_total;
+                hasher.update(canonical);
+                allocator.free(canonical);
+                continue;
+            },
+            else => {},
+        }
         const fragment = formattedReferenceFragment(
             plan,
             key,
@@ -7216,6 +7415,9 @@ fn compiledRegexMatches(
             }
         }
         active = next;
+        if (active[0] | active[1] | active[2] | active[3] == 0) {
+            return false;
+        }
         regexEpsilonClosure(pattern, &active);
     }
     regexEpsilonClosure(pattern, &active);
@@ -8773,6 +8975,7 @@ fn formattedReferenceFragment(
             .string => |text| text,
             else => null,
         },
+        .parent_json => null,
         .item => |pointer_id| switch (resolve(
             key.item,
             plan.pointers[pointer_id],
@@ -9924,6 +10127,8 @@ fn isValidationOperator(operator: definition.Operator) bool {
         .total_partition,
         .total_mapping,
         .path_format,
+        .array_count_equal,
+        .array_integer_sum_lte,
         => true,
         else => false,
     };
@@ -10001,6 +10206,8 @@ fn isRelationalRootOperator(operator: definition.Operator) bool {
         .at_least_one,
         .keyed_join,
         .predecessor_successor,
+        .array_count_equal,
+        .array_integer_sum_lte,
         => true,
         else => false,
     };
@@ -10092,6 +10299,7 @@ fn compileRegexRootRule(
         allocator,
         try definition_core.json.field(object, "patterns"),
     );
+    try validateRegexWorkBound(rule.*);
 }
 
 fn compileIdentifierRootRule(
@@ -10302,6 +10510,24 @@ fn compileRegexItemRule(
         allocator,
         try definition_core.json.field(object, "patterns"),
     );
+    try validateRegexWorkBound(rule.*);
+}
+
+fn validateRegexWorkBound(rule: CompiledRule) !void {
+    var total_atoms: usize = 0;
+    for (rule.regex_patterns) |pattern| {
+        total_atoms = std.math.add(
+            usize,
+            total_atoms,
+            pattern.atoms.len,
+        ) catch return error.RegexWorkBoundExceeded;
+    }
+    const work = std.math.mul(
+        usize,
+        rule.max_count.?,
+        total_atoms,
+    ) catch return error.RegexWorkBoundExceeded;
+    if (work > max_regex_work) return error.RegexWorkBoundExceeded;
 }
 
 fn compileIdentifierItemRule(

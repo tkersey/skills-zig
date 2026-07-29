@@ -22,6 +22,8 @@ pub const ChunkObserver = struct {
 pub const Line = struct {
     bytes: []const u8,
     number: usize,
+    start_offset: usize,
+    end_offset: usize,
 };
 
 /// Delivers newline-delimited records in source order without imposing an
@@ -38,6 +40,7 @@ pub const Stream = struct {
     chunk_len: usize = 0,
     line_number: usize = 0,
     bytes_read: usize = 0,
+    line_start_offset: usize = 0,
     eof: bool = false,
 
     pub fn init(
@@ -69,7 +72,15 @@ pub const Stream = struct {
                     try self.append(remaining[0..newline_rel]);
                     self.chunk_pos += newline_rel + 1;
                     self.line_number += 1;
-                    return .{ .bytes = self.line.items, .number = self.line_number };
+                    const start_offset = self.line_start_offset;
+                    const end_offset = start_offset + self.line.items.len;
+                    self.line_start_offset = end_offset + 1;
+                    return .{
+                        .bytes = self.line.items,
+                        .number = self.line_number,
+                        .start_offset = start_offset,
+                        .end_offset = end_offset,
+                    };
                 }
                 try self.append(remaining);
                 self.chunk_pos = self.chunk_len;
@@ -78,7 +89,15 @@ pub const Stream = struct {
             if (self.eof) {
                 if (self.line.items.len == 0) return null;
                 self.line_number += 1;
-                return .{ .bytes = self.line.items, .number = self.line_number };
+                const start_offset = self.line_start_offset;
+                const end_offset = start_offset + self.line.items.len;
+                self.line_start_offset = end_offset;
+                return .{
+                    .bytes = self.line.items,
+                    .number = self.line_number,
+                    .start_offset = start_offset,
+                    .end_offset = end_offset,
+                };
             }
 
             self.chunk_len = try self.reader.readSliceShort(self.chunk[0..]);
