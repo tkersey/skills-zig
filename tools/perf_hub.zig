@@ -543,7 +543,7 @@ const SealedFile = struct {
 };
 
 const CompilerEvidence = struct {
-    approved_path: []u8,
+    approved_path: [:0]u8,
     file: SealedFile,
     version: []u8,
 
@@ -551,7 +551,7 @@ const CompilerEvidence = struct {
         self: CompilerEvidence,
         allocator: std.mem.Allocator,
     ) !CompilerEvidence {
-        const approved_path = try allocator.dupe(u8, self.approved_path);
+        const approved_path = try allocator.dupeZ(u8, self.approved_path);
         errdefer allocator.free(approved_path);
         var file = try self.file.clone(allocator);
         errdefer file.deinit(allocator);
@@ -6662,6 +6662,21 @@ test "temp-root release deletes storage before freeing its path" {
         error.FileNotFound,
         std.Io.Dir.cwd().access(std.testing.io, observed_root, .{}),
     );
+}
+
+test "compiler evidence retains sentinel path ownership" {
+    const allocator = std.testing.allocator;
+    const approved_path = try allocator.dupeZ(u8, "/tmp/zig");
+    errdefer allocator.free(approved_path);
+    const file_path = try allocator.dupeZ(u8, "/tmp/sealed-zig");
+    errdefer allocator.free(file_path);
+    const version = try allocator.dupe(u8, "0.16.0");
+    var evidence = CompilerEvidence{
+        .approved_path = approved_path,
+        .file = .{ .path = file_path, .sha256 = undefined },
+        .version = version,
+    };
+    evidence.deinit(allocator);
 }
 
 test "inferBinary maps lift driver case to bench_stats" {
