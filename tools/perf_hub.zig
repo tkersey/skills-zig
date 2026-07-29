@@ -9,11 +9,11 @@ const perf_contract = @import("perf_contract");
 const Version = "0.0.0-dev";
 const paired_comparison_rounds: usize = 8;
 const accepted_generic_deep_schema1_sha =
-    "56b331131a0c066c83fd2e0a1d9632979f4c1912";
+    "ddf201901391ea625e4ac9b0c9649570bc56e58f";
 const accepted_generic_deep_schema1_tree =
-    "98bc897744f9bf485948620d748285c99df80674";
+    "59fcca22a691bbc98a4e38e50c6d642116611b43";
 const accepted_generic_deep_schema1_source_sha256 =
-    "2e71ab87c2ed27718e6255449c3bbe531ac950c7fff92a7615811e565294c12b";
+    "0be169c43deebf30f95954b63d334d4e66bde47e0f4a503e4f6b1ac8e5b15a5f";
 const shared_driver_source_path = "tools/perf_hub.zig";
 const deep_measurement_schema = "perf-deep-measurement/v1";
 const deep_comparison_method = "balanced-round-median-ratio/v1";
