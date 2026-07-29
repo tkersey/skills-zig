@@ -121,6 +121,9 @@ case "$mode" in
           package_changed=1
           ;;
         libs/core/src/perf_contract.zig)
+          if git cat-file -e "${head}:${path}" 2>/dev/null; then
+            mark_all
+          fi
           ;;
         libs/core/*)
           mark_all

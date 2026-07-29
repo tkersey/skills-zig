@@ -93,4 +93,15 @@ for token in \
   fi
 done
 
+for token in \
+  '"tools/perf_contract.zig"' \
+  "grep -Fxq 'tools/perf_contract.zig'" \
+  "if: needs.changes.outputs.perf == 'true'" \
+  "run: zig build test-perf-hub"; do
+  if ! grep -Fq -- "$token" "$workflow"; then
+    echo "Performance CI ownership token missing: $token" >&2
+    exit 1
+  fi
+done
+
 echo "Seq CI proof matrix is valid."

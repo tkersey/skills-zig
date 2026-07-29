@@ -24,6 +24,7 @@ on:
       - ".github/workflows/auto-release.yml"
       - "tools/durable_store_perf.zig"
       - "tools/perf_hub.zig"
+      - "tools/perf_contract.zig"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
 
@@ -75,7 +76,8 @@ jobs:
           done
 
           perf=false
-          if grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths"; then
+          if grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
+             grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths"; then
             perf=true
           fi
           echo "perf=$perf" >> "$GITHUB_OUTPUT"

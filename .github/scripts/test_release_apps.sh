@@ -19,6 +19,8 @@ for app in "${apps[@]}"; do
 done
 printf 'const img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 printf '.{}\n' >build.zig.zon
+mkdir -p libs/core/src
+printf 'legacy contract\n' >libs/core/src/perf_contract.zig
 git add .
 git commit -qm base
 base=$(git rev-parse HEAD)
@@ -83,9 +85,18 @@ write_store_core() {
   printf 'store\n' >libs/durable_store/root.zig
 }
 
-write_perf_contract() {
-  mkdir -p libs/core/src
-  printf 'contract\n' >libs/core/src/perf_contract.zig
+change_shared_perf_contract() {
+  printf 'shared contract\n' >libs/core/src/perf_contract.zig
+}
+
+move_perf_contract_to_tools() {
+  mkdir -p tools
+  mv libs/core/src/perf_contract.zig tools/perf_contract.zig
+}
+
+write_tool_perf_contract() {
+  mkdir -p tools
+  printf 'tool contract\n' >tools/perf_contract.zig
 }
 
 write_perf_hub_build() {
@@ -160,7 +171,9 @@ assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
-assert_affected "" write_perf_contract
+assert_affected seq,lift,cas,cron,ledger,memory-note,img change_shared_perf_contract
+assert_affected "" move_perf_contract_to_tools
+assert_affected "" write_tool_perf_contract
 assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
 assert_affected seq write_seq_strip_build
