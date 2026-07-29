@@ -1487,21 +1487,10 @@ const EffectSlotSource = struct {
                 else => return err,
             };
         errdefer if (before) |bytes| allocator.free(bytes);
-        const before_exists = if (stream_event_log) exists: {
-            try durable_store.rejectSymlinkComponents(slot_path);
-            const stat = std.Io.Dir.cwd().statFile(
-                defaultIo(),
-                slot_path,
-                .{ .follow_symlinks = false },
-            ) catch |err| switch (err) {
-                error.FileNotFound => break :exists false,
-                else => return err,
-            };
-            if (stat.kind == .sym_link) return error.SymlinkComponent;
-            if (stat.kind != .file) return error.NotFile;
-            if (stat.size > slot.max_bytes) return error.FileTooBig;
-            break :exists true;
-        } else before != null;
+        const before_exists = if (stream_event_log)
+            try eventLogSlotExists(slot_path, slot.max_bytes)
+        else
+            before != null;
         const before_digest = if (before) |bytes|
             try definition_core.canonical_json.digestBytesAlloc(
                 allocator,
@@ -1538,6 +1527,22 @@ const EffectSlotSource = struct {
         self.* = undefined;
     }
 };
+
+fn eventLogSlotExists(path: []const u8, max_bytes: usize) !bool {
+    try durable_store.rejectSymlinkComponents(path);
+    const stat = std.Io.Dir.cwd().statFile(
+        defaultIo(),
+        path,
+        .{ .follow_symlinks = false },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > max_bytes) return error.FileTooBig;
+    return true;
+}
 
 fn validateEffectSlotPreconditions(
     effect: storage.Effect,

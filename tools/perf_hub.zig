@@ -12,6 +12,8 @@ const accepted_generic_deep_schema1_sha =
     "4ff01f5e6f2fa5bd4c945f5b6a92bb6d22ca8389";
 const accepted_generic_deep_schema1_tree =
     "940f8017025d5b50bc52923ffbd8eda122649b94";
+const accepted_generic_deep_schema1_source_sha256 =
+    "9d186a4ce3fdf4485fad43ea9d98096067c1e98dffb0563ac8cd141206c23753";
 const shared_driver_source_path = "tools/perf_hub.zig";
 const deep_measurement_schema = "perf-deep-measurement/v1";
 const deep_comparison_method = "balanced-round-median-ratio/v1";
@@ -1314,7 +1316,6 @@ const DriverEvidence = struct {
     product_source_tree_sha: []u8,
     product_source_archive_sha256: [64]u8,
     compiler: CompilerEvidence,
-    configuration_digest: [64]u8,
 
     fn deinit(self: *DriverEvidence, allocator: std.mem.Allocator) void {
         self.file.deinit(allocator);
@@ -1425,7 +1426,6 @@ fn binaryEvidence(
 fn driverEvidence(
     allocator: std.mem.Allocator,
     built: BuiltSource,
-    case_cfg: DeepCase,
 ) !DriverEvidence {
     var file = try built.perf_hub.clone(allocator);
     errdefer file.deinit(allocator);
@@ -1454,7 +1454,6 @@ fn driverEvidence(
         .product_source_tree_sha = product_source_tree_sha,
         .product_source_archive_sha256 = built.source_archive.sha256,
         .compiler = compiler,
-        .configuration_digest = try deepConfigurationDigest(case_cfg),
     };
 }
 
@@ -1464,6 +1463,17 @@ fn requireDriverUnchanged(driver: DriverEvidence) !void {
 
 fn requireBinaryUnchanged(evidence: BinaryEvidence) !void {
     verifySealedFile(evidence.file) catch return error.ProductBinaryChanged;
+}
+
+fn requireCompilerDigestAtPath(
+    path: []const u8,
+    expected_digest: []const u8,
+) !void {
+    if (expected_digest.len != 64) return error.CompilerBinaryChanged;
+    const observed = try sha256FileBounded(path, 64 * 1024 * 1024);
+    if (!std.mem.eql(u8, &observed, expected_digest)) {
+        return error.CompilerBinaryChanged;
+    }
 }
 
 fn approvedCompilerEvidence(
@@ -1701,12 +1711,14 @@ fn readStableFileAlloc(
     return bytes;
 }
 
-fn deepConfigurationDigest(case_cfg: DeepCase) ![64]u8 {
+fn caseConfigurationDigest(case_cfg: CompatCase) ![64]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{
-        deep_measurement_schema,
-        deep_comparison_method,
+        "perf-case-configuration/v1",
         case_cfg.descriptor.case_id,
+        case_cfg.descriptor.binary,
+        case_cfg.descriptor.case_kind.asString(),
+        @tagName(case_cfg.descriptor.measurement_mode),
         @tagName(case_cfg.setup),
         "ReleaseFast",
     }) |value| {
@@ -1716,16 +1728,25 @@ fn deepConfigurationDigest(case_cfg: DeepCase) ![64]u8 {
     var encoded: [128]u8 = undefined;
     const numeric = try std.fmt.bufPrint(
         &encoded,
-        "{d}:{d}:{d}:{d}:{d:.6}",
+        "{d}:{d}:{d}:{d}:{d:.6}:{d:.6}",
         .{
             case_cfg.warmups,
             case_cfg.samples,
-            case_cfg.batch_iterations,
+            if (isDeepCaseId(case_cfg.descriptor.case_id))
+                DeepCases[0].batch_iterations
+            else
+                0,
             paired_comparison_rounds,
             case_cfg.tolerance_pct,
+            resource_tolerance_pct,
         },
     );
     hasher.update(numeric);
+    if (isDeepCaseId(case_cfg.descriptor.case_id)) {
+        hasher.update(deep_measurement_schema);
+        hasher.update(&.{0});
+        hasher.update(deep_comparison_method);
+    }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
@@ -2278,7 +2299,6 @@ fn runPairedDeepCases(
     var baseline_driver = try driverEvidence(
         allocator,
         baseline_built.*,
-        case_cfg,
     );
     errdefer baseline_driver.deinit(allocator);
     const candidate_built = ensureSourceBuilt(
@@ -2290,7 +2310,6 @@ fn runPairedDeepCases(
     var candidate_driver = try driverEvidence(
         allocator,
         candidate_built.*,
-        case_cfg,
     );
     errdefer candidate_driver.deinit(allocator);
     try requireBinaryUnchanged(baseline_evidence);
@@ -2437,6 +2456,21 @@ fn runPairedDeepCases(
     candidate_rss = .empty;
     try requireBinaryUnchanged(baseline_evidence);
     try requireBinaryUnchanged(candidate_evidence);
+    const final_baseline_workload = deepWorkloadDigestForRoot(
+        allocator,
+        baseline_root,
+        case_cfg,
+    ) catch |err| return deepStageError("baseline-workload-final", err);
+    const final_candidate_workload = deepWorkloadDigestForRoot(
+        allocator,
+        candidate_root,
+        case_cfg,
+    ) catch |err| return deepStageError("candidate-workload-final", err);
+    if (!std.mem.eql(u8, &baseline_workload, &final_baseline_workload) or
+        !std.mem.eql(u8, &candidate_workload, &final_candidate_workload))
+    {
+        return error.PerfWorkloadChanged;
+    }
     return .{
         .baseline = baseline,
         .candidate = candidate,
@@ -2543,6 +2577,12 @@ fn ensureSourceBuilt(
         source_root,
     );
     defer allocator.free(driver_source_bytes);
+    const driver_source_digest = evidenceDigest(driver_source_bytes);
+    if (!std.mem.eql(
+        u8,
+        &driver_source_digest,
+        accepted_generic_deep_schema1_source_sha256,
+    )) return error.DriverSourceRevisionMismatch;
     var driver_source_file = try sealEvidenceBytes(
         allocator,
         machine_dir,
@@ -2694,17 +2734,10 @@ fn ensureSourceBuilt(
         return error.DriverSourceChangedDuringBuild;
     }
     try verifySealedFile(compiler.file);
-    const post_compiler_sha = try sha256FileBounded(
+    try requireCompilerDigestAtPath(
         compiler.approved_path,
-        64 * 1024 * 1024,
-    );
-    if (!std.mem.eql(
-        u8,
-        &post_compiler_sha,
         &compiler.file.sha256,
-    )) {
-        return error.CompilerBinaryChanged;
-    }
+    );
     var executables: [3]SealedFile = undefined;
     var executable_count: usize = 0;
     defer for (executables[0..executable_count]) |*file| {
@@ -2781,6 +2814,10 @@ fn ensureSourceBuilt(
     defer allocator.free(driver_build.stderr);
     if (driver_build.exit_code != 0) return error.BuildFailed;
     try verifySealedFile(driver_source_file);
+    try requireCompilerDigestAtPath(
+        compiler.approved_path,
+        &compiler.file.sha256,
+    );
     const built_driver_path = try std.fs.path.join(
         allocator,
         &.{ prefix_dir, "bin", "perf_hub" },
@@ -3911,8 +3948,8 @@ fn writeSealedFile(
     writer: *std.Io.Writer,
     file: SealedFile,
 ) !void {
-    try writer.writeAll("{\"path\":");
-    try writeJsonString(writer, file.path);
+    try writer.writeAll("{\"label\":");
+    try writeJsonString(writer, std.fs.path.basename(file.path));
     try writer.writeAll(",\"sha256\":\"sha256:");
     try writer.writeAll(&file.sha256);
     try writer.writeAll("\"}");
@@ -3984,11 +4021,8 @@ fn writeDriverEvidence(
     try writer.writeAll(
         ",\"build\":{\"optimize\":\"ReleaseFast\",\"step\":\"install\"," ++
             "\"repo_local_prefix\":true,\"isolated_caches\":true," ++
-            "\"product_output_isolated\":true}," ++
-            "\"configuration_digest\":\"sha256:",
+            "\"product_output_isolated\":true}}",
     );
-    try writer.writeAll(&evidence.configuration_digest);
-    try writer.writeAll("\"}");
 }
 
 fn writePairedMetricsArtifact(
@@ -4011,56 +4045,25 @@ fn writePairedMetricsArtifact(
     const writer = &output.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
-    const git_sha = try gitShaAlloc(allocator);
-    defer allocator.free(git_sha);
+    const configuration_digest = try caseConfigurationDigest(
+        evidenceCaseConfig(case_cfg.descriptor.case_id) orelse
+            return error.InvalidPerfEvidenceFile,
+    );
     try writer.print(
-        "{{\"schema_version\":2,\"evidence_kind\":\"paired\"," ++
-            "\"machine_id\":\"{s}\",\"git_sha\":\"{s}\"," ++
-            "\"zig_version\":\"{s}\",\"binary\":\"{s}\"," ++
-            "\"case_id\":\"{s}\",\"case_kind\":\"{s}\"," ++
-            "\"warmups\":{d},\"samples\":{d},\"tolerance_pct\":{d:.2}," ++
-            "\"workload\":{{\"setup\":\"{s}\",\"digest\":\"sha256:{s}\"," ++
-            "\"ledger_seed_records\":{d}}}",
+        "{{\"schema_version\":3,\"evidence_kind\":\"paired\"," ++
+            "\"machine_id\":\"{s}\",\"binary\":\"{s}\"," ++
+            "\"case_id\":\"{s}\",\"configuration_digest\":\"sha256:{s}\"," ++
+            "\"workload_digest\":\"sha256:{s}\"",
         .{
             machine_name,
-            git_sha,
-            builtin.zig_version_string,
             case_cfg.descriptor.binary,
             case_cfg.descriptor.case_id,
-            case_cfg.descriptor.case_kind.asString(),
-            case_cfg.warmups,
-            case_cfg.samples,
-            case_cfg.tolerance_pct,
-            @tagName(case_cfg.setup),
+            configuration_digest,
             workload_digest,
-            if (case_cfg.setup == .ledger_transact or
-                case_cfg.setup == .ledger_project or
-                case_cfg.setup == .ledger_doctor)
-                ledger_perf_record_count
-            else
-                0,
         },
     );
-    if (baseline_driver != null or candidate_driver != null) {
-        if (baseline_driver == null or candidate_driver == null) {
-            return error.IncompletePerfDriverEvidence;
-        }
-        try writer.print(
-            ",\"measurement_contract\":{{\"schema\":\"{s}\"," ++
-                "\"latency_unit\":\"ns\",\"latency_scope\":\"batch-total\"," ++
-                "\"allocation_unit\":\"calls\"," ++
-                "\"allocation_scope\":\"per-operation\"}}," ++
-                "\"comparison_contract\":{{\"method\":\"{s}\"," ++
-                "\"rounds\":{d},\"samples_per_round\":{d}," ++
-                "\"batch_iterations\":{d}}}",
-            .{
-                deep_measurement_schema,
-                deep_comparison_method,
-                paired_comparison_rounds,
-                case_cfg.samples / paired_comparison_rounds,
-                DeepCases[0].batch_iterations,
-            },
-        );
+    if ((baseline_driver == null) != (candidate_driver == null)) {
+        return error.IncompletePerfDriverEvidence;
     }
     try writer.writeAll(",\"baseline\":{\"binary\":");
     try writeBinaryEvidence(writer, baseline_evidence);
@@ -4814,7 +4817,7 @@ fn jsonValueU64(value: std.json.Value, _: []const u8) !u64 {
     };
 }
 
-const CapsuleFile = struct { path: []const u8, sha256: []const u8 };
+const CapsuleFile = struct { label: []const u8, sha256: []const u8 };
 const CapsuleSource = struct {
     revision: []const u8,
     tree: []const u8,
@@ -4858,7 +4861,6 @@ const CapsuleDriver = struct {
     product_source: CapsuleDriverProductSource,
     compiler: CapsuleCompiler,
     build: CapsuleBuild,
-    configuration_digest: []const u8,
 };
 const CapsuleMetrics = struct {
     samples_ns: []const u64,
@@ -4889,26 +4891,14 @@ const CapsuleSide = struct {
     metrics: CapsuleMetrics,
     execution: CapsuleExecution,
 };
-const CapsuleWorkload = struct {
-    setup: []const u8,
-    digest: []const u8,
-    ledger_seed_records: u64,
-};
 const CapsuleEvidence = struct {
     schema_version: u64,
     evidence_kind: []const u8,
     machine_id: []const u8,
-    git_sha: []const u8,
-    zig_version: []const u8,
     binary: []const u8,
     case_id: []const u8,
-    case_kind: []const u8,
-    warmups: u64,
-    samples: u64,
-    tolerance_pct: f64,
-    workload: CapsuleWorkload,
-    measurement_contract: ?std.json.Value = null,
-    comparison_contract: ?std.json.Value = null,
+    configuration_digest: []const u8,
+    workload_digest: []const u8,
     baseline: CapsuleSide,
     candidate: CapsuleSide,
     compare_status: []const u8,
@@ -5080,10 +5070,9 @@ fn validatePairedEvidence(
     expected_candidate: []const u8,
 ) !void {
     const evidence = row.evidence;
-    if (evidence.schema_version != 2 or
+    if (evidence.schema_version != 3 or
         !std.mem.eql(u8, evidence.evidence_kind, "paired") or
-        !validFullRevision(evidence.git_sha) or
-        evidence.machine_id.len == 0 or evidence.zig_version.len == 0)
+        evidence.machine_id.len == 0)
     {
         return error.InvalidPerfEvidenceFile;
     }
@@ -5094,10 +5083,17 @@ fn validatePairedEvidence(
     }
     const config = evidenceCaseConfig(row.case_id) orelse
         return error.InvalidPerfEvidenceFile;
-    if (!std.mem.eql(u8, evidence.workload.setup, @tagName(config.setup))) {
-        return error.PerfWorkloadMismatch;
+    const configuration_digest = try caseConfigurationDigest(config);
+    if (evidence.configuration_digest.len != "sha256:".len + 64 or
+        !std.mem.eql(
+            u8,
+            evidence.configuration_digest["sha256:".len..],
+            &configuration_digest,
+        ))
+    {
+        return error.PerfDriverConfigurationMismatch;
     }
-    try requireDigestIdentity(evidence.workload.digest);
+    try requireDigestIdentity(evidence.workload_digest);
     try validateProductEvidence(
         allocator,
         evidence.baseline.binary,
@@ -5129,6 +5125,12 @@ fn validatePairedEvidence(
             candidate_driver,
             evidence.candidate.binary,
         );
+        try validateRetainedDeepWorkload(
+            allocator,
+            evidence.workload_digest,
+            evidence.baseline.binary.source.revision,
+            evidence.candidate.binary.source.revision,
+        );
         if (!std.mem.eql(
             u8,
             baseline_driver.source.file.sha256,
@@ -5137,10 +5139,6 @@ fn validatePairedEvidence(
             u8,
             baseline_driver.source.revision,
             candidate_driver.source.revision,
-        ) or !std.mem.eql(
-            u8,
-            baseline_driver.configuration_digest,
-            candidate_driver.configuration_digest,
         )) return error.PerfDriverSourceMismatch;
     } else if (evidence.baseline.driver != null or
         evidence.candidate.driver != null)
@@ -5181,6 +5179,62 @@ fn validatePairedEvidence(
         !std.mem.eql(u8, evidence.compare_status, row.status))
     {
         return error.PerfVerdictMismatch;
+    }
+}
+
+fn validateRetainedDeepWorkload(
+    allocator: std.mem.Allocator,
+    identity: []const u8,
+    baseline_revision: []const u8,
+    candidate_revision: []const u8,
+) !void {
+    if (identity.len != "sha256:".len + 64) {
+        return error.PerfWorkloadMismatch;
+    }
+    for ([_][]const u8{
+        baseline_revision,
+        candidate_revision,
+    }) |revision| {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(DeepCases[0].descriptor.case_id);
+        hasher.update(&.{0});
+        hasher.update(@tagName(DeepCases[0].setup));
+        hasher.update(&.{0});
+        var encoded: [32]u8 = undefined;
+        hasher.update(try std.fmt.bufPrint(
+            &encoded,
+            "{d}",
+            .{DeepCases[0].batch_iterations},
+        ));
+        for ([_][]const u8{
+            "apps/seq/src/v1/fixtures/message-observation.json",
+            "apps/seq/src/v1/fixtures/rollout.jsonl",
+        }) |path| {
+            const object = try std.fmt.allocPrint(
+                allocator,
+                "{s}:{s}",
+                .{ revision, path },
+            );
+            defer allocator.free(object);
+            const result = try runChildCaptureOutput(
+                allocator,
+                ".",
+                &.{ git_binary, "show", object },
+            );
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            if (result.exit_code != 0) return error.PerfWorkloadMismatch;
+            hasher.update(&.{0});
+            hasher.update(path);
+            hasher.update(&.{0});
+            hasher.update(result.stdout);
+        }
+        var raw: [32]u8 = undefined;
+        hasher.final(&raw);
+        const digest = std.fmt.bytesToHex(raw, .lower);
+        if (!std.mem.eql(u8, identity["sha256:".len..], &digest)) {
+            return error.PerfWorkloadMismatch;
+        }
     }
 }
 
@@ -5235,20 +5289,8 @@ fn validateDriverEvidence(
     driver: CapsuleDriver,
     product: CapsuleProduct,
 ) !void {
+    try validateDriverSourceMetadata(driver.source);
     if (!std.mem.eql(
-        u8,
-        driver.source.revision,
-        accepted_generic_deep_schema1_sha,
-    ) or !std.mem.eql(
-        u8,
-        driver.source.tree,
-        accepted_generic_deep_schema1_tree,
-    ) or
-        !std.mem.eql(
-            u8,
-            driver.source.path,
-            shared_driver_source_path,
-        ) or !std.mem.eql(
         u8,
         driver.product_source.revision,
         product.source.revision,
@@ -5272,17 +5314,51 @@ fn validateDriverEvidence(
         product.compiler.file.sha256,
     )) return error.CompilerBinaryChanged;
     try validateIsolatedBuild(driver.build);
-    try requireDigestIdentity(driver.configuration_digest);
+}
+
+fn validateDriverSourceMetadata(source: CapsuleDriverSource) !void {
+    if (!std.mem.eql(
+        u8,
+        source.revision,
+        accepted_generic_deep_schema1_sha,
+    ) or !std.mem.eql(
+        u8,
+        source.tree,
+        accepted_generic_deep_schema1_tree,
+    ) or !std.mem.eql(
+        u8,
+        source.path,
+        shared_driver_source_path,
+    ) or !std.mem.eql(
+        u8,
+        source.file.sha256,
+        "sha256:" ++ accepted_generic_deep_schema1_source_sha256,
+    )) return error.PerfEvidenceIdentityMismatch;
 }
 
 fn validateCompilerEvidence(
     allocator: std.mem.Allocator,
     compiler: CapsuleCompiler,
 ) !void {
-    if (compiler.approved_path.len == 0 or compiler.version.len == 0) {
+    if (!std.fs.path.isAbsolute(compiler.approved_path) or
+        compiler.version.len == 0)
+    {
         return error.InvalidPerfEvidenceFile;
     }
     try verifyCapsuleFile(allocator, compiler.file);
+    if (compiler.file.sha256.len != "sha256:".len + 64 or
+        !std.mem.eql(
+            u8,
+            compiler.file.sha256[0.."sha256:".len],
+            "sha256:",
+        ))
+    {
+        return error.CompilerBinaryChanged;
+    }
+    try requireCompilerDigestAtPath(
+        compiler.approved_path,
+        compiler.file.sha256["sha256:".len..],
+    );
 }
 
 fn validateIsolatedBuild(build: CapsuleBuild) !void {
@@ -5407,13 +5483,121 @@ fn loadCapsuleFileAlloc(
     max_bytes: usize,
 ) ![]u8 {
     try requireDigestIdentity(file.sha256);
-    try requireCapsuleBlobPath(allocator, file.path);
-    const data = try readRegularFileAlloc(
+    if (file.label.len == 0 or
+        !std.mem.eql(u8, file.label, std.fs.path.basename(file.label)) or
+        std.mem.eql(u8, file.label, ".") or
+        std.mem.eql(u8, file.label, ".."))
+    {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+    const machine_dir_relative = try resolveMachineDir(
         allocator,
-        file.path,
-        max_bytes,
+        ".perf-local",
     );
+    defer allocator.free(machine_dir_relative);
+    const machine_stat = try std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        machine_dir_relative,
+        .{ .follow_symlinks = false },
+    );
+    if (machine_stat.kind == .sym_link or
+        machine_stat.kind != .directory)
+    {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        machine_dir_relative,
+        allocator,
+    );
+    defer allocator.free(machine_dir);
+    const capsules_root = try std.fs.path.join(
+        allocator,
+        &.{ machine_dir, "capsules" },
+    );
+    defer allocator.free(capsules_root);
+    const capsules_stat = try std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        capsules_root,
+        .{ .follow_symlinks = false },
+    );
+    if (capsules_stat.kind == .sym_link or
+        capsules_stat.kind != .directory)
+    {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+    const blobs_root = try std.fs.path.join(
+        allocator,
+        &.{ capsules_root, "blobs" },
+    );
+    defer allocator.free(blobs_root);
+    const blobs_stat = try std.Io.Dir.cwd().statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        blobs_root,
+        .{ .follow_symlinks = false },
+    );
+    if (blobs_stat.kind == .sym_link or
+        blobs_stat.kind != .directory)
+    {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+    const digest = file.sha256["sha256:".len..];
+    var root = try std.Io.Dir.openDirAbsolute(
+        std.Io.Threaded.global_single_threaded.io(),
+        blobs_root,
+        .{ .follow_symlinks = false },
+    );
+    defer root.close(std.Io.Threaded.global_single_threaded.io());
+    const digest_stat = try root.statFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        digest,
+        .{ .follow_symlinks = false },
+    );
+    if (digest_stat.kind == .sym_link or digest_stat.kind != .directory) {
+        return error.PerfEvidencePathOutsideCapsule;
+    }
+    const relative_path = try std.fs.path.join(
+        allocator,
+        &.{ digest, file.label },
+    );
+    defer allocator.free(relative_path);
+    var opened = try root.openFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        relative_path,
+        .{
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        },
+    );
+    defer opened.close(std.Io.Threaded.global_single_threaded.io());
+    const before = try opened.stat(
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    if (before.kind != .file or before.nlink != 1 or
+        before.size > max_bytes)
+    {
+        return error.InvalidPerfEvidenceFile;
+    }
+    const size = std.math.cast(usize, before.size) orelse
+        return error.InvalidPerfEvidenceFile;
+    const data = try allocator.alloc(u8, size);
     errdefer allocator.free(data);
+    const count = try opened.readPositionalAll(
+        std.Io.Threaded.global_single_threaded.io(),
+        data,
+        0,
+    );
+    if (count != size) return error.PerfEvidenceFileChanged;
+    const after = try opened.stat(
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    if (after.kind != .file or after.nlink != 1 or
+        after.size != before.size or
+        after.mtime.nanoseconds != before.mtime.nanoseconds)
+    {
+        return error.PerfEvidenceFileChanged;
+    }
     const observed = evidenceDigest(data);
     if (!std.mem.eql(
         u8,
@@ -5435,34 +5619,6 @@ fn verifyCapsuleFile(
     allocator.free(data);
 }
 
-fn requireCapsuleBlobPath(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) !void {
-    if (!std.fs.path.isAbsolute(path)) {
-        return error.PerfEvidencePathOutsideCapsule;
-    }
-    const machine_dir_relative = try ensureCurrentMachineDir(allocator);
-    defer allocator.free(machine_dir_relative);
-    const machine_dir = try std.Io.Dir.cwd().realPathFileAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        machine_dir_relative,
-        allocator,
-    );
-    defer allocator.free(machine_dir);
-    const blobs_root = try std.fs.path.join(
-        allocator,
-        &.{ machine_dir, "capsules", "blobs" },
-    );
-    defer allocator.free(blobs_root);
-    if (!std.mem.startsWith(u8, path, blobs_root) or
-        path.len <= blobs_root.len or
-        path[blobs_root.len] != std.fs.path.sep)
-    {
-        return error.PerfEvidencePathOutsideCapsule;
-    }
-}
-
 fn requireCutoverReportTuple(
     environment: *const std.process.Environ.Map,
     tuple: ReportTuple,
@@ -5481,25 +5637,10 @@ fn requireCutoverReportTuple(
 fn resolveMachineDir(allocator: std.mem.Allocator, perf_root: []const u8) ![]u8 {
     const current_name = try currentMachineDirName(allocator);
     defer allocator.free(current_name);
-
     const preferred = try std.fs.path.join(allocator, &.{ perf_root, current_name });
     errdefer allocator.free(preferred);
-    if (pathExists(preferred)) return preferred;
-
-    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), perf_root, .{ .iterate = true });
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    var it = dir.iterate();
-    var fallback: ?[]u8 = null;
-    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
-        if (entry.kind != .directory) continue;
-        if (fallback != null) return error.AmbiguousMachineDir;
-        fallback = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ perf_root, entry.name });
-    }
-    if (fallback) |value| {
-        allocator.free(preferred);
-        return value;
-    }
-    return error.MissingMachineDir;
+    if (!pathExists(preferred)) return error.MissingMachineDir;
+    return preferred;
 }
 
 fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
@@ -5529,24 +5670,6 @@ fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "perf-report")) return "perf_report";
     if (std.mem.startsWith(u8, case_id, "cas-")) return "cas";
     return "unknown";
-}
-
-fn gitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
-    return fullGitShaAlloc(allocator);
-}
-
-fn fullGitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const result = try runChildCaptureOutput(
-        allocator,
-        ".",
-        &.{ git_binary, "rev-parse", "HEAD" },
-    );
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.exit_code != 0) return error.BinarySourceUnavailable;
-    const sha = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (!validFullRevision(sha)) return error.BinarySourceUnavailable;
-    return allocator.dupe(u8, sha);
 }
 
 fn pathExists(path: []const u8) bool {
@@ -5677,43 +5800,179 @@ fn writeJsonString(writer: anytype, text: []const u8) !void {
     try std.json.Stringify.value(text, .{}, writer);
 }
 
-test "resolveMachineDir prefers current machine directory when multiple directories exist" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const alloc = std.testing.allocator;
-    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
-    defer alloc.free(cwd_before);
-    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
-    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
-
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local");
-    const current_name = try currentMachineDirName(alloc);
-    defer alloc.free(current_name);
-    const current_path = try std.fmt.allocPrint(alloc, ".perf-local/{s}", .{current_name});
-    defer alloc.free(current_path);
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), current_path);
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local/other-machine");
-
-    const resolved = try resolveMachineDir(alloc, ".perf-local");
-    defer alloc.free(resolved);
-    try std.testing.expect(std.mem.endsWith(u8, resolved, current_name));
+fn restoreTestCwd(io: std.Io, path: []const u8) void {
+    std.process.setCurrentPath(io, path) catch |err| {
+        std.debug.panic("restore test cwd: {s}", .{@errorName(err)});
+    };
 }
 
-test "resolveMachineDir falls back to a single legacy directory" {
+test "resolveMachineDir rejects a legacy-only directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
     const alloc = std.testing.allocator;
-    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
+    const io = std.testing.io;
+    const cwd_before = try std.process.currentPathAlloc(io, alloc);
     defer alloc.free(cwd_before);
-    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
-    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer restoreTestCwd(io, cwd_before);
 
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local/legacy-only");
-    const resolved = try resolveMachineDir(alloc, ".perf-local");
-    defer alloc.free(resolved);
-    try std.testing.expect(std.mem.endsWith(u8, resolved, "legacy-only"));
+    try tmp.dir.createDirPath(io, ".perf-local/legacy-only");
+    try std.testing.expectError(
+        error.MissingMachineDir,
+        resolveMachineDir(alloc, ".perf-local"),
+    );
+}
+
+test "capsule files are digest-addressed beneath the current machine root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd_before = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd_before);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer restoreTestCwd(io, cwd_before);
+    const tmp_root = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(tmp_root);
+
+    const machine_dir = try ensureCurrentMachineDir(allocator);
+    defer allocator.free(machine_dir);
+    var sealed = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "payload",
+        "bound",
+        0o600,
+    );
+    defer sealed.deinit(allocator);
+    const identity = try std.fmt.allocPrint(
+        allocator,
+        "sha256:{s}",
+        .{sealed.sha256},
+    );
+    defer allocator.free(identity);
+    const valid = CapsuleFile{
+        .label = "payload",
+        .sha256 = identity,
+    };
+    const bytes = try loadCapsuleFileAlloc(allocator, valid, 64);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("bound", bytes);
+
+    try std.testing.expectError(
+        error.PerfEvidencePathOutsideCapsule,
+        loadCapsuleFileAlloc(
+            allocator,
+            .{ .label = "../payload", .sha256 = identity },
+            64,
+        ),
+    );
+
+    var symlinked = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "payload",
+        "external",
+        0o600,
+    );
+    defer symlinked.deinit(allocator);
+    const symlink_identity = try std.fmt.allocPrint(
+        allocator,
+        "sha256:{s}",
+        .{symlinked.sha256},
+    );
+    defer allocator.free(symlink_identity);
+    const symlink_blob_dir = std.fs.path.dirname(symlinked.path).?;
+    try std.Io.Dir.deleteFileAbsolute(io, symlinked.path);
+    try std.Io.Dir.deleteDirAbsolute(io, symlink_blob_dir);
+    const external_dir = try std.fs.path.join(
+        allocator,
+        &.{ tmp_root, "capsule-symlink-target" },
+    );
+    defer allocator.free(external_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(external_dir);
+    const external_path = try std.fs.path.join(
+        allocator,
+        &.{ external_dir, "payload" },
+    );
+    defer allocator.free(external_path);
+    try writeEvidenceFileAtomic(
+        allocator,
+        external_path,
+        "external",
+        0o600,
+    );
+    try std.Io.Dir.symLinkAbsolute(
+        io,
+        external_dir,
+        symlink_blob_dir,
+        .{ .is_directory = true },
+    );
+    try std.testing.expectError(
+        error.PerfEvidencePathOutsideCapsule,
+        loadCapsuleFileAlloc(
+            allocator,
+            .{
+                .label = "payload",
+                .sha256 = symlink_identity,
+            },
+            64,
+        ),
+    );
+}
+
+test "frozen driver source metadata binds the accepted bytes" {
+    var source = CapsuleDriverSource{
+        .revision = accepted_generic_deep_schema1_sha,
+        .tree = accepted_generic_deep_schema1_tree,
+        .path = shared_driver_source_path,
+        .file = .{
+            .label = "perf_hub.zig",
+            .sha256 = "sha256:" ++
+                accepted_generic_deep_schema1_source_sha256,
+        },
+    };
+    try validateDriverSourceMetadata(source);
+    source.file.sha256 =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expectError(
+        error.PerfEvidenceIdentityMismatch,
+        validateDriverSourceMetadata(source),
+    );
+}
+
+test "compiler digest check rejects mutation between builds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "zig",
+        .data = "approved",
+    });
+    const compiler_path = try tmp.dir.realPathFileAlloc(
+        io,
+        "zig",
+        allocator,
+    );
+    defer allocator.free(compiler_path);
+    const approved_digest = evidenceDigest("approved");
+    try requireCompilerDigestAtPath(
+        compiler_path,
+        &approved_digest,
+    );
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "zig",
+        .data = "replaced",
+    });
+    try std.testing.expectError(
+        error.CompilerBinaryChanged,
+        requireCompilerDigestAtPath(
+            compiler_path,
+            &approved_digest,
+        ),
+    );
 }
 
 test "report errors clearly when compare summary is missing" {
