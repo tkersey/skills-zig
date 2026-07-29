@@ -825,10 +825,20 @@ pub fn build(b: *std.Build) void {
     addRunStepPrefixed(b, perf_hub, "perf-manifest-local", "Emit native perf manifest", &.{"manifest"});
     addRunStepPrefixed(b, perf_hub, "perf-audit-local", "Audit native perf coverage", &.{"audit"});
     addRunStepPrefixed(b, perf_hub, "perf-doctor-local", "Validate local perf coverage and setup", &.{"doctor"});
-    addRunStepPrefixed(b, perf_hub, "perf-capture-local", "Capture local perf baselines", &.{"capture"});
-    addRunStepPrefixed(b, perf_hub, "perf-compare-local", "Compare against local perf baselines", &.{"compare"});
-    addRunStepPrefixed(b, perf_hub, "perf-report-local", "Summarize latest compare artifacts", &.{"report"});
-    addRunStepPrefixed(b, perf_hub, "perf-accept-local", "Accept current baselines into the local ledger", &.{"accept"});
+    addRunStepPrefixed(
+        b,
+        perf_hub,
+        "perf-compare-local",
+        "Run a sealed paired perf comparison",
+        &.{"compare"},
+    );
+    addRunStepPrefixed(
+        b,
+        perf_hub,
+        "perf-report-local",
+        "Verify and summarize the current perf capsule",
+        &.{"report"},
+    );
 }
 
 fn addExecutable(

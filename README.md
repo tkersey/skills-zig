@@ -75,21 +75,22 @@ zig build perf-list-local
 zig build perf-manifest-local
 zig build perf-audit-local
 zig build perf-doctor-local
-zig build perf-capture-local
-zig build perf-compare-local
+PERF_SEQ_BASE_BINARY=/path/to/base/seq \
+PERF_LEDGER_BASE_BINARY=/path/to/base/ledger \
+PERF_SEQ_BINARY=/path/to/candidate/seq \
+PERF_LEDGER_BINARY=/path/to/candidate/ledger \
+PERF_EXPECT_BASE_SHA=<base-revision> \
+PERF_EXPECT_CANDIDATE_SHA=<candidate-revision> \
+PERF_ZIG_BINARY=/absolute/path/to/zig \
+  zig build perf-compare-local -- --target cutover
 zig build perf-report-local
-zig build perf-accept-local
-
-# Optional filter by binary or case id substring.
-zig build perf-capture-local -- --target seq
-zig build perf-compare-local -- --target cron
 ```
 
-Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
-Accepted baseline snapshots and compare summaries are stored under the same machine-local root.
-`perf-report-local` writes `latest-report.json` for every complete comparison.
-Only a complete, exact-tuple `--target cutover` comparison also writes
-`cutover-status.json`.
+Content-addressed performance capsules live under the ignored
+`.perf-local/<machine-id>/capsules/` root. A successful paired comparison
+atomically updates `reports/current-capsule.json`, the non-authoritative
+locator verified by `perf-report-local`. Interrupted runs leave that locator
+incomplete; unmatched targets preserve the prior locator.
 Representative native qualification inputs remain beside the owning runtime.
 
 ## Release Model
