@@ -248,6 +248,9 @@ pub fn validateReplaySlotObserved(
     observer: anytype,
 ) !Stats {
     if (slot.kind != .event_log) return error.StreamReplayRequiresEventLog;
+    if (snapshot.read_custody == null) {
+        return error.ReplayRequiresMaterializedHistory;
+    }
     if (current_max_records == 0 or current_max_records > 10_000_000) {
         return error.InvalidReplayRecordBound;
     }

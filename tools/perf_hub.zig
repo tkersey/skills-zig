@@ -8,6 +8,7 @@ const perf_contract = @import("perf_contract");
 const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
+const paired_comparison_rounds: usize = 3;
 var process_environment: ?*const std.process.Environ.Map = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
@@ -196,7 +197,7 @@ const SeqCases = [_]perf_contract.CaseDescriptor{
     latencyCase("seq-sessions", "seq", "sessions"),
     latencyCase("seq-query", "seq", "query"),
     .{
-        .case_id = "seq-observe-deep-batch128",
+        .case_id = "seq-observe-deep-batch8",
         .binary = "seq",
         .family = "observe",
         .case_kind = .native,
@@ -372,7 +373,7 @@ const DeepCases = [_]DeepCase{
         .tolerance_pct = 3.0,
         .warmups = 3,
         .samples = 30,
-        .batch_iterations = 128,
+        .batch_iterations = 8,
     },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
@@ -549,6 +550,7 @@ const CompareRow = struct {
     case_id: []const u8,
     binary: []const u8,
     detail: []const u8,
+    tuple_bound: bool = false,
 };
 
 const ReportCounts = struct {
@@ -642,9 +644,11 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
     }
 
     const expected_rows = expectedComparisonCount(target);
-    if (expected_rows) |count| {
-        if (rows.items.len != count) any_fail = true;
-    }
+    if (!comparisonSummaryComplete(
+        target,
+        expected_rows,
+        rows.items,
+    )) any_fail = true;
     try writeCompareSummaryRows(
         allocator,
         machine_dir,
@@ -776,6 +780,7 @@ fn compareCompatCase(
                     .case_id = case_cfg.descriptor.case_id,
                     .binary = case_cfg.descriptor.binary,
                     .detail = "base and candidate binaries are byte-identical",
+                    .tuple_bound = true,
                 };
             }
             if (isPreCutoverBinary(baseline_evidence.version) and
@@ -793,6 +798,7 @@ fn compareCompatCase(
                     .case_id = case_cfg.descriptor.case_id,
                     .binary = case_cfg.descriptor.binary,
                     .detail = "incompatible-base-surface",
+                    .tuple_bound = true,
                 };
             }
             var paired = try runPairedMeasuredCases(
@@ -801,32 +807,17 @@ fn compareCompatCase(
                 case_cfg,
             );
             defer paired.deinit(allocator);
-            var compare = try compareMeasuredMetrics(
+            const compare = try compareMeasuredMetrics(
                 case_cfg,
                 paired.baseline,
                 paired.candidate,
             );
-            var comparison_attempts: usize = 1;
-            while (!std.mem.eql(u8, compare.status, "PASS") and
-                comparison_attempts < 3)
-            {
-                paired.deinit(allocator);
-                paired = try runPairedMeasuredCases(
-                    allocator,
-                    base_case,
-                    case_cfg,
-                );
-                compare = try compareMeasuredMetrics(
-                    case_cfg,
-                    paired.baseline,
-                    paired.candidate,
-                );
-                comparison_attempts += 1;
-            }
+            var evidence_case = case_cfg;
+            evidence_case.samples = paired.candidate.samples.items.len;
             try writePairedMetricsArtifact(
                 allocator,
                 latest_path,
-                case_cfg,
+                evidence_case,
                 baseline_evidence,
                 candidate_evidence,
                 paired.baseline,
@@ -845,6 +836,7 @@ fn compareCompatCase(
                 .case_id = case_cfg.descriptor.case_id,
                 .binary = case_cfg.descriptor.binary,
                 .detail = compare.detail,
+                .tuple_bound = true,
             };
         }
     }
@@ -911,6 +903,7 @@ fn compareDeepCase(
         compat_case.warmups = case_cfg.warmups;
         compat_case.samples = case_cfg.samples;
         compat_case.tolerance_pct = case_cfg.tolerance_pct;
+        try ensureBuilt(allocator, built, compat_case);
         if (baseBinaryOverride(compat_case)) |base_binary| {
             const base_exec = try absolutePathForCwdRelative(
                 allocator,
@@ -955,9 +948,64 @@ fn compareDeepCase(
                     .case_id = case_cfg.descriptor.case_id,
                     .binary = case_cfg.descriptor.binary,
                     .detail = "incompatible-base-surface",
+                    .tuple_bound = true,
                 };
             }
-            return error.DeepPairedBaselineUnsupported;
+            var paired = try runPairedDeepCases(
+                allocator,
+                built,
+                case_cfg,
+                baseline_evidence,
+                candidate_evidence,
+            );
+            defer paired.deinit(allocator);
+            const comparison_case = CompatCase{
+                .descriptor = case_cfg.descriptor,
+                .builder = .root,
+                .build_step = "build-seq",
+                .binary_path = "zig-out/bin/seq",
+                .setup = .seq_observe,
+                .warmups = case_cfg.warmups * paired_comparison_rounds,
+                .samples = paired.candidate.samples.items.len,
+                .tolerance_pct = case_cfg.tolerance_pct,
+            };
+            const compare = try compareMeasuredMetrics(
+                comparison_case,
+                paired.baseline,
+                paired.candidate,
+            );
+            const latest_path = try compatBaselinePath(
+                allocator,
+                machine_dir,
+                case_cfg.descriptor.binary,
+                case_cfg.descriptor.case_id,
+                true,
+            );
+            defer allocator.free(latest_path);
+            try writePairedMetricsArtifact(
+                allocator,
+                latest_path,
+                comparison_case,
+                baseline_evidence,
+                candidate_evidence,
+                paired.baseline,
+                paired.candidate,
+                paired.workload_digest,
+                paired.baseline_execution,
+                paired.candidate_execution,
+                if (std.mem.eql(u8, compare.status, "PASS"))
+                    "pass"
+                else
+                    "fail",
+                compare.detail,
+            );
+            return .{
+                .status = compare.status,
+                .case_id = case_cfg.descriptor.case_id,
+                .binary = case_cfg.descriptor.binary,
+                .detail = compare.detail,
+                .tuple_bound = true,
+            };
         }
     }
     const baseline_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, false);
@@ -982,24 +1030,11 @@ fn compareDeepCase(
         .samples = case_cfg.samples,
         .tolerance_pct = case_cfg.tolerance_pct,
     };
-    var compare = try compareLatencyMetrics(
+    const compare = try compareLatencyMetrics(
         comparison_case,
         baseline.value,
         metrics,
     );
-    var comparison_attempts: usize = 1;
-    while (!std.mem.eql(u8, compare.status, "PASS") and
-        comparison_attempts < 3)
-    {
-        metrics.deinit(allocator);
-        metrics = try runDeepMeasuredCase(allocator, case_cfg);
-        compare = try compareLatencyMetrics(
-            comparison_case,
-            baseline.value,
-            metrics,
-        );
-        comparison_attempts += 1;
-    }
 
     const latest_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, true);
     defer allocator.free(latest_path);
@@ -1070,19 +1105,50 @@ fn writeCompareSummaryRows(
         try writer.interface.writeAll("null");
     }
     try writer.interface.writeAll(",\"complete\":");
-    try writer.interface.writeAll(if (expected_rows == null or
-        expected_rows.? == rows.len) "true" else "false");
+    try writer.interface.writeAll(if (comparisonSummaryComplete(
+        target,
+        expected_rows,
+        rows,
+    )) "true" else "false");
     try writer.interface.writeAll(",\"rows\":[");
     for (rows, 0..) |row, idx| {
         if (idx > 0) try writer.interface.writeByte(',');
         try writer.interface.print(
-            "{{\"case_id\":\"{s}\",\"binary\":\"{s}\",\"status\":\"{s}\",\"detail\":",
-            .{ row.case_id, row.binary, row.status },
+            "{{\"case_id\":\"{s}\",\"binary\":\"{s}\"," ++
+                "\"status\":\"{s}\",\"tuple_bound\":{}," ++
+                "\"detail\":",
+            .{ row.case_id, row.binary, row.status, row.tuple_bound },
         );
         try std.json.Stringify.value(row.detail, .{}, &writer.interface);
         try writer.interface.writeByte('}');
     }
     try writer.interface.writeAll("]}\n");
+}
+
+fn comparisonSummaryComplete(
+    target: ?[]const u8,
+    expected_rows: ?usize,
+    rows: []const CompareRow,
+) bool {
+    const expected = expected_rows orelse return true;
+    if (expected != rows.len) return false;
+    const selected = target orelse return false;
+    if (!std.mem.eql(u8, selected, "seq") and
+        !std.mem.eql(u8, selected, "ledger") and
+        !std.mem.eql(u8, selected, "cutover"))
+    {
+        return true;
+    }
+    const environment = process_environment orelse return false;
+    if (environment.get("PERF_EXPECT_BASE_SHA") == null or
+        environment.get("PERF_EXPECT_CANDIDATE_SHA") == null)
+    {
+        return false;
+    }
+    for (rows) |row| {
+        if (!row.tuple_bound) return false;
+    }
+    return true;
 }
 
 const StatusDetail = struct {
@@ -1135,21 +1201,29 @@ fn ensureBuilt(allocator: std.mem.Allocator, built: *BuiltState, case_cfg: Compa
         case_cfg.build_step orelse "default",
     });
     defer allocator.free(key);
-    if (built.keys.contains(key)) return;
-
-    const cwd = ".";
-
-    var args: std.ArrayList([]const u8) = .empty;
-    defer args.deinit(allocator);
-    try args.append(allocator, "zig");
-    try args.append(allocator, "build");
-    if (case_cfg.build_step) |step| try args.append(allocator, step);
-    try args.append(allocator, "-Doptimize=ReleaseFast");
-    const result = try runChildCapture(allocator, cwd, args.items);
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.exit_code != 0) return error.BuildFailed;
-    try built.keys.put(try allocator.dupe(u8, key), {});
+    if (!built.keys.contains(key)) {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(allocator);
+        try args.append(allocator, "zig");
+        try args.append(allocator, "build");
+        if (case_cfg.build_step) |step| try args.append(allocator, step);
+        try args.append(allocator, "-Doptimize=ReleaseFast");
+        const result = try runChildCapture(allocator, ".", args.items);
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.exit_code != 0) return error.BuildFailed;
+        try built.keys.put(try allocator.dupe(u8, key), {});
+    }
+    const source_root = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        allocator,
+    );
+    defer allocator.free(source_root);
+    try requireCanonicalBuildOutput(
+        allocator,
+        source_root,
+        case_cfg,
+    );
 }
 
 fn ensureOverrideBuilt(
@@ -1187,12 +1261,22 @@ fn ensureOverrideBuilt(
         if (result.exit_code != 0) return error.BuildFailed;
         try built.keys.put(try allocator.dupe(u8, key), {});
     }
+    try requireCanonicalBuildOutput(allocator, source_root, case_cfg);
+}
+
+fn requireCanonicalBuildOutput(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    case_cfg: CompatCase,
+) !void {
     const canonical_output = try canonicalBuildOutputPathAlloc(
         allocator,
         source_root,
         case_cfg.descriptor.binary,
     );
     defer allocator.free(canonical_output);
+    const binary_path = try resolveBinaryExecPath(allocator, case_cfg);
+    defer allocator.free(binary_path);
     const supplied_real = try std.Io.Dir.cwd().realPathFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         binary_path,
@@ -1913,21 +1997,26 @@ fn runPairedMeasuredCases(
     errdefer candidate_samples.deinit(allocator);
     var candidate_allocs: std.ArrayList(u64) = .empty;
     errdefer candidate_allocs.deinit(allocator);
+    const measured_samples = std.math.mul(
+        usize,
+        baseline_case.samples,
+        paired_comparison_rounds,
+    ) catch return error.PerfSampleCountOverflow;
     try baseline_samples.ensureTotalCapacity(
         allocator,
-        baseline_case.samples,
+        measured_samples,
     );
     try baseline_allocs.ensureTotalCapacity(
         allocator,
-        baseline_case.samples,
+        measured_samples,
     );
     try candidate_samples.ensureTotalCapacity(
         allocator,
-        candidate_case.samples,
+        measured_samples,
     );
     try candidate_allocs.ensureTotalCapacity(
         allocator,
-        candidate_case.samples,
+        measured_samples,
     );
 
     var warmup_idx: usize = 0;
@@ -1944,7 +2033,7 @@ fn runPairedMeasuredCases(
         );
     }
     var sample_idx: usize = 0;
-    while (sample_idx < baseline_case.samples) : (sample_idx += 1) {
+    while (sample_idx < measured_samples) : (sample_idx += 1) {
         if (sample_idx % 2 == 0) {
             try appendCompatSample(
                 allocator,
@@ -1999,6 +2088,289 @@ fn runPairedMeasuredCases(
         .baseline_execution = baseline_execution,
         .candidate_execution = candidate_execution,
     };
+}
+
+fn runPairedDeepCases(
+    allocator: std.mem.Allocator,
+    built: *BuiltState,
+    case_cfg: DeepCase,
+    baseline_evidence: BinaryEvidence,
+    candidate_evidence: BinaryEvidence,
+) !PairedMetrics {
+    const baseline_root = try sourceRootForBinaryAlloc(
+        allocator,
+        baseline_evidence.path,
+    );
+    defer allocator.free(baseline_root);
+    const candidate_root = try sourceRootForBinaryAlloc(
+        allocator,
+        candidate_evidence.path,
+    );
+    defer allocator.free(candidate_root);
+    try ensureSourcePerfHubBuilt(allocator, built, baseline_root);
+    const baseline_workload = try deepWorkloadDigestForRoot(
+        allocator,
+        baseline_root,
+        case_cfg,
+    );
+    const candidate_workload = try deepWorkloadDigestForRoot(
+        allocator,
+        candidate_root,
+        case_cfg,
+    );
+    if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
+        return error.PerfWorkloadMismatch;
+    }
+
+    var baseline_samples: std.ArrayList(u64) = .empty;
+    errdefer baseline_samples.deinit(allocator);
+    var baseline_allocs: std.ArrayList(u64) = .empty;
+    errdefer baseline_allocs.deinit(allocator);
+    var candidate_samples: std.ArrayList(u64) = .empty;
+    errdefer candidate_samples.deinit(allocator);
+    var candidate_allocs: std.ArrayList(u64) = .empty;
+    errdefer candidate_allocs.deinit(allocator);
+    const measured_samples = std.math.mul(
+        usize,
+        case_cfg.samples,
+        paired_comparison_rounds,
+    ) catch return error.PerfSampleCountOverflow;
+    try baseline_samples.ensureTotalCapacity(allocator, measured_samples);
+    try candidate_samples.ensureTotalCapacity(allocator, measured_samples);
+    try candidate_allocs.ensureTotalCapacity(allocator, measured_samples);
+    try baseline_allocs.ensureTotalCapacity(
+        allocator,
+        paired_comparison_rounds,
+    );
+
+    var round: usize = 0;
+    while (round < paired_comparison_rounds) : (round += 1) {
+        if (round % 2 == 0) {
+            try appendSourceDeepMetrics(
+                allocator,
+                baseline_root,
+                case_cfg,
+                &baseline_samples,
+                &baseline_allocs,
+            );
+            try appendCandidateDeepMetrics(
+                allocator,
+                case_cfg,
+                &candidate_samples,
+                &candidate_allocs,
+            );
+        } else {
+            try appendCandidateDeepMetrics(
+                allocator,
+                case_cfg,
+                &candidate_samples,
+                &candidate_allocs,
+            );
+            try appendSourceDeepMetrics(
+                allocator,
+                baseline_root,
+                case_cfg,
+                &baseline_samples,
+                &baseline_allocs,
+            );
+        }
+    }
+    var baseline = try metricsFromSamples(
+        allocator,
+        baseline_samples,
+        baseline_allocs,
+    );
+    baseline_samples = .empty;
+    baseline_allocs = .empty;
+    errdefer baseline.deinit(allocator);
+    const candidate = try metricsFromSamples(
+        allocator,
+        candidate_samples,
+        candidate_allocs,
+    );
+    candidate_samples = .empty;
+    candidate_allocs = .empty;
+    return .{
+        .baseline = baseline,
+        .candidate = candidate,
+        .workload_digest = baseline_workload,
+        .baseline_execution = .{
+            .output_sha256 = baseline_workload,
+        },
+        .candidate_execution = .{
+            .output_sha256 = candidate_workload,
+        },
+    };
+}
+
+fn ensureSourcePerfHubBuilt(
+    allocator: std.mem.Allocator,
+    built: *BuiltState,
+    source_root: []const u8,
+) !void {
+    const key = try std.fmt.allocPrint(
+        allocator,
+        "{s}:perf-hub",
+        .{source_root},
+    );
+    defer allocator.free(key);
+    if (built.keys.contains(key)) return;
+    const result = try runChildCapture(
+        allocator,
+        source_root,
+        &.{ "zig", "build", "-Doptimize=ReleaseFast" },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.BuildFailed;
+    const perf_hub_path = try canonicalBuildOutputPathAlloc(
+        allocator,
+        source_root,
+        "perf_hub",
+    );
+    defer allocator.free(perf_hub_path);
+    std.Io.Dir.cwd().access(
+        std.Io.Threaded.global_single_threaded.io(),
+        perf_hub_path,
+        .{},
+    ) catch
+        return error.BuildFailed;
+    try built.keys.put(try allocator.dupe(u8, key), {});
+}
+
+fn deepWorkloadDigestForRoot(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    case_cfg: DeepCase,
+) ![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(case_cfg.descriptor.case_id);
+    hasher.update(&.{0});
+    hasher.update(@tagName(case_cfg.setup));
+    hasher.update(&.{0});
+    var encoded: [32]u8 = undefined;
+    const batch_text = try std.fmt.bufPrint(
+        &encoded,
+        "{d}",
+        .{case_cfg.batch_iterations},
+    );
+    hasher.update(batch_text);
+    for ([_][]const u8{
+        "apps/seq/src/v1/fixtures/message-observation.json",
+        "apps/seq/src/v1/fixtures/rollout.jsonl",
+    }) |relative_path| {
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ source_root, relative_path },
+        );
+        defer allocator.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+            allocator,
+            .limited(4 * 1024 * 1024),
+        );
+        defer allocator.free(bytes);
+        hasher.update(&.{0});
+        hasher.update(relative_path);
+        hasher.update(&.{0});
+        hasher.update(bytes);
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn appendSourceDeepMetrics(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    case_cfg: DeepCase,
+    samples: *std.ArrayList(u64),
+    alloc_samples: *std.ArrayList(u64),
+) !void {
+    const perf_hub_path = try canonicalBuildOutputPathAlloc(
+        allocator,
+        source_root,
+        "perf_hub",
+    );
+    defer allocator.free(perf_hub_path);
+    const result = try runChildCapture(
+        allocator,
+        source_root,
+        &.{
+            perf_hub_path,
+            "capture",
+            "--target",
+            case_cfg.descriptor.case_id,
+        },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CaseFailed;
+    const machine_name = try currentMachineDirName(allocator);
+    defer allocator.free(machine_name);
+    const artifact_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.json",
+        .{case_cfg.descriptor.case_id},
+    );
+    defer allocator.free(artifact_name);
+    const artifact_path = try std.fs.path.join(
+        allocator,
+        &.{
+            source_root,
+            ".perf-local",
+            machine_name,
+            "baselines",
+            case_cfg.descriptor.binary,
+            artifact_name,
+        },
+    );
+    defer allocator.free(artifact_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        artifact_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        bytes,
+        .{},
+    );
+    defer parsed.deinit();
+    const metrics = parsed.value.object.get("metrics") orelse
+        return error.InvalidData;
+    const raw_samples = metrics.object.get("samples_ns") orelse
+        return error.InvalidData;
+    for (raw_samples.array.items) |raw| {
+        try samples.append(
+            allocator,
+            try jsonValueU64(raw, "samples_ns"),
+        );
+    }
+    const batch_allocs = try jsonFieldU64(
+        metrics.object,
+        "p50_alloc_calls",
+    );
+    try alloc_samples.append(
+        allocator,
+        batch_allocs / case_cfg.batch_iterations,
+    );
+}
+
+fn appendCandidateDeepMetrics(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    samples: *std.ArrayList(u64),
+    alloc_samples: *std.ArrayList(u64),
+) !void {
+    var metrics = try runDeepMeasuredCase(allocator, case_cfg);
+    defer metrics.deinit(allocator);
+    try samples.appendSlice(allocator, metrics.samples.items);
+    try alloc_samples.appendSlice(allocator, metrics.alloc_samples.items);
 }
 
 fn retainPairedWorkloads() bool {
@@ -2178,15 +2550,19 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
 
     var sample_idx: usize = 0;
     while (sample_idx < case_cfg.samples) : (sample_idx += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var counting = core_perf.CountingAllocator.init(arena.allocator());
         const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
-        const allocation_calls = try executeDeepBatchFresh(
+        try executeDeepBatch(
+            counting.allocator(),
             case_cfg,
             temp_root,
         );
         try samples.append(allocator, @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1)));
         try alloc_samples.append(
             allocator,
-            allocation_calls / case_cfg.batch_iterations,
+            counting.stats.totalCalls() / case_cfg.batch_iterations,
         );
     }
 
@@ -2203,24 +2579,26 @@ fn executeDeepBatchFresh(
     case_cfg: DeepCase,
     temp_root: []const u8,
 ) !u64 {
-    var allocation_calls: u64 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var counting = core_perf.CountingAllocator.init(arena.allocator());
+    try executeDeepBatch(
+        counting.allocator(),
+        case_cfg,
+        temp_root,
+    );
+    return counting.stats.totalCalls();
+}
+
+fn executeDeepBatch(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    temp_root: []const u8,
+) !void {
     var index: usize = 0;
     while (index < case_cfg.batch_iterations) : (index += 1) {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        var counting = core_perf.CountingAllocator.init(arena.allocator());
-        try executeDeepCase(
-            counting.allocator(),
-            case_cfg.setup,
-            temp_root,
-        );
-        allocation_calls = std.math.add(
-            u64,
-            allocation_calls,
-            counting.stats.totalCalls(),
-        ) catch return error.PerfAllocationCountOverflow;
+        try executeDeepCase(allocator, case_cfg.setup, temp_root);
     }
-    return allocation_calls;
 }
 
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
@@ -3335,6 +3713,7 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
+    try validateCutoverCompareSummary(parsed.value);
     const rows_val = parsed.value.object.get("rows") orelse return error.InvalidData;
     const rows = rows_val.array;
 
@@ -3373,6 +3752,93 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
     const cutover_path = try std.fs.path.join(allocator, &.{ reports_dir, "cutover-status.json" });
     defer allocator.free(cutover_path);
     try writeCutoverStatus(allocator, cutover_path, rows);
+}
+
+fn validateCutoverCompareSummary(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCompareSummary,
+    };
+    const target = switch (object.get("target") orelse
+        return error.InvalidCompareSummary) {
+        .string => |target| target,
+        else => return error.InvalidCompareSummary,
+    };
+    if (!std.mem.eql(u8, target, "cutover")) {
+        return error.IncompleteCutoverComparison;
+    }
+    const expected_base = switch (object.get("expected_base_sha") orelse
+        return error.InvalidCompareSummary) {
+        .string => |sha| sha,
+        else => return error.InvalidCompareSummary,
+    };
+    const expected_candidate = switch (object.get(
+        "expected_candidate_sha",
+    ) orelse return error.InvalidCompareSummary) {
+        .string => |sha| sha,
+        else => return error.InvalidCompareSummary,
+    };
+    if (expected_base.len != 40 or expected_candidate.len != 40) {
+        return error.InvalidCompareSummary;
+    }
+    const expected_rows = switch (object.get("expected_rows") orelse
+        return error.InvalidCompareSummary) {
+        .integer => |count| count,
+        else => return error.InvalidCompareSummary,
+    };
+    if (expected_rows != SeqCases.len + LedgerCases.len) {
+        return error.IncompleteCutoverComparison;
+    }
+    const complete = switch (object.get("complete") orelse
+        return error.InvalidCompareSummary) {
+        .bool => |complete| complete,
+        else => return error.InvalidCompareSummary,
+    };
+    if (!complete) return error.IncompleteCutoverComparison;
+    const rows = switch (object.get("rows") orelse
+        return error.InvalidCompareSummary) {
+        .array => |rows| rows,
+        else => return error.InvalidCompareSummary,
+    };
+    if (rows.items.len != SeqCases.len + LedgerCases.len) {
+        return error.IncompleteCutoverComparison;
+    }
+    for (rows.items, 0..) |row_value, index| {
+        const row = switch (row_value) {
+            .object => |row| row,
+            else => return error.InvalidCompareSummary,
+        };
+        const tuple_bound = switch (row.get("tuple_bound") orelse
+            return error.InvalidCompareSummary) {
+            .bool => |bound| bound,
+            else => return error.InvalidCompareSummary,
+        };
+        if (!tuple_bound) return error.UnboundCutoverComparison;
+        const case_id = switch (row.get("case_id") orelse
+            return error.InvalidCompareSummary) {
+            .string => |case_id| case_id,
+            else => return error.InvalidCompareSummary,
+        };
+        for (rows.items[0..index]) |prior_value| {
+            const prior = prior_value.object.get("case_id").?.string;
+            if (std.mem.eql(u8, prior, case_id)) {
+                return error.DuplicateCutoverCase;
+            }
+        }
+        if (!isExpectedCutoverCase(case_id)) {
+            return error.UnexpectedCutoverCase;
+        }
+    }
+}
+
+fn isExpectedCutoverCase(case_id: []const u8) bool {
+    for (SeqCases) |descriptor| {
+        if (std.mem.eql(u8, descriptor.case_id, case_id)) return true;
+    }
+    for (LedgerCases) |descriptor| {
+        if (std.mem.eql(u8, descriptor.case_id, case_id)) return true;
+    }
+    return false;
 }
 
 fn cmdAccept(allocator: std.mem.Allocator) !void {
@@ -3782,6 +4248,52 @@ test "cutover comparison requires the complete Seq and Ledger matrix" {
         @as(?usize, SeqCases.len + LedgerCases.len),
         expectedComparisonCount("cutover"),
     );
+    var rows: [SeqCases.len + LedgerCases.len]CompareRow = undefined;
+    var index: usize = 0;
+    for (SeqCases) |descriptor| {
+        rows[index] = .{
+            .status = "PASS",
+            .case_id = descriptor.case_id,
+            .binary = descriptor.binary,
+            .detail = "paired",
+            .tuple_bound = true,
+        };
+        index += 1;
+    }
+    for (LedgerCases) |descriptor| {
+        rows[index] = .{
+            .status = "PASS",
+            .case_id = descriptor.case_id,
+            .binary = descriptor.binary,
+            .detail = "paired",
+            .tuple_bound = true,
+        };
+        index += 1;
+    }
+    const prior = process_environment;
+    defer process_environment = prior;
+    process_environment = null;
+    try std.testing.expect(!comparisonSummaryComplete(
+        "cutover",
+        SeqCases.len + LedgerCases.len,
+        &rows,
+    ));
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("PERF_EXPECT_BASE_SHA", "base");
+    try environment.put("PERF_EXPECT_CANDIDATE_SHA", "candidate");
+    process_environment = &environment;
+    try std.testing.expect(comparisonSummaryComplete(
+        "cutover",
+        SeqCases.len + LedgerCases.len,
+        &rows,
+    ));
+    rows[0].tuple_bound = false;
+    try std.testing.expect(!comparisonSummaryComplete(
+        "cutover",
+        SeqCases.len + LedgerCases.len,
+        &rows,
+    ));
 }
 
 test "paired baseline path outranks candidate environment override" {
@@ -3832,4 +4344,5 @@ test "override builds bind to the canonical product output" {
         "/repo/zig-out/bin/ledger",
         path,
     );
+    try std.testing.expectEqual(@as(usize, 3), paired_comparison_rounds);
 }
