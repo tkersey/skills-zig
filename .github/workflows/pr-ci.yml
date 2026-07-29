@@ -76,7 +76,8 @@ jobs:
           done
 
           perf=false
-          if grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
+          if grep -Fxq 'build.zig' <<<"$changed_paths" ||
+             grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths"; then
             perf=true
           fi
