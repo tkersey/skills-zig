@@ -1,17 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
-const core_perf = @import("core_perf");
 const cron_cli = @import("cron_cli");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const perf_contract = @import("perf_contract");
-const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
 const paired_comparison_rounds: usize = 8;
 const accepted_generic_deep_schema1_sha =
     "4ff01f5e6f2fa5bd4c945f5b6a92bb6d22ca8389";
+const accepted_generic_deep_schema1_tree =
+    "940f8017025d5b50bc52923ffbd8eda122649b94";
+const shared_driver_source_path = "tools/perf_hub.zig";
 const deep_measurement_schema = "perf-deep-measurement/v1";
 const deep_comparison_method = "balanced-round-median-ratio/v1";
 const ratio_scale: u64 = 1_000_000;
@@ -57,7 +58,6 @@ const UsageText =
 ;
 
 const Command = enum {
-    _measure,
     list,
     manifest,
     audit,
@@ -417,7 +417,6 @@ fn allManifests() []const perf_contract.BinaryManifest {
 const ParsedArgs = struct {
     command: Command,
     target: ?[]const u8 = null,
-    source_revision: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -429,11 +428,6 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
     switch (parsed.command) {
-        ._measure => try cmdMeasure(
-            allocator,
-            parsed.target,
-            parsed.source_revision,
-        ),
         .list => try cmdList(parsed.target),
         .manifest => try cmdManifest(allocator),
         .audit => try cmdAudit(),
@@ -447,7 +441,6 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
     if (args.len == 0) return error.MissingCommand;
     const command = parseCommand(args[0]) orelse return error.InvalidCommand;
     var target: ?[]const u8 = null;
-    var source_revision: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -457,30 +450,19 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
             target = args[i];
             continue;
         }
-        if (std.mem.eql(u8, arg, "--source-revision")) {
-            i += 1;
-            if (i >= args.len) return error.MissingArgValue;
-            source_revision = args[i];
-            continue;
-        }
         return error.UnknownArgument;
     }
     if (target != null and switch (command) {
-        ._measure, .list, .compare, .doctor => false,
+        .list, .compare, .doctor => false,
         .manifest, .audit, .report => true,
     }) return error.UnsupportedArgument;
-    if (source_revision != null and command != ._measure) {
-        return error.UnsupportedArgument;
-    }
     return .{
         .command = command,
         .target = target,
-        .source_revision = source_revision,
     };
 }
 
 fn parseCommand(raw: []const u8) ?Command {
-    if (std.mem.eql(u8, raw, "_measure")) return ._measure;
     if (std.mem.eql(u8, raw, "list")) return .list;
     if (std.mem.eql(u8, raw, "manifest")) return .manifest;
     if (std.mem.eql(u8, raw, "audit")) return .audit;
@@ -541,70 +523,6 @@ fn cmdAudit() !void {
     }
 }
 
-fn cmdMeasure(
-    allocator: std.mem.Allocator,
-    target: ?[]const u8,
-    source_revision: ?[]const u8,
-) !void {
-    const case_id = target orelse return error.MissingArgValue;
-    const git_sha = try requireMeasurementSourceRevision(source_revision);
-    const case_cfg = for (DeepCases) |candidate| {
-        if (std.mem.eql(
-            u8,
-            candidate.descriptor.case_id,
-            case_id,
-        )) break candidate;
-    } else return error.NoMatchingPerfCases;
-    var metrics = try runDeepMeasuredCase(allocator, case_cfg);
-    defer metrics.deinit(allocator);
-    const semantic_output = if (case_cfg.setup == .seq_observe)
-        try executeSeqObserveDeep(allocator, true)
-    else
-        null;
-    var stdout_writer = std.Io.File.stdout().writer(
-        std.Io.Threaded.global_single_threaded.io(),
-        &.{},
-    );
-    const writer = &stdout_writer.interface;
-    try writer.print(
-        "{{\"schema_version\":2,\"git_sha\":\"{s}\"," ++
-            "\"binary\":\"{s}\",\"case_id\":\"{s}\"," ++
-            "\"measurement_contract\":{{\"schema\":\"{s}\"," ++
-            "\"batch_iterations\":{d},\"latency_unit\":\"ns\"," ++
-            "\"latency_scope\":\"batch-total\"," ++
-            "\"allocation_unit\":\"calls\"," ++
-            "\"allocation_scope\":\"batch-total\"}},\"metrics\":",
-        .{
-            git_sha,
-            case_cfg.descriptor.binary,
-            case_cfg.descriptor.case_id,
-            deep_measurement_schema,
-            case_cfg.batch_iterations,
-        },
-    );
-    try writeMetricsObject(writer, metrics, true);
-    try writer.writeAll(
-        ",\"execution\":{\"semantic_output_sha256\":",
-    );
-    if (semantic_output) |digest| {
-        try writer.print("\"sha256:{s}\"", .{digest});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll("}}\n");
-}
-
-fn requireMeasurementSourceRevision(
-    source_revision: ?[]const u8,
-) ![]const u8 {
-    const revision = source_revision orelse
-        return error.MeasurementSourceRevisionRequired;
-    if (!validFullRevision(revision)) {
-        return error.InvalidMeasurementSourceRevision;
-    }
-    return revision;
-}
-
 const SealedFile = struct {
     path: [:0]u8,
     sha256: [64]u8,
@@ -658,6 +576,8 @@ const BuiltSource = struct {
     source_sha: []u8,
     source_tree_sha: []u8,
     source_archive: SealedFile,
+    driver_source_tree_sha: []u8,
+    driver_source_file: SealedFile,
     compiler: CompilerEvidence,
 
     fn executable(self: BuiltSource, binary: []const u8) !SealedFile {
@@ -674,6 +594,8 @@ const BuiltSource = struct {
         allocator.free(self.source_sha);
         allocator.free(self.source_tree_sha);
         self.source_archive.deinit(allocator);
+        allocator.free(self.driver_source_tree_sha);
+        self.driver_source_file.deinit(allocator);
         self.compiler.deinit(allocator);
         self.* = undefined;
     }
@@ -1385,17 +1307,21 @@ const BinaryEvidence = struct {
 
 const DriverEvidence = struct {
     file: SealedFile,
-    source_sha: []u8,
+    source_sha: []const u8,
     source_tree_sha: []u8,
-    source_archive: SealedFile,
+    source_file: SealedFile,
+    product_source_sha: []u8,
+    product_source_tree_sha: []u8,
+    product_source_archive_sha256: [64]u8,
     compiler: CompilerEvidence,
     configuration_digest: [64]u8,
 
     fn deinit(self: *DriverEvidence, allocator: std.mem.Allocator) void {
         self.file.deinit(allocator);
-        allocator.free(self.source_sha);
         allocator.free(self.source_tree_sha);
-        self.source_archive.deinit(allocator);
+        self.source_file.deinit(allocator);
+        allocator.free(self.product_source_sha);
+        allocator.free(self.product_source_tree_sha);
         self.compiler.deinit(allocator);
         self.* = undefined;
     }
@@ -1503,22 +1429,30 @@ fn driverEvidence(
 ) !DriverEvidence {
     var file = try built.perf_hub.clone(allocator);
     errdefer file.deinit(allocator);
-    const source_sha = try allocator.dupe(u8, built.source_sha);
-    errdefer allocator.free(source_sha);
     const source_tree_sha = try allocator.dupe(
+        u8,
+        built.driver_source_tree_sha,
+    );
+    errdefer allocator.free(source_tree_sha);
+    var source_file = try built.driver_source_file.clone(allocator);
+    errdefer source_file.deinit(allocator);
+    const product_source_sha = try allocator.dupe(u8, built.source_sha);
+    errdefer allocator.free(product_source_sha);
+    const product_source_tree_sha = try allocator.dupe(
         u8,
         built.source_tree_sha,
     );
-    errdefer allocator.free(source_tree_sha);
-    var source_archive = try built.source_archive.clone(allocator);
-    errdefer source_archive.deinit(allocator);
+    errdefer allocator.free(product_source_tree_sha);
     var compiler = try built.compiler.clone(allocator);
     errdefer compiler.deinit(allocator);
     return .{
         .file = file,
-        .source_sha = source_sha,
+        .source_sha = accepted_generic_deep_schema1_sha,
         .source_tree_sha = source_tree_sha,
-        .source_archive = source_archive,
+        .source_file = source_file,
+        .product_source_sha = product_source_sha,
+        .product_source_tree_sha = product_source_tree_sha,
+        .product_source_archive_sha256 = built.source_archive.sha256,
         .compiler = compiler,
         .configuration_digest = try deepConfigurationDigest(case_cfg),
     };
@@ -2427,24 +2361,17 @@ fn runPairedDeepCases(
         allocator,
         paired_comparison_rounds,
     );
-    var baseline_driver_semantic: ?[64]u8 = null;
-    var candidate_driver_semantic: ?[64]u8 = null;
-
     primeSourceDeepCase(
         allocator,
         baseline_root,
-        baseline_evidence.source_sha,
         case_cfg,
         baseline_driver,
-        &baseline_driver_semantic,
     ) catch |err| return deepStageError("baseline-prime", err);
     primeSourceDeepCase(
         allocator,
         candidate_root,
-        candidate_evidence.source_sha,
         case_cfg,
         candidate_driver,
-        &candidate_driver_semantic,
     ) catch |err| return deepStageError("candidate-prime", err);
 
     var round: usize = 0;
@@ -2453,10 +2380,8 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 baseline_root,
-                baseline_evidence.source_sha,
                 case_cfg,
                 baseline_driver,
-                &baseline_driver_semantic,
                 &baseline_samples,
                 &baseline_allocs,
                 &baseline_rss,
@@ -2464,10 +2389,8 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 candidate_root,
-                candidate_evidence.source_sha,
                 case_cfg,
                 candidate_driver,
-                &candidate_driver_semantic,
                 &candidate_samples,
                 &candidate_allocs,
                 &candidate_rss,
@@ -2476,10 +2399,8 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 candidate_root,
-                candidate_evidence.source_sha,
                 case_cfg,
                 candidate_driver,
-                &candidate_driver_semantic,
                 &candidate_samples,
                 &candidate_allocs,
                 &candidate_rss,
@@ -2487,41 +2408,13 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 baseline_root,
-                baseline_evidence.source_sha,
                 case_cfg,
                 baseline_driver,
-                &baseline_driver_semantic,
                 &baseline_samples,
                 &baseline_allocs,
                 &baseline_rss,
             );
         }
-    }
-    if (baseline_driver_semantic) |digest| {
-        if (!std.mem.eql(
-            u8,
-            &digest,
-            &(baseline_semantic.local_output_sha256 orelse
-                return error.MissingPerfSemanticOutput),
-        )) {
-            return error.PerfDriverSemanticOutputMismatch;
-        }
-    } else if (!std.mem.eql(
-        u8,
-        baseline_evidence.source_sha,
-        accepted_generic_deep_schema1_sha,
-    )) {
-        return error.MissingPerfSemanticOutput;
-    }
-    const candidate_driver_digest = candidate_driver_semantic orelse
-        return error.MissingPerfSemanticOutput;
-    if (!std.mem.eql(
-        u8,
-        &candidate_driver_digest,
-        &(candidate_semantic.local_output_sha256 orelse
-            return error.MissingPerfSemanticOutput),
-    )) {
-        return error.PerfDriverSemanticOutputMismatch;
     }
     var baseline = try metricsFromSamples(
         allocator,
@@ -2566,10 +2459,8 @@ fn deepStageError(stage: []const u8, err: anyerror) anyerror {
 fn primeSourceDeepCase(
     allocator: std.mem.Allocator,
     source_root: []const u8,
-    source_sha: []const u8,
     case_cfg: DeepCase,
     driver: DriverEvidence,
-    semantic_output: *?[64]u8,
 ) !void {
     var samples: std.ArrayList(u64) = .empty;
     defer samples.deinit(allocator);
@@ -2580,10 +2471,8 @@ fn primeSourceDeepCase(
     try appendSourceDeepMetrics(
         allocator,
         source_root,
-        source_sha,
         case_cfg,
         driver,
-        semantic_output,
         &samples,
         &alloc_samples,
         &rss_samples,
@@ -2638,6 +2527,33 @@ fn ensureSourceBuilt(
         allocator,
     );
     defer allocator.free(machine_dir);
+    const driver_source_tree_sha = try revisionTreeShaForRootAlloc(
+        allocator,
+        source_root,
+        accepted_generic_deep_schema1_sha,
+    );
+    defer allocator.free(driver_source_tree_sha);
+    if (!std.mem.eql(
+        u8,
+        driver_source_tree_sha,
+        accepted_generic_deep_schema1_tree,
+    )) return error.DriverSourceRevisionMismatch;
+    const driver_source_bytes = try sharedDriverSourceBytesAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(driver_source_bytes);
+    var driver_source_file = try sealEvidenceBytes(
+        allocator,
+        machine_dir,
+        "perf_hub.zig",
+        driver_source_bytes,
+        0o400,
+    );
+    var driver_source_file_owned = true;
+    defer if (driver_source_file_owned) {
+        driver_source_file.deinit(allocator);
+    };
     const staging_root = try std.fs.path.join(
         allocator,
         &.{ machine_dir, "capsules", "staging" },
@@ -2747,7 +2663,7 @@ fn ensureSourceBuilt(
         allocator,
         source_snapshot,
         &.{
-            compiler.approved_path,
+            compiler.file.path,
             "build",
             "-Doptimize=ReleaseFast",
             "--prefix",
@@ -2779,7 +2695,7 @@ fn ensureSourceBuilt(
     }
     try verifySealedFile(compiler.file);
     const post_compiler_sha = try sha256FileBounded(
-        compiler.approved_path,
+        compiler.file.path,
         64 * 1024 * 1024,
     );
     if (!std.mem.eql(
@@ -2794,7 +2710,7 @@ fn ensureSourceBuilt(
     defer for (executables[0..executable_count]) |*file| {
         file.deinit(allocator);
     };
-    for ([_][]const u8{ "seq", "ledger", "perf_hub" }, 0..) |name, index| {
+    for ([_][]const u8{ "seq", "ledger" }, 0..) |name, index| {
         const built_path = try std.fs.path.join(
             allocator,
             &.{ prefix_dir, "bin", name },
@@ -2810,6 +2726,100 @@ fn ensureSourceBuilt(
         );
         executable_count += 1;
     }
+    const driver_source_path = try std.fs.path.join(
+        allocator,
+        &.{ source_snapshot, shared_driver_source_path },
+    );
+    defer allocator.free(driver_source_path);
+    try writeEvidenceFileAtomic(
+        allocator,
+        driver_source_path,
+        driver_source_bytes,
+        0o400,
+    );
+    const overlaid_driver_source_sha = try sha256FileBounded(
+        driver_source_path,
+        max_sealed_evidence_bytes,
+    );
+    if (!std.mem.eql(
+        u8,
+        &overlaid_driver_source_sha,
+        &driver_source_file.sha256,
+    )) return error.DriverSourceChangedDuringBuild;
+    const driver_prefix_dir = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, "driver-prefix" },
+    );
+    defer allocator.free(driver_prefix_dir);
+    const driver_cache_dir = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, "driver-cache" },
+    );
+    defer allocator.free(driver_cache_dir);
+    const driver_global_cache_dir = try std.fs.path.join(
+        allocator,
+        &.{ staging_dir, "driver-global-cache" },
+    );
+    defer allocator.free(driver_global_cache_dir);
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
+        driver_prefix_dir,
+    );
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
+        driver_cache_dir,
+    );
+    try durable_store.ensurePrivateDirectoryPathNoSymlinks(
+        driver_global_cache_dir,
+    );
+    const driver_build = try runChildCapture(
+        allocator,
+        source_snapshot,
+        &.{
+            compiler.file.path,
+            "build",
+            "-Doptimize=ReleaseFast",
+            "--prefix",
+            driver_prefix_dir,
+            "--cache-dir",
+            driver_cache_dir,
+            "--global-cache-dir",
+            driver_global_cache_dir,
+        },
+    );
+    defer allocator.free(driver_build.stdout);
+    defer allocator.free(driver_build.stderr);
+    if (driver_build.exit_code != 0) return error.BuildFailed;
+    try verifySealedFile(driver_source_file);
+    const built_driver_path = try std.fs.path.join(
+        allocator,
+        &.{ driver_prefix_dir, "bin", "perf_hub" },
+    );
+    defer allocator.free(built_driver_path);
+    executables[2] = try sealEvidenceFile(
+        allocator,
+        machine_dir,
+        "perf_hub",
+        built_driver_path,
+        16 * 1024 * 1024,
+        0o500,
+    );
+    executable_count += 1;
+    try requireCleanSourceRoot(allocator, source_root);
+    const final_source_sha = try sourceShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(final_source_sha);
+    const final_tree_sha = try sourceTreeShaForRootAlloc(
+        allocator,
+        source_root,
+    );
+    defer allocator.free(final_tree_sha);
+    if (!std.mem.eql(u8, final_source_sha, expected_source_sha) or
+        !std.mem.eql(u8, final_tree_sha, source_tree_sha))
+    {
+        return error.DriverSourceChangedDuringBuild;
+    }
+    try verifySealedFile(compiler.file);
     const owned_key = try allocator.dupe(u8, key);
     errdefer allocator.free(owned_key);
     const owned_source_sha = try allocator.dupe(
@@ -2822,6 +2832,11 @@ fn ensureSourceBuilt(
         source_tree_sha,
     );
     errdefer allocator.free(owned_source_tree_sha);
+    const owned_driver_source_tree_sha = try allocator.dupe(
+        u8,
+        driver_source_tree_sha,
+    );
+    errdefer allocator.free(owned_driver_source_tree_sha);
     const owned_source: BuiltSource = .{
         .seq = executables[0],
         .ledger = executables[1],
@@ -2829,11 +2844,14 @@ fn ensureSourceBuilt(
         .source_sha = owned_source_sha,
         .source_tree_sha = owned_source_tree_sha,
         .source_archive = source_archive,
+        .driver_source_tree_sha = owned_driver_source_tree_sha,
+        .driver_source_file = driver_source_file,
         .compiler = compiler,
     };
     try built.sources.put(owned_key, owned_source);
     executable_count = 0;
     source_archive_owned = false;
+    driver_source_file_owned = false;
     compiler_owned = false;
     return built.sources.getPtr(key) orelse unreachable;
 }
@@ -2850,18 +2868,57 @@ fn sourceTreeShaForRootAlloc(
     allocator: std.mem.Allocator,
     source_root: []const u8,
 ) ![]u8 {
+    return revisionTreeShaForRootAlloc(
+        allocator,
+        source_root,
+        "HEAD",
+    );
+}
+
+fn revisionTreeShaForRootAlloc(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    revision: []const u8,
+) ![]u8 {
+    const tree_revision = try std.fmt.allocPrint(
+        allocator,
+        "{s}^{{tree}}",
+        .{revision},
+    );
+    defer allocator.free(tree_revision);
     const result = try runChildCaptureOutput(
         allocator,
         ".",
-        &.{ git_binary, "-C", source_root, "rev-parse", "HEAD^{tree}" },
+        &.{ git_binary, "-C", source_root, "rev-parse", tree_revision },
     );
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.BinarySourceUnavailable;
+    const tree = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (!validFullRevision(tree)) return error.BinarySourceUnavailable;
     return allocator.dupe(
         u8,
-        std.mem.trim(u8, result.stdout, " \t\r\n"),
+        tree,
     );
+}
+
+fn sharedDriverSourceBytesAlloc(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+) ![]u8 {
+    const object = accepted_generic_deep_schema1_sha ++
+        ":" ++ shared_driver_source_path;
+    const result = try runChildCaptureOutput(
+        allocator,
+        ".",
+        &.{ git_binary, "-C", source_root, "show", object },
+    );
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0 or result.stdout.len == 0) {
+        allocator.free(result.stdout);
+        return error.DriverSourceUnavailable;
+    }
+    return result.stdout;
 }
 
 fn deepWorkloadDigestForRoot(
@@ -2910,10 +2967,8 @@ fn deepWorkloadDigestForRoot(
 fn appendSourceDeepMetrics(
     allocator: std.mem.Allocator,
     source_root: []const u8,
-    source_sha: []const u8,
     case_cfg: DeepCase,
     driver: DriverEvidence,
-    semantic_output: *?[64]u8,
     samples: *std.ArrayList(u64),
     alloc_samples: *std.ArrayList(u64),
     rss_samples: *std.ArrayList(u64),
@@ -2947,55 +3002,33 @@ fn appendSourceDeepMetrics(
         error.FileNotFound => {},
         else => return err,
     };
-    const legacy_bridge = std.mem.eql(
-        u8,
-        source_sha,
-        accepted_generic_deep_schema1_sha,
-    );
-    const driver_argv: []const []const u8 = if (legacy_bridge)
+    const result = runChildCaptureOutput(
+        allocator,
+        source_root,
         &.{
             driver.file.path,
             "capture",
             "--target",
             case_cfg.descriptor.case_id,
-        }
-    else
-        &.{
-            driver.file.path,
-            "_measure",
-            "--target",
-            case_cfg.descriptor.case_id,
-            "--source-revision",
-            source_sha,
-        };
-    const result = runChildCaptureOutput(
-        allocator,
-        source_root,
-        driver_argv,
+        },
     ) catch |err| return deepStageError("driver-spawn", err);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.CaseFailed;
-    if (legacy_bridge) {
-        validateCaptureAcknowledgment(
-            allocator,
-            result.stdout,
-            case_cfg.descriptor.case_id,
-        ) catch |err| return deepStageError("driver-acknowledgment", err);
-    }
+    validateCaptureAcknowledgment(
+        allocator,
+        result.stdout,
+        case_cfg.descriptor.case_id,
+    ) catch |err| return deepStageError("driver-acknowledgment", err);
     requireDriverUnchanged(driver) catch |err|
         return deepStageError("driver-postflight", err);
-    const retained = if (legacy_bridge)
-        try std.Io.Dir.cwd().readFileAlloc(
-            std.Io.Threaded.global_single_threaded.io(),
-            artifact_path,
-            allocator,
-            .limited(4 * 1024 * 1024),
-        )
-    else
-        null;
-    defer if (retained) |bytes| allocator.free(bytes);
-    const bytes = retained orelse result.stdout;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        artifact_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -3003,23 +3036,7 @@ fn appendSourceDeepMetrics(
         .{},
     );
     defer parsed.deinit();
-    try validateDeepArtifactIdentity(
-        parsed.value,
-        case_cfg,
-        source_sha,
-    );
-    const schema_version = try jsonFieldU64(
-        parsed.value.object,
-        "schema_version",
-    );
-    switch (try deepMeasurementSchemaKind(schema_version, source_sha)) {
-        .legacy_bridge => {},
-        .explicit => try validateDeepMeasurementContract(
-            parsed.value,
-            case_cfg,
-            semantic_output,
-        ),
-    }
+    try validateSharedDriverArtifact(parsed.value, case_cfg);
     const metrics = parsed.value.object.get("metrics") orelse
         return error.InvalidData;
     const raw_samples = metrics.object.get("samples_ns") orelse
@@ -3067,10 +3084,9 @@ fn validateCaptureAcknowledgment(
     return error.InvalidPerfCaptureAcknowledgment;
 }
 
-fn validateDeepArtifactIdentity(
+fn validateSharedDriverArtifact(
     artifact: std.json.Value,
     case_cfg: DeepCase,
-    source_sha: []const u8,
 ) !void {
     const object = switch (artifact) {
         .object => |value| value,
@@ -3091,120 +3107,15 @@ fn validateDeepArtifactIdentity(
         .string => |value| value,
         else => return error.InvalidDeepArtifactIdentity,
     };
-    const frozen_bridge_revision = std.mem.eql(
-        u8,
-        source_sha,
-        accepted_generic_deep_schema1_sha,
-    ) and (std.mem.eql(u8, git_sha, "unknown") or
-        (git_sha.len > 0 and std.mem.startsWith(
-            u8,
-            source_sha,
-            git_sha,
-        )));
-    const revision_matches = std.mem.eql(u8, git_sha, source_sha);
+    const schema_version = try jsonFieldU64(
+        object,
+        "schema_version",
+    );
     if (!std.mem.eql(u8, case_id, case_cfg.descriptor.case_id) or
         !std.mem.eql(u8, binary, case_cfg.descriptor.binary) or
-        (!revision_matches and !frozen_bridge_revision))
+        !std.mem.eql(u8, git_sha, "unknown") or schema_version != 1)
     {
         return error.DeepArtifactIdentityMismatch;
-    }
-}
-
-const DeepMeasurementSchemaKind = enum {
-    legacy_bridge,
-    explicit,
-};
-
-fn deepMeasurementSchemaKind(
-    schema_version: u64,
-    source_sha: []const u8,
-) !DeepMeasurementSchemaKind {
-    return switch (schema_version) {
-        1 => if (std.mem.eql(
-            u8,
-            source_sha,
-            accepted_generic_deep_schema1_sha,
-        ))
-            .legacy_bridge
-        else
-            error.AmbiguousDeepMeasurementContract,
-        2 => .explicit,
-        else => error.UnsupportedDeepMeasurementContract,
-    };
-}
-
-fn validateDeepMeasurementContract(
-    artifact: std.json.Value,
-    case_cfg: DeepCase,
-    semantic_output: *?[64]u8,
-) !void {
-    const contract = switch (artifact.object.get(
-        "measurement_contract",
-    ) orelse return error.InvalidDeepMeasurementContract) {
-        .object => |value| value,
-        else => return error.InvalidDeepMeasurementContract,
-    };
-    const schema = switch (contract.get("schema") orelse
-        return error.InvalidDeepMeasurementContract) {
-        .string => |value| value,
-        else => return error.InvalidDeepMeasurementContract,
-    };
-    if (!std.mem.eql(u8, schema, deep_measurement_schema)) {
-        return error.UnsupportedDeepMeasurementContract;
-    }
-    if (try jsonFieldU64(contract, "batch_iterations") !=
-        case_cfg.batch_iterations)
-    {
-        return error.DeepMeasurementBatchMismatch;
-    }
-    for ([_]struct {
-        field: []const u8,
-        expected: []const u8,
-    }{
-        .{ .field = "latency_unit", .expected = "ns" },
-        .{ .field = "allocation_unit", .expected = "calls" },
-    }) |requirement| {
-        const unit = switch (contract.get(requirement.field) orelse
-            return error.InvalidDeepMeasurementContract) {
-            .string => |value| value,
-            else => return error.InvalidDeepMeasurementContract,
-        };
-        if (!std.mem.eql(u8, unit, requirement.expected)) {
-            return error.UnsupportedDeepMeasurementUnit;
-        }
-    }
-    for ([_][]const u8{ "latency_scope", "allocation_scope" }) |field| {
-        const scope = switch (contract.get(field) orelse
-            return error.InvalidDeepMeasurementContract) {
-            .string => |value| value,
-            else => return error.InvalidDeepMeasurementContract,
-        };
-        if (!std.mem.eql(u8, scope, "batch-total")) {
-            return error.UnsupportedDeepMeasurementScope;
-        }
-    }
-    const execution = switch (artifact.object.get("execution") orelse
-        return error.MissingPerfSemanticOutput) {
-        .object => |value| value,
-        else => return error.MissingPerfSemanticOutput,
-    };
-    const encoded = switch (execution.get(
-        "semantic_output_sha256",
-    ) orelse return error.MissingPerfSemanticOutput) {
-        .string => |value| value,
-        else => return error.MissingPerfSemanticOutput,
-    };
-    if (!std.mem.startsWith(u8, encoded, "sha256:") or encoded.len != 71) {
-        return error.InvalidPerfSemanticOutput;
-    }
-    var digest: [64]u8 = undefined;
-    @memcpy(&digest, encoded["sha256:".len..]);
-    if (semantic_output.*) |prior| {
-        if (!std.mem.eql(u8, &prior, &digest)) {
-            return error.PerfDriverSemanticOutputChanged;
-        }
-    } else {
-        semantic_output.* = digest;
     }
 }
 
@@ -3663,190 +3574,6 @@ fn metricsFromSamples(
     };
 }
 
-fn runDeepMeasuredCase(
-    allocator: std.mem.Allocator,
-    case_cfg: DeepCase,
-) !Metrics {
-    const temp_root = try makeTempRoot(
-        allocator,
-        case_cfg.descriptor.case_id,
-    );
-    defer cleanupTempRoot(temp_root);
-    defer allocator.free(temp_root);
-    var samples: std.ArrayList(u64) = .empty;
-    errdefer samples.deinit(allocator);
-    var allocations: std.ArrayList(u64) = .empty;
-    errdefer allocations.deinit(allocator);
-    var rss: std.ArrayList(u64) = .empty;
-    errdefer rss.deinit(allocator);
-    for (0..case_cfg.warmups) |_| {
-        _ = try executeDeepBatchFresh(case_cfg, temp_root);
-    }
-    for (0..case_cfg.samples) |_| {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        var counting = core_perf.CountingAllocator.init(
-            arena.allocator(),
-        );
-        const start = std.Io.Clock.awake.now(
-            std.Io.Threaded.global_single_threaded.io(),
-        ).nanoseconds;
-        try executeDeepBatch(
-            counting.allocator(),
-            case_cfg,
-            temp_root,
-        );
-        const elapsed = std.Io.Clock.awake.now(
-            std.Io.Threaded.global_single_threaded.io(),
-        ).nanoseconds - start;
-        try samples.append(allocator, @intCast(@max(elapsed, 1)));
-        try allocations.append(
-            allocator,
-            counting.stats.totalCalls(),
-        );
-    }
-    try rss.append(allocator, try currentPeakRssBytes());
-    return metricsFromSamples(allocator, samples, allocations, rss);
-}
-
-fn currentPeakRssBytes() !u64 {
-    if (builtin.os.tag != .macos) return error.UnsupportedPeakRss;
-    const usage = std.posix.getrusage(0);
-    return @intCast(usage.maxrss);
-}
-
-fn executeDeepBatchFresh(
-    case_cfg: DeepCase,
-    temp_root: []const u8,
-) !u64 {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    var counting = core_perf.CountingAllocator.init(arena.allocator());
-    try executeDeepBatch(
-        counting.allocator(),
-        case_cfg,
-        temp_root,
-    );
-    return counting.stats.totalCalls();
-}
-
-fn executeDeepBatch(
-    allocator: std.mem.Allocator,
-    case_cfg: DeepCase,
-    temp_root: []const u8,
-) !void {
-    var index: usize = 0;
-    while (index < case_cfg.batch_iterations) : (index += 1) {
-        try executeDeepCase(allocator, case_cfg.setup, temp_root);
-    }
-}
-
-fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
-    switch (setup) {
-        .seq_observe => _ = try executeSeqObserveDeep(allocator, false),
-        .cron_show => try cron_cli.runPerfCase(allocator, .show, temp_root),
-        .cron_create => try cron_cli.runPerfCase(allocator, .create, temp_root),
-        .cron_update => try cron_cli.runPerfCase(allocator, .update, temp_root),
-        .cron_enable => try cron_cli.runPerfCase(allocator, .enable, temp_root),
-        .cron_disable => try cron_cli.runPerfCase(allocator, .disable, temp_root),
-        .cron_run_now => try cron_cli.runPerfCase(allocator, .run_now, temp_root),
-        .cron_delete => try cron_cli.runPerfCase(allocator, .delete, temp_root),
-        .cron_run_due => try cron_cli.runPerfCase(allocator, .run_due, temp_root),
-    }
-}
-
-fn executeSeqObserveDeep(
-    allocator: std.mem.Allocator,
-    comptime capture_semantic_output: bool,
-) !?[64]u8 {
-    const cwd = try std.process.currentPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        allocator,
-    );
-    defer allocator.free(cwd);
-    const definition_root = try std.fs.path.join(
-        allocator,
-        &.{ cwd, "apps/seq/src/v1/fixtures" },
-    );
-    defer allocator.free(definition_root);
-    const projection_names = [_][]const u8{"rows"};
-    var plans = try seq_v1.compiled_plan.load(
-        allocator,
-        definition_root,
-        "message-observation.json",
-        .{ .projection_names = &projection_names },
-        "1.0.0",
-        "seq-source-adapter/v1",
-        .{},
-    );
-    defer plans.deinit(allocator);
-    const parameter_inputs = [_]definition_core.parameters.Input{.{
-        .name = "needle",
-        .raw_value = "failure",
-    }};
-    var parameters = try definition_core.parameters.bind(
-        allocator,
-        &plans.definition_plan.parameter_declarations,
-        &parameter_inputs,
-    );
-    defer parameters.deinit(allocator);
-    var program = try seq_v1.execution.compile(
-        allocator,
-        &plans.definition_plan,
-        &plans.native_plan,
-        &parameters,
-        "rows",
-    );
-    defer program.deinit(allocator);
-    const output_cells = try std.math.mul(
-        usize,
-        program.max_rows,
-        program.output_field_indices.len,
-    );
-    const output = try allocator.alloc(seq_v1.execution.Value, output_cells);
-    defer allocator.free(output);
-    const trace_path = try std.fs.path.join(
-        allocator,
-        &.{ definition_root, "rollout.jsonl" },
-    );
-    defer allocator.free(trace_path);
-    var observation = try seq_v1.trace_adapter.observeFile(
-        allocator,
-        &program,
-        trace_path,
-        .{
-            .max_input_bytes = plans.definition_plan.bounds.max_input_bytes,
-        },
-        output,
-    );
-    defer observation.deinit(allocator);
-    if (observation.result.row_count != 1 or
-        observation.metrics.bytes_read == 0)
-    {
-        return error.InvalidPerfObservation;
-    }
-    if (!capture_semantic_output) return null;
-    const rendered = try seq_v1.result.renderJsonAlloc(allocator, .{
-        .definition_plan = &plans.definition_plan,
-        .projection_name = "rows",
-        .parameters_digest = &parameters.values_digest,
-        .corpus = .{
-            .adapter = "codex-rollout-jsonl/v1",
-            .digest = &observation.corpus_digest,
-            .files = 1,
-            .sessions = 1,
-            .contaminated = false,
-        },
-        .rows = observation.result.rows(),
-        .compile_stats = .{},
-        .execution_stats = .{
-            .output_rows = observation.result.row_count,
-        },
-    });
-    defer allocator.free(rendered);
-    return @as(?[64]u8, try canonicalDataDigest(allocator, rendered));
-}
-
 fn canonicalDataDigest(
     allocator: std.mem.Allocator,
     rendered: []const u8,
@@ -4238,8 +3965,17 @@ fn writeDriverEvidence(
     try writeJsonString(writer, evidence.source_sha);
     try writer.writeAll(",\"tree\":");
     try writeJsonString(writer, evidence.source_tree_sha);
-    try writer.writeAll(",\"clean\":true,\"archive\":");
-    try writeSealedFile(writer, evidence.source_archive);
+    try writer.writeAll(",\"path\":");
+    try writeJsonString(writer, shared_driver_source_path);
+    try writer.writeAll(",\"file\":");
+    try writeSealedFile(writer, evidence.source_file);
+    try writer.writeAll("},\"product_source\":{\"revision\":");
+    try writeJsonString(writer, evidence.product_source_sha);
+    try writer.writeAll(",\"tree\":");
+    try writeJsonString(writer, evidence.product_source_tree_sha);
+    try writer.writeAll(",\"archive_sha256\":\"sha256:");
+    try writer.writeAll(&evidence.product_source_archive_sha256);
+    try writer.writeByte('"');
     try writer.writeAll("},\"compiler\":");
     try writeCompilerEvidence(writer, evidence.compiler);
     try writer.writeAll(
@@ -5102,9 +4838,21 @@ const CapsuleProduct = struct {
     compiler: CapsuleCompiler,
     build: CapsuleBuild,
 };
+const CapsuleDriverSource = struct {
+    revision: []const u8,
+    tree: []const u8,
+    path: []const u8,
+    file: CapsuleFile,
+};
+const CapsuleDriverProductSource = struct {
+    revision: []const u8,
+    tree: []const u8,
+    archive_sha256: []const u8,
+};
 const CapsuleDriver = struct {
     file: CapsuleFile,
-    source: CapsuleSource,
+    source: CapsuleDriverSource,
+    product_source: CapsuleDriverProductSource,
     compiler: CapsuleCompiler,
     build: CapsuleBuild,
     configuration_digest: []const u8,
@@ -5364,18 +5112,33 @@ fn validatePairedEvidence(
     )) return error.CompilerBinaryChanged;
     const deep = isDeepCaseId(row.case_id);
     if (deep) {
+        const baseline_driver = evidence.baseline.driver orelse
+            return error.IncompletePerfDriverEvidence;
+        const candidate_driver = evidence.candidate.driver orelse
+            return error.IncompletePerfDriverEvidence;
         try validateDriverEvidence(
             allocator,
-            evidence.baseline.driver orelse
-                return error.IncompletePerfDriverEvidence,
-            expected_base,
+            baseline_driver,
+            evidence.baseline.binary,
         );
         try validateDriverEvidence(
             allocator,
-            evidence.candidate.driver orelse
-                return error.IncompletePerfDriverEvidence,
-            expected_candidate,
+            candidate_driver,
+            evidence.candidate.binary,
         );
+        if (!std.mem.eql(
+            u8,
+            baseline_driver.source.file.sha256,
+            candidate_driver.source.file.sha256,
+        ) or !std.mem.eql(
+            u8,
+            baseline_driver.source.revision,
+            candidate_driver.source.revision,
+        ) or !std.mem.eql(
+            u8,
+            baseline_driver.configuration_digest,
+            candidate_driver.configuration_digest,
+        )) return error.PerfDriverSourceMismatch;
     } else if (evidence.baseline.driver != null or
         evidence.candidate.driver != null)
     {
@@ -5467,16 +5230,44 @@ fn validateProductEvidence(
 fn validateDriverEvidence(
     allocator: std.mem.Allocator,
     driver: CapsuleDriver,
-    expected_revision: []const u8,
+    product: CapsuleProduct,
 ) !void {
-    if (!std.mem.eql(u8, driver.source.revision, expected_revision) or
-        !validFullRevision(driver.source.tree) or !driver.source.clean)
-    {
+    if (!std.mem.eql(
+        u8,
+        driver.source.revision,
+        accepted_generic_deep_schema1_sha,
+    ) or !std.mem.eql(
+        u8,
+        driver.source.tree,
+        accepted_generic_deep_schema1_tree,
+    ) or
+        !std.mem.eql(
+            u8,
+            driver.source.path,
+            shared_driver_source_path,
+        ) or !std.mem.eql(
+        u8,
+        driver.product_source.revision,
+        product.source.revision,
+    ) or !std.mem.eql(
+        u8,
+        driver.product_source.tree,
+        product.source.tree,
+    ) or !std.mem.eql(
+        u8,
+        driver.product_source.archive_sha256,
+        product.source.archive.sha256,
+    )) {
         return error.PerfEvidenceIdentityMismatch;
     }
     try verifyCapsuleFile(allocator, driver.file);
-    try verifyCapsuleFile(allocator, driver.source.archive);
+    try verifyCapsuleFile(allocator, driver.source.file);
     try validateCompilerEvidence(allocator, driver.compiler);
+    if (!std.mem.eql(
+        u8,
+        driver.compiler.file.sha256,
+        product.compiler.file.sha256,
+    )) return error.CompilerBinaryChanged;
     try validateIsolatedBuild(driver.build);
     try requireDigestIdentity(driver.configuration_digest);
 }
@@ -6332,33 +6123,12 @@ test "rss tolerance rounds only to the observable page quantum" {
     try std.testing.expect(allowed - 2_690_581 < page_size);
 }
 
-test "deep measurement schema one is accepted only for the frozen oracle" {
-    try std.testing.expectEqual(
-        DeepMeasurementSchemaKind.legacy_bridge,
-        try deepMeasurementSchemaKind(
-            1,
-            accepted_generic_deep_schema1_sha,
-        ),
-    );
-    try std.testing.expectError(
-        error.AmbiguousDeepMeasurementContract,
-        deepMeasurementSchemaKind(
-            1,
-            "9b254f2b559a53cd6cc012d36cd250518c47e22b",
-        ),
-    );
-    try std.testing.expectEqual(
-        DeepMeasurementSchemaKind.explicit,
-        try deepMeasurementSchemaKind(2, "candidate"),
-    );
-}
-
-test "deep artifact identity binds case binary and source revision" {
+test "shared deep artifact identity is exact" {
     const case_cfg = DeepCases[0];
     const raw = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"case_id\":\"{s}\",\"binary\":\"{s}\"," ++
-            "\"git_sha\":\"abcdef0123456789abcdef0123456789abcdef01\"}}",
+        "{{\"schema_version\":1,\"case_id\":\"{s}\",\"binary\":\"{s}\"," ++
+            "\"git_sha\":\"unknown\"}}",
         .{
             case_cfg.descriptor.case_id,
             case_cfg.descriptor.binary,
@@ -6372,34 +6142,17 @@ test "deep artifact identity binds case binary and source revision" {
         .{},
     );
     defer parsed.deinit();
-    try validateDeepArtifactIdentity(
-        parsed.value,
-        case_cfg,
-        "abcdef0123456789abcdef0123456789abcdef01",
-    );
-    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "unknown" };
-    try validateDeepArtifactIdentity(
-        parsed.value,
-        case_cfg,
-        accepted_generic_deep_schema1_sha,
-    );
+    try validateSharedDriverArtifact(parsed.value, case_cfg);
+    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateDeepArtifactIdentity(
-            parsed.value,
-            case_cfg,
-            "abcdef0123456789abcdef0123456789abcdef01",
-        ),
+        validateSharedDriverArtifact(parsed.value, case_cfg),
     );
-    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "abcdef012345" };
+    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "unknown" };
     parsed.value.object.getPtr("case_id").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateDeepArtifactIdentity(
-            parsed.value,
-            case_cfg,
-            "abcdef0123456789abcdef0123456789abcdef01",
-        ),
+        validateSharedDriverArtifact(parsed.value, case_cfg),
     );
     parsed.value.object.getPtr("case_id").?.* = .{
         .string = case_cfg.descriptor.case_id,
@@ -6407,23 +6160,15 @@ test "deep artifact identity binds case binary and source revision" {
     parsed.value.object.getPtr("binary").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateDeepArtifactIdentity(
-            parsed.value,
-            case_cfg,
-            "abcdef0123456789abcdef0123456789abcdef01",
-        ),
+        validateSharedDriverArtifact(parsed.value, case_cfg),
     );
     parsed.value.object.getPtr("binary").?.* = .{
         .string = case_cfg.descriptor.binary,
     };
-    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "fedcba" };
+    parsed.value.object.getPtr("schema_version").?.* = .{ .integer = 2 };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateDeepArtifactIdentity(
-            parsed.value,
-            case_cfg,
-            "abcdef0123456789abcdef0123456789abcdef01",
-        ),
+        validateSharedDriverArtifact(parsed.value, case_cfg),
     );
 }
 
@@ -6593,34 +6338,6 @@ test "doctor counts compat and deep cases" {
     for (CompatCases) |_| count += 1;
     for (DeepCases) |_| count += 1;
     try std.testing.expectEqual(CompatCases.len + DeepCases.len, count);
-}
-
-test "deep measurement source identity is explicit and bounded" {
-    const revision = "1111111111111111111111111111111111111111";
-    const parsed = try parseArgs(&.{
-        "_measure",
-        "--target",
-        "seq-observe-deep-batch8",
-        "--source-revision",
-        revision,
-    });
-    try std.testing.expectEqual(Command._measure, parsed.command);
-    try std.testing.expectEqualStrings(
-        revision,
-        try requireMeasurementSourceRevision(parsed.source_revision),
-    );
-    try std.testing.expectError(
-        error.MeasurementSourceRevisionRequired,
-        requireMeasurementSourceRevision(null),
-    );
-    try std.testing.expectError(
-        error.InvalidMeasurementSourceRevision,
-        requireMeasurementSourceRevision("short"),
-    );
-    try std.testing.expectError(
-        error.UnsupportedArgument,
-        parseArgs(&.{ "report", "--source-revision", revision }),
-    );
 }
 
 test "cutover comparison requires the complete Seq and Ledger matrix" {
