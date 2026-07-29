@@ -976,8 +976,8 @@ fn compatBaselinePath(allocator: std.mem.Allocator, machine_dir: []const u8, bin
 
 fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bool, _: ?std.json.Value) ![]u8 {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
-    defer cleanupTempRoot(temp_root);
     defer allocator.free(temp_root);
+    defer cleanupTempRoot(temp_root);
     const artifact_path = try std.fs.path.join(allocator, &.{ temp_root, "artifact.json" });
     defer allocator.free(artifact_path);
     const binary_path = try resolveBinaryPath(allocator, case_cfg);
@@ -1009,8 +1009,8 @@ fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bo
 
 fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
-    defer cleanupTempRoot(temp_root);
     defer allocator.free(temp_root);
+    defer cleanupTempRoot(temp_root);
     try prepareCompatCase(allocator, case_cfg, temp_root);
     var samples: std.ArrayList(u64) = .empty;
     var alloc_samples: std.ArrayList(u64) = .empty;
@@ -1174,14 +1174,14 @@ fn runPairedMeasuredCases(
         allocator,
         "paired-baseline",
     );
-    defer cleanupTempRoot(baseline_root);
     defer allocator.free(baseline_root);
+    defer cleanupTempRoot(baseline_root);
     const candidate_root = try makeTempRoot(
         allocator,
         "paired-candidate",
     );
-    defer cleanupTempRoot(candidate_root);
     defer allocator.free(candidate_root);
+    defer cleanupTempRoot(candidate_root);
     try prepareCompatCase(allocator, baseline_case, baseline_root);
     try prepareCompatCase(allocator, candidate_case, candidate_root);
 
@@ -1344,8 +1344,8 @@ fn metricsFromSamples(
 
 fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metrics {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
-    defer cleanupTempRoot(temp_root);
     defer allocator.free(temp_root);
+    defer cleanupTempRoot(temp_root);
     var samples: std.ArrayList(u64) = .empty;
     var alloc_samples: std.ArrayList(u64) = .empty;
     try samples.ensureTotalCapacity(allocator, case_cfg.samples);
