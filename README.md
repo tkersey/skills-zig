@@ -87,7 +87,9 @@ zig build perf-compare-local -- --target cron
 
 Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
 Accepted baseline snapshots and compare summaries are stored under the same machine-local root.
-`perf-report-local` also writes `latest-report.json` and `cutover-status.json` under the machine-local reports directory.
+`perf-report-local` writes `latest-report.json` for every complete comparison.
+Only a complete, exact-tuple `--target cutover` comparison also writes
+`cutover-status.json`.
 Representative native qualification inputs remain beside the owning runtime.
 
 ## Release Model

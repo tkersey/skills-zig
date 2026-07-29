@@ -251,6 +251,37 @@ pub fn readSlot(
     definition_id: []const u8,
     slot: storage.ResolvedSlot,
 ) !SlotSnapshot {
+    return readSlotInternal(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        false,
+    );
+}
+
+pub fn readSlotOrMissing(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+) !SlotSnapshot {
+    return readSlotInternal(
+        allocator,
+        repo_root,
+        definition_id,
+        slot,
+        true,
+    );
+}
+
+fn readSlotInternal(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    allow_missing: bool,
+) !SlotSnapshot {
     if (!std.fs.path.isAbsolute(repo_root)) return error.RepositoryRootNotAbsolute;
     const path = try std.fs.path.join(
         allocator,
@@ -270,11 +301,45 @@ pub fn readSlot(
         binding_path,
     );
     errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
-    const content = try durable_store.readRegularFileNoSymlink(
+    const content = durable_store.readRegularFileNoSymlink(
         allocator,
         path,
         slot.max_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!allow_missing) return err;
+            try requireStableMissingSlot(
+                allocator,
+                repo_root,
+                slot.relative_path,
+                path,
+                binding_path,
+                read_custody != null,
+            );
+            return missingSlot(allocator, path, read_custody);
+        },
+        else => return err,
+    };
+    return finishPresentSlot(
+        allocator,
+        path,
+        binding_path,
+        definition_id,
+        slot,
+        content,
+        read_custody,
     );
+}
+
+fn finishPresentSlot(
+    allocator: std.mem.Allocator,
+    path: []u8,
+    binding_path: []const u8,
+    definition_id: []const u8,
+    slot: storage.ResolvedSlot,
+    content: []u8,
+    read_custody: ?durable_store.CasReadLockPair,
+) !SlotSnapshot {
     errdefer allocator.free(content);
     const revision = try definition_core.canonical_json.digestBytesAlloc(
         allocator,
@@ -305,71 +370,6 @@ pub fn readSlot(
         .binding = binding,
         .read_custody = read_custody,
     };
-}
-
-pub fn readSlotOrMissing(
-    allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    definition_id: []const u8,
-    slot: storage.ResolvedSlot,
-) !SlotSnapshot {
-    return readSlot(
-        allocator,
-        repo_root,
-        definition_id,
-        slot,
-    ) catch |err| switch (err) {
-        error.FileNotFound => {
-            return readMissingSlot(
-                allocator,
-                repo_root,
-                slot,
-            );
-        },
-        else => err,
-    };
-}
-
-fn readMissingSlot(
-    allocator: std.mem.Allocator,
-    repo_root: []const u8,
-    slot: storage.ResolvedSlot,
-) !SlotSnapshot {
-    const path = try std.fs.path.join(
-        allocator,
-        &.{ repo_root, ".ledger", slot.relative_path },
-    );
-    errdefer allocator.free(path);
-    const binding_path = try bindingPathAlloc(
-        allocator,
-        repo_root,
-        slot.relative_path,
-    );
-    defer allocator.free(binding_path);
-    var read_custody = try acquireSlotReadCustody(
-        allocator,
-        path,
-        binding_path,
-    );
-    errdefer if (read_custody) |*custody_lock| custody_lock.deinit();
-    const stat: ?std.Io.File.Stat = std.Io.Dir.cwd().statFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        path,
-        .{ .follow_symlinks = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    if (stat != null) return error.EventStoreBusy;
-    try requireStableMissingSlot(
-        allocator,
-        repo_root,
-        slot.relative_path,
-        path,
-        binding_path,
-        read_custody != null,
-    );
-    return missingSlot(allocator, path, read_custody);
 }
 
 fn acquireSlotReadCustody(

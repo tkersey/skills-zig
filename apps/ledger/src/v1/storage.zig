@@ -5074,6 +5074,10 @@ fn validateEncodedPathTemplate(
             return error.ReservedStoragePath;
         }
     }
+    const last = segments[segments.len - 1];
+    if (last.kind == .literal and isCasControlPath(last.text)) {
+        return error.ReservedStoragePath;
+    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     for (segments, 0..) |segment, index| {
@@ -5525,12 +5529,20 @@ fn validateLogicalSlotPath(path: []const u8) !void {
     const first_end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
     const first = path[0..first_end];
     if (isReservedStorageRoot(first)) return error.ReservedStoragePath;
+    if (isCasControlPath(std.fs.path.basename(path))) {
+        return error.ReservedStoragePath;
+    }
 }
 
 fn isReservedStorageRoot(component: []const u8) bool {
     return component.len == 0 or component[0] == '.' or
         std.ascii.eqlIgnoreCase(component, "transactions") or
         std.ascii.eqlIgnoreCase(component, "bindings");
+}
+
+fn isCasControlPath(basename: []const u8) bool {
+    return std.mem.endsWith(u8, basename, ".cas.lock") or
+        std.mem.endsWith(u8, basename, ".cas.lock.advisory");
 }
 
 fn deinitPathSegments(
@@ -5898,6 +5910,43 @@ test "storage compiler rejects reserved paths and implicit multi effects" {
         error.ReservedStoragePath,
         storage_reserved_definition,
     );
+}
+
+test "storage paths reserve generated CAS control suffixes" {
+    try std.testing.expectError(
+        error.ReservedStoragePath,
+        validateLogicalSlotPath("records/state.jsonl.cas.lock"),
+    );
+    try std.testing.expectError(
+        error.ReservedStoragePath,
+        validateLogicalSlotPath("records/state.jsonl.cas.lock.advisory"),
+    );
+    const static_segments = [_]PathSegment{.{
+        .kind = .literal,
+        .text = @constCast("state.jsonl.cas.lock"),
+    }};
+    try std.testing.expectError(
+        error.ReservedStoragePath,
+        validateEncodedPathTemplate(
+            std.testing.allocator,
+            "state.jsonl.cas.lock",
+            &static_segments,
+        ),
+    );
+    try std.testing.expect(!pathTemplateMatches(
+        .{
+            .name = @constCast("state"),
+            .relative_path = @constCast("{stream}"),
+            .path_segments = @constCast(&[_]PathSegment{.{
+                .kind = .parameter,
+                .text = @constCast("stream"),
+            }}),
+            .kind = .event_log,
+            .codec = .jsonl,
+            .max_bytes = 1024,
+        },
+        "state.jsonl.cas.lock",
+    ));
 }
 
 test "storage slot paths reject ancestor and case ambiguity" {

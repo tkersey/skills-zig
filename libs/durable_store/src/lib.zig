@@ -4049,7 +4049,17 @@ pub fn eventStoreLockPathAlloc(
 }
 
 fn casLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
+    try rejectCasControlTarget(store_path);
     return std.fmt.allocPrint(allocator, "{s}.cas.lock", .{store_path});
+}
+
+fn rejectCasControlTarget(store_path: []const u8) !void {
+    const basename = std.fs.path.basename(store_path);
+    if (std.mem.endsWith(u8, basename, ".cas.lock") or
+        std.mem.endsWith(u8, basename, ".cas.lock.advisory"))
+    {
+        return error.ReservedCasControlPath;
+    }
 }
 
 fn casAdvisoryPathAlloc(
@@ -5806,6 +5816,40 @@ test "cas writes and jsonl snapshots reject stale expectations" {
             null,
         ),
     );
+}
+
+test "CAS targets cannot inhabit generated control paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    for ([_][]const u8{
+        "state.jsonl.cas.lock",
+        "state.jsonl.cas.lock.advisory",
+    }) |basename| {
+        const path = try std.fs.path.join(
+            std.testing.allocator,
+            &.{ root, basename },
+        );
+        defer std.testing.allocator.free(path);
+        try std.testing.expectError(
+            error.ReservedCasControlPath,
+            writeTextAtomicCas(
+                std.testing.allocator,
+                path,
+                "{\"seq\":1}\n",
+                .{ .expected_exists = false },
+            ),
+        );
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().access(Io.io(), path, .{}),
+        );
+    }
 }
 
 const CasWorkerContext = struct {

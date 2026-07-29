@@ -9,6 +9,11 @@ const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
 const paired_comparison_rounds: usize = 4;
+const accepted_generic_deep_schema1_sha =
+    "4ff01f5e6f2fa5bd4c945f5b6a92bb6d22ca8389";
+const deep_measurement_schema = "perf-deep-measurement/v1";
+const deep_comparison_method = "balanced-round-median-ratio/v1";
+const ratio_scale: u64 = 1_000_000;
 var process_environment: ?*const std.process.Environ.Map = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
@@ -29,7 +34,7 @@ const UsageText =
     \\  capture               Run native preserved-matrix baseline capture
     \\  compare               Run native preserved-matrix comparison
     \\  doctor                Validate native local perf setup
-    \\  report                Summarize the last native compare artifact and emit cutover status
+    \\  report                Summarize the last native compare artifact
     \\  accept                Snapshot current baselines into an accepted ledger
     \\
     \\Options:
@@ -664,18 +669,24 @@ fn invalidateCompareSummary(
     allocator: std.mem.Allocator,
     machine_dir: []const u8,
 ) !void {
-    const latest_path = try std.fs.path.join(
-        allocator,
-        &.{ machine_dir, "reports", "latest-compare.json" },
-    );
-    defer allocator.free(latest_path);
-    std.Io.Dir.cwd().deleteFile(
-        std.Io.Threaded.global_single_threaded.io(),
-        latest_path,
-    ) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    for ([_][]const u8{
+        "latest-compare.json",
+        "latest-report.json",
+        "cutover-status.json",
+    }) |name| {
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ machine_dir, "reports", name },
+        );
+        defer allocator.free(path);
+        std.Io.Dir.cwd().deleteFile(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+        ) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn comparisonStatusFailed(status: []const u8) bool {
@@ -715,6 +726,10 @@ fn captureCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case
 fn captureDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_cfg: DeepCase) ![]const u8 {
     var metrics = try runDeepMeasuredCase(allocator, case_cfg);
     defer metrics.deinit(allocator);
+    const semantic_output = if (case_cfg.setup == .seq_observe)
+        try seqDeepSemanticOutputDigest(allocator)
+    else
+        null;
     const baseline_path = try compatBaselinePath(
         allocator,
         machine_dir,
@@ -723,16 +738,15 @@ fn captureDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_c
         false,
     );
     defer allocator.free(baseline_path);
-    try writeMetricsArtifact(allocator, baseline_path, .{
-        .descriptor = case_cfg.descriptor,
-        .builder = .root,
-        .build_step = null,
-        .binary_path = "",
-        .setup = .cron_help,
-        .warmups = case_cfg.warmups,
-        .samples = case_cfg.samples,
-        .tolerance_pct = case_cfg.tolerance_pct,
-    }, metrics, "capture", "captured");
+    try writeDeepMetricsArtifact(
+        allocator,
+        baseline_path,
+        case_cfg,
+        metrics,
+        semantic_output,
+        "capture",
+        "captured",
+    );
     return "captured";
 }
 
@@ -839,6 +853,8 @@ fn compareCompatCase(
                 evidence_case,
                 baseline_evidence,
                 candidate_evidence,
+                null,
+                null,
                 paired.baseline,
                 paired.candidate,
                 paired.workload_digest,
@@ -998,8 +1014,8 @@ fn compareDeepCase(
                 .samples = paired.candidate.samples.items.len,
                 .tolerance_pct = case_cfg.tolerance_pct,
             };
-            const compare = try compareMeasuredMetrics(
-                comparison_case,
+            const compare = try compareBalancedDeepMetrics(
+                case_cfg,
                 paired.baseline,
                 paired.candidate,
             );
@@ -1017,6 +1033,8 @@ fn compareDeepCase(
                 comparison_case,
                 baseline_evidence,
                 candidate_evidence,
+                paired.baseline_driver,
+                paired.candidate_driver,
                 paired.baseline,
                 paired.candidate,
                 paired.workload_digest,
@@ -1530,10 +1548,14 @@ const PairedMetrics = struct {
     workload_digest: [64]u8,
     baseline_execution: MeasuredOutputEvidence,
     candidate_execution: MeasuredOutputEvidence,
+    baseline_driver: ?DriverEvidence = null,
+    candidate_driver: ?DriverEvidence = null,
 
     fn deinit(self: *PairedMetrics, allocator: std.mem.Allocator) void {
         self.baseline.deinit(allocator);
         self.candidate.deinit(allocator);
+        if (self.baseline_driver) |*driver| driver.deinit(allocator);
+        if (self.candidate_driver) |*driver| driver.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -1555,6 +1577,19 @@ const BinaryEvidence = struct {
     fn deinit(self: *BinaryEvidence, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.version);
+        allocator.free(self.source_sha);
+        self.* = undefined;
+    }
+};
+
+const DriverEvidence = struct {
+    path: [:0]u8,
+    sha256: [64]u8,
+    source_sha: []u8,
+    configuration_digest: [64]u8,
+
+    fn deinit(self: *DriverEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
         allocator.free(self.source_sha);
         self.* = undefined;
     }
@@ -1608,6 +1643,82 @@ fn binaryEvidence(
         .source_sha = source_sha,
         .build_step = case_cfg.build_step orelse "default",
     };
+}
+
+fn driverEvidence(
+    allocator: std.mem.Allocator,
+    source_root: []const u8,
+    source_sha: []const u8,
+    case_cfg: DeepCase,
+) !DriverEvidence {
+    const unresolved = try canonicalBuildOutputPathAlloc(
+        allocator,
+        source_root,
+        "perf_hub",
+    );
+    defer allocator.free(unresolved);
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        unresolved,
+        allocator,
+    );
+    errdefer allocator.free(path);
+    return .{
+        .path = path,
+        .sha256 = try sha256File(path),
+        .source_sha = try allocator.dupe(u8, source_sha),
+        .configuration_digest = try deepConfigurationDigest(case_cfg),
+    };
+}
+
+fn requireDriverUnchanged(driver: DriverEvidence) !void {
+    const current = try sha256File(driver.path);
+    if (!std.mem.eql(u8, &current, &driver.sha256)) {
+        return error.DriverBinaryChanged;
+    }
+}
+
+fn sha256File(path: []const u8) ![64]u8 {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        std.heap.page_allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer std.heap.page_allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn deepConfigurationDigest(case_cfg: DeepCase) ![64]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    for ([_][]const u8{
+        deep_measurement_schema,
+        deep_comparison_method,
+        case_cfg.descriptor.case_id,
+        @tagName(case_cfg.setup),
+        "ReleaseFast",
+    }) |value| {
+        hasher.update(value);
+        hasher.update(&.{0});
+    }
+    var encoded: [128]u8 = undefined;
+    const numeric = try std.fmt.bufPrint(
+        &encoded,
+        "{d}:{d}:{d}:{d}:{d:.6}",
+        .{
+            case_cfg.warmups,
+            case_cfg.samples,
+            case_cfg.batch_iterations,
+            paired_comparison_rounds,
+            case_cfg.tolerance_pct,
+        },
+    );
+    hasher.update(numeric);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn sourceRootForBinaryAlloc(
@@ -2138,6 +2249,20 @@ fn runPairedDeepCases(
     defer allocator.free(candidate_root);
     try ensureSourcePerfHubBuilt(allocator, built, baseline_root);
     try ensureSourcePerfHubBuilt(allocator, built, candidate_root);
+    var baseline_driver = try driverEvidence(
+        allocator,
+        baseline_root,
+        baseline_evidence.source_sha,
+        case_cfg,
+    );
+    errdefer baseline_driver.deinit(allocator);
+    var candidate_driver = try driverEvidence(
+        allocator,
+        candidate_root,
+        candidate_evidence.source_sha,
+        case_cfg,
+    );
+    errdefer candidate_driver.deinit(allocator);
     const baseline_workload = try deepWorkloadDigestForRoot(
         allocator,
         baseline_root,
@@ -2150,6 +2275,22 @@ fn runPairedDeepCases(
     );
     if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
         return error.PerfWorkloadMismatch;
+    }
+    // Both products must observe one immutable physical input. Source-local
+    // copies are byte-equal here, but their absolute paths intentionally
+    // produce different source_event_id values.
+    const baseline_semantic = try productDeepSemanticOutputDigest(
+        allocator,
+        baseline_evidence.path,
+        candidate_root,
+    );
+    const candidate_semantic = try productDeepSemanticOutputDigest(
+        allocator,
+        candidate_evidence.path,
+        candidate_root,
+    );
+    if (!std.mem.eql(u8, &baseline_semantic, &candidate_semantic)) {
+        return error.PerfSemanticOutputMismatch;
     }
 
     var baseline_samples: std.ArrayList(u64) = .empty;
@@ -2172,9 +2313,25 @@ fn runPairedDeepCases(
         allocator,
         paired_comparison_rounds,
     );
+    var baseline_driver_semantic: ?[64]u8 = null;
+    var candidate_driver_semantic: ?[64]u8 = null;
 
-    try primeSourceDeepCase(allocator, baseline_root, case_cfg);
-    try primeSourceDeepCase(allocator, candidate_root, case_cfg);
+    try primeSourceDeepCase(
+        allocator,
+        baseline_root,
+        baseline_evidence.source_sha,
+        case_cfg,
+        baseline_driver,
+        &baseline_driver_semantic,
+    );
+    try primeSourceDeepCase(
+        allocator,
+        candidate_root,
+        candidate_evidence.source_sha,
+        case_cfg,
+        candidate_driver,
+        &candidate_driver_semantic,
+    );
 
     var round: usize = 0;
     while (round < paired_comparison_rounds) : (round += 1) {
@@ -2182,14 +2339,20 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 baseline_root,
+                baseline_evidence.source_sha,
                 case_cfg,
+                baseline_driver,
+                &baseline_driver_semantic,
                 &baseline_samples,
                 &baseline_allocs,
             );
             try appendSourceDeepMetrics(
                 allocator,
                 candidate_root,
+                candidate_evidence.source_sha,
                 case_cfg,
+                candidate_driver,
+                &candidate_driver_semantic,
                 &candidate_samples,
                 &candidate_allocs,
             );
@@ -2197,18 +2360,44 @@ fn runPairedDeepCases(
             try appendSourceDeepMetrics(
                 allocator,
                 candidate_root,
+                candidate_evidence.source_sha,
                 case_cfg,
+                candidate_driver,
+                &candidate_driver_semantic,
                 &candidate_samples,
                 &candidate_allocs,
             );
             try appendSourceDeepMetrics(
                 allocator,
                 baseline_root,
+                baseline_evidence.source_sha,
                 case_cfg,
+                baseline_driver,
+                &baseline_driver_semantic,
                 &baseline_samples,
                 &baseline_allocs,
             );
         }
+    }
+    if (baseline_driver_semantic) |digest| {
+        if (!std.mem.eql(u8, &digest, &baseline_semantic)) {
+            return error.PerfDriverSemanticOutputMismatch;
+        }
+    } else if (!std.mem.eql(
+        u8,
+        baseline_evidence.source_sha,
+        accepted_generic_deep_schema1_sha,
+    )) {
+        return error.MissingPerfSemanticOutput;
+    }
+    const candidate_driver_digest = candidate_driver_semantic orelse
+        return error.MissingPerfSemanticOutput;
+    if (!std.mem.eql(
+        u8,
+        &candidate_driver_digest,
+        &candidate_semantic,
+    )) {
+        return error.PerfDriverSemanticOutputMismatch;
     }
     var baseline = try metricsFromSamples(
         allocator,
@@ -2230,18 +2419,23 @@ fn runPairedDeepCases(
         .candidate = candidate,
         .workload_digest = baseline_workload,
         .baseline_execution = .{
-            .output_sha256 = baseline_workload,
+            .output_sha256 = baseline_semantic,
         },
         .candidate_execution = .{
-            .output_sha256 = candidate_workload,
+            .output_sha256 = candidate_semantic,
         },
+        .baseline_driver = baseline_driver,
+        .candidate_driver = candidate_driver,
     };
 }
 
 fn primeSourceDeepCase(
     allocator: std.mem.Allocator,
     source_root: []const u8,
+    source_sha: []const u8,
     case_cfg: DeepCase,
+    driver: DriverEvidence,
+    semantic_output: *?[64]u8,
 ) !void {
     var samples: std.ArrayList(u64) = .empty;
     defer samples.deinit(allocator);
@@ -2250,7 +2444,10 @@ fn primeSourceDeepCase(
     try appendSourceDeepMetrics(
         allocator,
         source_root,
+        source_sha,
         case_cfg,
+        driver,
+        semantic_output,
         &samples,
         &alloc_samples,
     );
@@ -2337,21 +2534,19 @@ fn deepWorkloadDigestForRoot(
 fn appendSourceDeepMetrics(
     allocator: std.mem.Allocator,
     source_root: []const u8,
+    source_sha: []const u8,
     case_cfg: DeepCase,
+    driver: DriverEvidence,
+    semantic_output: *?[64]u8,
     samples: *std.ArrayList(u64),
     alloc_samples: *std.ArrayList(u64),
 ) !void {
-    const perf_hub_path = try canonicalBuildOutputPathAlloc(
-        allocator,
-        source_root,
-        "perf_hub",
-    );
-    defer allocator.free(perf_hub_path);
+    try requireDriverUnchanged(driver);
     const result = try runChildCapture(
         allocator,
         source_root,
         &.{
-            perf_hub_path,
+            driver.path,
             "capture",
             "--target",
             case_cfg.descriptor.case_id,
@@ -2360,6 +2555,7 @@ fn appendSourceDeepMetrics(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.CaseFailed;
+    try requireDriverUnchanged(driver);
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const artifact_name = try std.fmt.allocPrint(
@@ -2394,10 +2590,25 @@ fn appendSourceDeepMetrics(
         .{},
     );
     defer parsed.deinit();
+    const schema_version = try jsonFieldU64(
+        parsed.value.object,
+        "schema_version",
+    );
+    switch (try deepMeasurementSchemaKind(schema_version, source_sha)) {
+        .legacy_bridge => {},
+        .explicit => try validateDeepMeasurementContract(
+            parsed.value,
+            case_cfg,
+            semantic_output,
+        ),
+    }
     const metrics = parsed.value.object.get("metrics") orelse
         return error.InvalidData;
     const raw_samples = metrics.object.get("samples_ns") orelse
         return error.InvalidData;
+    if (raw_samples.array.items.len != case_cfg.samples) {
+        return error.DeepMeasurementSampleCountMismatch;
+    }
     for (raw_samples.array.items) |raw| {
         try samples.append(
             allocator,
@@ -2412,6 +2623,117 @@ fn appendSourceDeepMetrics(
         allocator,
         batch_allocs / case_cfg.batch_iterations,
     );
+}
+
+const DeepMeasurementSchemaKind = enum {
+    legacy_bridge,
+    explicit,
+};
+
+fn deepMeasurementSchemaKind(
+    schema_version: u64,
+    source_sha: []const u8,
+) !DeepMeasurementSchemaKind {
+    return switch (schema_version) {
+        1 => if (std.mem.eql(
+            u8,
+            source_sha,
+            accepted_generic_deep_schema1_sha,
+        ))
+            .legacy_bridge
+        else
+            error.AmbiguousDeepMeasurementContract,
+        2 => .explicit,
+        else => error.UnsupportedDeepMeasurementContract,
+    };
+}
+
+fn validateDeepMeasurementContract(
+    artifact: std.json.Value,
+    case_cfg: DeepCase,
+    semantic_output: *?[64]u8,
+) !void {
+    const contract = switch (artifact.object.get(
+        "measurement_contract",
+    ) orelse return error.InvalidDeepMeasurementContract) {
+        .object => |value| value,
+        else => return error.InvalidDeepMeasurementContract,
+    };
+    const schema = switch (contract.get("schema") orelse
+        return error.InvalidDeepMeasurementContract) {
+        .string => |value| value,
+        else => return error.InvalidDeepMeasurementContract,
+    };
+    if (!std.mem.eql(u8, schema, deep_measurement_schema)) {
+        return error.UnsupportedDeepMeasurementContract;
+    }
+    if (try jsonFieldU64(contract, "batch_iterations") !=
+        case_cfg.batch_iterations)
+    {
+        return error.DeepMeasurementBatchMismatch;
+    }
+    for ([_][]const u8{ "latency_scope", "allocation_scope" }) |field| {
+        const scope = switch (contract.get(field) orelse
+            return error.InvalidDeepMeasurementContract) {
+            .string => |value| value,
+            else => return error.InvalidDeepMeasurementContract,
+        };
+        if (!std.mem.eql(u8, scope, "batch-total")) {
+            return error.UnsupportedDeepMeasurementScope;
+        }
+    }
+    const execution = switch (artifact.object.get("execution") orelse
+        return error.MissingPerfSemanticOutput) {
+        .object => |value| value,
+        else => return error.MissingPerfSemanticOutput,
+    };
+    const encoded = switch (execution.get(
+        "semantic_output_sha256",
+    ) orelse return error.MissingPerfSemanticOutput) {
+        .string => |value| value,
+        else => return error.MissingPerfSemanticOutput,
+    };
+    if (!std.mem.startsWith(u8, encoded, "sha256:") or encoded.len != 71) {
+        return error.InvalidPerfSemanticOutput;
+    }
+    var digest: [64]u8 = undefined;
+    @memcpy(&digest, encoded["sha256:".len..]);
+    if (semantic_output.*) |prior| {
+        if (!std.mem.eql(u8, &prior, &digest)) {
+            return error.PerfDriverSemanticOutputChanged;
+        }
+    } else {
+        semantic_output.* = digest;
+    }
+}
+
+fn productDeepSemanticOutputDigest(
+    allocator: std.mem.Allocator,
+    binary_path: []const u8,
+    source_root: []const u8,
+) ![64]u8 {
+    const result = try runChildCaptureOutput(
+        allocator,
+        source_root,
+        &.{
+            binary_path,
+            "observe",
+            "--definition",
+            "apps/seq/src/v1/fixtures/message-observation.json",
+            "--projection",
+            "rows",
+            "--path",
+            "apps/seq/src/v1/fixtures/rollout.jsonl",
+            "--param",
+            "needle=failure",
+            "--format",
+            "json",
+        },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CaseFailed;
+    return canonicalDataDigest(allocator, result.stdout);
 }
 
 fn retainPairedWorkloads() bool {
@@ -2594,13 +2916,21 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var counting = core_perf.CountingAllocator.init(arena.allocator());
-        const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+        const start_ns = std.Io.Clock.awake.now(
+            std.Io.Threaded.global_single_threaded.io(),
+        ).nanoseconds;
         try executeDeepBatch(
             counting.allocator(),
             case_cfg,
             temp_root,
         );
-        try samples.append(allocator, @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1)));
+        const elapsed = std.Io.Clock.awake.now(
+            std.Io.Threaded.global_single_threaded.io(),
+        ).nanoseconds - start_ns;
+        try samples.append(
+            allocator,
+            @intCast(@max(elapsed, 1)),
+        );
         try alloc_samples.append(
             allocator,
             counting.stats.totalCalls(),
@@ -2644,7 +2974,7 @@ fn executeDeepBatch(
 
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
     switch (setup) {
-        .seq_observe => try executeSeqObserveDeep(allocator),
+        .seq_observe => _ = try executeSeqObserveDeep(allocator, false),
         .cron_show => try cron_cli.runPerfCase(allocator, .show, temp_root),
         .cron_create => try cron_cli.runPerfCase(allocator, .create, temp_root),
         .cron_update => try cron_cli.runPerfCase(allocator, .update, temp_root),
@@ -2656,7 +2986,16 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
     }
 }
 
-fn executeSeqObserveDeep(allocator: std.mem.Allocator) !void {
+fn seqDeepSemanticOutputDigest(
+    allocator: std.mem.Allocator,
+) ![64]u8 {
+    return (try executeSeqObserveDeep(allocator, true)) orelse unreachable;
+}
+
+fn executeSeqObserveDeep(
+    allocator: std.mem.Allocator,
+    capture_semantic_output: bool,
+) !?[64]u8 {
     const cwd = try std.process.currentPathAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         allocator,
@@ -2723,6 +3062,49 @@ fn executeSeqObserveDeep(allocator: std.mem.Allocator) !void {
     {
         return error.InvalidPerfObservation;
     }
+    if (!capture_semantic_output) return null;
+    const rendered = try seq_v1.result.renderJsonAlloc(allocator, .{
+        .definition_plan = &plans.definition_plan,
+        .projection_name = "rows",
+        .parameters_digest = &parameters.values_digest,
+        .corpus = .{
+            .adapter = "codex-rollout-jsonl/v1",
+            .digest = &observation.corpus_digest,
+            .files = 1,
+            .sessions = 1,
+            .contaminated = false,
+        },
+        .rows = observation.result.rows(),
+        .compile_stats = .{},
+        .execution_stats = .{
+            .output_rows = observation.result.row_count,
+        },
+    });
+    defer allocator.free(rendered);
+    return @as(?[64]u8, try canonicalDataDigest(allocator, rendered));
+}
+
+fn canonicalDataDigest(
+    allocator: std.mem.Allocator,
+    rendered: []const u8,
+) ![64]u8 {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        rendered,
+        .{},
+    );
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data") orelse
+        return error.InvalidPerfSemanticOutput;
+    const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
+        allocator,
+        data,
+    );
+    defer allocator.free(canonical);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn compareLatencyMetrics(
@@ -2743,19 +3125,49 @@ fn compareLatencyMetrics(
     }
     const base_p50 = try jsonFieldU64(metric_obj, "p50_ns");
     const base_p95 = try jsonFieldU64(metric_obj, "p95_ns");
-    const allowed_p50 = allowedUpperBoundWithTolerance(base_p50, case_cfg.tolerance_pct);
-    const allowed_p95 = allowedUpperBoundWithTolerance(base_p95, case_cfg.tolerance_pct);
+    const allowed_p50 = allowedUpperBoundWithTolerance(
+        base_p50,
+        case_cfg.tolerance_pct,
+    );
+    const allowed_p95 = allowedUpperBoundWithTolerance(
+        base_p95,
+        case_cfg.tolerance_pct,
+    );
     if (metrics.p50_ns > allowed_p50) {
-        return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(std.heap.page_allocator, "p50 {d} > {d}", .{ metrics.p50_ns, allowed_p50 }) };
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "p50 {d} > {d}",
+                .{ metrics.p50_ns, allowed_p50 },
+            ),
+        };
     }
     if (metrics.p95_ns > allowed_p95) {
-        return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(std.heap.page_allocator, "p95 {d} > {d}", .{ metrics.p95_ns, allowed_p95 }) };
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "p95 {d} > {d}",
+                .{ metrics.p95_ns, allowed_p95 },
+            ),
+        };
     }
     if (case_cfg.descriptor.measurement_mode == .latency_alloc) {
         const base_alloc = try jsonFieldU64(metric_obj, "p50_alloc_calls");
-        const allowed_alloc = allowedUpperBoundWithTolerance(base_alloc, case_cfg.tolerance_pct);
+        const allowed_alloc = allowedUpperBoundWithTolerance(
+            base_alloc,
+            case_cfg.tolerance_pct,
+        );
         if (metrics.p50_alloc_calls > allowed_alloc) {
-            return .{ .status = "FAIL", .detail = try std.fmt.allocPrint(std.heap.page_allocator, "p50_alloc_calls {d} > {d}", .{ metrics.p50_alloc_calls, allowed_alloc }) };
+            return .{
+                .status = "FAIL",
+                .detail = try std.fmt.allocPrint(
+                    std.heap.page_allocator,
+                    "p50_alloc_calls {d} > {d}",
+                    .{ metrics.p50_alloc_calls, allowed_alloc },
+                ),
+            };
         }
     }
     return .{ .status = "PASS", .detail = "ok" };
@@ -2817,8 +3229,126 @@ fn compareMeasuredMetrics(
     return .{ .status = "PASS", .detail = "paired base/candidate ok" };
 }
 
-fn compareDriverRaw(allocator: std.mem.Allocator, case_cfg: CompatCase, baseline: std.json.Value, current_raw_json: []const u8) !StatusDetail {
-    var current = try std.json.parseFromSlice(std.json.Value, allocator, current_raw_json, .{});
+fn compareBalancedDeepMetrics(
+    case_cfg: DeepCase,
+    baseline: Metrics,
+    candidate: Metrics,
+) !StatusDetail {
+    const expected_samples = try std.math.mul(
+        usize,
+        case_cfg.samples,
+        paired_comparison_rounds,
+    );
+    if (baseline.samples.items.len != expected_samples or
+        candidate.samples.items.len != expected_samples)
+    {
+        return error.DeepMeasurementSampleCountMismatch;
+    }
+    var p50_ratios: [paired_comparison_rounds]u64 = undefined;
+    var p95_ratios: [paired_comparison_rounds]u64 = undefined;
+    for (0..paired_comparison_rounds) |round| {
+        const start = round * case_cfg.samples;
+        const end = start + case_cfg.samples;
+        p50_ratios[round] = try quantileRatioPpm(
+            baseline.samples.items[start..end],
+            candidate.samples.items[start..end],
+            50,
+        );
+        p95_ratios[round] = try quantileRatioPpm(
+            baseline.samples.items[start..end],
+            candidate.samples.items[start..end],
+            95,
+        );
+    }
+    const p50_ratio = medianRatioPpm(&p50_ratios);
+    const p95_ratio = medianRatioPpm(&p95_ratios);
+    const allowed_ratio: u64 = @intFromFloat(std.math.ceil(
+        @as(f64, @floatFromInt(ratio_scale)) *
+            (1.0 + case_cfg.tolerance_pct / 100.0),
+    ));
+    if (p50_ratio > allowed_ratio) {
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "balanced round p50 ratio_ppm={d} > {d}",
+                .{ p50_ratio, allowed_ratio },
+            ),
+        };
+    }
+    if (p95_ratio > allowed_ratio) {
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "balanced round p95 ratio_ppm={d} > {d}",
+                .{ p95_ratio, allowed_ratio },
+            ),
+        };
+    }
+    const allowed_alloc = allowedUpperBoundWithTolerance(
+        baseline.p50_alloc_calls,
+        case_cfg.tolerance_pct,
+    );
+    if (candidate.p50_alloc_calls > allowed_alloc) {
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "p50_alloc_calls {d} > {d}",
+                .{ candidate.p50_alloc_calls, allowed_alloc },
+            ),
+        };
+    }
+    return .{
+        .status = "PASS",
+        .detail = try std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "balanced round ratios p50_ppm={d} p95_ppm={d}",
+            .{ p50_ratio, p95_ratio },
+        ),
+    };
+}
+
+fn quantileRatioPpm(
+    baseline: []const u64,
+    candidate: []const u64,
+    percentile: usize,
+) !u64 {
+    const base = try percentileU64(
+        std.heap.page_allocator,
+        baseline,
+        percentile,
+    );
+    const current = try percentileU64(
+        std.heap.page_allocator,
+        candidate,
+        percentile,
+    );
+    if (base == 0) return error.InvalidDeepMeasurementContract;
+    const numerator = @as(u128, current) * ratio_scale + base - 1;
+    return @intCast(numerator / base);
+}
+
+fn medianRatioPpm(ratios: *[paired_comparison_rounds]u64) u64 {
+    std.mem.sort(u64, ratios, {}, std.sort.asc(u64));
+    const upper = ratios[paired_comparison_rounds / 2];
+    const lower = ratios[paired_comparison_rounds / 2 - 1];
+    return lower + (upper - lower + 1) / 2;
+}
+
+fn compareDriverRaw(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    baseline: std.json.Value,
+    current_raw_json: []const u8,
+) !StatusDetail {
+    var current = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        current_raw_json,
+        .{},
+    );
     defer current.deinit();
     const baseline_raw = baseline.object.get("raw_artifact") orelse return error.InvalidData;
     const current_raw = current.value;
@@ -2844,17 +3374,34 @@ fn compareDriverRaw(allocator: std.mem.Allocator, case_cfg: CompatCase, baseline
     return .{ .status = "PASS", .detail = "driver compare passed" };
 }
 
-fn compareUpperBoundField(allocator: std.mem.Allocator, current: std.json.Value, baseline: std.json.Value, field: []const u8, tolerance_pct: f64) !?[]const u8 {
+fn compareUpperBoundField(
+    allocator: std.mem.Allocator,
+    current: std.json.Value,
+    baseline: std.json.Value,
+    field: []const u8,
+    tolerance_pct: f64,
+) !?[]const u8 {
     const current_value = try jsonObjectFieldU64(current, field);
     const baseline_value = try jsonObjectFieldU64(baseline, field);
     const allowed = allowedUpperBoundWithTolerance(baseline_value, tolerance_pct);
     if (current_value > allowed) {
-        return try std.fmt.allocPrint(allocator, "{s} {d} > {d}", .{ field, current_value, allowed });
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s} {d} > {d}",
+            .{ field, current_value, allowed },
+        );
     }
     return null;
 }
 
-fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, metrics: Metrics, compare_status: []const u8, compare_detail: []const u8) !void {
+fn writeMetricsArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    case_cfg: CompatCase,
+    metrics: Metrics,
+    compare_status: []const u8,
+    compare_detail: []const u8,
+) !void {
     var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
@@ -2863,21 +3410,102 @@ fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg
     const sha = try gitShaAlloc(allocator);
     defer allocator.free(sha);
     try writer.print(
-        "{{\"schema_version\":1,\"machine_id\":\"{s}\",\"git_sha\":\"{s}\",\"zig_version\":\"{s}\",\"binary\":\"{s}\",\"case_id\":\"{s}\",\"case_kind\":\"{s}\",\"tolerance_pct\":{d:.2},\"metrics\":{{\"samples_ns\":[",
-        .{ machine_name, sha, builtin.zig_version_string, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, case_cfg.descriptor.case_kind.asString(), case_cfg.tolerance_pct },
+        "{{\"schema_version\":1,\"machine_id\":\"{s}\"," ++
+            "\"git_sha\":\"{s}\",\"zig_version\":\"{s}\"," ++
+            "\"binary\":\"{s}\",\"case_id\":\"{s}\"," ++
+            "\"case_kind\":\"{s}\",\"tolerance_pct\":{d:.2}," ++
+            "\"metrics\":{{\"samples_ns\":[",
+        .{
+            machine_name,
+            sha,
+            builtin.zig_version_string,
+            case_cfg.descriptor.binary,
+            case_cfg.descriptor.case_id,
+            case_cfg.descriptor.case_kind.asString(),
+            case_cfg.tolerance_pct,
+        },
     );
     for (metrics.samples.items, 0..) |sample, idx| {
         if (idx > 0) try writer.writeByte(',');
         try writer.print("{d}", .{sample});
     }
-    try writer.print("],\"p50_ns\":{d},\"p95_ns\":{d}", .{ metrics.p50_ns, metrics.p95_ns });
+    try writer.print(
+        "],\"p50_ns\":{d},\"p95_ns\":{d}",
+        .{ metrics.p50_ns, metrics.p95_ns },
+    );
     if (case_cfg.descriptor.measurement_mode == .latency_alloc) {
         try writer.print(",\"p50_alloc_calls\":{d}", .{metrics.p50_alloc_calls});
     }
-    try writer.print("}},\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
+    try writer.print(
+        "}},\"compare_status\":\"{s}\",\"compare_detail\":",
+        .{compare_status},
+    );
     try writeJsonString(writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = path, .data = writer_alloc.written() },
+    );
+}
+
+fn writeDeepMetricsArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    case_cfg: DeepCase,
+    metrics: Metrics,
+    semantic_output: ?[64]u8,
+    compare_status: []const u8,
+    compare_detail: []const u8,
+) !void {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    const writer = &output.writer;
+    const machine_name = try currentMachineDirName(allocator);
+    defer allocator.free(machine_name);
+    const sha = try gitShaAlloc(allocator);
+    defer allocator.free(sha);
+    try writer.print(
+        "{{\"schema_version\":2,\"machine_id\":\"{s}\"," ++
+            "\"git_sha\":\"{s}\",\"zig_version\":\"{s}\"," ++
+            "\"binary\":\"{s}\",\"case_id\":\"{s}\"," ++
+            "\"case_kind\":\"{s}\",\"tolerance_pct\":{d:.2}," ++
+            "\"measurement_contract\":{{\"schema\":\"{s}\"," ++
+            "\"batch_iterations\":{d},\"latency_scope\":\"batch-total\"," ++
+            "\"allocation_scope\":\"batch-total\"}},\"metrics\":",
+        .{
+            machine_name,
+            sha,
+            builtin.zig_version_string,
+            case_cfg.descriptor.binary,
+            case_cfg.descriptor.case_id,
+            case_cfg.descriptor.case_kind.asString(),
+            case_cfg.tolerance_pct,
+            deep_measurement_schema,
+            case_cfg.batch_iterations,
+        },
+    );
+    try writeMetricsObject(
+        writer,
+        metrics,
+        case_cfg.descriptor.measurement_mode == .latency_alloc,
+    );
+    try writer.writeAll(",\"execution\":{\"semantic_output_sha256\":");
+    if (semantic_output) |digest| {
+        try writer.writeAll("\"sha256:");
+        try writer.writeAll(&digest);
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("},\"compare_status\":");
+    try writeJsonString(writer, compare_status);
+    try writer.writeAll(",\"compare_detail\":");
+    try writeJsonString(writer, compare_detail);
+    try writer.writeAll("}\n");
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = path, .data = output.written() },
+    );
 }
 
 fn writeMetricsObject(
@@ -2922,12 +3550,34 @@ fn writeBinaryEvidence(
     try writer.writeByte('}');
 }
 
+fn writeDriverEvidence(
+    writer: *std.Io.Writer,
+    evidence: DriverEvidence,
+) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(writer, evidence.path);
+    try writer.writeAll(",\"sha256\":\"sha256:");
+    try writer.writeAll(&evidence.sha256);
+    try writer.writeAll("\",\"source_sha\":");
+    try writeJsonString(writer, evidence.source_sha);
+    try writer.writeAll(",\"source_clean\":true,\"zig_version\":");
+    try writeJsonString(writer, builtin.zig_version_string);
+    try writer.writeAll(
+        ",\"optimize\":\"ReleaseFast\",\"build_step\":\"perf-hub\"," ++
+            "\"configuration_digest\":\"sha256:",
+    );
+    try writer.writeAll(&evidence.configuration_digest);
+    try writer.writeAll("\"}");
+}
+
 fn writePairedMetricsArtifact(
     allocator: std.mem.Allocator,
     path: []const u8,
     case_cfg: CompatCase,
     baseline_evidence: BinaryEvidence,
     candidate_evidence: BinaryEvidence,
+    baseline_driver: ?DriverEvidence,
+    candidate_driver: ?DriverEvidence,
     baseline: Metrics,
     candidate: Metrics,
     workload_digest: [64]u8,
@@ -2950,7 +3600,7 @@ fn writePairedMetricsArtifact(
             "\"case_id\":\"{s}\",\"case_kind\":\"{s}\"," ++
             "\"warmups\":{d},\"samples\":{d},\"tolerance_pct\":{d:.2}," ++
             "\"workload\":{{\"setup\":\"{s}\",\"digest\":\"sha256:{s}\"," ++
-            "\"ledger_seed_records\":{d}}},\"baseline\":{{\"binary\":",
+            "\"ledger_seed_records\":{d}}}",
         .{
             machine_name,
             git_sha,
@@ -2971,7 +3621,28 @@ fn writePairedMetricsArtifact(
                 0,
         },
     );
+    if (baseline_driver != null or candidate_driver != null) {
+        if (baseline_driver == null or candidate_driver == null) {
+            return error.IncompletePerfDriverEvidence;
+        }
+        try writer.print(
+            ",\"comparison_contract\":{{\"method\":\"{s}\"," ++
+                "\"rounds\":{d},\"samples_per_round\":{d}," ++
+                "\"batch_iterations\":{d}}}",
+            .{
+                deep_comparison_method,
+                paired_comparison_rounds,
+                case_cfg.samples / paired_comparison_rounds,
+                DeepCases[0].batch_iterations,
+            },
+        );
+    }
+    try writer.writeAll(",\"baseline\":{\"binary\":");
     try writeBinaryEvidence(writer, baseline_evidence);
+    if (baseline_driver) |driver| {
+        try writer.writeAll(",\"driver\":");
+        try writeDriverEvidence(writer, driver);
+    }
     try writer.writeAll(",\"metrics\":");
     try writeMetricsObject(
         writer,
@@ -2982,6 +3653,10 @@ fn writePairedMetricsArtifact(
     try writeMeasuredOutputEvidence(writer, baseline_execution);
     try writer.writeAll("},\"candidate\":{\"binary\":");
     try writeBinaryEvidence(writer, candidate_evidence);
+    if (candidate_driver) |driver| {
+        try writer.writeAll(",\"driver\":");
+        try writeDriverEvidence(writer, driver);
+    }
     try writer.writeAll(",\"metrics\":");
     try writeMetricsObject(
         writer,
@@ -3754,15 +4429,39 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
     defer parsed.deinit();
-    const tuple = try validateCutoverCompareSummary(parsed.value);
-    const environment = process_environment orelse
-        return error.ExpectedSourceShaRequired;
-    const current_sha = try sourceShaForRootAlloc(allocator, ".");
-    defer allocator.free(current_sha);
-    try requireCutoverReportTuple(environment, tuple, current_sha);
-    try requireCleanSourceRoot(allocator, ".");
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidCompareSummary,
+    };
+    const target: ?[]const u8 = switch (object.get("target") orelse
+        return error.InvalidCompareSummary) {
+        .string => |value| value,
+        .null => null,
+        else => return error.InvalidCompareSummary,
+    };
+    const complete = switch (object.get("complete") orelse
+        return error.InvalidCompareSummary) {
+        .bool => |value| value,
+        else => return error.InvalidCompareSummary,
+    };
+    if (!complete) return error.IncompleteComparison;
+    const cutover = target != null and
+        std.mem.eql(u8, target.?, "cutover");
+    const tuple: ?ReportTuple = if (cutover) cutover_tuple: {
+        const value = try validateCutoverCompareSummary(parsed.value);
+        const environment = process_environment orelse
+            return error.ExpectedSourceShaRequired;
+        const current_sha = try sourceShaForRootAlloc(allocator, ".");
+        defer allocator.free(current_sha);
+        try requireCutoverReportTuple(environment, value, current_sha);
+        try requireCleanSourceRoot(allocator, ".");
+        break :cutover_tuple value;
+    } else null;
     const rows_val = parsed.value.object.get("rows") orelse return error.InvalidData;
     const rows = rows_val.array;
+    var summary_raw_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &summary_raw_digest, .{});
+    const summary_digest = std.fmt.bytesToHex(summary_raw_digest, .lower);
 
     var totals = std.StringHashMap(ReportCounts).init(allocator);
     defer totals.deinit();
@@ -3799,12 +4498,25 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         latest_report_path,
         row_keys.items,
         totals,
+        target,
         tuple,
+        summary_digest,
     );
 
-    const cutover_path = try std.fs.path.join(allocator, &.{ reports_dir, "cutover-status.json" });
-    defer allocator.free(cutover_path);
-    try writeCutoverStatus(allocator, cutover_path, rows, tuple);
+    if (tuple) |cutover_tuple| {
+        const cutover_path = try std.fs.path.join(
+            allocator,
+            &.{ reports_dir, "cutover-status.json" },
+        );
+        defer allocator.free(cutover_path);
+        try writeCutoverStatus(
+            allocator,
+            cutover_path,
+            rows,
+            cutover_tuple,
+            summary_digest,
+        );
+    }
 }
 
 const ReportTuple = struct {
@@ -4092,15 +4804,33 @@ fn writeLatestReport(
     path: []const u8,
     row_keys: []const []const u8,
     totals: std.StringHashMap(ReportCounts),
-    tuple: ReportTuple,
+    target: ?[]const u8,
+    tuple: ?ReportTuple,
+    summary_digest: [64]u8,
 ) !void {
     var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
-    try writer.writeAll("{\"expected_base_sha\":");
-    try writeJsonString(writer, tuple.base_sha);
+    try writer.writeAll("{\"target\":");
+    if (target) |value| {
+        try writeJsonString(writer, value);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"summary_digest\":\"sha256:");
+    try writer.writeAll(&summary_digest);
+    try writer.writeAll("\",\"expected_base_sha\":");
+    if (tuple) |value| {
+        try writeJsonString(writer, value.base_sha);
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"expected_candidate_sha\":");
-    try writeJsonString(writer, tuple.candidate_sha);
+    if (tuple) |value| {
+        try writeJsonString(writer, value.candidate_sha);
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll(",\"rows\":[");
     for (row_keys, 0..) |key, idx| {
         const counts = totals.get(key).?;
@@ -4116,6 +4846,7 @@ fn writeCutoverStatus(
     path: []const u8,
     rows: std.json.Array,
     tuple: ReportTuple,
+    summary_digest: [64]u8,
 ) !void {
     var all_cases_pass = true;
     for (rows.items) |row| {
@@ -4154,6 +4885,9 @@ fn writeCutoverStatus(
     try writeJsonString(writer, tuple.base_sha);
     try writer.writeAll(",\"expected_candidate_sha\":");
     try writeJsonString(writer, tuple.candidate_sha);
+    try writer.writeAll(",\"summary_digest\":\"sha256:");
+    try writer.writeAll(&summary_digest);
+    try writer.writeByte('"');
     try writer.print(
         ",\"native_public_ownership\":true,\"all_cases_pass\":{s}," ++
             "\"seq_status\":\"{s}\",\"ledger_status\":\"{s}\"," ++
@@ -4286,23 +5020,153 @@ test "comparison invalidates a prior summary before measurement" {
         std.Io.Threaded.global_single_threaded.io(),
         reports_dir,
     );
-    const latest_path = try std.fs.path.join(
-        alloc,
-        &.{ reports_dir, "latest-compare.json" },
-    );
-    defer alloc.free(latest_path);
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
-        .sub_path = latest_path,
-        .data = "{}\n",
-    });
-    try invalidateCompareSummary(alloc, machine_dir);
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().access(
+    for ([_][]const u8{
+        "latest-compare.json",
+        "latest-report.json",
+        "cutover-status.json",
+    }) |name| {
+        const path = try std.fs.path.join(
+            alloc,
+            &.{ reports_dir, name },
+        );
+        defer alloc.free(path);
+        try std.Io.Dir.cwd().writeFile(
             std.Io.Threaded.global_single_threaded.io(),
-            latest_path,
-            .{},
+            .{ .sub_path = path, .data = "{}\n" },
+        );
+    }
+    try invalidateCompareSummary(alloc, machine_dir);
+    for ([_][]const u8{
+        "latest-compare.json",
+        "latest-report.json",
+        "cutover-status.json",
+    }) |name| {
+        const path = try std.fs.path.join(
+            alloc,
+            &.{ reports_dir, name },
+        );
+        defer alloc.free(path);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().access(
+                std.Io.Threaded.global_single_threaded.io(),
+                path,
+                .{},
+            ),
+        );
+    }
+}
+
+test "balanced round ratios reject repeatable regressions not one noisy round" {
+    const alloc = std.testing.allocator;
+    var baseline_samples: std.ArrayList(u64) = .empty;
+    var candidate_samples: std.ArrayList(u64) = .empty;
+    var baseline_allocs: std.ArrayList(u64) = .empty;
+    var candidate_allocs: std.ArrayList(u64) = .empty;
+    for (0..120) |index| {
+        try baseline_samples.append(alloc, 100);
+        try candidate_samples.append(
+            alloc,
+            if (index < 30) 110 else 100,
+        );
+    }
+    for (0..paired_comparison_rounds) |_| {
+        try baseline_allocs.append(alloc, 100);
+        try candidate_allocs.append(alloc, 100);
+    }
+    var baseline = try metricsFromSamples(
+        alloc,
+        baseline_samples,
+        baseline_allocs,
+    );
+    defer baseline.deinit(alloc);
+    var candidate = try metricsFromSamples(
+        alloc,
+        candidate_samples,
+        candidate_allocs,
+    );
+    defer candidate.deinit(alloc);
+    const case_cfg = DeepCases[0];
+    const null_control = try compareBalancedDeepMetrics(
+        case_cfg,
+        baseline,
+        candidate,
+    );
+    try std.testing.expectEqualStrings("PASS", null_control.status);
+    for (candidate.samples.items) |*sample| sample.* = 104;
+    const regression = try compareBalancedDeepMetrics(
+        case_cfg,
+        baseline,
+        candidate,
+    );
+    try std.testing.expectEqualStrings("FAIL", regression.status);
+}
+
+test "deep measurement schema one is accepted only for the frozen oracle" {
+    try std.testing.expectEqual(
+        DeepMeasurementSchemaKind.legacy_bridge,
+        try deepMeasurementSchemaKind(
+            1,
+            accepted_generic_deep_schema1_sha,
         ),
+    );
+    try std.testing.expectError(
+        error.AmbiguousDeepMeasurementContract,
+        deepMeasurementSchemaKind(
+            1,
+            "9b254f2b559a53cd6cc012d36cd250518c47e22b",
+        ),
+    );
+    try std.testing.expectEqual(
+        DeepMeasurementSchemaKind.explicit,
+        try deepMeasurementSchemaKind(2, "candidate"),
+    );
+}
+
+test "semantic evidence hashes canonical observation data" {
+    const first = try canonicalDataDigest(
+        std.testing.allocator,
+        "{\"data\":{\"rows\":[{\"value\":1}],\"schema\":\"x/v1\"}}",
+    );
+    const reordered = try canonicalDataDigest(
+        std.testing.allocator,
+        "{\"data\":{\"schema\":\"x/v1\",\"rows\":[{\"value\":1}]}}",
+    );
+    const changed = try canonicalDataDigest(
+        std.testing.allocator,
+        "{\"data\":{\"schema\":\"x/v1\",\"rows\":[{\"value\":2}]}}",
+    );
+    try std.testing.expectEqualSlices(u8, &first, &reordered);
+    try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "driver evidence rejects executable substitution" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "perf_hub",
+        .data = "first",
+    });
+    const path = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        "perf_hub",
+        std.testing.allocator,
+    );
+    var driver: DriverEvidence = .{
+        .path = path,
+        .sha256 = try sha256File(path),
+        .source_sha = try std.testing.allocator.dupe(u8, "source"),
+        .configuration_digest = try deepConfigurationDigest(DeepCases[0]),
+    };
+    defer driver.deinit(std.testing.allocator);
+    try requireDriverUnchanged(driver);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "perf_hub",
+        .data = "second",
+    });
+    try std.testing.expectError(
+        error.DriverBinaryChanged,
+        requireDriverUnchanged(driver),
     );
 }
 
