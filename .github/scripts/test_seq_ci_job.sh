@@ -95,6 +95,8 @@ done
 
 for token in \
   '"tools/perf_contract.zig"' \
+  'perf=${selected[seq]:-false}' \
+  '${selected[cron]:-false}' \
   "grep -Fxq 'build.zig'" \
   "grep -Fxq 'tools/perf_contract.zig'" \
   "if: needs.changes.outputs.perf == 'true'" \

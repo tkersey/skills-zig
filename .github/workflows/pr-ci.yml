@@ -75,8 +75,9 @@ jobs:
             echo "${output_name}=${selected[$app]:-false}" >> "$GITHUB_OUTPUT"
           done
 
-          perf=false
-          if grep -Fxq 'build.zig' <<<"$changed_paths" ||
+          perf=${selected[seq]:-false}
+          if [[ "${selected[cron]:-false}" == true ]] ||
+             grep -Fxq 'build.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_hub.zig' <<<"$changed_paths" ||
              grep -Fxq 'tools/perf_contract.zig' <<<"$changed_paths"; then
             perf=true
