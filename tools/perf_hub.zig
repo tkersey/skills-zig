@@ -115,6 +115,7 @@ const DeepCase = struct {
     tolerance_pct: f64 = 20.0,
     warmups: usize = 1,
     samples: usize = 5,
+    batch_iterations: usize = 1,
 };
 
 fn latencyCase(
@@ -178,7 +179,7 @@ const SeqCases = [_]perf_contract.CaseDescriptor{
     latencyCase("seq-sessions", "seq", "sessions"),
     latencyCase("seq-query", "seq", "query"),
     .{
-        .case_id = "seq-observe-deep",
+        .case_id = "seq-observe-deep-batch8",
         .binary = "seq",
         .family = "observe",
         .case_kind = .native,
@@ -359,6 +360,7 @@ const DeepCases = [_]DeepCase{
         .tolerance_pct = 3.0,
         .warmups = 3,
         .samples = 30,
+        .batch_iterations = 8,
     },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
@@ -1354,7 +1356,11 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var counting = core_perf.CountingAllocator.init(arena.allocator());
-        try executeDeepCase(counting.allocator(), case_cfg.setup, temp_root);
+        try executeDeepBatch(
+            counting.allocator(),
+            case_cfg,
+            temp_root,
+        );
     }
 
     var sample_idx: usize = 0;
@@ -1363,7 +1369,11 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         defer arena.deinit();
         var counting = core_perf.CountingAllocator.init(arena.allocator());
         const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
-        try executeDeepCase(counting.allocator(), case_cfg.setup, temp_root);
+        try executeDeepBatch(
+            counting.allocator(),
+            case_cfg,
+            temp_root,
+        );
         try samples.append(allocator, @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1)));
         try alloc_samples.append(allocator, counting.stats.totalCalls());
     }
@@ -1375,6 +1385,17 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         .p95_ns = try percentileU64(allocator, samples.items, 95),
         .p50_alloc_calls = try percentileU64(allocator, alloc_samples.items, 50),
     };
+}
+
+fn executeDeepBatch(
+    allocator: std.mem.Allocator,
+    case_cfg: DeepCase,
+    temp_root: []const u8,
+) !void {
+    var index: usize = 0;
+    while (index < case_cfg.batch_iterations) : (index += 1) {
+        try executeDeepCase(allocator, case_cfg.setup, temp_root);
+    }
 }
 
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
