@@ -24,10 +24,10 @@ Release contract:
 
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
-   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
+   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI. Ledger app changes also count for `cas` because the CAS archive ships Ledger.
    - `build.zig` and `build.zig.zon` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
    - broad shared shipped surfaces (`libs/core/**`) count for every shipped CLI.
-   - `libs/definition_core/**` counts for its shipped consumers: `seq` and `ledger`.
+   - `libs/definition_core/**` and `libs/definition_compat/**` count for their shipped consumers: `seq`, `cas`, and `ledger`.
    - `libs/durable_store/**` counts for its shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
    - `libs/trace_core/**` counts for its shipped consumers: `seq` and `cas`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.

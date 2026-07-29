@@ -107,12 +107,15 @@ Per-app VERSION files are the source of truth:
 - `apps/memory-note/VERSION`
 - `apps/img/VERSION`
 
-PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app; `build.zig`
-and `build.zig.zon` changes are classified by their affected app or
-shared-library context and fail closed to every shipped CLI when ownership is
-ambiguous; broad shared shipped surfaces such as `libs/core/**` count for every shipped CLI;
-`libs/definition_core/**` counts for `seq` and `ledger`;
+PRs that touch release-relevant CLI surfaces must bump the corresponding
+`VERSION` file. The check is conservative: app-local changes count for that
+app, and Ledger app changes also count for CAS because its archive ships
+Ledger; `build.zig` and `build.zig.zon` changes are classified by their
+affected app or shared-library context and fail closed to every shipped CLI
+when ownership is ambiguous; broad shared shipped surfaces such as
+`libs/core/**` count for every shipped CLI;
+`libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
+`cas`, and `ledger`;
 `libs/durable_store/**` counts for `seq`, `cas`, `ledger`, and `memory-note`; and
 `libs/trace_core/**` counts for `seq` and `cas`.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
