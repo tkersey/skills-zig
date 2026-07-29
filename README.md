@@ -116,7 +116,8 @@ when ownership is ambiguous; broad shared shipped surfaces such as
 `libs/core/**` count for every shipped CLI;
 `libs/definition_core/**` and `libs/definition_compat/**` count for `seq`,
 `cas`, and `ledger`;
-`libs/durable_store/**` counts for `seq`, `cas`, `ledger`, and `memory-note`; and
+`libs/durable_store/**` and `libs/jsonl_core/**` count for `seq`, `cas`,
+`ledger`, and `memory-note`; and
 `libs/trace_core/**` counts for `seq` and `cas`.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.

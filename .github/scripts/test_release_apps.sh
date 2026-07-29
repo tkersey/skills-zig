@@ -85,6 +85,11 @@ write_store_core() {
   printf 'store\n' >libs/durable_store/root.zig
 }
 
+write_jsonl_core() {
+  mkdir -p libs/jsonl_core
+  printf 'jsonl\n' >libs/jsonl_core/root.zig
+}
+
 change_shared_perf_contract() {
   printf 'shared contract\n' >libs/core/src/perf_contract.zig
 }
@@ -171,6 +176,7 @@ assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
+assert_affected seq,cas,ledger,memory-note write_jsonl_core
 assert_affected seq,lift,cas,cron,ledger,memory-note,img change_shared_perf_contract
 assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract

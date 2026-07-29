@@ -94,6 +94,7 @@ for token in \
 done
 
 for token in \
+  '"libs/definition_compat/**"' \
   '"tools/perf_contract.zig"' \
   'perf=${selected[seq]:-false}' \
   '${selected[cron]:-false}' \

@@ -15,6 +15,7 @@ on:
       - "apps/img/**"
       - "libs/core/**"
       - "libs/definition_core/**"
+      - "libs/definition_compat/**"
       - "libs/durable_store/**"
       - "libs/jsonl_core/**"
       - "libs/trace_core/**"
