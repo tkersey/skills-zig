@@ -83,7 +83,9 @@ PERF_EXPECT_BASE_SHA=<base-revision> \
 PERF_EXPECT_CANDIDATE_SHA=<candidate-revision> \
 PERF_ZIG_BINARY=/absolute/path/to/zig \
   zig build perf-compare-local -- --target cutover
-zig build perf-report-local
+PERF_EXPECT_BASE_SHA=<base-revision> \
+PERF_EXPECT_CANDIDATE_SHA=<candidate-revision> \
+  zig build perf-report-local
 ```
 
 Content-addressed performance capsules live under the ignored

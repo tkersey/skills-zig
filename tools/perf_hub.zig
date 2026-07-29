@@ -53,9 +53,9 @@ const UsageText =
     \\  PERF_SEQ_BASE_BINARY  Pair this Seq base binary with the candidate
     \\  PERF_LEDGER_BASE_BINARY
     \\                        Pair this Ledger base binary with the candidate
-    \\  PERF_EXPECT_BASE_SHA  Required source SHA for a paired baseline
+    \\  PERF_EXPECT_BASE_SHA  Required baseline SHA for compare/report
     \\  PERF_EXPECT_CANDIDATE_SHA
-    \\                        Required source SHA for the paired candidate
+    \\                        Required candidate SHA for compare/report
     \\  PERF_ZIG_BINARY       Approved absolute Zig compiler for paired drivers
 ;
 
@@ -5495,6 +5495,10 @@ fn loadCapsuleFileAlloc(
         ".perf-local",
     );
     defer allocator.free(machine_dir_relative);
+    durable_store.rejectSymlinkComponents(machine_dir_relative) catch |err| switch (err) {
+        error.SymlinkComponent => return error.PerfEvidencePathOutsideCapsule,
+        else => return err,
+    };
     const machine_stat = try std.Io.Dir.cwd().statFile(
         std.Io.Threaded.global_single_threaded.io(),
         machine_dir_relative,
@@ -5858,6 +5862,30 @@ test "capsule files are digest-addressed beneath the current machine root" {
     const bytes = try loadCapsuleFileAlloc(allocator, valid, 64);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("bound", bytes);
+
+    try tmp.dir.rename(
+        ".perf-local",
+        tmp.dir,
+        "external-perf-local",
+        io,
+    );
+    try tmp.dir.symLink(
+        io,
+        "external-perf-local",
+        ".perf-local",
+        .{ .is_directory = true },
+    );
+    try std.testing.expectError(
+        error.PerfEvidencePathOutsideCapsule,
+        loadCapsuleFileAlloc(allocator, valid, 64),
+    );
+    try tmp.dir.deleteFile(io, ".perf-local");
+    try tmp.dir.rename(
+        "external-perf-local",
+        tmp.dir,
+        ".perf-local",
+        io,
+    );
 
     try std.testing.expectError(
         error.PerfEvidencePathOutsideCapsule,
