@@ -12,13 +12,20 @@ fi
 expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
-  sed -n \
-    '/^commands:$/,/^$/ {
-      s/^  //
-      /^commands:$/d
-      /^$/d
-      p
-    }' \
+  awk '
+    / commands:$/ { in_section = 1; next }
+    /^$/ { in_section = 0; next }
+    in_section && /^  [^ ]/ {
+      line = substr($0, 3)
+      sub(/^ledger /, "", line)
+      count = split(line, words, /[[:space:]]+/)
+      if (words[1] == "definition" && count >= 2) {
+        print words[1] " " words[2]
+      } else {
+        print words[1]
+      }
+    }
+  ' \
     <<<"$help_output"
 )
 

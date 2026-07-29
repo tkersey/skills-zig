@@ -10,6 +10,9 @@ const revision_archive = @import("revision_archive.zig");
 const storage = @import("storage.zig");
 const validation = @import("validation.zig");
 
+pub const max_historical_definition_versions: usize = 128;
+pub const max_historical_definition_bytes: usize = 16 * 1024 * 1024;
+
 const ArchivedPlan = struct {
     digest: []u8,
     archive: definition_archive.Loaded,
@@ -34,16 +37,22 @@ const PlanCache = struct {
     repo_root: []const u8,
     definition_id: []const u8,
     plans: std.ArrayList(ArchivedPlan) = .empty,
+    indices: std.StringHashMapUnmanaged(usize) = .empty,
+    definition_bytes: usize = 0,
 
     fn deinit(self: *PlanCache) void {
+        self.indices.deinit(self.allocator);
         for (self.plans.items) |*plan| plan.deinit(self.allocator);
         self.plans.deinit(self.allocator);
         self.* = undefined;
     }
 
     fn get(self: *PlanCache, digest: []const u8) !*const ArchivedPlan {
-        for (self.plans.items) |*plan| {
-            if (std.mem.eql(u8, plan.digest, digest)) return plan;
+        if (self.indices.get(digest)) |index| {
+            return &self.plans.items[index];
+        }
+        if (self.plans.items.len >= max_historical_definition_versions) {
+            return error.HistoricalDefinitionVersionBoundExceeded;
         }
         var archive = try definition_archive.load(
             self.allocator,
@@ -53,6 +62,14 @@ const PlanCache = struct {
         errdefer archive.deinit(self.allocator);
         if (!std.mem.eql(u8, archive.definition_id, self.definition_id)) {
             return error.DefinitionArchiveOwnerMismatch;
+        }
+        const next_definition_bytes = std.math.add(
+            usize,
+            self.definition_bytes,
+            archive.closure.total_definition_bytes,
+        ) catch return error.HistoricalDefinitionBytesBoundExceeded;
+        if (next_definition_bytes > max_historical_definition_bytes) {
+            return error.HistoricalDefinitionBytesBoundExceeded;
         }
         var definition_plan = try definition.compile(
             self.allocator,
@@ -78,6 +95,7 @@ const PlanCache = struct {
         errdefer if (protocol_plan) |*plan| plan.deinit(self.allocator);
         const owned_digest = try self.allocator.dupe(u8, digest);
         errdefer self.allocator.free(owned_digest);
+        const index = self.plans.items.len;
         try self.plans.append(self.allocator, .{
             .digest = owned_digest,
             .archive = archive,
@@ -86,7 +104,13 @@ const PlanCache = struct {
             .storage_plan = storage_plan,
             .protocol_plan = protocol_plan,
         });
-        return &self.plans.items[self.plans.items.len - 1];
+        errdefer {
+            var removed = self.plans.pop().?;
+            removed.deinit(self.allocator);
+        }
+        try self.indices.put(self.allocator, owned_digest, index);
+        self.definition_bytes = next_definition_bytes;
+        return &self.plans.items[index];
     }
 };
 
@@ -94,6 +118,7 @@ pub const Stats = struct {
     records_validated: usize,
     definition_versions: usize,
     protocol_state: ?protocol.ReplayState,
+    append_context: ?durable_store.EventAppendContext = null,
 
     pub fn deinit(self: *Stats, allocator: std.mem.Allocator) void {
         if (self.protocol_state) |*state| state.deinit(allocator);
@@ -183,6 +208,7 @@ pub fn validateSlotObserved(
         .records_validated = history.records_validated,
         .definition_versions = cache.plans.items.len,
         .protocol_state = history.protocol_state,
+        .append_context = history.append_context,
     };
 }
 
@@ -254,6 +280,7 @@ pub fn validateReplaySlotObserved(
         .records_validated = history.records_validated,
         .definition_versions = cache.plans.items.len,
         .protocol_state = history.protocol_state,
+        .append_context = history.append_context,
     };
 }
 
@@ -263,8 +290,13 @@ fn streamReplaySupported(
     rows: []const custody.BindingRow,
 ) bool {
     for (rows, 0..) |row, index| {
-        if (row.kind != .admission) return false;
         const resolved = resolveEffect(cache, slot, row) catch return false;
+        if (row.kind == .existing_store_binding) {
+            if (index != 0 or resolved.effect.kind != .bind_existing) {
+                return false;
+            }
+            continue;
+        }
         switch (resolved.effect.kind) {
             .compare_append => {},
             .create_new => if (index != 0) return false,
@@ -295,14 +327,62 @@ fn validateStreamedEventEpoch(
         rows: []const custody.BindingRow,
         parameters: *const definition_core.parameters.Bindings,
         protocol_required: bool,
+        max_records: usize,
         observer: Observer,
         row_index: usize = 0,
         protocol_state: ?protocol.ReplayState = null,
         row_hash: EventHash = EventHash.init(.{}),
+        raw_bytes_observed: usize = 0,
+        bound_prefix_hash: EventHash = EventHash.init(.{}),
+        bound_prefix_verified: bool = false,
+
+        fn observeRaw(
+            context: *anyopaque,
+            bytes: []const u8,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const observed_after = std.math.add(
+                usize,
+                self.raw_bytes_observed,
+                bytes.len,
+            ) catch return error.CurrentStoreBoundsExceeded;
+            if (self.rows[0].kind == .existing_store_binding and
+                !self.bound_prefix_verified)
+            {
+                const bound_end = self.rows[0].extent_end;
+                if (self.rows[0].extent_start != 0 or
+                    bound_end <= self.raw_bytes_observed)
+                {
+                    return error.StoreBindingExtentMismatch;
+                }
+                const remaining = bound_end - self.raw_bytes_observed;
+                const hashed = @min(remaining, bytes.len);
+                self.bound_prefix_hash.update(bytes[0..hashed]);
+                if (hashed == remaining) {
+                    var completed = self.bound_prefix_hash;
+                    var digest: [EventHash.digest_length]u8 = undefined;
+                    completed.final(&digest);
+                    const hex = std.fmt.bytesToHex(digest, .lower);
+                    var formatted: [71]u8 = undefined;
+                    @memcpy(formatted[0..7], "sha256:");
+                    @memcpy(formatted[7..], &hex);
+                    if (!std.mem.eql(
+                        u8,
+                        &formatted,
+                        self.rows[0].canonical_input_digest,
+                    )) return error.HistoricalInputDigestMismatch;
+                    self.bound_prefix_verified = true;
+                }
+            }
+            self.raw_bytes_observed = observed_after;
+        }
 
         fn visit(context: *anyopaque, record: durable_store.EventRecordView) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
             if (record.ordinal == 0) return error.StoreBindingRecordCountMismatch;
+            if (record.ordinal > self.max_records) {
+                return error.CurrentStoreRecordBoundsExceeded;
+            }
             const record_index: usize = @intCast(record.ordinal - 1);
             if (self.row_index >= self.rows.len) {
                 return error.StoreBindingRecordCountMismatch;
@@ -324,6 +404,9 @@ fn validateStreamedEventEpoch(
             const resolved = try resolveEffect(self.cache, self.slot, row);
             switch (resolved.effect.kind) {
                 .compare_append => {
+                    if (row.kind != .admission) {
+                        return error.HistoricalEffectKindMismatch;
+                    }
                     if (end != start + 1 or
                         row.extent_start != record.extent_start or
                         row.extent_end != record.extent_end)
@@ -333,7 +416,8 @@ fn validateStreamedEventEpoch(
                     self.row_hash.update(record.payload);
                 },
                 .create_new => {
-                    if (self.row_index != 0 or start != 0 or
+                    if (row.kind != .admission or
+                        self.row_index != 0 or start != 0 or
                         self.protocol_required)
                     {
                         return error.HistoricalEffectKindMismatch;
@@ -341,8 +425,14 @@ fn validateStreamedEventEpoch(
                     self.row_hash.update(record.payload);
                     self.row_hash.update("\n");
                 },
-                .compare_replace, .bind_existing =>
-                    return error.HistoricalEffectKindMismatch,
+                .bind_existing => {
+                    if (row.kind != .existing_store_binding or
+                        self.row_index != 0 or start != 0)
+                    {
+                        return error.HistoricalEffectKindMismatch;
+                    }
+                },
+                .compare_replace => return error.HistoricalEffectKindMismatch,
             }
             try validateEventInput(
                 self.allocator,
@@ -351,7 +441,7 @@ fn validateStreamedEventEpoch(
                 resolved,
                 record.payload,
                 self.parameters,
-                true,
+                row.kind == .admission,
                 self.observer,
             );
             if (record_index + 1 == end) {
@@ -359,6 +449,10 @@ fn validateStreamedEventEpoch(
                     row.extent_end != record.extent_end + 1)
                 {
                     return error.StoreBindingExtentMismatch;
+                }
+                if (resolved.effect.kind == .bind_existing) {
+                    self.row_index += 1;
+                    return;
                 }
                 var digest: [EventHash.digest_length]u8 = undefined;
                 self.row_hash.final(&digest);
@@ -382,6 +476,7 @@ fn validateStreamedEventEpoch(
         .rows = rows,
         .parameters = parameters,
         .protocol_required = protocol_required,
+        .max_records = current_max_records,
         .observer = observer,
     };
     errdefer if (validator.protocol_state) |*state| state.deinit(allocator);
@@ -389,7 +484,11 @@ fn validateStreamedEventEpoch(
     var summary = try backend.eventStore().scan(
         allocator,
         current_slot.max_bytes,
-        .{ .context = &validator, .visitFn = Validator.visit },
+        .{
+            .context = &validator,
+            .visitFn = Validator.visit,
+            .rawFn = Validator.observeRaw,
+        },
     );
     defer summary.deinit(allocator);
     if (!summary.exists or summary.record_count == 0) {
@@ -406,18 +505,25 @@ fn validateStreamedEventEpoch(
     if (!std.mem.eql(u8, summary.revision, content_revision)) {
         return error.HistoricalRevisionMismatch;
     }
+    if (rows[0].kind == .existing_store_binding and
+        !validator.bound_prefix_verified)
+    {
+        return error.HistoricalInputDigestMismatch;
+    }
     if (protocol_required and validator.protocol_state == null) {
         return error.HistoricalProtocolBindingMismatch;
     }
     return .{
         .records_validated = summary.record_count,
         .protocol_state = validator.protocol_state,
+        .append_context = summary.append_context,
     };
 }
 
 const HistoryResult = struct {
     records_validated: usize,
     protocol_state: ?protocol.ReplayState,
+    append_context: ?durable_store.EventAppendContext = null,
 };
 
 fn validateHistory(
@@ -901,6 +1007,7 @@ fn validateEventInput(
             event_materialization,
             bytes,
             parameters,
+            require_canonical,
             observer,
         );
     }
@@ -934,6 +1041,7 @@ fn validateMaterializedEvent(
     materialization_plan: *const storage.EventMaterialization,
     bytes: []const u8,
     parameters: *const definition_core.parameters.Bindings,
+    require_canonical: bool,
     observer: anytype,
 ) !void {
     var parsed = try std.json.parseFromSlice(
@@ -952,7 +1060,7 @@ fn validateMaterializedEvent(
         parsed.value,
     );
     defer allocator.free(canonical_event);
-    if (!std.mem.eql(u8, canonical_event, bytes)) {
+    if (require_canonical and !std.mem.eql(u8, canonical_event, bytes)) {
         return error.HistoricalArtifactNotCanonical;
     }
     const reconstructed = try reconstructStoredEventAlloc(

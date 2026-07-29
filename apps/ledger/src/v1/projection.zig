@@ -10,6 +10,8 @@ const replay = @import("replay.zig");
 const state_reducer = @import("state_reducer.zig");
 const storage = @import("storage.zig");
 
+const streaming_projection_min_store_bytes: usize = 64 * 1024;
+
 const Scalar = union(enum) {
     string: []u8,
     number: []u8,
@@ -747,6 +749,7 @@ const SortedAccumulator = struct {
     rows: std.ArrayList(SortedRow) = .empty,
     prepared_relevance: ?PreparedRelevance,
     referenced_ids: std.StringHashMap(void),
+    retained_limit: ?usize,
     records_seen: usize = 0,
     records_matched: usize = 0,
 
@@ -754,7 +757,21 @@ const SortedAccumulator = struct {
         allocator: std.mem.Allocator,
         projection: *const Projection,
         parameters: *const definition_core.parameters.Bindings,
+        limit: usize,
     ) !SortedAccumulator {
+        const retained_limit = if (projection.single)
+            1
+        else if (projection.relevance) |relevance|
+            if (relevance.ranked_plan) |ranked|
+                if (ranked.exclude_referenced != null or
+                    ranked_relevance.maxPerTheme(ranked) != null)
+                    null
+                else
+                    limit
+            else
+                limit
+        else
+            limit;
         return .{
             .allocator = allocator,
             .projection = projection,
@@ -768,6 +785,7 @@ const SortedAccumulator = struct {
             else
                 null,
             .referenced_ids = std.StringHashMap(void).init(allocator),
+            .retained_limit = retained_limit,
         };
     }
 
@@ -788,6 +806,15 @@ const SortedAccumulator = struct {
         value: std.json.Value,
     ) !void {
         return self.observeValue(value, null);
+    }
+
+    pub fn observeReplay(
+        self: *SortedAccumulator,
+        value: std.json.Value,
+        raw: []const u8,
+        _: ?*const protocol.ReplayState,
+    ) !void {
+        return self.observeRaw(value, raw);
     }
 
     fn observeRaw(
@@ -835,6 +862,24 @@ const SortedAccumulator = struct {
         });
         metadata.row_id = null;
         metadata.theme = null;
+        self.pruneRetainedRows();
+    }
+
+    fn pruneRetainedRows(self: *SortedAccumulator) void {
+        const limit = self.retained_limit orelse return;
+        if (self.rows.items.len <= limit) return;
+        var worst_index: usize = 0;
+        for (self.rows.items[1..], 1..) |row, index| {
+            if (lessSortedRow(
+                self.projection.sort_keys,
+                self.rows.items[worst_index],
+                row,
+            )) {
+                worst_index = index;
+            }
+        }
+        var removed = self.rows.swapRemove(worst_index);
+        removed.deinit(self.allocator);
     }
 
     fn trackReference(
@@ -988,6 +1033,20 @@ const SortedAccumulator = struct {
             self.projection.sort_keys,
             lessSortedRow,
         );
+        if (self.projection.single) {
+            stats.records_matched = self.records_matched;
+            if (self.rows.items.len == 0) {
+                if (self.projection.require_match) {
+                    return error.ProjectionNotFound;
+                }
+                try writer.writeAll("null");
+                stats.records_emitted = 0;
+                return;
+            }
+            try writer.writeAll(self.rows.items[0].payload);
+            stats.records_emitted = 1;
+            return;
+        }
         try writer.writeByte('[');
         var theme_counts = std.StringHashMap(usize).init(self.allocator);
         defer theme_counts.deinit();
@@ -4447,17 +4506,23 @@ fn executeResolvedProjection(
         try storage.resolve(allocator, storage_plan, parameters);
     defer resolved_storage.deinit(allocator);
     const slot = resolved_storage.slot(compiled.slot_index);
+    const effective_limit =
+        try resolveLimit(compiled.limit, parameters, plan.max_records);
+    const stream_candidate = slot.kind == .event_log and
+        slot.max_bytes > streaming_projection_min_store_bytes;
     var fused_sorted = try initSortedAccumulator(
         allocator,
         compiled,
         slot,
         parameters,
+        effective_limit,
+        stream_candidate,
     );
     defer if (fused_sorted) |*accumulator| accumulator.deinit();
     var fold_history =
         try initFoldHistory(allocator, compiled, event_protocol);
     defer if (fold_history) |*accumulator| accumulator.deinit();
-    if (slot.kind == .event_log and
+    if (stream_candidate and
         (fold_history != null or fused_sorted != null))
     {
         const streamed = executeResolvedStreamProjection(
@@ -4498,8 +4563,6 @@ fn executeResolvedProjection(
         if (fused_sorted) |*value| value else null,
     );
     defer replay_stats.deinit(allocator);
-    const effective_limit =
-        try resolveLimit(compiled.limit, parameters, plan.max_records);
     return executeValidatedProjection(
         allocator,
         definition_plan,
@@ -4620,13 +4683,21 @@ fn initSortedAccumulator(
     compiled: *const Projection,
     slot: storage.ResolvedSlot,
     parameters: *const definition_core.parameters.Bindings,
+    limit: usize,
+    stream_candidate: bool,
 ) !?SortedAccumulator {
     if (compiled.fold != null or slot.codec != .jsonl or
-        compiled.sort_keys.len == 0 or compiled.raw)
+        compiled.latest != null or
+        (compiled.sort_keys.len == 0 and !stream_candidate))
     {
         return null;
     }
-    return try SortedAccumulator.init(allocator, compiled, parameters);
+    return try SortedAccumulator.init(
+        allocator,
+        compiled,
+        parameters,
+        limit,
+    );
 }
 
 fn executeValidatedProjection(
@@ -6319,6 +6390,7 @@ fn executeSortedJsonl(
         allocator,
         projection,
         parameters,
+        limit,
     );
     defer accumulator.deinit();
     var lines = std.mem.splitScalar(u8, bytes, '\n');

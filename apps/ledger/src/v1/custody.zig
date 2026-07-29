@@ -381,6 +381,28 @@ pub fn readBindingSnapshot(
     );
 }
 
+/// Reads and validates binding history while deferring the current slot
+/// revision comparison to the immediately following streaming replay.
+pub fn readBindingSnapshotBeforeReplay(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    definition_id: []const u8,
+    slot_name: []const u8,
+    logical_path: []const u8,
+    idempotency: ?IdempotencyQuery,
+) !BindingSnapshot {
+    return readBindingSnapshotInternal(
+        allocator,
+        path,
+        definition_id,
+        slot_name,
+        logical_path,
+        null,
+        idempotency,
+        false,
+    );
+}
+
 fn readBindingSnapshotInternal(
     allocator: std.mem.Allocator,
     path: []const u8,

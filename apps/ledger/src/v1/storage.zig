@@ -5113,7 +5113,7 @@ fn validateLiteralPathSegment(component: []const u8) !void {
     {
         return error.InvalidStoragePathTemplate;
     }
-    for (component) |byte| if (byte < 0x20 or byte == 0x7f) {
+    for (component) |byte| if (byte < 0x20 or byte >= 0x7f) {
         return error.InvalidStoragePathTemplate;
     };
 }

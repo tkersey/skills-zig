@@ -67,6 +67,11 @@ fn canonicalPackageRoot(absolute_path: []const u8) ?[]const u8 {
             if (!hasRegularPackageManifest(cursor)) return null;
             const package = std.fs.path.dirname(cursor) orelse return null;
             const collection = std.fs.path.dirname(package) orelse return null;
+            if (!std.mem.eql(
+                u8,
+                std.fs.path.basename(collection),
+                "skills",
+            )) return null;
             if (std.mem.eql(
                 u8,
                 collection,
@@ -867,7 +872,9 @@ fn rejectAbsoluteSymlinkComponents(path: []const u8) !void {
 
 pub fn digestFiles(files: []const ClosureFile) [71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("definition-closure/v1\x00");
+    // This framing literal is part of the v1 closure-digest ABI. Changing it
+    // would invalidate definition-bound durable history.
+    hasher.update("skill-definition-closure/v1\x00");
     var length_bytes: [8]u8 = undefined;
     for (files) |file| {
         std.mem.writeInt(u64, &length_bytes, @intCast(file.path.len), .big);
@@ -961,30 +968,30 @@ test "manifested definition packages admit cross-package imports" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(
         std.testing.io,
-        "packages/first/definitions/artifacts",
+        "skills/first/definitions/artifacts",
     );
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "packages/first/definitions/manifest.json",
+        .sub_path = "skills/first/definitions/manifest.json",
         .data = "{}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "packages/first/definitions/artifacts/record.json",
+        .sub_path = "skills/first/definitions/artifacts/record.json",
         .data = "{}",
     });
     const absolute = try tmp.dir.realPathFileAlloc(
         std.testing.io,
-        "packages/first/definitions/artifacts/record.json",
+        "skills/first/definitions/artifacts/record.json",
         std.testing.allocator,
     );
     defer std.testing.allocator.free(absolute);
     const location = (try admittedPackageLocation(absolute)).?;
-    const packages_root = try tmp.dir.realPathFileAlloc(
+    const skills_root = try tmp.dir.realPathFileAlloc(
         std.testing.io,
-        "packages",
+        "skills",
         std.testing.allocator,
     );
-    defer std.testing.allocator.free(packages_root);
-    try std.testing.expectEqualStrings(packages_root, location.root);
+    defer std.testing.allocator.free(skills_root);
+    try std.testing.expectEqualStrings(skills_root, location.root);
     try std.testing.expectEqualStrings(
         "first/definitions/artifacts/record.json",
         location.entry,

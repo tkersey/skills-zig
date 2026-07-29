@@ -366,7 +366,6 @@ fn tryLoadLocator(
     locator_key: [32]u8,
     closure_limits: definition_core.closure.Limits,
 ) !?VerifiedLocator {
-    try validatePrivateCacheNamespace(allocator, cache_dir, "locators");
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -409,7 +408,6 @@ fn loadCachedPlan(
     locator: *const VerifiedLocator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
-    try validatePrivateCacheNamespace(allocator, cache_dir, "plans");
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -1109,20 +1107,6 @@ fn locatorKey(
         @tagName(route.kind),
         route.name orelse "",
     });
-}
-
-fn validatePrivateCacheNamespace(
-    allocator: std.mem.Allocator,
-    cache_dir: []const u8,
-    namespace: []const u8,
-) !void {
-    try durable_store.validatePrivateDirectoryPathNoSymlinks(cache_dir);
-    const namespace_path = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, namespace },
-    );
-    defer allocator.free(namespace_path);
-    try durable_store.validatePrivateDirectoryPathNoSymlinks(namespace_path);
 }
 
 fn cachePathAlloc(

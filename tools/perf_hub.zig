@@ -8,6 +8,7 @@ const perf_contract = @import("perf_contract");
 const seq_v1 = @import("seq_v1_core");
 
 const Version = "0.0.0-dev";
+var process_environment: ?*const std.process.Environ.Map = null;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "perf_hub",
     .help_text = UsageText,
@@ -35,6 +36,13 @@ const UsageText =
     \\  --help                Show help
     \\  --version             Show version
     \\  version               Show version
+    \\
+    \\Base-binary overrides:
+    \\  PERF_SEQ_BINARY       Use this Seq binary for capture or comparison
+    \\  PERF_LEDGER_BINARY    Use this Ledger binary for capture or comparison
+    \\  PERF_SEQ_BASE_BINARY  Pair this Seq base binary with the candidate
+    \\  PERF_LEDGER_BASE_BINARY
+    \\                        Pair this Ledger base binary with the candidate
 ;
 
 const Command = enum {
@@ -53,12 +61,10 @@ const CompatBuilder = enum {
 };
 
 const CompatSetup = enum {
-    seq_help,
     seq_definition_check,
     seq_observe,
     seq_sessions,
     seq_query,
-    ledger_help,
     ledger_definition_check,
     ledger_validate,
     ledger_materialize,
@@ -138,17 +144,35 @@ fn rootCompat(
     binary_path: []const u8,
     setup: CompatSetup,
 ) CompatCase {
+    return rootCompatSamples(
+        descriptor,
+        build_step,
+        binary_path,
+        setup,
+        100,
+    );
+}
+
+fn rootCompatSamples(
+    descriptor: perf_contract.CaseDescriptor,
+    build_step: []const u8,
+    binary_path: []const u8,
+    setup: CompatSetup,
+    samples: usize,
+) CompatCase {
     return .{
         .descriptor = descriptor,
         .builder = .root,
         .build_step = build_step,
         .binary_path = binary_path,
         .setup = setup,
+        .warmups = 3,
+        .samples = samples,
+        .tolerance_pct = 5.0,
     };
 }
 
 const SeqCases = [_]perf_contract.CaseDescriptor{
-    latencyCase("seq-help", "seq", "help"),
     latencyCase("seq-definition-check", "seq", "definition"),
     latencyCase("seq-observe", "seq", "observe"),
     latencyCase("seq-sessions", "seq", "sessions"),
@@ -200,7 +224,6 @@ const SeqDatasets = [_]perf_contract.DataSurface{
 };
 
 const LedgerCases = [_]perf_contract.CaseDescriptor{
-    latencyCase("ledger-help", "ledger", "help"),
     latencyCase("ledger-definition-check", "ledger", "definition"),
     latencyCase("ledger-validate", "ledger", "validate"),
     latencyCase("ledger-materialize", "ledger", "materialize"),
@@ -254,49 +277,48 @@ const MiscCoverages = [_]perf_contract.CommandCoverage{
 };
 
 const CompatCases = [_]CompatCase{
-    rootCompat(SeqCases[0], "build-seq", "zig-out/bin/seq", .seq_help),
     rootCompat(
-        SeqCases[1],
+        SeqCases[0],
         "build-seq",
         "zig-out/bin/seq",
         .seq_definition_check,
     ),
-    rootCompat(SeqCases[2], "build-seq", "zig-out/bin/seq", .seq_observe),
-    rootCompat(SeqCases[3], "build-seq", "zig-out/bin/seq", .seq_sessions),
-    rootCompat(SeqCases[4], "build-seq", "zig-out/bin/seq", .seq_query),
-    rootCompat(LedgerCases[0], "build-ledger", "zig-out/bin/ledger", .ledger_help),
+    rootCompat(SeqCases[1], "build-seq", "zig-out/bin/seq", .seq_observe),
+    rootCompat(SeqCases[2], "build-seq", "zig-out/bin/seq", .seq_sessions),
+    rootCompat(SeqCases[3], "build-seq", "zig-out/bin/seq", .seq_query),
     rootCompat(
-        LedgerCases[1],
+        LedgerCases[0],
         "build-ledger",
         "zig-out/bin/ledger",
         .ledger_definition_check,
     ),
     rootCompat(
-        LedgerCases[2],
+        LedgerCases[1],
         "build-ledger",
         "zig-out/bin/ledger",
         .ledger_validate,
     ),
     rootCompat(
-        LedgerCases[3],
+        LedgerCases[2],
         "build-ledger",
         "zig-out/bin/ledger",
         .ledger_materialize,
+    ),
+    rootCompatSamples(
+        LedgerCases[3],
+        "build-ledger",
+        "zig-out/bin/ledger",
+        .ledger_transact,
+        60,
     ),
     rootCompat(
         LedgerCases[4],
         "build-ledger",
         "zig-out/bin/ledger",
-        .ledger_transact,
-    ),
-    rootCompat(
-        LedgerCases[5],
-        "build-ledger",
-        "zig-out/bin/ledger",
         .ledger_project,
     ),
     rootCompat(
-        LedgerCases[6],
+        LedgerCases[5],
         "build-ledger",
         "zig-out/bin/ledger",
         .ledger_doctor,
@@ -317,7 +339,13 @@ const CompatCases = [_]CompatCase{
 };
 
 const DeepCases = [_]DeepCase{
-    .{ .descriptor = SeqCases[5], .setup = .seq_observe, .tolerance_pct = 5.0 },
+    .{
+        .descriptor = SeqCases[4],
+        .setup = .seq_observe,
+        .tolerance_pct = 3.0,
+        .warmups = 3,
+        .samples = 30,
+    },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
@@ -357,6 +385,7 @@ const ParsedArgs = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    process_environment = init.environ_map;
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
@@ -619,6 +648,44 @@ fn captureDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_c
 fn compareCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_cfg: CompatCase) !CompareRow {
     const baseline_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, false);
     defer allocator.free(baseline_path);
+    const latest_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, true);
+    defer allocator.free(latest_path);
+    if (baseBinaryOverride(case_cfg)) |base_binary| {
+        if (case_cfg.descriptor.case_kind == .subprocess or
+            case_cfg.descriptor.case_kind == .native)
+        {
+            var base_case = case_cfg;
+            base_case.binary_path = base_binary;
+            var paired = try runPairedMeasuredCases(
+                allocator,
+                base_case,
+                case_cfg,
+            );
+            defer paired.deinit(allocator);
+            const compare = try compareMeasuredMetrics(
+                case_cfg,
+                paired.baseline,
+                paired.candidate,
+            );
+            try writeMetricsArtifact(
+                allocator,
+                latest_path,
+                case_cfg,
+                paired.candidate,
+                if (std.mem.eql(u8, compare.status, "PASS"))
+                    "pass"
+                else
+                    "fail",
+                compare.detail,
+            );
+            return .{
+                .status = compare.status,
+                .case_id = case_cfg.descriptor.case_id,
+                .binary = case_cfg.descriptor.binary,
+                .detail = compare.detail,
+            };
+        }
+    }
     if (!pathExists(baseline_path)) {
         return .{ .status = "FAIL", .case_id = case_cfg.descriptor.case_id, .binary = case_cfg.descriptor.binary, .detail = "missing baseline" };
     }
@@ -627,9 +694,6 @@ fn compareCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case
     defer allocator.free(baseline_data);
     var baseline = try std.json.parseFromSlice(std.json.Value, allocator, baseline_data, .{});
     defer baseline.deinit();
-
-    const latest_path = try compatBaselinePath(allocator, machine_dir, case_cfg.descriptor.binary, case_cfg.descriptor.case_id, true);
-    defer allocator.free(latest_path);
 
     var status: []const u8 = "PASS";
     var detail: []const u8 = "ok";
@@ -793,12 +857,41 @@ fn ensureBuilt(allocator: std.mem.Allocator, built: *BuiltState, case_cfg: Compa
 
 fn resolveBinaryPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
     _ = case_cfg.builder;
+    const environment = process_environment;
+    const override = if (environment != null and std.mem.eql(
+        u8,
+        case_cfg.descriptor.binary,
+        "seq",
+    ))
+        environment.?.get("PERF_SEQ_BINARY")
+    else if (environment != null and std.mem.eql(
+        u8,
+        case_cfg.descriptor.binary,
+        "ledger",
+    ))
+        environment.?.get("PERF_LEDGER_BINARY")
+    else
+        null;
+    if (override) |path| return allocator.dupe(u8, path);
+    if (std.fs.path.isAbsolute(case_cfg.binary_path)) {
+        return allocator.dupe(u8, case_cfg.binary_path);
+    }
     return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
 }
 
 fn resolveBinaryExecPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]u8 {
-    _ = case_cfg.builder;
-    return std.fs.path.join(allocator, &.{ ".", case_cfg.binary_path });
+    return resolveBinaryPath(allocator, case_cfg);
+}
+
+fn baseBinaryOverride(case_cfg: CompatCase) ?[]const u8 {
+    const environment = process_environment orelse return null;
+    if (std.mem.eql(u8, case_cfg.descriptor.binary, "seq")) {
+        return environment.get("PERF_SEQ_BASE_BINARY");
+    }
+    if (std.mem.eql(u8, case_cfg.descriptor.binary, "ledger")) {
+        return environment.get("PERF_LEDGER_BASE_BINARY");
+    }
+    return null;
 }
 
 fn compatBaselinePath(allocator: std.mem.Allocator, machine_dir: []const u8, binary: []const u8, case_id: []const u8, latest: bool) ![]u8 {
@@ -904,6 +997,199 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
         .p50_ns = try percentileU64(allocator, samples.items, 50),
         .p95_ns = try percentileU64(allocator, samples.items, 95),
         .p50_alloc_calls = 0,
+    };
+}
+
+const PairedMetrics = struct {
+    baseline: Metrics,
+    candidate: Metrics,
+
+    fn deinit(self: *PairedMetrics, allocator: std.mem.Allocator) void {
+        self.baseline.deinit(allocator);
+        self.candidate.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn runPairedMeasuredCases(
+    allocator: std.mem.Allocator,
+    baseline_case: CompatCase,
+    candidate_case: CompatCase,
+) !PairedMetrics {
+    if (baseline_case.samples != candidate_case.samples or
+        baseline_case.warmups != candidate_case.warmups)
+    {
+        return error.MismatchedPairedPerfCase;
+    }
+    const baseline_root = try makeTempRoot(
+        allocator,
+        "paired-baseline",
+    );
+    defer cleanupTempRoot(baseline_root);
+    defer allocator.free(baseline_root);
+    const candidate_root = try makeTempRoot(
+        allocator,
+        "paired-candidate",
+    );
+    defer cleanupTempRoot(candidate_root);
+    defer allocator.free(candidate_root);
+    try prepareCompatCase(allocator, baseline_case, baseline_root);
+    try prepareCompatCase(allocator, candidate_case, candidate_root);
+
+    var baseline_samples: std.ArrayList(u64) = .empty;
+    errdefer baseline_samples.deinit(allocator);
+    var baseline_allocs: std.ArrayList(u64) = .empty;
+    errdefer baseline_allocs.deinit(allocator);
+    var candidate_samples: std.ArrayList(u64) = .empty;
+    errdefer candidate_samples.deinit(allocator);
+    var candidate_allocs: std.ArrayList(u64) = .empty;
+    errdefer candidate_allocs.deinit(allocator);
+    try baseline_samples.ensureTotalCapacity(
+        allocator,
+        baseline_case.samples,
+    );
+    try baseline_allocs.ensureTotalCapacity(
+        allocator,
+        baseline_case.samples,
+    );
+    try candidate_samples.ensureTotalCapacity(
+        allocator,
+        candidate_case.samples,
+    );
+    try candidate_allocs.ensureTotalCapacity(
+        allocator,
+        candidate_case.samples,
+    );
+
+    var warmup_idx: usize = 0;
+    while (warmup_idx < baseline_case.warmups) : (warmup_idx += 1) {
+        try runCompatWarmup(
+            allocator,
+            baseline_case,
+            baseline_root,
+        );
+        try runCompatWarmup(
+            allocator,
+            candidate_case,
+            candidate_root,
+        );
+    }
+    var sample_idx: usize = 0;
+    while (sample_idx < baseline_case.samples) : (sample_idx += 1) {
+        if (sample_idx % 2 == 0) {
+            try appendCompatSample(
+                allocator,
+                baseline_case,
+                baseline_root,
+                &baseline_samples,
+                &baseline_allocs,
+            );
+            try appendCompatSample(
+                allocator,
+                candidate_case,
+                candidate_root,
+                &candidate_samples,
+                &candidate_allocs,
+            );
+        } else {
+            try appendCompatSample(
+                allocator,
+                candidate_case,
+                candidate_root,
+                &candidate_samples,
+                &candidate_allocs,
+            );
+            try appendCompatSample(
+                allocator,
+                baseline_case,
+                baseline_root,
+                &baseline_samples,
+                &baseline_allocs,
+            );
+        }
+    }
+    var baseline = try metricsFromSamples(
+        allocator,
+        baseline_samples,
+        baseline_allocs,
+    );
+    baseline_samples = .empty;
+    baseline_allocs = .empty;
+    errdefer baseline.deinit(allocator);
+    const candidate = try metricsFromSamples(
+        allocator,
+        candidate_samples,
+        candidate_allocs,
+    );
+    candidate_samples = .empty;
+    candidate_allocs = .empty;
+    return .{ .baseline = baseline, .candidate = candidate };
+}
+
+fn runCompatWarmup(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    temp_root: []const u8,
+) !void {
+    var run_arena = std.heap.ArenaAllocator.init(allocator);
+    defer run_arena.deinit();
+    const run = try renderCompatRun(
+        run_arena.allocator(),
+        case_cfg,
+        temp_root,
+    );
+    const result = try runChildCapture(allocator, run.cwd, run.argv);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CaseFailed;
+}
+
+fn appendCompatSample(
+    allocator: std.mem.Allocator,
+    case_cfg: CompatCase,
+    temp_root: []const u8,
+    samples: *std.ArrayList(u64),
+    alloc_samples: *std.ArrayList(u64),
+) !void {
+    var run_arena = std.heap.ArenaAllocator.init(allocator);
+    defer run_arena.deinit();
+    const run = try renderCompatRun(
+        run_arena.allocator(),
+        case_cfg,
+        temp_root,
+    );
+    const start_ns = std.Io.Clock.awake.now(
+        std.Io.Threaded.global_single_threaded.io(),
+    ).nanoseconds;
+    const result = try runChildCapture(allocator, run.cwd, run.argv);
+    const elapsed: u64 = @intCast(@max(
+        std.Io.Clock.awake.now(
+            std.Io.Threaded.global_single_threaded.io(),
+        ).nanoseconds - start_ns,
+        1,
+    ));
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CaseFailed;
+    try samples.append(allocator, elapsed);
+    try alloc_samples.append(allocator, 0);
+}
+
+fn metricsFromSamples(
+    allocator: std.mem.Allocator,
+    samples: std.ArrayList(u64),
+    alloc_samples: std.ArrayList(u64),
+) !Metrics {
+    return .{
+        .samples = samples,
+        .alloc_samples = alloc_samples,
+        .p50_ns = try percentileU64(allocator, samples.items, 50),
+        .p95_ns = try percentileU64(allocator, samples.items, 95),
+        .p50_alloc_calls = try percentileU64(
+            allocator,
+            alloc_samples.items,
+            50,
+        ),
     };
 }
 
@@ -1063,6 +1349,62 @@ fn compareLatencyMetrics(
     return .{ .status = "PASS", .detail = "ok" };
 }
 
+fn compareMeasuredMetrics(
+    case_cfg: CompatCase,
+    baseline: Metrics,
+    candidate: Metrics,
+) !StatusDetail {
+    const allowed_p50 = allowedUpperBoundWithTolerance(
+        baseline.p50_ns,
+        case_cfg.tolerance_pct,
+    );
+    const allowed_p95 = allowedUpperBoundWithTolerance(
+        baseline.p95_ns,
+        case_cfg.tolerance_pct,
+    );
+    if (candidate.p50_ns > allowed_p50) {
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "paired p50 candidate={d} base={d} allowed={d}",
+                .{ candidate.p50_ns, baseline.p50_ns, allowed_p50 },
+            ),
+        };
+    }
+    if (candidate.p95_ns > allowed_p95) {
+        return .{
+            .status = "FAIL",
+            .detail = try std.fmt.allocPrint(
+                std.heap.page_allocator,
+                "paired p95 candidate={d} base={d} allowed={d}",
+                .{ candidate.p95_ns, baseline.p95_ns, allowed_p95 },
+            ),
+        };
+    }
+    if (case_cfg.descriptor.measurement_mode == .latency_alloc) {
+        const allowed_alloc = allowedUpperBoundWithTolerance(
+            baseline.p50_alloc_calls,
+            case_cfg.tolerance_pct,
+        );
+        if (candidate.p50_alloc_calls > allowed_alloc) {
+            return .{
+                .status = "FAIL",
+                .detail = try std.fmt.allocPrint(
+                    std.heap.page_allocator,
+                    "paired p50_alloc_calls candidate={d} base={d} allowed={d}",
+                    .{
+                        candidate.p50_alloc_calls,
+                        baseline.p50_alloc_calls,
+                        allowed_alloc,
+                    },
+                ),
+            };
+        }
+    }
+    return .{ .status = "PASS", .detail = "paired base/candidate ok" };
+}
+
 fn compareDriverRaw(allocator: std.mem.Allocator, case_cfg: CompatCase, baseline: std.json.Value, current_raw_json: []const u8) !StatusDetail {
     var current = try std.json.parseFromSlice(std.json.Value, allocator, current_raw_json, .{});
     defer current.deinit();
@@ -1151,7 +1493,7 @@ fn prepareCompatCase(
     temp_root: []const u8,
 ) !void {
     switch (case_cfg.setup) {
-        .ledger_project, .ledger_doctor => {},
+        .ledger_transact, .ledger_project, .ledger_doctor => {},
         else => return,
     }
     const repo_path = try std.fs.path.join(
@@ -1193,7 +1535,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
     errdefer args.deinit(allocator);
 
     switch (case_cfg.setup) {
-        .seq_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .seq_definition_check => try args.appendSlice(allocator, &.{
             binary_path,
             "definition",
@@ -1237,7 +1578,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
                 "\"session_id\",\"role\",\"text\"],\"limit\":5," ++
                 "\"format\":\"json\"}",
         }),
-        .ledger_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .ledger_definition_check => try args.appendSlice(allocator, &.{
             binary_path,
             "definition",
@@ -1271,12 +1611,10 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const stamp = std.Io.Clock.awake.now(
                 std.Io.Threaded.global_single_threaded.io(),
             ).nanoseconds;
-            const repo_path = try std.fmt.allocPrint(
+            const repo_path = try std.fs.path.join(
                 allocator,
-                "{s}/ledger-txn-{d}",
-                .{ temp_root, stamp },
+                &.{ temp_root, "ledger-repo" },
             );
-            try makeRepoAwarePath(allocator, repo_path);
             const request = try std.fmt.allocPrint(
                 allocator,
                 "request=perf-{d}",

@@ -237,7 +237,6 @@ fn loadLocator(
     admitted_root: []const u8,
     closure_limits: definition_core.closure.Limits,
 ) !?Locator {
-    try validatePrivateCacheNamespace(allocator, cache_dir, "locators");
     const locator_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -280,7 +279,6 @@ fn loadCachedPlan(
     locator: *const Locator,
     closure_limits: definition_core.closure.Limits,
 ) !PlanSet {
-    try validatePrivateCacheNamespace(allocator, cache_dir, "plans");
     const plan_path = try cachePathAlloc(
         allocator,
         cache_dir,
@@ -760,20 +758,6 @@ fn projectionSetDigest(request: Request) [32]u8 {
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digest;
-}
-
-fn validatePrivateCacheNamespace(
-    allocator: std.mem.Allocator,
-    cache_dir: []const u8,
-    namespace: []const u8,
-) !void {
-    try durable_store.validatePrivateDirectoryPathNoSymlinks(cache_dir);
-    const namespace_path = try std.fs.path.join(
-        allocator,
-        &.{ cache_dir, namespace },
-    );
-    defer allocator.free(namespace_path);
-    try durable_store.validatePrivateDirectoryPathNoSymlinks(namespace_path);
 }
 
 fn cachePathAlloc(

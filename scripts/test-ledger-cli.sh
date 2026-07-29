@@ -68,6 +68,12 @@ if grep -Eq \
 then
   exit 1
 fi
+if "$binary" capture --help >/dev/null 2>&1; then
+  exit 1
+fi
+if "$binary" definition capture --help >/dev/null 2>&1; then
+  exit 1
+fi
 
 check_output=$("$binary" definition check \
   --definition "$definition" \

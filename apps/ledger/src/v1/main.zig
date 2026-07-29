@@ -6,6 +6,8 @@ const durable_store = @import("durable_store");
 const ledger = @import("ledger_v1_core");
 
 const Version = std.mem.trim(u8, app_meta.version, " \t\r\n");
+const max_projection_table_columns: usize = 1024;
+const max_projection_table_cells: usize = 4_000_000;
 threadlocal var runtime_io: ?std.Io = null;
 
 pub const panic = if (builtin.is_test)
@@ -189,36 +191,64 @@ pub fn runWithArgv(
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    if (containsHelp(argv[2..])) {
-        try writeStdout(Help);
-        return 0;
-    }
     if (std.mem.eql(u8, argv[1], "capabilities")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return emitCapabilities(argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "definition")) {
         if (argv.len < 3) return error.MissingDefinitionAction;
         if (std.mem.eql(u8, argv[2], "check")) {
+            if (isOnlyHelp(argv[3..])) {
+                try writeStdout(Help);
+                return 0;
+            }
             return runDefinitionCheck(allocator, environment, argv[3..]);
         }
         if (std.mem.eql(u8, argv[2], "describe")) {
+            if (isOnlyHelp(argv[3..])) {
+                try writeStdout(Help);
+                return 0;
+            }
             return runDefinitionDescribe(allocator, environment, argv[3..]);
         }
         return error.UnknownDefinitionAction;
     }
     if (std.mem.eql(u8, argv[1], "validate")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runValidate(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "materialize")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runMaterialize(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "transact")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runTransact(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "project")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runProject(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "doctor")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runDoctor(allocator, environment, argv[2..]);
     }
     return error.UnknownCommand;
@@ -1246,15 +1276,17 @@ fn emitProjection(
                 ),
                 .table => try writeProjectionTable(
                     allocator,
-                    &output.writer,
+                    &output,
                     parsed.value,
                     false,
+                    result.max_output_bytes,
                 ),
                 .markdown => try writeProjectionTable(
                     allocator,
-                    &output.writer,
+                    &output,
                     parsed.value,
                     true,
+                    result.max_output_bytes,
                 ),
                 else => unreachable,
             }
@@ -1292,9 +1324,10 @@ fn writeProjectionJsonl(
 
 fn writeProjectionTable(
     allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     value: std.json.Value,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
     switch (value) {
         .array => |array| {
@@ -1306,51 +1339,105 @@ fn writeProjectionTable(
                 break;
             }
             if (!object_rows) {
-                try writeTableHeader(writer, &.{"value"}, markdown);
+                try validateTableCellCount(array.items.len, 1);
+                try writeTableHeader(
+                    output,
+                    &.{"value"},
+                    markdown,
+                    max_output_bytes,
+                );
                 for (array.items) |item| {
                     try writeTableRow(
                         allocator,
-                        writer,
+                        output,
                         &.{item},
                         markdown,
+                        max_output_bytes,
                     );
                 }
                 return;
             }
             const keys = try collectTableKeys(allocator, array.items);
             defer allocator.free(keys);
-            try writeTableHeader(writer, keys, markdown);
+            try validateTableCellCount(array.items.len, keys.len);
+            try writeTableHeader(
+                output,
+                keys,
+                markdown,
+                max_output_bytes,
+            );
             for (array.items) |item| {
                 try writeObjectTableRow(
                     allocator,
-                    writer,
+                    output,
                     item.object,
                     keys,
                     markdown,
+                    max_output_bytes,
                 );
             }
         },
         .object => |object| {
             const keys = try collectTableKeys(allocator, &.{value});
             defer allocator.free(keys);
-            try writeTableHeader(writer, &.{ "key", "value" }, markdown);
+            try validateTableCellCount(keys.len, 2);
+            try writeTableHeader(
+                output,
+                &.{ "key", "value" },
+                markdown,
+                max_output_bytes,
+            );
             for (keys) |key| {
-                if (markdown) try writer.writeAll("| ");
-                try writeTableTextCell(writer, key, markdown);
-                try writeTableSeparator(writer, markdown);
+                if (markdown) {
+                    try writeBoundedAll(output, "| ", max_output_bytes);
+                }
+                try writeTableTextCell(
+                    output,
+                    key,
+                    markdown,
+                    max_output_bytes,
+                );
+                try writeTableSeparator(
+                    output,
+                    markdown,
+                    max_output_bytes,
+                );
                 try writeTableValueCell(
                     allocator,
-                    writer,
+                    output,
                     object.get(key).?,
                     markdown,
+                    max_output_bytes,
                 );
-                try writeTableRowEnd(writer, markdown);
+                try writeTableRowEnd(output, markdown, max_output_bytes);
             }
         },
         else => {
-            try writeTableHeader(writer, &.{"value"}, markdown);
-            try writeTableRow(allocator, writer, &.{value}, markdown);
+            try writeTableHeader(
+                output,
+                &.{"value"},
+                markdown,
+                max_output_bytes,
+            );
+            try writeTableRow(
+                allocator,
+                output,
+                &.{value},
+                markdown,
+                max_output_bytes,
+            );
         },
+    }
+}
+
+fn validateTableCellCount(rows: usize, columns: usize) !void {
+    if (columns > max_projection_table_columns) {
+        return error.ProjectionTableColumnBoundExceeded;
+    }
+    const cells = std.math.mul(usize, rows, columns) catch
+        return error.ProjectionTableCellBoundExceeded;
+    if (cells > max_projection_table_cells) {
+        return error.ProjectionTableCellBoundExceeded;
     }
 }
 
@@ -1367,6 +1454,9 @@ fn collectTableKeys(
         while (iterator.next()) |entry| {
             const result = try seen.getOrPut(allocator, entry.key_ptr.*);
             if (result.found_existing) continue;
+            if (keys.items.len >= max_projection_table_columns) {
+                return error.ProjectionTableColumnBoundExceeded;
+            }
             try keys.append(allocator, entry.key_ptr.*);
         }
     }
@@ -1379,64 +1469,98 @@ fn collectTableKeys(
 }
 
 fn writeTableHeader(
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     keys: []const []const u8,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
-    if (markdown) try writer.writeAll("| ");
+    if (markdown) try writeBoundedAll(output, "| ", max_output_bytes);
     for (keys, 0..) |key, index| {
-        if (index != 0) try writeTableSeparator(writer, markdown);
-        try writeTableTextCell(writer, key, markdown);
+        if (index != 0) {
+            try writeTableSeparator(output, markdown, max_output_bytes);
+        }
+        try writeTableTextCell(
+            output,
+            key,
+            markdown,
+            max_output_bytes,
+        );
     }
-    try writeTableRowEnd(writer, markdown);
+    try writeTableRowEnd(output, markdown, max_output_bytes);
     if (!markdown) return;
-    try writer.writeAll("| ");
+    try writeBoundedAll(output, "| ", max_output_bytes);
     for (keys, 0..) |_, index| {
-        if (index != 0) try writer.writeAll(" | ");
-        try writer.writeAll("---");
+        if (index != 0) {
+            try writeBoundedAll(output, " | ", max_output_bytes);
+        }
+        try writeBoundedAll(output, "---", max_output_bytes);
     }
-    try writer.writeAll(" |\n");
+    try writeBoundedAll(output, " |\n", max_output_bytes);
 }
 
 fn writeObjectTableRow(
     allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     object: std.json.ObjectMap,
     keys: []const []const u8,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
-    if (markdown) try writer.writeAll("| ");
+    if (markdown) try writeBoundedAll(output, "| ", max_output_bytes);
     for (keys, 0..) |key, index| {
-        if (index != 0) try writeTableSeparator(writer, markdown);
+        if (index != 0) {
+            try writeTableSeparator(output, markdown, max_output_bytes);
+        }
         if (object.get(key)) |value| {
-            try writeTableValueCell(allocator, writer, value, markdown);
+            try writeTableValueCell(
+                allocator,
+                output,
+                value,
+                markdown,
+                max_output_bytes,
+            );
         }
     }
-    try writeTableRowEnd(writer, markdown);
+    try writeTableRowEnd(output, markdown, max_output_bytes);
 }
 
 fn writeTableRow(
     allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     values: []const std.json.Value,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
-    if (markdown) try writer.writeAll("| ");
+    if (markdown) try writeBoundedAll(output, "| ", max_output_bytes);
     for (values, 0..) |value, index| {
-        if (index != 0) try writeTableSeparator(writer, markdown);
-        try writeTableValueCell(allocator, writer, value, markdown);
+        if (index != 0) {
+            try writeTableSeparator(output, markdown, max_output_bytes);
+        }
+        try writeTableValueCell(
+            allocator,
+            output,
+            value,
+            markdown,
+            max_output_bytes,
+        );
     }
-    try writeTableRowEnd(writer, markdown);
+    try writeTableRowEnd(output, markdown, max_output_bytes);
 }
 
 fn writeTableValueCell(
     allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     value: std.json.Value,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
     if (value == .string) {
-        return writeTableTextCell(writer, value.string, markdown);
+        return writeTableTextCell(
+            output,
+            value.string,
+            markdown,
+            max_output_bytes,
+        );
     }
     var canonical: std.Io.Writer.Allocating = .init(allocator);
     defer canonical.deinit();
@@ -1445,33 +1569,84 @@ fn writeTableValueCell(
         &canonical.writer,
         value,
     );
-    try writeTableTextCell(writer, canonical.written(), markdown);
+    try writeTableTextCell(
+        output,
+        canonical.written(),
+        markdown,
+        max_output_bytes,
+    );
 }
 
 fn writeTableTextCell(
-    writer: *std.Io.Writer,
+    output: *std.Io.Writer.Allocating,
     text: []const u8,
     markdown: bool,
+    max_output_bytes: usize,
 ) !void {
     for (text) |byte| {
         if (markdown and byte == '|') {
-            try writer.writeAll("\\|");
+            try writeBoundedAll(output, "\\|", max_output_bytes);
         } else if (byte == '\n' or byte == '\r') {
-            try writer.writeAll(if (markdown) "<br>" else " ");
+            try writeBoundedAll(
+                output,
+                if (markdown) "<br>" else " ",
+                max_output_bytes,
+            );
         } else if (!markdown and byte == '\t') {
-            try writer.writeByte(' ');
+            try writeBoundedByte(output, ' ', max_output_bytes);
         } else {
-            try writer.writeByte(byte);
+            try writeBoundedByte(output, byte, max_output_bytes);
         }
     }
 }
 
-fn writeTableSeparator(writer: *std.Io.Writer, markdown: bool) !void {
-    try writer.writeAll(if (markdown) " | " else "\t");
+fn writeTableSeparator(
+    output: *std.Io.Writer.Allocating,
+    markdown: bool,
+    max_output_bytes: usize,
+) !void {
+    try writeBoundedAll(
+        output,
+        if (markdown) " | " else "\t",
+        max_output_bytes,
+    );
 }
 
-fn writeTableRowEnd(writer: *std.Io.Writer, markdown: bool) !void {
-    try writer.writeAll(if (markdown) " |\n" else "\n");
+fn writeTableRowEnd(
+    output: *std.Io.Writer.Allocating,
+    markdown: bool,
+    max_output_bytes: usize,
+) !void {
+    try writeBoundedAll(
+        output,
+        if (markdown) " |\n" else "\n",
+        max_output_bytes,
+    );
+}
+
+fn writeBoundedAll(
+    output: *std.Io.Writer.Allocating,
+    bytes: []const u8,
+    max_output_bytes: usize,
+) !void {
+    const next = std.math.add(
+        usize,
+        output.written().len,
+        bytes.len,
+    ) catch return error.OutputBytesExceeded;
+    if (next > max_output_bytes) return error.OutputBytesExceeded;
+    try output.writer.writeAll(bytes);
+}
+
+fn writeBoundedByte(
+    output: *std.Io.Writer.Allocating,
+    byte: u8,
+    max_output_bytes: usize,
+) !void {
+    if (output.written().len >= max_output_bytes) {
+        return error.OutputBytesExceeded;
+    }
+    try output.writer.writeByte(byte);
 }
 
 fn emitProjectionError(
@@ -1590,9 +1765,14 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
         "{d}",
         .{definition_core.cache.format_version},
     );
-    try stdout_writer.interface.writeAll(
-        ",\"bounds\":{\"max_definition_files\":128," ++
-            "\"max_definition_bytes\":4194304,\"max_import_depth\":32}," ++
+    try stdout_writer.interface.print(
+        ",\"bounds\":{{\"max_definition_files\":128," ++
+            "\"max_definition_bytes\":4194304,\"max_import_depth\":32," ++
+            "\"max_event_record_bytes\":{d}," ++
+            "\"max_historical_definition_bytes\":{d}," ++
+            "\"max_historical_definition_versions\":{d}," ++
+            "\"max_projection_table_cells\":{d}," ++
+            "\"max_projection_table_columns\":{d}}}," ++
             "\"result_schemas\":[\"ledger-capabilities/v1\"," ++
             "\"ledger-command-error/v1\"," ++
             "\"ledger-definition-check-result/v1\"," ++
@@ -1603,7 +1783,14 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
             "\"ledger-transaction-result/v1\"," ++
             "\"ledger-transaction-error/v1\"," ++
             "\"ledger-projection-result/v1\"," ++
-            "\"ledger-validation-result/v1\"]}\n",
+            "\"ledger-validation-result/v1\"]}}\n",
+        .{
+            durable_store.max_event_record_bytes,
+            ledger.replay.max_historical_definition_bytes,
+            ledger.replay.max_historical_definition_versions,
+            max_projection_table_cells,
+            max_projection_table_columns,
+        },
     );
     return 0;
 }
@@ -1649,9 +1836,8 @@ fn isHelp(token: []const u8) bool {
     return std.mem.eql(u8, token, "-h") or std.mem.eql(u8, token, "--help");
 }
 
-fn containsHelp(argv: []const []const u8) bool {
-    for (argv) |token| if (isHelp(token)) return true;
-    return false;
+fn isOnlyHelp(argv: []const []const u8) bool {
+    return argv.len == 1 and isHelp(argv[0]);
 }
 
 fn isVersion(token: []const u8) bool {

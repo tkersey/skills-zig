@@ -56,6 +56,15 @@ grep -Fq '"files_opened":1' <<<"$observation_output"
 grep -Fq '"rows_materialized":0' <<<"$observation_output"
 grep -Fq '"authority_granted":false' <<<"$observation_output"
 
+stdin_observation_output=$("$binary" observe \
+  --definition "$external_definition" \
+  --input facts=- \
+  --projection rows \
+  --format json \
+  <"$external_facts")
+grep -Fq '"files_opened":0' <<<"$stdin_observation_output"
+grep -Fq '"files":0' <<<"$stdin_observation_output"
+
 opencode_output=$("$binary" observe \
   --definition "$message_definition" \
   --projection rows \
@@ -242,6 +251,12 @@ grep -Fq '"id":"sort","version":1' <<<"$capabilities"
 grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
 grep -Fq '"opencode-prompt-history-jsonl/v1"' <<<"$capabilities"
+grep -Fq '"seq-command-error/v1"' <<<"$capabilities"
+grep -Fq '"seq-definition-check-result/v1"' <<<"$capabilities"
+grep -Fq '"seq-definition-description/v1"' <<<"$capabilities"
+grep -Fq '"seq-index-result/v1"' <<<"$capabilities"
+grep -Fq '"seq-observation-plan/v1"' <<<"$capabilities"
+grep -Fq '"seq-observation-result/v1"' <<<"$capabilities"
 if grep -Eq '"id":"(join|ordered-fold|reachability)"' \
   <<<"$capabilities"
 then
@@ -257,6 +272,12 @@ fi
 help_output=$("$binary" --help)
 grep -Fq 'definition check' <<<"$help_output"
 grep -Fq 'observe' <<<"$help_output"
+if "$binary" skill-decision-audit --help >/dev/null 2>&1; then
+  exit 1
+fi
+if "$binary" definition capture --help >/dev/null 2>&1; then
+  exit 1
+fi
 if grep -Eq 'skill-decision-audit|execution-policy-compile|actuation-audit' \
   <<<"$help_output"
 then

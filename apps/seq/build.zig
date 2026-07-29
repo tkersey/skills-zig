@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/v1/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
         .imports = &.{
             .{ .name = "app_meta", .module = seq_meta },
             .{ .name = "definition_core", .module = definition_core },

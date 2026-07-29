@@ -62,6 +62,7 @@ const PreparedEffect = struct {
     binding_path: []u8,
     slot_before: ?[]u8,
     slot_before_digest: ?[]u8,
+    slot_before_exists: bool,
     slot_after: []u8,
     slot_after_digest: []u8,
     binding_before: custody.BindingSnapshot,
@@ -70,6 +71,7 @@ const PreparedEffect = struct {
     generated_outputs: []protocol.GeneratedOutput,
     revision_archive: ?revision_archive.Candidate,
     idempotency_match: bool,
+    append_only: bool,
 
     fn deinit(self: *PreparedEffect, allocator: std.mem.Allocator) void {
         allocator.free(self.slot_path);
@@ -1094,15 +1096,6 @@ fn validateExistingMaterializedEvent(
         },
     );
     defer parsed.deinit();
-    const canonical = try canonicalExistingEventAlloc(
-        allocator,
-        &materialized,
-        parsed.value,
-    );
-    defer allocator.free(canonical);
-    if (!std.mem.eql(u8, canonical, bytes)) {
-        return error.ExistingStoreValidationFailed;
-    }
     const reconstructed = try reconstructExistingEventInputAlloc(
         allocator,
         event_protocol,
@@ -1128,24 +1121,6 @@ fn validateExistingMaterializedEvent(
             parameters,
         );
     }
-}
-
-fn canonicalExistingEventAlloc(
-    allocator: std.mem.Allocator,
-    materialized: *const storage.EventMaterialization,
-    value: std.json.Value,
-) ![]u8 {
-    return switch (materialized.mode) {
-        .chained => definition_core.canonical_json.canonicalJsonAlloc(
-            allocator,
-            value,
-        ),
-        .plain => protocol.canonicalPlainStoredEventAlloc(
-            allocator,
-            materialized,
-            value,
-        ),
-    };
 }
 
 fn reconstructExistingEventInputAlloc(
@@ -1338,7 +1313,6 @@ fn prepareEffect(
         slot,
         effect,
         repo_root,
-        parameters,
     );
     errdefer source.deinit(allocator);
     var idempotency = try EffectIdempotency.init(
@@ -1359,6 +1333,12 @@ fn prepareEffect(
         &idempotency,
     );
     errdefer binding_before.deinit(allocator);
+    try validateEffectSlotPreconditions(
+        effect,
+        source.before_exists,
+        source.before_digest,
+        parameters,
+    );
     return prepareEffectWithBinding(
         allocator,
         definition_plan,
@@ -1430,13 +1410,14 @@ const EffectSlotSource = struct {
     binding_path: []u8,
     before: ?[]u8,
     before_digest: ?[]u8,
+    before_exists: bool,
+    stream_event_log: bool,
 
     fn init(
         allocator: std.mem.Allocator,
         slot: storage.ResolvedSlot,
         effect: storage.Effect,
         repo_root: []const u8,
-        parameters: *const definition_core.parameters.Bindings,
     ) !EffectSlotSource {
         const slot_path = try std.fs.path.join(
             allocator,
@@ -1449,15 +1430,35 @@ const EffectSlotSource = struct {
             slot.relative_path,
         );
         errdefer allocator.free(binding_path);
-        const before = durable_store.readRegularFileNoSymlink(
-            allocator,
-            slot_path,
-            slot.max_bytes,
-        ) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        const stream_event_log =
+            slot.kind == .event_log and effect.kind == .compare_append;
+        const before = if (stream_event_log)
+            null
+        else
+            durable_store.readRegularFileNoSymlink(
+                allocator,
+                slot_path,
+                slot.max_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
         errdefer if (before) |bytes| allocator.free(bytes);
+        const before_exists = if (stream_event_log) exists: {
+            try durable_store.rejectSymlinkComponents(slot_path);
+            const stat = std.Io.Dir.cwd().statFile(
+                defaultIo(),
+                slot_path,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => break :exists false,
+                else => return err,
+            };
+            if (stat.kind == .sym_link) return error.SymlinkComponent;
+            if (stat.kind != .file) return error.NotFile;
+            if (stat.size > slot.max_bytes) return error.FileTooBig;
+            break :exists true;
+        } else before != null;
         const before_digest = if (before) |bytes|
             try definition_core.canonical_json.digestBytesAlloc(
                 allocator,
@@ -1466,17 +1467,13 @@ const EffectSlotSource = struct {
         else
             null;
         errdefer if (before_digest) |digest| allocator.free(digest);
-        try validateEffectSlotPreconditions(
-            effect,
-            before,
-            before_digest,
-            parameters,
-        );
         return .{
             .slot_path = slot_path,
             .binding_path = binding_path,
             .before = before,
             .before_digest = before_digest,
+            .before_exists = before_exists,
+            .stream_event_log = stream_event_log,
         };
     }
 
@@ -1494,16 +1491,16 @@ const EffectSlotSource = struct {
 
 fn validateEffectSlotPreconditions(
     effect: storage.Effect,
-    before: ?[]const u8,
+    before_exists: bool,
     before_digest: ?[]const u8,
     parameters: *const definition_core.parameters.Bindings,
 ) !void {
     switch (effect.kind) {
-        .create_new => if (before != null) {
+        .create_new => if (before_exists) {
             return error.StorageSlotAlreadyExists;
         },
         .compare_append => {},
-        .compare_replace => if (before == null) {
+        .compare_replace => if (!before_exists) {
             return error.StorageSlotMissing;
         },
         .bind_existing => return error.BindingOperationRequiresMigrationPath,
@@ -1592,30 +1589,50 @@ fn readEffectBindingSnapshot(
     definition_id: []const u8,
     definition_digest: []const u8,
     slot: storage.ResolvedSlot,
-    source: *const EffectSlotSource,
+    source: *EffectSlotSource,
     operation_name: []const u8,
     idempotency: *const EffectIdempotency,
 ) !custody.BindingSnapshot {
-    var snapshot = try custody.readBindingSnapshot(
-        allocator,
-        source.binding_path,
-        definition_id,
-        slot.name,
-        slot.relative_path,
-        source.before_digest,
-        if (idempotency.parameter) |key| .{
+    const query: ?custody.IdempotencyQuery = if (idempotency.parameter) |key|
+        .{
             .definition_digest = definition_digest,
             .operation = operation_name,
             .key = key,
             .input_digest = idempotency.input_digest,
-        } else null,
-    );
+        }
+    else
+        null;
+    var snapshot = if (source.stream_event_log)
+        try custody.readBindingSnapshotBeforeReplay(
+            allocator,
+            source.binding_path,
+            definition_id,
+            slot.name,
+            slot.relative_path,
+            query,
+        )
+    else
+        try custody.readBindingSnapshot(
+            allocator,
+            source.binding_path,
+            definition_id,
+            slot.name,
+            slot.relative_path,
+            source.before_digest,
+            query,
+        );
     errdefer snapshot.deinit(allocator);
-    if (source.before != null and !snapshot.exists) {
+    if (source.before_exists and !snapshot.exists) {
         return error.UnboundStore;
     }
-    if (source.before == null and snapshot.exists) {
+    if (!source.before_exists and snapshot.exists) {
         return error.OrphanedStoreBinding;
+    }
+    if (source.stream_event_log and snapshot.exists) {
+        source.before_digest = try allocator.dupe(
+            u8,
+            snapshot.last_revision orelse return error.InvalidStoreBinding,
+        );
     }
     return snapshot;
 }
@@ -1624,6 +1641,7 @@ const EffectReplayContext = struct {
     existing_records: ?usize,
     state: ?protocol.ReplayState,
     derived_match: ?[]u8,
+    append_context: ?durable_store.EventAppendContext,
 
     fn deinit(
         self: *EffectReplayContext,
@@ -1652,43 +1670,75 @@ fn prepareEffectReplay(
         event_protocol,
         slot_index,
     );
-    if (source.before) |content| {
-        const snapshot: custody.SlotSnapshot = .{
-            .exists = true,
-            .path = source.slot_path,
-            .content = content,
-            .revision = source.before_digest.?,
-            .binding = binding_before,
-        };
+    if (source.before_exists) {
         var derived_observer = try DerivedMatchObserver.init(
             allocator,
             effect,
             derived_key,
         );
         defer derived_observer.deinit();
-        var stats = if (derived_observer.active())
-            try replay.validateSlotObserved(
-                allocator,
-                repo_root,
-                definition_plan.id,
-                slot,
-                &snapshot,
-                parameters,
-                definition_plan.bounds.max_records,
-                protocol_required,
-                &derived_observer,
-            )
-        else
-            try replay.validateSlot(
-                allocator,
-                repo_root,
-                definition_plan.id,
-                slot,
-                &snapshot,
-                parameters,
-                definition_plan.bounds.max_records,
-                protocol_required,
-            );
+        var stats = if (source.stream_event_log) stream: {
+            const snapshot: custody.ReplaySlot = .{
+                .exists = true,
+                .path = source.slot_path,
+                .revision = source.before_digest.?,
+                .binding = binding_before,
+            };
+            break :stream if (derived_observer.active())
+                try replay.validateReplaySlotObserved(
+                    allocator,
+                    repo_root,
+                    definition_plan.id,
+                    slot,
+                    &snapshot,
+                    parameters,
+                    definition_plan.bounds.max_records,
+                    protocol_required,
+                    &derived_observer,
+                )
+            else
+                try replay.validateReplaySlot(
+                    allocator,
+                    repo_root,
+                    definition_plan.id,
+                    slot,
+                    &snapshot,
+                    parameters,
+                    definition_plan.bounds.max_records,
+                    protocol_required,
+                );
+        } else materialized: {
+            const snapshot: custody.SlotSnapshot = .{
+                .exists = true,
+                .path = source.slot_path,
+                .content = source.before.?,
+                .revision = source.before_digest.?,
+                .binding = binding_before,
+            };
+            break :materialized if (derived_observer.active())
+                try replay.validateSlotObserved(
+                    allocator,
+                    repo_root,
+                    definition_plan.id,
+                    slot,
+                    &snapshot,
+                    parameters,
+                    definition_plan.bounds.max_records,
+                    protocol_required,
+                    &derived_observer,
+                )
+            else
+                try replay.validateSlot(
+                    allocator,
+                    repo_root,
+                    definition_plan.id,
+                    slot,
+                    &snapshot,
+                    parameters,
+                    definition_plan.bounds.max_records,
+                    protocol_required,
+                );
+        };
         defer stats.deinit(allocator);
         return .{
             .existing_records = if (slot.kind == .event_log)
@@ -1697,12 +1747,17 @@ fn prepareEffectReplay(
                 null,
             .state = stats.takeProtocolState(),
             .derived_match = derived_observer.takeMatch(),
+            .append_context = stats.append_context,
         };
     }
     return .{
         .existing_records = if (slot.kind == .event_log) 0 else null,
         .state = null,
         .derived_match = null,
+        .append_context = if (source.stream_event_log)
+            durable_store.EventAppendContext{}
+        else
+            null,
     };
 }
 
@@ -1808,7 +1863,7 @@ fn prepareEffectAfterReplay(
         parameters,
         transaction_generated,
         slot,
-        source.before,
+        source,
         binding_before,
         replay_context,
         derived_match,
@@ -1824,7 +1879,7 @@ fn prepareEffectAfterReplay(
         slot,
         source,
         binding_before,
-        replay_context.existing_records,
+        replay_context,
         idempotency_key,
         input_digest,
         idempotency_match,
@@ -1855,7 +1910,7 @@ fn materializeEffectInputAlloc(
     parameters: *const definition_core.parameters.Bindings,
     transaction_generated: []const protocol.GeneratedOutput,
     slot: storage.ResolvedSlot,
-    before: ?[]const u8,
+    source: *const EffectSlotSource,
     binding_before: *const custody.BindingSnapshot,
     replay_context: *EffectReplayContext,
     derived_match: ?[]const u8,
@@ -1871,7 +1926,8 @@ fn materializeEffectInputAlloc(
     if (binding_before.idempotency_match and effect.event != null) {
         return materializeBoundEventInputAlloc(
             allocator,
-            before,
+            source,
+            slot.max_bytes,
             binding_before,
         );
     }
@@ -1900,7 +1956,7 @@ fn materializeEffectInputAlloc(
             parameters,
             transaction_generated,
             slot,
-            before,
+            source.before,
             request,
         );
     }
@@ -1919,10 +1975,21 @@ fn materializeEffectInputAlloc(
 
 fn materializeBoundEventInputAlloc(
     allocator: std.mem.Allocator,
-    before: ?[]const u8,
+    source: *const EffectSlotSource,
+    max_bytes: usize,
     binding: *const custody.BindingSnapshot,
 ) !EffectMaterializedInput {
-    const content = before orelse return error.InvalidIdempotencyBinding;
+    const owned = if (source.before == null)
+        try durable_store.readRegularFileNoSymlink(
+            allocator,
+            source.slot_path,
+            max_bytes,
+        )
+    else
+        null;
+    defer if (owned) |content| allocator.free(content);
+    const content = source.before orelse owned orelse
+        return error.InvalidIdempotencyBinding;
     const match_index = binding.idempotency_match_index orelse
         return error.InvalidIdempotencyBinding;
     const row = binding.rows[match_index];
@@ -2175,7 +2242,7 @@ fn finishPreparedEffect(
     slot: storage.ResolvedSlot,
     source: *const EffectSlotSource,
     binding_before: *const custody.BindingSnapshot,
-    existing_records: ?usize,
+    replay_context: *const EffectReplayContext,
     idempotency_key: ?[]const u8,
     input_digest: []const u8,
     idempotency_match: bool,
@@ -2193,7 +2260,7 @@ fn finishPreparedEffect(
         effect,
         slot,
         source,
-        existing_records,
+        replay_context,
         input.canonical,
         idempotency_match,
     );
@@ -2250,6 +2317,7 @@ fn assembledPreparedEffect(
         .binding_path = source.binding_path,
         .slot_before = source.before,
         .slot_before_digest = source.before_digest,
+        .slot_before_exists = source.before_exists,
         .slot_after = slot_after.bytes,
         .slot_after_digest = slot_after.digest,
         .binding_before = binding_before.*,
@@ -2258,6 +2326,7 @@ fn assembledPreparedEffect(
         .generated_outputs = input.outputs,
         .revision_archive = revision,
         .idempotency_match = idempotency_match,
+        .append_only = slot_after.append_only,
     };
 }
 
@@ -2267,21 +2336,79 @@ fn prepareSlotAfter(
     effect: storage.Effect,
     slot: storage.ResolvedSlot,
     source: *const EffectSlotSource,
-    existing_records: ?usize,
+    replay_context: *const EffectReplayContext,
     canonical_input: []const u8,
     idempotency_match: bool,
 ) !SlotAfter {
     if (idempotency_match) {
-        const prior = source.before orelse
-            return error.InvalidIdempotencyBinding;
         const prior_digest = source.before_digest orelse
             return error.InvalidIdempotencyBinding;
-        const bytes = try allocator.dupe(u8, prior);
+        const bytes = if (source.before) |prior|
+            try allocator.dupe(u8, prior)
+        else
+            try allocator.alloc(u8, 0);
         errdefer allocator.free(bytes);
         return .{
             .bytes = bytes,
             .digest = try allocator.dupe(u8, prior_digest),
             .extent = null,
+            .append_only = false,
+        };
+    }
+    if (source.stream_event_log and effect.kind == .compare_append) {
+        const append_context = replay_context.append_context orelse
+            return error.StreamingAppendContextMissing;
+        const existing_records = replay_context.existing_records orelse
+            return error.ExistingEventRecordCountMissing;
+        if (existing_records >= definition_plan.bounds.max_records) {
+            return error.TransactionRecordBoundsExceeded;
+        }
+        const separator = append_context.separator_bytes;
+        if (separator > 1) return error.InvalidEventAppendSeparator;
+        const suffix_size = std.math.add(
+            usize,
+            separator,
+            canonical_input.len,
+        ) catch return error.StorageSlotBoundsExceeded;
+        const final_size = std.math.add(
+            usize,
+            suffix_size,
+            1,
+        ) catch return error.StorageSlotBoundsExceeded;
+        const after_size = std.math.add(
+            usize,
+            append_context.extent_bytes,
+            final_size,
+        ) catch return error.StorageSlotBoundsExceeded;
+        if (after_size > slot.max_bytes) {
+            return error.StorageSlotBoundsExceeded;
+        }
+        const suffix = try allocator.alloc(u8, final_size);
+        errdefer allocator.free(suffix);
+        var cursor: usize = 0;
+        if (separator != 0) {
+            suffix[cursor] = '\n';
+            cursor += 1;
+        }
+        @memcpy(suffix[cursor .. cursor + canonical_input.len], canonical_input);
+        const extent_start = append_context.extent_bytes + separator;
+        cursor += canonical_input.len;
+        suffix[cursor] = '\n';
+        const digest = try append_context.revisionWithSuffixAlloc(
+            allocator,
+            suffix,
+        );
+        return .{
+            .bytes = suffix,
+            .digest = digest,
+            .extent = .{
+                .kind = .admission,
+                .record_start = existing_records,
+                .record_end = existing_records + 1,
+                .extent_start = extent_start,
+                .extent_end = extent_start + canonical_input.len,
+            },
+            .append_only = true,
         };
     }
     const content = try slotContentAfter(
@@ -2289,7 +2416,7 @@ fn prepareSlotAfter(
         slot,
         effect.kind,
         source.before,
-        existing_records,
+        replay_context.existing_records,
         canonical_input,
     );
     errdefer allocator.free(content.bytes);
@@ -2309,6 +2436,7 @@ fn prepareSlotAfter(
         .bytes = content.bytes,
         .digest = digest,
         .extent = content.extent,
+        .append_only = false,
     };
 }
 
@@ -2385,6 +2513,7 @@ const SlotAfter = struct {
     bytes: []u8,
     digest: []u8,
     extent: ?custody.BindingExtent,
+    append_only: bool,
 };
 
 fn slotContentAfter(
@@ -2470,10 +2599,12 @@ fn buildMutations(
             .text = effect.slot_after,
             .expectation = .{
                 .expected_digest = effect.slot_before_digest,
-                .expected_exists = effect.slot_before != null,
+                .expected_exists = effect.slot_before_exists,
             },
             .content_mode = .raw,
             .max_bytes = slot.max_bytes,
+            .action = if (effect.append_only) .append else .write,
+            .expected_digest_after = effect.slot_after_digest,
         };
         mutations[index * 2 + 1] = .{
             .path = effect.binding_path,
@@ -3854,6 +3985,9 @@ const plain_event_request =
 const plain_event_expected =
     "{\"v\":1,\"source\":\"example\",\"event\":\"capture\"," ++
     "\"record\":{\"status\":\"open\",\"id\":\"item-1\"}}";
+const plain_event_existing_noncanonical =
+    "{\"event\":\"capture\",\"source\":\"example\",\"v\":1," ++
+    "\"record\":{\"id\":\"item-1\",\"status\":\"open\"}}";
 
 fn expectPlainCachedStorage(
     plans: *const TransactionTestPlans,
@@ -3950,7 +4084,7 @@ fn expectPlainExistingBinding(
     try durable_store.writeTextAtomic(
         std.testing.allocator,
         event_path,
-        plain_event_expected ++ "\n",
+        plain_event_existing_noncanonical ++ "\n",
     );
     var bound = try executeTestWithStorage(
         plans,
@@ -3964,6 +4098,31 @@ fn expectPlainExistingBinding(
     defer bound.deinit(std.testing.allocator);
     try std.testing.expect(bound.storage_mutated);
     try std.testing.expectEqualStrings("bound", bound.effects[0].result);
+    var resolved = try storage.resolve(
+        std.testing.allocator,
+        cached_storage,
+        parameters,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    var snapshot = try custody.readReplaySlotOrMissing(
+        std.testing.allocator,
+        binding_root,
+        plans.definition_plan.id,
+        resolved.slot(0),
+    );
+    defer snapshot.deinit(std.testing.allocator);
+    var stats = try replay.validateReplaySlot(
+        std.testing.allocator,
+        binding_root,
+        plans.definition_plan.id,
+        resolved.slot(0),
+        &snapshot,
+        parameters,
+        4,
+        false,
+    );
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), stats.records_validated);
 }
 
 test "plain event materialization preserves declared bytes through replay and binding" {

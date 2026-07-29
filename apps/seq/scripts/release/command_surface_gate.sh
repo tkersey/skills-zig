@@ -12,13 +12,20 @@ fi
 expected=$'definition check\ndefinition describe\nobserve\nexplain\nsessions\nturns\nsession-detail\ntool-lifecycle\nsession-graph\ntail\nfind-session\ndatasets\ndataset-schema\nquery\nindex\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
-  sed -n \
-    '/^commands:$/,/^$/ {
-      s/^  //
-      /^commands:$/d
-      /^$/d
-      p
-    }' \
+  awk '
+    / commands:$/ { in_section = 1; next }
+    /^$/ { in_section = 0; next }
+    in_section && /^  [^ ]/ {
+      line = substr($0, 3)
+      sub(/^seq /, "", line)
+      count = split(line, words, /[[:space:]]+/)
+      if (words[1] == "definition" && count >= 2) {
+        print words[1] " " words[2]
+      } else {
+        print words[1]
+      }
+    }
+  ' \
     <<<"$help_output"
 )
 
@@ -39,7 +46,16 @@ jq -e --arg version "$version" \
     (.operators | type == "array" and length > 0) and
     (.renderers | type == "array" and length > 0) and
     .cache_format != null and
-    (.limits | type == "object")
+    (.limits | type == "object") and
+    (.result_schemas | sort) == ([
+      "seq-capabilities/v1",
+      "seq-command-error/v1",
+      "seq-definition-check-result/v1",
+      "seq-definition-description/v1",
+      "seq-index-result/v1",
+      "seq-observation-plan/v1",
+      "seq-observation-result/v1"
+    ] | sort)
   ' \
   <<<"$capabilities" >/dev/null
 

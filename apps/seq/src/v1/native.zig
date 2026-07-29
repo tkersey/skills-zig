@@ -1574,6 +1574,7 @@ pub fn resolveTargetPaths(
         options,
     );
     errdefer freePaths(allocator, &paths);
+    retainCanonicalRolloutWindow(allocator, &paths, options);
 
     const exact_session_id = options.session_id orelse if (options.current)
         environmentValue(options.environment, "CODEX_THREAD_ID") orelse
@@ -1588,6 +1589,100 @@ pub fn resolveTargetPaths(
         if (paths.items.len != 1) return error.AmbiguousSessionTarget;
     }
     return paths;
+}
+
+fn retainCanonicalRolloutWindow(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]u8),
+    options: Options,
+) void {
+    if (options.since_ms == null and options.until_ms == null) return;
+    var write_index: usize = 0;
+    for (paths.items) |path| {
+        if (canonicalRolloutPathPassesWindow(path, options)) {
+            paths.items[write_index] = path;
+            write_index += 1;
+        } else {
+            allocator.free(path);
+        }
+    }
+    paths.items.len = write_index;
+}
+
+fn canonicalRolloutPathPassesWindow(path: []const u8, options: Options) bool {
+    const basename = std.fs.path.basename(path);
+    const prefix = "rollout-";
+    if (!std.mem.startsWith(u8, basename, prefix) or
+        basename.len < prefix.len + 11 or
+        basename[prefix.len + 10] != 'T')
+    {
+        return true;
+    }
+    const filename_date = seq_time.parseDayLiteral(
+        basename[prefix.len .. prefix.len + 10],
+    ) orelse return true;
+    const parent = std.fs.path.basename(
+        std.fs.path.dirname(path) orelse return true,
+    );
+    const month_parent = std.fs.path.basename(
+        std.fs.path.dirname(
+            std.fs.path.dirname(path) orelse return true,
+        ) orelse return true,
+    );
+    const year_parent = std.fs.path.basename(
+        std.fs.path.dirname(
+            std.fs.path.dirname(
+                std.fs.path.dirname(path) orelse return true,
+            ) orelse return true,
+        ) orelse return true,
+    );
+    const canonical_parent_date = parsePartitionDate(
+        year_parent,
+        month_parent,
+        parent,
+    ) orelse return true;
+    if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
+
+    // Codex partitions rollouts by the local start date while session metadata
+    // is UTC. A two-day margin preserves sessions across timezone and DST
+    // boundaries while avoiding reads from unrelated historical partitions.
+    const margin_ms: i64 = 2 * std.time.ms_per_day;
+    if (options.since_ms) |since| {
+        const lower_ms = std.math.sub(i64, since, margin_ms) catch
+            return true;
+        const lower = seq_time.dateFromUtcTimestampMillis(lower_ms);
+        if (compareDates(filename_date, lower) == .lt) return false;
+    }
+    if (options.until_ms) |until| {
+        const upper_ms = std.math.add(i64, until, margin_ms) catch
+            return true;
+        const upper = seq_time.dateFromUtcTimestampMillis(upper_ms);
+        if (compareDates(filename_date, upper) == .gt) return false;
+    }
+    return true;
+}
+
+fn parsePartitionDate(
+    year: []const u8,
+    month: []const u8,
+    day: []const u8,
+) ?seq_time.Date {
+    if (year.len != 4 or month.len != 2 or day.len != 2) return null;
+    var text: [10]u8 = undefined;
+    @memcpy(text[0..4], year);
+    text[4] = '-';
+    @memcpy(text[5..7], month);
+    text[7] = '-';
+    @memcpy(text[8..10], day);
+    return seq_time.parseDayLiteral(&text);
+}
+
+fn compareDates(left: seq_time.Date, right: seq_time.Date) std.math.Order {
+    if (left.year != right.year) return std.math.order(left.year, right.year);
+    if (left.month != right.month) {
+        return std.math.order(left.month, right.month);
+    }
+    return std.math.order(left.day, right.day);
 }
 
 fn retainSessionId(
@@ -2010,6 +2105,33 @@ test "bounded temporal selectors preserve all possible session directories" {
         "flat.jsonl",
         std.fs.path.basename(paths.items[2]),
     );
+}
+
+test "canonical rollout partitions push down distant temporal windows" {
+    const options: Options = .{
+        .since_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T00:00:00Z",
+        ),
+        .until_ms = seq_time.parseIsoTimestampMillis(
+            "2026-07-27T23:59:59Z",
+        ),
+    };
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
+        options,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/sessions/2026/07/25/rollout-2026-07-25T23-59-59-margin.jsonl",
+        options,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/sessions/2026/06/01/renamed.jsonl",
+        options,
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/sessions/2026/06/02/rollout-2026-06-01T10-00-00-mismatch.jsonl",
+        options,
+    ));
 }
 
 test "physical queries select row timestamps across session directories" {

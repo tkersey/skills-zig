@@ -23,9 +23,9 @@ const Help =
     \\observation commands:
     \\  seq observe --definition <file> --projection <name>
     \\    [--root <dir> | --session-id <id> | --path <file> | --repo <dir>]
-    \\    [--since <time>] [--until <time>] [--last <count>]
+    \\    [--since <time>] [--until <time>] [--last <duration>]
     \\    [--input <name>=<file|->]... [--param <name>=<value>]...
-    \\    [--format json|text]
+    \\    [--format json]
     \\  seq explain --definition <file> --projection <name>
     \\    [--param <name>=<value>]... [--format json|text]
     \\
@@ -116,30 +116,50 @@ pub fn runWithArgv(
         try stdout_writer.interface.print("{s}\n", .{Version});
         return 0;
     }
-    if (containsHelp(argv[2..])) {
-        try writeStdout(Help);
-        return 0;
-    }
     if (std.mem.eql(u8, argv[1], "capabilities")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return emitCapabilities(argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "definition")) {
         if (argv.len < 3) return error.MissingDefinitionAction;
         if (std.mem.eql(u8, argv[2], "check")) {
+            if (isOnlyHelp(argv[3..])) {
+                try writeStdout(Help);
+                return 0;
+            }
             return runDefinitionCheck(allocator, environment, argv[3..]);
         }
         if (std.mem.eql(u8, argv[2], "describe")) {
+            if (isOnlyHelp(argv[3..])) {
+                try writeStdout(Help);
+                return 0;
+            }
             return runDefinitionDescribe(allocator, environment, argv[3..]);
         }
         return error.UnknownDefinitionAction;
     }
     if (std.mem.eql(u8, argv[1], "observe")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runObserve(allocator, environment, argv[2..]);
     }
     if (std.mem.eql(u8, argv[1], "explain")) {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         return runExplain(allocator, environment, argv[2..]);
     }
     if (seq.native.Command.parse(argv[1])) |command| {
+        if (isOnlyHelp(argv[2..])) {
+            try writeStdout(Help);
+            return 0;
+        }
         var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
         return seq.native.run(
             allocator,
@@ -1004,16 +1024,27 @@ fn executeExternalObservation(
         &relation,
         output,
     );
+    const files_opened: usize = if (externalInputIsStdin(args.input_specs))
+        0
+    else
+        1;
     return .{
         .result = result,
         .external_relation = relation,
         .corpus_adapter = "immutable-relation-json/v1",
         .corpus_digest = relation.raw_digest,
-        .corpus_files = 1,
+        .corpus_files = files_opened,
         .corpus_sessions = 0,
-        .files_opened = 1,
+        .files_opened = files_opened,
         .bytes_read = relation.input_bytes,
     };
+}
+
+fn externalInputIsStdin(specs: []const []const u8) bool {
+    if (specs.len != 1) return false;
+    const separator = std.mem.indexOfScalar(u8, specs[0], '=') orelse
+        return false;
+    return std.mem.eql(u8, specs[0][separator + 1 ..], "-");
 }
 
 fn observationLimitations(
@@ -1512,7 +1543,13 @@ fn emitCapabilities(argv: []const []const u8) !u8 {
     try stdout_writer.interface.print(
         "],\"renderers\":[\"json\"],\"cache_format\":{d}," ++
             "\"limits\":{{\"max_output_cells\":{d}}}," ++
-            "\"result_schemas\":[\"seq-observation-result/v1\"]}}\n",
+            "\"result_schemas\":[\"seq-capabilities/v1\"," ++
+            "\"seq-command-error/v1\"," ++
+            "\"seq-definition-check-result/v1\"," ++
+            "\"seq-definition-description/v1\"," ++
+            "\"seq-index-result/v1\"," ++
+            "\"seq-observation-plan/v1\"," ++
+            "\"seq-observation-result/v1\"]}}\n",
         .{ definition_core.cache.format_version, max_output_cells },
     );
     return 0;
@@ -1623,9 +1660,8 @@ fn isHelp(token: []const u8) bool {
         std.mem.eql(u8, token, "--help");
 }
 
-fn containsHelp(argv: []const []const u8) bool {
-    for (argv) |token| if (isHelp(token)) return true;
-    return false;
+fn isOnlyHelp(argv: []const []const u8) bool {
+    return argv.len == 1 and isHelp(argv[0]);
 }
 
 fn isVersion(token: []const u8) bool {
