@@ -116,6 +116,10 @@ write_seq_build() {
   printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
 }
 
+write_ledger_build() {
+  printf 'const ledger_root = "apps/ledger/src/v2/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void {}\n' >build.zig
+}
+
 write_seq_strip_build() {
   printf 'const seq_root = "apps/seq/src/v1/main.zig";\nconst img_meta = "apps/img/VERSION";\npub fn build() void { _ = .{ .strip = optimize == .ReleaseFast, seq_root }; }\n' >build.zig
 }
@@ -130,6 +134,10 @@ write_mixed_seq_unknown_build() {
 
 write_definition_package_path() {
   printf '.{ .paths = .{"libs/definition_core/src"}, }\n' >build.zig.zon
+}
+
+write_ledger_package_path() {
+  printf '.{ .paths = .{"apps/ledger/src/v2"}, }\n' >build.zig.zon
 }
 
 write_unknown_package_change() {
@@ -182,10 +190,12 @@ assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
+assert_affected cas,ledger write_ledger_build
 assert_affected seq write_seq_strip_build
 assert_affected img move_build_line
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_mixed_seq_unknown_build
 assert_affected seq,cas,ledger write_definition_package_path
+assert_affected cas,ledger write_ledger_package_path
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_change
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app

@@ -66,6 +66,9 @@ case "$mode" in
         token=${app//-/_}
         if grep -Eqi "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
           mark_app "$app"
+          if [[ "$app" == ledger ]]; then
+            mark_app cas
+          fi
           matched=0
         fi
       done
@@ -270,6 +273,9 @@ case "$mode" in
             for app in "${apps[@]}"; do
               if [[ "$raw" == *"\"apps/$app/"* ]]; then
                 mark_app "$app"
+                if [[ "$app" == ledger ]]; then
+                  mark_app cas
+                fi
                 matched=1
               fi
             done
