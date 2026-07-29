@@ -3028,7 +3028,11 @@ fn appendSourceDeepMetrics(
         .{},
     );
     defer parsed.deinit();
-    try validateSharedDriverArtifact(parsed.value, case_cfg);
+    try validateSharedDriverArtifact(
+        parsed.value,
+        case_cfg,
+        driver.product_source_sha,
+    );
     const metrics = parsed.value.object.get("metrics") orelse
         return error.InvalidData;
     const raw_samples = metrics.object.get("samples_ns") orelse
@@ -3079,6 +3083,7 @@ fn validateCaptureAcknowledgment(
 fn validateSharedDriverArtifact(
     artifact: std.json.Value,
     case_cfg: DeepCase,
+    product_source_sha: []const u8,
 ) !void {
     const object = switch (artifact) {
         .object => |value| value,
@@ -3103,9 +3108,15 @@ fn validateSharedDriverArtifact(
         object,
         "schema_version",
     );
+    const source_matches = std.mem.eql(u8, git_sha, "unknown") or
+        (git_sha.len > 0 and std.mem.startsWith(
+            u8,
+            product_source_sha,
+            git_sha,
+        ));
     if (!std.mem.eql(u8, case_id, case_cfg.descriptor.case_id) or
         !std.mem.eql(u8, binary, case_cfg.descriptor.binary) or
-        !std.mem.eql(u8, git_sha, "unknown") or schema_version != 1)
+        !source_matches or schema_version != 1)
     {
         return error.DeepArtifactIdentityMismatch;
     }
@@ -6134,17 +6145,39 @@ test "shared deep artifact identity is exact" {
         .{},
     );
     defer parsed.deinit();
-    try validateSharedDriverArtifact(parsed.value, case_cfg);
+    const product_source_sha =
+        "abcdef0123456789abcdef0123456789abcdef01";
+    try validateSharedDriverArtifact(
+        parsed.value,
+        case_cfg,
+        product_source_sha,
+    );
+    parsed.value.object.getPtr("git_sha").?.* = .{
+        .string = product_source_sha[0..12],
+    };
+    try validateSharedDriverArtifact(
+        parsed.value,
+        case_cfg,
+        product_source_sha,
+    );
     parsed.value.object.getPtr("git_sha").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(parsed.value, case_cfg),
+        validateSharedDriverArtifact(
+            parsed.value,
+            case_cfg,
+            product_source_sha,
+        ),
     );
     parsed.value.object.getPtr("git_sha").?.* = .{ .string = "unknown" };
     parsed.value.object.getPtr("case_id").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(parsed.value, case_cfg),
+        validateSharedDriverArtifact(
+            parsed.value,
+            case_cfg,
+            product_source_sha,
+        ),
     );
     parsed.value.object.getPtr("case_id").?.* = .{
         .string = case_cfg.descriptor.case_id,
@@ -6152,7 +6185,11 @@ test "shared deep artifact identity is exact" {
     parsed.value.object.getPtr("binary").?.* = .{ .string = "other" };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(parsed.value, case_cfg),
+        validateSharedDriverArtifact(
+            parsed.value,
+            case_cfg,
+            product_source_sha,
+        ),
     );
     parsed.value.object.getPtr("binary").?.* = .{
         .string = case_cfg.descriptor.binary,
@@ -6160,7 +6197,11 @@ test "shared deep artifact identity is exact" {
     parsed.value.object.getPtr("schema_version").?.* = .{ .integer = 2 };
     try std.testing.expectError(
         error.DeepArtifactIdentityMismatch,
-        validateSharedDriverArtifact(parsed.value, case_cfg),
+        validateSharedDriverArtifact(
+            parsed.value,
+            case_cfg,
+            product_source_sha,
+        ),
     );
 }
 
