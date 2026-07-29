@@ -2812,21 +2812,34 @@ pub fn recoverTransaction(
         format == .legacy and
         parsed.state == .committed and
         fileExists(commit_marker_path);
-    var recovery_locks = acquireTransactionRecoveryLocks(
+    if (legacy_terminal) {
+        try ensureLegacyTerminalLeasesQuiescent(
+            allocator,
+            parsed.expected,
+            parsed.owner,
+        );
+        return makeRecoveryReceipt(
+            allocator,
+            parsed.transaction_id,
+            .already_committed,
+            "already_committed",
+        );
+    }
+    var legacy_leases = if (format == .legacy)
+        try acquireLegacyTransactionRecoveryLeases(
+            allocator,
+            parsed.expected,
+            parsed.owner,
+        )
+    else
+        null;
+    defer if (legacy_leases) |*leases| {
+        releaseLegacyTransactionRecoveryLeases(allocator, leases);
+    };
+    var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
         parsed.expected,
-    ) catch |err| switch (err) {
-        error.FileNotFound => if (legacy_terminal)
-            return makeRecoveryReceipt(
-                allocator,
-                parsed.transaction_id,
-                .already_committed,
-                "already_committed",
-            )
-        else
-            return err,
-        else => return err,
-    };
+    );
     defer recovery_locks.deinit(allocator);
     const status = try inspectTransaction(allocator, transaction_dir);
     defer status.deinit(allocator);
@@ -2940,6 +2953,139 @@ pub fn recoverAndCompactTransactions(
     }
 }
 
+fn acquireLegacyTransactionRecoveryLeases(
+    allocator: std.mem.Allocator,
+    expected: []const TransactionExpected,
+    owner: Owner,
+) ![]LeaseLock {
+    const leases = try allocator.alloc(LeaseLock, expected.len);
+    var acquired: usize = 0;
+    errdefer {
+        var index: usize = acquired;
+        while (index > 0) {
+            index -= 1;
+            releaseLease(
+                allocator,
+                &leases[index],
+                leases[index].fencing_token,
+            ) catch leases[index].deinit(allocator);
+        }
+        allocator.free(leases);
+    }
+    for (expected) |row| {
+        const parent = std.fs.path.dirname(row.path) orelse
+            return error.InvalidPath;
+        const stat = try std.Io.Dir.cwd().statFile(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        );
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+        if (stat.kind != .directory) return error.InvalidPath;
+    }
+    for (expected) |row| {
+        leases[acquired] = acquireLeaseLock(
+            allocator,
+            row.path,
+            .{ .owner = owner },
+        ) catch |err| switch (err) {
+            error.LockBusy => retry: {
+                const lock_path = try lockPathAlloc(allocator, row.path);
+                defer allocator.free(lock_path);
+                var current = readLeaseLock(
+                    allocator,
+                    lock_path,
+                ) catch |read_err| switch (read_err) {
+                    error.FileNotFound => break :retry try acquireLeaseLock(
+                        allocator,
+                        row.path,
+                        .{ .owner = owner },
+                    ),
+                    else => return read_err,
+                };
+                defer current.deinit(allocator);
+                if (!std.mem.eql(u8, current.resource, row.path)) {
+                    return error.TransactionCorrupt;
+                }
+                const expires_ms = try parseU64Text(current.expires_at);
+                if (clockMillis(.real) < expires_ms) return error.LockBusy;
+                const receipt = try reclaimExpiredLease(
+                    allocator,
+                    row.path,
+                    .{ .owner = owner },
+                );
+                defer {
+                    allocator.free(receipt.lock_id);
+                    allocator.free(receipt.resource);
+                    allocator.free(receipt.result);
+                }
+                break :retry try acquireLeaseLock(
+                    allocator,
+                    row.path,
+                    .{ .owner = owner },
+                );
+            },
+            else => return err,
+        };
+        acquired += 1;
+    }
+    return leases;
+}
+
+fn ensureLegacyTerminalLeasesQuiescent(
+    allocator: std.mem.Allocator,
+    expected: []const TransactionExpected,
+    owner: Owner,
+) !void {
+    for (expected) |row| {
+        const lock_path = try lockPathAlloc(allocator, row.path);
+        defer allocator.free(lock_path);
+        var current = readLeaseLock(
+            allocator,
+            lock_path,
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer current.deinit(allocator);
+        if (!std.mem.eql(u8, current.resource, row.path)) {
+            return error.TransactionCorrupt;
+        }
+        const expires_ms = try parseU64Text(current.expires_at);
+        if (clockMillis(.real) < expires_ms) return error.LockBusy;
+        const receipt = reclaimExpiredLease(
+            allocator,
+            row.path,
+            .{ .owner = owner },
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer {
+            allocator.free(receipt.lock_id);
+            allocator.free(receipt.resource);
+            allocator.free(receipt.result);
+        }
+    }
+}
+
+fn releaseLegacyTransactionRecoveryLeases(
+    allocator: std.mem.Allocator,
+    leases: *[]LeaseLock,
+) void {
+    var index: usize = leases.len;
+    while (index > 0) {
+        index -= 1;
+        releaseLease(
+            allocator,
+            &leases.*[index],
+            leases.*[index].fencing_token,
+        ) catch leases.*[index].deinit(allocator);
+    }
+    allocator.free(leases.*);
+    leases.* = &.{};
+}
+
 fn transactionControlRoot(transaction_dir: []const u8) ![]const u8 {
     const transactions_dir = std.fs.path.dirname(transaction_dir) orelse
         return error.InvalidPath;
@@ -2998,6 +3144,28 @@ fn validateTransactionRecordScope(
         };
         if (!std.mem.eql(u8, row.staged_ref, expected_name)) {
             return error.TransactionCorrupt;
+        }
+        for (parsed.expected) |expected| {
+            if (std.mem.eql(
+                u8,
+                std.fs.path.dirname(expected.path) orelse "",
+                transaction_dir,
+            ) and std.mem.eql(
+                u8,
+                std.fs.path.basename(expected.path),
+                row.staged_ref,
+            )) return error.TransactionCorrupt;
+        }
+        for (parsed.writes) |sibling| {
+            if (std.mem.eql(
+                u8,
+                std.fs.path.dirname(sibling.path) orelse "",
+                transaction_dir,
+            ) and std.mem.eql(
+                u8,
+                std.fs.path.basename(sibling.path),
+                row.staged_ref,
+            )) return error.TransactionCorrupt;
         }
         if (format == .legacy) continue;
         for (parsed.expected) |expected| {
@@ -7057,9 +7225,25 @@ test "committed legacy journals validate legacy stages and compact terminal reco
     );
     try writeCommittedTransactionMarker(allocator, commit_marker_path);
     try std.Io.Dir.cwd().deleteTree(Io.io(), removed_target_parent);
+    var expired_lease = try acquireLeaseLock(
+        allocator,
+        target_path,
+        .{
+            .owner = .{
+                .process_id = 906,
+                .session_id = "legacy-committed-compatibility",
+                .executor = "test",
+            },
+            .lease_ms = 1,
+        },
+    );
+    defer expired_lease.deinit(allocator);
+    std.Io.sleep(Io.io(), .fromMilliseconds(3), .awake) catch {};
 
     try recoverAndCompactTransactions(allocator, transactions_dir);
     try std.testing.expect(!fileExists(transaction_dir));
+    try std.testing.expect(!fileExists(expired_lease.path));
+    try std.testing.expect(!fileExists(removed_target_parent));
     const after = try tryReadForTest(target_path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings(content, after);
@@ -7110,11 +7294,113 @@ test "prepared legacy journals recover under legacy stage names" {
         after,
     );
 
+    {
+        var legacy_lease = try acquireLeaseLock(
+            allocator,
+            target_path,
+            .{
+                .owner = .{
+                    .process_id = 908,
+                    .session_id = "legacy-pre-marker",
+                    .executor = "test",
+                },
+                .lease_ms = 60_000,
+            },
+        );
+        defer releaseLease(
+            allocator,
+            &legacy_lease,
+            legacy_lease.fencing_token,
+        ) catch {};
+        try std.testing.expectError(
+            error.LockBusy,
+            recoverAndCompactTransactions(allocator, transactions_dir),
+        );
+        try std.testing.expect(fileExists(transaction_dir));
+        const unchanged = try tryReadForTest(target_path);
+        defer allocator.free(unchanged);
+        try std.testing.expectEqualStrings(before, unchanged);
+    }
+
     try recoverAndCompactTransactions(allocator, transactions_dir);
     try std.testing.expect(!fileExists(transaction_dir));
     const recovered = try tryReadForTest(target_path);
     defer allocator.free(recovered);
     try std.testing.expectEqualStrings(after, recovered);
+}
+
+test "legacy journals reject targets that alias their stage files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_id = "dtx-3";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const staged_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "write-0.staged" },
+    );
+    defer allocator.free(staged_path);
+    const before = "{\"seq\":1}\n";
+    const after = "{\"seq\":2}\n";
+    try writeTextAtomic(allocator, staged_path, before);
+    const digest_before = try digestBytesAlloc(allocator, before);
+    defer allocator.free(digest_before);
+    const digest_after = try digestBytesAlloc(allocator, after);
+    defer allocator.free(digest_after);
+    const expected = [_]TransactionExpected{.{
+        .path = staged_path,
+        .digest = digest_before,
+        .sequence = 1,
+    }};
+    const writes = [_]TransactionWrite{.{
+        .path = staged_path,
+        .staged_ref = "write-0.staged",
+        .digest_after = digest_after,
+        .sequence_after = 2,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 909,
+            .session_id = "legacy-stage-alias",
+            .executor = "test",
+        },
+        .prepared,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        recoverAndCompactTransactions(allocator, transactions_dir),
+    );
+    try std.testing.expect(fileExists(transaction_dir));
+    const unchanged = try tryReadForTest(staged_path);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(before, unchanged);
 }
 
 test "committed current journals retain strict scope and writer locks" {
