@@ -296,9 +296,15 @@ const TransactionPaths = struct {
         if (require_revisions) {
             try durable_store.ensureDirectoryPathNoSymlinks(self.revisions);
         }
-        try durable_store.recoverAndCompactTransactions(
+        const counter_path = try std.fs.path.join(
+            allocator,
+            &.{ self.ledger_root, ".fencing.counter" },
+        );
+        defer allocator.free(counter_path);
+        try durable_store.recoverAndCompactTransactionsWithOptions(
             allocator,
             self.transactions,
+            .{ .legacy_fencing_counter_path = counter_path },
         );
         try durable_store.ensureNoPendingTransactions(
             allocator,

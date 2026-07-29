@@ -884,6 +884,11 @@ pub const AcquireOptions = struct {
     reject_symlinks: bool = true,
 };
 
+pub const TransactionRecoveryOptions = struct {
+    /// Must match the counter authority used by legacy transaction writers.
+    legacy_fencing_counter_path: ?[]const u8 = null,
+};
+
 pub const LeaseLock = struct {
     lock_id: []const u8,
     resource: []const u8,
@@ -2727,6 +2732,7 @@ pub fn inspectTransaction(
     defer parsed.deinit(allocator);
     const format = try transactionRecordFormat(parsed.transaction_id);
     try validateTransactionRecordScope(
+        allocator,
         control_root,
         transaction_dir,
         parsed,
@@ -2788,6 +2794,18 @@ pub fn recoverTransaction(
     allocator: std.mem.Allocator,
     transaction_dir: []const u8,
 ) !RecoveryReceipt {
+    return recoverTransactionWithOptions(
+        allocator,
+        transaction_dir,
+        .{},
+    );
+}
+
+pub fn recoverTransactionWithOptions(
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+    options: TransactionRecoveryOptions,
+) !RecoveryReceipt {
     const control_root = try transactionControlRoot(transaction_dir);
     const record_path = try std.fs.path.join(
         allocator,
@@ -2803,6 +2821,7 @@ pub fn recoverTransaction(
     defer parsed.deinit(allocator);
     const format = try transactionRecordFormat(parsed.transaction_id);
     try validateTransactionRecordScope(
+        allocator,
         control_root,
         transaction_dir,
         parsed,
@@ -2817,6 +2836,7 @@ pub fn recoverTransaction(
             allocator,
             parsed.expected,
             parsed.owner,
+            options.legacy_fencing_counter_path,
         );
         return makeRecoveryReceipt(
             allocator,
@@ -2830,6 +2850,7 @@ pub fn recoverTransaction(
             allocator,
             parsed.expected,
             parsed.owner,
+            options.legacy_fencing_counter_path,
         )
     else
         null;
@@ -2846,6 +2867,12 @@ pub fn recoverTransaction(
     switch (status.decision) {
         .already_committed => return makeRecoveryReceipt(allocator, parsed.transaction_id, .already_committed, "already_committed"),
         .finish_commit => {
+            try validateRollForwardTransaction(
+                allocator,
+                control_root,
+                transaction_dir,
+                parsed,
+            );
             try rollForwardTransaction(
                 allocator,
                 control_root,
@@ -2881,6 +2908,18 @@ pub fn recoverTransaction(
 pub fn recoverAndCompactTransactions(
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
+) !void {
+    return recoverAndCompactTransactionsWithOptions(
+        allocator,
+        transactions_dir,
+        .{},
+    );
+}
+
+pub fn recoverAndCompactTransactionsWithOptions(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    options: TransactionRecoveryOptions,
 ) !void {
     const max_entries: usize = 4096;
     const max_record_bytes: usize = 16 * 1024 * 1024;
@@ -2946,7 +2985,11 @@ pub fn recoverAndCompactTransactions(
         ) catch return error.FileTooBig;
         if (record_bytes > max_record_bytes) return error.FileTooBig;
 
-        var receipt = try recoverTransaction(allocator, transaction_dir);
+        var receipt = try recoverTransactionWithOptions(
+            allocator,
+            transaction_dir,
+            options,
+        );
         receipt.deinit(allocator);
         try std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir);
         try syncDirectoryHandle(&dir);
@@ -2957,6 +3000,7 @@ fn acquireLegacyTransactionRecoveryLeases(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
     owner: Owner,
+    fencing_counter_path: ?[]const u8,
 ) ![]LeaseLock {
     const leases = try allocator.alloc(LeaseLock, expected.len);
     var acquired: usize = 0;
@@ -2987,7 +3031,10 @@ fn acquireLegacyTransactionRecoveryLeases(
         leases[acquired] = acquireLeaseLock(
             allocator,
             row.path,
-            .{ .owner = owner },
+            .{
+                .owner = owner,
+                .fencing_counter_path = fencing_counter_path,
+            },
         ) catch |err| switch (err) {
             error.LockBusy => retry: {
                 const lock_path = try lockPathAlloc(allocator, row.path);
@@ -2999,7 +3046,10 @@ fn acquireLegacyTransactionRecoveryLeases(
                     error.FileNotFound => break :retry try acquireLeaseLock(
                         allocator,
                         row.path,
-                        .{ .owner = owner },
+                        .{
+                            .owner = owner,
+                            .fencing_counter_path = fencing_counter_path,
+                        },
                     ),
                     else => return read_err,
                 };
@@ -3012,7 +3062,10 @@ fn acquireLegacyTransactionRecoveryLeases(
                 const receipt = try reclaimExpiredLease(
                     allocator,
                     row.path,
-                    .{ .owner = owner },
+                    .{
+                        .owner = owner,
+                        .fencing_counter_path = fencing_counter_path,
+                    },
                 );
                 defer {
                     allocator.free(receipt.lock_id);
@@ -3022,7 +3075,10 @@ fn acquireLegacyTransactionRecoveryLeases(
                 break :retry try acquireLeaseLock(
                     allocator,
                     row.path,
-                    .{ .owner = owner },
+                    .{
+                        .owner = owner,
+                        .fencing_counter_path = fencing_counter_path,
+                    },
                 );
             },
             else => return err,
@@ -3036,6 +3092,7 @@ fn ensureLegacyTerminalLeasesQuiescent(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
     owner: Owner,
+    fencing_counter_path: ?[]const u8,
 ) !void {
     for (expected) |row| {
         const lock_path = try lockPathAlloc(allocator, row.path);
@@ -3056,7 +3113,10 @@ fn ensureLegacyTerminalLeasesQuiescent(
         const receipt = reclaimExpiredLease(
             allocator,
             row.path,
-            .{ .owner = owner },
+            .{
+                .owner = owner,
+                .fencing_counter_path = fencing_counter_path,
+            },
         ) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -3107,6 +3167,7 @@ fn transactionRecordFormat(
 }
 
 fn validateTransactionRecordScope(
+    allocator: std.mem.Allocator,
     control_root: []const u8,
     transaction_dir: []const u8,
     parsed: ParsedTransactionRecord,
@@ -3127,9 +3188,19 @@ fn validateTransactionRecordScope(
     }
     for (parsed.expected) |row| {
         _ = try pathRelativeToControlRoot(control_root, row.path);
+        if (try pathIsWithinTransactionDirectory(
+            allocator,
+            transaction_dir,
+            row.path,
+        )) return error.TransactionCorrupt;
     }
     for (parsed.writes, 0..) |row, write_index| {
         _ = try pathRelativeToControlRoot(control_root, row.path);
+        if (try pathIsWithinTransactionDirectory(
+            allocator,
+            transaction_dir,
+            row.path,
+        )) return error.TransactionCorrupt;
         var expected_name_buffer: [96]u8 = undefined;
         const expected_name = switch (format) {
             .current => try transactionStageName(
@@ -3144,28 +3215,6 @@ fn validateTransactionRecordScope(
         };
         if (!std.mem.eql(u8, row.staged_ref, expected_name)) {
             return error.TransactionCorrupt;
-        }
-        for (parsed.expected) |expected| {
-            if (std.mem.eql(
-                u8,
-                std.fs.path.dirname(expected.path) orelse "",
-                transaction_dir,
-            ) and std.mem.eql(
-                u8,
-                std.fs.path.basename(expected.path),
-                row.staged_ref,
-            )) return error.TransactionCorrupt;
-        }
-        for (parsed.writes) |sibling| {
-            if (std.mem.eql(
-                u8,
-                std.fs.path.dirname(sibling.path) orelse "",
-                transaction_dir,
-            ) and std.mem.eql(
-                u8,
-                std.fs.path.basename(sibling.path),
-                row.staged_ref,
-            )) return error.TransactionCorrupt;
         }
         if (format == .legacy) continue;
         for (parsed.expected) |expected| {
@@ -3183,6 +3232,45 @@ fn validateTransactionRecordScope(
             )) return error.TransactionCorrupt;
         }
     }
+}
+
+fn pathIsWithinTransactionDirectory(
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+    path: []const u8,
+) !bool {
+    if (pathIsAtOrBelow(transaction_dir, path)) return true;
+    const canonical_transaction_dir = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        transaction_dir,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(canonical_transaction_dir);
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    const canonical_parent = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        parent,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(canonical_parent);
+    return pathIsAtOrBelow(
+        canonical_transaction_dir,
+        canonical_parent,
+    );
+}
+
+fn pathIsAtOrBelow(parent: []const u8, candidate: []const u8) bool {
+    return std.mem.eql(u8, parent, candidate) or
+        (candidate.len > parent.len and
+            std.mem.startsWith(u8, candidate, parent) and
+            (candidate[parent.len] == '/' or
+                candidate[parent.len] == '\\'));
 }
 
 fn isGeneratedTransactionId(transaction_id: []const u8) bool {
@@ -3385,6 +3473,61 @@ fn rollForwardTransaction(
         try stage_dir.deleteFile(Io.io(), write.staged_ref);
         try syncDirectoryHandle(&stage_dir);
         try target.verifyPathIdentity();
+    }
+}
+
+fn validateRollForwardTransaction(
+    allocator: std.mem.Allocator,
+    control_root: []const u8,
+    transaction_dir: []const u8,
+    parsed: ParsedTransactionRecord,
+) !void {
+    var stage_dir = if (std.fs.path.isAbsolute(transaction_dir))
+        try std.Io.Dir.openDirAbsolute(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        });
+    defer stage_dir.close(Io.io());
+    for (parsed.writes) |write| {
+        var target = try TransactionTarget.init(control_root, write.path);
+        defer target.deinit();
+        try target.verifyPathIdentity();
+        const current = digestRegularFileNoSymlinkAtAlloc(
+            allocator,
+            &target.dir,
+            target.base,
+            transaction_recovery_max_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (current) |digest| allocator.free(digest);
+        if (current) |digest| {
+            if (std.mem.eql(u8, digest, write.digest_after)) continue;
+            if (!digestMatchesExpectedBefore(
+                write.path,
+                digest,
+                parsed.expected,
+            )) return error.TransactionRecoveryRequired;
+        } else if (!expectedMissingBefore(write.path, parsed.expected)) {
+            return error.TransactionRecoveryRequired;
+        }
+        const staged_digest = digestRegularFileNoSymlinkAtAlloc(
+            allocator,
+            &stage_dir,
+            write.staged_ref,
+            transaction_recovery_max_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.TransactionRecoveryRequired,
+            else => return err,
+        };
+        defer allocator.free(staged_digest);
+        if (!std.mem.eql(u8, staged_digest, write.digest_after)) {
+            return error.TransactionCorrupt;
+        }
     }
 }
 
@@ -7225,6 +7368,12 @@ test "committed legacy journals validate legacy stages and compact terminal reco
     );
     try writeCommittedTransactionMarker(allocator, commit_marker_path);
     try std.Io.Dir.cwd().deleteTree(Io.io(), removed_target_parent);
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, ".fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    try writeTextAtomic(allocator, counter_path, "10\n");
     var expired_lease = try acquireLeaseLock(
         allocator,
         target_path,
@@ -7235,12 +7384,17 @@ test "committed legacy journals validate legacy stages and compact terminal reco
                 .executor = "test",
             },
             .lease_ms = 1,
+            .fencing_counter_path = counter_path,
         },
     );
     defer expired_lease.deinit(allocator);
-    std.Io.sleep(Io.io(), .fromMilliseconds(3), .awake) catch {};
+    try std.Io.sleep(Io.io(), .fromMilliseconds(3), .awake);
 
-    try recoverAndCompactTransactions(allocator, transactions_dir);
+    try recoverAndCompactTransactionsWithOptions(
+        allocator,
+        transactions_dir,
+        .{ .legacy_fencing_counter_path = counter_path },
+    );
     try std.testing.expect(!fileExists(transaction_dir));
     try std.testing.expect(!fileExists(expired_lease.path));
     try std.testing.expect(!fileExists(removed_target_parent));
@@ -7311,7 +7465,12 @@ test "prepared legacy journals recover under legacy stage names" {
             allocator,
             &legacy_lease,
             legacy_lease.fencing_token,
-        ) catch {};
+        ) catch |release_error| {
+            std.debug.panic(
+                "failed to release legacy lease: {s}",
+                .{@errorName(release_error)},
+            );
+        };
         try std.testing.expectError(
             error.LockBusy,
             recoverAndCompactTransactions(allocator, transactions_dir),
@@ -7329,7 +7488,66 @@ test "prepared legacy journals recover under legacy stage names" {
     try std.testing.expectEqualStrings(after, recovered);
 }
 
-test "legacy journals reject targets that alias their stage files" {
+test "legacy roll-forward validates every target before publishing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "dtx-4" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const target_a = try std.fs.path.join(
+        allocator,
+        &.{ root, "a.jsonl" },
+    );
+    defer allocator.free(target_a);
+    const target_b = try std.fs.path.join(
+        allocator,
+        &.{ root, "b.jsonl" },
+    );
+    defer allocator.free(target_b);
+    const before = "{\"seq\":1}\n";
+    try writeTextAtomic(allocator, target_a, before);
+    try writeTextAtomic(allocator, target_b, before);
+    try writePreparedTwoWriteRecordForTest(
+        allocator,
+        record_path,
+        "dtx-4",
+        .{
+            .process_id = 910,
+            .session_id = "legacy-preflight",
+            .executor = "test",
+        },
+        target_a,
+        target_b,
+    );
+    try std.Io.Dir.deleteFileAbsolute(Io.io(), target_b);
+
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        recoverAndCompactTransactions(allocator, transactions_dir),
+    );
+    try std.testing.expect(fileExists(transaction_dir));
+    const unchanged = try tryReadForTest(target_a);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualStrings(before, unchanged);
+}
+
+test "legacy journals reject filesystem aliases into their directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -7352,6 +7570,27 @@ test "legacy journals reject targets that alias their stage files" {
         &.{ transaction_dir, "transaction.json" },
     );
     defer allocator.free(record_path);
+    const transaction_alias = try std.fs.path.join(
+        allocator,
+        &.{ root, "transaction-alias" },
+    );
+    defer allocator.free(transaction_alias);
+    try std.Io.Dir.cwd().symLink(
+        Io.io(),
+        transaction_dir,
+        transaction_alias,
+        .{ .is_directory = true },
+    );
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_alias, "victim.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const actual_target_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "victim.jsonl" },
+    );
+    defer allocator.free(actual_target_path);
     const staged_path = try std.fs.path.join(
         allocator,
         &.{ transaction_dir, "write-0.staged" },
@@ -7359,18 +7598,19 @@ test "legacy journals reject targets that alias their stage files" {
     defer allocator.free(staged_path);
     const before = "{\"seq\":1}\n";
     const after = "{\"seq\":2}\n";
-    try writeTextAtomic(allocator, staged_path, before);
+    try writeTextAtomic(allocator, actual_target_path, before);
+    try writeTextAtomic(allocator, staged_path, after);
     const digest_before = try digestBytesAlloc(allocator, before);
     defer allocator.free(digest_before);
     const digest_after = try digestBytesAlloc(allocator, after);
     defer allocator.free(digest_after);
     const expected = [_]TransactionExpected{.{
-        .path = staged_path,
+        .path = target_path,
         .digest = digest_before,
         .sequence = 1,
     }};
     const writes = [_]TransactionWrite{.{
-        .path = staged_path,
+        .path = target_path,
         .staged_ref = "write-0.staged",
         .digest_after = digest_after,
         .sequence_after = 2,
@@ -7398,7 +7638,7 @@ test "legacy journals reject targets that alias their stage files" {
         recoverAndCompactTransactions(allocator, transactions_dir),
     );
     try std.testing.expect(fileExists(transaction_dir));
-    const unchanged = try tryReadForTest(staged_path);
+    const unchanged = try tryReadForTest(target_path);
     defer allocator.free(unchanged);
     try std.testing.expectEqualStrings(before, unchanged);
 }
@@ -7562,6 +7802,7 @@ test "transaction records reject non-reserved and target-aliased stages" {
     try std.testing.expectError(
         error.TransactionCorrupt,
         validateTransactionRecordScope(
+            std.testing.allocator,
             "/repo/.ledger",
             "/repo/.ledger/transactions/dtx-1-00000000000000000000000000000002",
             .{
@@ -7580,6 +7821,7 @@ test "transaction records reject non-reserved and target-aliased stages" {
     try std.testing.expectError(
         error.TransactionCorrupt,
         validateTransactionRecordScope(
+            std.testing.allocator,
             "/repo/.ledger",
             "/repo/.ledger/transactions/dtx-1-00000000000000000000000000000002",
             .{
@@ -7603,6 +7845,7 @@ test "transaction records reject non-reserved and target-aliased stages" {
     try std.testing.expectError(
         error.TransactionCorrupt,
         validateTransactionRecordScope(
+            std.testing.allocator,
             "/repo/.ledger",
             "/repo/.ledger/transactions/dtx-1",
             .{
@@ -9372,20 +9615,11 @@ fn writePreparedRecordForTest(
         .digest = digest_before,
         .sequence = (try jsonlSequenceRequired(allocator, before)).?,
     }};
-    const staged_ref = switch (try transactionRecordFormat(transaction_id)) {
-        .current => try transactionStageNameAlloc(
-            allocator,
-            transaction_id,
-            0,
-        ),
-        .legacy => legacy: {
-            var legacy_buffer: [96]u8 = undefined;
-            break :legacy try allocator.dupe(
-                u8,
-                try legacyTransactionStageName(&legacy_buffer, 0),
-            );
-        },
-    };
+    const staged_ref = try transactionRecordStageNameAlloc(
+        allocator,
+        transaction_id,
+        0,
+    );
     defer allocator.free(staged_ref);
     const writes = [_]TransactionWrite{.{
         .path = path,
@@ -9430,13 +9664,13 @@ fn writePreparedTwoWriteRecordForTest(
             .sequence = 1,
         },
     };
-    const staged_ref_a = try transactionStageNameAlloc(
+    const staged_ref_a = try transactionRecordStageNameAlloc(
         allocator,
         transaction_id,
         0,
     );
     defer allocator.free(staged_ref_a);
-    const staged_ref_b = try transactionStageNameAlloc(
+    const staged_ref_b = try transactionRecordStageNameAlloc(
         allocator,
         transaction_id,
         1,
@@ -9483,6 +9717,27 @@ fn writePreparedTwoWriteRecordForTest(
         2,
         true,
     );
+}
+
+fn transactionRecordStageNameAlloc(
+    allocator: std.mem.Allocator,
+    transaction_id: []const u8,
+    write_index: usize,
+) ![]u8 {
+    return switch (try transactionRecordFormat(transaction_id)) {
+        .current => transactionStageNameAlloc(
+            allocator,
+            transaction_id,
+            write_index,
+        ),
+        .legacy => legacy: {
+            var buffer: [96]u8 = undefined;
+            break :legacy allocator.dupe(
+                u8,
+                try legacyTransactionStageName(&buffer, write_index),
+            );
+        },
+    };
 }
 
 fn tryReadForTest(path: []const u8) ![]u8 {
