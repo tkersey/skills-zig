@@ -104,7 +104,8 @@ pub fn help(command: Command) []const u8 {
         \\
         ,
         .index =>
-        \\usage: seq index [rebuild] [--root <dir>] [--format json|text]
+        \\usage: seq index [build|refresh|status] [--root <dir>]
+        \\  [--format json]
         \\
         ,
     };
@@ -1767,7 +1768,13 @@ pub fn resolveTargetPaths(
     else
         null;
     if (exact_session_id == null) {
-        retainCanonicalRolloutWindow(allocator, &paths, options);
+        retainCanonicalRolloutWindow(
+            allocator,
+            io,
+            &paths,
+            options,
+            options.root == null,
+        );
     }
     if (exact_session_id) |wanted| {
         retainSessionId(allocator, &paths, wanted);
@@ -1781,13 +1788,24 @@ pub fn resolveTargetPaths(
 
 fn retainCanonicalRolloutWindow(
     allocator: std.mem.Allocator,
+    io: std.Io,
     paths: *std.ArrayList([]u8),
     options: Options,
+    live_native_root: bool,
 ) void {
     if (options.since_ms == null and options.until_ms == null) return;
     var write_index: usize = 0;
     for (paths.items) |path| {
-        if (canonicalRolloutPathPassesWindow(path, options)) {
+        const modified_ms: ?i64 = if (live_native_root and
+            options.since_ms != null)
+            modifiedMillis(io, path)
+        else
+            null;
+        if (canonicalRolloutPathPassesWindow(
+            path,
+            options,
+            modified_ms,
+        )) {
             paths.items[write_index] = path;
             write_index += 1;
         } else {
@@ -1797,7 +1815,24 @@ fn retainCanonicalRolloutWindow(
     paths.items.len = write_index;
 }
 
-fn canonicalRolloutPathPassesWindow(path: []const u8, options: Options) bool {
+fn modifiedMillis(io: std.Io, path: []const u8) ?i64 {
+    const stat = std.Io.Dir.cwd().statFile(
+        io,
+        path,
+        .{ .follow_symlinks = false },
+    ) catch return null;
+    if (stat.kind != .file) return null;
+    return std.math.cast(
+        i64,
+        @divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms),
+    );
+}
+
+fn canonicalRolloutPathPassesWindow(
+    path: []const u8,
+    options: Options,
+    modified_ms: ?i64,
+) bool {
     const basename = std.fs.path.basename(path);
     const prefix = "rollout-";
     if (!std.mem.startsWith(u8, basename, prefix) or
@@ -1831,15 +1866,20 @@ fn canonicalRolloutPathPassesWindow(path: []const u8, options: Options) bool {
     ) orelse return true;
     if (compareDates(filename_date, canonical_parent_date) != .eq) return true;
 
-    // Codex partitions rollouts by the local start date while session metadata
-    // is UTC. A two-day margin preserves sessions across timezone and DST
-    // boundaries while avoiding reads from unrelated historical partitions.
+    // A canonical partition is a session-start index. On the live native
+    // source, filesystem modification time is the append frontier: a resumed
+    // session updates it even when its start partition is arbitrarily old.
+    // Imported roots do not carry that source guarantee and remain
+    // conservative by passing no modification frontier.
     const margin_ms: i64 = 2 * std.time.ms_per_day;
     if (options.since_ms) |since| {
         const lower_ms = std.math.sub(i64, since, margin_ms) catch
             return true;
         const lower = seq_time.dateFromUtcTimestampMillis(lower_ms);
-        if (compareDates(filename_date, lower) == .lt) return false;
+        if (compareDates(filename_date, lower) == .lt) {
+            const modified = modified_ms orelse return true;
+            if (modified < lower_ms) return false;
+        }
     }
     if (options.until_ms) |until| {
         const upper_ms = std.math.add(i64, until, margin_ms) catch
@@ -2295,7 +2335,7 @@ test "bounded temporal selectors preserve all possible session directories" {
     );
 }
 
-test "canonical rollout partitions push down distant temporal windows" {
+test "canonical rollout partitions preserve resumed sessions" {
     const options: Options = .{
         .since_ms = seq_time.parseIsoTimestampMillis(
             "2026-07-27T00:00:00Z",
@@ -2304,35 +2344,53 @@ test "canonical rollout partitions push down distant temporal windows" {
             "2026-07-27T23:59:59Z",
         ),
     };
-    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
         options,
+        null,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/07/25/rollout-2026-07-25T23-59-59-margin.jsonl",
         options,
+        null,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/01/renamed.jsonl",
         options,
+        null,
     ));
     try std.testing.expect(canonicalRolloutPathPassesWindow(
         "/sessions/2026/06/02/rollout-2026-06-01T10-00-00-mismatch.jsonl",
         options,
+        null,
+    ));
+    try std.testing.expect(!canonicalRolloutPathPassesWindow(
+        "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-old.jsonl",
+        options,
+        seq_time.parseIsoTimestampMillis(
+            "2026-06-02T00:00:00Z",
+        ),
+    ));
+    try std.testing.expect(canonicalRolloutPathPassesWindow(
+        "/sessions/2026/06/01/rollout-2026-06-01T10-00-00-resumed.jsonl",
+        options,
+        seq_time.parseIsoTimestampMillis(
+            "2026-07-27T12:00:00Z",
+        ),
     ));
 }
 
 test "physical queries select row timestamps across session directories" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "2026/07/26");
+    try tmp.dir.createDirPath(std.testing.io, "2026/07/25");
     try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "2026/07/26/rollout.jsonl",
-        .data = "{\"timestamp\":\"2026-07-26T23:59:00Z\",\"type\":\"session_meta\"," ++
+        .sub_path = "2026/07/25/rollout-2026-07-25T23-59-00-multi-day.jsonl",
+        .data = "{\"timestamp\":\"2026-07-25T23:59:00Z\",\"type\":\"session_meta\"," ++
             "\"payload\":{\"id\":\"multi-day\"}}\n" ++
-            "{\"timestamp\":\"2026-07-26T23:59:30Z\",\"type\":\"event_msg\"," ++
+            "{\"timestamp\":\"2026-07-25T23:59:30Z\",\"type\":\"event_msg\"," ++
             "\"payload\":{\"type\":\"agent_message\",\"message\":\"early\"}}\n" ++
-            "{\"timestamp\":\"2026-07-27T00:01:00Z\",\"type\":\"event_msg\"," ++
+            "{\"timestamp\":\"2026-07-29T00:01:00Z\",\"type\":\"event_msg\"," ++
             "\"payload\":{\"type\":\"agent_message\",\"message\":\"later\"}}\n",
     });
     const root = try tmp.dir.realPathFileAlloc(
@@ -2357,16 +2415,16 @@ test "physical queries select row timestamps across session directories" {
         .{
             .root = root,
             .since_ms = seq_time.parseIsoTimestampMillis(
-                "2026-07-27T00:00:00Z",
+                "2026-07-29T00:00:00Z",
             ),
             .until_ms = seq_time.parseIsoTimestampMillis(
-                "2026-07-27T00:02:00Z",
+                "2026-07-29T00:02:00Z",
             ),
         },
         parsed.value.object,
     );
     try std.testing.expectEqualStrings(
-        "[{\"text\":\"later\",\"timestamp\":\"2026-07-27T00:01:00+00:00\"}]\n",
+        "[{\"text\":\"later\",\"timestamp\":\"2026-07-29T00:01:00+00:00\"}]\n",
         output.written(),
     );
 }
@@ -2599,6 +2657,16 @@ test "native help exposes command-specific required options" {
     );
     try std.testing.expect(
         std.mem.indexOf(u8, help(.find_session), "--prompt") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            help(.index),
+            "[build|refresh|status]",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, help(.index), "json|text") == null,
     );
 }
 

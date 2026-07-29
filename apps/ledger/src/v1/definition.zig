@@ -1629,8 +1629,8 @@ fn parseBounds(object: std.json.ObjectMap) !Bounds {
 
 fn validateBounds(bounds: Bounds) !void {
     if (bounds.max_input_bytes == 0 or bounds.max_input_bytes > 256 * 1024 * 1024 or
-        bounds.max_store_bytes == 0 or bounds.max_store_bytes > 4 * 1024 * 1024 * 1024 or
-        bounds.max_records == 0 or bounds.max_records > 10_000_000 or
+        bounds.max_store_bytes == 0 or bounds.max_store_bytes > 64 * 1024 * 1024 or
+        bounds.max_records == 0 or bounds.max_records > 1_048_576 or
         bounds.max_output_bytes == 0 or bounds.max_output_bytes > 256 * 1024 * 1024 or
         bounds.max_diagnostics == 0 or bounds.max_diagnostics > 1024 or
         bounds.max_reducer_states == 0 or bounds.max_reducer_states > 65_536)

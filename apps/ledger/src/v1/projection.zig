@@ -705,6 +705,7 @@ pub const Stats = struct {
     records_scanned: usize,
     records_matched: usize,
     records_emitted: usize,
+    streamed: bool = false,
 };
 
 pub const Result = struct {
@@ -4710,6 +4711,7 @@ fn executeResolvedStreamProjection(
         .records_scanned = replay_stats.records_validated,
         .records_matched = 0,
         .records_emitted = 0,
+        .streamed = true,
     };
     try writeStreamProjection(
         allocator,

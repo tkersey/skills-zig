@@ -358,13 +358,15 @@ pub fn writeProjectionJson(
     try writer.writeAll(result.payload);
     try writer.print(
         ",\"exit_code\":{d},\"stats\":{{\"records_scanned\":{d}," ++
-            "\"records_matched\":{d},\"records_emitted\":{d}}}," ++
+            "\"records_matched\":{d},\"records_emitted\":{d}," ++
+            "\"streamed\":{}}}," ++
             "\"compile_stats\":",
         .{
             result.exit_code,
             result.stats.records_scanned,
             result.stats.records_matched,
             result.stats.records_emitted,
+            result.stats.streamed,
         },
     );
     try writeCompileStatsJson(writer, compile_stats);

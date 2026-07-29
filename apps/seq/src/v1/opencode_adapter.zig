@@ -4,6 +4,7 @@ const jsonl_core = @import("jsonl_core");
 const physical = @import("physical.zig");
 
 pub const adapter_id = "opencode-prompt-history-jsonl/v1";
+pub const max_record_bytes: usize = 8 * 1024 * 1024;
 
 pub const Metrics = struct {
     bytes_read: usize,
@@ -80,7 +81,10 @@ pub fn feedFileSelected(
         allocator,
         &reader.interface,
         .{
-            .max_line_bytes = max_input_bytes,
+            .max_line_bytes = @min(
+                max_input_bytes,
+                max_record_bytes,
+            ),
             .chunk_observer = .{
                 .context = &digest_observer,
                 .observeFn = DigestObserver.observe,
@@ -1124,6 +1128,16 @@ fn singleSourceEventProgram(
 test "adapter recognizes only the OpenCode prompt-history source" {
     try std.testing.expect(recognizes("/tmp/prompt-history.jsonl"));
     try std.testing.expect(!recognizes("/tmp/rollout.jsonl"));
+}
+
+test "OpenCode record bound is independent from aggregate input" {
+    try std.testing.expect(
+        max_record_bytes < 256 * 1024 * 1024,
+    );
+    try std.testing.expectEqual(
+        max_record_bytes,
+        @min(@as(usize, 256 * 1024 * 1024), max_record_bytes),
+    );
 }
 
 test "OpenCode prompt history streams aggregate input" {

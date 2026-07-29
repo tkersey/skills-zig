@@ -1,5 +1,6 @@
 const std = @import("std");
 const canonical_json = @import("canonical_json.zig");
+const definition_compat = @import("definition_compat");
 
 const package_ancestor_count_max: usize = 256;
 
@@ -888,9 +889,7 @@ fn rejectAbsoluteSymlinkComponents(path: []const u8) !void {
 
 pub fn digestFiles(files: []const ClosureFile) [71]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    // This framing literal is part of the v1 closure-digest ABI. Changing it
-    // would invalidate definition-bound durable history.
-    hasher.update("skill-definition-closure/v1\x00");
+    hasher.update(definition_compat.closure_digest_frame);
     var length_bytes: [8]u8 = undefined;
     for (files) |file| {
         std.mem.writeInt(u64, &length_bytes, @intCast(file.path.len), .big);

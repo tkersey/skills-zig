@@ -56,10 +56,18 @@ pub fn build(b: *std.Build) void {
             .{ .name = "jsonl_core", .module = jsonl_core },
         },
     });
+    const definition_compat = b.createModule(.{
+        .root_source_file = b.path("libs/definition_compat/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const definition_core = b.createModule(.{
         .root_source_file = b.path("libs/definition_core/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "definition_compat", .module = definition_compat },
+        },
     });
     const trace_core = b.createModule(.{
         .root_source_file = b.path("libs/trace_core/src/root.zig"),

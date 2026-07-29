@@ -20,6 +20,7 @@
         "libs/core/src",
         "libs/jsonl_core/src",
         "libs/durable_store/src",
+        "libs/definition_compat/src",
         "libs/definition_core/src",
         "libs/trace_core/src",
     },
