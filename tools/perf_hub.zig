@@ -2111,14 +2111,12 @@ fn runPairedMeasuredCases(
         allocator,
         "paired-baseline",
     );
-    defer if (!retainPairedWorkloads()) cleanupTempRoot(baseline_root);
-    defer allocator.free(baseline_root);
+    defer releaseTempRoot(allocator, baseline_root, retainPairedWorkloads());
     const candidate_root = try makeTempRoot(
         allocator,
         "paired-candidate",
     );
-    defer if (!retainPairedWorkloads()) cleanupTempRoot(candidate_root);
-    defer allocator.free(candidate_root);
+    defer releaseTempRoot(allocator, candidate_root, retainPairedWorkloads());
     try prepareCompatCase(allocator, baseline_case, baseline_root);
     try prepareCompatCase(allocator, candidate_case, candidate_root);
     const baseline_execution = try measuredOutputEvidenceOnce(
@@ -4614,10 +4612,7 @@ fn runChildCapturePosixSpawn(
         try makeTempRoot(allocator, "capture")
     else
         null;
-    defer if (capture_root) |path| {
-        cleanupTempRoot(path);
-        allocator.free(path);
-    };
+    defer if (capture_root) |path| releaseTempRoot(allocator, path, false);
     const capture_path = if (capture_root) |root|
         try std.fs.path.join(allocator, &.{ root, "stdout" })
     else
@@ -4721,8 +4716,23 @@ fn makeTempRoot(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
     return base;
 }
 
-fn cleanupTempRoot(path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+fn releaseTempRoot(
+    allocator: std.mem.Allocator,
+    path: []u8,
+    retain: bool,
+) void {
+    if (!retain) {
+        std.Io.Dir.cwd().deleteTree(
+            std.Io.Threaded.global_single_threaded.io(),
+            path,
+        ) catch |err| {
+            std.log.warn(
+                "temp-root cleanup failed path={s} error={s}",
+                .{ path, @errorName(err) },
+            );
+        };
+    }
+    allocator.free(path);
 }
 
 fn makeExecutable(path: []const u8) !void {
@@ -6640,6 +6650,17 @@ test "sealed evidence rejects content substitution" {
     try std.testing.expectError(
         error.PerfEvidenceDigestMismatch,
         verifySealedFile(file),
+    );
+}
+
+test "temp-root release deletes storage before freeing its path" {
+    const root = try makeTempRoot(std.testing.allocator, "release-order");
+    const observed_root = try std.testing.allocator.dupe(u8, root);
+    defer std.testing.allocator.free(observed_root);
+    releaseTempRoot(std.testing.allocator, root, false);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, observed_root, .{}),
     );
 }
 
