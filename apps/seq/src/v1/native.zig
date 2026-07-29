@@ -748,12 +748,10 @@ fn runFindSession(
         return error.MissingFindSessionSelector;
     }
     if (options.format != .json) return error.UnsupportedNativeFormat;
-    var search_options = options;
-    search_options.session_id = null;
     var paths = try resolveTargetPaths(
         allocator,
         io,
-        search_options,
+        options,
         false,
     );
     defer freePaths(allocator, &paths);
@@ -1755,6 +1753,11 @@ pub fn resolveTargetPaths(
         options.root,
     );
     defer allocator.free(root);
+    const live_native_root = try isLiveNativeSessionRoot(
+        allocator,
+        options,
+        root,
+    );
     var paths = try collectTargetJsonlPaths(
         allocator,
         io,
@@ -1773,7 +1776,7 @@ pub fn resolveTargetPaths(
             io,
             &paths,
             options,
-            options.root == null,
+            live_native_root,
         );
     }
     if (exact_session_id) |wanted| {
@@ -1937,6 +1940,12 @@ fn retainSessionId(
             }
             continue;
         }
+        if (isCanonicalRolloutBasename(std.fs.path.basename(path)) and
+            !rolloutBasenameMatchesSessionId(path, wanted))
+        {
+            allocator.free(path);
+            continue;
+        }
         var trace = trace_core.parseSessionSummaryTrace(
             allocator,
             path,
@@ -1956,6 +1965,31 @@ fn retainSessionId(
         }
     }
     paths.items.len = write_index;
+}
+
+fn isCanonicalRolloutBasename(basename: []const u8) bool {
+    return std.mem.startsWith(u8, basename, "rollout-") and
+        std.mem.endsWith(u8, basename, ".jsonl");
+}
+
+fn rolloutBasenameMatchesSessionId(
+    path: []const u8,
+    wanted: []const u8,
+) bool {
+    const basename = std.fs.path.basename(path);
+    const extension = ".jsonl";
+    if (!isCanonicalRolloutBasename(basename) or
+        basename.len < wanted.len + extension.len + 1)
+    {
+        return false;
+    }
+    const id_start = basename.len - extension.len - wanted.len;
+    return id_start != 0 and basename[id_start - 1] == '-' and
+        std.mem.eql(
+            u8,
+            basename[id_start .. basename.len - extension.len],
+            wanted,
+        );
 }
 
 fn collectJsonlPaths(
@@ -2038,6 +2072,21 @@ fn resolveRootAlloc(
     const home = environmentValue(environment, "HOME") orelse
         return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".codex", "sessions" });
+}
+
+fn isLiveNativeSessionRoot(
+    allocator: std.mem.Allocator,
+    options: Options,
+    root: []const u8,
+) !bool {
+    if (options.root == null) return true;
+    const native_root = resolveRootAlloc(
+        allocator,
+        options.environment,
+        null,
+    ) catch return false;
+    defer allocator.free(native_root);
+    return std.mem.eql(u8, root, native_root);
 }
 
 pub fn absolutePathAlloc(
@@ -2377,6 +2426,51 @@ test "canonical rollout partitions preserve resumed sessions" {
         seq_time.parseIsoTimestampMillis(
             "2026-07-27T12:00:00Z",
         ),
+    ));
+}
+
+test "an explicit canonical session root retains live-source semantics" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".codex/sessions");
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".codex/sessions",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const codex_home = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".codex",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(codex_home);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("CODEX_HOME", codex_home);
+    try std.testing.expect(try isLiveNativeSessionRoot(
+        std.testing.allocator,
+        .{ .root = root, .environment = &environment },
+        root,
+    ));
+    try std.testing.expect(!(try isLiveNativeSessionRoot(
+        std.testing.allocator,
+        .{ .root = "/tmp/imported", .environment = &environment },
+        "/tmp/imported",
+    )));
+}
+
+test "canonical rollout basenames cut exact session discovery" {
+    const wanted = "019c1234-5678-7000-8000-000000000001";
+    try std.testing.expect(rolloutBasenameMatchesSessionId(
+        "/sessions/2026/07/28/rollout-2026-07-28T12-00-00-" ++
+            wanted ++ ".jsonl",
+        wanted,
+    ));
+    try std.testing.expect(!rolloutBasenameMatchesSessionId(
+        "/sessions/2026/07/28/rollout-2026-07-28T12-00-00-" ++
+            "019c1234-5678-7000-8000-000000000002.jsonl",
+        wanted,
     ));
 }
 

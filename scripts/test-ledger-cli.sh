@@ -307,7 +307,7 @@ chained_current=$("$binary" project \
   --format json)
 grep -Fq '"data":[{"id":"item-1","status":"closed"}]' <<<"$chained_current"
 grep -Fq \
-  '"stats":{"records_scanned":2,"records_matched":1,"records_emitted":1}' \
+  '"stats":{"records_scanned":2,"records_matched":1,"records_emitted":1,"streamed":false}' \
   <<<"$chained_current"
 
 chained_current_warm=$("$binary" project \

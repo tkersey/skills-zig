@@ -69,7 +69,7 @@ case "$mode" in
           matched=0
         fi
       done
-      if grep -Eqi 'definition_core|definition-core' <<<"$raw"; then
+      if grep -Eqi 'definition_(core|compat)|definition-(core|compat)' <<<"$raw"; then
         mark_definition_consumers
         matched=0
       fi
@@ -120,7 +120,7 @@ case "$mode" in
         libs/core/*)
           mark_all
           ;;
-        libs/definition_core/*)
+        libs/definition_core/*|libs/definition_compat/*)
           mark_definition_consumers
           ;;
         libs/trace_core/*)
@@ -269,7 +269,7 @@ case "$mode" in
               mark_all
             fi
             ;;
-          *'"libs/definition_core/'*)
+          *'"libs/definition_core/'*|*'"libs/definition_compat/'*)
             mark_definition_consumers
             ;;
           *'"libs/trace_core/'*)

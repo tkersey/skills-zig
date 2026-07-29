@@ -68,6 +68,11 @@ write_definition_core() {
   printf 'definition\n' >libs/definition_core/root.zig
 }
 
+write_definition_compat() {
+  mkdir -p libs/definition_compat
+  printf 'compatibility\n' >libs/definition_compat/root.zig
+}
+
 write_trace_core() {
   mkdir -p libs/trace_core
   printf 'trace\n' >libs/trace_core/root.zig
@@ -143,6 +148,7 @@ write_ci_helper() {
 assert_affected seq write_seq
 assert_affected cas,ledger write_ledger
 assert_affected seq,cas,ledger write_definition_core
+assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
 assert_affected seq write_seq_build

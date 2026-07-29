@@ -102,27 +102,46 @@ pub fn feedFileSelected(
         &stream,
         selection,
     );
-    if (relation == .sessions and !runner.stopped and
-        scanned.session_matches)
-    {
-        var row_storage: [256]execution.Value = undefined;
-        const row = row_storage[0..program.source_width];
-        try fillSession(
-            row,
-            program.source_field_indices,
-            session_id,
-            path,
-            scanned.records,
-            scanned.tools,
-        );
-        _ = try runner.feed(row);
-    }
+    try emitSessionRow(
+        program,
+        runner,
+        relation,
+        session_id,
+        path,
+        scanned,
+    );
     return .{
         .bytes_read = digest_observer.bytes_read,
         .records = scanned.records,
         .warnings = scanned.warnings,
         .digest = digest_observer.final(),
     };
+}
+
+fn emitSessionRow(
+    program: *const execution.Program,
+    runner: *execution.Runner,
+    relation: physical.Relation,
+    session_id: []const u8,
+    path: []const u8,
+    scanned: ScanResult,
+) !void {
+    if (relation != .sessions or runner.stopped or
+        !scanned.session_matches)
+    {
+        return;
+    }
+    var row_storage: [256]execution.Value = undefined;
+    const row = row_storage[0..program.source_width];
+    try fillSession(
+        row,
+        program.source_field_indices,
+        session_id,
+        path,
+        scanned.records,
+        scanned.tools,
+    );
+    _ = try runner.feed(row);
 }
 
 const DigestObserver = struct {

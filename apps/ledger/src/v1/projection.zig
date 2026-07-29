@@ -4705,6 +4705,38 @@ fn executeResolvedStreamProjection(
     defer replay_stats.deinit(allocator);
     const effective_limit =
         try resolveLimit(compiled.limit, parameters, plan.max_records);
+    return try renderStreamProjectionResult(
+        allocator,
+        definition_plan,
+        event_protocol,
+        plan,
+        compiled,
+        projection_name,
+        slot,
+        &snapshot,
+        parameters,
+        effective_limit,
+        &replay_stats,
+        fold_history,
+        fused_sorted,
+    );
+}
+
+fn renderStreamProjectionResult(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    event_protocol: ?*const protocol.Plan,
+    plan: *const Plan,
+    compiled: *const Projection,
+    projection_name: []const u8,
+    slot: *const storage.ResolvedSlot,
+    snapshot: *const custody.ReplaySlot,
+    parameters: *const definition_core.parameters.Bindings,
+    effective_limit: usize,
+    replay_stats: *replay.Stats,
+    fold_history: *?FoldHistoryAccumulator,
+    fused_sorted: *?SortedAccumulator,
+) !Result {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     var stats: Stats = .{
@@ -4720,7 +4752,7 @@ fn executeResolvedStreamProjection(
         parameters,
         effective_limit,
         plan.max_output_bytes,
-        &replay_stats,
+        replay_stats,
         fold_history,
         fused_sorted,
         &output,
