@@ -226,11 +226,24 @@ assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,cron,ledger,memory-note,img write_ci_helper
 
-grep -Fq -- '      - "libs/definition_compat/**"' \
-  "$repo_root/.github/workflows/auto-release.yml" || {
-  echo "auto-release paths omit libs/definition_compat/**" >&2
-  exit 1
+assert_auto_release_path() {
+  local release_path=$1
+  grep -Fq -- "      - \"$release_path\"" \
+    "$repo_root/.github/workflows/auto-release.yml" || {
+    echo "auto-release paths omit $release_path" >&2
+    exit 1
+  }
 }
+
+for release_path in \
+  "libs/definition_compat/**" \
+  "scripts/guards/definition-core-domain.sh" \
+  "scripts/test-ledger-cli.sh" \
+  "scripts/test-seq-cli.sh" \
+  "tools/durable_store_perf.zig"
+do
+  assert_auto_release_path "$release_path"
+done
 
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION

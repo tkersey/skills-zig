@@ -2805,6 +2805,14 @@ pub fn recoverTransaction(
         parsed,
         scope_mode,
     );
+    if (scope_mode == .committed_legacy_compatible) {
+        return makeRecoveryReceipt(
+            allocator,
+            parsed.transaction_id,
+            .already_committed,
+            "already_committed",
+        );
+    }
     var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
         parsed.expected,
@@ -2896,7 +2904,9 @@ pub fn recoverAndCompactTransactions(
                 .{ .follow_symlinks = false },
             ) catch |err| switch (err) {
                 error.FileNotFound => {
-                    if (!isGeneratedTransactionId(entry.name)) {
+                    if (!isGeneratedTransactionId(entry.name) and
+                        !isLegacyTransactionId(entry.name))
+                    {
                         return error.TransactionCorrupt;
                     }
                     try dir.deleteDir(Io.io(), entry.name);
@@ -6891,7 +6901,7 @@ test "preparing transaction recovery removes only journal-owned stages" {
     try std.testing.expectEqualStrings(before, after);
 }
 
-test "transaction recovery removes an empty pre-record journal directory" {
+test "transaction recovery removes current and legacy empty pre-record journals" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -6911,13 +6921,20 @@ test "transaction recovery removes an empty pre-record journal directory" {
     );
     defer allocator.free(incomplete_dir);
     try ensureDirectoryPathNoSymlinks(incomplete_dir);
+    const legacy_incomplete_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "dtx-1" },
+    );
+    defer allocator.free(legacy_incomplete_dir);
+    try ensureDirectoryPathNoSymlinks(legacy_incomplete_dir);
 
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 2),
         try countPendingTransactions(allocator, transactions_dir),
     );
     try recoverAndCompactTransactions(allocator, transactions_dir);
     try std.testing.expect(!fileExists(incomplete_dir));
+    try std.testing.expect(!fileExists(legacy_incomplete_dir));
 }
 
 test "committed legacy journals compact without staging reinterpretation" {
@@ -6953,21 +6970,47 @@ test "committed legacy journals compact without staging reinterpretation" {
         &.{ root, "events.jsonl" },
     );
     defer allocator.free(target_path);
+    const removed_target_parent = try std.fs.path.join(
+        allocator,
+        &.{ root, "removed" },
+    );
+    defer allocator.free(removed_target_parent);
+    const removed_target_path = try std.fs.path.join(
+        allocator,
+        &.{ removed_target_parent, "events.jsonl" },
+    );
+    defer allocator.free(removed_target_path);
     const content = "{\"seq\":1}\n";
     try writeTextAtomic(allocator, target_path, content);
+    try writeTextAtomic(allocator, removed_target_path, content);
     const content_digest = try digestBytesAlloc(allocator, content);
     defer allocator.free(content_digest);
-    const expected = [_]TransactionExpected{.{
-        .path = target_path,
-        .digest = content_digest,
-        .sequence = 1,
-    }};
-    const writes = [_]TransactionWrite{.{
-        .path = target_path,
-        .staged_ref = "write-0.staged",
-        .digest_after = content_digest,
-        .sequence_after = 1,
-    }};
+    const expected = [_]TransactionExpected{
+        .{
+            .path = target_path,
+            .digest = content_digest,
+            .sequence = 1,
+        },
+        .{
+            .path = removed_target_path,
+            .digest = content_digest,
+            .sequence = 1,
+        },
+    };
+    const writes = [_]TransactionWrite{
+        .{
+            .path = target_path,
+            .staged_ref = "write-0.staged",
+            .digest_after = content_digest,
+            .sequence_after = 1,
+        },
+        .{
+            .path = removed_target_path,
+            .staged_ref = "write-1.staged",
+            .digest_after = content_digest,
+            .sequence_after = 1,
+        },
+    };
     try writeTransactionRecord(
         allocator,
         record_path,
@@ -6986,6 +7029,7 @@ test "committed legacy journals compact without staging reinterpretation" {
         true,
     );
     try writeCommittedTransactionMarker(allocator, commit_marker_path);
+    try std.Io.Dir.cwd().deleteTree(Io.io(), removed_target_parent);
 
     try recoverAndCompactTransactions(allocator, transactions_dir);
     try std.testing.expect(!fileExists(transaction_dir));
