@@ -5070,10 +5070,7 @@ fn validateEncodedPathTemplate(
     }
     if (segments[0].kind == .literal) {
         const first = segments[0].text;
-        if (first[0] == '.' or
-            std.ascii.eqlIgnoreCase(first, "transactions") or
-            std.ascii.eqlIgnoreCase(first, "bindings"))
-        {
+        if (isReservedStorageRoot(first)) {
             return error.ReservedStoragePath;
         }
     }
@@ -5403,6 +5400,11 @@ fn advanceParameterPathEnumeration(
         if (visited_entries.* > max_entries) {
             return error.StoragePathEntryBoundsExceeded;
         }
+        if (frame.segment_index == 0 and
+            isReservedStorageRoot(entry.name))
+        {
+            continue;
+        }
         definition_core.json.safeIdentifier(entry.name, 128) catch continue;
         if (std.mem.indexOfScalar(u8, entry.name, '/') != null) continue;
         const stat = parameter.directory.statFile(
@@ -5522,11 +5524,13 @@ fn validateLogicalSlotPath(path: []const u8) !void {
     try definition_core.json.repositoryRelativePath(path, false);
     const first_end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
     const first = path[0..first_end];
-    if (first[0] == '.' or std.ascii.eqlIgnoreCase(first, "transactions") or
-        std.ascii.eqlIgnoreCase(first, "bindings"))
-    {
-        return error.ReservedStoragePath;
-    }
+    if (isReservedStorageRoot(first)) return error.ReservedStoragePath;
+}
+
+fn isReservedStorageRoot(component: []const u8) bool {
+    return component.len == 0 or component[0] == '.' or
+        std.ascii.eqlIgnoreCase(component, "transactions") or
+        std.ascii.eqlIgnoreCase(component, "bindings");
 }
 
 fn deinitPathSegments(
@@ -5840,6 +5844,52 @@ test "storage path parameters compile once and resolve as safe components" {
     try expectStoragePathParameterRejections(
         &test_plan.plan,
         &test_plan.definition_plan,
+    );
+}
+
+test "matching storage enumeration excludes transaction control artifacts" {
+    var test_plan = try StorageTestPlan.init(
+        storage_parameterized_definition,
+    );
+    defer test_plan.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(
+        std.testing.io,
+        ".ledger/transactions",
+    );
+    try tmp.dir.createDirPath(
+        std.testing.io,
+        ".ledger/tenant-1",
+    );
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/transactions/events.jsonl",
+        .data = "{\"control\":true}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".ledger/tenant-1/events.jsonl",
+        .data = "{\"tenant\":true}\n",
+    });
+    const repo_root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(repo_root);
+    const paths = try enumerateMatchingPathsAlloc(
+        std.testing.allocator,
+        repo_root,
+        test_plan.plan.slots[0],
+        10,
+    );
+    defer {
+        for (paths) |path| std.testing.allocator.free(path);
+        std.testing.allocator.free(paths);
+    }
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqualStrings(
+        "tenant-1/events.jsonl",
+        paths[0],
     );
 }
 

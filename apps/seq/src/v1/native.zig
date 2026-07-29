@@ -1780,7 +1780,12 @@ pub fn resolveTargetPaths(
         );
     }
     if (exact_session_id) |wanted| {
-        retainSessionId(allocator, &paths, wanted);
+        retainSessionId(
+            allocator,
+            &paths,
+            wanted,
+            live_native_root,
+        );
     }
     if (require_single or exact_session_id != null) {
         if (paths.items.len == 0) return error.SessionNotFound;
@@ -1920,6 +1925,7 @@ fn retainSessionId(
     allocator: std.mem.Allocator,
     paths: *std.ArrayList([]u8),
     wanted: []const u8,
+    live_native_root: bool,
 ) void {
     var write_index: usize = 0;
     for (paths.items) |path| {
@@ -1940,7 +1946,8 @@ fn retainSessionId(
             }
             continue;
         }
-        if (isCanonicalRolloutBasename(std.fs.path.basename(path)) and
+        if (live_native_root and
+            isCanonicalRolloutBasename(std.fs.path.basename(path)) and
             !rolloutBasenameMatchesSessionId(path, wanted))
         {
             allocator.free(path);
@@ -2300,6 +2307,36 @@ test "current session resolves CODEX_THREAD_ID exactly" {
     try std.testing.expectEqual(@as(usize, 1), paths.items.len);
     try std.testing.expectEqualStrings(
         "current.jsonl",
+        std.fs.path.basename(paths.items[0]),
+    );
+}
+
+test "exact session selector inspects noncanonical files under imported roots" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "rollout-export.jsonl",
+        .data = testSession("fixture-session", "2026-07-26T10:00:00Z"),
+    });
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    var paths = try resolveTargetPaths(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .root = root,
+            .session_id = "fixture-session",
+        },
+        false,
+    );
+    defer freePaths(std.testing.allocator, &paths);
+    try std.testing.expectEqual(@as(usize, 1), paths.items.len);
+    try std.testing.expectEqualStrings(
+        "rollout-export.jsonl",
         std.fs.path.basename(paths.items[0]),
     );
 }

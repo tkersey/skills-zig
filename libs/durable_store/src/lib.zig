@@ -1942,20 +1942,6 @@ pub fn commitTextTransaction(
     errdefer allocator.free(transaction_id);
     const transaction_dir = try std.fs.path.join(allocator, &.{ transactions_dir, transaction_id });
     errdefer allocator.free(transaction_dir);
-    try ensureDirectoryPathNoSymlinks(transaction_dir);
-    try syncDirectoryPath(transactions_dir);
-    var record_persisted = false;
-    errdefer if (!record_persisted) {
-        std.Io.Dir.cwd().deleteTree(
-            Io.io(),
-            transaction_dir,
-        ) catch |cleanup_error| switch (cleanup_error) {
-            else => {},
-        };
-        syncDirectoryPath(transactions_dir) catch |cleanup_error| switch (cleanup_error) {
-            else => {},
-        };
-    };
     const record_path = try std.fs.path.join(allocator, &.{ transaction_dir, "transaction.json" });
     errdefer allocator.free(record_path);
     const commit_marker_path = try std.fs.path.join(
@@ -1964,34 +1950,23 @@ pub fn commitTextTransaction(
     );
     errdefer allocator.free(commit_marker_path);
 
-    var locks = try allocator.alloc(LeaseLock, ordered.len);
-    var lock_count: usize = 0;
+    var targets = try allocator.alloc(TransactionTarget, ordered.len);
+    var target_count: usize = 0;
     defer {
-        var index: usize = 0;
-        while (index < lock_count) : (index += 1) {
-            releaseLease(allocator, &locks[index], locks[index].fencing_token) catch locks[index].deinit(allocator);
-        }
-        allocator.free(locks);
+        for (targets[0..target_count]) |*target| target.deinit();
+        allocator.free(targets);
     }
     for (ordered) |mutation| {
-        locks[lock_count] = try acquireLeaseLock(allocator, mutation.path, .{
-            .owner = options.owner,
-            .lease_ms = options.lease_ms,
-            .fencing_counter_path = options.fencing_counter_path,
-            .reject_symlinks = options.reject_symlinks,
-        });
-        lock_count += 1;
+        const parent = std.fs.path.dirname(mutation.path) orelse
+            return error.InvalidPath;
+        try ensureDirectoryPathNoSymlinks(parent);
+        targets[target_count] = try TransactionTarget.init(
+            control_root,
+            mutation.path,
+        );
+        target_count += 1;
     }
 
-    var cas_locks = try allocator.alloc(LockFile, ordered.len);
-    var cas_lock_count: usize = 0;
-    defer {
-        var index: usize = 0;
-        while (index < cas_lock_count) : (index += 1) {
-            cas_locks[index].release(allocator);
-        }
-        allocator.free(cas_locks);
-    }
     var advisory_locks = try allocator.alloc(std.Io.File, ordered.len);
     var advisory_lock_count: usize = 0;
     defer {
@@ -2006,32 +1981,6 @@ pub fn commitTextTransaction(
             mutation.path,
         );
         advisory_lock_count += 1;
-        const cas_lock_path = try casLockPathAlloc(allocator, mutation.path);
-        cas_locks[cas_lock_count] = acquireExclusiveLockPathRetry(
-            allocator,
-            cas_lock_path,
-            5000,
-            2,
-        ) catch |err| {
-            allocator.free(cas_lock_path);
-            return err;
-        };
-        allocator.free(cas_lock_path);
-        cas_lock_count += 1;
-    }
-
-    var targets = try allocator.alloc(TransactionTarget, ordered.len);
-    var target_count: usize = 0;
-    defer {
-        for (targets[0..target_count]) |*target| target.deinit();
-        allocator.free(targets);
-    }
-    for (ordered) |mutation| {
-        targets[target_count] = try TransactionTarget.init(
-            control_root,
-            mutation.path,
-        );
-        target_count += 1;
     }
 
     const now_ms = clockMillis(.real);
@@ -2049,17 +1998,6 @@ pub fn commitTextTransaction(
     }
     const before_exists = try allocator.alloc(bool, ordered.len);
     defer allocator.free(before_exists);
-    var staged_files = try allocator.alloc(StagedTransactionFile, ordered.len);
-    var staged_file_count: usize = 0;
-    defer {
-        for (staged_files[0..staged_file_count]) |*staged| {
-            staged.deinit(
-                &targets[staged.target_index].dir,
-                record_persisted,
-            );
-        }
-        allocator.free(staged_files);
-    }
 
     for (ordered, targets, 0..) |mutation, *target, mutation_index| {
         try target.verifyPathIdentity();
@@ -2174,28 +2112,112 @@ pub fn commitTextTransaction(
         write_count += 1;
     }
 
-    try writeTransactionRecord(
-        allocator,
-        record_path,
-        transaction_id,
-        options.owner,
-        .preparing,
-        expected[0..expected_count],
-        writes[0..write_count],
-        locks[0..lock_count],
-        now_ms,
-        clockMillis(.real),
-        true,
-    );
-    try syncDirectoryPath(transaction_dir);
-    record_persisted = true;
+    // Target custody is process-owned and crash-released. The journal namespace
+    // lock makes the empty-directory-to-preparing-record transition indivisible
+    // to recovery, before any persistent compatibility lock or stage exists.
+    var record_persisted = false;
+    {
+        var journal_lock = try acquireTransactionJournalLock(
+            allocator,
+            transactions_dir,
+        );
+        defer journal_lock.close(Io.io());
+        errdefer if (!record_persisted) {
+            std.Io.Dir.cwd().deleteTree(
+                Io.io(),
+                transaction_dir,
+            ) catch |cleanup_error| switch (cleanup_error) {
+                else => {},
+            };
+            syncDirectoryPath(transactions_dir) catch |sync_error| switch (sync_error) {
+                else => {},
+            };
+        };
+        try ensureDirectoryPathNoSymlinks(transaction_dir);
+        try writeTransactionRecord(
+            allocator,
+            record_path,
+            transaction_id,
+            options.owner,
+            .preparing,
+            expected[0..expected_count],
+            writes[0..write_count],
+            &.{},
+            now_ms,
+            clockMillis(.real),
+            true,
+        );
+        try syncDirectoryPath(transaction_dir);
+        try syncDirectoryPath(transactions_dir);
+        record_persisted = true;
+    }
+
+    var transaction_stage_dir = if (std.fs.path.isAbsolute(transaction_dir))
+        try std.Io.Dir.openDirAbsolute(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        });
+    defer transaction_stage_dir.close(Io.io());
+
+    var cas_locks = try allocator.alloc(LockFile, ordered.len);
+    var cas_lock_count: usize = 0;
+    defer {
+        var index: usize = 0;
+        while (index < cas_lock_count) : (index += 1) {
+            cas_locks[index].release(allocator);
+        }
+        allocator.free(cas_locks);
+    }
+    for (ordered) |mutation| {
+        const cas_lock_path = try casLockPathAlloc(allocator, mutation.path);
+        cas_locks[cas_lock_count] = acquireExclusiveLockPathRetry(
+            allocator,
+            cas_lock_path,
+            5000,
+            2,
+        ) catch |err| {
+            allocator.free(cas_lock_path);
+            return err;
+        };
+        allocator.free(cas_lock_path);
+        cas_lock_count += 1;
+    }
+    for (ordered, targets) |mutation, *target| {
+        var expectation = mutation.expectation;
+        if (mutation.content_mode == .raw and
+            expectation.expected_sequence == 0)
+        {
+            expectation.expected_sequence = null;
+        }
+        try validateTransactionExpectationAt(
+            allocator,
+            mutation,
+            expectation,
+            target,
+        );
+    }
+
+    var staged_files = try allocator.alloc(StagedTransactionFile, ordered.len);
+    var staged_file_count: usize = 0;
+    defer {
+        for (staged_files[0..staged_file_count]) |*staged| {
+            staged.deinit(
+                &transaction_stage_dir,
+                record_persisted,
+            );
+        }
+        allocator.free(staged_files);
+    }
 
     var write_index: usize = 0;
     for (ordered, targets, 0..) |mutation, *target, mutation_index| {
         if (mutation.action == .check_only) continue;
         const write = &writes[write_index];
         staged_files[staged_file_count] = try createStagedTransactionFile(
-            &target.dir,
+            &transaction_stage_dir,
             write.staged_ref,
             mutation_index,
         );
@@ -2231,7 +2253,7 @@ pub fn commitTextTransaction(
             },
             .check_only => unreachable,
         };
-        try syncDirectoryHandle(&target.dir);
+        try syncDirectoryHandle(&transaction_stage_dir);
         errdefer allocator.free(digest_after);
         if (mutation.expected_digest_after) |expected_after| {
             if (!std.mem.eql(u8, digest_after, expected_after)) {
@@ -2251,7 +2273,7 @@ pub fn commitTextTransaction(
         .prepared,
         expected[0..expected_count],
         writes[0..write_count],
-        locks[0..lock_count],
+        &.{},
         now_ms,
         clockMillis(.real),
         false,
@@ -2273,13 +2295,27 @@ pub fn commitTextTransaction(
             mutation,
             expectation,
             target,
+            &transaction_stage_dir,
             &staged_files[publish_index],
             target_index,
         );
         publish_index += 1;
     }
+    try syncDirectoryHandle(&transaction_stage_dir);
 
-    try writeTransactionRecord(allocator, record_path, transaction_id, options.owner, .committed, expected[0..expected_count], writes[0..write_count], locks[0..lock_count], now_ms, clockMillis(.real), false);
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        options.owner,
+        .committed,
+        expected[0..expected_count],
+        writes[0..write_count],
+        &.{},
+        now_ms,
+        clockMillis(.real),
+        false,
+    );
     try syncDirectoryPath(transaction_dir);
     try writeTextCreateNew(allocator, commit_marker_path, "{\"commit_marker\":\"DTX-v1\",\"state\":\"committed\"}\n", .{});
     try syncDirectoryPath(transaction_dir);
@@ -2380,7 +2416,7 @@ const StagedTransactionFile = struct {
 
     fn deinit(
         self: *StagedTransactionFile,
-        target_dir: *std.Io.Dir,
+        stage_dir: *std.Io.Dir,
         journal_owns_file: bool,
     ) void {
         if (self.file_open) {
@@ -2388,7 +2424,7 @@ const StagedTransactionFile = struct {
             self.file_open = false;
         }
         if (self.file_exists and !journal_owns_file) {
-            target_dir.deleteFile(
+            stage_dir.deleteFile(
                 Io.io(),
                 self.staged_ref,
             ) catch |cleanup_error| switch (cleanup_error) {
@@ -2400,12 +2436,12 @@ const StagedTransactionFile = struct {
 };
 
 fn createStagedTransactionFile(
-    target_dir: *std.Io.Dir,
+    stage_dir: *std.Io.Dir,
     staged_ref: []const u8,
     target_index: usize,
 ) !StagedTransactionFile {
     return .{
-        .file = try target_dir.createFile(Io.io(), staged_ref, .{
+        .file = try stage_dir.createFile(Io.io(), staged_ref, .{
             .exclusive = true,
             .read = true,
             .truncate = false,
@@ -2524,6 +2560,7 @@ fn publishStagedTransactionWrite(
     mutation: TransactionMutation,
     expectation: CasExpectation,
     target: *TransactionTarget,
+    stage_dir: *std.Io.Dir,
     staged: *StagedTransactionFile,
     target_index: usize,
 ) !void {
@@ -2556,7 +2593,7 @@ fn publishStagedTransactionWrite(
     {
         return error.TransactionCorrupt;
     }
-    const entry = try target.dir.statFile(
+    const entry = try stage_dir.statFile(
         Io.io(),
         write.staged_ref,
         .{ .follow_symlinks = false },
@@ -2568,7 +2605,7 @@ fn publishStagedTransactionWrite(
     }
     staged.file.close(Io.io());
     staged.file_open = false;
-    try target.dir.rename(
+    try stage_dir.rename(
         write.staged_ref,
         target.dir,
         target.base,
@@ -2652,7 +2689,11 @@ pub fn inspectTransaction(
     defer allocator.free(commit_marker_path);
     const parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
-    try validateTransactionRecordScope(control_root, parsed);
+    try validateTransactionRecordScope(
+        control_root,
+        transaction_dir,
+        parsed,
+    );
     if (parsed.state == .preparing) {
         return makeRecoveryStatus(
             allocator,
@@ -2719,7 +2760,11 @@ pub fn recoverTransaction(
     defer allocator.free(commit_marker_path);
     var parsed = try parseTransactionRecord(allocator, record_path);
     defer parsed.deinit(allocator);
-    try validateTransactionRecordScope(control_root, parsed);
+    try validateTransactionRecordScope(
+        control_root,
+        transaction_dir,
+        parsed,
+    );
     var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
         parsed.expected,
@@ -2733,6 +2778,7 @@ pub fn recoverTransaction(
             try rollForwardTransaction(
                 allocator,
                 control_root,
+                transaction_dir,
                 parsed,
             );
             const record = try renderParsedTransactionRecordAlloc(allocator, parsed, .committed);
@@ -2748,7 +2794,7 @@ pub fn recoverTransaction(
         },
         .roll_back_unpublished => {
             try deleteReservedTransactionStages(
-                control_root,
+                transaction_dir,
                 parsed.writes,
             );
             const record = try renderParsedTransactionRecordAlloc(allocator, parsed, .aborted);
@@ -2798,17 +2844,27 @@ pub fn recoverAndCompactTransactions(
             &.{ transaction_dir, "transaction.json" },
         );
         defer allocator.free(record_path);
-        const stat = std.Io.Dir.cwd().statFile(
-            Io.io(),
-            record_path,
-            .{ .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.FileNotFound => {
-                try std.Io.Dir.cwd().deleteTree(Io.io(), transaction_dir);
-                try syncDirectoryHandle(&dir);
-                continue;
-            },
-            else => return err,
+        const stat = locked: {
+            var journal_lock = try acquireTransactionJournalLock(
+                allocator,
+                transactions_dir,
+            );
+            defer journal_lock.close(Io.io());
+            break :locked std.Io.Dir.cwd().statFile(
+                Io.io(),
+                record_path,
+                .{ .follow_symlinks = false },
+            ) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (!isGeneratedTransactionId(entry.name)) {
+                        return error.TransactionCorrupt;
+                    }
+                    try dir.deleteDir(Io.io(), entry.name);
+                    try syncDirectoryHandle(&dir);
+                    continue;
+                },
+                else => return err,
+            };
         };
         if (stat.kind == .sym_link) return error.SymlinkComponent;
         if (stat.kind != .file) return error.TransactionCorrupt;
@@ -2835,8 +2891,18 @@ fn transactionControlRoot(transaction_dir: []const u8) ![]const u8 {
 
 fn validateTransactionRecordScope(
     control_root: []const u8,
+    transaction_dir: []const u8,
     parsed: ParsedTransactionRecord,
 ) !void {
+    if (!isGeneratedTransactionId(parsed.transaction_id) or
+        !std.mem.eql(
+            u8,
+            std.fs.path.basename(transaction_dir),
+            parsed.transaction_id,
+        ))
+    {
+        return error.TransactionCorrupt;
+    }
     for (parsed.expected) |row| {
         _ = try pathRelativeToControlRoot(control_root, row.path);
     }
@@ -2868,15 +2934,43 @@ fn validateTransactionRecordScope(
     }
 }
 
+fn isGeneratedTransactionId(transaction_id: []const u8) bool {
+    const prefix = "dtx-";
+    if (!std.mem.startsWith(u8, transaction_id, prefix)) return false;
+    const suffix_separator = std.mem.lastIndexOfScalar(
+        u8,
+        transaction_id,
+        '-',
+    ) orelse return false;
+    if (suffix_separator <= prefix.len or
+        transaction_id.len - suffix_separator - 1 != 32)
+    {
+        return false;
+    }
+    for (transaction_id[prefix.len..suffix_separator]) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    for (transaction_id[suffix_separator + 1 ..]) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return false;
+    }
+    return true;
+}
+
 fn deleteReservedTransactionStages(
-    control_root: []const u8,
+    transaction_dir: []const u8,
     writes: []const TransactionWrite,
 ) !void {
+    var stage_dir = if (std.fs.path.isAbsolute(transaction_dir))
+        try std.Io.Dir.openDirAbsolute(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        });
+    defer stage_dir.close(Io.io());
     for (writes) |write| {
-        var target = try TransactionTarget.init(control_root, write.path);
-        defer target.deinit();
-        try target.verifyPathIdentity();
-        const stat = target.dir.statFile(
+        const stat = stage_dir.statFile(
             Io.io(),
             write.staged_ref,
             .{ .follow_symlinks = false },
@@ -2888,8 +2982,8 @@ fn deleteReservedTransactionStages(
         if (stat.kind != .file or stat.nlink != 1) {
             return error.TransactionCorrupt;
         }
-        try target.dir.deleteFile(Io.io(), write.staged_ref);
-        try syncDirectoryHandle(&target.dir);
+        try stage_dir.deleteFile(Io.io(), write.staged_ref);
+        try syncDirectoryHandle(&stage_dir);
     }
 }
 
@@ -2920,9 +3014,13 @@ fn acquireTransactionRecoveryLocks(
     expected: []const TransactionExpected,
 ) !TransactionRecoveryLocks {
     const advisory = try allocator.alloc(std.Io.File, expected.len);
-    errdefer allocator.free(advisory);
-    const compatibility = try allocator.alloc(LockFile, expected.len);
-    errdefer allocator.free(compatibility);
+    const compatibility = allocator.alloc(
+        LockFile,
+        expected.len,
+    ) catch |err| {
+        allocator.free(advisory);
+        return err;
+    };
     var result: TransactionRecoveryLocks = .{
         .advisory = advisory,
         .compatibility = compatibility,
@@ -2965,8 +3063,18 @@ fn acquireTransactionRecoveryLocks(
 fn rollForwardTransaction(
     allocator: std.mem.Allocator,
     control_root: []const u8,
+    transaction_dir: []const u8,
     parsed: ParsedTransactionRecord,
 ) !void {
+    var stage_dir = if (std.fs.path.isAbsolute(transaction_dir))
+        try std.Io.Dir.openDirAbsolute(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), transaction_dir, .{
+            .follow_symlinks = false,
+        });
+    defer stage_dir.close(Io.io());
     for (parsed.writes) |write| {
         var target = try TransactionTarget.init(control_root, write.path);
         defer target.deinit();
@@ -2983,14 +3091,14 @@ fn rollForwardTransaction(
         defer if (current) |digest| allocator.free(digest);
         if (current) |digest| {
             if (std.mem.eql(u8, digest, write.digest_after)) {
-                target.dir.deleteFile(
+                stage_dir.deleteFile(
                     Io.io(),
                     write.staged_ref,
                 ) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return err,
                 };
-                try syncDirectoryHandle(&target.dir);
+                try syncDirectoryHandle(&stage_dir);
                 continue;
             }
             if (!digestMatchesExpectedBefore(
@@ -3003,15 +3111,15 @@ fn rollForwardTransaction(
         }
         try rejectHardlinkedTargetAt(&target.dir, target.base);
         try publishVerifiedStagedFile(
-            &target.dir,
+            &stage_dir,
             write.staged_ref,
             write.digest_after,
             transaction_recovery_max_bytes,
             &target,
         );
         try syncDirectoryHandle(&target.dir);
-        try target.dir.deleteFile(Io.io(), write.staged_ref);
-        try syncDirectoryHandle(&target.dir);
+        try stage_dir.deleteFile(Io.io(), write.staged_ref);
+        try syncDirectoryHandle(&stage_dir);
         try target.verifyPathIdentity();
     }
 }
@@ -3962,6 +4070,21 @@ fn acquireCasAdvisoryLock(
     };
 }
 
+fn acquireTransactionJournalLock(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+) !std.Io.File {
+    const path = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, ".journal.advisory" },
+    );
+    defer allocator.free(path);
+    return openEventStoreSidecarExclusive(path) catch |err| switch (err) {
+        error.WouldBlock => return error.LockBusy,
+        else => return err,
+    };
+}
+
 pub fn fileExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(Io.io(), path, .{}) catch return false;
@@ -4161,14 +4284,26 @@ pub fn listSortedRegularFilesNoSymlink(
     max_files: usize,
     max_file_bytes: usize,
 ) ![][]u8 {
-    const dir_stat = try std.Io.Dir.cwd().statFile(Io.io(), dir_path, .{ .follow_symlinks = false });
+    const dir_stat = try std.Io.Dir.cwd().statFile(
+        Io.io(),
+        dir_path,
+        .{ .follow_symlinks = false },
+    );
     if (dir_stat.kind == .sym_link) return error.SymlinkComponent;
     if (dir_stat.kind != .directory) return error.NotDir;
 
     var dir = if (std.fs.path.isAbsolute(dir_path))
-        try std.Io.Dir.openDirAbsolute(Io.io(), dir_path, .{ .iterate = true, .follow_symlinks = false })
+        try std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        )
     else
-        try std.Io.Dir.cwd().openDir(Io.io(), dir_path, .{ .iterate = true, .follow_symlinks = false });
+        try std.Io.Dir.cwd().openDir(
+            Io.io(),
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        );
     defer dir.close(Io.io());
 
     var names: std.ArrayList([]u8) = .empty;
@@ -6230,7 +6365,11 @@ test "durable transactions commit and recover from prepared records" {
     defer committed_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(RecoveryDecision.already_committed, committed_status.decision);
 
-    const rollback_dir = try std.fs.path.join(std.testing.allocator, &.{ transactions_dir, "manual-rollback" });
+    const rollback_id = "dtx-1-00000000000000000000000000000003";
+    const rollback_dir = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ transactions_dir, rollback_id },
+    );
     defer std.testing.allocator.free(rollback_dir);
     try ensureDirectoryPathNoSymlinks(rollback_dir);
     const rollback_record = try std.fs.path.join(std.testing.allocator, &.{ rollback_dir, "transaction.json" });
@@ -6238,9 +6377,23 @@ test "durable transactions commit and recover from prepared records" {
     const rollback_path = try std.fs.path.join(std.testing.allocator, &.{ root, "rollback.jsonl" });
     defer std.testing.allocator.free(rollback_path);
     try writeTextAtomic(std.testing.allocator, rollback_path, "{\"seq\":1}\n");
-    try writePreparedRecordForTest(std.testing.allocator, rollback_record, "txn-rollback", owner, rollback_path, "{\"seq\":1}\n", "{\"seq\":2}\n");
-    try std.testing.expectEqual(@as(usize, 1), try countPendingTransactions(std.testing.allocator, transactions_dir));
-    try std.testing.expectError(error.TransactionRecoveryRequired, ensureNoPendingTransactions(std.testing.allocator, transactions_dir));
+    try writePreparedRecordForTest(
+        std.testing.allocator,
+        rollback_record,
+        rollback_id,
+        owner,
+        rollback_path,
+        "{\"seq\":1}\n",
+        "{\"seq\":2}\n",
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        ensureNoPendingTransactions(std.testing.allocator, transactions_dir),
+    );
     var rollback_status = try inspectTransaction(std.testing.allocator, rollback_dir);
     defer rollback_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(RecoveryDecision.finish_commit, rollback_status.decision);
@@ -6250,9 +6403,16 @@ test "durable transactions commit and recover from prepared records" {
     const rollback_after = try tryReadForTest(rollback_path);
     defer std.testing.allocator.free(rollback_after);
     try std.testing.expectEqualStrings("{\"seq\":2}\n", rollback_after);
-    try std.testing.expectEqual(@as(usize, 0), try countPendingTransactions(std.testing.allocator, transactions_dir));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
 
-    const finish_dir = try std.fs.path.join(std.testing.allocator, &.{ transactions_dir, "manual-finish" });
+    const finish_id = "dtx-1-00000000000000000000000000000004";
+    const finish_dir = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ transactions_dir, finish_id },
+    );
     defer std.testing.allocator.free(finish_dir);
     try ensureDirectoryPathNoSymlinks(finish_dir);
     const finish_record = try std.fs.path.join(std.testing.allocator, &.{ finish_dir, "transaction.json" });
@@ -6260,8 +6420,19 @@ test "durable transactions commit and recover from prepared records" {
     const finish_path = try std.fs.path.join(std.testing.allocator, &.{ root, "finish.jsonl" });
     defer std.testing.allocator.free(finish_path);
     try writeTextAtomic(std.testing.allocator, finish_path, "{\"seq\":2}\n");
-    try writePreparedRecordForTest(std.testing.allocator, finish_record, "txn-finish", owner, finish_path, "{\"seq\":1}\n", "{\"seq\":2}\n");
-    try std.testing.expectEqual(@as(usize, 1), try countPendingTransactions(std.testing.allocator, transactions_dir));
+    try writePreparedRecordForTest(
+        std.testing.allocator,
+        finish_record,
+        finish_id,
+        owner,
+        finish_path,
+        "{\"seq\":1}\n",
+        "{\"seq\":2}\n",
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
     var finish_status = try inspectTransaction(std.testing.allocator, finish_dir);
     defer finish_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(RecoveryDecision.finish_commit, finish_status.decision);
@@ -6271,9 +6442,13 @@ test "durable transactions commit and recover from prepared records" {
     const finish_marker = try std.fs.path.join(std.testing.allocator, &.{ finish_dir, "commit.json" });
     defer std.testing.allocator.free(finish_marker);
     try std.testing.expect(fileExists(finish_marker));
-    try std.testing.expectEqual(@as(usize, 0), try countPendingTransactions(std.testing.allocator, transactions_dir));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
 
-    const mixed_dir = try std.fs.path.join(std.testing.allocator, &.{ transactions_dir, "manual-mixed" });
+    const mixed_id = "dtx-1-00000000000000000000000000000005";
+    const mixed_dir = try std.fs.path.join(std.testing.allocator, &.{ transactions_dir, mixed_id });
     defer std.testing.allocator.free(mixed_dir);
     try ensureDirectoryPathNoSymlinks(mixed_dir);
     const mixed_record = try std.fs.path.join(std.testing.allocator, &.{ mixed_dir, "transaction.json" });
@@ -6284,8 +6459,18 @@ test "durable transactions commit and recover from prepared records" {
     defer std.testing.allocator.free(mixed_b);
     try writeTextAtomic(std.testing.allocator, mixed_a, "{\"seq\":2}\n");
     try writeTextAtomic(std.testing.allocator, mixed_b, "{\"seq\":1}\n");
-    try writePreparedTwoWriteRecordForTest(std.testing.allocator, mixed_record, owner, mixed_a, mixed_b);
-    try std.testing.expectEqual(@as(usize, 1), try countPendingTransactions(std.testing.allocator, transactions_dir));
+    try writePreparedTwoWriteRecordForTest(
+        std.testing.allocator,
+        mixed_record,
+        mixed_id,
+        owner,
+        mixed_a,
+        mixed_b,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try countPendingTransactions(std.testing.allocator, transactions_dir),
+    );
     var mixed_status = try inspectTransaction(std.testing.allocator, mixed_dir);
     defer mixed_status.deinit(std.testing.allocator);
     try std.testing.expectEqual(RecoveryDecision.finish_commit, mixed_status.decision);
@@ -6308,7 +6493,7 @@ test "preparing transaction recovery removes only journal-owned stages" {
         &.{ root, "transactions" },
     );
     defer allocator.free(transactions_dir);
-    const transaction_id = "dtx-preparing-recovery";
+    const transaction_id = "dtx-1-00000000000000000000000000000001";
     const transaction_dir = try std.fs.path.join(
         allocator,
         &.{ transactions_dir, transaction_id },
@@ -6337,7 +6522,7 @@ test "preparing transaction recovery removes only journal-owned stages" {
     defer allocator.free(staged_ref);
     const staged_path = try std.fs.path.join(
         allocator,
-        &.{ root, staged_ref },
+        &.{ transaction_dir, staged_ref },
     );
     defer allocator.free(staged_path);
     const expected = [_]TransactionExpected{.{
@@ -6402,7 +6587,10 @@ test "transaction recovery removes an empty pre-record journal directory" {
     defer allocator.free(transactions_dir);
     const incomplete_dir = try std.fs.path.join(
         allocator,
-        &.{ transactions_dir, "dtx-incomplete" },
+        &.{
+            transactions_dir,
+            "dtx-1-00000000000000000000000000000006",
+        },
     );
     defer allocator.free(incomplete_dir);
     try ensureDirectoryPathNoSymlinks(incomplete_dir);
@@ -6415,8 +6603,44 @@ test "transaction recovery removes an empty pre-record journal directory" {
     try std.testing.expect(!fileExists(incomplete_dir));
 }
 
+test "journal lock prevents live recordless directory reclamation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    try ensureDirectoryPathNoSymlinks(transactions_dir);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{
+            transactions_dir,
+            "dtx-1-00000000000000000000000000000007",
+        },
+    );
+    defer allocator.free(transaction_dir);
+    var live_journal = try acquireTransactionJournalLock(
+        allocator,
+        transactions_dir,
+    );
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    try std.testing.expectError(
+        error.LockBusy,
+        recoverAndCompactTransactions(allocator, transactions_dir),
+    );
+    try std.testing.expect(fileExists(transaction_dir));
+    live_journal.close(Io.io());
+
+    try recoverAndCompactTransactions(allocator, transactions_dir);
+    try std.testing.expect(!fileExists(transaction_dir));
+}
+
 test "transaction records reject non-reserved and target-aliased stages" {
-    const transaction_id = "dtx-stage-authority";
+    const transaction_id = "dtx-1-00000000000000000000000000000002";
     var expected = [_]TransactionExpected{.{
         .path = "/repo/.ledger/events.jsonl",
         .digest = "",
@@ -6435,16 +6659,97 @@ test "transaction records reject non-reserved and target-aliased stages" {
     }};
     try std.testing.expectError(
         error.TransactionCorrupt,
-        validateTransactionRecordScope("/repo/.ledger", .{
-            .transaction_id = transaction_id,
-            .owner = owner,
-            .state = .preparing,
-            .expected = &expected,
-            .writes = &invalid,
-            .created_at = "1",
-            .updated_at = "2",
-        }),
+        validateTransactionRecordScope(
+            "/repo/.ledger",
+            "/repo/.ledger/transactions/dtx-1-00000000000000000000000000000002",
+            .{
+                .transaction_id = transaction_id,
+                .owner = owner,
+                .state = .preparing,
+                .expected = &expected,
+                .writes = &invalid,
+                .created_at = "1",
+                .updated_at = "2",
+            },
+        ),
     );
+}
+
+test "transaction recovery binds journal identity to its directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const directory_id = "dtx-1-00000000000000000000000000000008";
+    const claimed_id = "dtx-1-00000000000000000000000000000009";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, directory_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const staged_ref = try transactionStageNameAlloc(
+        allocator,
+        claimed_id,
+        0,
+    );
+    defer allocator.free(staged_ref);
+    const staged_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, staged_ref },
+    );
+    defer allocator.free(staged_path);
+    const expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = "",
+        .sequence = 0,
+    }};
+    const writes = [_]TransactionWrite{.{
+        .path = target_path,
+        .staged_ref = staged_ref,
+        .digest_after = "",
+        .sequence_after = 1,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        claimed_id,
+        .{
+            .process_id = 905,
+            .session_id = "identity-mismatch",
+            .executor = "test",
+        },
+        .preparing,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+    try writeTextCreateNew(allocator, staged_path, "{\"seq\":1}\n", .{});
+
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        inspectTransaction(allocator, transaction_dir),
+    );
+    try std.testing.expect(fileExists(staged_path));
 }
 
 test "transactions publish in canonical path order and reject duplicates" {
@@ -8046,11 +8351,11 @@ fn writePreparedRecordForTest(
         .digest_after = digest_after,
         .sequence_after = (try jsonlSequenceRequired(allocator, after)).?,
     }};
-    const target_dir = std.fs.path.dirname(path) orelse
+    const transaction_dir = std.fs.path.dirname(record_path) orelse
         return error.InvalidPath;
     const staged_path = try std.fs.path.join(
         allocator,
-        &.{ target_dir, staged_ref },
+        &.{ transaction_dir, staged_ref },
     );
     defer allocator.free(staged_path);
     try writeTextCreateNew(allocator, staged_path, after, .{});
@@ -8060,11 +8365,11 @@ fn writePreparedRecordForTest(
 fn writePreparedTwoWriteRecordForTest(
     allocator: std.mem.Allocator,
     record_path: []const u8,
+    transaction_id: []const u8,
     owner: Owner,
     path_a: []const u8,
     path_b: []const u8,
 ) !void {
-    const transaction_id = "txn-mixed";
     const before = "{\"seq\":1}\n";
     const after = "{\"seq\":2}\n";
     const digest_before = try digestBytesAlloc(allocator, before);
@@ -8109,18 +8414,16 @@ fn writePreparedTwoWriteRecordForTest(
             .sequence_after = 2,
         },
     };
-    const target_dir_a = std.fs.path.dirname(path_a) orelse
-        return error.InvalidPath;
-    const target_dir_b = std.fs.path.dirname(path_b) orelse
+    const transaction_dir = std.fs.path.dirname(record_path) orelse
         return error.InvalidPath;
     const staged_a = try std.fs.path.join(
         allocator,
-        &.{ target_dir_a, staged_ref_a },
+        &.{ transaction_dir, staged_ref_a },
     );
     defer allocator.free(staged_a);
     const staged_b = try std.fs.path.join(
         allocator,
-        &.{ target_dir_b, staged_ref_b },
+        &.{ transaction_dir, staged_ref_b },
     );
     defer allocator.free(staged_b);
     try writeTextCreateNew(allocator, staged_a, after, .{});
