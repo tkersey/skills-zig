@@ -3757,7 +3757,7 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
 
 fn executeSeqObserveDeep(
     allocator: std.mem.Allocator,
-    capture_semantic_output: bool,
+    comptime capture_semantic_output: bool,
 ) !?[64]u8 {
     const cwd = try std.process.currentPathAlloc(
         std.Io.Threaded.global_single_threaded.io(),
