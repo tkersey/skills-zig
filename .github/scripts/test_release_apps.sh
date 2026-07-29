@@ -83,6 +83,15 @@ write_store_core() {
   printf 'store\n' >libs/durable_store/root.zig
 }
 
+write_perf_contract() {
+  mkdir -p libs/core/src
+  printf 'contract\n' >libs/core/src/perf_contract.zig
+}
+
+write_perf_hub_build() {
+  printf 'const img_meta = "apps/img/VERSION";\nconst core_perf_contract = b.createModule(.{});\npub fn build() void {\n  addRunStepPrefixed(\n    b,\n    perf_hub,\n    "perf-report-local",\n    &.{"report"},\n  );\n}\n' >build.zig
+}
+
 write_build_only() {
   printf 'const img_meta = "apps/img/VERSION";\npub fn build() void { @panic("changed"); }\n' >build.zig
 }
@@ -151,6 +160,8 @@ assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
 assert_affected seq,cas,ledger,memory-note write_store_core
+assert_affected "" write_perf_contract
+assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
 assert_affected seq write_seq_strip_build
 assert_affected img move_build_line

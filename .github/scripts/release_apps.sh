@@ -89,6 +89,9 @@ case "$mode" in
         mark_definition_consumers
         matched=0
       fi
+      if grep -Eqi 'perf_(hub|contract)|perf-(hub|contract)' <<<"$raw"; then
+        matched=0
+      fi
       if grep -Eqi 'retrace|execution_policy|seq_bundle|seq_perf' <<<"$raw"; then
         mark_app seq
         matched=0
@@ -106,7 +109,7 @@ case "$mode" in
 
     contextual_build_line() {
       local raw=$1
-      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|pub fn build\(\) void \{\}|\[\]const u8,|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
+      grep -Eq '^[[:space:]]*($|[{}(),.;&]+|b,|addRunStepPrefixed\(|pub fn build\(\) void \{(\})?|\[\]const u8,|&\.\{.*\},|\.target = target,|\.optimize = optimize,|\.strip = optimize == \.ReleaseFast,|\.imports = &\.\{|\.module = b\.createModule\(\.\{|\.link_libc = true,|\.sqlite = true,|\.build_deps = &\.\{.*\},|\.test_deps = &\.\{.*\},|\.{ \.name = "core_[A-Za-z0-9_-]+", \.module = core_[A-Za-z0-9_]+ \},|".*",)$' <<<"$raw"
     }
 
     while IFS= read -r path; do
@@ -116,6 +119,8 @@ case "$mode" in
           ;;
         build.zig.zon)
           package_changed=1
+          ;;
+        libs/core/src/perf_contract.zig)
           ;;
         libs/core/*)
           mark_all
