@@ -1369,7 +1369,7 @@ fn prepareEffect(
         source.before_digest,
         parameters,
     );
-    return prepareEffectWithBinding(
+    const prepared = try prepareEffectWithBinding(
         allocator,
         definition_plan,
         event_protocol,
@@ -1384,6 +1384,8 @@ fn prepareEffect(
         &binding_before,
         &idempotency,
     );
+    source.releaseReadCustody();
+    return prepared;
 }
 
 fn prepareEffectWithBinding(
@@ -1442,6 +1444,7 @@ const EffectSlotSource = struct {
     before_digest: ?[]u8,
     before_exists: bool,
     stream_event_log: bool,
+    read_custody: ?durable_store.CasReadLockPair,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -1460,6 +1463,16 @@ const EffectSlotSource = struct {
             slot.relative_path,
         );
         errdefer allocator.free(binding_path);
+        var read_custody_pair = try durable_store.acquireCasReadLockPair(
+            allocator,
+            slot_path,
+            binding_path,
+        );
+        var read_custody = if (read_custody_pair.count == 0) none: {
+            read_custody_pair.deinit();
+            break :none null;
+        } else read_custody_pair;
+        errdefer if (read_custody) |*locks| locks.deinit();
         const stream_event_log =
             slot.kind == .event_log and effect.kind == .compare_append;
         const before = if (stream_event_log)
@@ -1504,13 +1517,20 @@ const EffectSlotSource = struct {
             .before_digest = before_digest,
             .before_exists = before_exists,
             .stream_event_log = stream_event_log,
+            .read_custody = read_custody,
         };
+    }
+
+    fn releaseReadCustody(self: *EffectSlotSource) void {
+        if (self.read_custody) |*locks| locks.deinit();
+        self.read_custody = null;
     }
 
     fn deinit(
         self: *EffectSlotSource,
         allocator: std.mem.Allocator,
     ) void {
+        self.releaseReadCustody();
         allocator.free(self.slot_path);
         allocator.free(self.binding_path);
         if (self.before) |bytes| allocator.free(bytes);
@@ -1813,12 +1833,7 @@ fn validateStreamedEffectReplay(
     protocol_required: bool,
     observer: *DerivedMatchObserver,
 ) !replay.Stats {
-    const snapshot: custody.ReplaySlot = .{
-        .exists = true,
-        .path = source.slot_path,
-        .revision = source.before_digest.?,
-        .binding = binding_before,
-    };
+    const snapshot = streamingReplaySlot(source, binding_before);
     if (observer.active()) {
         return replay.validateReplaySlotObserved(
             allocator,
@@ -1842,6 +1857,19 @@ fn validateStreamedEffectReplay(
         definition_plan.bounds.max_records,
         protocol_required,
     );
+}
+
+fn streamingReplaySlot(
+    source: *const EffectSlotSource,
+    binding_before: custody.BindingSnapshot,
+) custody.ReplaySlot {
+    return .{
+        .exists = true,
+        .path = source.slot_path,
+        .revision = source.before_digest.?,
+        .binding = binding_before,
+        .read_custody = source.read_custody,
+    };
 }
 
 fn validateMaterializedEffectReplay(
@@ -5103,6 +5131,59 @@ test "document replacements replay from immutable prior revisions" {
 const replaced_event_log_definition =
     \\{"schema":"ledger-artifact-definition/v1","id":"example/replaced-log","owner":"example","requires":{"abi":"ledger-artifact-abi/v1","operators":["compare-and-append","compare-and-replace","exact-object"]},"parameters":{"revision":{"type":"digest","required":false}},"inputs":{"event":{"codec":"json","required":false,"max_bytes":4096},"snapshot":{"codec":"jsonl","required":false,"max_bytes":4096}},"canonicalization":{},"shape":{"documents":{"event":{"object":"exact","fields":{"kind":{}}}}},"constraints":{"laws":[]},"identity":{},"storage":{"kind":"event-log","slots":{"events":{"path":"example/replaced-log.jsonl","kind":"event-log","codec":"jsonl","max_bytes":65536}}},"operations":{"append":{"effects":[{"op":"compare-and-append","slot":"events","input":"event"}]},"replace":{"effects":[{"op":"compare-and-replace","slot":"events","input":"snapshot","expected_revision_param":"revision"}]}},"projections":{},"bounds":{"max_input_bytes":4096,"max_store_bytes":65536,"max_records":8,"max_output_bytes":4096,"max_diagnostics":8,"max_reducer_states":1}}
 ;
+
+test "transaction streaming replay owns and releases read custody" {
+    var plans = try TransactionTestPlans.init(
+        replaced_event_log_definition,
+        "stream-custody.json",
+    );
+    defer plans.deinit();
+    var empty = try plans.bind(&.{});
+    defer empty.deinit(std.testing.allocator);
+    var first = try plans.execute(
+        null,
+        "append",
+        &.{.{ .name = "event", .bytes = "{\"kind\":\"first\"}" }},
+        &empty,
+    );
+    defer first.deinit(std.testing.allocator);
+    var resolved = try storage.resolve(
+        std.testing.allocator,
+        &plans.storage_plan,
+        &empty,
+    );
+    defer resolved.deinit(std.testing.allocator);
+    const operation = resolved.findOperation("append").?;
+    const effect = operation.effects[0];
+    const slot = resolved.slot(effect.slot_index);
+    var source = try EffectSlotSource.init(
+        std.testing.allocator,
+        slot,
+        effect,
+        plans.repo_root,
+    );
+    defer source.deinit(std.testing.allocator);
+    try std.testing.expect(source.stream_event_log);
+    try std.testing.expect(source.before == null);
+    try std.testing.expect(source.read_custody != null);
+    var binding = try custody.readBindingSnapshotBeforeReplay(
+        std.testing.allocator,
+        source.binding_path,
+        plans.definition_plan.id,
+        slot.name,
+        slot.relative_path,
+        null,
+    );
+    defer binding.deinit(std.testing.allocator);
+    source.before_digest = try std.testing.allocator.dupe(
+        u8,
+        binding.last_revision.?,
+    );
+    const snapshot = streamingReplaySlot(&source, binding);
+    try std.testing.expect(snapshot.read_custody != null);
+    source.releaseReadCustody();
+    try std.testing.expect(source.read_custody == null);
+}
 
 test "append falls back to materialized replay after an event-log replacement" {
     var plans = try TransactionTestPlans.init(

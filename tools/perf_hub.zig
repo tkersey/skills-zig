@@ -417,6 +417,7 @@ fn allManifests() []const perf_contract.BinaryManifest {
 const ParsedArgs = struct {
     command: Command,
     target: ?[]const u8 = null,
+    source_revision: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -428,7 +429,11 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
     switch (parsed.command) {
-        ._measure => try cmdMeasure(allocator, parsed.target),
+        ._measure => try cmdMeasure(
+            allocator,
+            parsed.target,
+            parsed.source_revision,
+        ),
         .list => try cmdList(parsed.target),
         .manifest => try cmdManifest(allocator),
         .audit => try cmdAudit(),
@@ -442,6 +447,7 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
     if (args.len == 0) return error.MissingCommand;
     const command = parseCommand(args[0]) orelse return error.InvalidCommand;
     var target: ?[]const u8 = null;
+    var source_revision: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -451,13 +457,26 @@ fn parseArgs(args: []const []const u8) !ParsedArgs {
             target = args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--source-revision")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            source_revision = args[i];
+            continue;
+        }
         return error.UnknownArgument;
     }
     if (target != null and switch (command) {
         ._measure, .list, .compare, .doctor => false,
         .manifest, .audit, .report => true,
     }) return error.UnsupportedArgument;
-    return .{ .command = command, .target = target };
+    if (source_revision != null and command != ._measure) {
+        return error.UnsupportedArgument;
+    }
+    return .{
+        .command = command,
+        .target = target,
+        .source_revision = source_revision,
+    };
 }
 
 fn parseCommand(raw: []const u8) ?Command {
@@ -525,8 +544,10 @@ fn cmdAudit() !void {
 fn cmdMeasure(
     allocator: std.mem.Allocator,
     target: ?[]const u8,
+    source_revision: ?[]const u8,
 ) !void {
     const case_id = target orelse return error.MissingArgValue;
+    const git_sha = try requireMeasurementSourceRevision(source_revision);
     const case_cfg = for (DeepCases) |candidate| {
         if (std.mem.eql(
             u8,
@@ -540,8 +561,6 @@ fn cmdMeasure(
         try executeSeqObserveDeep(allocator, true)
     else
         null;
-    const git_sha = try fullGitShaAlloc(allocator);
-    defer allocator.free(git_sha);
     var stdout_writer = std.Io.File.stdout().writer(
         std.Io.Threaded.global_single_threaded.io(),
         &.{},
@@ -573,6 +592,17 @@ fn cmdMeasure(
         try writer.writeAll("null");
     }
     try writer.writeAll("}}\n");
+}
+
+fn requireMeasurementSourceRevision(
+    source_revision: ?[]const u8,
+) ![]const u8 {
+    const revision = source_revision orelse
+        return error.MeasurementSourceRevisionRequired;
+    if (!validFullRevision(revision)) {
+        return error.InvalidMeasurementSourceRevision;
+    }
+    return revision;
 }
 
 const SealedFile = struct {
@@ -2922,15 +2952,26 @@ fn appendSourceDeepMetrics(
         source_sha,
         accepted_generic_deep_schema1_sha,
     );
+    const driver_argv: []const []const u8 = if (legacy_bridge)
+        &.{
+            driver.file.path,
+            "capture",
+            "--target",
+            case_cfg.descriptor.case_id,
+        }
+    else
+        &.{
+            driver.file.path,
+            "_measure",
+            "--target",
+            case_cfg.descriptor.case_id,
+            "--source-revision",
+            source_sha,
+        };
     const result = runChildCaptureOutput(
         allocator,
         source_root,
-        &.{
-            driver.file.path,
-            if (legacy_bridge) "capture" else "_measure",
-            "--target",
-            case_cfg.descriptor.case_id,
-        },
+        driver_argv,
     ) catch |err| return deepStageError("driver-spawn", err);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -6552,6 +6593,34 @@ test "doctor counts compat and deep cases" {
     for (CompatCases) |_| count += 1;
     for (DeepCases) |_| count += 1;
     try std.testing.expectEqual(CompatCases.len + DeepCases.len, count);
+}
+
+test "deep measurement source identity is explicit and bounded" {
+    const revision = "1111111111111111111111111111111111111111";
+    const parsed = try parseArgs(&.{
+        "_measure",
+        "--target",
+        "seq-observe-deep-batch8",
+        "--source-revision",
+        revision,
+    });
+    try std.testing.expectEqual(Command._measure, parsed.command);
+    try std.testing.expectEqualStrings(
+        revision,
+        try requireMeasurementSourceRevision(parsed.source_revision),
+    );
+    try std.testing.expectError(
+        error.MeasurementSourceRevisionRequired,
+        requireMeasurementSourceRevision(null),
+    );
+    try std.testing.expectError(
+        error.InvalidMeasurementSourceRevision,
+        requireMeasurementSourceRevision("short"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedArgument,
+        parseArgs(&.{ "report", "--source-revision", revision }),
+    );
 }
 
 test "cutover comparison requires the complete Seq and Ledger matrix" {
