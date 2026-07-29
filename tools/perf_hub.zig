@@ -1562,6 +1562,7 @@ const PairedMetrics = struct {
 
 const MeasuredOutputEvidence = struct {
     output_sha256: [64]u8,
+    local_output_sha256: ?[64]u8 = null,
     streamed: ?bool = null,
     records_scanned: ?u64 = null,
     records_emitted: ?u64 = null,
@@ -2276,20 +2277,24 @@ fn runPairedDeepCases(
     if (!std.mem.eql(u8, &baseline_workload, &candidate_workload)) {
         return error.PerfWorkloadMismatch;
     }
-    // Both products must observe one immutable physical input. Source-local
-    // copies are byte-equal here, but their absolute paths intentionally
-    // produce different source_event_id values.
-    const baseline_semantic = try productDeepSemanticOutputDigest(
+    // Each product is measured against its co-located immutable driver and
+    // source tree. The cross-product digest normalizes only the absolute-path
+    // component of a separately verified physical source-event identity.
+    const baseline_semantic = try productDeepSemanticOutputEvidence(
         allocator,
         baseline_evidence.path,
-        candidate_root,
+        baseline_root,
     );
-    const candidate_semantic = try productDeepSemanticOutputDigest(
+    const candidate_semantic = try productDeepSemanticOutputEvidence(
         allocator,
         candidate_evidence.path,
         candidate_root,
     );
-    if (!std.mem.eql(u8, &baseline_semantic, &candidate_semantic)) {
+    if (!std.mem.eql(
+        u8,
+        &baseline_semantic.output_sha256,
+        &candidate_semantic.output_sha256,
+    )) {
         return error.PerfSemanticOutputMismatch;
     }
 
@@ -2380,7 +2385,12 @@ fn runPairedDeepCases(
         }
     }
     if (baseline_driver_semantic) |digest| {
-        if (!std.mem.eql(u8, &digest, &baseline_semantic)) {
+        if (!std.mem.eql(
+            u8,
+            &digest,
+            &(baseline_semantic.local_output_sha256 orelse
+                return error.MissingPerfSemanticOutput),
+        )) {
             return error.PerfDriverSemanticOutputMismatch;
         }
     } else if (!std.mem.eql(
@@ -2395,7 +2405,8 @@ fn runPairedDeepCases(
     if (!std.mem.eql(
         u8,
         &candidate_driver_digest,
-        &candidate_semantic,
+        &(candidate_semantic.local_output_sha256 orelse
+            return error.MissingPerfSemanticOutput),
     )) {
         return error.PerfDriverSemanticOutputMismatch;
     }
@@ -2418,12 +2429,8 @@ fn runPairedDeepCases(
         .baseline = baseline,
         .candidate = candidate,
         .workload_digest = baseline_workload,
-        .baseline_execution = .{
-            .output_sha256 = baseline_semantic,
-        },
-        .candidate_execution = .{
-            .output_sha256 = candidate_semantic,
-        },
+        .baseline_execution = baseline_semantic,
+        .candidate_execution = candidate_semantic,
         .baseline_driver = baseline_driver,
         .candidate_driver = candidate_driver,
     };
@@ -2542,20 +2549,6 @@ fn appendSourceDeepMetrics(
     alloc_samples: *std.ArrayList(u64),
 ) !void {
     try requireDriverUnchanged(driver);
-    const result = try runChildCapture(
-        allocator,
-        source_root,
-        &.{
-            driver.path,
-            "capture",
-            "--target",
-            case_cfg.descriptor.case_id,
-        },
-    );
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.exit_code != 0) return error.CaseFailed;
-    try requireDriverUnchanged(driver);
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const artifact_name = try std.fmt.allocPrint(
@@ -2576,6 +2569,32 @@ fn appendSourceDeepMetrics(
         },
     );
     defer allocator.free(artifact_path);
+    std.Io.Dir.cwd().deleteFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        artifact_path,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const result = try runChildCaptureOutput(
+        allocator,
+        source_root,
+        &.{
+            driver.path,
+            "capture",
+            "--target",
+            case_cfg.descriptor.case_id,
+        },
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.CaseFailed;
+    try validateCaptureAcknowledgment(
+        allocator,
+        result.stdout,
+        case_cfg.descriptor.case_id,
+    );
+    try requireDriverUnchanged(driver);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(
         std.Io.Threaded.global_single_threaded.io(),
         artifact_path,
@@ -2590,6 +2609,11 @@ fn appendSourceDeepMetrics(
         .{},
     );
     defer parsed.deinit();
+    try validateDeepArtifactIdentity(
+        parsed.value,
+        case_cfg,
+        source_sha,
+    );
     const schema_version = try jsonFieldU64(
         parsed.value.object,
         "schema_version",
@@ -2623,6 +2647,62 @@ fn appendSourceDeepMetrics(
         allocator,
         batch_allocs / case_cfg.batch_iterations,
     );
+}
+
+fn validateCaptureAcknowledgment(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    case_id: []const u8,
+) !void {
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "PASS\t{s}\tcaptured",
+        .{case_id},
+    );
+    defer allocator.free(expected);
+    if (std.mem.eql(u8, raw, expected)) return;
+    if (raw.len == expected.len + 1 and raw[expected.len] == '\n' and
+        std.mem.eql(u8, raw[0..expected.len], expected)) return;
+    if (raw.len == expected.len + 2 and
+        std.mem.eql(u8, raw[expected.len..], "\r\n") and
+        std.mem.eql(u8, raw[0..expected.len], expected)) return;
+    return error.InvalidPerfCaptureAcknowledgment;
+}
+
+fn validateDeepArtifactIdentity(
+    artifact: std.json.Value,
+    case_cfg: DeepCase,
+    source_sha: []const u8,
+) !void {
+    const object = switch (artifact) {
+        .object => |value| value,
+        else => return error.InvalidDeepArtifactIdentity,
+    };
+    const case_id = switch (object.get("case_id") orelse
+        return error.InvalidDeepArtifactIdentity) {
+        .string => |value| value,
+        else => return error.InvalidDeepArtifactIdentity,
+    };
+    const binary = switch (object.get("binary") orelse
+        return error.InvalidDeepArtifactIdentity) {
+        .string => |value| value,
+        else => return error.InvalidDeepArtifactIdentity,
+    };
+    const git_sha = switch (object.get("git_sha") orelse
+        return error.InvalidDeepArtifactIdentity) {
+        .string => |value| value,
+        else => return error.InvalidDeepArtifactIdentity,
+    };
+    const revision_matches = git_sha.len > 0 and
+        std.mem.startsWith(u8, source_sha, git_sha);
+    const frozen_bridge_revision = std.mem.eql(u8, git_sha, "unknown") and
+        std.mem.eql(u8, source_sha, accepted_generic_deep_schema1_sha);
+    if (!std.mem.eql(u8, case_id, case_cfg.descriptor.case_id) or
+        !std.mem.eql(u8, binary, case_cfg.descriptor.binary) or
+        (!revision_matches and !frozen_bridge_revision))
+    {
+        return error.DeepArtifactIdentityMismatch;
+    }
 }
 
 const DeepMeasurementSchemaKind = enum {
@@ -2672,6 +2752,22 @@ fn validateDeepMeasurementContract(
     {
         return error.DeepMeasurementBatchMismatch;
     }
+    for ([_]struct {
+        field: []const u8,
+        expected: []const u8,
+    }{
+        .{ .field = "latency_unit", .expected = "ns" },
+        .{ .field = "allocation_unit", .expected = "calls" },
+    }) |requirement| {
+        const unit = switch (contract.get(requirement.field) orelse
+            return error.InvalidDeepMeasurementContract) {
+            .string => |value| value,
+            else => return error.InvalidDeepMeasurementContract,
+        };
+        if (!std.mem.eql(u8, unit, requirement.expected)) {
+            return error.UnsupportedDeepMeasurementUnit;
+        }
+    }
     for ([_][]const u8{ "latency_scope", "allocation_scope" }) |field| {
         const scope = switch (contract.get(field) orelse
             return error.InvalidDeepMeasurementContract) {
@@ -2707,11 +2803,14 @@ fn validateDeepMeasurementContract(
     }
 }
 
-fn productDeepSemanticOutputDigest(
+const normalized_source_event_id =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn productDeepSemanticOutputEvidence(
     allocator: std.mem.Allocator,
     binary_path: []const u8,
     source_root: []const u8,
-) ![64]u8 {
+) !MeasuredOutputEvidence {
     const result = try runChildCaptureOutput(
         allocator,
         source_root,
@@ -2733,7 +2832,85 @@ fn productDeepSemanticOutputDigest(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) return error.CaseFailed;
-    return canonicalDataDigest(allocator, result.stdout);
+    return canonicalDeepDataEvidence(allocator, result.stdout, source_root);
+}
+
+fn canonicalDeepDataEvidence(
+    allocator: std.mem.Allocator,
+    rendered: []const u8,
+    source_root: []const u8,
+) !MeasuredOutputEvidence {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        rendered,
+        .{},
+    );
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |*value| value,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    const data = root.getPtr("data") orelse
+        return error.InvalidPerfSemanticOutput;
+    const local_digest = try canonicalValueDigest(allocator, data.*);
+    const data_object = switch (data.*) {
+        .object => |*value| value,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    const rows_value = data_object.getPtr("rows") orelse
+        return error.InvalidPerfSemanticOutput;
+    const rows = switch (rows_value.*) {
+        .array => |*value| value,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    if (rows.items.len != 1) return error.InvalidPerfSemanticOutput;
+    const row = switch (rows.items[0]) {
+        .object => |*value| value,
+        else => return error.InvalidPerfSemanticOutput,
+    };
+    const source_event_id = row.getPtr("source_event_id") orelse
+        return error.MissingPerfSourceEventIdentity;
+    const encoded = switch (source_event_id.*) {
+        .string => |value| value,
+        else => return error.InvalidPerfSourceEventIdentity,
+    };
+    const fixture_path = try std.fs.path.join(
+        allocator,
+        &.{ source_root, "apps/seq/src/v1/fixtures/rollout.jsonl" },
+    );
+    defer allocator.free(fixture_path);
+    const expected = expectedSourceEventId(fixture_path, 3, 2);
+    if (!std.mem.eql(u8, encoded, &expected)) {
+        return error.PerfSourceEventIdentityMismatch;
+    }
+    source_event_id.* = .{ .string = normalized_source_event_id };
+    return .{
+        .output_sha256 = try canonicalValueDigest(allocator, data.*),
+        .local_output_sha256 = local_digest,
+    };
+}
+
+fn expectedSourceEventId(
+    path: []const u8,
+    line_number: usize,
+    ordinal: usize,
+) [71]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("trace-source-event/v1\x00");
+    hasher.update(path);
+    var number: [8]u8 = undefined;
+    std.mem.writeInt(u64, &number, @intCast(line_number), .big);
+    hasher.update(&number);
+    std.mem.writeInt(u64, &number, @intCast(ordinal), .big);
+    hasher.update(&number);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    var identity: [71]u8 = undefined;
+    @memcpy(identity[0..7], "sha256:");
+    @memcpy(identity[7..], &hex);
+    return identity;
 }
 
 fn retainPairedWorkloads() bool {
@@ -3097,9 +3274,16 @@ fn canonicalDataDigest(
     defer parsed.deinit();
     const data = parsed.value.object.get("data") orelse
         return error.InvalidPerfSemanticOutput;
+    return canonicalValueDigest(allocator, data);
+}
+
+fn canonicalValueDigest(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![64]u8 {
     const canonical = try definition_core.canonical_json.canonicalJsonAlloc(
         allocator,
-        data,
+        value,
     );
     defer allocator.free(canonical);
     var digest: [32]u8 = undefined;
@@ -3244,8 +3428,14 @@ fn compareBalancedDeepMetrics(
     {
         return error.DeepMeasurementSampleCountMismatch;
     }
+    if (baseline.alloc_samples.items.len != paired_comparison_rounds or
+        candidate.alloc_samples.items.len != paired_comparison_rounds)
+    {
+        return error.DeepMeasurementAllocationCountMismatch;
+    }
     var p50_ratios: [paired_comparison_rounds]u64 = undefined;
     var p95_ratios: [paired_comparison_rounds]u64 = undefined;
+    var allocation_ratios: [paired_comparison_rounds]u64 = undefined;
     for (0..paired_comparison_rounds) |round| {
         const start = round * case_cfg.samples;
         const end = start + case_cfg.samples;
@@ -3259,9 +3449,14 @@ fn compareBalancedDeepMetrics(
             candidate.samples.items[start..end],
             95,
         );
+        allocation_ratios[round] = try ratioPpm(
+            baseline.alloc_samples.items[round],
+            candidate.alloc_samples.items[round],
+        );
     }
     const p50_ratio = medianRatioPpm(&p50_ratios);
     const p95_ratio = medianRatioPpm(&p95_ratios);
+    const allocation_ratio = medianRatioPpm(&allocation_ratios);
     const allowed_ratio: u64 = @intFromFloat(std.math.ceil(
         @as(f64, @floatFromInt(ratio_scale)) *
             (1.0 + case_cfg.tolerance_pct / 100.0),
@@ -3286,17 +3481,13 @@ fn compareBalancedDeepMetrics(
             ),
         };
     }
-    const allowed_alloc = allowedUpperBoundWithTolerance(
-        baseline.p50_alloc_calls,
-        case_cfg.tolerance_pct,
-    );
-    if (candidate.p50_alloc_calls > allowed_alloc) {
+    if (allocation_ratio > allowed_ratio) {
         return .{
             .status = "FAIL",
             .detail = try std.fmt.allocPrint(
                 std.heap.page_allocator,
-                "p50_alloc_calls {d} > {d}",
-                .{ candidate.p50_alloc_calls, allowed_alloc },
+                "balanced round allocation ratio_ppm={d} > {d}",
+                .{ allocation_ratio, allowed_ratio },
             ),
         };
     }
@@ -3304,8 +3495,8 @@ fn compareBalancedDeepMetrics(
         .status = "PASS",
         .detail = try std.fmt.allocPrint(
             std.heap.page_allocator,
-            "balanced round ratios p50_ppm={d} p95_ppm={d}",
-            .{ p50_ratio, p95_ratio },
+            "balanced round ratios p50_ppm={d} p95_ppm={d} allocation_ppm={d}",
+            .{ p50_ratio, p95_ratio, allocation_ratio },
         ),
     };
 }
@@ -3325,6 +3516,10 @@ fn quantileRatioPpm(
         candidate,
         percentile,
     );
+    return ratioPpm(base, current);
+}
+
+fn ratioPpm(base: u64, current: u64) !u64 {
     if (base == 0) return error.InvalidDeepMeasurementContract;
     const numerator = @as(u128, current) * ratio_scale + base - 1;
     return @intCast(numerator / base);
@@ -3470,7 +3665,8 @@ fn writeDeepMetricsArtifact(
             "\"binary\":\"{s}\",\"case_id\":\"{s}\"," ++
             "\"case_kind\":\"{s}\",\"tolerance_pct\":{d:.2}," ++
             "\"measurement_contract\":{{\"schema\":\"{s}\"," ++
-            "\"batch_iterations\":{d},\"latency_scope\":\"batch-total\"," ++
+            "\"batch_iterations\":{d},\"latency_unit\":\"ns\"," ++
+            "\"latency_scope\":\"batch-total\",\"allocation_unit\":\"calls\"," ++
             "\"allocation_scope\":\"batch-total\"}},\"metrics\":",
         .{
             machine_name,
@@ -3523,8 +3719,13 @@ fn writeMetricsObject(
         .{ metrics.p50_ns, metrics.p95_ns },
     );
     if (include_allocations) {
+        try writer.writeAll(",\"allocation_samples\":[");
+        for (metrics.alloc_samples.items, 0..) |sample, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            try writer.print("{d}", .{sample});
+        }
         try writer.print(
-            ",\"p50_alloc_calls\":{d}",
+            "],\"p50_alloc_calls\":{d}",
             .{metrics.p50_alloc_calls},
         );
     }
@@ -3626,10 +3827,15 @@ fn writePairedMetricsArtifact(
             return error.IncompletePerfDriverEvidence;
         }
         try writer.print(
-            ",\"comparison_contract\":{{\"method\":\"{s}\"," ++
+            ",\"measurement_contract\":{{\"schema\":\"{s}\"," ++
+                "\"latency_unit\":\"ns\",\"latency_scope\":\"batch-total\"," ++
+                "\"allocation_unit\":\"calls\"," ++
+                "\"allocation_scope\":\"per-operation\"}}," ++
+                "\"comparison_contract\":{{\"method\":\"{s}\"," ++
                 "\"rounds\":{d},\"samples_per_round\":{d}," ++
                 "\"batch_iterations\":{d}}}",
             .{
+                deep_measurement_schema,
                 deep_comparison_method,
                 paired_comparison_rounds,
                 case_cfg.samples / paired_comparison_rounds,
@@ -3682,7 +3888,15 @@ fn writeMeasuredOutputEvidence(
 ) !void {
     try writer.writeAll("{\"output_sha256\":\"sha256:");
     try writer.writeAll(&evidence.output_sha256);
-    try writer.writeAll("\",\"streamed\":");
+    try writer.writeAll("\",\"local_output_sha256\":");
+    if (evidence.local_output_sha256) |digest| {
+        try writer.writeAll("\"sha256:");
+        try writer.writeAll(&digest);
+        try writer.writeByte('"');
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"streamed\":");
     if (evidence.streamed) |value| {
         try writer.writeAll(if (value) "true" else "false");
     } else {
@@ -4457,8 +4671,7 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         try requireCleanSourceRoot(allocator, ".");
         break :cutover_tuple value;
     } else null;
-    const rows_val = parsed.value.object.get("rows") orelse return error.InvalidData;
-    const rows = rows_val.array;
+    const rows = try validateComparisonRows(parsed.value);
     var summary_raw_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &summary_raw_digest, .{});
     const summary_digest = std.fmt.bytesToHex(summary_raw_digest, .lower);
@@ -4524,6 +4737,62 @@ const ReportTuple = struct {
     candidate_sha: []const u8,
 };
 
+fn validateComparisonRows(value: std.json.Value) !std.json.Array {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidCompareSummary,
+    };
+    const rows = switch (object.get("rows") orelse
+        return error.InvalidCompareSummary) {
+        .array => |rows| rows,
+        else => return error.InvalidCompareSummary,
+    };
+    if (rows.items.len > SeqCases.len + LedgerCases.len +
+        CronCases.len + MiscCases.len)
+    {
+        return error.InvalidCompareSummary;
+    }
+    for (rows.items) |row_value| {
+        const row = switch (row_value) {
+            .object => |row| row,
+            else => return error.InvalidCompareSummary,
+        };
+        for ([_]struct {
+            name: []const u8,
+            max_len: usize,
+        }{
+            .{ .name = "case_id", .max_len = 256 },
+            .{ .name = "binary", .max_len = 64 },
+            .{ .name = "status", .max_len = 32 },
+            .{ .name = "detail", .max_len = 4096 },
+        }) |field| {
+            const string = switch (row.get(field.name) orelse
+                return error.InvalidCompareSummary) {
+                .string => |string| string,
+                else => return error.InvalidCompareSummary,
+            };
+            if (string.len == 0 or string.len > field.max_len or
+                !std.unicode.utf8ValidateSlice(string))
+            {
+                return error.InvalidCompareSummary;
+            }
+        }
+        const status = row.get("status").?.string;
+        if (!std.mem.eql(u8, status, "PASS") and
+            !std.mem.eql(u8, status, "FAIL") and
+            !std.mem.eql(u8, status, "INCOMPATIBLE"))
+        {
+            return error.InvalidCompareSummary;
+        }
+        switch (row.get("tuple_bound") orelse
+            return error.InvalidCompareSummary) {
+            .bool => {},
+            else => return error.InvalidCompareSummary,
+        }
+    }
+    return rows;
+}
+
 fn validateCutoverCompareSummary(value: std.json.Value) !ReportTuple {
     const object = switch (value) {
         .object => |object| object,
@@ -4565,11 +4834,7 @@ fn validateCutoverCompareSummary(value: std.json.Value) !ReportTuple {
         else => return error.InvalidCompareSummary,
     };
     if (!complete) return error.IncompleteCutoverComparison;
-    const rows = switch (object.get("rows") orelse
-        return error.InvalidCompareSummary) {
-        .array => |rows| rows,
-        else => return error.InvalidCompareSummary,
-    };
+    const rows = try validateComparisonRows(value);
     if (rows.items.len != SeqCases.len + LedgerCases.len) {
         return error.IncompleteCutoverComparison;
     }
@@ -4996,6 +5261,69 @@ test "report errors clearly when compare summary is missing" {
     try std.testing.expectError(error.MissingCompareSummary, cmdReport(alloc));
 }
 
+test "report rejects malformed rows before writing report artifacts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const alloc = std.testing.allocator;
+    const cwd_before = try std.process.currentPathAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        alloc,
+    );
+    defer alloc.free(cwd_before);
+    try std.process.setCurrentDir(
+        std.Io.Threaded.global_single_threaded.io(),
+        tmp.dir,
+    );
+    defer std.process.setCurrentPath(
+        std.Io.Threaded.global_single_threaded.io(),
+        cwd_before,
+    ) catch |err| {
+        std.debug.panic("restore working directory: {s}", .{@errorName(err)});
+    };
+
+    const current_name = try currentMachineDirName(alloc);
+    defer alloc.free(current_name);
+    const reports_path = try std.fmt.allocPrint(
+        alloc,
+        ".perf-local/{s}/reports",
+        .{current_name},
+    );
+    defer alloc.free(reports_path);
+    try tmp.dir.createDirPath(
+        std.Io.Threaded.global_single_threaded.io(),
+        reports_path,
+    );
+    const summary_path = try std.fs.path.join(
+        alloc,
+        &.{ reports_path, "latest-compare.json" },
+    );
+    defer alloc.free(summary_path);
+    try std.Io.Dir.cwd().writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{
+            .sub_path = summary_path,
+            .data = "{\"target\":null,\"complete\":true,\"rows\":[{" ++
+                "\"case_id\":\"case\",\"binary\":7,\"status\":\"PASS\"," ++
+                "\"tuple_bound\":false,\"detail\":\"bad\"}]}\n",
+        },
+    );
+
+    try std.testing.expectError(error.InvalidCompareSummary, cmdReport(alloc));
+    for ([_][]const u8{ "latest-report.json", "cutover-status.json" }) |name| {
+        const path = try std.fs.path.join(alloc, &.{ reports_path, name });
+        defer alloc.free(path);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().access(
+                std.Io.Threaded.global_single_threaded.io(),
+                path,
+                .{},
+            ),
+        );
+    }
+}
+
 test "comparison invalidates a prior summary before measurement" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5100,6 +5428,27 @@ test "balanced round ratios reject repeatable regressions not one noisy round" {
         candidate,
     );
     try std.testing.expectEqualStrings("FAIL", regression.status);
+    for (candidate.samples.items) |*sample| sample.* = 100;
+    candidate.alloc_samples.items[0] = 110;
+    const one_noisy_allocation_round = try compareBalancedDeepMetrics(
+        case_cfg,
+        baseline,
+        candidate,
+    );
+    try std.testing.expectEqualStrings(
+        "PASS",
+        one_noisy_allocation_round.status,
+    );
+    candidate.alloc_samples.items[1] = 110;
+    const repeated_allocation_regression = try compareBalancedDeepMetrics(
+        case_cfg,
+        baseline,
+        candidate,
+    );
+    try std.testing.expectEqualStrings(
+        "FAIL",
+        repeated_allocation_regression.status,
+    );
 }
 
 test "deep measurement schema one is accepted only for the frozen oracle" {
@@ -5120,6 +5469,156 @@ test "deep measurement schema one is accepted only for the frozen oracle" {
     try std.testing.expectEqual(
         DeepMeasurementSchemaKind.explicit,
         try deepMeasurementSchemaKind(2, "candidate"),
+    );
+}
+
+test "deep artifact identity binds case binary and source revision" {
+    const case_cfg = DeepCases[0];
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"case_id\":\"{s}\",\"binary\":\"{s}\"," ++
+            "\"git_sha\":\"abcdef012345\"}}",
+        .{
+            case_cfg.descriptor.case_id,
+            case_cfg.descriptor.binary,
+        },
+    );
+    defer std.testing.allocator.free(raw);
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        raw,
+        .{},
+    );
+    defer parsed.deinit();
+    try validateDeepArtifactIdentity(
+        parsed.value,
+        case_cfg,
+        "abcdef0123456789abcdef0123456789abcdef01",
+    );
+    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "unknown" };
+    try validateDeepArtifactIdentity(
+        parsed.value,
+        case_cfg,
+        accepted_generic_deep_schema1_sha,
+    );
+    try std.testing.expectError(
+        error.DeepArtifactIdentityMismatch,
+        validateDeepArtifactIdentity(
+            parsed.value,
+            case_cfg,
+            "abcdef0123456789abcdef0123456789abcdef01",
+        ),
+    );
+    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "abcdef012345" };
+    parsed.value.object.getPtr("case_id").?.* = .{ .string = "other" };
+    try std.testing.expectError(
+        error.DeepArtifactIdentityMismatch,
+        validateDeepArtifactIdentity(
+            parsed.value,
+            case_cfg,
+            "abcdef0123456789abcdef0123456789abcdef01",
+        ),
+    );
+    parsed.value.object.getPtr("case_id").?.* = .{
+        .string = case_cfg.descriptor.case_id,
+    };
+    parsed.value.object.getPtr("binary").?.* = .{ .string = "other" };
+    try std.testing.expectError(
+        error.DeepArtifactIdentityMismatch,
+        validateDeepArtifactIdentity(
+            parsed.value,
+            case_cfg,
+            "abcdef0123456789abcdef0123456789abcdef01",
+        ),
+    );
+    parsed.value.object.getPtr("binary").?.* = .{
+        .string = case_cfg.descriptor.binary,
+    };
+    parsed.value.object.getPtr("git_sha").?.* = .{ .string = "fedcba" };
+    try std.testing.expectError(
+        error.DeepArtifactIdentityMismatch,
+        validateDeepArtifactIdentity(
+            parsed.value,
+            case_cfg,
+            "abcdef0123456789abcdef0123456789abcdef01",
+        ),
+    );
+}
+
+test "deep capture acknowledgment is exact and single-line" {
+    try validateCaptureAcknowledgment(
+        std.testing.allocator,
+        "PASS\tseq-observe-deep\tcaptured\n",
+        "seq-observe-deep",
+    );
+    for ([_][]const u8{
+        "",
+        "PASS\tother\tcaptured\n",
+        "PASS\tseq-observe-deep\tcaptured\nPASS\tother\tcaptured\n",
+    }) |raw| {
+        try std.testing.expectError(
+            error.InvalidPerfCaptureAcknowledgment,
+            validateCaptureAcknowledgment(
+                std.testing.allocator,
+                raw,
+                "seq-observe-deep",
+            ),
+        );
+    }
+}
+
+test "deep semantic evidence verifies local identity before relocation normalization" {
+    const allocator = std.testing.allocator;
+    const roots = [_][]const u8{ "/tmp/perf-root-a", "/tmp/perf-root-b" };
+    var evidence: [2]MeasuredOutputEvidence = undefined;
+    for (roots, 0..) |root, index| {
+        const fixture_path = try std.fs.path.join(
+            allocator,
+            &.{ root, "apps/seq/src/v1/fixtures/rollout.jsonl" },
+        );
+        defer allocator.free(fixture_path);
+        const identity = expectedSourceEventId(fixture_path, 3, 2);
+        const rendered = try std.fmt.allocPrint(
+            allocator,
+            "{{\"data\":{{\"schema\":\"example-message-rows/v1\"," ++
+                "\"rows\":[{{\"session_id\":\"fixture-session\"," ++
+                "\"role\":\"assistant\",\"text\":\"Observed FAILURE evidence\"," ++
+                "\"source_event_id\":\"{s}\"}}]}}}}",
+            .{identity},
+        );
+        defer allocator.free(rendered);
+        evidence[index] = try canonicalDeepDataEvidence(
+            allocator,
+            rendered,
+            root,
+        );
+    }
+    try std.testing.expectEqualSlices(
+        u8,
+        &evidence[0].output_sha256,
+        &evidence[1].output_sha256,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &(evidence[0].local_output_sha256.?),
+        &(evidence[1].local_output_sha256.?),
+    ));
+    const wrong_fixture = try std.fs.path.join(
+        allocator,
+        &.{ roots[0], "apps/seq/src/v1/fixtures/rollout.jsonl" },
+    );
+    defer allocator.free(wrong_fixture);
+    const wrong_identity = expectedSourceEventId(wrong_fixture, 3, 2);
+    const wrong_rendered = try std.fmt.allocPrint(
+        allocator,
+        "{{\"data\":{{\"rows\":[{{\"source_event_id\":\"{s}\"}}]}}}}",
+        .{wrong_identity},
+    );
+    defer allocator.free(wrong_rendered);
+    try std.testing.expectError(
+        error.PerfSourceEventIdentityMismatch,
+        canonicalDeepDataEvidence(allocator, wrong_rendered, roots[1]),
     );
 }
 

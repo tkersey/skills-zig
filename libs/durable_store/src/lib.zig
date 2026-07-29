@@ -1931,6 +1931,9 @@ pub fn commitTextTransaction(
     options: AcquireOptions,
 ) !CommitTransactionReceipt {
     if (mutations.len == 0) return error.InvalidPath;
+    for (mutations) |mutation| {
+        try rejectCasControlTargetPath(mutation.path);
+    }
     try ensureDirectoryPathNoSymlinks(transactions_dir);
     const control_root = std.fs.path.dirname(transactions_dir) orelse
         return error.InvalidPath;
@@ -4049,17 +4052,24 @@ pub fn eventStoreLockPathAlloc(
 }
 
 fn casLockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
-    try rejectCasControlTarget(store_path);
+    try rejectCasControlTargetPath(store_path);
     return std.fmt.allocPrint(allocator, "{s}.cas.lock", .{store_path});
 }
 
-fn rejectCasControlTarget(store_path: []const u8) !void {
-    const basename = std.fs.path.basename(store_path);
-    if (std.mem.endsWith(u8, basename, ".cas.lock") or
-        std.mem.endsWith(u8, basename, ".cas.lock.advisory"))
-    {
-        return error.ReservedCasControlPath;
+pub fn rejectCasControlTargetPath(store_path: []const u8) !void {
+    var components = std.mem.tokenizeAny(u8, store_path, "/\\");
+    while (components.next()) |component| {
+        if (endsWithAsciiIgnoreCase(component, ".cas.lock") or
+            endsWithAsciiIgnoreCase(component, ".cas.lock.advisory"))
+        {
+            return error.ReservedCasControlPath;
+        }
     }
+}
+
+fn endsWithAsciiIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    if (value.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
 }
 
 fn casAdvisoryPathAlloc(
@@ -5830,6 +5840,9 @@ test "CAS targets cannot inhabit generated control paths" {
     for ([_][]const u8{
         "state.jsonl.cas.lock",
         "state.jsonl.cas.lock.advisory",
+        "state.jsonl.CAS.LOCK",
+        "state.jsonl.CAS.LOCK.ADVISORY",
+        "state.jsonl.cas.lock/child.jsonl",
     }) |basename| {
         const path = try std.fs.path.join(
             std.testing.allocator,
@@ -5845,6 +5858,60 @@ test "CAS targets cannot inhabit generated control paths" {
                 .{ .expected_exists = false },
             ),
         );
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().access(Io.io(), path, .{}),
+        );
+    }
+}
+
+test "transactions reject CAS control aliases before creating directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "transactions" },
+    );
+    defer std.testing.allocator.free(transactions_dir);
+    const target_parent = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "state.jsonl.CAS.LOCK" },
+    );
+    defer std.testing.allocator.free(target_parent);
+    const target = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ target_parent, "child.jsonl" },
+    );
+    defer std.testing.allocator.free(target);
+    const mutations = [_]TransactionMutation{.{
+        .path = target,
+        .text = "{\"seq\":1}\n",
+        .expectation = .{ .expected_exists = false },
+        .content_mode = .raw,
+        .max_bytes = 4096,
+    }};
+    try std.testing.expectError(
+        error.ReservedCasControlPath,
+        commitTextTransaction(
+            std.testing.allocator,
+            transactions_dir,
+            &mutations,
+            .{
+                .owner = .{
+                    .process_id = 1,
+                    .session_id = "reserved-control-path",
+                    .executor = "test",
+                },
+            },
+        ),
+    );
+    for ([_][]const u8{ transactions_dir, target_parent }) |path| {
         try std.testing.expectError(
             error.FileNotFound,
             std.Io.Dir.cwd().access(Io.io(), path, .{}),

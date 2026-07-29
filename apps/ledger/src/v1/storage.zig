@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const durable_store = @import("durable_store");
 const definition = @import("definition.zig");
 const document = @import("document.zig");
 
@@ -5074,10 +5075,8 @@ fn validateEncodedPathTemplate(
             return error.ReservedStoragePath;
         }
     }
-    const last = segments[segments.len - 1];
-    if (last.kind == .literal and isCasControlPath(last.text)) {
+    durable_store.rejectCasControlTargetPath(expected) catch
         return error.ReservedStoragePath;
-    }
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     for (segments, 0..) |segment, index| {
@@ -5529,20 +5528,14 @@ fn validateLogicalSlotPath(path: []const u8) !void {
     const first_end = std.mem.indexOfScalar(u8, path, '/') orelse path.len;
     const first = path[0..first_end];
     if (isReservedStorageRoot(first)) return error.ReservedStoragePath;
-    if (isCasControlPath(std.fs.path.basename(path))) {
+    durable_store.rejectCasControlTargetPath(path) catch
         return error.ReservedStoragePath;
-    }
 }
 
 fn isReservedStorageRoot(component: []const u8) bool {
     return component.len == 0 or component[0] == '.' or
         std.ascii.eqlIgnoreCase(component, "transactions") or
         std.ascii.eqlIgnoreCase(component, "bindings");
-}
-
-fn isCasControlPath(basename: []const u8) bool {
-    return std.mem.endsWith(u8, basename, ".cas.lock") or
-        std.mem.endsWith(u8, basename, ".cas.lock.advisory");
 }
 
 fn deinitPathSegments(
@@ -5913,14 +5906,18 @@ test "storage compiler rejects reserved paths and implicit multi effects" {
 }
 
 test "storage paths reserve generated CAS control suffixes" {
-    try std.testing.expectError(
-        error.ReservedStoragePath,
-        validateLogicalSlotPath("records/state.jsonl.cas.lock"),
-    );
-    try std.testing.expectError(
-        error.ReservedStoragePath,
-        validateLogicalSlotPath("records/state.jsonl.cas.lock.advisory"),
-    );
+    for ([_][]const u8{
+        "records/state.jsonl.cas.lock",
+        "records/state.jsonl.cas.lock.advisory",
+        "records/state.jsonl.CAS.LOCK",
+        "records/state.jsonl.CAS.LOCK.ADVISORY",
+        "records/state.jsonl.cas.lock/child.jsonl",
+    }) |path| {
+        try std.testing.expectError(
+            error.ReservedStoragePath,
+            validateLogicalSlotPath(path),
+        );
+    }
     const static_segments = [_]PathSegment{.{
         .kind = .literal,
         .text = @constCast("state.jsonl.cas.lock"),
@@ -5931,6 +5928,24 @@ test "storage paths reserve generated CAS control suffixes" {
             std.testing.allocator,
             "state.jsonl.cas.lock",
             &static_segments,
+        ),
+    );
+    const ancestor_segments = [_]PathSegment{
+        .{
+            .kind = .literal,
+            .text = @constCast("state.jsonl.CAS.LOCK"),
+        },
+        .{
+            .kind = .literal,
+            .text = @constCast("child.jsonl"),
+        },
+    };
+    try std.testing.expectError(
+        error.ReservedStoragePath,
+        validateEncodedPathTemplate(
+            std.testing.allocator,
+            "state.jsonl.CAS.LOCK/child.jsonl",
+            &ancestor_segments,
         ),
     );
     try std.testing.expect(!pathTemplateMatches(
@@ -5946,6 +5961,26 @@ test "storage paths reserve generated CAS control suffixes" {
             .max_bytes = 1024,
         },
         "state.jsonl.cas.lock",
+    ));
+    try std.testing.expect(!pathTemplateMatches(
+        .{
+            .name = @constCast("state"),
+            .relative_path = @constCast("{stream}/child.jsonl"),
+            .path_segments = @constCast(&[_]PathSegment{
+                .{
+                    .kind = .parameter,
+                    .text = @constCast("stream"),
+                },
+                .{
+                    .kind = .literal,
+                    .text = @constCast("child.jsonl"),
+                },
+            }),
+            .kind = .event_log,
+            .codec = .jsonl,
+            .max_bytes = 1024,
+        },
+        "state.jsonl.CAS.LOCK/child.jsonl",
     ));
 }
 
