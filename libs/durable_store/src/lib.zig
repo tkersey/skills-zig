@@ -4988,6 +4988,17 @@ const HostObjectIdentity = struct {
     ctime_ns: i96,
 };
 
+fn hostObjectIdentitiesEqual(
+    left: HostObjectIdentity,
+    right: HostObjectIdentity,
+) bool {
+    return left.device == right.device and
+        left.inode == right.inode and
+        left.kind == right.kind and
+        left.mtime_ns == right.mtime_ns and
+        left.ctime_ns == right.ctime_ns;
+}
+
 fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
     if (@import("builtin").os.tag == .windows) return null;
     var file = (if (std.fs.path.isAbsolute(path))
@@ -7573,6 +7584,7 @@ fn nearestExistingPathAlloc(
 }
 
 const directory_case_cache_entries_max: usize = 64;
+const directory_case_provisional_ttl_ms: u64 = 50;
 
 const DirectoryCaseCache = struct {
     const Value = union(enum) {
@@ -7586,6 +7598,7 @@ const DirectoryCaseCache = struct {
         mtime_ns: i96,
         ctime_ns: i96,
         value: Value,
+        provisional_expires_ms: u64,
     };
 
     entries: [directory_case_cache_entries_max]Entry = undefined,
@@ -7595,6 +7608,7 @@ const DirectoryCaseCache = struct {
     fn get(
         self: DirectoryCaseCache,
         identity: HostObjectIdentity,
+        now_ms: u64,
     ) ?Value {
         for (self.entries[0..self.count]) |entry| {
             if (entry.device == identity.device and
@@ -7602,6 +7616,11 @@ const DirectoryCaseCache = struct {
                 entry.mtime_ns == identity.mtime_ns and
                 entry.ctime_ns == identity.ctime_ns)
             {
+                if (entry.value == .provisional and
+                    now_ms >= entry.provisional_expires_ms)
+                {
+                    return null;
+                }
                 return entry.value;
             }
         }
@@ -7612,12 +7631,17 @@ const DirectoryCaseCache = struct {
         self: *DirectoryCaseCache,
         identity: HostObjectIdentity,
         value: Value,
+        now_ms: u64,
     ) void {
         for (self.entries[0..self.count], 0..) |entry, index| {
             if (entry.device == identity.device and
                 entry.inode == identity.inode)
             {
-                self.entries[index] = makeEntry(identity, value);
+                self.entries[index] = makeEntry(
+                    identity,
+                    value,
+                    now_ms,
+                );
                 return;
             }
         }
@@ -7625,20 +7649,40 @@ const DirectoryCaseCache = struct {
             defer self.count += 1;
             break :grow self.count;
         } else replace: {
-            defer self.replace_index =
-                (self.replace_index + 1) % self.entries.len;
-            break :replace self.replace_index;
+            break :replace self.replacementIndex(value) orelse return;
         };
-        self.entries[index] = makeEntry(identity, value);
+        self.entries[index] = makeEntry(identity, value, now_ms);
+        self.replace_index = (index + 1) % self.entries.len;
     }
 
-    fn makeEntry(identity: HostObjectIdentity, value: Value) Entry {
+    fn replacementIndex(self: DirectoryCaseCache, value: Value) ?usize {
+        var offset: usize = 0;
+        while (offset < self.entries.len) : (offset += 1) {
+            const index = (self.replace_index + offset) % self.entries.len;
+            if (self.entries[index].value == .provisional) return index;
+        }
+        return if (value == .direct) self.replace_index else null;
+    }
+
+    fn makeEntry(
+        identity: HostObjectIdentity,
+        value: Value,
+        now_ms: u64,
+    ) Entry {
         return .{
             .device = identity.device,
             .inode = identity.inode,
             .mtime_ns = identity.mtime_ns,
             .ctime_ns = identity.ctime_ns,
             .value = value,
+            .provisional_expires_ms = switch (value) {
+                .direct => 0,
+                .provisional => std.math.add(
+                    u64,
+                    now_ms,
+                    directory_case_provisional_ttl_ms,
+                ) catch std.math.maxInt(u64),
+            },
         };
     }
 };
@@ -7654,25 +7698,26 @@ test "directory case cache is bounded and identity keyed" {
         .mtime_ns = 3,
         .ctime_ns = 4,
     };
-    try std.testing.expect(cache.get(first) == null);
-    cache.put(first, .{ .direct = true });
-    try std.testing.expect(cache.get(first).?.direct);
+    try std.testing.expect(cache.get(first, 10) == null);
+    cache.put(first, .{ .direct = true }, 10);
+    try std.testing.expect(cache.get(first, 10).?.direct);
     try std.testing.expect(cache.get(.{
         .device = 2,
         .inode = 2,
         .kind = .directory,
         .mtime_ns = 3,
         .ctime_ns = 4,
-    }) == null);
+    }, 10) == null);
     var changed = first;
     changed.ctime_ns += 1;
-    try std.testing.expect(cache.get(changed) == null);
-    cache.put(changed, .provisional);
+    try std.testing.expect(cache.get(changed, 10) == null);
+    cache.put(changed, .provisional, 10);
     try std.testing.expectEqual(@as(usize, 1), cache.count);
     try std.testing.expectEqual(
         DirectoryCaseCache.Value.provisional,
-        cache.get(changed).?,
+        cache.get(changed, 10).?,
     );
+    try std.testing.expect(cache.get(changed, 60) == null);
     for (0..directory_case_cache_entries_max + 1) |index| {
         cache.put(.{
             .device = 3,
@@ -7680,8 +7725,34 @@ test "directory case cache is bounded and identity keyed" {
             .kind = .directory,
             .mtime_ns = 5,
             .ctime_ns = 6,
-        }, .{ .direct = false });
+        }, .{ .direct = false }, 10);
     }
+    try std.testing.expectEqual(
+        directory_case_cache_entries_max,
+        cache.count,
+    );
+}
+
+test "provisional case entries do not evict direct observations" {
+    var cache: DirectoryCaseCache = .{};
+    const direct: HostObjectIdentity = .{
+        .device = 1,
+        .inode = 1,
+        .kind = .directory,
+        .mtime_ns = 1,
+        .ctime_ns = 1,
+    };
+    cache.put(direct, .{ .direct = true }, 10);
+    for (0..directory_case_cache_entries_max) |index| {
+        cache.put(.{
+            .device = 2,
+            .inode = @intCast(index),
+            .kind = .directory,
+            .mtime_ns = 2,
+            .ctime_ns = 2,
+        }, .provisional, 10);
+    }
+    try std.testing.expect(cache.get(direct, 10).?.direct);
     try std.testing.expectEqual(
         directory_case_cache_entries_max,
         cache.count,
@@ -7710,27 +7781,40 @@ fn directoryNamesAreCaseInsensitive(
     const identity = try hostObjectIdentity(canonical);
     if (identity) |value| {
         if (value.kind != .directory) return error.NotDir;
-        if (directory_case_cache.get(value)) |cached| {
-            return switch (cached) {
-                .direct => |case_insensitive| case_insensitive,
-                .provisional => detectAncestorCaseInsensitivity(
-                    allocator,
-                    canonical,
-                ),
-            };
+        if (directory_case_cache.get(
+            value,
+            clockMillis(.awake),
+        )) |cached| {
+            switch (cached) {
+                .direct => |case_insensitive| return case_insensitive,
+                .provisional => {
+                    const case_insensitive =
+                        try detectAncestorCaseInsensitivity(
+                            allocator,
+                            canonical,
+                        );
+                    const refreshed = (try hostObjectIdentity(canonical)) orelse
+                        return error.TransactionRecoveryRequired;
+                    if (hostObjectIdentitiesEqual(value, refreshed)) {
+                        return case_insensitive;
+                    }
+                },
+            }
         }
     }
     const observation = try detectDirectoryCaseInsensitivity(
         allocator,
         canonical,
     );
-    if (identity) |value| {
+    if (try hostObjectIdentity(canonical)) |value| {
+        if (value.kind != .directory) return error.NotDir;
         directory_case_cache.put(
             value,
             if (observation.direct)
                 .{ .direct = observation.case_insensitive }
             else
                 .provisional,
+            clockMillis(.awake),
         );
     }
     return observation.case_insensitive;
