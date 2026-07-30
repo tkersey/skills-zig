@@ -1028,6 +1028,11 @@ pub const TransactionState = enum {
     }
 };
 
+const TransactionRecordFormat = enum {
+    current,
+    legacy,
+};
+
 pub const TransactionExpected = struct {
     path: []const u8,
     digest: []const u8,
@@ -1052,12 +1057,24 @@ pub const DurableTransaction = struct {
     updated_at: []const u8,
 
     pub fn writeJson(self: DurableTransaction, writer: anytype) !void {
+        try self.writeJsonWithFormat(writer, null);
+    }
+
+    fn writeJsonWithFormat(
+        self: DurableTransaction,
+        writer: anytype,
+        format: ?TransactionRecordFormat,
+    ) !void {
         try writer.writeAll("{\"transaction_version\":\"DTX-v1\",\"transaction_id\":");
         try std.json.Stringify.value(self.transaction_id, .{}, writer);
         try writer.writeAll(",\"owner\":");
         try self.owner.writeJson(writer);
         try writer.writeAll(",\"state\":");
         try std.json.Stringify.value(self.state.asString(), .{}, writer);
+        if (format) |journal_format| {
+            try writer.writeAll(",\"journal_format\":");
+            try std.json.Stringify.value(@tagName(journal_format), .{}, writer);
+        }
         try writer.writeAll(",\"expected\":[");
         for (self.expected, 0..) |row, index| {
             if (index != 0) try writer.writeByte(',');
@@ -2784,6 +2801,22 @@ pub fn inspectTransaction(
             .manual_recovery_required,
             "published-digest-disagreement",
         );
+    if (parsed.state == .committed) {
+        return if (published == parsed.writes.len)
+            makeRecoveryStatus(
+                allocator,
+                parsed.transaction_id,
+                .finish_commit,
+                "committed-marker-required",
+            )
+        else
+            makeRecoveryStatus(
+                allocator,
+                parsed.transaction_id,
+                .manual_recovery_required,
+                "committed-digest-disagreement",
+            );
+    }
     if (published == parsed.writes.len) {
         return makeRecoveryStatus(
             allocator,
@@ -2837,11 +2870,21 @@ pub fn recoverTransactionWithOptions(
         parsed,
         format,
     );
-    const legacy_fencing_counter_path = if (format == .legacy)
-        legacyFencingCounterPath(
-            options.legacy_fencing_authority orelse
-                return error.TransactionRecoveryRequired,
-        )
+    const legacy_fencing_authority = if (format == .legacy)
+        options.legacy_fencing_authority orelse
+            return error.TransactionRecoveryRequired
+    else
+        null;
+    if (legacy_fencing_authority) |authority| {
+        try validateLegacyFencingAuthorityScope(
+            allocator,
+            transaction_dir,
+            parsed,
+            authority,
+        );
+    }
+    const legacy_fencing_counter_path = if (legacy_fencing_authority) |authority|
+        legacyFencingCounterPath(authority)
     else
         null;
     const legacy_terminal =
@@ -2860,7 +2903,8 @@ pub fn recoverTransactionWithOptions(
             "already_committed",
         );
     }
-    var legacy_leases = if (format == .legacy)
+    var legacy_leases = if (format == .legacy and
+        parsed.state != .committed)
         try acquireLegacyTransactionRecoveryLeases(
             allocator,
             parsed.expected,
@@ -3027,6 +3071,75 @@ fn legacyFencingCounterPath(
     };
 }
 
+fn validateLegacyFencingAuthorityScope(
+    allocator: std.mem.Allocator,
+    transaction_dir: []const u8,
+    parsed: ParsedTransactionRecord,
+    authority: LegacyFencingAuthority,
+) !void {
+    const transactions_dir = std.fs.path.dirname(transaction_dir) orelse
+        return error.InvalidPath;
+    switch (authority) {
+        .shared => |counter_path| try validateFencingAuthorityPath(
+            allocator,
+            transactions_dir,
+            parsed,
+            counter_path,
+        ),
+        .per_resource => for (parsed.expected) |expected| {
+            const lock_path = try lockPathAlloc(allocator, expected.path);
+            defer allocator.free(lock_path);
+            const counter_path = try fencingCounterPathAlloc(
+                allocator,
+                lock_path,
+                null,
+            );
+            defer allocator.free(counter_path);
+            try validateFencingAuthorityPath(
+                allocator,
+                transactions_dir,
+                parsed,
+                counter_path,
+            );
+        },
+    }
+}
+
+fn validateFencingAuthorityPath(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    parsed: ParsedTransactionRecord,
+    counter_path: []const u8,
+) !void {
+    const counter_lock_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.lock",
+        .{counter_path},
+    );
+    defer allocator.free(counter_lock_path);
+    const authority_paths = [_][]const u8{
+        counter_path,
+        counter_lock_path,
+    };
+    for (authority_paths) |authority_path| {
+        if (try pathIsWithinDirectory(
+            allocator,
+            transactions_dir,
+            authority_path,
+        )) return error.TransactionCorrupt;
+        for (parsed.expected) |row| {
+            if (pathsAliasOrOverlap(row.path, authority_path)) {
+                return error.TransactionCorrupt;
+            }
+        }
+        for (parsed.writes) |row| {
+            if (pathsAliasOrOverlap(row.path, authority_path)) {
+                return error.TransactionCorrupt;
+            }
+        }
+    }
+}
+
 fn acquireLegacyTransactionRecoveryLeases(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
@@ -3147,11 +3260,6 @@ fn transactionControlRoot(transaction_dir: []const u8) ![]const u8 {
         return error.InvalidPath;
 }
 
-const TransactionRecordFormat = enum {
-    current,
-    legacy,
-};
-
 fn transactionRecordFormat(
     parsed: ParsedTransactionRecord,
 ) !TransactionRecordFormat {
@@ -3159,17 +3267,27 @@ fn transactionRecordFormat(
     const legacy_id = isLegacyTransactionId(parsed.transaction_id);
     if (!current_id and !legacy_id) return error.TransactionCorrupt;
     if (parsed.writes.len == 0) {
-        return if (legacy_id or parsed.embedded_lock_count != 0)
+        const inferred: TransactionRecordFormat = if (legacy_id or
+            parsed.embedded_lock_count != 0)
             .legacy
         else
             .current;
+        if (parsed.format_hint) |hint| {
+            if (hint == .legacy and current_id) return .legacy;
+            if (hint != inferred) return error.TransactionCorrupt;
+        }
+        return inferred;
     }
     var selected: ?TransactionRecordFormat = null;
     for (parsed.writes, 0..) |write, write_index| {
         var name_buffer: [96]u8 = undefined;
+        const expected_index = try expectedIndexForWrite(
+            parsed.expected,
+            write.path,
+        );
         const legacy_name = try legacyTransactionStageName(
             &name_buffer,
-            write_index,
+            expected_index,
         );
         const row_format: TransactionRecordFormat = if (std.mem.eql(
             u8,
@@ -3195,7 +3313,21 @@ fn transactionRecordFormat(
             selected = row_format;
         }
     }
-    return selected.?;
+    const inferred = selected.?;
+    if (parsed.format_hint) |hint| {
+        if (hint != inferred) return error.TransactionCorrupt;
+    }
+    return inferred;
+}
+
+fn expectedIndexForWrite(
+    expected: []const TransactionExpected,
+    write_path: []const u8,
+) !usize {
+    for (expected, 0..) |row, index| {
+        if (std.mem.eql(u8, row.path, write_path)) return index;
+    }
+    return error.TransactionCorrupt;
 }
 
 fn validateTransactionRecordScope(
@@ -3241,14 +3373,10 @@ fn validateTransactionRecordScope(
             transactions_dir,
             row.path,
         )) return error.TransactionCorrupt;
-        var expected_match = false;
-        for (parsed.expected) |expected| {
-            if (std.ascii.eqlIgnoreCase(expected.path, row.path)) {
-                expected_match = true;
-                break;
-            }
-        }
-        if (!expected_match) return error.TransactionCorrupt;
+        const expected_index = try expectedIndexForWrite(
+            parsed.expected,
+            row.path,
+        );
         for (parsed.writes[write_index + 1 ..]) |sibling| {
             if (pathsAliasOrOverlap(row.path, sibling.path)) {
                 return error.TransactionCorrupt;
@@ -3263,7 +3391,7 @@ fn validateTransactionRecordScope(
             ),
             .legacy => try legacyTransactionStageName(
                 &expected_name_buffer,
-                write_index,
+                expected_index,
             ),
         };
         if (!std.mem.eql(u8, row.staged_ref, expected_name)) {
@@ -3556,34 +3684,39 @@ fn validateRollForwardTransaction(
             .follow_symlinks = false,
         });
     defer stage_dir.close(Io.io());
-    for (parsed.expected) |expected| {
-        var written = false;
-        for (parsed.writes) |write| {
-            if (std.ascii.eqlIgnoreCase(expected.path, write.path)) {
-                written = true;
-                break;
+    if (parsed.state != .committed) {
+        for (parsed.expected) |expected| {
+            var written = false;
+            for (parsed.writes) |write| {
+                if (std.mem.eql(u8, expected.path, write.path)) {
+                    written = true;
+                    break;
+                }
             }
-        }
-        if (written) continue;
-        var target = try TransactionTarget.init(control_root, expected.path);
-        defer target.deinit();
-        try target.verifyPathIdentity();
-        const current = digestRegularFileNoSymlinkAtAlloc(
-            allocator,
-            &target.dir,
-            target.base,
-            transaction_recovery_max_bytes,
-        ) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        defer if (current) |digest| allocator.free(digest);
-        if (current) |digest| {
-            if (!std.mem.eql(u8, digest, expected.digest)) {
+            if (written) continue;
+            var target = try TransactionTarget.init(
+                control_root,
+                expected.path,
+            );
+            defer target.deinit();
+            try target.verifyPathIdentity();
+            const current = digestRegularFileNoSymlinkAtAlloc(
+                allocator,
+                &target.dir,
+                target.base,
+                transaction_recovery_max_bytes,
+            ) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            defer if (current) |digest| allocator.free(digest);
+            if (current) |digest| {
+                if (!std.mem.eql(u8, digest, expected.digest)) {
+                    return error.TransactionRecoveryRequired;
+                }
+            } else if (expected.digest.len != 0) {
                 return error.TransactionRecoveryRequired;
             }
-        } else if (expected.digest.len != 0) {
-            return error.TransactionRecoveryRequired;
         }
     }
     for (parsed.writes) |write| {
@@ -3802,6 +3935,7 @@ const ParsedTransactionRecord = struct {
     expected: []TransactionExpected,
     writes: []TransactionWrite,
     embedded_lock_count: usize = 0,
+    format_hint: ?TransactionRecordFormat = null,
     created_at: []const u8,
     updated_at: []const u8,
 
@@ -3852,9 +3986,24 @@ fn parseTransactionRecord(allocator: std.mem.Allocator, record_path: []const u8)
         .expected = try parseTransactionExpectedArray(allocator, expected_value.array.items),
         .writes = try parseTransactionWriteArray(allocator, writes_value.array.items),
         .embedded_lock_count = locks_value.array.items.len,
+        .format_hint = if (object.get("journal_format")) |format_value|
+            parseTransactionRecordFormat(
+                jsonString(format_value) orelse
+                    return error.TransactionCorrupt,
+            ) orelse return error.TransactionCorrupt
+        else
+            null,
         .created_at = try allocator.dupe(u8, jsonString(object.get("created_at") orelse return error.TransactionCorrupt) orelse return error.TransactionCorrupt),
         .updated_at = try allocator.dupe(u8, jsonString(object.get("updated_at") orelse return error.TransactionCorrupt) orelse return error.TransactionCorrupt),
     };
+}
+
+fn parseTransactionRecordFormat(text: []const u8) ?TransactionRecordFormat {
+    inline for (.{ .current, .legacy }) |format| {
+        const typed_format: TransactionRecordFormat = format;
+        if (std.mem.eql(u8, text, @tagName(typed_format))) return typed_format;
+    }
+    return null;
 }
 
 fn parseTransactionState(text: []const u8) ?TransactionState {
@@ -3995,6 +4144,7 @@ fn renderParsedTransactionRecordAlloc(
     parsed: ParsedTransactionRecord,
     state: TransactionState,
 ) ![]u8 {
+    const format = try transactionRecordFormat(parsed);
     const transaction: DurableTransaction = .{
         .transaction_id = parsed.transaction_id,
         .owner = parsed.owner,
@@ -4007,7 +4157,10 @@ fn renderParsedTransactionRecordAlloc(
     };
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
-    try transaction.writeJson(&out.writer);
+    try transaction.writeJsonWithFormat(
+        &out.writer,
+        if (format == .legacy) .legacy else null,
+    );
     try out.writer.writeByte('\n');
     return out.toOwnedSlice();
 }
@@ -7716,12 +7869,12 @@ test "legacy recovery validates expected-only participants before writes" {
     defer allocator.free(record_path);
     const source_path = try std.fs.path.join(
         allocator,
-        &.{ root, "source.json" },
+        &.{ root, "a-source.json" },
     );
     defer allocator.free(source_path);
     const binding_path = try std.fs.path.join(
         allocator,
-        &.{ root, "binding.json" },
+        &.{ root, "z-binding.json" },
     );
     defer allocator.free(binding_path);
     const source_before = "{\"source\":1}\n";
@@ -7752,13 +7905,13 @@ test "legacy recovery validates expected-only participants before writes" {
     };
     const writes = [_]TransactionWrite{.{
         .path = binding_path,
-        .staged_ref = "write-0.staged",
+        .staged_ref = "write-1.staged",
         .digest_after = binding_after_digest,
         .sequence_after = 0,
     }};
     const staged_path = try std.fs.path.join(
         allocator,
-        &.{ transaction_dir, "write-0.staged" },
+        &.{ transaction_dir, "write-1.staged" },
     );
     defer allocator.free(staged_path);
     try writeTextCreateNew(allocator, staged_path, binding_after, .{});
@@ -7794,6 +7947,195 @@ test "legacy recovery validates expected-only participants before writes" {
     const unchanged = try tryReadForTest(binding_path);
     defer allocator.free(unchanged);
     try std.testing.expectEqualStrings(binding_before, unchanged);
+}
+
+test "committed recovery does not revalidate released expected-only guards" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_id = "dtx-6-00000000000000000000000000000001";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const source_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "source.json" },
+    );
+    defer allocator.free(source_path);
+    const binding_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "binding.json" },
+    );
+    defer allocator.free(binding_path);
+    const source_before = "{\"source\":1}\n";
+    const source_after = "{\"source\":2}\n";
+    const binding_before = "{\"binding\":1}\n";
+    const binding_after = "{\"binding\":2}\n";
+    try writeTextAtomic(allocator, source_path, source_before);
+    try writeTextAtomic(allocator, binding_path, binding_before);
+    const source_digest = try digestBytesAlloc(allocator, source_before);
+    defer allocator.free(source_digest);
+    const binding_before_digest = try digestBytesAlloc(
+        allocator,
+        binding_before,
+    );
+    defer allocator.free(binding_before_digest);
+    const binding_after_digest = try digestBytesAlloc(
+        allocator,
+        binding_after,
+    );
+    defer allocator.free(binding_after_digest);
+    const expected = [_]TransactionExpected{
+        .{ .path = binding_path, .digest = binding_before_digest, .sequence = 0 },
+        .{ .path = source_path, .digest = source_digest, .sequence = 0 },
+    };
+    const staged_ref = try transactionStageNameAlloc(
+        allocator,
+        transaction_id,
+        0,
+    );
+    defer allocator.free(staged_ref);
+    const writes = [_]TransactionWrite{.{
+        .path = binding_path,
+        .staged_ref = staged_ref,
+        .digest_after = binding_after_digest,
+        .sequence_after = 0,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 916,
+            .session_id = "committed-guard-release",
+            .executor = "test",
+        },
+        .committed,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+    var incomplete = try inspectTransaction(allocator, transaction_dir);
+    defer incomplete.deinit(allocator);
+    try std.testing.expectEqual(
+        RecoveryDecision.manual_recovery_required,
+        incomplete.decision,
+    );
+    try writeTextAtomic(allocator, binding_path, binding_after);
+    try writeTextAtomic(allocator, source_path, source_after);
+
+    try recoverAndCompactTransactions(
+        allocator,
+        transactions_dir,
+    );
+    try std.testing.expect(!fileExists(transaction_dir));
+    const binding = try tryReadForTest(binding_path);
+    defer allocator.free(binding);
+    try std.testing.expectEqualStrings(binding_after, binding);
+}
+
+test "legacy recovery cannot target its shared fencing authority" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "dtx-7" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    const counter_before = "10\n";
+    const counter_after = "0\n";
+    try writeTextAtomic(allocator, counter_path, counter_before);
+    const before_digest = try digestBytesAlloc(allocator, counter_before);
+    defer allocator.free(before_digest);
+    const after_digest = try digestBytesAlloc(allocator, counter_after);
+    defer allocator.free(after_digest);
+    const expected = [_]TransactionExpected{.{
+        .path = counter_path,
+        .digest = before_digest,
+        .sequence = 0,
+    }};
+    const writes = [_]TransactionWrite{.{
+        .path = counter_path,
+        .staged_ref = "write-0.staged",
+        .digest_after = after_digest,
+        .sequence_after = 0,
+    }};
+    const staged_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "write-0.staged" },
+    );
+    defer allocator.free(staged_path);
+    try writeTextCreateNew(allocator, staged_path, counter_after, .{});
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        "dtx-7",
+        .{
+            .process_id = 917,
+            .session_id = "fencing-authority-target",
+            .executor = "test",
+        },
+        .prepared,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        recoverAndCompactTransactionsWithOptions(
+            allocator,
+            transactions_dir,
+            .{
+                .legacy_fencing_authority = .{
+                    .shared = counter_path,
+                },
+            },
+        ),
+    );
+    const counter = try tryReadForTest(counter_path);
+    defer allocator.free(counter);
+    try std.testing.expectEqualStrings(counter_before, counter);
 }
 
 test "legacy recovery rejects duplicate write targets before publishing" {
@@ -8365,6 +8707,97 @@ test "embedded locks identify write-free legacy transaction records" {
             .created_at = "1",
             .updated_at = "2",
         }),
+    );
+}
+
+test "legacy format survives recovery record rewrites without embedded locks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const original: ParsedTransactionRecord = .{
+        .transaction_id = "dtx-1-00000000000000000000000000000012",
+        .owner = .{
+            .process_id = 918,
+            .session_id = "legacy-format-rewrite",
+            .executor = "test",
+        },
+        .state = .prepared,
+        .expected = &.{},
+        .writes = &.{},
+        .embedded_lock_count = 1,
+        .created_at = "1",
+        .updated_at = "2",
+    };
+    const rewritten = try renderParsedTransactionRecordAlloc(
+        allocator,
+        original,
+        .committed,
+    );
+    defer allocator.free(rewritten);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            rewritten,
+            "\"journal_format\":\"legacy\"",
+        ) != null,
+    );
+    try writeTextAtomic(allocator, record_path, rewritten);
+    const reparsed = try parseTransactionRecord(allocator, record_path);
+    defer reparsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), reparsed.embedded_lock_count);
+    try std.testing.expectEqual(
+        TransactionRecordFormat.legacy,
+        try transactionRecordFormat(reparsed),
+    );
+}
+
+test "transaction writes require exact expected path identity" {
+    const transaction_id = "dtx-1-00000000000000000000000000000013";
+    var expected = [_]TransactionExpected{.{
+        .path = "/repo/foo",
+        .digest = "",
+        .sequence = 0,
+    }};
+    var stage_buffer: [96]u8 = undefined;
+    const staged_ref = try transactionStageName(
+        &stage_buffer,
+        transaction_id,
+        0,
+    );
+    var writes = [_]TransactionWrite{.{
+        .path = "/repo/FOO",
+        .staged_ref = staged_ref,
+        .digest_after = "",
+        .sequence_after = 0,
+    }};
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        validateTransactionRecordScope(
+            std.testing.allocator,
+            "/repo",
+            "/repo/transactions/dtx-1-00000000000000000000000000000013",
+            .{
+                .transaction_id = transaction_id,
+                .owner = .{
+                    .process_id = 919,
+                    .session_id = "exact-path-identity",
+                    .executor = "test",
+                },
+                .state = .prepared,
+                .expected = &expected,
+                .writes = &writes,
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            .current,
+        ),
     );
 }
 
