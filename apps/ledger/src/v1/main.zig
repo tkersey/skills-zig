@@ -52,7 +52,8 @@ const Help =
     \\  ledger recovery inspect --repo <path> --transaction <id>
     \\    [--format json|text]
     \\  ledger recovery reclaim --repo <path> --transaction <id>
-    \\    --lock-id <id> --fencing-token <u64> [--format json|text]
+    \\    --resource <path> --lock-id <id> --fencing-token <u64>
+    \\    [--confirm-no-legacy-writers] [--format json|text]
     \\
     \\metadata commands:
     \\  ledger capabilities [--format json|text]
@@ -143,8 +144,10 @@ const DoctorArgs = struct {
 const RecoveryArgs = struct {
     repo_path: []const u8,
     transaction_id: []const u8,
+    resource: ?[]const u8,
     lock_id: ?[]const u8,
     fencing_token: ?u64,
+    confirm_no_legacy_writers: bool,
     format: Format,
 };
 
@@ -367,12 +370,12 @@ fn runRecoveryInspection(
     format: Format,
     paths: RecoveryPaths,
 ) !u8 {
-    const candidates = try durable_store.inspectExpiredLegacyLeases(
+    const candidates = try durable_store.inspectLegacyLeaseRecoveryCandidates(
         allocator,
         paths.transaction_dir,
         .{ .shared = paths.counter_path },
     );
-    defer durable_store.deinitExpiredLegacyLeaseCandidates(
+    defer durable_store.deinitLegacyLeaseRecoveryCandidates(
         allocator,
         candidates,
     );
@@ -386,14 +389,16 @@ fn runRecoveryReclaim(
     paths: RecoveryPaths,
 ) !u8 {
     var summary: durable_store.TransactionRecoverySummary = .{};
-    const receipt = durable_store.reclaimExpiredLegacyLease(
+    const receipt = durable_store.reclaimLegacyLease(
         allocator,
         paths.transaction_dir,
         .{ .shared = paths.counter_path },
         .{
             .transaction_id = args.transaction_id,
+            .resource = args.resource.?,
             .lock_id = args.lock_id.?,
             .fencing_token = args.fencing_token.?,
+            .confirm_no_legacy_writers = args.confirm_no_legacy_writers,
         },
         &summary,
     ) catch |err| {
@@ -1070,8 +1075,10 @@ fn parseRecoveryArgs(
 ) !RecoveryArgs {
     var repo_path: ?[]const u8 = null;
     var transaction_id: ?[]const u8 = null;
+    var resource: ?[]const u8 = null;
     var lock_id: ?[]const u8 = null;
     var fencing_token: ?u64 = null;
+    var confirm_no_legacy_writers = false;
     var format: Format = .json;
     var format_seen = false;
     var index: usize = 0;
@@ -1100,6 +1107,24 @@ fn parseRecoveryArgs(
             lock_id = argv[index];
             continue;
         }
+        if (std.mem.eql(u8, token, "--resource")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (resource != null) return error.DuplicateResourceOption;
+            resource = argv[index];
+            continue;
+        }
+        if (std.mem.eql(
+            u8,
+            token,
+            "--confirm-no-legacy-writers",
+        )) {
+            if (confirm_no_legacy_writers) {
+                return error.DuplicateConfirmationOption;
+            }
+            confirm_no_legacy_writers = true;
+            continue;
+        }
         if (std.mem.eql(u8, token, "--fencing-token")) {
             index += 1;
             if (index >= argv.len) return error.MissingOptionValue;
@@ -1126,8 +1151,10 @@ fn parseRecoveryArgs(
     return finishRecoveryArgs(
         repo_path,
         transaction_id,
+        resource,
         lock_id,
         fencing_token,
+        confirm_no_legacy_writers,
         format,
         reclaim,
     );
@@ -1136,22 +1163,32 @@ fn parseRecoveryArgs(
 fn finishRecoveryArgs(
     repo_path: ?[]const u8,
     transaction_id: ?[]const u8,
+    resource: ?[]const u8,
     lock_id: ?[]const u8,
     fencing_token: ?u64,
+    confirm_no_legacy_writers: bool,
     format: Format,
     reclaim: bool,
 ) !RecoveryArgs {
-    if (!reclaim and (lock_id != null or fencing_token != null)) {
+    if (!reclaim and
+        (resource != null or
+            lock_id != null or
+            fencing_token != null or
+            confirm_no_legacy_writers))
+    {
         return error.UnsupportedOption;
     }
+    if (reclaim and resource == null) return error.MissingResource;
     if (reclaim and lock_id == null) return error.MissingLockId;
     if (reclaim and fencing_token == null) return error.MissingFencingToken;
     return .{
         .repo_path = repo_path orelse return error.MissingRepository,
         .transaction_id = transaction_id orelse
             return error.MissingTransaction,
+        .resource = resource,
         .lock_id = lock_id,
         .fencing_token = fencing_token,
+        .confirm_no_legacy_writers = confirm_no_legacy_writers,
         .format = format,
     };
 }
@@ -2202,7 +2239,7 @@ fn emitCommandError(err: anyerror) !void {
 
 fn emitRecoveryInspection(
     format: Format,
-    candidates: []const durable_store.ExpiredLegacyLeaseCandidate,
+    candidates: []const durable_store.LegacyLeaseRecoveryCandidate,
 ) !void {
     var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
     switch (format) {
@@ -2220,7 +2257,7 @@ fn emitRecoveryInspection(
         },
         .text => {
             try stdout_writer.interface.print(
-                "expired legacy lease candidates: {d}\n",
+                "legacy lease recovery candidates: {d}\n",
                 .{candidates.len},
             );
             for (candidates) |candidate| {
@@ -2244,6 +2281,10 @@ fn emitRecoveryInspection(
                     candidate.resource,
                     .{},
                     &stdout_writer.interface,
+                );
+                try stdout_writer.interface.print(
+                    " kind={s}",
+                    .{@tagName(candidate.kind)},
                 );
                 try stdout_writer.interface.writeAll(" expires_at=");
                 try std.json.Stringify.value(
@@ -2375,21 +2416,44 @@ test "recovery parser separates inspection from exact witnessed reclaim" {
         "--transaction",
         "dtx-42",
     }, false);
+    try std.testing.expect(inspection.resource == null);
     try std.testing.expect(inspection.lock_id == null);
     try std.testing.expect(inspection.fencing_token == null);
+    try std.testing.expect(!inspection.confirm_no_legacy_writers);
     const reclaim = try parseRecoveryArgs(&.{
         "--repo",
         "/repo",
         "--transaction",
         "dtx-42",
+        "--resource",
+        "/repo/.ledger/events.jsonl",
         "--lock-id",
         "dlk-7-1",
         "--fencing-token",
         "18446744073709551615",
+        "--confirm-no-legacy-writers",
     }, true);
+    try std.testing.expectEqualStrings(
+        "/repo/.ledger/events.jsonl",
+        reclaim.resource.?,
+    );
     try std.testing.expectEqual(
         std.math.maxInt(u64),
         reclaim.fencing_token.?,
+    );
+    try std.testing.expect(reclaim.confirm_no_legacy_writers);
+    try std.testing.expectError(
+        error.MissingResource,
+        parseRecoveryArgs(&.{
+            "--repo",
+            "/repo",
+            "--transaction",
+            "dtx-42",
+            "--lock-id",
+            "dlk-7-1",
+            "--fencing-token",
+            "7",
+        }, true),
     );
     try std.testing.expectError(
         error.UnsupportedOption,

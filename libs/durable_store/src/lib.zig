@@ -881,6 +881,7 @@ pub const AcquireOptions = struct {
     retry_interval_ms: u64 = 25,
     lease_ms: u64 = 5000,
     fencing_counter_path: ?[]const u8 = null,
+    transaction_id: ?[]const u8 = null,
     reject_symlinks: bool = true,
 };
 
@@ -970,15 +971,25 @@ pub const ReclaimReceipt = struct {
     }
 };
 
-pub const ExpiredLegacyLeaseCandidate = struct {
+pub const LegacyLeaseRecoveryCandidate = struct {
     transaction_id: []u8,
     lock_id: []u8,
     resource: []u8,
     fencing_token: u64,
     expires_at: []u8,
+    kind: Kind,
+
+    pub const Kind = enum {
+        expired_legacy,
+        interrupted_recovery,
+
+        fn writeJson(self: Kind, writer: anytype) !void {
+            try std.json.Stringify.value(@tagName(self), .{}, writer);
+        }
+    };
 
     pub fn deinit(
-        self: *ExpiredLegacyLeaseCandidate,
+        self: *LegacyLeaseRecoveryCandidate,
         allocator: std.mem.Allocator,
     ) void {
         allocator.free(self.transaction_id);
@@ -989,7 +1000,7 @@ pub const ExpiredLegacyLeaseCandidate = struct {
     }
 
     pub fn writeJson(
-        self: ExpiredLegacyLeaseCandidate,
+        self: LegacyLeaseRecoveryCandidate,
         writer: anytype,
     ) !void {
         try writer.writeAll("{\"transaction_id\":");
@@ -1002,14 +1013,18 @@ pub const ExpiredLegacyLeaseCandidate = struct {
         try writer.print("{d}", .{self.fencing_token});
         try writer.writeAll(",\"expires_at\":");
         try std.json.Stringify.value(self.expires_at, .{}, writer);
+        try writer.writeAll(",\"kind\":");
+        try self.kind.writeJson(writer);
         try writer.writeByte('}');
     }
 };
 
-pub const ExpiredLegacyLeaseReclaimRequest = struct {
+pub const LegacyLeaseReclaimRequest = struct {
     transaction_id: []const u8,
+    resource: []const u8,
     lock_id: []const u8,
     fencing_token: u64,
+    confirm_no_legacy_writers: bool = false,
 };
 
 pub const CasExpectation = struct {
@@ -1353,6 +1368,31 @@ fn acquireLeaseLockObserved(
 
     const started_ms = clockMillis(.awake);
     while (true) { // tiger: event-loop -- bounded by lock timeout.
+        var advisory = acquireLeaseAdvisoryLockObserved(
+            allocator,
+            lock_path,
+            storage_mutated,
+        ) catch |err| switch (err) {
+            error.LockBusy => {
+                if (options.timeout_ms == 0 or
+                    elapsedMillis(started_ms) >= options.timeout_ms)
+                {
+                    return error.LockBusy;
+                }
+                const sleep_ms = @min(
+                    @max(options.retry_interval_ms, 1),
+                    @as(u64, @intCast(std.math.maxInt(i64))),
+                );
+                std.Io.sleep(
+                    Io.io(),
+                    .fromMilliseconds(@intCast(sleep_ms)),
+                    .awake,
+                ) catch {};
+                continue;
+            },
+            else => return err,
+        };
+        defer advisory.close(Io.io());
         const token = try allocateFencingToken(
             allocator,
             counter_path,
@@ -1368,7 +1408,7 @@ fn acquireLeaseLockObserved(
             now_ms,
             expires_ms,
             token,
-            null,
+            options.transaction_id,
         );
 
         const payload = renderLeaseLockAlloc(allocator, lock) catch |err| {
@@ -1402,6 +1442,11 @@ pub fn refreshLease(
     expected_fencing_token: u64,
     lease_ms: u64,
 ) !void {
+    var advisory = try acquireLeaseAdvisoryLock(
+        allocator,
+        lock.path,
+    );
+    defer advisory.close(Io.io());
     const current = try readLeaseLock(allocator, lock.path);
     var current_owned = current;
     defer current_owned.deinit(allocator);
@@ -1435,6 +1480,11 @@ pub fn releaseLease(
     lock: *LeaseLock,
     expected_fencing_token: u64,
 ) !void {
+    var advisory = try acquireLeaseAdvisoryLock(
+        allocator,
+        lock.path,
+    );
+    defer advisory.close(Io.io());
     const current = try readLeaseLock(allocator, lock.path);
     var current_owned = current;
     defer current_owned.deinit(allocator);
@@ -1460,24 +1510,41 @@ pub fn reclaimExpiredLease(
     const counter_path = try fencingCounterPathAlloc(allocator, lock_path, options.fencing_counter_path);
     defer allocator.free(counter_path);
 
+    var advisory = try acquireLeaseAdvisoryLock(
+        allocator,
+        lock_path,
+    );
+    defer advisory.close(Io.io());
     var current = try readLeaseLock(allocator, lock_path);
     defer current.deinit(allocator);
-    return reclaimExpiredLeaseMatchingWitness(
+    if (current.transaction_id != null) {
+        return error.TransactionRecoveryRequired;
+    }
+    return reclaimLeaseMatchingWitnessLocked(
         allocator,
         current,
         counter_path,
         null,
+        true,
     );
 }
 
-fn reclaimExpiredLeaseMatchingWitness(
+fn reclaimLeaseMatchingWitnessLocked(
     allocator: std.mem.Allocator,
     expected: LeaseLock,
     counter_path: []const u8,
     storage_mutated: ?*bool,
+    require_expired: bool,
 ) !ReclaimReceipt {
-    const expires_ms = try parseU64Text(expected.expires_at);
-    if (clockMillis(.real) < expires_ms) return error.LockBusy;
+    if (require_expired) {
+        const expires_ms = try parseU64Text(expected.expires_at);
+        if (clockMillis(.real) < expires_ms) return error.LockBusy;
+    }
+    var current = try readLeaseLock(allocator, expected.path);
+    defer current.deinit(allocator);
+    if (!leaseWitnessesEqual(current, expected)) {
+        return error.FencingTokenStale;
+    }
     const new_counter = try allocateFencingToken(
         allocator,
         counter_path,
@@ -1486,34 +1553,39 @@ fn reclaimExpiredLeaseMatchingWitness(
     if (expected.fencing_token >= new_counter) {
         return error.FencingTokenStale;
     }
-    var current = try readLeaseLock(allocator, expected.path);
-    defer current.deinit(allocator);
-    if (!leaseWitnessesEqual(current, expected)) {
-        return error.FencingTokenStale;
-    }
     const evidence_path = try std.fmt.allocPrint(
         allocator,
-        "{s}.reclaimed-{d}-{d}",
+        "{s}.reclaimed-{d}",
         .{
             expected.path,
-            clockMillis(.real),
             expected.fencing_token,
         },
     );
     defer allocator.free(evidence_path);
+    const payload = try renderLeaseLockAlloc(allocator, expected);
+    defer allocator.free(payload);
+    writeTextCreateNew(
+        allocator,
+        evidence_path,
+        payload,
+        .{},
+    ) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const existing = try readRegularFileNoSymlink(
+                allocator,
+                evidence_path,
+                4096,
+            );
+            defer allocator.free(existing);
+            if (!std.mem.eql(u8, existing, payload)) return err;
+        },
+        else => return err,
+    };
+    if (storage_mutated) |mutated| mutated.* = true;
     if (std.fs.path.isAbsolute(expected.path)) {
-        try std.Io.Dir.renameAbsolute(
-            expected.path,
-            evidence_path,
-            Io.io(),
-        );
+        try std.Io.Dir.deleteFileAbsolute(Io.io(), expected.path);
     } else {
-        try std.Io.Dir.cwd().rename(
-            expected.path,
-            std.Io.Dir.cwd(),
-            evidence_path,
-            Io.io(),
-        );
+        try std.Io.Dir.cwd().deleteFile(Io.io(), expected.path);
     }
     if (storage_mutated) |mutated| mutated.* = true;
     try syncDirectoryPath(
@@ -1588,6 +1660,52 @@ fn fencingCounterPathAlloc(
 ) ![]u8 {
     if (explicit_counter_path) |path| return allocator.dupe(u8, path);
     return std.fmt.allocPrint(allocator, "{s}.counter", .{lock_path});
+}
+
+fn leaseAdvisoryPathAlloc(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}.advisory",
+        .{lock_path},
+    );
+}
+
+fn acquireLeaseAdvisoryLock(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+) !std.Io.File {
+    return acquireLeaseAdvisoryLockObserved(
+        allocator,
+        lock_path,
+        null,
+    );
+}
+
+fn acquireLeaseAdvisoryLockObserved(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+    storage_mutated: ?*bool,
+) !std.Io.File {
+    const advisory_path = try leaseAdvisoryPathAlloc(
+        allocator,
+        lock_path,
+    );
+    defer allocator.free(advisory_path);
+    var created = false;
+    const lock = openEventStoreSidecarExclusiveObserved(
+        advisory_path,
+        &created,
+    ) catch |err| switch (err) {
+        error.WouldBlock => return error.LockBusy,
+        else => return err,
+    };
+    if (created) {
+        if (storage_mutated) |mutated| mutated.* = true;
+    }
+    return lock;
 }
 
 fn allocateFencingToken(
@@ -3292,20 +3410,25 @@ pub fn inspectTransaction(
     );
 }
 
-pub fn inspectExpiredLegacyLeases(
+pub fn inspectLegacyLeaseRecoveryCandidates(
     allocator: std.mem.Allocator,
     transaction_dir: []const u8,
     authority: LegacyFencingAuthority,
-) ![]ExpiredLegacyLeaseCandidate {
+) ![]LegacyLeaseRecoveryCandidate {
     const parsed = try parseValidatedLegacyRecoveryRecord(
         allocator,
         transaction_dir,
         authority,
     );
     defer parsed.deinit(allocator);
-    var candidates = try allocator.alloc(
-        ExpiredLegacyLeaseCandidate,
+    const capacity = std.math.add(
+        usize,
+        parsed.expected.len,
         parsed.embedded_locks.len,
+    ) catch return error.TooManyFiles;
+    var candidates = try allocator.alloc(
+        LegacyLeaseRecoveryCandidate,
+        capacity,
     );
     var count: usize = 0;
     errdefer {
@@ -3313,6 +3436,39 @@ pub fn inspectExpiredLegacyLeases(
             candidate.deinit(allocator);
         }
         allocator.free(candidates);
+    }
+    for (parsed.expected) |expected| {
+        const lock_path = try lockPathAlloc(
+            allocator,
+            expected.path,
+        );
+        defer allocator.free(lock_path);
+        var current = readLeaseLock(
+            allocator,
+            lock_path,
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer current.deinit(allocator);
+        if (!std.mem.eql(u8, current.resource, expected.path) or
+            !ownersEqual(current.owner, parsed.owner) or
+            current.transaction_id == null or
+            !std.mem.eql(
+                u8,
+                current.transaction_id.?,
+                parsed.transaction_id,
+            ))
+        {
+            continue;
+        }
+        candidates[count] = try makeLegacyLeaseRecoveryCandidate(
+            allocator,
+            parsed.transaction_id,
+            current,
+            .interrupted_recovery,
+        );
+        count += 1;
     }
     const now_ms = clockMillis(.real);
     for (parsed.embedded_locks) |embedded| {
@@ -3324,13 +3480,23 @@ pub fn inspectExpiredLegacyLeases(
             else => return err,
         };
         defer current.deinit(allocator);
+        if (current.transaction_id != null and
+            std.mem.eql(
+                u8,
+                current.transaction_id.?,
+                parsed.transaction_id,
+            ))
+        {
+            continue;
+        }
         if (!leaseWitnessesEqual(current, embedded)) continue;
         const expires_ms = try parseU64Text(current.expires_at);
         if (now_ms < expires_ms) continue;
-        candidates[count] = try makeExpiredLegacyLeaseCandidate(
+        candidates[count] = try makeLegacyLeaseRecoveryCandidate(
             allocator,
             parsed.transaction_id,
             current,
+            .expired_legacy,
         );
         count += 1;
     }
@@ -3370,11 +3536,12 @@ fn parseValidatedLegacyRecoveryRecord(
     return parsed;
 }
 
-fn makeExpiredLegacyLeaseCandidate(
+fn makeLegacyLeaseRecoveryCandidate(
     allocator: std.mem.Allocator,
     transaction_id: []const u8,
     lock: LeaseLock,
-) !ExpiredLegacyLeaseCandidate {
+    kind: LegacyLeaseRecoveryCandidate.Kind,
+) !LegacyLeaseRecoveryCandidate {
     const transaction_id_owned = try allocator.dupe(u8, transaction_id);
     errdefer allocator.free(transaction_id_owned);
     const lock_id_owned = try allocator.dupe(u8, lock.lock_id);
@@ -3388,22 +3555,23 @@ fn makeExpiredLegacyLeaseCandidate(
         .resource = resource_owned,
         .fencing_token = lock.fencing_token,
         .expires_at = expires_at_owned,
+        .kind = kind,
     };
 }
 
-pub fn deinitExpiredLegacyLeaseCandidates(
+pub fn deinitLegacyLeaseRecoveryCandidates(
     allocator: std.mem.Allocator,
-    candidates: []ExpiredLegacyLeaseCandidate,
+    candidates: []LegacyLeaseRecoveryCandidate,
 ) void {
     for (candidates) |*candidate| candidate.deinit(allocator);
     allocator.free(candidates);
 }
 
-pub fn reclaimExpiredLegacyLease(
+pub fn reclaimLegacyLease(
     allocator: std.mem.Allocator,
     transaction_dir: []const u8,
     authority: LegacyFencingAuthority,
-    request: ExpiredLegacyLeaseReclaimRequest,
+    request: LegacyLeaseReclaimRequest,
     summary: *TransactionRecoverySummary,
 ) !ReclaimReceipt {
     const transactions_dir = std.fs.path.dirname(transaction_dir) orelse
@@ -3425,37 +3593,90 @@ pub fn reclaimExpiredLegacyLease(
         parsed.transaction_id,
         request.transaction_id,
     )) return error.TransactionCorrupt;
-    var selected: ?LeaseLock = null;
+
+    var resource_selected = false;
+    for (parsed.expected) |expected| {
+        if (!std.mem.eql(u8, expected.path, request.resource)) continue;
+        if (resource_selected) return error.TransactionCorrupt;
+        resource_selected = true;
+    }
+    if (!resource_selected) return error.TransactionRecoveryRequired;
+
+    const lock_path = try lockPathAlloc(
+        allocator,
+        request.resource,
+    );
+    defer allocator.free(lock_path);
+    var advisory = try acquireLeaseAdvisoryLockObserved(
+        allocator,
+        lock_path,
+        &summary.storage_mutated,
+    );
+    defer advisory.close(Io.io());
+    var current = try readLeaseLock(allocator, lock_path);
+    defer current.deinit(allocator);
+    if (!std.mem.eql(u8, current.resource, request.resource) or
+        !std.mem.eql(u8, current.lock_id, request.lock_id) or
+        current.fencing_token != request.fencing_token)
+    {
+        return error.TransactionRecoveryRequired;
+    }
+
+    const interrupted_recovery =
+        current.transaction_id != null and
+        std.mem.eql(
+            u8,
+            current.transaction_id.?,
+            parsed.transaction_id,
+        ) and
+        ownersEqual(current.owner, parsed.owner);
+    var embedded_selected: ?LeaseLock = null;
     for (parsed.embedded_locks) |embedded| {
-        if (std.mem.eql(u8, embedded.lock_id, request.lock_id) and
+        if (std.mem.eql(u8, embedded.resource, request.resource) and
+            std.mem.eql(u8, embedded.lock_id, request.lock_id) and
             embedded.fencing_token == request.fencing_token)
         {
-            if (selected != null) return error.TransactionCorrupt;
-            selected = embedded;
+            if (embedded_selected != null) {
+                return error.TransactionCorrupt;
+            }
+            embedded_selected = embedded;
         }
     }
-    const expected = selected orelse return error.TransactionRecoveryRequired;
+    const expected = if (interrupted_recovery)
+        current
+    else legacy: {
+        const embedded = embedded_selected orelse
+            return error.TransactionRecoveryRequired;
+        if (!request.confirm_no_legacy_writers) {
+            return error.LegacyWriterConfirmationRequired;
+        }
+        if (!leaseWitnessesEqual(current, embedded)) {
+            return error.TransactionRecoveryRequired;
+        }
+        break :legacy embedded;
+    };
     const counter_path = switch (authority) {
         .shared => |path| try allocator.dupe(u8, path),
         .per_resource => per_resource: {
-            const lock_path = try lockPathAlloc(
+            const derived_lock_path = try lockPathAlloc(
                 allocator,
                 expected.resource,
             );
-            defer allocator.free(lock_path);
+            defer allocator.free(derived_lock_path);
             break :per_resource try fencingCounterPathAlloc(
                 allocator,
-                lock_path,
+                derived_lock_path,
                 null,
             );
         },
     };
     defer allocator.free(counter_path);
-    return reclaimExpiredLeaseMatchingWitness(
+    return reclaimLeaseMatchingWitnessLocked(
         allocator,
         expected,
         counter_path,
         &summary.storage_mutated,
+        !interrupted_recovery,
     );
 }
 
@@ -3610,11 +3831,13 @@ pub fn recoverTransactionWithOptionsAccumulating(
         &storage_mutated,
     );
     defer recovery_lock.close(Io.io());
+    var hash_bytes_remaining = transaction_recovery_hash_max_bytes;
     var receipt = recoverTransactionWithOptionsAccumulatingLocked(
         allocator,
         transaction_dir,
         options,
         &storage_mutated,
+        &hash_bytes_remaining,
     ) catch |err| {
         summary.storage_mutated = storage_mutated;
         return err;
@@ -3630,6 +3853,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
     transaction_dir: []const u8,
     options: TransactionRecoveryOptions,
     storage_mutated: *bool,
+    hash_bytes_remaining: *usize,
 ) !RecoveryReceipt {
     const control_root = try transactionControlRoot(transaction_dir);
     const record_path = try std.fs.path.join(
@@ -3673,7 +3897,6 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
         format == .legacy and
         parsed.state == .committed and
         fileExists(commit_marker_path);
-    var hash_bytes_remaining = transaction_recovery_hash_max_bytes;
     if (legacy_terminal) {
         try ensureLegacyTerminalLeasesQuiescent(
             allocator,
@@ -3683,6 +3906,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
             allocator,
             parsed.expected,
             parsed.owner,
+            parsed.transaction_id,
             legacy_fencing_counter_path,
             storage_mutated,
         );
@@ -3710,7 +3934,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
             control_root,
             parsed.writes,
             parsed.expected,
-            &hash_bytes_remaining,
+            hash_bytes_remaining,
         )) orelse return error.TransactionRecoveryRequired;
         if (published != parsed.writes.len) {
             return error.TransactionRecoveryRequired;
@@ -3743,6 +3967,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
             allocator,
             parsed.expected,
             parsed.owner,
+            parsed.transaction_id,
             legacy_fencing_counter_path,
             storage_mutated,
         )
@@ -3772,7 +3997,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
     const status = try inspectTransactionWithBudget(
         allocator,
         transaction_dir,
-        &hash_bytes_remaining,
+        hash_bytes_remaining,
     );
     defer status.deinit(allocator);
     switch (status.decision) {
@@ -3803,7 +4028,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
                 control_root,
                 transaction_dir,
                 parsed,
-                &hash_bytes_remaining,
+                hash_bytes_remaining,
             );
             try rollForwardTransaction(
                 allocator,
@@ -3811,7 +4036,7 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
                 transaction_dir,
                 parsed,
                 storage_mutated,
-                &hash_bytes_remaining,
+                hash_bytes_remaining,
             );
             const record = try renderParsedTransactionRecordAlloc(allocator, parsed, .committed);
             defer allocator.free(record);
@@ -3901,6 +4126,23 @@ pub fn recoverAndCompactTransactionsAccumulating(
     transactions_dir: []const u8,
     options: TransactionRecoveryOptions,
     summary: *TransactionRecoverySummary,
+) !void {
+    var hash_bytes_remaining = transaction_recovery_hash_max_bytes;
+    return recoverAndCompactTransactionsAccumulatingWithHashBudget(
+        allocator,
+        transactions_dir,
+        options,
+        summary,
+        &hash_bytes_remaining,
+    );
+}
+
+fn recoverAndCompactTransactionsAccumulatingWithHashBudget(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    options: TransactionRecoveryOptions,
+    summary: *TransactionRecoverySummary,
+    hash_bytes_remaining: *usize,
 ) !void {
     const max_entries: usize = 4096;
     const max_record_bytes: usize = 16 * 1024 * 1024;
@@ -3992,6 +4234,7 @@ pub fn recoverAndCompactTransactionsAccumulating(
             transaction_dir,
             options,
             &summary.storage_mutated,
+            hash_bytes_remaining,
         );
         receipt.deinit(allocator);
         try compactRecoveredTransaction(
@@ -4716,7 +4959,7 @@ fn validateLegacyRecoveryControlDisjointness(
     const control_count = std.math.mul(
         usize,
         parsed.expected.len,
-        3,
+        4,
     ) catch return error.TransactionCorrupt;
     var control_paths: CanonicalPathIndex = .{
         .paths = try allocator.alloc([]u8, control_count),
@@ -4743,6 +4986,11 @@ fn validateLegacyRecoveryControlDisjointness(
             identities,
             expected.path,
             ".lock",
+        );
+        try control_paths.appendDerived(
+            identities,
+            expected.path,
+            ".lock.advisory",
         );
         try control_paths.appendDerived(
             identities,
@@ -4807,6 +5055,7 @@ fn acquireLegacyTransactionRecoveryLeases(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
     owner: Owner,
+    transaction_id: []const u8,
     fencing_counter_path: ?[]const u8,
     storage_mutated: *bool,
 ) ![]LeaseLock {
@@ -4848,6 +5097,7 @@ fn acquireLegacyTransactionRecoveryLeases(
                 .owner = owner,
                 .lease_ms = recovery_lease_ms,
                 .fencing_counter_path = fencing_counter_path,
+                .transaction_id = transaction_id,
             },
             storage_mutated,
         ) catch |err| switch (err) {
@@ -4865,6 +5115,7 @@ fn acquireLegacyTransactionRecoveryLeases(
                             .owner = owner,
                             .lease_ms = recovery_lease_ms,
                             .fencing_counter_path = fencing_counter_path,
+                            .transaction_id = transaction_id,
                         },
                         storage_mutated,
                     ),
@@ -9560,6 +9811,57 @@ test "transaction recovery hashing consumes one aggregate budget" {
     );
 }
 
+test "recovery scan shares one hash budget across transaction journals" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    try ensureDirectoryPathNoSymlinks(transactions_dir);
+    const content = "{\"seq\":1}\n";
+    for (0..2) |index| {
+        const transaction_id = try std.fmt.allocPrint(
+            allocator,
+            "dtx-1-0000000000000000000000000000000{d}",
+            .{index + 1},
+        );
+        defer allocator.free(transaction_id);
+        const target_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}/events-{d}.jsonl",
+            .{ root, index },
+        );
+        defer allocator.free(target_path);
+        try writeTextAtomic(allocator, target_path, content);
+        try writeCommittedRecoveryJournalForTest(
+            allocator,
+            transactions_dir,
+            transaction_id,
+            target_path,
+            content,
+        );
+    }
+    var summary: TransactionRecoverySummary = .{};
+    var hash_bytes_remaining = content.len * 5 - 1;
+    try std.testing.expectError(
+        error.TransactionRecoveryWorkExceeded,
+        recoverAndCompactTransactionsAccumulatingWithHashBudget(
+            allocator,
+            transactions_dir,
+            .{},
+            &summary,
+            &hash_bytes_remaining,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
+    try std.testing.expectEqual(content.len - 1, hash_bytes_remaining);
+}
+
 test "durable transactions compare check-only participants without rewriting them" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10501,6 +10803,7 @@ test "committed legacy journals retain fail-closed lease custody until marker" {
         allocator,
         &expected,
         owner,
+        "dtx-20",
         counter_path,
         &recovery_storage_mutated,
     );
@@ -10518,6 +10821,7 @@ test "committed legacy journals retain fail-closed lease custody until marker" {
         allocator,
         &expected,
         owner,
+        "dtx-20",
         counter_path,
         &recovery_storage_mutated,
     );
@@ -10674,7 +10978,7 @@ const ExpiredLeaseRepairFixture = struct {
     }
 };
 
-test "expired legacy lease repair requires and revalidates an exact journal witness" {
+test "legacy lease repair requires and revalidates an exact journal witness" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -10682,12 +10986,12 @@ test "expired legacy lease repair requires and revalidates an exact journal witn
     defer allocator.free(root);
     var fixture = try ExpiredLeaseRepairFixture.init(allocator, root);
     defer fixture.deinit(allocator);
-    const candidates = try inspectExpiredLegacyLeases(
+    const candidates = try inspectLegacyLeaseRecoveryCandidates(
         allocator,
         fixture.transaction_dir,
         .{ .shared = fixture.counter_path },
     );
-    defer deinitExpiredLegacyLeaseCandidates(allocator, candidates);
+    defer deinitLegacyLeaseRecoveryCandidates(allocator, candidates);
     try std.testing.expectEqual(@as(usize, 1), candidates.len);
     try std.testing.expectEqualStrings(
         fixture.expired.lock_id,
@@ -10697,33 +11001,67 @@ test "expired legacy lease repair requires and revalidates an exact journal witn
         fixture.expired.fencing_token,
         candidates[0].fencing_token,
     );
+    try std.testing.expectEqual(
+        LegacyLeaseRecoveryCandidate.Kind.expired_legacy,
+        candidates[0].kind,
+    );
 
+    const counter_before_mismatch = try readFencingCounter(
+        allocator,
+        fixture.counter_path,
+    );
     var mismatch_summary: TransactionRecoverySummary = .{};
     try std.testing.expectError(
         error.TransactionRecoveryRequired,
-        reclaimExpiredLegacyLease(
+        reclaimLegacyLease(
             allocator,
             fixture.transaction_dir,
             .{ .shared = fixture.counter_path },
             .{
                 .transaction_id = "dtx-62",
+                .resource = fixture.expired.resource,
                 .lock_id = fixture.expired.lock_id,
                 .fencing_token = fixture.expired.fencing_token + 1,
+                .confirm_no_legacy_writers = true,
             },
             &mismatch_summary,
         ),
     );
     try std.testing.expect(fileExists(fixture.expired.path));
+    try std.testing.expectEqual(
+        counter_before_mismatch,
+        try readFencingCounter(allocator, fixture.counter_path),
+    );
+
+    var unconfirmed_summary: TransactionRecoverySummary = .{};
+    try std.testing.expectError(
+        error.LegacyWriterConfirmationRequired,
+        reclaimLegacyLease(
+            allocator,
+            fixture.transaction_dir,
+            .{ .shared = fixture.counter_path },
+            .{
+                .transaction_id = "dtx-62",
+                .resource = fixture.expired.resource,
+                .lock_id = fixture.expired.lock_id,
+                .fencing_token = fixture.expired.fencing_token,
+            },
+            &unconfirmed_summary,
+        ),
+    );
+    try std.testing.expect(fileExists(fixture.expired.path));
 
     var summary: TransactionRecoverySummary = .{};
-    const receipt = try reclaimExpiredLegacyLease(
+    const receipt = try reclaimLegacyLease(
         allocator,
         fixture.transaction_dir,
         .{ .shared = fixture.counter_path },
         .{
             .transaction_id = "dtx-62",
+            .resource = fixture.expired.resource,
             .lock_id = fixture.expired.lock_id,
             .fencing_token = fixture.expired.fencing_token,
+            .confirm_no_legacy_writers = true,
         },
         &summary,
     );
@@ -10738,6 +11076,140 @@ test "expired legacy lease repair requires and revalidates an exact journal witn
         receipt.previous_fencing_token,
     );
     try std.testing.expect(!fileExists(fixture.expired.path));
+}
+
+test "legacy reclaim preserves existing recovery evidence without replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    var fixture = try ExpiredLeaseRepairFixture.init(allocator, root);
+    defer fixture.deinit(allocator);
+    const evidence_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.reclaimed-{d}",
+        .{ fixture.expired.path, fixture.expired.fencing_token },
+    );
+    defer allocator.free(evidence_path);
+    try writeTextCreateNew(
+        allocator,
+        evidence_path,
+        "preexisting evidence\n",
+        .{},
+    );
+
+    var summary: TransactionRecoverySummary = .{};
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        reclaimLegacyLease(
+            allocator,
+            fixture.transaction_dir,
+            .{ .shared = fixture.counter_path },
+            .{
+                .transaction_id = "dtx-62",
+                .resource = fixture.expired.resource,
+                .lock_id = fixture.expired.lock_id,
+                .fencing_token = fixture.expired.fencing_token,
+                .confirm_no_legacy_writers = true,
+            },
+            &summary,
+        ),
+    );
+    const preserved = try readFileAlloc(
+        allocator,
+        evidence_path,
+        4096,
+    );
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings(
+        "preexisting evidence\n",
+        preserved,
+    );
+    try std.testing.expect(fileExists(fixture.expired.path));
+}
+
+test "interrupted recovery leases are transaction-bound and repairable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    var fixture = try ExpiredLeaseRepairFixture.init(allocator, root);
+    defer fixture.deinit(allocator);
+    const resource = try allocator.dupe(u8, fixture.expired.resource);
+    defer allocator.free(resource);
+    try releaseLease(
+        allocator,
+        &fixture.expired,
+        fixture.expired.fencing_token,
+    );
+    const owner: Owner = .{
+        .process_id = 962,
+        .session_id = "witnessed-lease-repair",
+        .executor = "test",
+    };
+    var interrupted = try acquireLeaseLock(
+        allocator,
+        resource,
+        .{
+            .owner = owner,
+            .lease_ms = std.math.maxInt(u64) / 2,
+            .fencing_counter_path = fixture.counter_path,
+            .transaction_id = "dtx-62",
+        },
+    );
+    const lock_id = try allocator.dupe(u8, interrupted.lock_id);
+    defer allocator.free(lock_id);
+    const fencing_token = interrupted.fencing_token;
+    interrupted.deinit(allocator);
+
+    const candidates = try inspectLegacyLeaseRecoveryCandidates(
+        allocator,
+        fixture.transaction_dir,
+        .{ .shared = fixture.counter_path },
+    );
+    defer deinitLegacyLeaseRecoveryCandidates(allocator, candidates);
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expectEqual(
+        LegacyLeaseRecoveryCandidate.Kind.interrupted_recovery,
+        candidates[0].kind,
+    );
+
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        reclaimExpiredLease(
+            allocator,
+            resource,
+            .{
+                .owner = owner,
+                .fencing_counter_path = fixture.counter_path,
+            },
+        ),
+    );
+
+    var summary: TransactionRecoverySummary = .{};
+    const receipt = try reclaimLegacyLease(
+        allocator,
+        fixture.transaction_dir,
+        .{ .shared = fixture.counter_path },
+        .{
+            .transaction_id = "dtx-62",
+            .resource = resource,
+            .lock_id = lock_id,
+            .fencing_token = fencing_token,
+        },
+        &summary,
+    );
+    defer {
+        allocator.free(receipt.lock_id);
+        allocator.free(receipt.resource);
+        allocator.free(receipt.result);
+    }
+    try std.testing.expect(summary.storage_mutated);
+    const lock_path = try lockPathAlloc(allocator, resource);
+    defer allocator.free(lock_path);
+    try std.testing.expect(!fileExists(lock_path));
 }
 
 test "recovery accumulation preserves a successful prefix across later errors" {
@@ -15119,6 +15591,62 @@ fn writePreparedRecordForTest(
     defer allocator.free(staged_path);
     try writeTextCreateNew(allocator, staged_path, after, .{});
     try writeTransactionRecord(allocator, record_path, transaction_id, owner, .prepared, &expected, &writes, &.{}, 1, 2, true);
+}
+
+fn writeCommittedRecoveryJournalForTest(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    transaction_id: []const u8,
+    target_path: []const u8,
+    content: []const u8,
+) !void {
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const digest = try digestBytesAlloc(allocator, content);
+    defer allocator.free(digest);
+    const expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = digest,
+        .sequence = 1,
+    }};
+    const staged_ref = try transactionRecordStageNameAlloc(
+        allocator,
+        transaction_id,
+        0,
+    );
+    defer allocator.free(staged_ref);
+    const writes = [_]TransactionWrite{.{
+        .path = target_path,
+        .staged_ref = staged_ref,
+        .digest_after = digest,
+        .sequence_after = 1,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 964,
+            .session_id = "aggregate-recovery-budget",
+            .executor = "test",
+        },
+        .committed,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
 }
 
 fn writePreparedLegacyStageRecordForTest(
