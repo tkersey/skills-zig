@@ -9,7 +9,7 @@ if [[ ! -x "$bin_path" ]]; then
   exit 1
 fi
 
-expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\ncapabilities\nversion'
+expected=$'definition check\ndefinition describe\nvalidate\nmaterialize\ntransact\nproject\ndoctor\nrecovery inspect\nrecovery reclaim\ncapabilities\nversion'
 help_output=$("$bin_path" --help)
 actual=$(
   awk '
@@ -19,7 +19,7 @@ actual=$(
       line = substr($0, 3)
       sub(/^ledger /, "", line)
       count = split(line, words, /[[:space:]]+/)
-      if (words[1] == "definition" && count >= 2) {
+      if ((words[1] == "definition" || words[1] == "recovery") && count >= 2) {
         print words[1] " " words[2]
       } else {
         print words[1]

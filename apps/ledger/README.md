@@ -100,6 +100,36 @@ Use `ledger project --payload-only` only for explicit structural piping. Normal
 JSON projections preserve the `ledger-projection-result/v1` envelope and its
 definition/store identity.
 
+## Recovery maintenance
+
+Automatic recovery never treats lease expiry as an authority transfer. Inspect
+one legacy transaction for an exact expired lease witness before authorizing
+any repair:
+
+```bash
+ledger recovery inspect \
+  --repo <repo> \
+  --transaction <dtx-id> \
+  --format json
+
+ledger recovery reclaim \
+  --repo <repo> \
+  --transaction <dtx-id> \
+  --resource <path> \
+  --lock-id <dlk-id> \
+  --fencing-token <u64> \
+  --confirm-no-legacy-writers \
+  --format json
+```
+
+`reclaim` accepts no broad mode. It revalidates the transaction, lock identity,
+owner, resource, fencing token, and lease witness immediately before advancing
+the fencing authority and preserving the retired lease as no-replace recovery
+evidence. An interrupted current recovery is transaction-bound and can be
+reclaimed once Ledger holds the transaction recovery lock. An original legacy
+lease additionally requires `--confirm-no-legacy-writers`, an operator
+assertion that no pre-advisory-lock writer can still refresh or release it.
+
 ## Native surface
 
 ```text
@@ -110,6 +140,8 @@ ledger materialize
 ledger transact
 ledger project
 ledger doctor
+ledger recovery inspect
+ledger recovery reclaim
 ledger capabilities
 ledger version
 ```

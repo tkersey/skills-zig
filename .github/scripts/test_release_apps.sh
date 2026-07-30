@@ -24,6 +24,14 @@ printf 'legacy contract\n' >libs/core/src/perf_contract.zig
 git add .
 git commit -qm base
 base=$(git rev-parse HEAD)
+declare -A release_fixture_paths=()
+
+record_release_fixture_paths() {
+  local path
+  while IFS= read -r path; do
+    release_fixture_paths["$path"]=1
+  done < <(git diff --name-only "$base" HEAD)
+}
 
 assert_affected() {
   local expected=$1
@@ -37,6 +45,9 @@ assert_affected() {
   if [[ "$actual" != "$expected" ]]; then
     echo "expected affected=$expected actual=$actual" >&2
     exit 1
+  fi
+  if [[ -n "$expected" ]]; then
+    record_release_fixture_paths
   fi
 }
 
@@ -52,6 +63,9 @@ assert_ci_affected() {
   if [[ "$actual" != "$expected" ]]; then
     echo "expected ci-affected=$expected actual=$actual" >&2
     exit 1
+  fi
+  if [[ -n "$expected" ]]; then
+    record_release_fixture_paths
   fi
 }
 
@@ -225,6 +239,31 @@ assert_ci_affected seq,cas,ledger write_definition_guard
 assert_ci_affected seq write_seq_smoke
 assert_ci_affected ledger write_ledger_smoke
 assert_ci_affected seq,lift,cas,cron,ledger,memory-note,img write_ci_helper
+
+auto_release_paths=()
+while IFS= read -r trigger_path; do
+  auto_release_paths+=("$trigger_path")
+done < <(
+  sed -n \
+    '/^    paths:/,/^[^ ]/s/^      - "\(.*\)"$/\1/p' \
+    "$repo_root/.github/workflows/auto-release.yml"
+)
+while IFS= read -r release_path; do
+  covered=0
+  for trigger_path in "${auto_release_paths[@]}"; do
+    if [[ "$release_path" == $trigger_path ]]; then
+      covered=1
+      break
+    fi
+  done
+  if [[ "$covered" -ne 1 ]]; then
+    echo "auto-release paths omit classifier fixture $release_path" >&2
+    exit 1
+  fi
+done < <(
+  printf '%s\n' "${!release_fixture_paths[@]}" |
+    LC_ALL=C sort
+)
 
 git reset --hard -q "$base"
 printf '1.0.1\n' >apps/ledger/VERSION
