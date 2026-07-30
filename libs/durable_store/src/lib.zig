@@ -2903,8 +2903,7 @@ pub fn recoverTransactionWithOptions(
             "already_committed",
         );
     }
-    var legacy_leases = if (format == .legacy and
-        parsed.state != .committed)
+    var legacy_leases = if (format == .legacy)
         try acquireLegacyTransactionRecoveryLeases(
             allocator,
             parsed.expected,
@@ -2980,6 +2979,22 @@ pub fn recoverAndCompactTransactionsWithOptions(
     transactions_dir: []const u8,
     options: TransactionRecoveryOptions,
 ) !TransactionRecoverySummary {
+    var summary: TransactionRecoverySummary = .{};
+    try recoverAndCompactTransactionsAccumulating(
+        allocator,
+        transactions_dir,
+        options,
+        &summary,
+    );
+    return summary;
+}
+
+pub fn recoverAndCompactTransactionsAccumulating(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+    options: TransactionRecoveryOptions,
+    summary: *TransactionRecoverySummary,
+) !void {
     const max_entries: usize = 4096;
     const max_record_bytes: usize = 16 * 1024 * 1024;
     var dir = if (std.fs.path.isAbsolute(transactions_dir))
@@ -2996,7 +3011,6 @@ pub fn recoverAndCompactTransactionsWithOptions(
 
     var entries: usize = 0;
     var record_bytes: usize = 0;
-    var summary: TransactionRecoverySummary = .{};
     var iter = dir.iterate();
     while (try iter.next(Io.io())) |entry| {
         if (entry.kind == .sym_link) return error.SymlinkComponent;
@@ -3059,7 +3073,6 @@ pub fn recoverAndCompactTransactionsWithOptions(
         try syncDirectoryHandle(&dir);
         summary.transaction_count += 1;
     }
-    return summary;
 }
 
 fn legacyFencingCounterPath(
@@ -3146,6 +3159,11 @@ fn acquireLegacyTransactionRecoveryLeases(
     owner: Owner,
     fencing_counter_path: ?[]const u8,
 ) ![]LeaseLock {
+    // Current recovery never reclaims an extant legacy lease. Its own
+    // compatibility lease therefore uses the fail-closed protocol horizon:
+    // a legacy writer cannot reclaim it mid-recovery, and an abnormal exit
+    // still requires the same explicit operator repair as any stale lease.
+    const recovery_lease_ms = std.math.maxInt(u64) / 2;
     const leases = try allocator.alloc(LeaseLock, expected.len);
     var acquired: usize = 0;
     errdefer {
@@ -3177,6 +3195,7 @@ fn acquireLegacyTransactionRecoveryLeases(
             row.path,
             .{
                 .owner = owner,
+                .lease_ms = recovery_lease_ms,
                 .fencing_counter_path = fencing_counter_path,
             },
         ) catch |err| switch (err) {
@@ -3192,6 +3211,7 @@ fn acquireLegacyTransactionRecoveryLeases(
                         row.path,
                         .{
                             .owner = owner,
+                            .lease_ms = recovery_lease_ms,
                             .fencing_counter_path = fencing_counter_path,
                         },
                     ),
@@ -7682,6 +7702,191 @@ test "committed legacy journals validate legacy stages and compact terminal reco
     const after = try tryReadForTest(target_path);
     defer allocator.free(after);
     try std.testing.expectEqualStrings(content, after);
+}
+
+test "committed legacy journals retain fail-closed lease custody until marker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "dtx-20" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "guard.json" },
+    );
+    defer allocator.free(target_path);
+    const content = "{\"guard\":true}\n";
+    try writeTextAtomic(allocator, target_path, content);
+    const digest = try digestBytesAlloc(allocator, content);
+    defer allocator.free(digest);
+    const expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = digest,
+        .sequence = 0,
+    }};
+    const owner: Owner = .{
+        .process_id = 920,
+        .session_id = "legacy-committed-custody",
+        .executor = "test",
+    };
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        "dtx-20",
+        owner,
+        .committed,
+        &expected,
+        &.{},
+        &.{},
+        1,
+        2,
+        true,
+    );
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    var writer_lease = try acquireLeaseLock(
+        allocator,
+        target_path,
+        .{
+            .owner = owner,
+            .lease_ms = 60_000,
+            .fencing_counter_path = counter_path,
+        },
+    );
+    try std.testing.expectError(
+        error.LockBusy,
+        recoverAndCompactTransactionsWithOptions(
+            allocator,
+            transactions_dir,
+            .{
+                .legacy_fencing_authority = .{
+                    .shared = counter_path,
+                },
+            },
+        ),
+    );
+    try releaseLease(
+        allocator,
+        &writer_lease,
+        writer_lease.fencing_token,
+    );
+
+    var recovery_leases = try acquireLegacyTransactionRecoveryLeases(
+        allocator,
+        &expected,
+        owner,
+        counter_path,
+    );
+    const expires_ms = try parseU64Text(recovery_leases[0].expires_at);
+    try std.testing.expect(
+        expires_ms - clockMillis(.real) > 365 * 24 * 60 * 60 * 1000,
+    );
+    releaseLegacyTransactionRecoveryLeases(
+        allocator,
+        &recovery_leases,
+    );
+
+    const summary = try recoverAndCompactTransactionsWithOptions(
+        allocator,
+        transactions_dir,
+        .{
+            .legacy_fencing_authority = .{
+                .shared = counter_path,
+            },
+        },
+    );
+    try std.testing.expect(summary.storage_mutated);
+    try std.testing.expect(!fileExists(transaction_dir));
+}
+
+test "recovery accumulation preserves a successful prefix across later errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const recoverable_dir = try std.fs.path.join(
+        allocator,
+        &.{
+            transactions_dir,
+            "dtx-1-00000000000000000000000000000014",
+        },
+    );
+    defer allocator.free(recoverable_dir);
+    try ensureDirectoryPathNoSymlinks(recoverable_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ recoverable_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        "dtx-1-00000000000000000000000000000014",
+        .{
+            .process_id = 921,
+            .session_id = "recovery-prefix",
+            .executor = "test",
+        },
+        .preparing,
+        &.{},
+        &.{},
+        &.{},
+        1,
+        2,
+        true,
+    );
+    var summary: TransactionRecoverySummary = .{};
+    try recoverAndCompactTransactionsAccumulating(
+        allocator,
+        transactions_dir,
+        .{},
+        &summary,
+    );
+    try std.testing.expect(summary.storage_mutated);
+    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
+
+    const corrupt_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "dtx-21" },
+    );
+    defer allocator.free(corrupt_dir);
+    try ensureDirectoryPathNoSymlinks(corrupt_dir);
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        recoverAndCompactTransactionsAccumulating(
+            allocator,
+            transactions_dir,
+            .{},
+            &summary,
+        ),
+    );
+    try std.testing.expect(summary.storage_mutated);
+    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
 }
 
 test "prepared legacy journals recover under legacy stage names" {

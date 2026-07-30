@@ -282,18 +282,24 @@ const TransactionPaths = struct {
             !directoryExists(initialized.bindings) or
             !directoryExists(initialized.definitions) or
             (require_revisions and !directoryExists(initialized.revisions));
-        initialized.recovery_mutated_storage = try initialized.ensure(
+        initialized.ensure(
             allocator,
             require_revisions,
-        );
+        ) catch |err| {
+            last_mutation_state = if (initialized.recovery_mutated_storage)
+                true
+            else
+                null;
+            return err;
+        };
         return initialized;
     }
 
     fn ensure(
-        self: TransactionPaths,
+        self: *TransactionPaths,
         allocator: std.mem.Allocator,
         require_revisions: bool,
-    ) !bool {
+    ) !void {
         try durable_store.ensureDirectoryPathNoSymlinks(self.ledger_root);
         try durable_store.ensureDirectoryPathNoSymlinks(self.transactions);
         try durable_store.ensureDirectoryPathNoSymlinks(self.bindings);
@@ -306,7 +312,8 @@ const TransactionPaths = struct {
             &.{ self.ledger_root, ".fencing.counter" },
         );
         defer allocator.free(counter_path);
-        const recovery = try durable_store.recoverAndCompactTransactionsWithOptions(
+        var recovery: durable_store.TransactionRecoverySummary = .{};
+        durable_store.recoverAndCompactTransactionsAccumulating(
             allocator,
             self.transactions,
             .{
@@ -314,12 +321,20 @@ const TransactionPaths = struct {
                     .shared = counter_path,
                 },
             },
-        );
+            &recovery,
+        ) catch |err| {
+            self.recovery_mutated_storage =
+                self.recovery_mutated_storage or
+                recovery.storage_mutated;
+            return err;
+        };
+        self.recovery_mutated_storage =
+            self.recovery_mutated_storage or
+            recovery.storage_mutated;
         try durable_store.ensureNoPendingTransactions(
             allocator,
             self.transactions,
         );
-        return recovery.storage_mutated;
     }
 
     fn deinit(
@@ -334,6 +349,37 @@ const TransactionPaths = struct {
         self.* = undefined;
     }
 };
+
+test "known recovery mutation survives later commit uncertainty" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    var paths = try TransactionPaths.init(
+        allocator,
+        root,
+        false,
+    );
+    defer paths.deinit(allocator);
+    last_mutation_state = true;
+    try std.testing.expectError(
+        error.InvalidPath,
+        commitMutationsAlloc(
+            allocator,
+            &paths,
+            &.{},
+        ),
+    );
+    try std.testing.expectEqual(
+        true,
+        lastMutationState().?,
+    );
+}
 
 fn directoryExists(path: []const u8) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -513,7 +559,9 @@ fn commitMutationsAlloc(
         &.{ paths.ledger_root, ".fencing.counter" },
     );
     defer allocator.free(counter_path);
-    last_mutation_state = null;
+    if (last_mutation_state != true) {
+        last_mutation_state = null;
+    }
     var commit = try durable_store.commitTextTransaction(
         allocator,
         paths.transactions,
