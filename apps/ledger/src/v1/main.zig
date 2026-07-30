@@ -177,12 +177,16 @@ const RecoveryPaths = struct {
             &.{ ledger_root, ".transactions", transaction_id },
         );
         errdefer allocator.free(transaction_dir);
+        const counter_path = try std.fs.path.join(
+            allocator,
+            &.{ ledger_root, ".fencing.counter" },
+        );
+        errdefer allocator.free(counter_path);
+        try durable_store.rejectSymlinkComponents(transaction_dir);
+        try durable_store.rejectSymlinkComponents(counter_path);
         return .{
             .transaction_dir = transaction_dir,
-            .counter_path = try std.fs.path.join(
-                allocator,
-                &.{ ledger_root, ".fencing.counter" },
-            ),
+            .counter_path = counter_path,
         };
     }
 
@@ -2472,6 +2476,33 @@ test "recovery parser separates inspection from exact witnessed reclaim" {
     );
     try validateRecoveryTransactionId(
         "dtx-42-00000000000000000000000000000001",
+    );
+}
+
+test "recovery paths reject symlinks in generated control components" {
+    if (@import("builtin").os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    try tmp.dir.createDir(defaultIo(), "repo", .default_dir);
+    try tmp.dir.createDir(defaultIo(), "outside", .default_dir);
+    try tmp.dir.symLink(
+        defaultIo(),
+        "../outside",
+        "repo/.ledger",
+        .{ .is_directory = true },
+    );
+    const repo = try tmp.dir.realPathFileAlloc(
+        defaultIo(),
+        "repo",
+        allocator,
+    );
+    defer allocator.free(repo);
+    try std.testing.expectError(
+        error.SymlinkComponent,
+        RecoveryPaths.init(allocator, repo, "dtx-42"),
     );
 }
 

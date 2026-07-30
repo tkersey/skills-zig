@@ -1383,13 +1383,11 @@ fn acquireLeaseLockObserved(
                     @max(options.retry_interval_ms, 1),
                     @as(u64, @intCast(std.math.maxInt(i64))),
                 );
-                std.Io.sleep(
+                try std.Io.sleep(
                     Io.io(),
                     .fromMilliseconds(@intCast(sleep_ms)),
                     .awake,
-                ) catch |sleep_error| switch (sleep_error) {
-                    else => {},
-                };
+                );
                 continue;
             },
             else => return err,
@@ -1425,7 +1423,11 @@ fn acquireLeaseLockObserved(
                 cleanup.deinit(allocator);
                 if (options.timeout_ms == 0 or elapsedMillis(started_ms) >= options.timeout_ms) return error.LockBusy;
                 const sleep_ms = @min(@max(options.retry_interval_ms, 1), @as(u64, @intCast(std.math.maxInt(i64))));
-                std.Io.sleep(Io.io(), .fromMilliseconds(@intCast(sleep_ms)), .awake) catch {};
+                try std.Io.sleep(
+                    Io.io(),
+                    .fromMilliseconds(@intCast(sleep_ms)),
+                    .awake,
+                );
                 continue;
             },
             else => {
@@ -1555,13 +1557,9 @@ fn reclaimLeaseMatchingWitnessLocked(
     if (expected.fencing_token >= new_counter) {
         return error.FencingTokenStale;
     }
-    const evidence_path = try std.fmt.allocPrint(
+    const evidence_path = try reclaimEvidencePathAlloc(
         allocator,
-        "{s}.reclaimed-{d}",
-        .{
-            expected.path,
-            expected.fencing_token,
-        },
+        expected,
     );
     defer allocator.free(evidence_path);
     const payload = try renderLeaseLockAlloc(allocator, expected);
@@ -1584,20 +1582,31 @@ fn reclaimLeaseMatchingWitnessLocked(
         else => return err,
     };
     if (storage_mutated) |mutated| mutated.* = true;
+    const parent = std.fs.path.dirname(expected.path) orelse
+        return error.InvalidPath;
+    try syncDirectoryPath(parent);
     if (std.fs.path.isAbsolute(expected.path)) {
         try std.Io.Dir.deleteFileAbsolute(Io.io(), expected.path);
     } else {
         try std.Io.Dir.cwd().deleteFile(Io.io(), expected.path);
     }
     if (storage_mutated) |mutated| mutated.* = true;
-    try syncDirectoryPath(
-        std.fs.path.dirname(expected.path) orelse
-            return error.InvalidPath,
-    );
+    try syncDirectoryPath(parent);
     return makeReclaimReceipt(
         allocator,
         expected,
         new_counter,
+    );
+}
+
+fn reclaimEvidencePathAlloc(
+    allocator: std.mem.Allocator,
+    lock: LeaseLock,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}.reclaimed-{d}",
+        .{ lock.path, lock.fencing_token },
     );
 }
 
@@ -2250,19 +2259,22 @@ const TransactionTarget = struct {
         );
         errdefer dir.close(Io.io());
         if (parent.len != 0) {
-            var components = std.mem.splitAny(u8, parent, "/\\");
+            var components = std.fs.path.componentIterator(parent);
             while (components.next()) |component| {
-                if (component.len == 0 or
-                    std.mem.eql(u8, component, ".") or
-                    std.mem.eql(u8, component, ".."))
+                if (component.name.len == 0 or
+                    std.mem.eql(u8, component.name, ".") or
+                    std.mem.eql(u8, component.name, ".."))
                 {
                     return error.InvalidPath;
                 }
-                const next = try dir.openDir(
+                const next = dir.openDir(
                     Io.io(),
-                    component,
+                    component.name,
                     .{ .follow_symlinks = false },
-                );
+                ) catch |err| switch (err) {
+                    error.SymLinkLoop => return error.SymlinkComponent,
+                    else => return err,
+                };
                 dir.close(Io.io());
                 dir = next;
             }
@@ -2305,29 +2317,31 @@ fn pathRelativeToControlRoot(
         !std.fs.path.isAbsolute(path) or
         path.len <= control_root.len or
         !std.mem.eql(u8, path[0..control_root.len], control_root) or
-        (path[control_root.len] != '/' and path[control_root.len] != '\\'))
+        !std.fs.path.isSep(path[control_root.len]))
     {
         return error.TransactionPathOutsideControlRoot;
     }
     const relative = path[control_root.len + 1 ..];
-    if (relative.len == 0 or relative[0] == '/' or relative[0] == '\\') {
+    if (relative.len == 0 or std.fs.path.isSep(relative[0])) {
         return error.InvalidPath;
     }
-    var components = std.mem.tokenizeAny(u8, relative, "/\\");
+    var components = std.fs.path.componentIterator(relative);
     var observed: usize = 0;
     while (components.next()) |component| {
-        observed += component.len;
-        if (std.mem.eql(u8, component, ".") or
-            std.mem.eql(u8, component, ".."))
+        observed += component.name.len;
+        if (std.mem.eql(u8, component.name, ".") or
+            std.mem.eql(u8, component.name, ".."))
         {
             return error.TransactionPathOutsideControlRoot;
         }
     }
-    if (observed == 0 or
-        std.mem.indexOf(u8, relative, "//") != null or
-        std.mem.indexOf(u8, relative, "\\\\") != null)
-    {
-        return error.InvalidPath;
+    if (observed == 0) return error.InvalidPath;
+    for (relative[1..], 1..) |byte, index| {
+        if (std.fs.path.isSep(byte) and
+            std.fs.path.isSep(relative[index - 1]))
+        {
+            return error.InvalidPath;
+        }
     }
     return relative;
 }
@@ -2355,6 +2369,71 @@ test "transaction paths reject lexical escapes before recovery reads" {
         pathRelativeToControlRoot(
             "/tmp/control",
             "/tmp/control//record.json",
+        ),
+    );
+    if (@import("builtin").os.tag != .windows) {
+        try std.testing.expectError(
+            error.TransactionPathOutsideControlRoot,
+            pathRelativeToControlRoot(
+                "/tmp/control",
+                "/tmp/control\\outside.json",
+            ),
+        );
+    }
+}
+
+test "legacy transaction paths reserve reclaim evidence components" {
+    try std.testing.expect(pathContainsReclaimEvidenceComponent(
+        "/repo/events.jsonl.lock.reclaimed-42",
+    ));
+    try std.testing.expect(pathContainsReclaimEvidenceComponent(
+        "/repo/EVENTS.LOCK.RECLAIMED-42/child",
+    ));
+    try std.testing.expect(!pathContainsReclaimEvidenceComponent(
+        "/repo/events.jsonl.lock.reclaimed-not-a-token",
+    ));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, ".transactions", "dtx-68" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const evidence_target = try std.fs.path.join(
+        allocator,
+        &.{ root, "events.jsonl.lock.reclaimed-7" },
+    );
+    defer allocator.free(evidence_target);
+    var expected = [_]TransactionExpected{.{
+        .path = evidence_target,
+        .digest = "",
+        .sequence = 0,
+    }};
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        validateTransactionRecordScope(
+            allocator,
+            root,
+            transaction_dir,
+            .{
+                .transaction_id = "dtx-68",
+                .owner = .{
+                    .process_id = 968,
+                    .session_id = "reclaim-evidence-namespace",
+                    .executor = "test",
+                },
+                .state = .prepared,
+                .expected = &expected,
+                .writes = &.{},
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            .legacy,
         ),
     );
 }
@@ -3604,17 +3683,29 @@ pub fn reclaimLegacyLease(
     }
     if (!resource_selected) return error.TransactionRecoveryRequired;
 
+    const control_root = try transactionControlRoot(transaction_dir);
+    var resource_target = try TransactionTarget.init(
+        control_root,
+        request.resource,
+    );
+    defer resource_target.deinit();
+    try rejectSymlinkComponents(request.resource);
+    try resource_target.verifyPathIdentity();
     const lock_path = try lockPathAlloc(
         allocator,
         request.resource,
     );
     defer allocator.free(lock_path);
+    try rejectSymlinkComponents(lock_path);
     var advisory = try acquireLeaseAdvisoryLockObserved(
         allocator,
         lock_path,
         &summary.storage_mutated,
     );
     defer advisory.close(Io.io());
+    try rejectSymlinkComponents(request.resource);
+    try rejectSymlinkComponents(lock_path);
+    try resource_target.verifyPathIdentity();
     var current = try readLeaseLock(allocator, lock_path);
     defer current.deinit(allocator);
     if (!std.mem.eql(u8, current.resource, request.resource) or
@@ -5358,6 +5449,11 @@ fn validateTransactionRecordScope(
     var expected_paths = try allocator.alloc([]const u8, parsed.expected.len);
     defer allocator.free(expected_paths);
     for (parsed.expected, 0..) |row, row_index| {
+        if (format == .legacy and
+            pathContainsReclaimEvidenceComponent(row.path))
+        {
+            return error.TransactionCorrupt;
+        }
         _ = try pathRelativeToControlRoot(control_root, row.path);
         if (try pathIsWithinDirectory(
             allocator,
@@ -5411,6 +5507,37 @@ fn validateTransactionRecordScope(
         }
     }
     try validateTransactionPathsDisjoint(allocator, format, write_paths);
+}
+
+fn pathContainsReclaimEvidenceComponent(path: []const u8) bool {
+    var components = std.fs.path.componentIterator(path);
+    while (components.next()) |component| {
+        if (isReclaimEvidenceComponent(component.name)) return true;
+    }
+    return false;
+}
+
+fn isReclaimEvidenceComponent(component: []const u8) bool {
+    const marker = ".lock.reclaimed-";
+    if (component.len <= marker.len) return false;
+    var offset: usize = 0;
+    while (offset + marker.len < component.len) : (offset += 1) {
+        if (!std.ascii.eqlIgnoreCase(
+            component[offset .. offset + marker.len],
+            marker,
+        )) continue;
+        const token = component[offset + marker.len ..];
+        if (token.len == 0) continue;
+        var all_digits = true;
+        for (token) |byte| {
+            if (!std.ascii.isDigit(byte)) {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) return true;
+    }
+    return false;
 }
 
 fn validateTransactionPathsDisjoint(
@@ -11212,6 +11339,107 @@ test "interrupted recovery leases are transaction-bound and repairable" {
     const lock_path = try lockPathAlloc(allocator, resource);
     defer allocator.free(lock_path);
     try std.testing.expect(!fileExists(lock_path));
+}
+
+test "legacy reclaim rejects symlinked resource parents" {
+    if (@import("builtin").os.tag == .windows) {
+        return error.SkipZigTest;
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDir(Io.io(), "outside", .default_dir);
+    try tmp.dir.symLink(
+        Io.io(),
+        "outside",
+        "linked",
+        .{ .is_directory = true },
+    );
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-69" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const resource = try std.fs.path.join(
+        allocator,
+        &.{ root, "linked", "repair.jsonl" },
+    );
+    defer allocator.free(resource);
+    const lock_path = try lockPathAlloc(allocator, resource);
+    defer allocator.free(lock_path);
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    const owner: Owner = .{
+        .process_id = 969,
+        .session_id = "symlinked-reclaim-resource",
+        .executor = "test",
+    };
+    var lock = try makeLeaseLockOwned(
+        allocator,
+        lock_path,
+        resource,
+        owner,
+        1,
+        2,
+        1,
+        null,
+    );
+    defer lock.deinit(allocator);
+    const payload = try renderLeaseLockAlloc(allocator, lock);
+    defer allocator.free(payload);
+    try tmp.dir.writeFile(Io.io(), .{
+        .sub_path = "outside/repair.jsonl.lock",
+        .data = payload,
+    });
+    var expected = [_]TransactionExpected{.{
+        .path = resource,
+        .digest = "",
+        .sequence = 0,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        "dtx-69",
+        owner,
+        .prepared,
+        &expected,
+        &.{},
+        &.{lock},
+        1,
+        2,
+        true,
+    );
+    try writeTextAtomic(allocator, counter_path, "1\n");
+
+    var summary: TransactionRecoverySummary = .{};
+    try std.testing.expectError(
+        error.SymLinkLoop,
+        reclaimLegacyLease(
+            allocator,
+            transaction_dir,
+            .{ .shared = counter_path },
+            .{
+                .transaction_id = "dtx-69",
+                .resource = resource,
+                .lock_id = lock.lock_id,
+                .fencing_token = lock.fencing_token,
+                .confirm_no_legacy_writers = true,
+            },
+            &summary,
+        ),
+    );
+    try std.testing.expect(fileExists(lock_path));
 }
 
 test "recovery accumulation preserves a successful prefix across later errors" {
