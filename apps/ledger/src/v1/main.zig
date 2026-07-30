@@ -414,7 +414,10 @@ fn runRecoveryReclaim(
         allocator.free(receipt.resource);
         allocator.free(receipt.result);
     }
-    try emitRecoveryReclaim(args.format, receipt);
+    emitRecoveryReclaim(args.format, receipt) catch |err| {
+        try emitRecoveryError(err, summary.storage_mutated);
+        return 2;
+    };
     return 0;
 }
 

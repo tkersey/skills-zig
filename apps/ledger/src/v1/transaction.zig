@@ -14,6 +14,8 @@ const validation = @import("validation.zig");
 
 threadlocal var runtime_io: ?std.Io = null;
 threadlocal var last_mutation_state: ?bool = false;
+const recovery_lock_retry_interval_ms: i64 = 25;
+const recovery_lock_attempts_max: usize = 201;
 
 pub const EffectReceipt = struct {
     slot: []u8,
@@ -323,21 +325,46 @@ const TransactionPaths = struct {
         );
         defer allocator.free(counter_path);
         var recovery: durable_store.TransactionRecoverySummary = .{};
-        durable_store.recoverAndCompactTransactionsAccumulating(
-            allocator,
-            self.transactions,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
+        var recovery_lock_attempts: usize = 1;
+        while (true) { // tiger: event-loop -- bounded by the attempt limit.
+            durable_store.recoverAndCompactTransactionsAccumulating(
+                allocator,
+                self.transactions,
+                .{
+                    .legacy_fencing_authority = .{
+                        .shared = counter_path,
+                    },
                 },
-            },
-            &recovery,
-        ) catch |err| {
-            self.recovery_mutated_storage =
-                self.recovery_mutated_storage or
-                recovery.storage_mutated;
-            return err;
-        };
+                &recovery,
+            ) catch |err| switch (err) {
+                error.LockBusy => {
+                    self.recovery_mutated_storage =
+                        self.recovery_mutated_storage or
+                        recovery.storage_mutated;
+                    if (recovery_lock_attempts >=
+                        recovery_lock_attempts_max)
+                    {
+                        return err;
+                    }
+                    recovery_lock_attempts += 1;
+                    try std.Io.sleep(
+                        defaultIo(),
+                        .fromMilliseconds(
+                            recovery_lock_retry_interval_ms,
+                        ),
+                        .awake,
+                    );
+                    continue;
+                },
+                else => {
+                    self.recovery_mutated_storage =
+                        self.recovery_mutated_storage or
+                        recovery.storage_mutated;
+                    return err;
+                },
+            };
+            break;
+        }
         self.recovery_mutated_storage =
             self.recovery_mutated_storage or
             recovery.storage_mutated;
@@ -359,6 +386,75 @@ const TransactionPaths = struct {
         self.* = undefined;
     }
 };
+
+const StartupRecoveryWorker = struct {
+    repo_root: []const u8,
+    result: ?anyerror = null,
+    completed: bool = false,
+};
+
+fn runStartupRecoveryWorker(context: *StartupRecoveryWorker) void {
+    var paths = TransactionPaths.init(
+        std.heap.smp_allocator,
+        context.repo_root,
+        false,
+    ) catch |err| {
+        context.result = err;
+        return;
+    };
+    paths.deinit(std.heap.smp_allocator);
+    context.completed = true;
+}
+
+test "transaction startup retries transient recovery lock contention" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    try durable_store.ensureDirectoryPathNoSymlinks(transactions);
+    const recovery_advisory = try std.fs.path.join(
+        allocator,
+        &.{ transactions, ".recovery.advisory" },
+    );
+    defer allocator.free(recovery_advisory);
+    try std.Io.Dir.cwd().writeFile(defaultIo(), .{
+        .sub_path = recovery_advisory,
+        .data = "",
+    });
+    var held = try std.Io.Dir.openFileAbsolute(
+        defaultIo(),
+        recovery_advisory,
+        .{
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        },
+    );
+    var context: StartupRecoveryWorker = .{ .repo_root = root };
+    const thread = try std.Thread.spawn(
+        .{},
+        runStartupRecoveryWorker,
+        .{&context},
+    );
+    try std.Io.sleep(
+        defaultIo(),
+        .fromMilliseconds(50),
+        .awake,
+    );
+    held.close(defaultIo());
+    thread.join();
+    try std.testing.expect(context.completed);
+    try std.testing.expect(context.result == null);
+}
 
 test "known recovery mutation survives later commit uncertainty" {
     var tmp = std.testing.tmpDir(.{});
