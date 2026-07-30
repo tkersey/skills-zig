@@ -2225,6 +2225,7 @@ pub fn commitTextTransaction(
         var journal_lock = try acquireTransactionJournalLock(
             allocator,
             transactions_dir,
+            null,
         );
         defer journal_lock.close(Io.io());
         errdefer if (!record_persisted) {
@@ -2895,6 +2896,22 @@ pub fn inspectTransaction(
             "all-digests-published",
         );
     }
+    if (format == .legacy) {
+        return if (published == 0)
+            makeRecoveryStatus(
+                allocator,
+                parsed.transaction_id,
+                .roll_back_unpublished,
+                "legacy-no-digests-published",
+            )
+        else
+            makeRecoveryStatus(
+                allocator,
+                parsed.transaction_id,
+                .manual_recovery_required,
+                "legacy-mixed-published-digests",
+            );
+    }
     return makeRecoveryStatus(
         allocator,
         parsed.transaction_id,
@@ -2989,6 +3006,11 @@ fn recoverTransactionWithOptionsAccumulating(
     if (legacy_terminal) {
         try ensureLegacyTerminalLeasesQuiescent(
             allocator,
+            parsed.expected,
+        );
+        try syncLegacyTerminalEffects(
+            control_root,
+            transaction_dir,
             parsed.expected,
         );
         return makeRecoveryReceipt(
@@ -3181,6 +3203,7 @@ pub fn recoverAndCompactTransactionsAccumulating(
             var journal_lock = try acquireTransactionJournalLock(
                 allocator,
                 transactions_dir,
+                &summary.storage_mutated,
             );
             defer journal_lock.close(Io.io());
             break :locked std.Io.Dir.cwd().statFile(
@@ -3194,21 +3217,7 @@ pub fn recoverAndCompactTransactionsAccumulating(
                     if (!current_id and !legacy_id) {
                         return error.TransactionCorrupt;
                     }
-                    if (legacy_id) {
-                        return error.TransactionRecoveryRequired;
-                    }
-                    var removed = true;
-                    dir.deleteDir(Io.io(), entry.name) catch |delete_err| switch (delete_err) {
-                        error.FileNotFound => removed = false,
-                        error.DirNotEmpty => return error.TransactionCorrupt,
-                        else => return delete_err,
-                    };
-                    if (removed) {
-                        summary.storage_mutated = true;
-                        try syncDirectoryHandle(&dir);
-                    }
-                    summary.transaction_count += 1;
-                    continue;
+                    return error.TransactionRecoveryRequired;
                 },
                 else => return err,
             };
@@ -3250,6 +3259,7 @@ fn compactRecoveredTransaction(
     var journal_lock = try acquireTransactionJournalLock(
         allocator,
         transactions_dir,
+        storage_mutated,
     );
     defer journal_lock.close(Io.io());
     const stat = std.Io.Dir.cwd().statFile(
@@ -3793,6 +3803,21 @@ fn ensureLegacyTerminalLeasesQuiescent(
     }
 }
 
+fn syncLegacyTerminalEffects(
+    control_root: []const u8,
+    transaction_dir: []const u8,
+    expected: []const TransactionExpected,
+) !void {
+    for (expected) |row| {
+        var target = try TransactionTarget.init(control_root, row.path);
+        defer target.deinit();
+        try target.verifyPathIdentity();
+        try syncDirectoryHandle(&target.dir);
+        try target.verifyPathIdentity();
+    }
+    try syncDirectoryPath(transaction_dir);
+}
+
 fn releaseLegacyTransactionRecoveryLeases(
     allocator: std.mem.Allocator,
     leases: *[]LeaseLock,
@@ -3802,16 +3827,45 @@ fn releaseLegacyTransactionRecoveryLeases(
     var index: usize = leases.len;
     while (index > 0) {
         index -= 1;
-        releaseLease(
-            allocator,
-            &leases.*[index],
-            leases.*[index].fencing_token,
-        ) catch |err| {
+        const parent = std.fs.path.dirname(
+            leases.*[index].path,
+        ) orelse {
+            leases.*[index].deinit(allocator);
+            if (first_error == null) first_error = error.InvalidPath;
+            continue;
+        };
+        var parent_dir = (if (std.fs.path.isAbsolute(parent))
+            std.Io.Dir.openDirAbsolute(
+                Io.io(),
+                parent,
+                .{ .follow_symlinks = false },
+            )
+        else
+            std.Io.Dir.cwd().openDir(
+                Io.io(),
+                parent,
+                .{ .follow_symlinks = false },
+            )) catch |err| {
             leases.*[index].deinit(allocator);
             if (first_error == null) first_error = err;
             continue;
         };
-        storage_mutated.* = true;
+        {
+            defer parent_dir.close(Io.io());
+            releaseLease(
+                allocator,
+                &leases.*[index],
+                leases.*[index].fencing_token,
+            ) catch |err| {
+                leases.*[index].deinit(allocator);
+                if (first_error == null) first_error = err;
+                continue;
+            };
+            storage_mutated.* = true;
+            syncDirectoryHandle(&parent_dir) catch |err| {
+                if (first_error == null) first_error = err;
+            };
+        }
     }
     allocator.free(leases.*);
     leases.* = &.{};
@@ -4154,10 +4208,12 @@ fn acquireTransactionRecoveryLocks(
     };
     errdefer result.deinit(allocator);
     for (expected) |row| {
-        result.advisory[result.advisory_count] = try acquireCasAdvisoryLock(
-            allocator,
-            row.path,
-        );
+        result.advisory[result.advisory_count] =
+            try acquireCasAdvisoryLockObserved(
+                allocator,
+                row.path,
+                storage_mutated,
+            );
         result.advisory_count += 1;
         const cas_path = try casLockPathAlloc(allocator, row.path);
         defer allocator.free(cas_path);
@@ -4185,6 +4241,7 @@ fn acquireTransactionRecoveryLocks(
         result.compatibility[result.compatibility_count] =
             try acquireExclusiveLockPath(allocator, cas_path);
         result.compatibility_count += 1;
+        storage_mutated.* = true;
     }
     return result;
 }
@@ -4273,7 +4330,15 @@ fn validateRollForwardTransaction(
             .follow_symlinks = false,
         });
     defer stage_dir.close(Io.io());
-    if (parsed.state != .committed) {
+    const published = (try transactionPublishedCount(
+        allocator,
+        control_root,
+        parsed.writes,
+        parsed.expected,
+    )) orelse return error.TransactionRecoveryRequired;
+    if (parsed.state != .committed and
+        published != parsed.writes.len)
+    {
         for (parsed.expected) |expected| {
             var written = false;
             for (parsed.writes) |write| {
@@ -5503,15 +5568,35 @@ fn acquireCasAdvisoryLock(
     allocator: std.mem.Allocator,
     store_path: []const u8,
 ) !std.Io.File {
+    return acquireCasAdvisoryLockObserved(
+        allocator,
+        store_path,
+        null,
+    );
+}
+
+fn acquireCasAdvisoryLockObserved(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+    storage_mutated: ?*bool,
+) !std.Io.File {
     const advisory_path = try casAdvisoryPathAlloc(
         allocator,
         store_path,
     );
     defer allocator.free(advisory_path);
-    return openEventStoreSidecarExclusive(advisory_path) catch |err| switch (err) {
+    var created = false;
+    const lock = openEventStoreSidecarExclusiveObserved(
+        advisory_path,
+        &created,
+    ) catch |err| switch (err) {
         error.WouldBlock => return error.LockBusy,
         else => return err,
     };
+    if (created) {
+        if (storage_mutated) |mutated| mutated.* = true;
+    }
+    return lock;
 }
 
 pub const CasReadLockPair = struct {
@@ -5568,16 +5653,25 @@ fn openCasAdvisorySharedIfExists(
 fn acquireTransactionJournalLock(
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
+    storage_mutated: ?*bool,
 ) !std.Io.File {
     const path = try std.fs.path.join(
         allocator,
         &.{ transactions_dir, ".journal.advisory" },
     );
     defer allocator.free(path);
-    return openEventStoreSidecarExclusive(path) catch |err| switch (err) {
+    var created = false;
+    const lock = openEventStoreSidecarExclusiveObserved(
+        path,
+        &created,
+    ) catch |err| switch (err) {
         error.WouldBlock => return error.LockBusy,
         else => return err,
     };
+    if (created) {
+        if (storage_mutated) |mutated| mutated.* = true;
+    }
+    return lock;
 }
 
 fn acquireTransactionRecoveryLock(
@@ -8419,7 +8513,7 @@ test "preparing transaction recovery removes only journal-owned stages" {
     try std.testing.expectEqualStrings(before, after);
 }
 
-test "transaction recovery rejects recordless legacy journal directories" {
+test "transaction recovery rejects every recordless journal directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -8444,8 +8538,12 @@ test "transaction recovery rejects recordless legacy journal directories" {
         @as(usize, 1),
         try countPendingTransactions(allocator, transactions_dir),
     );
-    try recoverAndCompactTransactions(allocator, transactions_dir);
-    try std.testing.expect(!fileExists(incomplete_dir));
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        recoverAndCompactTransactions(allocator, transactions_dir),
+    );
+    try std.testing.expect(fileExists(incomplete_dir));
+    try std.Io.Dir.cwd().deleteDir(Io.io(), incomplete_dir);
 
     const legacy_incomplete_dir = try std.fs.path.join(
         allocator,
@@ -8526,9 +8624,27 @@ test "transaction recovery reports recovery lock creation as mutation" {
         .{},
     );
     try std.testing.expect(!second.storage_mutated);
+
+    const invalid_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, "invalid" },
+    );
+    defer allocator.free(invalid_dir);
+    try ensureDirectoryPathNoSymlinks(invalid_dir);
+    var failed: TransactionRecoverySummary = .{};
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        recoverAndCompactTransactionsAccumulating(
+            allocator,
+            transactions_dir,
+            .{},
+            &failed,
+        ),
+    );
+    try std.testing.expect(failed.storage_mutated);
 }
 
-test "committed legacy journals validate legacy stages and compact terminal records" {
+test "committed legacy journals require syncable target parents before compaction" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -8662,18 +8778,19 @@ test "committed legacy journals validate legacy stages and compact terminal reco
         expired_lease.fencing_token,
     );
 
-    const summary = try recoverAndCompactTransactionsWithOptions(
-        allocator,
-        transactions_dir,
-        .{
-            .legacy_fencing_authority = .{
-                .shared = counter_path,
+    try std.testing.expectError(
+        error.FileNotFound,
+        recoverAndCompactTransactionsWithOptions(
+            allocator,
+            transactions_dir,
+            .{
+                .legacy_fencing_authority = .{
+                    .shared = counter_path,
+                },
             },
-        },
+        ),
     );
-    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
-    try std.testing.expect(summary.storage_mutated);
-    try std.testing.expect(!fileExists(transaction_dir));
+    try std.testing.expect(fileExists(transaction_dir));
     try std.testing.expect(!fileExists(expired_lease.path));
     try std.testing.expect(!fileExists(removed_target_parent));
     const after = try tryReadForTest(target_path);
@@ -9124,7 +9241,102 @@ test "recovery replaces empty stale compatibility locks" {
     try std.testing.expect(storage_mutated);
 }
 
-test "prepared legacy journals recover under legacy stage names" {
+test "direct recovery reports target advisory creation as mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_id = "dtx-1-00000000000000000000000000000042";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const marker_path = try transactionCommitMarkerPathAlloc(
+        allocator,
+        transaction_dir,
+    );
+    defer allocator.free(marker_path);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const content = "{\"seq\":1}\n";
+    try writeTextAtomic(allocator, target_path, content);
+    const digest = try digestBytesAlloc(allocator, content);
+    defer allocator.free(digest);
+    const expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = digest,
+        .sequence = 1,
+    }};
+    var stage_buffer: [96]u8 = undefined;
+    const staged_ref = try transactionStageName(
+        &stage_buffer,
+        transaction_id,
+        0,
+    );
+    const writes = [_]TransactionWrite{.{
+        .path = target_path,
+        .staged_ref = staged_ref,
+        .digest_after = digest,
+        .sequence_after = 1,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 942,
+            .session_id = "target-advisory-mutation",
+            .executor = "test",
+        },
+        .committed,
+        &expected,
+        &writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+    try writeCommittedTransactionMarker(allocator, marker_path);
+    const recovery_advisory = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, ".recovery.advisory" },
+    );
+    defer allocator.free(recovery_advisory);
+    try writeTextCreateNew(allocator, recovery_advisory, "", .{});
+    const target_advisory = try casAdvisoryPathAlloc(
+        allocator,
+        target_path,
+    );
+    defer allocator.free(target_advisory);
+    try std.testing.expect(!fileExists(target_advisory));
+
+    var receipt = try recoverTransaction(allocator, transaction_dir);
+    defer receipt.deinit(allocator);
+    try std.testing.expectEqual(
+        RecoveryDecision.already_committed,
+        receipt.decision,
+    );
+    try std.testing.expect(receipt.storage_mutated);
+    try std.testing.expect(fileExists(target_advisory));
+}
+
+test "prepared legacy journals preserve rollback-on-zero-published law" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -9223,10 +9435,10 @@ test "prepared legacy journals recover under legacy stage names" {
     try std.testing.expect(!fileExists(transaction_dir));
     const recovered = try tryReadForTest(target_path);
     defer allocator.free(recovered);
-    try std.testing.expectEqualStrings(after, recovered);
+    try std.testing.expectEqualStrings(before, recovered);
 }
 
-test "hashed transaction ids retain legacy stage compatibility" {
+test "hashed transaction ids retain legacy stage and decision compatibility" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -9282,10 +9494,64 @@ test "hashed transaction ids retain legacy stage compatibility" {
     try std.testing.expect(!fileExists(transaction_dir));
     const recovered = try tryReadForTest(target_path);
     defer allocator.free(recovered);
-    try std.testing.expectEqualStrings(after, recovered);
+    try std.testing.expectEqualStrings(before, recovered);
 }
 
-test "legacy recovery validates expected-only participants before writes" {
+test "legacy prepared journals quarantine mixed published prefixes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-41" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const first_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "first.jsonl" },
+    );
+    defer allocator.free(first_path);
+    const second_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "second.jsonl" },
+    );
+    defer allocator.free(second_path);
+    try writeTextAtomic(allocator, first_path, "{\"seq\":2}\n");
+    try writeTextAtomic(allocator, second_path, "{\"seq\":1}\n");
+    try writePreparedTwoWriteRecordForTest(
+        allocator,
+        record_path,
+        "dtx-41",
+        .{
+            .process_id = 941,
+            .session_id = "legacy-mixed-prefix",
+            .executor = "test",
+        },
+        first_path,
+        second_path,
+    );
+
+    var status = try inspectTransaction(allocator, transaction_dir);
+    defer status.deinit(allocator);
+    try std.testing.expectEqual(
+        RecoveryDecision.manual_recovery_required,
+        status.decision,
+    );
+    try std.testing.expectEqualStrings(
+        "legacy-mixed-published-digests",
+        status.reason,
+    );
+}
+
+test "legacy rollback does not reacquire expected-only guards" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -9374,16 +9640,15 @@ test "legacy recovery validates expected-only participants before writes" {
     );
     try writeTextAtomic(allocator, source_path, source_after);
 
-    try std.testing.expectError(
-        error.TransactionRecoveryRequired,
-        recoverAndCompactTransactionsWithOptions(
-            allocator,
-            transactions_dir,
-            .{
-                .legacy_fencing_authority = .per_resource,
-            },
-        ),
+    const summary = try recoverAndCompactTransactionsWithOptions(
+        allocator,
+        transactions_dir,
+        .{
+            .legacy_fencing_authority = .per_resource,
+        },
     );
+    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
+    try std.testing.expect(!fileExists(transaction_dir));
     const unchanged = try tryReadForTest(binding_path);
     defer allocator.free(unchanged);
     try std.testing.expectEqualStrings(binding_before, unchanged);
@@ -9490,6 +9755,60 @@ test "committed recovery does not revalidate released expected-only guards" {
     const binding = try tryReadForTest(binding_path);
     defer allocator.free(binding);
     try std.testing.expectEqualStrings(binding_after, binding);
+
+    const prepared_id = "dtx-6-00000000000000000000000000000002";
+    const prepared_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, prepared_id },
+    );
+    defer allocator.free(prepared_dir);
+    try ensureDirectoryPathNoSymlinks(prepared_dir);
+    const prepared_record = try std.fs.path.join(
+        allocator,
+        &.{ prepared_dir, "transaction.json" },
+    );
+    defer allocator.free(prepared_record);
+    const prepared_staged_ref = try transactionStageNameAlloc(
+        allocator,
+        prepared_id,
+        0,
+    );
+    defer allocator.free(prepared_staged_ref);
+    const prepared_writes = [_]TransactionWrite{.{
+        .path = binding_path,
+        .staged_ref = prepared_staged_ref,
+        .digest_after = binding_after_digest,
+        .sequence_after = 0,
+    }};
+    try writeTransactionRecord(
+        allocator,
+        prepared_record,
+        prepared_id,
+        .{
+            .process_id = 917,
+            .session_id = "prepared-guard-release",
+            .executor = "test",
+        },
+        .prepared,
+        &expected,
+        &prepared_writes,
+        &.{},
+        1,
+        2,
+        true,
+    );
+    var prepared = try inspectTransaction(allocator, prepared_dir);
+    defer prepared.deinit(allocator);
+    try std.testing.expectEqual(
+        RecoveryDecision.finish_commit,
+        prepared.decision,
+    );
+
+    try recoverAndCompactTransactions(
+        allocator,
+        transactions_dir,
+    );
+    try std.testing.expect(!fileExists(prepared_dir));
 }
 
 test "legacy recovery cannot target its shared fencing authority" {
@@ -9744,7 +10063,7 @@ test "legacy recovery rejects the transaction-control namespace" {
     try std.testing.expectEqualStrings(before, unchanged);
 }
 
-test "legacy roll-forward validates every target before publishing" {
+test "legacy zero-published recovery rolls back without target preflight" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -9793,17 +10112,15 @@ test "legacy roll-forward validates every target before publishing" {
     );
     try std.Io.Dir.deleteFileAbsolute(Io.io(), target_b);
 
-    try std.testing.expectError(
-        error.TransactionRecoveryRequired,
-        recoverAndCompactTransactionsWithOptions(
-            allocator,
-            transactions_dir,
-            .{
-                .legacy_fencing_authority = .per_resource,
-            },
-        ),
+    const summary = try recoverAndCompactTransactionsWithOptions(
+        allocator,
+        transactions_dir,
+        .{
+            .legacy_fencing_authority = .per_resource,
+        },
     );
-    try std.testing.expect(fileExists(transaction_dir));
+    try std.testing.expectEqual(@as(usize, 1), summary.transaction_count);
+    try std.testing.expect(!fileExists(transaction_dir));
     const unchanged = try tryReadForTest(target_a);
     defer allocator.free(unchanged);
     try std.testing.expectEqualStrings(before, unchanged);
@@ -10013,7 +10330,7 @@ test "committed current journals retain strict scope and writer locks" {
     try std.testing.expect(!fileExists(transaction_dir));
 }
 
-test "journal lock prevents live recordless directory reclamation" {
+test "journal lock excludes recovery without proving recordless liveness" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -10036,6 +10353,7 @@ test "journal lock prevents live recordless directory reclamation" {
     var live_journal = try acquireTransactionJournalLock(
         allocator,
         transactions_dir,
+        null,
     );
     try ensureDirectoryPathNoSymlinks(transaction_dir);
     try std.testing.expectError(
@@ -10045,8 +10363,11 @@ test "journal lock prevents live recordless directory reclamation" {
     try std.testing.expect(fileExists(transaction_dir));
     live_journal.close(Io.io());
 
-    try recoverAndCompactTransactions(allocator, transactions_dir);
-    try std.testing.expect(!fileExists(transaction_dir));
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        recoverAndCompactTransactions(allocator, transactions_dir),
+    );
+    try std.testing.expect(fileExists(transaction_dir));
 }
 
 test "recovered transaction compaction is idempotent after disappearance" {

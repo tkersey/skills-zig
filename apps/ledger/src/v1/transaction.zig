@@ -286,7 +286,8 @@ const TransactionPaths = struct {
             allocator,
             require_revisions,
         ) catch |err| {
-            last_mutation_state = if (initialized.recovery_mutated_storage)
+            last_mutation_state = if (initialized.created_control_paths or
+                initialized.recovery_mutated_storage)
                 true
             else
                 null;
@@ -379,6 +380,65 @@ test "known recovery mutation survives later commit uncertainty" {
         true,
         lastMutationState().?,
     );
+}
+
+test "created control paths survive later recovery uncertainty" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    const transactions = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".transactions" },
+    );
+    defer allocator.free(transactions);
+    try durable_store.ensureDirectoryPathNoSymlinks(transactions);
+    const invalid = try std.fs.path.join(
+        allocator,
+        &.{ transactions, "invalid" },
+    );
+    defer allocator.free(invalid);
+    try durable_store.ensureDirectoryPathNoSymlinks(invalid);
+    const recovery_advisory = try std.fs.path.join(
+        allocator,
+        &.{ transactions, ".recovery.advisory" },
+    );
+    defer allocator.free(recovery_advisory);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = recovery_advisory,
+        .data = "",
+    });
+    const journal_advisory = try std.fs.path.join(
+        allocator,
+        &.{ transactions, ".journal.advisory" },
+    );
+    defer allocator.free(journal_advisory);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = journal_advisory,
+        .data = "",
+    });
+
+    last_mutation_state = null;
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        TransactionPaths.init(
+            allocator,
+            root,
+            false,
+        ),
+    );
+    try std.testing.expect(lastMutationState().?);
+    const bindings = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger", ".bindings" },
+    );
+    defer allocator.free(bindings);
+    try std.testing.expect(directoryExists(bindings));
 }
 
 fn directoryExists(path: []const u8) bool {
