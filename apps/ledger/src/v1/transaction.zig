@@ -276,12 +276,6 @@ const TransactionPaths = struct {
             &.{ ledger_root, ".revisions" },
         );
         errdefer allocator.free(initialized.revisions);
-        initialized.created_control_paths =
-            !directoryExists(initialized.ledger_root) or
-            !directoryExists(initialized.transactions) or
-            !directoryExists(initialized.bindings) or
-            !directoryExists(initialized.definitions) or
-            (require_revisions and !directoryExists(initialized.revisions));
         initialized.ensure(
             allocator,
             require_revisions,
@@ -301,12 +295,27 @@ const TransactionPaths = struct {
         allocator: std.mem.Allocator,
         require_revisions: bool,
     ) !void {
-        try durable_store.ensureDirectoryPathNoSymlinks(self.ledger_root);
-        try durable_store.ensureDirectoryPathNoSymlinks(self.transactions);
-        try durable_store.ensureDirectoryPathNoSymlinks(self.bindings);
-        try durable_store.ensureDirectoryPathNoSymlinks(self.definitions);
+        try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            self.ledger_root,
+            &self.created_control_paths,
+        );
+        try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            self.transactions,
+            &self.created_control_paths,
+        );
+        try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            self.bindings,
+            &self.created_control_paths,
+        );
+        try durable_store.ensureDirectoryPathNoSymlinksObserved(
+            self.definitions,
+            &self.created_control_paths,
+        );
         if (require_revisions) {
-            try durable_store.ensureDirectoryPathNoSymlinks(self.revisions);
+            try durable_store.ensureDirectoryPathNoSymlinksObserved(
+                self.revisions,
+                &self.created_control_paths,
+            );
         }
         const counter_path = try std.fs.path.join(
             allocator,
@@ -439,6 +448,41 @@ test "created control paths survive later recovery uncertainty" {
     );
     defer allocator.free(bindings);
     try std.testing.expect(directoryExists(bindings));
+}
+
+test "failed control path creation remains uncertain" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(
+        std.testing.io,
+        ".",
+        allocator,
+    );
+    defer allocator.free(root);
+    const ledger_root = try std.fs.path.join(
+        allocator,
+        &.{ root, ".ledger" },
+    );
+    defer allocator.free(ledger_root);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = ledger_root,
+        .data = "not-a-directory",
+    });
+
+    last_mutation_state = false;
+    try std.testing.expectError(
+        error.NotDir,
+        TransactionPaths.init(
+            allocator,
+            root,
+            false,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        lastMutationState(),
+    );
 }
 
 fn directoryExists(path: []const u8) bool {
