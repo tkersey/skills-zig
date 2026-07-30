@@ -3226,6 +3226,11 @@ fn validateLegacyFencingAuthorityScope(
 ) !void {
     const transactions_dir = std.fs.path.dirname(transaction_dir) orelse
         return error.InvalidPath;
+    try validateLegacyRecoveryControlDisjointness(
+        allocator,
+        parsed,
+        authority,
+    );
     switch (authority) {
         .shared => |counter_path| try validateFencingAuthorityPath(
             allocator,
@@ -3251,6 +3256,60 @@ fn validateLegacyFencingAuthorityScope(
         },
     }
     try validateLegacyFencingTokenFloor(allocator, parsed, authority);
+}
+
+fn validateLegacyRecoveryControlDisjointness(
+    allocator: std.mem.Allocator,
+    parsed: ParsedTransactionRecord,
+    authority: LegacyFencingAuthority,
+) !void {
+    const shared_counter_path = switch (authority) {
+        .per_resource => null,
+        .shared => |counter_path| counter_path,
+    };
+    const shared_counter_lock_path = if (shared_counter_path) |counter_path|
+        try std.fmt.allocPrint(allocator, "{s}.lock", .{counter_path})
+    else
+        null;
+    defer if (shared_counter_lock_path) |path| allocator.free(path);
+
+    for (parsed.expected) |expected| {
+        const lease_path = try lockPathAlloc(allocator, expected.path);
+        defer allocator.free(lease_path);
+        const cas_path = try casLockPathAlloc(allocator, expected.path);
+        defer allocator.free(cas_path);
+        const advisory_path = try casAdvisoryPathAlloc(
+            allocator,
+            expected.path,
+        );
+        defer allocator.free(advisory_path);
+        const control_paths = [_][]const u8{
+            lease_path,
+            cas_path,
+            advisory_path,
+        };
+        for (control_paths) |control_path| {
+            try validateTransactionRowsDisjointFromPath(
+                allocator,
+                parsed,
+                control_path,
+            );
+            if (shared_counter_path) |counter_path| {
+                if (try canonicalPathsAliasOrOverlapOnHost(
+                    allocator,
+                    counter_path,
+                    control_path,
+                )) return error.TransactionCorrupt;
+            }
+            if (shared_counter_lock_path) |counter_lock_path| {
+                if (try canonicalPathsAliasOrOverlapOnHost(
+                    allocator,
+                    counter_lock_path,
+                    control_path,
+                )) return error.TransactionCorrupt;
+            }
+        }
+    }
 }
 
 fn validateLegacyFencingTokenFloor(
@@ -3307,23 +3366,35 @@ fn validateFencingAuthorityPath(
             transactions_dir,
             authority_path,
         )) return error.TransactionCorrupt;
-        for (parsed.expected) |row| {
-            if (try canonicalPathsAliasOrOverlapOnHost(
-                allocator,
-                row.path,
-                authority_path,
-            )) {
-                return error.TransactionCorrupt;
-            }
+        try validateTransactionRowsDisjointFromPath(
+            allocator,
+            parsed,
+            authority_path,
+        );
+    }
+}
+
+fn validateTransactionRowsDisjointFromPath(
+    allocator: std.mem.Allocator,
+    parsed: ParsedTransactionRecord,
+    protected_path: []const u8,
+) !void {
+    for (parsed.expected) |row| {
+        if (try canonicalPathsAliasOrOverlapOnHost(
+            allocator,
+            row.path,
+            protected_path,
+        )) {
+            return error.TransactionCorrupt;
         }
-        for (parsed.writes) |row| {
-            if (try canonicalPathsAliasOrOverlapOnHost(
-                allocator,
-                row.path,
-                authority_path,
-            )) {
-                return error.TransactionCorrupt;
-            }
+    }
+    for (parsed.writes) |row| {
+        if (try canonicalPathsAliasOrOverlapOnHost(
+            allocator,
+            row.path,
+            protected_path,
+        )) {
+            return error.TransactionCorrupt;
         }
     }
 }
@@ -9838,6 +9909,137 @@ test "legacy fencing authority rejects canonical target aliases" {
         ),
     );
     try std.testing.expect(!fileExists(target_path));
+}
+
+test "legacy recovery targets reject derived control path aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-33" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "target.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    const lease_path = try lockPathAlloc(allocator, target_path);
+    defer allocator.free(lease_path);
+    const cas_path = try casLockPathAlloc(allocator, target_path);
+    defer allocator.free(cas_path);
+    const advisory_path = try casAdvisoryPathAlloc(
+        allocator,
+        target_path,
+    );
+    defer allocator.free(advisory_path);
+    const control_paths = [_][]const u8{
+        lease_path,
+        cas_path,
+        advisory_path,
+    };
+    for (control_paths) |control_path| {
+        var expected = [_]TransactionExpected{
+            .{ .path = target_path, .digest = "", .sequence = 0 },
+            .{ .path = control_path, .digest = "", .sequence = 0 },
+        };
+        try std.testing.expectError(
+            error.TransactionCorrupt,
+            validateLegacyFencingAuthorityScope(
+                allocator,
+                transaction_dir,
+                .{
+                    .transaction_id = "dtx-33",
+                    .owner = .{
+                        .process_id = 933,
+                        .session_id = "recovery-control-target-alias",
+                        .executor = "test",
+                    },
+                    .state = .prepared,
+                    .expected = &expected,
+                    .writes = &.{},
+                    .created_at = "1",
+                    .updated_at = "2",
+                },
+                .{ .shared = counter_path },
+            ),
+        );
+    }
+}
+
+test "legacy fencing authority rejects derived recovery controls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-34" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "target.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const lease_path = try lockPathAlloc(allocator, target_path);
+    defer allocator.free(lease_path);
+    const cas_path = try casLockPathAlloc(allocator, target_path);
+    defer allocator.free(cas_path);
+    const advisory_path = try casAdvisoryPathAlloc(
+        allocator,
+        target_path,
+    );
+    defer allocator.free(advisory_path);
+    var expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = "",
+        .sequence = 0,
+    }};
+    const parsed: ParsedTransactionRecord = .{
+        .transaction_id = "dtx-34",
+        .owner = .{
+            .process_id = 934,
+            .session_id = "recovery-control-authority-alias",
+            .executor = "test",
+        },
+        .state = .prepared,
+        .expected = &expected,
+        .writes = &.{},
+        .created_at = "1",
+        .updated_at = "2",
+    };
+    const control_paths = [_][]const u8{
+        lease_path,
+        cas_path,
+        advisory_path,
+    };
+    for (control_paths) |control_path| {
+        try writeTextAtomic(allocator, control_path, "7\n");
+        try std.testing.expectError(
+            error.TransactionCorrupt,
+            validateLegacyFencingAuthorityScope(
+                allocator,
+                transaction_dir,
+                parsed,
+                .{ .shared = control_path },
+            ),
+        );
+        const retained = try tryReadForTest(control_path);
+        defer allocator.free(retained);
+        try std.testing.expectEqualStrings("7\n", retained);
+    }
 }
 
 test "legacy fencing authority cannot regress embedded witness tokens" {
