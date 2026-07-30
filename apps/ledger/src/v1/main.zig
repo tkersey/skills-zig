@@ -48,6 +48,12 @@ const Help =
     \\  ledger doctor --definition <file> --repo <path>
     \\    [--param <name>=<value>]... [--format json|text]
     \\
+    \\recovery commands:
+    \\  ledger recovery inspect --repo <path> --transaction <id>
+    \\    [--format json|text]
+    \\  ledger recovery reclaim --repo <path> --transaction <id>
+    \\    --lock-id <id> --fencing-token <u64> [--format json|text]
+    \\
     \\metadata commands:
     \\  ledger capabilities [--format json|text]
     \\  ledger version
@@ -134,6 +140,56 @@ const DoctorArgs = struct {
     }
 };
 
+const RecoveryArgs = struct {
+    repo_path: []const u8,
+    transaction_id: []const u8,
+    lock_id: ?[]const u8,
+    fencing_token: ?u64,
+    format: Format,
+};
+
+const RecoveryPaths = struct {
+    transaction_dir: []u8,
+    counter_path: []u8,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        repo_path: []const u8,
+        transaction_id: []const u8,
+    ) !RecoveryPaths {
+        try durable_store.rejectSymlinkComponents(repo_path);
+        const repo_root = try std.Io.Dir.cwd().realPathFileAlloc(
+            defaultIo(),
+            repo_path,
+            allocator,
+        );
+        defer allocator.free(repo_root);
+        const ledger_root = try std.fs.path.join(
+            allocator,
+            &.{ repo_root, ".ledger" },
+        );
+        defer allocator.free(ledger_root);
+        const transaction_dir = try std.fs.path.join(
+            allocator,
+            &.{ ledger_root, ".transactions", transaction_id },
+        );
+        errdefer allocator.free(transaction_dir);
+        return .{
+            .transaction_dir = transaction_dir,
+            .counter_path = try std.fs.path.join(
+                allocator,
+                &.{ ledger_root, ".fencing.counter" },
+            ),
+        };
+    }
+
+    fn deinit(self: *RecoveryPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.transaction_dir);
+        allocator.free(self.counter_path);
+        self.* = undefined;
+    }
+};
+
 const DefinitionContext = ledger.compiled_plan.PlanSet;
 
 const OwnedDocument = struct {
@@ -168,7 +224,8 @@ fn requiresDurableIo(argv: []const []const u8) bool {
     if (argv.len < 2) return false;
     return std.mem.eql(u8, argv[1], "transact") or
         std.mem.eql(u8, argv[1], "project") or
-        std.mem.eql(u8, argv[1], "doctor");
+        std.mem.eql(u8, argv[1], "doctor") or
+        std.mem.eql(u8, argv[1], "recovery");
 }
 
 pub fn runWithArgv(
@@ -209,6 +266,9 @@ fn runSubcommand(
     }
     if (std.mem.eql(u8, command, "definition")) {
         return runDefinitionCommand(allocator, environment, argv);
+    }
+    if (std.mem.eql(u8, command, "recovery")) {
+        return runRecoveryCommand(allocator, argv);
     }
     return runOperationCommand(allocator, environment, command, argv);
 }
@@ -271,6 +331,82 @@ fn isOperationCommand(command: []const u8) bool {
         std.mem.eql(u8, command, "transact") or
         std.mem.eql(u8, command, "project") or
         std.mem.eql(u8, command, "doctor");
+}
+
+fn runRecoveryCommand(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+) !u8 {
+    if (argv.len == 0) return error.MissingRecoveryAction;
+    if (!std.mem.eql(u8, argv[0], "inspect") and
+        !std.mem.eql(u8, argv[0], "reclaim"))
+    {
+        return error.UnknownRecoveryAction;
+    }
+    if (isOnlyHelp(argv[1..])) {
+        try writeStdout(Help);
+        return 0;
+    }
+    const reclaim = std.mem.eql(u8, argv[0], "reclaim");
+    const args = try parseRecoveryArgs(argv[1..], reclaim);
+    try validateRecoveryTransactionId(args.transaction_id);
+    var paths = try RecoveryPaths.init(
+        allocator,
+        args.repo_path,
+        args.transaction_id,
+    );
+    defer paths.deinit(allocator);
+    return if (reclaim)
+        runRecoveryReclaim(allocator, args, paths)
+    else
+        runRecoveryInspection(allocator, args.format, paths);
+}
+
+fn runRecoveryInspection(
+    allocator: std.mem.Allocator,
+    format: Format,
+    paths: RecoveryPaths,
+) !u8 {
+    const candidates = try durable_store.inspectExpiredLegacyLeases(
+        allocator,
+        paths.transaction_dir,
+        .{ .shared = paths.counter_path },
+    );
+    defer durable_store.deinitExpiredLegacyLeaseCandidates(
+        allocator,
+        candidates,
+    );
+    try emitRecoveryInspection(format, candidates);
+    return 0;
+}
+
+fn runRecoveryReclaim(
+    allocator: std.mem.Allocator,
+    args: RecoveryArgs,
+    paths: RecoveryPaths,
+) !u8 {
+    var summary: durable_store.TransactionRecoverySummary = .{};
+    const receipt = durable_store.reclaimExpiredLegacyLease(
+        allocator,
+        paths.transaction_dir,
+        .{ .shared = paths.counter_path },
+        .{
+            .transaction_id = args.transaction_id,
+            .lock_id = args.lock_id.?,
+            .fencing_token = args.fencing_token.?,
+        },
+        &summary,
+    ) catch |err| {
+        try emitRecoveryError(err, summary.storage_mutated);
+        return 2;
+    };
+    defer {
+        allocator.free(receipt.lock_id);
+        allocator.free(receipt.resource);
+        allocator.free(receipt.result);
+    }
+    try emitRecoveryReclaim(args.format, receipt);
+    return 0;
 }
 
 fn runTransact(
@@ -926,6 +1062,133 @@ fn parseDoctorArgs(
         .format = format,
         .parameter_specs = try parameters.toOwnedSlice(allocator),
     };
+}
+
+fn parseRecoveryArgs(
+    argv: []const []const u8,
+    reclaim: bool,
+) !RecoveryArgs {
+    var repo_path: ?[]const u8 = null;
+    var transaction_id: ?[]const u8 = null;
+    var lock_id: ?[]const u8 = null;
+    var fencing_token: ?u64 = null;
+    var format: Format = .json;
+    var format_seen = false;
+    var index: usize = 0;
+    while (index < argv.len) : (index += 1) {
+        const token = argv[index];
+        if (std.mem.eql(u8, token, "--repo")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (repo_path != null) return error.DuplicateRepositoryOption;
+            repo_path = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--transaction")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (transaction_id != null) {
+                return error.DuplicateTransactionOption;
+            }
+            transaction_id = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--lock-id")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (lock_id != null) return error.DuplicateLockIdOption;
+            lock_id = argv[index];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--fencing-token")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (fencing_token != null) {
+                return error.DuplicateFencingTokenOption;
+            }
+            fencing_token = std.fmt.parseUnsigned(
+                u64,
+                argv[index],
+                10,
+            ) catch return error.InvalidFencingToken;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--format")) {
+            index += 1;
+            if (index >= argv.len) return error.MissingOptionValue;
+            if (format_seen) return error.DuplicateFormatOption;
+            format_seen = true;
+            format = try Format.parse(argv[index]);
+            continue;
+        }
+        return error.UnknownOption;
+    }
+    return finishRecoveryArgs(
+        repo_path,
+        transaction_id,
+        lock_id,
+        fencing_token,
+        format,
+        reclaim,
+    );
+}
+
+fn finishRecoveryArgs(
+    repo_path: ?[]const u8,
+    transaction_id: ?[]const u8,
+    lock_id: ?[]const u8,
+    fencing_token: ?u64,
+    format: Format,
+    reclaim: bool,
+) !RecoveryArgs {
+    if (!reclaim and (lock_id != null or fencing_token != null)) {
+        return error.UnsupportedOption;
+    }
+    if (reclaim and lock_id == null) return error.MissingLockId;
+    if (reclaim and fencing_token == null) return error.MissingFencingToken;
+    return .{
+        .repo_path = repo_path orelse return error.MissingRepository,
+        .transaction_id = transaction_id orelse
+            return error.MissingTransaction,
+        .lock_id = lock_id,
+        .fencing_token = fencing_token,
+        .format = format,
+    };
+}
+
+fn validateRecoveryTransactionId(transaction_id: []const u8) !void {
+    const prefix = "dtx-";
+    if (!std.mem.startsWith(u8, transaction_id, prefix) or
+        transaction_id.len == prefix.len)
+    {
+        return error.InvalidTransaction;
+    }
+    const suffix_separator = std.mem.lastIndexOfScalar(
+        u8,
+        transaction_id,
+        '-',
+    ) orelse return error.InvalidTransaction;
+    if (suffix_separator == prefix.len - 1) {
+        for (transaction_id[prefix.len..]) |byte| {
+            if (!std.ascii.isDigit(byte)) {
+                return error.InvalidTransaction;
+            }
+        }
+        return;
+    }
+    if (suffix_separator <= prefix.len or
+        transaction_id.len - suffix_separator - 1 != 32)
+    {
+        return error.InvalidTransaction;
+    }
+    for (transaction_id[prefix.len..suffix_separator]) |byte| {
+        if (!std.ascii.isDigit(byte)) return error.InvalidTransaction;
+    }
+    for (transaction_id[suffix_separator + 1 ..]) |byte| {
+        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) {
+            return error.InvalidTransaction;
+        }
+    }
 }
 
 fn loadDefinition(
@@ -1907,6 +2170,8 @@ fn writeCapabilityTail(writer: *std.Io.Writer) !void {
             "\"ledger-doctor-result/v1\"," ++
             "\"ledger-materialization-result/v1\"," ++
             "\"ledger-projection-error/v1\"," ++
+            "\"ledger-recovery-inspection/v1\"," ++
+            "\"ledger-recovery-reclaim-result/v1\"," ++
             "\"ledger-transaction-result/v1\"," ++
             "\"ledger-transaction-error/v1\"," ++
             "\"ledger-projection-result/v1\"," ++
@@ -1932,6 +2197,120 @@ fn emitCommandError(err: anyerror) !void {
     );
     try stdout_writer.interface.writeAll(
         ",\"authority_granted\":false,\"storage_mutated\":false}\n",
+    );
+}
+
+fn emitRecoveryInspection(
+    format: Format,
+    candidates: []const durable_store.ExpiredLegacyLeaseCandidate,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    switch (format) {
+        .json => {
+            try stdout_writer.interface.writeAll(
+                "{\"schema\":\"ledger-recovery-inspection/v1\"," ++
+                    "\"authority_granted\":false," ++
+                    "\"storage_mutated\":false,\"candidates\":[",
+            );
+            for (candidates, 0..) |candidate, index| {
+                if (index != 0) try stdout_writer.interface.writeByte(',');
+                try candidate.writeJson(&stdout_writer.interface);
+            }
+            try stdout_writer.interface.writeAll("]}\n");
+        },
+        .text => {
+            try stdout_writer.interface.print(
+                "expired legacy lease candidates: {d}\n",
+                .{candidates.len},
+            );
+            for (candidates) |candidate| {
+                try stdout_writer.interface.writeAll("transaction=");
+                try std.json.Stringify.value(
+                    candidate.transaction_id,
+                    .{},
+                    &stdout_writer.interface,
+                );
+                try stdout_writer.interface.writeAll(" lock_id=");
+                try std.json.Stringify.value(
+                    candidate.lock_id,
+                    .{},
+                    &stdout_writer.interface,
+                );
+                try stdout_writer.interface.print(
+                    " fencing_token={d} resource=",
+                    .{candidate.fencing_token},
+                );
+                try std.json.Stringify.value(
+                    candidate.resource,
+                    .{},
+                    &stdout_writer.interface,
+                );
+                try stdout_writer.interface.writeAll(" expires_at=");
+                try std.json.Stringify.value(
+                    candidate.expires_at,
+                    .{},
+                    &stdout_writer.interface,
+                );
+                try stdout_writer.interface.writeByte('\n');
+            }
+        },
+    }
+}
+
+fn emitRecoveryReclaim(
+    format: Format,
+    receipt: durable_store.ReclaimReceipt,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    switch (format) {
+        .json => {
+            try stdout_writer.interface.writeAll(
+                "{\"schema\":\"ledger-recovery-reclaim-result/v1\"," ++
+                    "\"authority_granted\":false," ++
+                    "\"storage_mutated\":true,\"result\":",
+            );
+            try receipt.writeJson(&stdout_writer.interface);
+            try stdout_writer.interface.writeAll("}\n");
+        },
+        .text => {
+            try stdout_writer.interface.writeAll("reclaimed legacy lease ");
+            try std.json.Stringify.value(
+                receipt.lock_id,
+                .{},
+                &stdout_writer.interface,
+            );
+            try stdout_writer.interface.writeAll(" for ");
+            try std.json.Stringify.value(
+                receipt.resource,
+                .{},
+                &stdout_writer.interface,
+            );
+            try stdout_writer.interface.print(
+                "; fencing authority advanced from {d} to {d}\n",
+                .{
+                    receipt.previous_fencing_token,
+                    receipt.authority_counter,
+                },
+            );
+        },
+    }
+}
+
+fn emitRecoveryError(
+    err: anyerror,
+    storage_mutated: bool,
+) !void {
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(
+        "{\"schema\":\"ledger-command-error/v1\",\"code\":",
+    );
+    try definition_core.canonical_json.writeCanonicalString(
+        &stdout_writer.interface,
+        @errorName(err),
+    );
+    try stdout_writer.interface.print(
+        ",\"authority_granted\":false,\"storage_mutated\":{s}}}\n",
+        .{if (storage_mutated) "true" else "false"},
     );
 }
 
@@ -1986,6 +2365,50 @@ test "only store-backed commands install durable runtime IO" {
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "transact" }));
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "project" }));
     try std.testing.expect(requiresDurableIo(&.{ "ledger", "doctor" }));
+    try std.testing.expect(requiresDurableIo(&.{ "ledger", "recovery" }));
+}
+
+test "recovery parser separates inspection from exact witnessed reclaim" {
+    const inspection = try parseRecoveryArgs(&.{
+        "--repo",
+        "/repo",
+        "--transaction",
+        "dtx-42",
+    }, false);
+    try std.testing.expect(inspection.lock_id == null);
+    try std.testing.expect(inspection.fencing_token == null);
+    const reclaim = try parseRecoveryArgs(&.{
+        "--repo",
+        "/repo",
+        "--transaction",
+        "dtx-42",
+        "--lock-id",
+        "dlk-7-1",
+        "--fencing-token",
+        "18446744073709551615",
+    }, true);
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        reclaim.fencing_token.?,
+    );
+    try std.testing.expectError(
+        error.UnsupportedOption,
+        parseRecoveryArgs(&.{
+            "--repo",
+            "/repo",
+            "--transaction",
+            "dtx-42",
+            "--lock-id",
+            "dlk-7-1",
+        }, false),
+    );
+    try std.testing.expectError(
+        error.InvalidTransaction,
+        validateRecoveryTransactionId("../dtx-42"),
+    );
+    try validateRecoveryTransactionId(
+        "dtx-42-00000000000000000000000000000001",
+    );
 }
 
 test "common parser accepts named inputs and parameters only on artifact commands" {
