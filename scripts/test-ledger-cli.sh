@@ -208,7 +208,7 @@ idempotent_output=$("$binary" transact \
   --param request=smoke-one \
   --format json)
 grep -Fq '"result":"idempotent"' <<<"$idempotent_output"
-grep -Fq '"storage_mutated":false' <<<"$idempotent_output"
+grep -Fq '"storage_mutated":true' <<<"$idempotent_output"
 
 set +e
 conflict_output=$("$binary" transact \
@@ -263,7 +263,7 @@ chained_duplicate=$("$binary" transact \
   --param request=chain-two \
   --format json)
 grep -Fq '"result":"idempotent"' <<<"$chained_duplicate"
-grep -Fq '"storage_mutated":false' <<<"$chained_duplicate"
+grep -Fq '"storage_mutated":true' <<<"$chained_duplicate"
 
 set +e
 chained_failure=$("$binary" transact \
@@ -472,7 +472,7 @@ snapshot_duplicate=$("$binary" transact \
   --param stream=snapshot-one \
   --format json)
 grep -Fq '"result":"idempotent"' <<<"$snapshot_duplicate"
-grep -Fq '"storage_mutated":false' <<<"$snapshot_duplicate"
+grep -Fq '"storage_mutated":true' <<<"$snapshot_duplicate"
 
 snapshot_projection=$("$binary" project \
   --definition "$event_snapshot_definition" \

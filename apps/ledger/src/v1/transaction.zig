@@ -4214,7 +4214,7 @@ fn expectSecondChainedEventAndDuplicate(
         parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqual(
         @as(usize, 0),
         duplicate.generated_outputs.len,
@@ -5103,7 +5103,7 @@ fn duplicateDocumentReplacement(
         &parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqualStrings(
         "idempotent",
         duplicate.effects[0].result,
@@ -5442,7 +5442,7 @@ fn captureInitialContentEvent(
         parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqualStrings(
         "idempotent",
         duplicate.effects[0].result,
@@ -5514,7 +5514,7 @@ fn expectLegacyContentBinding(
         parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqualStrings(
         expected,
         duplicate.returned_content.?,
@@ -5555,7 +5555,7 @@ fn expectContentIdempotencyBypass(
         ordinary,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
+    try std.testing.expect(duplicate.storage_mutated);
     try std.testing.expectEqualStrings(expected, duplicate.returned_content.?);
     try expectContentEventCount(plans, 2);
 }
