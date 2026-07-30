@@ -4825,6 +4825,7 @@ const HostPathIdentityContext = struct {
     fn directoryIdentity(
         self: *HostPathIdentityContext,
         directory: []const u8,
+        witness_name: []const u8,
     ) !DirectoryIdentity {
         const resolved = try std.fs.path.resolve(
             self.allocator,
@@ -4839,9 +4840,10 @@ const HostPathIdentityContext = struct {
             resolved,
         );
         errdefer self.allocator.free(canonical);
-        const case_insensitive = try directoryNamesAreCaseInsensitive(
+        const case_insensitive = try directoryNameIsCaseInsensitive(
             self.allocator,
             canonical,
+            witness_name,
         );
         if (case_insensitive) {
             for (canonical) |*byte| byte.* = std.ascii.toLower(byte.*);
@@ -4865,7 +4867,10 @@ const HostPathIdentityContext = struct {
         defer self.allocator.free(resolved);
         const parent = std.fs.path.dirname(resolved) orelse
             return error.InvalidPath;
-        const directory = try self.directoryIdentity(parent);
+        const directory = try self.directoryIdentity(
+            parent,
+            std.fs.path.basename(resolved),
+        );
         if (containsNonAscii(std.fs.path.basename(resolved))) {
             const host_canonical = std.Io.Dir.cwd().realPathFileAlloc(
                 Io.io(),
@@ -4947,9 +4952,15 @@ const HostPathIdentityContext = struct {
                 defer self.allocator.free(suffix);
                 const normalized = try self.allocator.dupe(u8, suffix);
                 defer self.allocator.free(normalized);
-                if (try directoryNamesAreCaseInsensitive(
+                const separator = std.mem.indexOfScalar(
+                    u8,
+                    suffix,
+                    std.fs.path.sep,
+                ) orelse suffix.len;
+                if (try directoryNameIsCaseInsensitive(
                     self.allocator,
                     candidate,
+                    suffix[0..separator],
                 )) {
                     if (containsNonAscii(normalized)) {
                         return error.TransactionRecoveryRequired;
@@ -6514,7 +6525,11 @@ fn transactionPathsAliasOrOverlap(
     const shorter = if (left.len < right.len) left else right;
     const parent = std.fs.path.dirname(shorter) orelse
         return error.InvalidPath;
-    return directoryNamesAreCaseInsensitive(allocator, parent);
+    return directoryNameIsCaseInsensitive(
+        allocator,
+        parent,
+        std.fs.path.basename(shorter),
+    );
 }
 
 fn pathsAliasOrOverlapCaseSensitive(
@@ -7583,7 +7598,9 @@ fn nearestExistingPathAlloc(
     }
 }
 
-const directory_case_cache_entries_max: usize = 64;
+const directory_case_direct_entries_max: usize = 64;
+const directory_case_inconclusive_entries_max: usize = 16;
+const directory_case_probe_attempts_max: usize = 3;
 
 const DirectoryCaseCache = struct {
     const Value = union(enum) {
@@ -7599,19 +7616,42 @@ const DirectoryCaseCache = struct {
         value: Value,
     };
 
-    entries: [directory_case_cache_entries_max]Entry = undefined,
-    count: usize = 0,
-    replace_index: usize = 0,
+    direct_entries: [directory_case_direct_entries_max]Entry = undefined,
+    direct_count: usize = 0,
+    direct_replace_index: usize = 0,
+    inconclusive_entries: [directory_case_inconclusive_entries_max]Entry = undefined,
+    inconclusive_count: usize = 0,
+    inconclusive_replace_index: usize = 0,
 
     fn get(self: DirectoryCaseCache, identity: HostObjectIdentity) ?Value {
-        for (self.entries[0..self.count]) |entry| {
+        for (self.direct_entries[0..self.direct_count]) |entry| {
+            if (entryMatchesIdentity(entry, identity)) return entry.value;
+        }
+        for (
+            self.inconclusive_entries[0..self.inconclusive_count],
+        ) |entry| {
+            if (entryMatchesIdentity(entry, identity)) return entry.value;
+        }
+        return null;
+    }
+
+    fn entryMatchesIdentity(
+        entry: Entry,
+        identity: HostObjectIdentity,
+    ) bool {
+        return entry.device == identity.device and
+            entry.inode == identity.inode and
+            entry.mtime_ns == identity.mtime_ns and
+            entry.ctime_ns == identity.ctime_ns;
+    }
+
+    fn ownerIndex(
+        entries: []const Entry,
+        identity: HostObjectIdentity,
+    ) ?usize {
+        for (entries, 0..) |entry, index| {
             if (entry.device == identity.device and
-                entry.inode == identity.inode and
-                entry.mtime_ns == identity.mtime_ns and
-                entry.ctime_ns == identity.ctime_ns)
-            {
-                return entry.value;
-            }
+                entry.inode == identity.inode) return index;
         }
         return null;
     }
@@ -7621,20 +7661,52 @@ const DirectoryCaseCache = struct {
         identity: HostObjectIdentity,
         value: Value,
     ) void {
-        for (self.entries[0..self.count], 0..) |entry, index| {
-            if (entry.device == identity.device and
-                entry.inode == identity.inode)
-            {
-                self.entries[index] = makeEntry(identity, value);
-                return;
-            }
+        switch (value) {
+            .direct => self.putDirect(identity, value),
+            .scan_inconclusive => self.putInconclusive(identity, value),
         }
-        const index = if (self.count < self.entries.len) grow: {
-            defer self.count += 1;
-            break :grow self.count;
-        } else self.replace_index;
-        self.entries[index] = makeEntry(identity, value);
-        self.replace_index = (index + 1) % self.entries.len;
+    }
+
+    fn putDirect(
+        self: *DirectoryCaseCache,
+        identity: HostObjectIdentity,
+        value: Value,
+    ) void {
+        const entries = self.direct_entries[0..self.direct_count];
+        const index = ownerIndex(entries, identity) orelse add: {
+            if (self.direct_count < self.direct_entries.len) {
+                defer self.direct_count += 1;
+                break :add self.direct_count;
+            }
+            break :add self.direct_replace_index;
+        };
+        self.direct_entries[index] = makeEntry(identity, value);
+        self.direct_replace_index =
+            (index + 1) % self.direct_entries.len;
+    }
+
+    fn putInconclusive(
+        self: *DirectoryCaseCache,
+        identity: HostObjectIdentity,
+        value: Value,
+    ) void {
+        for (self.direct_entries[0..self.direct_count]) |entry| {
+            if (entryMatchesIdentity(entry, identity)) return;
+        }
+        const entries =
+            self.inconclusive_entries[0..self.inconclusive_count];
+        const index = ownerIndex(entries, identity) orelse add: {
+            if (self.inconclusive_count <
+                self.inconclusive_entries.len)
+            {
+                defer self.inconclusive_count += 1;
+                break :add self.inconclusive_count;
+            }
+            break :add self.inconclusive_replace_index;
+        };
+        self.inconclusive_entries[index] = makeEntry(identity, value);
+        self.inconclusive_replace_index =
+            (index + 1) % self.inconclusive_entries.len;
     }
 
     fn makeEntry(
@@ -7676,12 +7748,13 @@ test "directory case cache is bounded and identity keyed" {
     changed.ctime_ns += 1;
     try std.testing.expect(cache.get(changed) == null);
     cache.put(changed, .scan_inconclusive);
-    try std.testing.expectEqual(@as(usize, 1), cache.count);
+    try std.testing.expectEqual(@as(usize, 1), cache.direct_count);
+    try std.testing.expectEqual(@as(usize, 1), cache.inconclusive_count);
     try std.testing.expectEqual(
         DirectoryCaseCache.Value.scan_inconclusive,
         cache.get(changed).?,
     );
-    for (0..directory_case_cache_entries_max + 1) |index| {
+    for (0..directory_case_direct_entries_max + 1) |index| {
         cache.put(.{
             .device = 3,
             .inode = @intCast(index),
@@ -7691,14 +7764,14 @@ test "directory case cache is bounded and identity keyed" {
         }, .{ .direct = false });
     }
     try std.testing.expectEqual(
-        directory_case_cache_entries_max,
-        cache.count,
+        directory_case_direct_entries_max,
+        cache.direct_count,
     );
 }
 
 test "inconclusive case scans enter a saturated cache" {
     var cache: DirectoryCaseCache = .{};
-    for (0..directory_case_cache_entries_max) |index| {
+    for (0..directory_case_direct_entries_max) |index| {
         cache.put(.{
             .device = 1,
             .inode = @intCast(index),
@@ -7720,19 +7793,12 @@ test "inconclusive case scans enter a saturated cache" {
         cache.get(inconclusive).?,
     );
     try std.testing.expectEqual(
-        directory_case_cache_entries_max,
-        cache.count,
+        directory_case_direct_entries_max,
+        cache.direct_count,
     );
-}
-
-fn directoryNamesAreCaseInsensitive(
-    allocator: std.mem.Allocator,
-    directory: []const u8,
-) !bool {
-    return directoryCaseSensitivity(
-        allocator,
-        directory,
-        null,
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        cache.inconclusive_count,
     );
 }
 
@@ -7741,17 +7807,23 @@ fn directoryNameIsCaseInsensitive(
     directory: []const u8,
     witness_name: []const u8,
 ) !bool {
-    return directoryCaseSensitivity(
-        allocator,
-        directory,
-        witness_name,
-    );
+    for (0..directory_case_probe_attempts_max) |_| {
+        return directoryCaseSensitivityAttempt(
+            allocator,
+            directory,
+            witness_name,
+        ) catch |err| switch (err) {
+            error.DirectoryIdentityChanged => continue,
+            else => return err,
+        };
+    }
+    return error.TransactionRecoveryRequired;
 }
 
-fn directoryCaseSensitivity(
+fn directoryCaseSensitivityAttempt(
     allocator: std.mem.Allocator,
     directory: []const u8,
-    witness_name: ?[]const u8,
+    witness_name: []const u8,
 ) !bool {
     const canonical = try nearestExistingPathAlloc(allocator, directory);
     defer allocator.free(canonical);
@@ -7769,53 +7841,143 @@ fn directoryCaseSensitivity(
         if (value == .direct) return value.direct;
     }
 
-    var direct: ?bool = null;
-    var scan_inconclusive = false;
-    if (witness_name) |name| {
-        direct = try targetNameCaseSensitivity(
-            allocator,
-            canonical,
-            name,
-        );
+    var direct = try targetNameCaseSensitivity(
+        allocator,
+        canonical,
+        witness_name,
+    );
+    if (direct == null) {
+        direct = try hostDirectoryCaseSensitivity(canonical);
         if (direct == null) {
-            if (cached != null and cached.? == .scan_inconclusive) {
-                scan_inconclusive = true;
-            } else {
+            if (cached == null or cached.? != .scan_inconclusive) {
                 direct = try childNameCaseSensitivity(
                     allocator,
                     canonical,
                 );
             }
         }
-    } else {
-        direct = try childNameCaseSensitivity(
-            allocator,
-            canonical,
-        );
     }
-    if (direct == null) scan_inconclusive = true;
+    if (direct == null) {
+        const before = identity orelse
+            return error.TransactionRecoveryRequired;
+        if (try directoryCrossesDeviceBoundary(canonical, before)) {
+            return error.TransactionRecoveryRequired;
+        }
+    }
     const case_insensitive = direct orelse
         try detectAncestorCaseInsensitivity(
             allocator,
             canonical,
         );
-    if (identity) |value| {
-        const refreshed = (try hostObjectIdentity(canonical)) orelse
-            return error.TransactionRecoveryRequired;
-        if (!hostObjectIdentitiesEqual(value, refreshed)) {
-            return error.TransactionRecoveryRequired;
-        }
-        directory_case_cache.put(
-            refreshed,
-            if (direct) |observed|
-                .{ .direct = observed }
-            else if (scan_inconclusive)
-                .scan_inconclusive
-            else
-                unreachable,
-        );
-    }
+    try cacheDirectoryCaseResult(canonical, identity, direct);
     return case_insensitive;
+}
+
+fn cacheDirectoryCaseResult(
+    directory: []const u8,
+    identity: ?HostObjectIdentity,
+    direct: ?bool,
+) !void {
+    const before = identity orelse return;
+    const refreshed = (try hostObjectIdentity(directory)) orelse
+        return error.TransactionRecoveryRequired;
+    if (!hostObjectIdentitiesEqual(before, refreshed)) {
+        return error.DirectoryIdentityChanged;
+    }
+    directory_case_cache.put(
+        refreshed,
+        if (direct) |observed|
+            .{ .direct = observed }
+        else
+            .scan_inconclusive,
+    );
+}
+
+fn directoryCrossesDeviceBoundary(
+    directory: []const u8,
+    identity: HostObjectIdentity,
+) !bool {
+    const parent = std.fs.path.dirname(directory) orelse return false;
+    if (std.mem.eql(u8, parent, directory)) return false;
+    const parent_identity = (try hostObjectIdentity(parent)) orelse
+        return error.TransactionRecoveryRequired;
+    if (parent_identity.kind != .directory) return error.NotDir;
+    return parent_identity.device != identity.device;
+}
+
+fn hostDirectoryCaseSensitivity(
+    directory: []const u8,
+) !?bool {
+    return switch (@import("builtin").os.tag) {
+        .linux => linuxDirectoryCaseSensitivity(directory),
+        .windows => windowsDirectoryCaseSensitivity(directory),
+        else => null,
+    };
+}
+
+fn linuxDirectoryCaseSensitivity(
+    directory: []const u8,
+) !?bool {
+    const linux = std.os.linux;
+    const fs_ioc_getflags: u32 = 0x8008_6601;
+    const fs_casefold_fl: usize = 0x4000_0000;
+    var dir = if (std.fs.path.isAbsolute(directory))
+        try std.Io.Dir.openDirAbsolute(Io.io(), directory, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), directory, .{
+            .follow_symlinks = false,
+        });
+    defer dir.close(Io.io());
+    while (true) { // tiger: event-loop -- bounded by syscall completion.
+        var flags: usize = 0;
+        const result = linux.ioctl(
+            dir.handle,
+            fs_ioc_getflags,
+            @intFromPtr(&flags),
+        );
+        switch (linux.errno(result)) {
+            .SUCCESS => return (flags & fs_casefold_fl) != 0,
+            .INTR => continue,
+            .INVAL, .NOTTY, .OPNOTSUPP, .NOSYS => return null,
+            else => return error.TransactionRecoveryRequired,
+        }
+    }
+}
+
+const WindowsFileCaseSensitiveInformation = extern struct {
+    flags: u32,
+};
+
+fn windowsDirectoryCaseSensitivity(
+    directory: []const u8,
+) !?bool {
+    const windows = std.os.windows;
+    const file_cs_flag_case_sensitive_dir: u32 = 0x1;
+    var dir = if (std.fs.path.isAbsolute(directory))
+        try std.Io.Dir.openDirAbsolute(Io.io(), directory, .{
+            .follow_symlinks = false,
+        })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), directory, .{
+            .follow_symlinks = false,
+        });
+    defer dir.close(Io.io());
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var information: WindowsFileCaseSensitiveInformation = undefined;
+    return switch (windows.ntdll.NtQueryInformationFile(
+        dir.handle,
+        &io_status_block,
+        &information,
+        @sizeOf(WindowsFileCaseSensitiveInformation),
+        .CaseSensitive,
+    )) {
+        .SUCCESS => (information.flags &
+            file_cs_flag_case_sensitive_dir) == 0,
+        .INVALID_INFO_CLASS, .INVALID_PARAMETER, .NOT_SUPPORTED => null,
+        else => error.TransactionRecoveryRequired,
+    };
 }
 
 fn detectAncestorCaseInsensitivity(
@@ -7866,6 +8028,7 @@ fn targetNameCaseSensitivity(
     directory: []const u8,
     witness_name: []const u8,
 ) !?bool {
+    const attempts_max: usize = 2;
     var dir = if (std.fs.path.isAbsolute(directory))
         try std.Io.Dir.openDirAbsolute(Io.io(), directory, .{
             .follow_symlinks = false,
@@ -7880,16 +8043,77 @@ fn targetNameCaseSensitivity(
         witness_name,
     )) orelse return null;
     defer allocator.free(variant);
-    const original_stat = try targetNameStat(dir, witness_name);
-    const alias_stat = try targetNameStat(dir, variant);
-    if (original_stat) |original| {
+    for (0..attempts_max) |_| {
+        const first = try targetNameStats(
+            dir,
+            witness_name,
+            variant,
+        );
+        const second = try targetNameStats(
+            dir,
+            witness_name,
+            variant,
+        );
+        if (!first.eql(second)) continue;
+        return classifyTargetNameStats(
+            allocator,
+            dir,
+            witness_name,
+            variant,
+            second,
+        );
+    }
+    return error.TransactionRecoveryRequired;
+}
+
+const TargetNameStats = struct {
+    original: ?std.Io.File.Stat,
+    alias: ?std.Io.File.Stat,
+
+    fn eql(left: TargetNameStats, right: TargetNameStats) bool {
+        return targetNameStatEqual(left.original, right.original) and
+            targetNameStatEqual(left.alias, right.alias);
+    }
+};
+
+fn targetNameStats(
+    dir: std.Io.Dir,
+    original_name: []const u8,
+    alias_name: []const u8,
+) !TargetNameStats {
+    return .{
+        .original = try targetNameStat(dir, original_name),
+        .alias = try targetNameStat(dir, alias_name),
+    };
+}
+
+fn targetNameStatEqual(
+    left: ?std.Io.File.Stat,
+    right: ?std.Io.File.Stat,
+) bool {
+    const left_value = left orelse return right == null;
+    const right_value = right orelse return false;
+    return left_value.inode == right_value.inode and
+        left_value.kind == right_value.kind and
+        left_value.mtime.nanoseconds == right_value.mtime.nanoseconds and
+        left_value.ctime.nanoseconds == right_value.ctime.nanoseconds;
+}
+
+fn classifyTargetNameStats(
+    allocator: std.mem.Allocator,
+    dir: std.Io.Dir,
+    witness_name: []const u8,
+    variant: []const u8,
+    stats: TargetNameStats,
+) !?bool {
+    if (stats.original) |original| {
         if (original.kind == .sym_link) return null;
     } else {
-        const alias = alias_stat orelse return null;
+        const alias = stats.alias orelse return null;
         if (alias.kind == .sym_link) return null;
         return false;
     }
-    if (alias_stat) |alias| {
+    if (stats.alias) |alias| {
         if (alias.kind == .sym_link) return false;
     } else {
         return false;
@@ -10107,7 +10331,11 @@ test "transactions reject missing descendants of case-aliased journal roots" {
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
     defer allocator.free(root);
-    if (!try directoryNamesAreCaseInsensitive(allocator, root)) {
+    if (!try directoryNameIsCaseInsensitive(
+        allocator,
+        root,
+        "Probe",
+    )) {
         return error.SkipZigTest;
     }
     const transactions_dir = try std.fs.path.join(
@@ -14286,7 +14514,11 @@ test "legacy journal path identity follows the host filesystem" {
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
     defer allocator.free(root);
-    if (try directoryNamesAreCaseInsensitive(allocator, root)) {
+    if (try directoryNameIsCaseInsensitive(
+        allocator,
+        root,
+        "Probe",
+    )) {
         return error.SkipZigTest;
     }
     const transaction_dir = try std.fs.path.join(
@@ -14568,7 +14800,11 @@ test "legacy recovery derives controls from an existing unicode target identity"
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
     defer allocator.free(root);
-    if (!try directoryNamesAreCaseInsensitive(allocator, root)) {
+    if (!try directoryNameIsCaseInsensitive(
+        allocator,
+        root,
+        "Probe",
+    )) {
         return error.SkipZigTest;
     }
     const transactions_dir = try std.fs.path.join(
@@ -16553,32 +16789,20 @@ test "EventStore inconclusive case cache rechecks the target witness" {
     const allocator = std.testing.allocator;
     const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
     defer allocator.free(root);
-    const identity = (try hostObjectIdentity(root)) orelse
-        return error.SkipZigTest;
-
-    _ = try directoryNameIsCaseInsensitive(
-        allocator,
-        root,
-        "Events.jsonl",
-    );
-    try std.testing.expectEqual(
-        DirectoryCaseCache.Value.scan_inconclusive,
-        directory_case_cache.get(identity).?,
-    );
-
     var witness = try tmp.dir.createFile(
         Io.io(),
         "Events.jsonl",
         .{ .exclusive = true },
     );
     witness.close(Io.io());
+    const refreshed = (try hostObjectIdentity(root)) orelse
+        return error.SkipZigTest;
+    directory_case_cache.put(refreshed, .scan_inconclusive);
     _ = try directoryNameIsCaseInsensitive(
         allocator,
         root,
         "Events.jsonl",
     );
-    const refreshed = (try hostObjectIdentity(root)) orelse
-        return error.SkipZigTest;
     try std.testing.expect(
         directory_case_cache.get(refreshed).? == .direct,
     );
