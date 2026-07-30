@@ -1743,6 +1743,7 @@ pub fn readJsonlSnapshot(
 const TransactionSnapshot = struct {
     digest: []u8,
     sequence: ?u64,
+    byte_len: usize,
 
     fn deinit(self: TransactionSnapshot, allocator: std.mem.Allocator) void {
         allocator.free(self.digest);
@@ -1759,14 +1760,16 @@ fn readTransactionSnapshotAt(
         if (mutation.expectation.expected_sequence) |sequence| {
             if (sequence != 0) return error.SequenceMismatch;
         }
+        const observed = try digestRegularFileNoSymlinkAtAlloc(
+            allocator,
+            dir,
+            base,
+            mutation.max_bytes,
+        );
         return .{
-            .digest = try digestRegularFileNoSymlinkAtAlloc(
-                allocator,
-                dir,
-                base,
-                mutation.max_bytes,
-            ),
+            .digest = observed.digest,
             .sequence = null,
+            .byte_len = observed.byte_len,
         };
     }
     const data = try readRegularFileNoSymlinkAt(
@@ -1790,15 +1793,21 @@ fn readTransactionSnapshotAt(
     return .{
         .digest = digest,
         .sequence = sequence,
+        .byte_len = data.len,
     };
 }
+
+const RegularFileDigest = struct {
+    digest: []u8,
+    byte_len: usize,
+};
 
 fn digestRegularFileNoSymlinkAtAlloc(
     allocator: std.mem.Allocator,
     dir: *std.Io.Dir,
     base: []const u8,
     max_bytes: usize,
-) ![]u8 {
+) !RegularFileDigest {
     const stat = try dir.statFile(
         Io.io(),
         base,
@@ -1829,7 +1838,14 @@ fn digestRegularFileNoSymlinkAtAlloc(
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+    return .{
+        .digest = try std.fmt.allocPrint(
+            allocator,
+            "sha256:{s}",
+            .{&hex},
+        ),
+        .byte_len = observed,
+    };
 }
 
 fn rejectHardlinkedTargetAt(dir: *std.Io.Dir, base: []const u8) !void {
@@ -2020,6 +2036,72 @@ test "transaction paths reject lexical escapes before recovery reads" {
     );
 }
 
+fn addTransactionRecoveryHashAdmission(
+    admitted: *usize,
+    bytes: usize,
+    max_bytes: usize,
+) !void {
+    const total = std.math.add(usize, admitted.*, bytes) catch
+        return error.TransactionRecoveryWorkExceeded;
+    if (total > max_bytes) {
+        return error.TransactionRecoveryWorkExceeded;
+    }
+    admitted.* = total;
+}
+
+fn admitTransactionRecoveryHashWork(
+    admitted: *usize,
+    before_bytes: usize,
+    after_bytes: usize,
+    max_bytes: usize,
+) !void {
+    const before_recovery = std.math.mul(
+        usize,
+        before_bytes,
+        4,
+    ) catch return error.TransactionRecoveryWorkExceeded;
+    const staged_recovery = std.math.mul(
+        usize,
+        after_bytes,
+        2,
+    ) catch return error.TransactionRecoveryWorkExceeded;
+    const unpublished_recovery = std.math.add(
+        usize,
+        before_recovery,
+        staged_recovery,
+    ) catch return error.TransactionRecoveryWorkExceeded;
+    const published_recovery = std.math.mul(
+        usize,
+        after_bytes,
+        4,
+    ) catch return error.TransactionRecoveryWorkExceeded;
+    try addTransactionRecoveryHashAdmission(
+        admitted,
+        @max(unpublished_recovery, published_recovery),
+        max_bytes,
+    );
+}
+
+test "transaction admission covers repeated recovery hashes" {
+    var admitted: usize = 0;
+    try admitTransactionRecoveryHashWork(
+        &admitted,
+        2,
+        2,
+        16,
+    );
+    try std.testing.expectEqual(@as(usize, 12), admitted);
+    try std.testing.expectError(
+        error.TransactionRecoveryWorkExceeded,
+        admitTransactionRecoveryHashWork(
+            &admitted,
+            2,
+            2,
+            16,
+        ),
+    );
+}
+
 pub fn commitTextTransaction(
     allocator: std.mem.Allocator,
     transactions_dir: []const u8,
@@ -2107,6 +2189,10 @@ pub fn commitTextTransaction(
     }
     const before_exists = try allocator.alloc(bool, ordered.len);
     defer allocator.free(before_exists);
+    const before_sizes = try allocator.alloc(usize, ordered.len);
+    defer allocator.free(before_sizes);
+    var recovery_hash_admission: usize = 0;
+    var recovery_hash_check_only: usize = 0;
 
     for (ordered, targets, 0..) |mutation, *target, mutation_index| {
         try target.verifyPathIdentity();
@@ -2126,14 +2212,21 @@ pub fn commitTextTransaction(
                 else => return err,
             };
         defer if (maybe_before) |before| before.deinit(allocator);
-        before_exists[mutation_index] = if (append_fast_path)
-            try transactionTargetExistsAt(
+        if (append_fast_path) {
+            const maybe_size = try transactionTargetSizeAt(
                 &target.dir,
                 target.base,
                 mutation.max_bytes,
-            )
-        else
-            maybe_before != null;
+            );
+            before_exists[mutation_index] = maybe_size != null;
+            before_sizes[mutation_index] = maybe_size orelse 0;
+        } else {
+            before_exists[mutation_index] = maybe_before != null;
+            before_sizes[mutation_index] = if (maybe_before) |before|
+                before.byte_len
+            else
+                0;
+        }
         if (append_fast_path) {
             if (mutation.expectation.expected_exists) |expected_exists| {
                 if (expected_exists != before_exists[mutation_index]) {
@@ -2190,7 +2283,14 @@ pub fn commitTextTransaction(
         }
         expected_count += 1;
 
-        if (mutation.action == .check_only) continue;
+        if (mutation.action == .check_only) {
+            recovery_hash_check_only = std.math.add(
+                usize,
+                recovery_hash_check_only,
+                before_sizes[mutation_index],
+            ) catch return error.TransactionRecoveryWorkExceeded;
+            continue;
+        }
         if (mutation.text.len > mutation.max_bytes) return error.FileTooBig;
         if (mutation.content_mode == .jsonl_sequence_required) {
             const validation = validateJsonlBytes(allocator, mutation.text);
@@ -2219,6 +2319,32 @@ pub fn commitTextTransaction(
             .sequence_after = sequence_after,
         };
         write_count += 1;
+        const after_size = switch (mutation.action) {
+            .write => mutation.text.len,
+            .append => size: {
+                const size = std.math.add(
+                    usize,
+                    before_sizes[mutation_index],
+                    mutation.text.len,
+                ) catch return error.FileTooBig;
+                if (size > mutation.max_bytes) return error.FileTooBig;
+                break :size size;
+            },
+            .check_only => unreachable,
+        };
+        try admitTransactionRecoveryHashWork(
+            &recovery_hash_admission,
+            before_sizes[mutation_index],
+            after_size,
+            transaction_recovery_hash_max_bytes,
+        );
+    }
+    if (write_count != 0) {
+        try addTransactionRecoveryHashAdmission(
+            &recovery_hash_admission,
+            recovery_hash_check_only,
+            transaction_recovery_hash_max_bytes,
+        );
     }
 
     // Target custody is process-owned and crash-released. The journal namespace
@@ -2495,24 +2621,24 @@ fn stageAppendedTransactionWrite(
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
 }
 
-fn transactionTargetExistsAt(
+fn transactionTargetSizeAt(
     dir: *std.Io.Dir,
     base: []const u8,
     max_bytes: usize,
-) !bool {
+) !?usize {
     const stat = dir.statFile(
         Io.io(),
         base,
         .{ .follow_symlinks = false },
     ) catch |err| switch (err) {
-        error.FileNotFound => return false,
+        error.FileNotFound => return null,
         else => return err,
     };
     if (stat.kind == .sym_link) return error.SymlinkComponent;
     if (stat.kind != .file) return error.NotFile;
     if (stat.nlink > 1) return error.HardlinkTarget;
     if (stat.size > max_bytes) return error.FileTooBig;
-    return true;
+    return std.math.cast(usize, stat.size) orelse error.FileTooBig;
 }
 
 const transaction_stage_prefix = ".ledger-dtx-stage-";
@@ -2609,7 +2735,7 @@ fn publishVerifiedStagedFile(
     expected_digest: []const u8,
     max_bytes: usize,
     target: *TransactionTarget,
-) !void {
+) !usize {
     const entry = try staged_dir.statFile(
         Io.io(),
         staged_ref,
@@ -2673,6 +2799,7 @@ fn publishVerifiedStagedFile(
     }
     try destination.file.sync(Io.io());
     try destination.replace(Io.io());
+    return observed;
 }
 
 fn publishVerifiedRecoveryStagedFile(
@@ -2694,14 +2821,17 @@ fn publishVerifiedRecoveryStagedFile(
     {
         return error.TransactionRecoveryWorkExceeded;
     }
-    try publishVerifiedStagedFile(
+    const observed = publishVerifiedStagedFile(
         staged_dir,
         staged_ref,
         expected_digest,
         @min(transaction_recovery_max_bytes, hash_bytes_remaining.*),
         target,
-    );
-    hash_bytes_remaining.* -= size;
+    ) catch |err| switch (err) {
+        error.FileTooBig => return error.TransactionRecoveryWorkExceeded,
+        else => return err,
+    };
+    hash_bytes_remaining.* -= observed;
 }
 
 fn publishStagedTransactionWrite(
@@ -3052,10 +3182,30 @@ fn recoverTransactionWithOptionsAccumulating(
         fileExists(commit_marker_path);
     var hash_bytes_remaining = transaction_recovery_hash_max_bytes;
     if (legacy_terminal) {
-        try ensureLegacyTerminalLeasesQuiescent(
+        try prepareLegacyTerminalLeases(
             allocator,
             parsed.expected,
+            parsed.owner,
+            legacy_fencing_counter_path,
+            storage_mutated,
         );
+        var terminal_leases = try acquireLegacyTransactionRecoveryLeases(
+            allocator,
+            parsed.expected,
+            parsed.owner,
+            legacy_fencing_counter_path,
+            storage_mutated,
+        );
+        var terminal_leases_pending = true;
+        defer if (terminal_leases_pending) {
+            releaseLegacyTransactionRecoveryLeases(
+                allocator,
+                &terminal_leases,
+                storage_mutated,
+            ) catch |release_error| switch (release_error) {
+                else => {},
+            };
+        };
         var terminal_locks = try acquireTransactionRecoveryLocks(
             allocator,
             parsed.expected,
@@ -3083,6 +3233,12 @@ fn recoverTransactionWithOptionsAccumulating(
         terminal_locks_pending = false;
         try terminal_locks.releaseDurable(
             allocator,
+            storage_mutated,
+        );
+        terminal_leases_pending = false;
+        try releaseLegacyTransactionRecoveryLeases(
+            allocator,
+            &terminal_leases,
             storage_mutated,
         );
         return makeRecoveryReceipt(
@@ -3889,9 +4045,12 @@ fn acquireLegacyTransactionRecoveryLeases(
     return leases;
 }
 
-fn ensureLegacyTerminalLeasesQuiescent(
+fn prepareLegacyTerminalLeases(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
+    owner: Owner,
+    fencing_counter_path: ?[]const u8,
+    storage_mutated: *bool,
 ) !void {
     for (expected) |row| {
         const lock_path = try lockPathAlloc(allocator, row.path);
@@ -3909,7 +4068,23 @@ fn ensureLegacyTerminalLeasesQuiescent(
         }
         const expires_ms = try parseU64Text(current.expires_at);
         if (clockMillis(.real) < expires_ms) return error.LockBusy;
-        return error.TransactionRecoveryRequired;
+        const receipt = try reclaimExpiredLease(
+            allocator,
+            row.path,
+            .{
+                .owner = owner,
+                .fencing_counter_path = fencing_counter_path,
+            },
+        );
+        defer {
+            allocator.free(receipt.lock_id);
+            allocator.free(receipt.resource);
+            allocator.free(receipt.result);
+        }
+        storage_mutated.* = true;
+        const parent = std.fs.path.dirname(lock_path) orelse
+            return error.InvalidPath;
+        try syncDirectoryPath(parent);
     }
 }
 
@@ -5111,14 +5286,17 @@ fn digestRecoveryFileAtAlloc(
     {
         return error.TransactionRecoveryWorkExceeded;
     }
-    const digest = try digestRegularFileNoSymlinkAtAlloc(
+    const observed = digestRegularFileNoSymlinkAtAlloc(
         allocator,
         dir,
         base,
         @min(transaction_recovery_max_bytes, hash_bytes_remaining.*),
-    );
-    hash_bytes_remaining.* -= size;
-    return digest;
+    ) catch |err| switch (err) {
+        error.FileTooBig => return error.TransactionRecoveryWorkExceeded,
+        else => return err,
+    };
+    hash_bytes_remaining.* -= observed.byte_len;
+    return observed.digest;
 }
 
 fn digestRegularFileNoSymlinkAlloc(
@@ -5714,12 +5892,30 @@ fn childNameCaseSensitivity(
     var iter = dir.iterate();
     while (try iter.next(Io.io())) |entry| {
         entries += 1;
-        if (entries > entries_max) return error.TooManyFiles;
+        if (entries > entries_max) return null;
+        const original_stat = dir.statFile(
+            Io.io(),
+            entry.name,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (original_stat.kind == .sym_link) continue;
         const variant = (try caseVariantAlloc(
             allocator,
             entry.name,
         )) orelse continue;
         defer allocator.free(variant);
+        const alias_stat = dir.statFile(
+            Io.io(),
+            variant,
+            .{ .follow_symlinks = false },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        if (alias_stat.kind == .sym_link) continue;
         const original = dir.realPathFileAlloc(
             Io.io(),
             entry.name,
@@ -9111,26 +9307,6 @@ test "committed legacy journals require syncable target parents before compactio
     try std.Io.sleep(Io.io(), .fromMilliseconds(3), .awake);
 
     try std.testing.expectError(
-        error.TransactionRecoveryRequired,
-        recoverAndCompactTransactionsWithOptions(
-            allocator,
-            transactions_dir,
-            .{
-                .legacy_fencing_authority = .{
-                    .shared = counter_path,
-                },
-            },
-        ),
-    );
-    try std.testing.expect(fileExists(transaction_dir));
-    try std.testing.expect(fileExists(expired_lease.path));
-    try releaseLease(
-        allocator,
-        &expired_lease,
-        expired_lease.fencing_token,
-    );
-
-    try std.testing.expectError(
         error.FileNotFound,
         recoverAndCompactTransactionsWithOptions(
             allocator,
@@ -9144,6 +9320,7 @@ test "committed legacy journals require syncable target parents before compactio
     );
     try std.testing.expect(fileExists(transaction_dir));
     try std.testing.expect(!fileExists(expired_lease.path));
+    expired_lease.deinit(allocator);
     try std.testing.expect(!fileExists(removed_target_parent));
     const after = try tryReadForTest(target_path);
     defer allocator.free(after);
@@ -9278,6 +9455,30 @@ test "committed legacy journals retain fail-closed lease custody until marker" {
     );
     try std.testing.expectEqual(@as(usize, 0), failed_release_leases.len);
 
+    const commit_marker_path = try transactionCommitMarkerPathAlloc(
+        allocator,
+        transaction_dir,
+    );
+    defer allocator.free(commit_marker_path);
+    try writeCommittedTransactionMarker(
+        allocator,
+        commit_marker_path,
+    );
+    var expired_terminal_lease = try acquireLeaseLock(
+        allocator,
+        target_path,
+        .{
+            .owner = owner,
+            .lease_ms = 1,
+            .fencing_counter_path = counter_path,
+        },
+    );
+    defer expired_terminal_lease.deinit(allocator);
+    try std.Io.sleep(Io.io(), .fromMilliseconds(3), .awake);
+    const counter_before_terminal = try readFencingCounter(
+        allocator,
+        counter_path,
+    );
     const summary = try recoverAndCompactTransactionsWithOptions(
         allocator,
         transactions_dir,
@@ -9289,6 +9490,11 @@ test "committed legacy journals retain fail-closed lease custody until marker" {
     );
     try std.testing.expect(summary.storage_mutated);
     try std.testing.expect(!fileExists(transaction_dir));
+    try std.testing.expect(!fileExists(expired_terminal_lease.path));
+    try std.testing.expect(
+        try readFencingCounter(allocator, counter_path) >
+            counter_before_terminal,
+    );
 }
 
 test "recovery accumulation preserves a successful prefix across later errors" {
@@ -13206,6 +13412,72 @@ test "EventStore case probe does not treat directory symlinks as folding" {
 
     try std.testing.expect(
         !std.mem.eql(u8, upper_advisory, lower_advisory),
+    );
+}
+
+test "EventStore case probe excludes child symlink destinations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    if (try directoryNamesAreCaseInsensitive(
+        std.testing.allocator,
+        root,
+    )) return;
+
+    const witness_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "Witness" },
+    );
+    defer std.testing.allocator.free(witness_path);
+    try writeTextAtomic(
+        std.testing.allocator,
+        witness_path,
+        "case-sensitive\n",
+    );
+    try tmp.dir.symLink(Io.io(), "Witness", "witness", .{});
+    try std.testing.expect(
+        !try directoryNamesAreCaseInsensitive(
+            std.testing.allocator,
+            root,
+        ),
+    );
+}
+
+test "EventStore case probe falls back after a bounded inconclusive scan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+
+    var name_buffer: [32]u8 = undefined;
+    for (0..1025) |index| {
+        const name = try std.fmt.bufPrint(
+            &name_buffer,
+            "{d}",
+            .{index},
+        );
+        var file = try tmp.dir.createFile(
+            Io.io(),
+            name,
+            .{ .exclusive = true },
+        );
+        file.close(Io.io());
+    }
+    try std.testing.expectEqual(
+        @as(?bool, null),
+        try childNameCaseSensitivity(
+            std.testing.allocator,
+            root,
+        ),
     );
 }
 
