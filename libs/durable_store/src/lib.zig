@@ -5031,6 +5031,7 @@ fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
     };
     defer file.close(Io.io());
     const portable_stat = try file.stat(Io.io());
+    if (portable_stat.kind == .sym_link) return error.SymLinkLoop;
     const location = try hostFileLocation(file);
     return .{
         .device = location.device,
