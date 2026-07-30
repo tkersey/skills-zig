@@ -4041,13 +4041,22 @@ fn transactionExpectedRowsEqual(
 fn transactionWriteRowsEqual(
     left: []const TransactionWrite,
     right: []const TransactionWrite,
+    preliminary_state: TransactionState,
+    custodied_state: TransactionState,
 ) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| {
         if (!std.mem.eql(u8, a.path, b.path) or
             !std.mem.eql(u8, a.staged_ref, b.staged_ref) or
-            !std.mem.eql(u8, a.digest_after, b.digest_after) or
             a.sequence_after != b.sequence_after)
+        {
+            return false;
+        }
+        if (std.mem.eql(u8, a.digest_after, b.digest_after)) continue;
+        if (preliminary_state != .preparing or
+            custodied_state == .preparing or
+            a.digest_after.len != 0 or
+            b.digest_after.len == 0)
         {
             return false;
         }
@@ -4079,6 +4088,10 @@ fn recoveryRecordCustodyEqual(
         preliminary.format_hint == custodied.format_hint and
         preliminary.bounded_rows == custodied.bounded_rows and
         std.mem.eql(u8, preliminary.created_at, custodied.created_at) and
+        recoveryStateTransitionAllowed(
+            preliminary.state,
+            custodied.state,
+        ) and
         transactionExpectedRowsEqual(
             preliminary.expected,
             custodied.expected,
@@ -4086,11 +4099,32 @@ fn recoveryRecordCustodyEqual(
         transactionWriteRowsEqual(
             preliminary.writes,
             custodied.writes,
+            preliminary.state,
+            custodied.state,
         ) and
         transactionLockRowsEqual(
             preliminary.embedded_locks,
             custodied.embedded_locks,
         );
+}
+
+fn recoveryStateTransitionAllowed(
+    preliminary: TransactionState,
+    custodied: TransactionState,
+) bool {
+    if (preliminary == custodied) return true;
+    return switch (preliminary) {
+        .preparing => switch (custodied) {
+            .prepared, .committing, .committed => true,
+            else => false,
+        },
+        .prepared => switch (custodied) {
+            .committing, .committed => true,
+            else => false,
+        },
+        .committing => custodied == .committed,
+        .committed, .aborted, .recovery_required => false,
+    };
 }
 
 fn parseCustodiedRecoveryRecord(
@@ -4259,6 +4293,21 @@ fn recoverTransactionWithOptionsAccumulatingLocked(
         defer if (terminal_locks_pending) {
             terminal_locks.deinit(allocator);
         };
+        const terminal_custodied = try parseCustodiedRecoveryRecord(
+            allocator,
+            control_root,
+            transaction_dir,
+            record_path,
+            parsed,
+            format,
+        );
+        parsed.deinit(allocator);
+        parsed = terminal_custodied;
+        if (parsed.state != .committed or
+            !fileExists(commit_marker_path))
+        {
+            return error.TransactionRecoveryRequired;
+        }
         const published = (try transactionPublishedCount(
             allocator,
             control_root,
@@ -4935,6 +4984,8 @@ const HostObjectIdentity = struct {
     device: u64,
     inode: std.Io.File.INode,
     kind: std.Io.File.Kind,
+    mtime_ns: i96,
+    ctime_ns: i96,
 };
 
 fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
@@ -4960,6 +5011,8 @@ fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
         .device = try hostFileDevice(file),
         .inode = portable_stat.inode,
         .kind = portable_stat.kind,
+        .mtime_ns = portable_stat.mtime.nanoseconds,
+        .ctime_ns = portable_stat.ctime.nanoseconds,
     };
 }
 
@@ -6020,27 +6073,63 @@ const TransactionRecoveryLocks = struct {
 const CompatibilityReleaseEntry = struct {
     lock: *LockFile,
     parent: []const u8,
-    removed: bool = false,
 };
 
 fn deleteCompatibilityLockObserved(
-    path: []const u8,
+    parent_dir: *std.Io.Dir,
+    basename: []const u8,
     storage_mutated: *bool,
 ) !bool {
     var removed = true;
-    if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.deleteFileAbsolute(Io.io(), path) catch |err| switch (err) {
-            error.FileNotFound => removed = false,
-            else => return err,
-        };
-    } else {
-        std.Io.Dir.cwd().deleteFile(Io.io(), path) catch |err| switch (err) {
-            error.FileNotFound => removed = false,
-            else => return err,
-        };
-    }
+    parent_dir.deleteFile(Io.io(), basename) catch |err| switch (err) {
+        error.FileNotFound => removed = false,
+        else => return err,
+    };
     if (removed) storage_mutated.* = true;
     return removed;
+}
+
+fn openCompatibilityLockParent(parent: []const u8) !std.Io.Dir {
+    return if (std.fs.path.isAbsolute(parent))
+        std.Io.Dir.openDirAbsolute(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        )
+    else
+        std.Io.Dir.cwd().openDir(
+            Io.io(),
+            parent,
+            .{ .follow_symlinks = false },
+        );
+}
+
+fn releaseCompatibilityLockGroup(
+    entries: []CompatibilityReleaseEntry,
+    storage_mutated: *bool,
+) !void {
+    std.debug.assert(entries.len != 0);
+    var parent_dir = try openCompatibilityLockParent(entries[0].parent);
+    defer parent_dir.close(Io.io());
+    var first_error: ?anyerror = null;
+    var removed = false;
+    for (entries) |entry| {
+        const deleted = deleteCompatibilityLockObserved(
+            &parent_dir,
+            std.fs.path.basename(entry.lock.path),
+            storage_mutated,
+        ) catch |err| failed: {
+            if (first_error == null) first_error = err;
+            break :failed false;
+        };
+        removed = removed or deleted;
+    }
+    if (removed) {
+        syncDirectoryHandle(&parent_dir) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    }
+    if (first_error) |err| return err;
 }
 
 fn releaseCompatibilityLocksDurable(
@@ -6078,30 +6167,21 @@ fn releaseCompatibilityLocksDurable(
         }.lessThan,
     );
     var first_error: ?anyerror = null;
-    for (entries) |*entry| {
-        entry.removed = deleteCompatibilityLockObserved(
-            entry.lock.path,
-            storage_mutated,
-        ) catch |err| failed: {
-            if (first_error == null) first_error = err;
-            break :failed false;
-        };
-    }
     var index: usize = 0;
     while (index < entries.len) {
         const parent = entries[index].parent;
-        var removed = false;
+        const start = index;
         while (index < entries.len and
             std.mem.eql(u8, entries[index].parent, parent))
         {
-            removed = removed or entries[index].removed;
             index += 1;
         }
-        if (removed) {
-            syncDirectoryPath(parent) catch |err| {
-                if (first_error == null) first_error = err;
-            };
-        }
+        releaseCompatibilityLockGroup(
+            entries[start..index],
+            storage_mutated,
+        ) catch |err| {
+            if (first_error == null) first_error = err;
+        };
     }
     for (locks) |*lock| {
         allocator.free(lock.path);
@@ -7498,6 +7578,8 @@ const DirectoryCaseCache = struct {
     const Entry = struct {
         device: u64,
         inode: std.Io.File.INode,
+        mtime_ns: i96,
+        ctime_ns: i96,
         case_insensitive: bool,
     };
 
@@ -7511,7 +7593,9 @@ const DirectoryCaseCache = struct {
     ) ?bool {
         for (self.entries[0..self.count]) |entry| {
             if (entry.device == identity.device and
-                entry.inode == identity.inode)
+                entry.inode == identity.inode and
+                entry.mtime_ns == identity.mtime_ns and
+                entry.ctime_ns == identity.ctime_ns)
             {
                 return entry.case_insensitive;
             }
@@ -7535,6 +7619,8 @@ const DirectoryCaseCache = struct {
         self.entries[index] = .{
             .device = identity.device,
             .inode = identity.inode,
+            .mtime_ns = identity.mtime_ns,
+            .ctime_ns = identity.ctime_ns,
             .case_insensitive = case_insensitive,
         };
     }
@@ -7548,6 +7634,8 @@ test "directory case cache is bounded and identity keyed" {
         .device = 1,
         .inode = 2,
         .kind = .directory,
+        .mtime_ns = 3,
+        .ctime_ns = 4,
     };
     try std.testing.expect(cache.get(first) == null);
     cache.put(first, true);
@@ -7556,18 +7644,38 @@ test "directory case cache is bounded and identity keyed" {
         .device = 2,
         .inode = 2,
         .kind = .directory,
+        .mtime_ns = 3,
+        .ctime_ns = 4,
     }) == null);
+    var changed = first;
+    changed.ctime_ns += 1;
+    try std.testing.expect(cache.get(changed) == null);
     for (0..directory_case_cache_entries_max + 1) |index| {
         cache.put(.{
             .device = 3,
             .inode = @intCast(index),
             .kind = .directory,
+            .mtime_ns = 5,
+            .ctime_ns = 6,
         }, false);
     }
     try std.testing.expectEqual(
         directory_case_cache_entries_max,
         cache.count,
     );
+}
+
+test "empty directory case observations remain provisional" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const observation = try detectDirectoryCaseInsensitivity(
+        allocator,
+        root,
+    );
+    try std.testing.expect(!observation.direct);
 }
 
 fn directoryNamesAreCaseInsensitive(
@@ -7581,28 +7689,47 @@ fn directoryNamesAreCaseInsensitive(
         if (value.kind != .directory) return error.NotDir;
         if (directory_case_cache.get(value)) |cached| return cached;
     }
-    const case_insensitive = try detectDirectoryCaseInsensitivity(
+    const observation = try detectDirectoryCaseInsensitivity(
         allocator,
         canonical,
     );
     if (identity) |value| {
-        directory_case_cache.put(value, case_insensitive);
+        if (observation.direct) {
+            directory_case_cache.put(
+                value,
+                observation.case_insensitive,
+            );
+        }
     }
-    return case_insensitive;
+    return observation.case_insensitive;
 }
+
+const DirectoryCaseObservation = struct {
+    case_insensitive: bool,
+    direct: bool,
+};
 
 fn detectDirectoryCaseInsensitivity(
     allocator: std.mem.Allocator,
     directory: []const u8,
-) !bool {
+) !DirectoryCaseObservation {
     var canonical = try allocator.dupeZ(u8, directory);
     defer allocator.free(canonical);
     if (try childNameCaseSensitivity(allocator, canonical)) |value| {
-        return value;
+        return .{
+            .case_insensitive = value,
+            .direct = true,
+        };
     }
     while (true) { // tiger: event-loop -- bounded by path ancestors.
-        const parent = std.fs.path.dirname(canonical) orelse return false;
-        if (std.mem.eql(u8, parent, canonical)) return false;
+        const parent = std.fs.path.dirname(canonical) orelse return .{
+            .case_insensitive = false,
+            .direct = false,
+        };
+        if (std.mem.eql(u8, parent, canonical)) return .{
+            .case_insensitive = false,
+            .direct = false,
+        };
         const variant = (try caseVariantAlloc(
             allocator,
             std.fs.path.basename(canonical),
@@ -7620,20 +7747,32 @@ fn detectDirectoryCaseInsensitivity(
             alias,
             .{ .follow_symlinks = false },
         ) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => return .{
+                .case_insensitive = false,
+                .direct = false,
+            },
             else => return err,
         };
-        if (alias_stat.kind != .directory) return false;
+        if (alias_stat.kind != .directory) return .{
+            .case_insensitive = false,
+            .direct = false,
+        };
         const alias_real = std.Io.Dir.cwd().realPathFileAlloc(
             Io.io(),
             alias,
             allocator,
         ) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound => return .{
+                .case_insensitive = false,
+                .direct = false,
+            },
             else => return err,
         };
         defer allocator.free(alias_real);
-        return std.mem.eql(u8, canonical, alias_real);
+        return .{
+            .case_insensitive = std.mem.eql(u8, canonical, alias_real),
+            .direct = false,
+        };
     }
 }
 
@@ -13621,6 +13760,49 @@ test "current journals enforce the new row bound without rejecting legacy input"
         transaction_recovery_max_rows + 1,
         transaction_recovery_max_rows + 1,
         transaction_recovery_max_rows + 1,
+    );
+}
+
+test "recovery custody accepts digest completion and rejects state regression" {
+    var preliminary_writes = [_]TransactionWrite{.{
+        .path = "/tmp/target",
+        .staged_ref = ".txn-dtx-1-00.stage",
+        .digest_after = "",
+        .sequence_after = 1,
+    }};
+    var custodied_writes = [_]TransactionWrite{.{
+        .path = "/tmp/target",
+        .staged_ref = ".txn-dtx-1-00.stage",
+        .digest_after = "sha256:after",
+        .sequence_after = 1,
+    }};
+    const preliminary: ParsedTransactionRecord = .{
+        .transaction_id = "dtx-1",
+        .owner = .{
+            .process_id = 1,
+            .session_id = "custody",
+            .executor = "test",
+        },
+        .state = .preparing,
+        .expected = &.{},
+        .writes = &preliminary_writes,
+        .created_at = "1",
+        .updated_at = "2",
+    };
+    var custodied = preliminary;
+    custodied.state = .prepared;
+    custodied.writes = &custodied_writes;
+    try std.testing.expect(
+        recoveryRecordCustodyEqual(preliminary, custodied),
+    );
+    var regressed = custodied;
+    regressed.state = .preparing;
+    try std.testing.expect(
+        !recoveryRecordCustodyEqual(custodied, regressed),
+    );
+    regressed.state = .aborted;
+    try std.testing.expect(
+        !recoveryRecordCustodyEqual(custodied, regressed),
     );
 }
 
