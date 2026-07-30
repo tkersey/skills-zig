@@ -235,6 +235,7 @@ const TransactionPaths = struct {
     definitions: []u8,
     revisions: []u8,
     created_control_paths: bool,
+    recovery_mutated_storage: bool,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -256,6 +257,7 @@ const TransactionPaths = struct {
             .definitions = undefined,
             .revisions = undefined,
             .created_control_paths = false,
+            .recovery_mutated_storage = false,
         };
         errdefer allocator.free(paths.transactions);
         var initialized = paths;
@@ -280,7 +282,10 @@ const TransactionPaths = struct {
             !directoryExists(initialized.bindings) or
             !directoryExists(initialized.definitions) or
             (require_revisions and !directoryExists(initialized.revisions));
-        try initialized.ensure(allocator, require_revisions);
+        initialized.recovery_mutated_storage = try initialized.ensure(
+            allocator,
+            require_revisions,
+        );
         return initialized;
     }
 
@@ -288,7 +293,7 @@ const TransactionPaths = struct {
         self: TransactionPaths,
         allocator: std.mem.Allocator,
         require_revisions: bool,
-    ) !void {
+    ) !bool {
         try durable_store.ensureDirectoryPathNoSymlinks(self.ledger_root);
         try durable_store.ensureDirectoryPathNoSymlinks(self.transactions);
         try durable_store.ensureDirectoryPathNoSymlinks(self.bindings);
@@ -301,15 +306,20 @@ const TransactionPaths = struct {
             &.{ self.ledger_root, ".fencing.counter" },
         );
         defer allocator.free(counter_path);
-        try durable_store.recoverAndCompactTransactionsWithOptions(
+        const recovery = try durable_store.recoverAndCompactTransactionsWithOptions(
             allocator,
             self.transactions,
-            .{ .legacy_fencing_counter_path = counter_path },
+            .{
+                .legacy_fencing_authority = .{
+                    .shared = counter_path,
+                },
+            },
         );
         try durable_store.ensureNoPendingTransactions(
             allocator,
             self.transactions,
         );
+        return recovery.storage_mutated;
     }
 
     fn deinit(
@@ -382,7 +392,8 @@ fn transactValidated(
         operationNeedsRevisionArchive(operation),
     );
     defer paths.deinit(allocator);
-    last_mutation_state = paths.created_control_paths;
+    last_mutation_state = paths.created_control_paths or
+        paths.recovery_mutated_storage;
     var archive = try definition_archive.prepare(
         allocator,
         repo_root,
@@ -428,6 +439,7 @@ fn transactValidated(
         prepared,
         transaction_id,
         duplicate_count != 0,
+        paths.recovery_mutated_storage,
     );
 }
 
@@ -530,6 +542,7 @@ fn finishTransactionResult(
     prepared: []const PreparedEffect,
     transaction_id: ?[]u8,
     idempotent: bool,
+    recovery_mutated_storage: bool,
 ) !Result {
     const receipts = try buildReceipts(
         allocator,
@@ -561,7 +574,7 @@ fn finishTransactionResult(
         .effects = receipts,
         .returned_content = returned_content,
         .generated_outputs = generated_outputs,
-        .storage_mutated = !idempotent,
+        .storage_mutated = recovery_mutated_storage or !idempotent,
     };
 }
 
@@ -619,7 +632,8 @@ fn bindExisting(
         false,
     );
     defer paths.deinit(allocator);
-    last_mutation_state = paths.created_control_paths;
+    last_mutation_state = paths.created_control_paths or
+        paths.recovery_mutated_storage;
     var archive = try definition_archive.prepare(
         allocator,
         repo_root,
@@ -3728,6 +3742,18 @@ fn expectBasicEventBytesAndDuplicate(
         "{\"kind\":\"one\",\"value\":1}\n{\"kind\":\"two\",\"value\":2}\n",
         events,
     );
+    const commit_marker_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{
+            plans.repo_root,
+            ".ledger",
+            ".transactions",
+            results.second.transaction_id.?,
+            "commit.json",
+        },
+    );
+    defer std.testing.allocator.free(commit_marker_path);
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, commit_marker_path);
     var duplicate = try plans.execute(
         null,
         "append",
@@ -3735,8 +3761,8 @@ fn expectBasicEventBytesAndDuplicate(
         second_parameters,
     );
     defer duplicate.deinit(std.testing.allocator);
-    try std.testing.expect(!duplicate.storage_mutated);
-    try std.testing.expect(!lastMutationState().?);
+    try std.testing.expect(duplicate.storage_mutated);
+    try std.testing.expect(lastMutationState().?);
     try std.testing.expectEqualStrings(
         "idempotent",
         duplicate.effects[0].result,
