@@ -7854,13 +7854,17 @@ fn directoryCaseSensitivityAttempt(
         if (value == .direct) return value.direct;
     }
 
-    var direct = try hostDirectoryCaseSensitivity(canonical);
+    var direct = try targetNameCaseSensitivity(
+        allocator,
+        canonical,
+        witness_name,
+    );
+    var host_error: ?anyerror = null;
     if (direct == null) {
-        direct = try targetNameCaseSensitivity(
-            allocator,
-            canonical,
-            witness_name,
-        );
+        direct = hostDirectoryCaseSensitivity(canonical) catch |err| value: {
+            host_error = err;
+            break :value null;
+        };
         if (direct == null) {
             if (cached == null or cached.? != .scan_inconclusive) {
                 direct = try childNameCaseSensitivity(
@@ -7871,6 +7875,7 @@ fn directoryCaseSensitivityAttempt(
         }
     }
     if (direct == null) {
+        if (host_error) |err| return err;
         const before = identity orelse
             return error.TransactionRecoveryRequired;
         if (try directoryCrossesDeviceBoundary(canonical, before)) {
@@ -7954,10 +7959,8 @@ fn linuxDirectoryCaseSensitivity(
             @intFromPtr(&flags),
         );
         switch (linux.errno(result)) {
-            .SUCCESS => return if ((flags & fs_casefold_fl) != 0)
-                true
-            else
-                null,
+            // FS_CASEFOLD_FL reports the directory's lookup semantics.
+            .SUCCESS => return (flags & fs_casefold_fl) != 0,
             .INTR => continue,
             .INVAL, .NOTTY, .OPNOTSUPP, .NOSYS => return null,
             else => return error.TransactionRecoveryRequired,
@@ -16651,6 +16654,46 @@ test "EventStore prospective case identity follows the host filesystem" {
     try std.testing.expectError(
         error.EventStoreBusy,
         alias.eventStore().snapshot(std.testing.allocator, 4096),
+    );
+}
+
+test "Linux case probes preserve known-target search access" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    directory_case_cache = .{};
+    defer directory_case_cache = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(Io.io(), "search-only", .default_dir);
+    var parent = try tmp.dir.openDir(Io.io(), "search-only", .{
+        .iterate = true,
+    });
+    defer parent.close(Io.io());
+    var witness = try parent.createFile(
+        Io.io(),
+        "Events.jsonl",
+        .{ .exclusive = true },
+    );
+    witness.close(Io.io());
+    const root = try parent.realPathFileAlloc(
+        Io.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    const writable = std.Io.File.Permissions.fromMode(0o700);
+    const search_only = std.Io.File.Permissions.fromMode(0o300);
+    try parent.setPermissions(Io.io(), search_only);
+    defer parent.setPermissions(Io.io(), writable) catch |err| {
+        std.debug.panic("restore test directory permissions: {s}", .{
+            @errorName(err),
+        });
+    };
+    try std.testing.expect(
+        !try directoryNameIsCaseInsensitive(
+            std.testing.allocator,
+            root,
+            "Events.jsonl",
+        ),
     );
 }
 
