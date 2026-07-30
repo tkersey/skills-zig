@@ -1387,7 +1387,9 @@ fn acquireLeaseLockObserved(
                     Io.io(),
                     .fromMilliseconds(@intCast(sleep_ms)),
                     .awake,
-                ) catch {};
+                ) catch |sleep_error| switch (sleep_error) {
+                    else => {},
+                };
                 continue;
             },
             else => return err,
