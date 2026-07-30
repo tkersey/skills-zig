@@ -2022,6 +2022,9 @@ pub fn commitTextTransaction(
     options: AcquireOptions,
 ) !CommitTransactionReceipt {
     if (mutations.len == 0) return error.InvalidPath;
+    if (mutations.len > transaction_recovery_max_rows) {
+        return error.TooManyFiles;
+    }
     for (mutations) |mutation| {
         try rejectCasControlTargetPath(mutation.path);
     }
@@ -3009,6 +3012,7 @@ fn recoverTransactionWithOptionsAccumulating(
     var recovery_locks = try acquireTransactionRecoveryLocks(
         allocator,
         parsed.expected,
+        storage_mutated,
     );
     defer recovery_locks.deinit(allocator);
     const status = try inspectTransaction(allocator, transaction_dir);
@@ -3246,6 +3250,39 @@ fn validateLegacyFencingAuthorityScope(
             );
         },
     }
+    try validateLegacyFencingTokenFloor(allocator, parsed, authority);
+}
+
+fn validateLegacyFencingTokenFloor(
+    allocator: std.mem.Allocator,
+    parsed: ParsedTransactionRecord,
+    authority: LegacyFencingAuthority,
+) !void {
+    if (parsed.embedded_locks.len == 0) return;
+    switch (authority) {
+        .shared => |counter_path| {
+            const counter = try readFencingCounter(allocator, counter_path);
+            for (parsed.embedded_locks) |lock| {
+                if (counter < lock.fencing_token) {
+                    return error.TransactionRecoveryRequired;
+                }
+            }
+        },
+        .per_resource => for (parsed.embedded_locks) |lock| {
+            const lock_path = try lockPathAlloc(allocator, lock.resource);
+            defer allocator.free(lock_path);
+            const counter_path = try fencingCounterPathAlloc(
+                allocator,
+                lock_path,
+                null,
+            );
+            defer allocator.free(counter_path);
+            const counter = try readFencingCounter(allocator, counter_path);
+            if (counter < lock.fencing_token) {
+                return error.TransactionRecoveryRequired;
+            }
+        },
+    }
 }
 
 fn validateFencingAuthorityPath(
@@ -3271,12 +3308,20 @@ fn validateFencingAuthorityPath(
             authority_path,
         )) return error.TransactionCorrupt;
         for (parsed.expected) |row| {
-            if (pathsAliasOrOverlap(row.path, authority_path)) {
+            if (try canonicalPathsAliasOrOverlapOnHost(
+                allocator,
+                row.path,
+                authority_path,
+            )) {
                 return error.TransactionCorrupt;
             }
         }
         for (parsed.writes) |row| {
-            if (pathsAliasOrOverlap(row.path, authority_path)) {
+            if (try canonicalPathsAliasOrOverlapOnHost(
+                allocator,
+                row.path,
+                authority_path,
+            )) {
                 return error.TransactionCorrupt;
             }
         }
@@ -3546,7 +3591,12 @@ fn validateTransactionRecordScope(
             row.path,
         )) return error.TransactionCorrupt;
         for (parsed.expected[row_index + 1 ..]) |sibling| {
-            if (pathsAliasOrOverlap(row.path, sibling.path)) {
+            if (try transactionPathsAliasOrOverlap(
+                allocator,
+                format,
+                row.path,
+                sibling.path,
+            )) {
                 return error.TransactionCorrupt;
             }
         }
@@ -3563,7 +3613,12 @@ fn validateTransactionRecordScope(
             row.path,
         );
         for (parsed.writes[write_index + 1 ..]) |sibling| {
-            if (pathsAliasOrOverlap(row.path, sibling.path)) {
+            if (try transactionPathsAliasOrOverlap(
+                allocator,
+                format,
+                row.path,
+                sibling.path,
+            )) {
                 return error.TransactionCorrupt;
             }
         }
@@ -3744,6 +3799,7 @@ const TransactionRecoveryLocks = struct {
 fn acquireTransactionRecoveryLocks(
     allocator: std.mem.Allocator,
     expected: []const TransactionExpected,
+    storage_mutated: *bool,
 ) !TransactionRecoveryLocks {
     const advisory = try allocator.alloc(std.Io.File, expected.len);
     const compatibility = allocator.alloc(
@@ -3784,6 +3840,7 @@ fn acquireTransactionRecoveryLocks(
             } else {
                 try std.Io.Dir.cwd().deleteFile(Io.io(), cas_path);
             }
+            storage_mutated.* = true;
         }
         result.compatibility[result.compatibility_count] =
             try acquireExclusiveLockPath(allocator, cas_path);
@@ -4046,6 +4103,93 @@ fn pathsAliasOrOverlap(left: []const u8, right: []const u8) bool {
     return longer.len > shorter.len and
         std.ascii.startsWithIgnoreCase(longer, shorter) and
         longer[shorter.len] == std.fs.path.sep;
+}
+
+fn transactionPathsAliasOrOverlap(
+    allocator: std.mem.Allocator,
+    format: TransactionRecordFormat,
+    left: []const u8,
+    right: []const u8,
+) !bool {
+    if (!pathsAliasOrOverlap(left, right)) return false;
+    if (format == .current or pathsAliasOrOverlapCaseSensitive(left, right)) {
+        return true;
+    }
+    const shorter = if (left.len < right.len) left else right;
+    const parent = std.fs.path.dirname(shorter) orelse
+        return error.InvalidPath;
+    return directoryNamesAreCaseInsensitive(allocator, parent);
+}
+
+fn pathsAliasOrOverlapCaseSensitive(
+    left: []const u8,
+    right: []const u8,
+) bool {
+    if (std.mem.eql(u8, left, right)) return true;
+    const shorter = if (left.len < right.len) left else right;
+    const longer = if (left.len < right.len) right else left;
+    return longer.len > shorter.len and
+        std.mem.startsWith(u8, longer, shorter) and
+        longer[shorter.len] == std.fs.path.sep;
+}
+
+fn canonicalProspectivePathAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) ![]u8 {
+    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    defer allocator.free(resolved);
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(
+        Io.io(),
+        resolved,
+        allocator,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (canonical) |existing| {
+        defer allocator.free(existing);
+        return allocator.dupe(u8, existing);
+    }
+    const parent = std.fs.path.dirname(resolved) orelse
+        return error.InvalidPath;
+    const canonical_parent =
+        std.Io.Dir.cwd().realPathFileAlloc(
+            Io.io(),
+            parent,
+            allocator,
+        ) catch |parent_err| switch (parent_err) {
+            error.FileNotFound => return allocator.dupe(u8, resolved),
+            else => return parent_err,
+        };
+    defer allocator.free(canonical_parent);
+    return std.fs.path.join(
+        allocator,
+        &.{ canonical_parent, std.fs.path.basename(resolved) },
+    );
+}
+
+fn canonicalPathsAliasOrOverlapOnHost(
+    allocator: std.mem.Allocator,
+    left: []const u8,
+    right: []const u8,
+) !bool {
+    const canonical_left = try canonicalProspectivePathAlloc(
+        allocator,
+        left,
+    );
+    defer allocator.free(canonical_left);
+    const canonical_right = try canonicalProspectivePathAlloc(
+        allocator,
+        right,
+    );
+    defer allocator.free(canonical_right);
+    return transactionPathsAliasOrOverlap(
+        allocator,
+        .legacy,
+        canonical_left,
+        canonical_right,
+    );
 }
 
 fn rejectTransactionPath(path: []const u8, reject_symlinks: bool) !void {
@@ -6911,6 +7055,52 @@ test "transactions reject targets inside their journal namespace" {
     );
 }
 
+test "transactions reject journals larger than recovery can represent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const target = try std.fs.path.join(
+        allocator,
+        &.{ root, "payload.json" },
+    );
+    defer allocator.free(target);
+    const mutations = try allocator.alloc(
+        TransactionMutation,
+        transaction_recovery_max_rows + 1,
+    );
+    defer allocator.free(mutations);
+    for (mutations) |*mutation| {
+        mutation.* = .{
+            .path = target,
+            .text = "{}\n",
+            .content_mode = .raw,
+        };
+    }
+    try std.testing.expectError(
+        error.TooManyFiles,
+        commitTextTransaction(
+            allocator,
+            transactions_dir,
+            mutations,
+            .{
+                .owner = .{
+                    .process_id = 1,
+                    .session_id = "recovery-row-bound",
+                    .executor = "test",
+                },
+            },
+        ),
+    );
+    try std.testing.expect(!fileExists(transactions_dir));
+}
+
 const CasWorkerContext = struct {
     path: []const u8,
     result: ?anyerror = null,
@@ -8305,6 +8495,70 @@ test "recovery reports target publication before a later stage cleanup error" {
     try std.testing.expectEqualStrings(after, published);
 }
 
+test "recovery reports stale compatibility lock cleanup before later errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transactions_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions" },
+    );
+    defer allocator.free(transactions_dir);
+    const transaction_id = "dtx-1-00000000000000000000000000000016";
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ transactions_dir, transaction_id },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(
+        allocator,
+        &.{ transaction_dir, "transaction.json" },
+    );
+    defer allocator.free(record_path);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "events.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const before = "{\"seq\":1}\n";
+    const after = "{\"seq\":2}\n";
+    try writeTextAtomic(allocator, target_path, before);
+    try writePreparedRecordForTest(
+        allocator,
+        record_path,
+        transaction_id,
+        .{
+            .process_id = 923,
+            .session_id = "stale-compatibility-lock",
+            .executor = "test",
+        },
+        target_path,
+        before,
+        after,
+    );
+    try writeTextAtomic(allocator, target_path, "{\"seq\":3}\n");
+    const cas_path = try casLockPathAlloc(allocator, target_path);
+    defer allocator.free(cas_path);
+    try writeTextCreateNew(allocator, cas_path, "stale\n", .{});
+
+    var summary: TransactionRecoverySummary = .{};
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        recoverAndCompactTransactionsAccumulating(
+            allocator,
+            transactions_dir,
+            .{},
+            &summary,
+        ),
+    );
+    try std.testing.expect(summary.storage_mutated);
+    try std.testing.expect(!fileExists(cas_path));
+    try std.testing.expect(fileExists(transaction_dir));
+}
+
 test "prepared legacy journals recover under legacy stage names" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9480,6 +9734,175 @@ test "legacy journals bind embedded lock witnesses to expected targets" {
             .legacy,
         ),
     );
+}
+
+test "legacy journal path identity follows the host filesystem" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    if (try directoryNamesAreCaseInsensitive(allocator, root)) {
+        return error.SkipZigTest;
+    }
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-30" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const upper_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "A.jsonl" },
+    );
+    defer allocator.free(upper_path);
+    const lower_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "a.jsonl" },
+    );
+    defer allocator.free(lower_path);
+    var expected = [_]TransactionExpected{
+        .{ .path = upper_path, .digest = "", .sequence = 0 },
+        .{ .path = lower_path, .digest = "", .sequence = 0 },
+    };
+    try validateTransactionRecordScope(
+        allocator,
+        root,
+        transaction_dir,
+        .{
+            .transaction_id = "dtx-30",
+            .owner = .{
+                .process_id = 930,
+                .session_id = "host-path-identity",
+                .executor = "test",
+            },
+            .state = .prepared,
+            .expected = &expected,
+            .writes = &.{},
+            .created_at = "1",
+            .updated_at = "2",
+        },
+        .legacy,
+    );
+}
+
+test "legacy fencing authority rejects canonical target aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-31" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const nested = try std.fs.path.join(allocator, &.{ root, "nested" });
+    defer allocator.free(nested);
+    try ensureDirectoryPathNoSymlinks(nested);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "target.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const counter_alias = try std.fs.path.join(
+        allocator,
+        &.{ nested, "..", "target.jsonl" },
+    );
+    defer allocator.free(counter_alias);
+    var expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = "",
+        .sequence = 0,
+    }};
+    try std.testing.expectError(
+        error.TransactionCorrupt,
+        validateLegacyFencingAuthorityScope(
+            allocator,
+            transaction_dir,
+            .{
+                .transaction_id = "dtx-31",
+                .owner = .{
+                    .process_id = 931,
+                    .session_id = "canonical-fencing-alias",
+                    .executor = "test",
+                },
+                .state = .prepared,
+                .expected = &expected,
+                .writes = &.{},
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            .{ .shared = counter_alias },
+        ),
+    );
+    try std.testing.expect(!fileExists(target_path));
+}
+
+test "legacy fencing authority cannot regress embedded witness tokens" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", allocator);
+    defer allocator.free(root);
+    const transaction_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, "transactions", "dtx-32" },
+    );
+    defer allocator.free(transaction_dir);
+    try ensureDirectoryPathNoSymlinks(transaction_dir);
+    const target_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "target.jsonl" },
+    );
+    defer allocator.free(target_path);
+    const counter_path = try std.fs.path.join(
+        allocator,
+        &.{ root, "fencing.counter" },
+    );
+    defer allocator.free(counter_path);
+    try writeTextAtomic(allocator, counter_path, "9\n");
+    const owner: Owner = .{
+        .process_id = 932,
+        .session_id = "fencing-token-floor",
+        .executor = "test",
+    };
+    var expected = [_]TransactionExpected{.{
+        .path = target_path,
+        .digest = "",
+        .sequence = 0,
+    }};
+    var locks = [_]LeaseLock{.{
+        .lock_id = "dlk-10-1",
+        .resource = target_path,
+        .owner = owner,
+        .acquired_at = "1",
+        .expires_at = "2",
+        .fencing_token = 10,
+        .path = "unused",
+    }};
+    try std.testing.expectError(
+        error.TransactionRecoveryRequired,
+        validateLegacyFencingAuthorityScope(
+            allocator,
+            transaction_dir,
+            .{
+                .transaction_id = "dtx-32",
+                .owner = owner,
+                .state = .prepared,
+                .expected = &expected,
+                .writes = &.{},
+                .embedded_locks = &locks,
+                .created_at = "1",
+                .updated_at = "2",
+            },
+            .{ .shared = counter_path },
+        ),
+    );
+    const counter = try tryReadForTest(counter_path);
+    defer allocator.free(counter);
+    try std.testing.expectEqualStrings("9\n", counter);
 }
 
 test "transaction writes require exact expected path identity" {
