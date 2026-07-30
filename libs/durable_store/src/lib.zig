@@ -7599,7 +7599,7 @@ fn nearestExistingPathAlloc(
 }
 
 const directory_case_direct_entries_max: usize = 64;
-const directory_case_inconclusive_entries_max: usize = 16;
+const directory_case_inconclusive_entries_max: usize = 64;
 const directory_case_probe_attempts_max: usize = 3;
 
 const DirectoryCaseCache = struct {
@@ -7800,6 +7800,19 @@ test "inconclusive case scans enter a saturated cache" {
         @as(usize, 1),
         cache.inconclusive_count,
     );
+    for (0..directory_case_inconclusive_entries_max + 1) |index| {
+        cache.put(.{
+            .device = 4,
+            .inode = @intCast(index),
+            .kind = .directory,
+            .mtime_ns = 4,
+            .ctime_ns = 4,
+        }, .scan_inconclusive);
+    }
+    try std.testing.expectEqual(
+        directory_case_inconclusive_entries_max,
+        cache.inconclusive_count,
+    );
 }
 
 fn directoryNameIsCaseInsensitive(
@@ -7841,13 +7854,13 @@ fn directoryCaseSensitivityAttempt(
         if (value == .direct) return value.direct;
     }
 
-    var direct = try targetNameCaseSensitivity(
-        allocator,
-        canonical,
-        witness_name,
-    );
+    var direct = try hostDirectoryCaseSensitivity(canonical);
     if (direct == null) {
-        direct = try hostDirectoryCaseSensitivity(canonical);
+        direct = try targetNameCaseSensitivity(
+            allocator,
+            canonical,
+            witness_name,
+        );
         if (direct == null) {
             if (cached == null or cached.? != .scan_inconclusive) {
                 direct = try childNameCaseSensitivity(
@@ -7910,7 +7923,8 @@ fn hostDirectoryCaseSensitivity(
 ) !?bool {
     return switch (@import("builtin").os.tag) {
         .linux => linuxDirectoryCaseSensitivity(directory),
-        .windows => windowsDirectoryCaseSensitivity(directory),
+        // std.Io uses case-insensitive Windows object lookup.
+        .windows => true,
         else => null,
     };
 }
@@ -7919,65 +7933,36 @@ fn linuxDirectoryCaseSensitivity(
     directory: []const u8,
 ) !?bool {
     const linux = std.os.linux;
-    const fs_ioc_getflags: u32 = 0x8008_6601;
-    const fs_casefold_fl: usize = 0x4000_0000;
+    const fs_ioc_getflags = linux.IOCTL.IOR('f', 1, c_long);
+    const fs_casefold_fl: c_long = 0x4000_0000;
     var dir = if (std.fs.path.isAbsolute(directory))
         try std.Io.Dir.openDirAbsolute(Io.io(), directory, .{
+            .iterate = true,
             .follow_symlinks = false,
         })
     else
         try std.Io.Dir.cwd().openDir(Io.io(), directory, .{
+            .iterate = true,
             .follow_symlinks = false,
         });
     defer dir.close(Io.io());
     while (true) { // tiger: event-loop -- bounded by syscall completion.
-        var flags: usize = 0;
+        var flags: c_long = 0;
         const result = linux.ioctl(
             dir.handle,
             fs_ioc_getflags,
             @intFromPtr(&flags),
         );
         switch (linux.errno(result)) {
-            .SUCCESS => return (flags & fs_casefold_fl) != 0,
+            .SUCCESS => return if ((flags & fs_casefold_fl) != 0)
+                true
+            else
+                null,
             .INTR => continue,
             .INVAL, .NOTTY, .OPNOTSUPP, .NOSYS => return null,
             else => return error.TransactionRecoveryRequired,
         }
     }
-}
-
-const WindowsFileCaseSensitiveInformation = extern struct {
-    flags: u32,
-};
-
-fn windowsDirectoryCaseSensitivity(
-    directory: []const u8,
-) !?bool {
-    const windows = std.os.windows;
-    const file_cs_flag_case_sensitive_dir: u32 = 0x1;
-    var dir = if (std.fs.path.isAbsolute(directory))
-        try std.Io.Dir.openDirAbsolute(Io.io(), directory, .{
-            .follow_symlinks = false,
-        })
-    else
-        try std.Io.Dir.cwd().openDir(Io.io(), directory, .{
-            .follow_symlinks = false,
-        });
-    defer dir.close(Io.io());
-    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-    var information: WindowsFileCaseSensitiveInformation = undefined;
-    return switch (windows.ntdll.NtQueryInformationFile(
-        dir.handle,
-        &io_status_block,
-        &information,
-        @sizeOf(WindowsFileCaseSensitiveInformation),
-        .CaseSensitive,
-    )) {
-        .SUCCESS => (information.flags &
-            file_cs_flag_case_sensitive_dir) == 0,
-        .INVALID_INFO_CLASS, .INVALID_PARAMETER, .NOT_SUPPORTED => null,
-        else => error.TransactionRecoveryRequired,
-    };
 }
 
 fn detectAncestorCaseInsensitivity(
