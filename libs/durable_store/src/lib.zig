@@ -4993,6 +4993,7 @@ const HostPathIdentityContext = struct {
 
 const HostObjectIdentity = struct {
     device: u64,
+    mount_id: ?u64 = null,
     inode: std.Io.File.INode,
     kind: std.Io.File.Kind,
     mtime_ns: i96,
@@ -5004,6 +5005,7 @@ fn hostObjectIdentitiesEqual(
     right: HostObjectIdentity,
 ) bool {
     return left.device == right.device and
+        left.mount_id == right.mount_id and
         left.inode == right.inode and
         left.kind == right.kind and
         left.mtime_ns == right.mtime_ns and
@@ -5016,21 +5018,23 @@ fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
         std.Io.Dir.openFileAbsolute(Io.io(), path, .{
             .allow_directory = true,
             .follow_symlinks = false,
-            .path_only = false,
+            .path_only = @import("builtin").os.tag == .linux,
         })
     else
         std.Io.Dir.cwd().openFile(Io.io(), path, .{
             .allow_directory = true,
             .follow_symlinks = false,
-            .path_only = false,
+            .path_only = @import("builtin").os.tag == .linux,
         })) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
     defer file.close(Io.io());
     const portable_stat = try file.stat(Io.io());
+    const location = try hostFileLocation(file);
     return .{
-        .device = try hostFileDevice(file),
+        .device = location.device,
+        .mount_id = location.mount_id,
         .inode = portable_stat.inode,
         .kind = portable_stat.kind,
         .mtime_ns = portable_stat.mtime.nanoseconds,
@@ -5038,15 +5042,20 @@ fn hostObjectIdentity(path: []const u8) !?HostObjectIdentity {
     };
 }
 
-fn hostFileDevice(file: std.Io.File) !u64 {
+const HostFileLocation = struct {
+    device: u64,
+    mount_id: ?u64,
+};
+
+fn hostFileLocation(file: std.Io.File) !HostFileLocation {
     return switch (@import("builtin").os.tag) {
-        .linux => linuxFileDevice(file),
+        .linux => linuxFileLocation(file),
         .windows => unreachable,
-        else => posixFileDevice(file),
+        else => posixFileLocation(file),
     };
 }
 
-fn linuxFileDevice(file: std.Io.File) !u64 {
+fn linuxFileLocation(file: std.Io.File) !HostFileLocation {
     const linux = std.os.linux;
     while (true) { // tiger: event-loop -- bounded by syscall completion.
         var statx = std.mem.zeroes(linux.Statx);
@@ -5054,24 +5063,33 @@ fn linuxFileDevice(file: std.Io.File) !u64 {
             file.handle,
             "",
             linux.AT.EMPTY_PATH,
-            .{ .INO = true },
+            .{ .INO = true, .MNT_ID = true },
             &statx,
         );
         switch (linux.errno(result)) {
-            .SUCCESS => return (@as(u64, statx.dev_major) << 32) |
-                @as(u64, statx.dev_minor),
+            .SUCCESS => return .{
+                .device = (@as(u64, statx.dev_major) << 32) |
+                    @as(u64, statx.dev_minor),
+                .mount_id = if (statx.mask.MNT_ID)
+                    statx.mnt_id
+                else
+                    null,
+            },
             .INTR => continue,
             else => return error.TransactionRecoveryRequired,
         }
     }
 }
 
-fn posixFileDevice(file: std.Io.File) !u64 {
+fn posixFileLocation(file: std.Io.File) !HostFileLocation {
     var host_stat: std.posix.Stat = undefined;
     if (std.posix.system.fstat(file.handle, &host_stat) != 0) {
         return error.TransactionRecoveryRequired;
     }
-    return @intCast(host_stat.dev);
+    return .{
+        .device = @intCast(host_stat.dev),
+        .mount_id = null,
+    };
 }
 
 test "host object identity collapses hardlinked path aliases" {
@@ -7610,6 +7628,7 @@ const DirectoryCaseCache = struct {
 
     const Entry = struct {
         device: u64,
+        mount_id: ?u64,
         inode: std.Io.File.INode,
         mtime_ns: i96,
         ctime_ns: i96,
@@ -7640,6 +7659,7 @@ const DirectoryCaseCache = struct {
         identity: HostObjectIdentity,
     ) bool {
         return entry.device == identity.device and
+            entry.mount_id == identity.mount_id and
             entry.inode == identity.inode and
             entry.mtime_ns == identity.mtime_ns and
             entry.ctime_ns == identity.ctime_ns;
@@ -7651,6 +7671,7 @@ const DirectoryCaseCache = struct {
     ) ?usize {
         for (entries, 0..) |entry, index| {
             if (entry.device == identity.device and
+                entry.mount_id == identity.mount_id and
                 entry.inode == identity.inode) return index;
         }
         return null;
@@ -7715,6 +7736,7 @@ const DirectoryCaseCache = struct {
     ) Entry {
         return .{
             .device = identity.device,
+            .mount_id = identity.mount_id,
             .inode = identity.inode,
             .mtime_ns = identity.mtime_ns,
             .ctime_ns = identity.ctime_ns,
@@ -7729,6 +7751,7 @@ test "directory case cache is bounded and identity keyed" {
     var cache: DirectoryCaseCache = .{};
     const first: HostObjectIdentity = .{
         .device = 1,
+        .mount_id = 7,
         .inode = 2,
         .kind = .directory,
         .mtime_ns = 3,
@@ -7739,6 +7762,14 @@ test "directory case cache is bounded and identity keyed" {
     try std.testing.expect(cache.get(first).?.direct);
     try std.testing.expect(cache.get(.{
         .device = 2,
+        .inode = 2,
+        .kind = .directory,
+        .mtime_ns = 3,
+        .ctime_ns = 4,
+    }) == null);
+    try std.testing.expect(cache.get(.{
+        .device = 1,
+        .mount_id = 8,
         .inode = 2,
         .kind = .directory,
         .mtime_ns = 3,
@@ -7854,11 +7885,14 @@ fn directoryCaseSensitivityAttempt(
         if (value == .direct) return value.direct;
     }
 
-    var direct = try targetNameCaseSensitivity(
-        allocator,
-        canonical,
-        witness_name,
-    );
+    var direct: ?bool = if (@import("builtin").os.tag == .windows)
+        true
+    else
+        try targetNameCaseSensitivity(
+            allocator,
+            canonical,
+            witness_name,
+        );
     var host_error: ?anyerror = null;
     if (direct == null) {
         direct = hostDirectoryCaseSensitivity(canonical) catch |err| value: {
@@ -7875,10 +7909,13 @@ fn directoryCaseSensitivityAttempt(
         }
     }
     if (direct == null) {
-        if (host_error) |err| return err;
+        if (host_error) |err| {
+            try cacheDirectoryCaseResult(canonical, identity, null);
+            return err;
+        }
         const before = identity orelse
             return error.TransactionRecoveryRequired;
-        if (try directoryCrossesDeviceBoundary(canonical, before)) {
+        if (try directoryCrossesMountBoundary(canonical, before)) {
             return error.TransactionRecoveryRequired;
         }
     }
@@ -7911,7 +7948,7 @@ fn cacheDirectoryCaseResult(
     );
 }
 
-fn directoryCrossesDeviceBoundary(
+fn directoryCrossesMountBoundary(
     directory: []const u8,
     identity: HostObjectIdentity,
 ) !bool {
@@ -7920,7 +7957,10 @@ fn directoryCrossesDeviceBoundary(
     const parent_identity = (try hostObjectIdentity(parent)) orelse
         return error.TransactionRecoveryRequired;
     if (parent_identity.kind != .directory) return error.NotDir;
-    return parent_identity.device != identity.device;
+    if (parent_identity.device != identity.device) return true;
+    const parent_mount = parent_identity.mount_id orelse return false;
+    const directory_mount = identity.mount_id orelse return false;
+    return parent_mount != directory_mount;
 }
 
 fn hostDirectoryCaseSensitivity(
@@ -7959,8 +7999,10 @@ fn linuxDirectoryCaseSensitivity(
             @intFromPtr(&flags),
         );
         switch (linux.errno(result)) {
-            // FS_CASEFOLD_FL reports the directory's lookup semantics.
-            .SUCCESS => return (flags & fs_casefold_fl) != 0,
+            .SUCCESS => return if ((flags & fs_casefold_fl) != 0)
+                true
+            else
+                null,
             .INTR => continue,
             .INVAL, .NOTTY, .OPNOTSUPP, .NOSYS => return null,
             else => return error.TransactionRecoveryRequired,
@@ -16680,6 +16722,11 @@ test "Linux case probes preserve known-target search access" {
         std.testing.allocator,
     );
     defer std.testing.allocator.free(root);
+    const expected = (try targetNameCaseSensitivity(
+        std.testing.allocator,
+        root,
+        "Events.jsonl",
+    )) orelse return error.SkipZigTest;
     const writable = std.Io.File.Permissions.fromMode(0o700);
     const search_only = std.Io.File.Permissions.fromMode(0o300);
     try parent.setPermissions(Io.io(), search_only);
@@ -16688,8 +16735,9 @@ test "Linux case probes preserve known-target search access" {
             @errorName(err),
         });
     };
-    try std.testing.expect(
-        !try directoryNameIsCaseInsensitive(
+    try std.testing.expectEqual(
+        expected,
+        try directoryNameIsCaseInsensitive(
             std.testing.allocator,
             root,
             "Events.jsonl",
