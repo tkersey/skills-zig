@@ -775,7 +775,10 @@ pub const Client = struct {
             const remaining_ms = deadline_ms - monotonicMillis();
             if (remaining_ms <= 0) return error.ConnectionTimedOut;
             return self.websocket.?.readTextAllocTimeout(@intCast(remaining_ms)) catch |err| switch (err) {
-                error.Timeout => error.ConnectionTimedOut,
+                error.Timeout => {
+                    self.websocket.?.poison();
+                    return error.ConnectionTimedOut;
+                },
                 else => err,
             };
         }

@@ -33,6 +33,7 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     read_buf: std.ArrayList(u8) = .empty,
+    usable: bool = true,
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -65,7 +66,14 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
+        if (!self.usable) return;
+        self.usable = false;
         self.stream.close(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    pub fn poison(self: *Connection) void {
+        self.close();
+        self.read_buf.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *Connection) void {
@@ -73,14 +81,17 @@ pub const Connection = struct {
     }
 
     pub fn sendText(self: *Connection, payload: []const u8) !void {
+        if (!self.usable) return error.ConnectionPoisoned;
         try writeClientFrame(self, 0x1, payload);
     }
 
     pub fn readTextAlloc(self: *Connection) !?[]u8 {
+        if (!self.usable) return error.ConnectionPoisoned;
         return self.readTextAllocUntil(null);
     }
 
     pub fn readTextAllocTimeout(self: *Connection, timeout_ms: u32) !?[]u8 {
+        if (!self.usable) return error.ConnectionPoisoned;
         const io = std.Io.Threaded.global_single_threaded.io();
         const duration = std.Io.Clock.Duration{
             .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
@@ -495,9 +506,14 @@ test "websocket read deadline bounds a stalled live socket" {
         connection.close();
         connection.deinit();
     }
+    var server_writer = server_stream.writer(io, &.{});
+    try server_writer.interface.writeAll(&.{ 0x81, 0x05, 'h', 'e' });
+    try server_writer.interface.flush();
 
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(50));
+    connection.poison();
+    try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     try std.testing.expect(elapsed_ms < 1_000);
 }
