@@ -40,8 +40,7 @@ case "$mode" in
       done
     }
 
-    mark_ledger_consumers() {
-      mark_app cas
+    mark_ledger() {
       mark_app ledger
     }
 
@@ -71,7 +70,7 @@ case "$mode" in
         token=${app//-/_}
         if grep -Eqi "apps/$app/|${token}_(root|meta|install|tests)|build-$app|test-$app|run-$app" <<<"$raw"; then
           if [[ "$app" == ledger ]]; then
-            mark_ledger_consumers
+            mark_ledger
           else
             mark_app "$app"
           fi
@@ -110,7 +109,7 @@ case "$mode" in
         matched=0
       fi
       if grep -Eqi 'learnings?|append_learning|synesthesia|ledger_actuation|actuation|universalist|(^|[^[:alnum:]_])ledger([^[:alnum:]_]|$)|ledger[_\.]' <<<"$raw"; then
-        mark_ledger_consumers
+        mark_ledger
         matched=0
       fi
       return "$matched"
@@ -188,7 +187,7 @@ case "$mode" in
                 ;;
               "apps/$app/"*)
                 if [[ "$app" == ledger ]]; then
-                  mark_ledger_consumers
+                  mark_ledger
                 else
                   mark_app "$app"
                 fi
@@ -273,14 +272,14 @@ case "$mode" in
         raw=${line:1}
         case "$raw" in
           *'"apps/learnings/'*|*'"apps/synesthesia/'*)
-            mark_ledger_consumers
+            mark_ledger
             ;;
           *'"apps/'*)
             matched=0
             for app in "${apps[@]}"; do
               if [[ "$raw" == *"\"apps/$app/"* ]]; then
                 if [[ "$app" == ledger ]]; then
-                  mark_ledger_consumers
+                  mark_ledger
                 else
                   mark_app "$app"
                 fi

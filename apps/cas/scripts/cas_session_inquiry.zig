@@ -57,7 +57,6 @@ const UsageText =
     \\  --timeout-ms N
     \\  --max-total-tokens N
     \\  --transport auto|stdio|websocket
-    \\  --ledger-path PATH
     \\  --store-root DIR
     \\  --json
     \\  --verdict-only
@@ -159,28 +158,23 @@ const Options = struct {
     receipt_format: []const u8 = "table",
     receipt_summary: bool = false,
     codex_path: []const u8 = "codex",
-    ledger_path: ?[]const u8 = null,
     store_root: ?[]const u8 = null,
     home: []const u8 = "",
     path_env: []const u8 = "",
     capsule_bytes: ?[]const u8 = null,
     capsule_validation_bytes: ?[]const u8 = null,
-    capsule_revalidation_bytes: ?[]const u8 = null,
     plan_bytes: ?[]const u8 = null,
     plan_validation_bytes: ?[]const u8 = null,
-    plan_revalidation_bytes: ?[]const u8 = null,
 };
 
 const ValidatedInput = struct {
     input: []const u8,
     receipt: []const u8,
-    revalidation: []const u8,
     definition_digest: []const u8,
 
     fn deinit(self: *ValidatedInput, allocator: std.mem.Allocator) void {
         allocator.free(self.input);
         allocator.free(self.receipt);
-        allocator.free(self.revalidation);
         allocator.free(self.definition_digest);
         self.* = undefined;
     }
@@ -518,8 +512,6 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.receipt_format = value;
         } else if (std.mem.eql(u8, arg, "--codex-path")) {
             options.codex_path = try takeValue(argv, &i, arg);
-        } else if (std.mem.eql(u8, arg, "--ledger-path")) {
-            options.ledger_path = try takeValue(argv, &i, arg);
         } else if (std.mem.eql(u8, arg, "--store-root")) {
             const value = try takeValue(argv, &i, arg);
             if (value.len == 0) return error.InvalidStoreRoot;
@@ -629,8 +621,6 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     defer allocator.free(capsule_definition_absolute);
     var capsule_input = validateLedgerInput(
         allocator,
-        options,
-        capsule_definition_absolute,
         capsule_path,
         capsule_validation_path,
         "retrace/decision-context-packet",
@@ -659,8 +649,6 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     defer allocator.free(plan_definition_absolute);
     var plan_input = validateLedgerInput(
         allocator,
-        options,
-        plan_definition_absolute,
         plan_path,
         plan_validation_path,
         "retrace/retrace-inquiry-plan",
@@ -683,11 +671,9 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
     bound_options.capsule_definition_path = capsule_definition_absolute;
     bound_options.capsule_bytes = capsule_input.input;
     bound_options.capsule_validation_bytes = capsule_input.receipt;
-    bound_options.capsule_revalidation_bytes = capsule_input.revalidation;
     bound_options.plan_definition_path = plan_definition_absolute;
     bound_options.plan_bytes = plan_input.input;
     bound_options.plan_validation_bytes = plan_input.receipt;
-    bound_options.plan_revalidation_bytes = plan_input.revalidation;
     if (!std.mem.eql(u8, rip.plan_id, dcp.packet_id)) {
         try printFailureJson(allocator, FailureCode.plan_invalid, "RIP source_capsule does not match DCP packet_id");
         std.process.exit(2);
@@ -1254,8 +1240,6 @@ fn statusToExitCode(status: u32) u8 {
 
 fn validateLedgerInput(
     allocator: std.mem.Allocator,
-    options: Options,
-    definition_path: []const u8,
     input_path: []const u8,
     receipt_path: []const u8,
     definition_id: []const u8,
@@ -1265,156 +1249,19 @@ fn validateLedgerInput(
     errdefer allocator.free(input);
     const receipt = try readFileAlloc(allocator, receipt_path, MaxInputBytes);
     errdefer allocator.free(receipt);
-    const revalidation = try runLedgerValidation(
-        allocator,
-        options,
-        definition_path,
-        input,
-        input_name,
-    );
-    errdefer allocator.free(revalidation);
     const definition_digest = try validateLedgerReceiptBytes(
-        allocator,
-        input,
-        revalidation,
-        definition_id,
-        null,
-        input_name,
-    );
-    errdefer allocator.free(definition_digest);
-    const receipt_digest = try validateLedgerReceiptBytes(
         allocator,
         input,
         receipt,
         definition_id,
-        definition_digest,
+        null,
         input_name,
     );
-    allocator.free(receipt_digest);
     return .{
         .input = input,
         .receipt = receipt,
-        .revalidation = revalidation,
         .definition_digest = definition_digest,
     };
-}
-
-fn runLedgerValidation(
-    allocator: std.mem.Allocator,
-    options: Options,
-    definition_path: []const u8,
-    input: []const u8,
-    input_name: []const u8,
-) ![]u8 {
-    const ledger_path = try resolveLedgerExecutableAlloc(
-        allocator,
-        options,
-    );
-    defer allocator.free(ledger_path);
-    const snapshot_root = try makeLedgerSnapshotRoot(allocator);
-    defer {
-        std.Io.Dir.cwd().deleteTree(
-            std.Io.Threaded.global_single_threaded.io(),
-            snapshot_root,
-        ) catch |err| std.log.warn(
-            "could not remove Ledger validation snapshot {s}: {s}",
-            .{ snapshot_root, @errorName(err) },
-        );
-        allocator.free(snapshot_root);
-    }
-    const snapshot_path = try std.fs.path.join(
-        allocator,
-        &.{ snapshot_root, "input.json" },
-    );
-    defer allocator.free(snapshot_path);
-    try durable_store.writeTextAtomic(
-        allocator,
-        snapshot_path,
-        input,
-    );
-    const input_spec = try std.fmt.allocPrint(
-        allocator,
-        "{s}={s}",
-        .{ input_name, snapshot_path },
-    );
-    defer allocator.free(input_spec);
-    const argv = [_][]const u8{
-        ledger_path,
-        "validate",
-        "--definition",
-        definition_path,
-        "--input",
-        input_spec,
-        "--format",
-        "json",
-    };
-    const result = std.process.run(
-        allocator,
-        std.Io.Threaded.global_single_threaded.io(),
-        .{
-            .argv = &argv,
-            .stdout_limit = .limited(MaxInputBytes),
-            .stderr_limit = .limited(64 * 1024),
-        },
-    ) catch return error.LedgerRevalidationFailed;
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-    if (!(result.term == .exited and result.term.exited == 0)) {
-        return error.LedgerRevalidationFailed;
-    }
-    return result.stdout;
-}
-
-fn resolveLedgerExecutableAlloc(
-    allocator: std.mem.Allocator,
-    options: Options,
-) ![]u8 {
-    if (options.ledger_path) |explicit| {
-        return resolveExecutablePathAlloc(
-            allocator,
-            explicit,
-            options.path_env,
-        ) catch return error.LedgerUnavailable;
-    }
-    const executable_dir = std.process.executableDirPathAlloc(
-        std.Io.Threaded.global_single_threaded.io(),
-        allocator,
-    ) catch null;
-    if (executable_dir) |dir| {
-        defer allocator.free(dir);
-        const sibling = try std.fs.path.join(
-            allocator,
-            &.{ dir, "ledger" },
-        );
-        if (fileExists(sibling)) return sibling;
-        allocator.free(sibling);
-    }
-    return resolveExecutablePathAlloc(
-        allocator,
-        "ledger",
-        options.path_env,
-    ) catch return error.LedgerUnavailable;
-}
-
-fn makeLedgerSnapshotRoot(allocator: std.mem.Allocator) ![]u8 {
-    var random_bytes: [16]u8 = undefined;
-    std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
-    const suffix = std.fmt.bytesToHex(random_bytes, .lower);
-    const root = try std.fmt.allocPrint(
-        allocator,
-        "/tmp/cas-ledger-validation-{s}",
-        .{suffix},
-    );
-    errdefer allocator.free(root);
-    std.Io.Dir.createDirAbsolute(
-        std.Io.Threaded.global_single_threaded.io(),
-        root,
-        @enumFromInt(0o700),
-    ) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.TempDirCreationFailed,
-        else => return err,
-    };
-    return root;
 }
 
 fn shellQuoteAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -1493,7 +1340,6 @@ fn validateLedgerInputReceipt(
     return .{
         .input = input,
         .receipt = receipt,
-        .revalidation = try allocator.dupe(u8, receipt),
         .definition_digest = definition_digest,
     };
 }
@@ -2341,12 +2187,6 @@ fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inqui
         "--store-root",
         store_root,
     });
-    if (options.ledger_path) |ledger_path| {
-        try argv.appendSlice(
-            allocator,
-            &.{ "--ledger-path", ledger_path },
-        );
-    }
     try argv.append(allocator, "--json");
     _ = try cas_websocket.spawnDetachedProcess(
         allocator,
@@ -2389,17 +2229,8 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
         "capsule.validation.json",
     );
     defer allocator.free(capsule_receipt_path);
-    const capsule_definition_path = try persistedDefinitionPathAlloc(
-        allocator,
-        options.home,
-        inquiry_id,
-        "capsule.definition.path",
-    );
-    defer allocator.free(capsule_definition_path);
     var capsule_input = try validateLedgerInput(
         allocator,
-        options,
-        capsule_definition_path,
         capsule_path,
         capsule_receipt_path,
         "retrace/decision-context-packet",
@@ -2420,17 +2251,8 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
         "plan.validation.json",
     );
     defer allocator.free(plan_receipt_path);
-    const plan_definition_path = try persistedDefinitionPathAlloc(
-        allocator,
-        options.home,
-        inquiry_id,
-        "plan.definition.path",
-    );
-    defer allocator.free(plan_definition_path);
     var plan_input = try validateLedgerInput(
         allocator,
-        options,
-        plan_definition_path,
         plan_path,
         plan_receipt_path,
         "retrace/retrace-inquiry-plan",
@@ -4467,16 +4289,6 @@ fn persistInputCopies(allocator: std.mem.Allocator, options: Options, inquiry_id
             source,
         );
     }
-    if (options.capsule_revalidation_bytes) |validated| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "capsule.revalidation.json",
-            validated,
-            "",
-        );
-    }
     if (options.plan_definition_path) |source| {
         try persistInputCopy(
             allocator,
@@ -4505,16 +4317,6 @@ fn persistInputCopies(allocator: std.mem.Allocator, options: Options, inquiry_id
             "plan.validation.json",
             options.plan_validation_bytes,
             source,
-        );
-    }
-    if (options.plan_revalidation_bytes) |validated| {
-        try persistInputCopy(
-            allocator,
-            options.home,
-            inquiry_id,
-            "plan.revalidation.json",
-            validated,
-            "",
         );
     }
 }
@@ -5570,7 +5372,7 @@ test "sha256HexAlloc prefixes digest" {
     try std.testing.expectEqualStrings("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", digest);
 }
 
-test "Ledger validation receipts bind exact inquiry inputs" {
+test "CAS binds caller Ledger receipts without a Ledger runtime" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5610,14 +5412,11 @@ test "Ledger validation receipts bind exact inquiry inputs" {
         allocator,
     );
     defer allocator.free(receipt_path);
-    const definition_digest =
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    var validated = try validateLedgerInputReceipt(
+    var validated = try validateLedgerInput(
         allocator,
-        receipt_path,
         input_path,
+        receipt_path,
         "retrace/decision-context-packet",
-        definition_digest,
         "packet",
     );
     defer validated.deinit(allocator);
@@ -5629,12 +5428,11 @@ test "Ledger validation receipts bind exact inquiry inputs" {
     });
     try std.testing.expectError(
         error.LedgerValidationInputDigestMismatch,
-        validateLedgerInputReceipt(
+        validateLedgerInput(
             allocator,
-            receipt_path,
             input_path,
+            receipt_path,
             "retrace/decision-context-packet",
-            definition_digest,
             "packet",
         ),
     );

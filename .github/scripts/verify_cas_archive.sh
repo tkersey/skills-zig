@@ -43,7 +43,6 @@ expected_members=(
   cas-conformance-suite
   cas-goal
   cas-perf-budget-governor
-  ledger
 )
 
 expected_normalized="$scratch/expected-normalized"

@@ -236,7 +236,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Build cas binaries
-        run: zig build build-cas build-ledger -Doptimize=ReleaseFast
+        run: zig build build-cas -Doptimize=ReleaseFast
       - name: Verify packaged Linux CAS dispatcher layout
         run: |
           set -euo pipefail
@@ -258,7 +258,6 @@ jobs:
           cp zig-out/bin/cas_goal "${package_dir}/cas_goal"
           cp zig-out/bin/cas_goal "${package_dir}/cas-goal"
           cp zig-out/bin/cas-perf-budget-governor "${package_dir}/cas-perf-budget-governor"
-          cp zig-out/bin/ledger "${package_dir}/ledger"
           tar -czf "${archive}" -C "${package_dir}" .
           .github/scripts/verify_cas_archive.sh linux-x86_64 "${archive}"
       - name: Test generic CAS surfaces
