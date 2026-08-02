@@ -10,8 +10,11 @@ const loopback_host = "127.0.0.1";
 pub const ManagedServer = struct {
     child: std.process.Child,
     listen_url: []u8,
+    owner_control: ?std.Io.File = null,
+    stopped: bool = false,
 
     pub fn deinit(self: *ManagedServer, allocator: std.mem.Allocator) void {
+        if (self.owner_control != null) self.kill();
         allocator.free(self.listen_url);
     }
 
@@ -25,7 +28,19 @@ pub const ManagedServer = struct {
     }
 
     pub fn kill(self: *ManagedServer) void {
-        self.child.kill(std.Io.Threaded.global_single_threaded.io());
+        if (self.stopped) return;
+        self.stopped = true;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (self.owner_control) |control| {
+            control.close(io);
+            self.owner_control = null;
+            _ = self.child.wait(io) catch {
+                self.child.kill(io);
+                return;
+            };
+            return;
+        }
+        self.child.kill(io);
     }
 };
 
@@ -220,6 +235,41 @@ pub fn startManagedLoopbackServer(
     hook_policy: hooks.HookPolicy,
     io: std.Io,
 ) !ManagedServer {
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        false,
+        io,
+    );
+}
+
+pub fn startOwnerLivedLoopbackServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    io: std.Io,
+) !ManagedServer {
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        true,
+        io,
+    );
+}
+
+fn startManagedLoopbackServerWithOwnership(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    owner_lived: bool,
+    io: std.Io,
+) !ManagedServer {
     try hooks.ensureLaunchSupportsPolicy(allocator, io, codex_path, cwd, hook_policy);
 
     var address = try std.Io.net.IpAddress.parse(loopback_host, 0);
@@ -235,11 +285,192 @@ pub fn startManagedLoopbackServer(
     try argv.append(allocator, codex_path);
     try hooks.appendAppServerArgs(allocator, &argv, hook_policy, listen_url);
 
+    if (owner_lived) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            return error.OwnerLivedManagedServerUnsupported;
+        }
+        return spawnOwnerPipeManagedServer(
+            allocator,
+            cwd,
+            argv.items,
+            listen_url,
+            io,
+        );
+    }
+
     const child = try spawnDetachedProcess(allocator, cwd, argv.items, io);
 
     return .{
         .child = child,
         .listen_url = listen_url,
+    };
+}
+
+const owner_watchdog_script =
+    \\child=0
+    \\cleanup() {
+    \\  if [ "$child" -gt 0 ] 2>/dev/null; then
+    \\    kill "$child" 2>/dev/null || true
+    \\    attempts=0
+    \\    while kill -0 "$child" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    \\      sleep 0.05
+    \\      attempts=$((attempts + 1))
+    \\    done
+    \\    kill -KILL "$child" 2>/dev/null || true
+    \\    wait "$child" 2>/dev/null || true
+    \\  fi
+    \\}
+    \\trap cleanup EXIT HUP INT TERM
+    \\"$@" &
+    \\child=$!
+    \\while IFS= read -r _; do :; done
+;
+
+fn spawnOwnerPipeManagedServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    server_argv: []const []const u8,
+    listen_url: []u8,
+    io: std.Io,
+) !ManagedServer {
+    var watchdog_argv: std.ArrayList([]const u8) = .empty;
+    defer watchdog_argv.deinit(allocator);
+    try watchdog_argv.appendSlice(allocator, &.{
+        "/bin/sh",
+        "-c",
+        owner_watchdog_script,
+        "cas-app-server-watchdog",
+    });
+    try watchdog_argv.appendSlice(allocator, server_argv);
+
+    if (builtin.os.tag == .macos and builtin.link_libc) {
+        return spawnOwnerPipeManagedServerPosix(
+            allocator,
+            cwd,
+            watchdog_argv.items,
+            listen_url,
+        );
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = watchdog_argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    });
+    const owner_control = child.stdin orelse {
+        child.kill(io);
+        return error.ChildMissingStdin;
+    };
+    child.stdin = null;
+    return .{
+        .child = child,
+        .listen_url = listen_url,
+        .owner_control = owner_control,
+    };
+}
+
+fn spawnOwnerPipeManagedServerPosix(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    watchdog_argv: []const []const u8,
+    listen_url: []u8,
+) !ManagedServer {
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.SystemResources;
+    var read_open = true;
+    var write_open = true;
+    defer if (read_open) {
+        _ = std.c.close(pipe_fds[0]);
+    };
+    errdefer if (write_open) {
+        _ = std.c.close(pipe_fds[1]);
+    };
+    const write_fd_flags = std.c.fcntl(pipe_fds[1], std.c.F.GETFD);
+    if (write_fd_flags < 0 or
+        std.c.fcntl(
+            pipe_fds[1],
+            std.c.F.SETFD,
+            write_fd_flags | std.c.FD_CLOEXEC,
+        ) < 0)
+    {
+        return error.SystemResources;
+    }
+
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+
+    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    defer allocator.free(cwd_storage);
+    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[0] != 0 and
+        (std.c.posix_spawn_file_actions_adddup2(&actions, pipe_fds[0], 0) != 0 or
+            std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[0]) != 0))
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[1] != 0 and
+        std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[1]) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0 or
+        std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, watchdog_argv.len, null);
+    defer allocator.free(argv_buf);
+    var arg_storage = try allocator.alloc([:0]u8, watchdog_argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (watchdog_argv, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = std.c.posix_spawn(
+        &pid,
+        argv_buf[0].?,
+        &actions,
+        null,
+        argv_buf.ptr,
+        envp,
+    );
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    _ = std.c.close(pipe_fds[0]);
+    read_open = false;
+    write_open = false;
+    return .{
+        .child = .{
+            .id = pid,
+            .thread_handle = {},
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        },
+        .listen_url = listen_url,
+        .owner_control = .{
+            .handle = pipe_fds[1],
+            .flags = .{ .nonblocking = false },
+        },
     };
 }
 
@@ -341,6 +572,23 @@ pub fn processAlive(process_id: u64) bool {
             break :blk true;
         },
     };
+}
+
+pub fn waitForProcessExit(process_id: u64, timeout_ms: u32) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const started_ms = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    );
+    while (processAlive(process_id)) {
+        const now_ms = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            1_000_000,
+        );
+        if (now_ms - started_ms >= timeout_ms) return false;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return true;
 }
 
 pub fn terminateProcess(process_id: u64) void {
@@ -619,4 +867,62 @@ test "websocket write deadline expires before a frame crosses the socket" {
 
     try std.testing.expectError(error.Timeout, connection.sendTextTimeout("payload", 0));
     try std.testing.expectError(error.ConnectionPoisoned, connection.sendText("retry"));
+}
+
+test "owner-lived watchdog retires its exact server when owner control closes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
+    defer allocator.free(pid_path);
+    const listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1");
+    errdefer allocator.free(listen_url);
+    var managed = try spawnOwnerPipeManagedServer(
+        allocator,
+        root,
+        &.{
+            "/bin/sh",
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done",
+            "cas-owner-lived-test-server",
+            pid_path,
+        },
+        listen_url,
+        io,
+    );
+    defer managed.deinit(allocator);
+    const watchdog_pid = managed.processId();
+
+    var server_pid: ?u64 = null;
+    for (0..100) |_| {
+        const pid_bytes = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            pid_path,
+            allocator,
+            .limited(64),
+        ) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            continue;
+        };
+        defer allocator.free(pid_bytes);
+        server_pid = try std.fmt.parseInt(
+            u64,
+            std.mem.trim(u8, pid_bytes, " \t\r\n"),
+            10,
+        );
+        break;
+    }
+    try std.testing.expect(server_pid != null);
+    try std.testing.expect(processAlive(watchdog_pid));
+    try std.testing.expect(processAlive(server_pid.?));
+
+    managed.kill();
+    try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
+    try std.testing.expect(waitForProcessExit(server_pid.?, 2_000));
 }
