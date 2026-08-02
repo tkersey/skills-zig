@@ -1360,7 +1360,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
 
     if (parsed.wait_after_start) {
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "waiting", null, review_thread_id, review_turn_id, record_path, event_log_path);
-        const latest = waitForReviewCompletion(
+        const latest = waitForReviewCompletionOwnerLived(
             allocator,
             &client,
             record.review_thread_id,
@@ -1369,6 +1369,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.timeout_ms,
             parsed.poll_interval_ms,
             codex_version,
+            workflow_binding != null,
         ) catch |err| switch (err) {
             error.WaitTimedOut => {
                 const timeout_status = try fetchReviewStatus(
@@ -3745,6 +3746,46 @@ fn waitForReviewCompletion(
     }
 }
 
+const OwnerLivedTimeoutDisposition = enum {
+    continue_waiting,
+    return_timeout,
+};
+
+fn ownerLivedTimeoutDisposition(workflow_bound: bool) OwnerLivedTimeoutDisposition {
+    return if (workflow_bound) .continue_waiting else .return_timeout;
+}
+
+fn waitForReviewCompletionOwnerLived(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    event_log_path: []const u8,
+    timeout_ms: u32,
+    poll_interval_ms: u32,
+    codex_version: []const u8,
+    workflow_bound: bool,
+) !ReviewStatus {
+    while (true) {
+        return waitForReviewCompletion(
+            allocator,
+            client,
+            review_thread_id,
+            review_turn_id,
+            event_log_path,
+            timeout_ms,
+            poll_interval_ms,
+            codex_version,
+        ) catch |err| switch (err) {
+            error.WaitTimedOut => switch (ownerLivedTimeoutDisposition(workflow_bound)) {
+                .continue_waiting => continue,
+                .return_timeout => return error.WaitTimedOut,
+            },
+            else => return err,
+        };
+    }
+}
+
 fn startParentThreadAlloc(
     allocator: std.mem.Allocator,
     client: *cas.Client,
@@ -5808,6 +5849,7 @@ fn renderErrorAndExit(
                 null,
             .multiAgentModeSupport = receipt.multi_agent_mode_support.asString(),
             .multiAgentModeMetricEligible = receipt.multi_agent_mode_metric_eligible,
+            .workflowBinding = receipt.workflow_binding,
             .failureCode = failure.code,
             .failureClass = failure_class,
             .retryableSameTupleNow = retryable_same_tuple_now,
@@ -5827,6 +5869,7 @@ fn renderErrorAndExit(
                 .reviewTurnId = @as(?[]const u8, null),
                 .recordPath = @as(?[]const u8, null),
                 .eventLogPath = @as(?[]const u8, null),
+                .workflowBinding = receipt.workflow_binding,
                 .findings = [_]std.json.Value{},
             },
         };
@@ -8836,6 +8879,7 @@ fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
     if (std.mem.eql(u8, value, "review_transport_lost")) return "transport_review_attempt";
     if (std.mem.indexOf(u8, value, "transport") != null) return "transport_review_attempt";
     if (std.mem.eql(u8, value, "wait_timed_out")) return "timeout";
+    if (std.mem.eql(u8, value, "workflow_bound_review_requires_owner_lived_wait")) return "caller_error";
     if (std.mem.indexOf(u8, value, "parse") != null) return "parse";
     if (std.mem.eql(u8, value, "review_untrusted_source")) return "review_output";
     if (std.mem.indexOf(u8, value, "output") != null) return "review_output";
@@ -8848,6 +8892,7 @@ fn retryableSameTupleNowForCode(code: ?[]const u8) ?bool {
     if (failureCodeIsAccountResourceExhausted(value)) return false;
     if (std.mem.eql(u8, value, "review_transport_lost")) return true;
     if (std.mem.eql(u8, value, "wait_timed_out")) return true;
+    if (std.mem.eql(u8, value, "workflow_bound_review_requires_owner_lived_wait")) return true;
     return null;
 }
 
@@ -9311,6 +9356,23 @@ test "owner-lived admission exhausts action binding and wait states" {
             }
         }
     }
+}
+
+test "workflow-bound wait timeout preserves the notification owner" {
+    try std.testing.expectEqual(
+        OwnerLivedTimeoutDisposition.continue_waiting,
+        ownerLivedTimeoutDisposition(true),
+    );
+    try std.testing.expectEqual(
+        OwnerLivedTimeoutDisposition.return_timeout,
+        ownerLivedTimeoutDisposition(false),
+    );
+}
+
+test "owner-lived admission failure is an immediate caller retry" {
+    const code = "workflow_bound_review_requires_owner_lived_wait";
+    try std.testing.expectEqualStrings("caller_error", failureClassForCode(code).?);
+    try std.testing.expectEqual(true, retryableSameTupleNowForCode(code).?);
 }
 
 test "parseArgs accepts latest wait selector" {
