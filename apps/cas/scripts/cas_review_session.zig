@@ -962,12 +962,15 @@ fn workflowBoundStartAdmissionFailure(
     if (!parsed.wait_after_start) {
         return .{
             .code = "workflow_bound_review_requires_owner_lived_wait",
-            .hint = "workflow-bound review attempts require one owner-lived `cas review start --wait` process through terminal evidence; rerun with --wait --timeout-ms 2700000",
+            .hint = "workflow-bound review attempts require one owner-lived " ++
+                "`cas review start --wait` process through terminal evidence; " ++
+                "rerun with --wait --timeout-ms 2700000",
         };
     }
     if (!parsed.json) return .{
         .code = "workflow_bound_review_requires_structured_output",
-        .hint = "workflow-bound review attempts require --json so every terminal verdict or owner failure is machine-readable",
+        .hint = "workflow-bound review attempts require --json so every " ++
+            "terminal verdict or owner failure is machine-readable",
     };
     return null;
 }
@@ -998,7 +1001,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 .{ .workflow_binding = workflow_binding },
                 .{
                     .code = "review_target_resolution_failed",
-                    .hint = "CAS could not resolve the workflow-bound repository before review/start; no review attempt was created",
+                    .hint = "CAS could not resolve the workflow-bound " ++
+                        "repository before review/start; no review attempt was created",
                 },
             );
         }
@@ -1173,7 +1177,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 output_receipt,
                 .{
                     .code = "review_target_resolution_failed",
-                    .hint = "CAS could not canonicalize the workflow-bound review target; no review attempt was created",
+                    .hint = "CAS could not canonicalize the workflow-bound " ++
+                        "review target; no review attempt was created",
                 },
             );
         }
@@ -1202,7 +1207,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 output_receipt,
                 .{
                     .code = "review_target_resolution_failed",
-                    .hint = "CAS could not bind the workflow-bound target identity; no review attempt was created",
+                    .hint = "CAS could not bind the workflow-bound target " ++
+                        "identity; no review attempt was created",
                 },
             );
         }
@@ -1230,7 +1236,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             output_receipt,
             .{
                 .code = "pre_review_start_failed",
-                .hint = "CAS could not bind the owner-lived review tuple before review/start; no review attempt was created",
+                .hint = "CAS could not bind the owner-lived review tuple " ++
+                    "before review/start; no review attempt was created",
             },
         );
     };
@@ -1254,8 +1261,24 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
         defer allocator.free(existing_parent_event_log_path);
-        resumeParentThread(allocator, &client, existing, existing_parent_event_log_path, codex_version) catch |err| {
-            updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "pre_review_start_failed", null, null, null, existing_parent_event_log_path);
+        resumeParentThread(
+            allocator,
+            &client,
+            existing,
+            existing_parent_event_log_path,
+            codex_version,
+        ) catch |err| {
+            updateReviewTupleLockBestEffort(
+                allocator,
+                tuple_lock_bundle.path,
+                tuple_lock_bundle.lock,
+                "pre_review_start_failed",
+                "pre_review_start_failed",
+                null,
+                null,
+                null,
+                existing_parent_event_log_path,
+            );
             if (workflow_binding != null) {
                 managed_server.kill();
                 output_receipt.error_review_attempt_phase = "pre_review_start";
@@ -1269,7 +1292,9 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     output_receipt,
                     .{
                         .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not resume its selected parent before review/start; no review attempt was created",
+                        .hint = "the owner-lived review could not resume its " ++
+                            "selected parent before review/start; no review " ++
+                            "attempt was created",
                     },
                 );
             }
@@ -1284,7 +1309,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             null,
             codex_version,
         ) catch |err| {
-            updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "pre_review_start_failed", null, null, null, existing_parent_event_log_path);
+            updateReviewTupleLockBestEffort(
+                allocator,
+                tuple_lock_bundle.path,
+                tuple_lock_bundle.lock,
+                "pre_review_start_failed",
+                "pre_review_start_failed",
+                null,
+                null,
+                null,
+                existing_parent_event_log_path,
+            );
             if (workflow_binding != null) {
                 managed_server.kill();
                 output_receipt.error_review_attempt_phase = "pre_review_start";
@@ -1298,7 +1333,9 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     output_receipt,
                     .{
                         .code = "pre_review_start_failed",
-                        .hint = "the owner-lived review could not validate its selected parent before review/start; no review attempt was created",
+                        .hint = "the owner-lived review could not validate its " ++
+                            "selected parent before review/start; no review " ++
+                            "attempt was created",
                     },
                 );
             }
@@ -1326,7 +1363,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         session_dir,
         parsed.custom_instructions,
     ) catch |err| {
-        updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "pre_review_start_failed", null, null, null, null);
+        updateReviewTupleLockBestEffort(
+            allocator,
+            tuple_lock_bundle.path,
+            tuple_lock_bundle.lock,
+            "pre_review_start_failed",
+            "pre_review_start_failed",
+            null,
+            null,
+            null,
+            null,
+        );
         if (workflow_binding != null) {
             managed_server.kill();
             output_receipt.error_review_attempt_phase = "pre_review_start";
@@ -1340,7 +1387,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 output_receipt,
                 .{
                     .code = "pre_review_start_failed",
-                    .hint = "the owner-lived review failed before review/start; the exact request may start one fresh attempt",
+                    .hint = "the owner-lived review failed before review/start; " ++
+                        "the exact request may start one fresh attempt",
                 },
             );
         }
@@ -1372,7 +1420,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.poll_interval_ms,
             codex_version,
         ) catch {
-            updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "pre_review_start_failed", null, null, null, parent_event_log_path);
+            updateReviewTupleLockBestEffort(
+                allocator,
+                tuple_lock_bundle.path,
+                tuple_lock_bundle.lock,
+                "pre_review_start_failed",
+                "pre_review_start_failed",
+                null,
+                null,
+                null,
+                parent_event_log_path,
+            );
             if (workflow_binding != null) managed_server.kill();
             try renderErrorAndExit(
                 parsed.json,
@@ -1436,7 +1494,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             );
         }
         if (reviewStartFailureOwnsAttempt(workflow_binding != null, request_send_started, err)) {
-            output_receipt.error_review_attempt_phase = if (request_send_started) "review_terminal" else "pre_review_start";
+            output_receipt.error_review_attempt_phase = if (request_send_started)
+                "review_terminal"
+            else
+                "pre_review_start";
             output_receipt.error_review_attempt_exists = request_send_started;
             const timeout_failure = workflowOwnedPostStartFailure(err);
             terminalizeOwnedReviewAttempt(
@@ -1467,7 +1528,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 parsed.poll_interval_ms,
                 codex_version,
             ) catch {
-                updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "pre_review_start_failed", null, null, null, parent_event_log_path);
+                updateReviewTupleLockBestEffort(
+                    allocator,
+                    tuple_lock_bundle.path,
+                    tuple_lock_bundle.lock,
+                    "pre_review_start_failed",
+                    "pre_review_start_failed",
+                    null,
+                    null,
+                    null,
+                    parent_event_log_path,
+                );
                 if (workflow_binding != null) managed_server.kill();
                 try renderErrorAndExit(
                     parsed.json,
@@ -1520,8 +1591,15 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         retry_failure.?,
                     );
                 }
-                if (reviewStartFailureOwnsAttempt(workflow_binding != null, retry_send_started, retry_err)) {
-                    output_receipt.error_review_attempt_phase = if (retry_send_started) "review_terminal" else "pre_review_start";
+                if (reviewStartFailureOwnsAttempt(
+                    workflow_binding != null,
+                    retry_send_started,
+                    retry_err,
+                )) {
+                    output_receipt.error_review_attempt_phase = if (retry_send_started)
+                        "review_terminal"
+                    else
+                        "pre_review_start";
                     output_receipt.error_review_attempt_exists = retry_send_started;
                     const timeout_failure = workflowOwnedPostStartFailure(retry_err);
                     terminalizeOwnedReviewAttempt(
@@ -1643,8 +1721,24 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
     defer allocator.free(record_path);
 
-    appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json) catch {};
-    appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json) catch {};
+    appendLogRecord(
+        allocator,
+        event_log_path,
+        "review/start",
+        "request",
+        review_params_json,
+    ) catch |err| switch (err) {
+        else => {},
+    };
+    appendLogRecord(
+        allocator,
+        event_log_path,
+        "review/start",
+        "response",
+        review_result_json,
+    ) catch |err| switch (err) {
+        else => {},
+    };
     if (review_start_retry_used) {
         appendLogRecord(allocator, event_log_path, "review/start", "note", "{\"retry\":\"fresh-parent-materialization\"}") catch {};
     }
@@ -1778,7 +1872,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         managed_server_listen_url,
                         io,
                         parsed,
-                        monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
+                        monotonicMilliseconds() + @as(
+                            i64,
+                            finalReviewStatusGraceMs(parsed.poll_interval_ms),
+                        ),
                     ) catch {
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
@@ -1919,7 +2016,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                             failure,
                         );
                     } else {
-                        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+                        var stderr_writer = std.Io.File.stderr().writer(
+                            std.Io.Threaded.global_single_threaded.io(),
+                            &.{},
+                        );
                         try stderr_writer.interface.print(
                             "cas review start: {s} ({s})\nrecord: {s}\n",
                             .{ failure.hint, failure.code, record_path },
@@ -2500,7 +2600,10 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     record.managed_server_listen_url,
                     io,
                     parsed,
-                    monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
+                    monotonicMilliseconds() + @as(
+                        i64,
+                        finalReviewStatusGraceMs(parsed.poll_interval_ms),
+                    ),
                 ) catch break :grace try makeDisconnectedReviewStatus(allocator);
                 defer {
                     grace_client.close();
@@ -4644,14 +4747,21 @@ fn waitForReviewCompletion(
             }
             latest.deinit(allocator);
         }
-        const now_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
+        const now_ms = @divFloor(
+            std.Io.Clock.awake.now(
+                std.Io.Threaded.global_single_threaded.io(),
+            ).nanoseconds,
+            1_000_000,
+        );
         if (now_ms >= deadline_ms) return error.WaitTimedOut;
         const remaining_ms: u32 = @intCast(deadline_ms - now_ms);
         std.Io.sleep(
             std.Io.Threaded.global_single_threaded.io(),
             .fromMilliseconds(@min(poll_interval_ms, remaining_ms)),
             .awake,
-        ) catch {};
+        ) catch |err| switch (err) {
+            else => {},
+        };
     }
 }
 
@@ -4684,11 +4794,13 @@ fn reviewWaitTimeoutDisposition(workflow_bound: bool) ReviewWaitTimeoutDispositi
 fn terminalReviewTransportFailure(code: []const u8) ?FailureInfo {
     if (std.mem.eql(u8, code, "review_transport_timeout")) return .{
         .code = "review_transport_timeout",
-        .hint = "owner-lived review reached its finite deadline; start one fresh same-request recovery attempt",
+        .hint = "owner-lived review reached its finite deadline; start one " ++
+            "fresh same-request recovery attempt",
     };
     if (std.mem.eql(u8, code, "review_transport_lost")) return .{
         .code = "review_transport_lost",
-        .hint = "managed websocket review transport is terminal; start one fresh same-request recovery attempt",
+        .hint = "managed websocket review transport is terminal; start one " ++
+            "fresh same-request recovery attempt",
     };
     return null;
 }
@@ -4697,7 +4809,9 @@ fn terminalReviewOwnerFailure(code: []const u8) ?FailureInfo {
     if (terminalReviewTransportFailure(code)) |failure| return failure;
     if (std.mem.eql(u8, code, "review_owner_failed")) return .{
         .code = "review_owner_failed",
-        .hint = "the owner-lived review process terminated after launch; inspect its durable receipt, then start one fresh exact-request recovery attempt",
+        .hint = "the owner-lived review process terminated after launch; " ++
+            "inspect its durable receipt, then start one fresh exact-request " ++
+            "recovery attempt",
     };
     return null;
 }
@@ -4705,7 +4819,8 @@ fn terminalReviewOwnerFailure(code: []const u8) ?FailureInfo {
 fn workflowOwnerActiveFailureInfo() FailureInfo {
     return .{
         .code = "workflow_bound_review_owner_active",
-        .hint = "the owner-lived review process is still active; consume its terminal receipt instead of starting a duplicate owner",
+        .hint = "the owner-lived review process is still active; consume its " ++
+            "terminal receipt instead of starting a duplicate owner",
     };
 }
 
@@ -4717,12 +4832,14 @@ fn workflowDeadOwnerFailureInfo(lock: ReviewTupleLock) FailureInfo {
     if (workflowDeadOwnerAttemptExists(lock)) {
         return .{
             .code = "review_transport_lost",
-            .hint = "the workflow-bound review owner died; the lease is terminal and the exact request may use one fresh recovery attempt",
+            .hint = "the workflow-bound review owner died; the lease is " ++
+                "terminal and the exact request may use one fresh recovery attempt",
         };
     }
     return .{
         .code = "workflow_bound_review_owner_lost_before_start",
-        .hint = "the workflow-bound owner died before review/start send began; the exact request may retry without consuming review-attempt credit",
+        .hint = "the workflow-bound owner died before review/start send began; " ++
+            "the exact request may retry without consuming review-attempt credit",
     };
 }
 
@@ -4769,7 +4886,9 @@ fn terminalizeOwnedReviewAttempt(
         context.record_path,
         context.event_log_path,
     );
-    writeReviewTupleLock(allocator, lock_path, terminal_lock) catch {};
+    writeReviewTupleLock(allocator, lock_path, terminal_lock) catch |err| switch (err) {
+        else => {},
+    };
 
     if (context.record) |record| {
         record.last_observed_status = "disconnected";
@@ -4777,7 +4896,9 @@ fn terminalizeOwnedReviewAttempt(
         record.terminal_failure_hint = durable_failure.hint;
         record.terminal_failure_at_unix_s = unixSeconds();
         if (context.record_path) |record_path| {
-            writeSessionRecord(allocator, record_path, record.*) catch {};
+            writeSessionRecord(allocator, record_path, record.*) catch |err| switch (err) {
+                else => {},
+            };
         }
     }
 }
@@ -5381,7 +5502,10 @@ fn emitHistoricalWaitTimeoutAndExit(
             failure,
         );
     } else {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         try stdout_writer.interface.print(
             "cas review wait timed out after {d}ms\nreview thread: {s}\n",
             .{ parsed.timeout_ms, record.review_thread_id },
@@ -6023,7 +6147,10 @@ fn replayTerminalRecordAndExit(
             },
         );
         defer normalized.deinit(allocator);
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stdout_writer = std.Io.File.stdout().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         const stdout = &stdout_writer.interface;
         if (json_mode) {
             try writeReceiptObject(stdout, normalized);
@@ -6031,7 +6158,12 @@ fn replayTerminalRecordAndExit(
         } else {
             try stdout.print(
                 "cas review wait\nreview thread: {s}\nstatus: {s}\nfindings: {d}\nrecord: {s}\n",
-                .{ record.review_thread_id, normalized.status, normalized.finding_count, record_path },
+                .{
+                    record.review_thread_id,
+                    normalized.status,
+                    normalized.finding_count,
+                    record_path,
+                },
             );
         }
         // A completed review is a successful wait operation even when its
@@ -6055,7 +6187,8 @@ fn replayTerminalRecordAndExit(
     const failure = terminalReviewOwnerFailure(code) orelse FailureInfo{
         .code = code,
         .hint = record.terminal_failure_hint orelse
-            "the durable review owner recorded a terminal failure; inspect the persisted receipt before starting a replacement",
+            "the durable review owner recorded a terminal failure; inspect " ++
+                "the persisted receipt before starting a replacement",
     };
     if (json_mode) {
         try printRecordedReviewFailureJson(
@@ -6068,7 +6201,10 @@ fn replayTerminalRecordAndExit(
             failure,
         );
     } else {
-        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        var stderr_writer = std.Io.File.stderr().writer(
+            std.Io.Threaded.global_single_threaded.io(),
+            &.{},
+        );
         try stderr_writer.interface.print(
             "cas review wait: {s} ({s})\nrecord: {s}\n",
             .{ failure.hint, failure.code, record_path },
@@ -6304,11 +6440,17 @@ fn reviewTupleLockPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ locks_dir, bare_hash });
 }
 
-fn reviewTupleLockRewriteLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
+fn reviewTupleLockRewriteLeasePathAlloc(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.rewrite-lease", .{lock_path});
 }
 
-fn reviewTupleLockLegacyRewriteClaimPathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
+fn reviewTupleLockLegacyRewriteClaimPathAlloc(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
 }
 
@@ -6336,7 +6478,9 @@ const ReviewTupleRewriteLease = struct {
             std.Io.Dir.deleteFileAbsolute(
                 std.Io.Threaded.global_single_threaded.io(),
                 claim_path,
-            ) catch {};
+            ) catch |err| switch (err) {
+                else => {},
+            };
             allocator.free(claim_path);
         }
         self.file.close(std.Io.Threaded.global_single_threaded.io());
@@ -6352,7 +6496,7 @@ fn tryAcquireReviewOwnerLeaseAlloc(
     errdefer allocator.free(lease_path);
     try ensureParentPath(lease_path);
     const io = std.Io.Threaded.global_single_threaded.io();
-    while (true) {
+    while (true) { // tiger: event-loop
         const file = std.Io.Dir.openFileAbsolute(io, lease_path, .{
             .mode = .read_write,
             .lock = .exclusive,
@@ -6666,7 +6810,9 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
                         io,
                         .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
                         .awake,
-                    ) catch {};
+                    ) catch |sleep_err| switch (sleep_err) {
+                        else => {},
+                    };
                     continue;
                 },
                 else => return create_err,
@@ -6678,7 +6824,9 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
                     io,
                     .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
                     .awake,
-                ) catch {};
+                ) catch |sleep_err| switch (sleep_err) {
+                    else => {},
+                };
                 continue;
             },
             else => return open_err,
@@ -6704,7 +6852,9 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
                         io,
                         .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
                         .awake,
-                    ) catch {};
+                    ) catch |sleep_err| switch (sleep_err) {
+                        else => {},
+                    };
                     continue;
                 },
                 else => {
@@ -6846,7 +6996,7 @@ fn ensureReviewTuplePredecessorExitedWithin(
         const receipt_token = lock.managedServerShutdownReceiptToken orelse
             return error.InvalidReviewTupleLockBinding;
         const started_ms = monotonicMilliseconds();
-        while (true) {
+        while (true) { // tiger: event-loop
             const raw = durable_store.readRegularFileNoSymlink(
                 allocator,
                 receipt_path,
@@ -6886,13 +7036,15 @@ fn ensureReviewTuplePredecessorExitedWithin(
                 std.Io.Threaded.global_single_threaded.io(),
                 .fromMilliseconds(10),
                 .awake,
-            ) catch {};
+            ) catch |err| switch (err) {
+                else => {},
+            };
         }
     }
 
     if (incarnation_status != null) {
         const started_ms = monotonicMilliseconds();
-        while (true) {
+        while (true) { // tiger: event-loop
             if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
                 return;
             }
@@ -6903,7 +7055,9 @@ fn ensureReviewTuplePredecessorExitedWithin(
                 std.Io.Threaded.global_single_threaded.io(),
                 .fromMilliseconds(10),
                 .awake,
-            ) catch {};
+            ) catch |err| switch (err) {
+                else => {},
+            };
         }
     }
 
@@ -6919,7 +7073,9 @@ fn ensureReviewTuplePredecessorExitedWithin(
         std.Io.Threaded.global_single_threaded.io(),
         .fromMilliseconds(compatibility_wait_ms),
         .awake,
-    ) catch {};
+    ) catch |err| switch (err) {
+        else => {},
+    };
 }
 
 fn reviewTuplePredecessorIncarnationExitedAlloc(
@@ -6969,11 +7125,23 @@ fn reviewTupleLockActionForAcquire(
                 .block_dead_owner;
         }
     }
-    const dead_transport_proven = if (existing) |lock| reviewTupleLockDeadTransportProven(allocator, lock) else false;
-    var action = reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, dead_transport_proven);
+    const dead_transport_proven = if (existing) |lock|
+        reviewTupleLockDeadTransportProven(allocator, lock)
+    else
+        false;
+    var action = reviewTupleLockActionWithProbe(
+        action_name,
+        existing,
+        now_s,
+        override_reason,
+        fresh_attempt_reason,
+        dead_transport_proven,
+    );
     if (action == .normalize_existing and fresh_attempt_reason == null) {
         if (existing) |lock| {
-            if (terminalLockNeedsFreshAttempt(allocator, action_name, lock, target_identity)) action = .fresh_after_terminal;
+            if (terminalLockNeedsFreshAttempt(allocator, action_name, lock, target_identity)) {
+                action = .fresh_after_terminal;
+            }
         }
     }
     if (owner_lease_held_elsewhere == true and reviewTupleLockActionMutates(action)) {
@@ -7034,7 +7202,8 @@ fn printReviewTupleLockExistingAndExit(
 
     const review_thread_id = lock.reviewThreadId;
     const review_turn_id = lock.reviewTurnId;
-    const lock_points_to_terminal = std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized");
+    const lock_points_to_terminal = std.mem.eql(u8, lock.state, "terminal") or
+        std.mem.eql(u8, lock.state, "normalized");
     const workflow_owner_active = tuple.workflow_binding != null and !lock_points_to_terminal;
     const active_failure: ?FailureInfo = if (workflow_owner_active)
         workflowOwnerActiveFailureInfo()
@@ -7044,7 +7213,8 @@ fn printReviewTupleLockExistingAndExit(
     const active_failure_hint: []const u8 = if (active_failure) |failure|
         failure.hint
     else if (decision == .normalize_existing)
-        "tuple lock points to an existing terminal receipt; normalize that record instead of starting a duplicate review"
+        "tuple lock points to an existing terminal receipt; " ++
+            "normalize that record instead of starting a duplicate review"
     else
         "tuple lock points to an existing active review attempt";
     const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
@@ -7165,7 +7335,9 @@ fn reviewBrokerActionForBlockedLock(decision: ReviewTupleLockAction) []const u8 
 }
 
 fn tupleLockDiagnosticVerdictStatus(lock: ReviewTupleLock) []const u8 {
-    if (std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_timeout")) return "review_transport_failure";
+    if (std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_timeout")) {
+        return "review_transport_failure";
+    }
     if (std.mem.eql(u8, lock.lastFailureCode orelse "", "wait_timed_out")) return "timeout";
     return "incomplete";
 }
@@ -7215,7 +7387,8 @@ fn emitReviewTupleLockBlockedAndExit(
             "--review-lock-override is supplied",
         .block_stale => "tuple lock is stale; supply --review-lock-override " ++
             "with a takeover reason before starting a new review",
-        .block_invalid => "tuple lock file is invalid for CAS-RTL-v3, CAS-RTL-v2, or historical CAS-RTL-v1; " ++
+        .block_invalid => "tuple lock file is invalid for CAS-RTL-v3, CAS-RTL-v2, " ++
+            "or historical CAS-RTL-v1; " ++
             "inspect or remove it before starting a new review",
         else => "an active review attempt already owns this repo/base/head/account tuple",
     };
@@ -7488,7 +7661,12 @@ fn acquireReviewTupleStartLockOrExit(
                                 raced_decision,
                             );
                         },
-                        .block_active, .block_dead_owner, .block_stale, .block_account_resource, .block_invalid => {
+                        .block_active,
+                        .block_dead_owner,
+                        .block_stale,
+                        .block_account_resource,
+                        .block_invalid,
+                        => {
                             killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
                             try emitReviewTupleLockBlockedAndExit(
                                 allocator,
@@ -7610,7 +7788,12 @@ fn acquireReviewTupleStartLockOrExit(
                         latest_decision,
                     );
                 },
-                .block_active, .block_dead_owner, .block_stale, .block_account_resource, .block_invalid => {
+                .block_active,
+                .block_dead_owner,
+                .block_stale,
+                .block_account_resource,
+                .block_invalid,
+                => {
                     killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
                     try emitReviewTupleLockBlockedAndExit(
                         allocator,
@@ -9261,13 +9444,24 @@ fn statusReviewAttemptPhase(status: ?ReviewStatus, timed_out: ?bool) []const u8 
     return "review_started";
 }
 
-fn startReceiptReviewAttemptPhase(status: ?ReviewStatus, timed_out: bool, failure: ?FailureInfo, review_thread_id: ?[]const u8) []const u8 {
+fn startReceiptReviewAttemptPhase(
+    status: ?ReviewStatus,
+    timed_out: bool,
+    failure: ?FailureInfo,
+    review_thread_id: ?[]const u8,
+) []const u8 {
     if (failure) |value| {
         if (terminalReviewOwnerFailure(value.code) != null) {
-            return if (reviewAttemptExists(review_thread_id)) "review_terminal" else "pre_review_start";
+            return if (reviewAttemptExists(review_thread_id))
+                "review_terminal"
+            else
+                "pre_review_start";
         }
         if (failureCodeIsAccountResourceExhausted(value.code)) {
-            return if (reviewAttemptExists(review_thread_id)) "review_terminal" else "pre_review_start";
+            return if (reviewAttemptExists(review_thread_id))
+                "review_terminal"
+            else
+                "pre_review_start";
         }
     }
     return statusReviewAttemptPhase(status, timed_out);
@@ -9842,7 +10036,12 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
         if (std.mem.indexOf(u8, code, "transport") != null)
             "review_transport_failure"
         else
-            reviewVerdictStatus(false, 0, .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" }, review_thread_id)
+            reviewVerdictStatus(
+                false,
+                0,
+                .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" },
+                review_thread_id,
+            )
     else
         "incomplete";
     _ = context;
@@ -9913,7 +10112,12 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         else if (!review_attempt_exists)
             "incomplete"
         else
-            reviewVerdictStatus(false, finding_count, .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" }, review_thread_id)
+            reviewVerdictStatus(
+                false,
+                finding_count,
+                .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" },
+                review_thread_id,
+            )
     else if (timed_out)
         "timeout"
     else if (!review_attempt_exists)
@@ -11025,7 +11229,9 @@ fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, value, "transport") != null) return "transport_review_attempt";
     if (std.mem.eql(u8, value, "review_owner_failed")) return "owner_review_attempt";
     if (std.mem.eql(u8, value, "pre_review_start_failed")) return "caller_error";
-    if (std.mem.eql(u8, value, "workflow_bound_review_owner_lost_before_start")) return "coordination";
+    if (std.mem.eql(u8, value, "workflow_bound_review_owner_lost_before_start")) {
+        return "coordination";
+    }
     if (std.mem.eql(u8, value, "wait_timed_out")) return "timeout";
     if (std.mem.eql(u8, value, "workflow_bound_review_requires_owner_lived_wait") or
         std.mem.eql(u8, value, "workflow_bound_review_requires_structured_output") or
@@ -11535,7 +11741,10 @@ test "workflow-bound wait timeout is one terminal owner failure" {
     const workflow_bound = reviewWaitTimeoutDisposition(true);
     try std.testing.expectEqualStrings("terminal", workflow_bound.lock_state);
     try std.testing.expectEqualStrings("review_transport_timeout", workflow_bound.failure.code);
-    try std.testing.expectEqualStrings("transport_review_attempt", failureClassForCode(workflow_bound.failure.code).?);
+    try std.testing.expectEqualStrings(
+        "transport_review_attempt",
+        failureClassForCode(workflow_bound.failure.code).?,
+    );
     try std.testing.expectEqual(true, retryableSameTupleNowForCode(workflow_bound.failure.code).?);
     try std.testing.expectEqualStrings(
         "review_terminal",
@@ -15973,10 +16182,34 @@ test "review tuple acquire does not reuse non-proof terminal receipts" {
         .expiresAtUnixS = now_s + 60,
         .ownerPid = 1,
     };
-    try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockActionForAcquire(std.testing.allocator, "run", lock, now_s, null, null, target_identity, null));
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.normalize_existing,
+        reviewTupleLockActionForAcquire(
+            std.testing.allocator,
+            "run",
+            lock,
+            now_s,
+            null,
+            null,
+            target_identity,
+            null,
+        ),
+    );
 
     lock.recordPath = diagnostic_path;
-    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockActionForAcquire(std.testing.allocator, "run", lock, now_s, null, null, target_identity, null));
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.fresh_after_terminal,
+        reviewTupleLockActionForAcquire(
+            std.testing.allocator,
+            "run",
+            lock,
+            now_s,
+            null,
+            null,
+            target_identity,
+            null,
+        ),
+    );
 }
 
 test "review tuple lock write and load roundtrip" {
@@ -16578,7 +16811,12 @@ test "terminal timeout session replays only through its exact tuple lock" {
     owner_failed_record.terminal_failure_at_unix_s = 2;
     owner_failed_record.terminal_review_result_source = "rollout_exited_review_mode";
     owner_failed_record.terminal_review_result_json =
-        "{\"findings\":[{\"title\":\"uncommitted\",\"body\":\"body\",\"confidenceScore\":0.9,\"priority\":1,\"codeLocation\":{\"absoluteFilePath\":\"/tmp/file\",\"lineRange\":{\"start\":1,\"end\":1}}}],\"overallCorrectness\":\"patch is incorrect\",\"overallExplanation\":\"uncommitted\",\"overallConfidenceScore\":0.9}";
+        "{\"findings\":[{\"title\":\"uncommitted\",\"body\":\"body\"," ++
+        "\"confidenceScore\":0.9,\"priority\":1,\"codeLocation\":{" ++
+        "\"absoluteFilePath\":\"/tmp/file\",\"lineRange\":{" ++
+        "\"start\":1,\"end\":1}}}],\"overallCorrectness\":" ++
+        "\"patch is incorrect\",\"overallExplanation\":\"uncommitted\"," ++
+        "\"overallConfidenceScore\":0.9}";
     try writeSessionRecord(
         std.testing.allocator,
         record_path,
@@ -16606,9 +16844,18 @@ test "terminal timeout session replays only through its exact tuple lock" {
     );
     defer owner_failed_receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("incomplete", owner_failed_receipt.status);
-    try std.testing.expectEqualStrings("review_terminal", owner_failed_receipt.review_attempt_phase);
-    try std.testing.expectEqualStrings("review_owner_failed", owner_failed_receipt.failure_code.?);
-    try std.testing.expectEqualStrings("owner_review_attempt", owner_failed_receipt.failure_class.?);
+    try std.testing.expectEqualStrings(
+        "review_terminal",
+        owner_failed_receipt.review_attempt_phase,
+    );
+    try std.testing.expectEqualStrings(
+        "review_owner_failed",
+        owner_failed_receipt.failure_code.?,
+    );
+    try std.testing.expectEqualStrings(
+        "owner_review_attempt",
+        owner_failed_receipt.failure_class.?,
+    );
     try std.testing.expectEqual(true, owner_failed_receipt.retryable_same_tuple_now.?);
 
     lock.state = "waiting";

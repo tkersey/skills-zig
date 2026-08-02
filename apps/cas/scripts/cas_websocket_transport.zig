@@ -96,7 +96,14 @@ pub const Connection = struct {
                 continue;
             };
 
-            handshakeClient(allocator, stream, parsed.host, parsed.port, parsed.path, deadline) catch |err| {
+            handshakeClient(
+                allocator,
+                stream,
+                parsed.host,
+                parsed.port,
+                parsed.path,
+                deadline,
+            ) catch |err| {
                 stream.close(io);
                 return switch (err) {
                     error.Timeout => error.ConnectionTimedOut,
@@ -701,7 +708,9 @@ pub fn waitForProcessGroupExit(process_group_id: u64, timeout_ms: u32) bool {
             1_000_000,
         );
         if (now_ms - started_ms >= timeout_ms) return false;
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
     }
     return true;
 }
@@ -758,7 +767,9 @@ pub fn waitForProcessExit(process_id: u64, timeout_ms: u32) bool {
             1_000_000,
         );
         if (now_ms - started_ms >= timeout_ms) return false;
-        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
     }
     return true;
 }
@@ -1085,7 +1096,8 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
         &.{
             "/bin/sh",
             "-c",
-            "pid_tmp=\"$1.tmp\"; printf '%s\\n' \"$$\" > \"$pid_tmp\"; mv \"$pid_tmp\" \"$1\"; while :; do sleep 1; done",
+            "pid_tmp=\"$1.tmp\"; printf '%s\\n' \"$$\" > \"$pid_tmp\"; " ++
+                "mv \"$pid_tmp\" \"$1\"; while :; do sleep 1; done",
             "cas-owner-lived-test-server",
             pid_path,
         },
@@ -1108,7 +1120,9 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
             allocator,
             .limited(64),
         ) catch {
-            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+                else => {},
+            };
             continue;
         };
         defer allocator.free(pid_bytes);

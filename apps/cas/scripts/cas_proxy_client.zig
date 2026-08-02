@@ -856,7 +856,9 @@ pub const Client = struct {
                 return try self.websocket.?.readTextAlloc();
             const remaining_ms = deadline_ms - monotonicMillis();
             if (remaining_ms <= 0) return error.ConnectionTimedOut;
-            return self.websocket.?.readTextAllocTimeout(@intCast(remaining_ms)) catch |err| switch (err) {
+            return self.websocket.?.readTextAllocTimeout(
+                @intCast(remaining_ms),
+            ) catch |err| switch (err) {
                 error.Timeout => return error.ConnectionTimedOut,
                 else => err,
             };
@@ -994,7 +996,9 @@ const SendObserverProbe = struct {
             std.Io.Threaded.global_single_threaded.io(),
             .fromMilliseconds(100),
             .awake,
-        ) catch {};
+        ) catch |err| switch (err) {
+            else => {},
+        };
     }
 };
 
