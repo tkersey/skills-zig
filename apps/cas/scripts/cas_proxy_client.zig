@@ -95,6 +95,7 @@ pub const Client = struct {
     read_only: bool,
     blocking_server_request_count: u64 = 0,
     request_deadline_ms: ?i64 = null,
+    request_send_started: bool = false,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         if (opts.websocket_url) |url| {
@@ -216,6 +217,7 @@ pub const Client = struct {
         params_json: ?[]const u8,
         notification_lines: ?*std.ArrayList([]u8),
     ) ![]u8 {
+        self.request_send_started = false;
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
@@ -262,6 +264,10 @@ pub const Client = struct {
         const previous = self.request_deadline_ms;
         self.request_deadline_ms = deadline_ms;
         return previous;
+    }
+
+    pub fn lastRequestSendStarted(self: *const Client) bool {
+        return self.request_send_started;
     }
 
     fn isNotificationMessage(msg_obj: core_json.ObjectMap) bool {
@@ -413,6 +419,7 @@ pub const Client = struct {
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
+                self.request_send_started = true;
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
@@ -537,13 +544,13 @@ pub const Client = struct {
     }
 
     fn sendWebSocket(self: *Client, payload: []const u8) !void {
-        const deadline_ms = self.request_deadline_ms orelse
+        const deadline_ms = self.request_deadline_ms orelse {
+            self.request_send_started = true;
             return self.websocket.?.sendText(payload);
+        };
         const remaining_ms = deadline_ms - monotonicMillis();
-        if (remaining_ms <= 0) {
-            self.websocket.?.poison();
-            return error.ConnectionTimedOut;
-        }
+        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        self.request_send_started = true;
         self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
             error.Timeout => return error.ConnectionTimedOut,
             else => return err,
@@ -789,10 +796,7 @@ pub const Client = struct {
             const remaining_ms = deadline_ms - monotonicMillis();
             if (remaining_ms <= 0) return error.ConnectionTimedOut;
             return self.websocket.?.readTextAllocTimeout(@intCast(remaining_ms)) catch |err| switch (err) {
-                error.Timeout => {
-                    self.websocket.?.poison();
-                    return error.ConnectionTimedOut;
-                },
+                error.Timeout => return error.ConnectionTimedOut,
                 else => err,
             };
         }
@@ -884,6 +888,33 @@ pub fn stringField(obj: ObjectMap, key: []const u8) ?[]const u8 {
 
 pub fn intField(obj: ObjectMap, key: []const u8) ?i64 {
     return core_json.intField(obj, key);
+}
+
+test "expired request deadline remains pre-send" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .websocket,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+        .request_deadline_ms = monotonicMillis() - 1,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.ConnectionTimedOut, client.sendWebSocket("{}"));
+    try std.testing.expect(!client.lastRequestSendStarted());
 }
 
 test "resolveExecDecision honors read_only and explicit approvals" {

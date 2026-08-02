@@ -117,7 +117,13 @@ pub const Connection = struct {
             io,
             duration,
         );
-        return self.readTextAllocUntil(deadline);
+        return self.readTextAllocUntil(deadline) catch |err| switch (err) {
+            error.Timeout => {
+                self.poison();
+                return error.Timeout;
+            },
+            else => return err,
+        };
     }
 
     fn readTextAllocUntil(
@@ -585,7 +591,6 @@ test "websocket read deadline bounds a stalled live socket" {
 
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(50));
-    connection.poison();
     try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     try std.testing.expect(elapsed_ms < 1_000);
