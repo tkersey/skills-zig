@@ -2202,7 +2202,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             terminal_context.codex_path,
             terminal_context.codex_version,
         );
-        updateReviewTupleLockBestEffort(
+        try updateReviewTupleLock(
             allocator,
             tuple_lock_bundle.path,
             tuple_lock_bundle.lock,
@@ -6454,6 +6454,32 @@ fn reviewTupleLockLegacyRewriteClaimPathAlloc(
     return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
 }
 
+fn reviewTupleLockLegacyRewriteClaimExpired(
+    allocator: std.mem.Allocator,
+    claim_path: []const u8,
+    now_s: i64,
+) bool {
+    const raw = durable_store.readRegularFileNoSymlink(
+        allocator,
+        claim_path,
+        4096,
+    ) catch return true;
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return true,
+    };
+    const created_at = jsonI64Field(object, "createdAtUnixS") orelse return true;
+    const expires_at = std.math.add(
+        i64,
+        created_at,
+        review_tuple_lock_ttl_seconds,
+    ) catch return true;
+    return expires_at <= now_s;
+}
+
 fn reviewOwnerLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.owner-lease", .{lock_path});
 }
@@ -6787,6 +6813,7 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
     try ensureParentPath(lease_path);
 
     const started_ms = monotonicMilliseconds();
+    var stale_legacy_claim_removed = false;
     while (true) {
         const io = std.Io.Threaded.global_single_threaded.io();
         const file = std.Io.Dir.openFileAbsolute(io, lease_path, .{
@@ -6846,6 +6873,23 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
             ) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     file.close(io);
+                    if (!stale_legacy_claim_removed and
+                        reviewTupleLockLegacyRewriteClaimExpired(
+                            allocator,
+                            claim_path,
+                            unixSeconds(),
+                        ))
+                    {
+                        std.Io.Dir.deleteFileAbsolute(
+                            io,
+                            claim_path,
+                        ) catch |delete_err| switch (delete_err) {
+                            error.FileNotFound => {},
+                            else => return delete_err,
+                        };
+                        stale_legacy_claim_removed = true;
+                        continue;
+                    }
                     const elapsed_ms = monotonicMilliseconds() - started_ms;
                     if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
                     std.Io.sleep(
@@ -7024,6 +7068,9 @@ fn ensureReviewTuplePredecessorExitedWithin(
                     jsonStringField(object, "token") orelse "",
                     receipt_token,
                 )) return error.InvalidReviewTupleLockBinding;
+                if (incarnation_status == false) {
+                    return error.ReviewPredecessorStillAlive;
+                }
                 return;
             }
             if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
@@ -7924,6 +7971,32 @@ fn updateReviewTupleLockBestEffort(
     record_path: ?[]const u8,
     event_log_path: ?[]const u8,
 ) void {
+    updateReviewTupleLock(
+        allocator,
+        path,
+        current,
+        state,
+        failure_code,
+        review_thread_id,
+        review_turn_id,
+        record_path,
+        event_log_path,
+    ) catch |err| switch (err) {
+        else => {},
+    };
+}
+
+fn updateReviewTupleLock(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    current: ReviewTupleLock,
+    state: []const u8,
+    failure_code: ?[]const u8,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    record_path: ?[]const u8,
+    event_log_path: ?[]const u8,
+) !void {
     const next = withReviewTupleLockState(
         current,
         state,
@@ -7934,7 +8007,7 @@ fn updateReviewTupleLockBestEffort(
         record_path,
         event_log_path,
     );
-    writeReviewTupleLock(allocator, path, next) catch {};
+    try writeReviewTupleLock(allocator, path, next);
 }
 
 fn transitionReviewTupleLockForRecordOrReplay(
@@ -16419,6 +16492,23 @@ test "replacement admission requires exact predecessor shutdown receipt" {
     try ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1);
     try std.testing.expect(cas_websocket.processAlive(process_id));
 
+    if (builtin.os.tag == .linux) {
+        const boot_id = try cas_websocket.currentBootIdAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(boot_id);
+        var current_lock = lock;
+        current_lock.lockVersion = review_tuple_lock_version;
+        current_lock.managedServerProcessGroupId = process_id;
+        current_lock.managedServerBootId = boot_id;
+        try std.testing.expectError(
+            error.ReviewPredecessorStillAlive,
+            ensureReviewTuplePredecessorExitedWithin(
+                std.testing.allocator,
+                current_lock,
+                1,
+            ),
+        );
+    }
+
     var legacy_lock = lock;
     legacy_lock.managedServerShutdownReceiptPath = null;
     legacy_lock.managedServerShutdownReceiptToken = null;
@@ -17149,7 +17239,17 @@ test "terminal clean receipt preserves transport lock" {
     try writeReviewTupleLock(allocator, lock_path, lock);
     try std.testing.expect(durable_store.fileExists(lock_path));
 
-    updateReviewTupleLockBestEffort(allocator, lock_path, lock, "terminal", null, "thr_clean", "turn_clean", record_path, event_path);
+    try updateReviewTupleLock(
+        allocator,
+        lock_path,
+        lock,
+        "terminal",
+        null,
+        "thr_clean",
+        "turn_clean",
+        record_path,
+        event_path,
+    );
     try std.testing.expect(durable_store.fileExists(lock_path));
     var updated = (try loadReviewTupleLock(allocator, lock_path)).?;
     defer updated.deinit(allocator);
@@ -17216,4 +17316,42 @@ test "review tuple lock rewrite lease ignores orphaned sidecar content" {
     );
     defer lease.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(lease_path, lease.path);
+}
+
+test "v2 rewrite bridge reclaims an expired legacy claim" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(tmp_root);
+    const path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/lock.json",
+        .{tmp_root},
+    );
+    defer std.testing.allocator.free(path);
+    const claim_path = try reviewTupleLockLegacyRewriteClaimPathAlloc(
+        std.testing.allocator,
+        path,
+    );
+    defer std.testing.allocator.free(claim_path);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        claim_path,
+        "{\"ownerPid\":1,\"createdAtUnixS\":1}\n",
+    );
+
+    var lease = try acquireReviewTupleLockRewriteLeaseWithin(
+        std.testing.allocator,
+        path,
+        0,
+        true,
+    );
+    try std.testing.expect(durable_store.fileExists(claim_path));
+    lease.deinit(std.testing.allocator);
+    try std.testing.expect(!durable_store.fileExists(claim_path));
 }
