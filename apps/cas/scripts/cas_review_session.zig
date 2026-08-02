@@ -1360,7 +1360,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
 
     if (parsed.wait_after_start) {
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "waiting", null, review_thread_id, review_turn_id, record_path, event_log_path);
-        const latest = waitForReviewCompletionOwnerLived(
+        const latest = waitForReviewCompletion(
             allocator,
             &client,
             record.review_thread_id,
@@ -1369,21 +1369,38 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.timeout_ms,
             parsed.poll_interval_ms,
             codex_version,
-            workflow_binding != null,
         ) catch |err| switch (err) {
-            error.WaitTimedOut => {
-                const timeout_status = try fetchReviewStatus(
-                    allocator,
-                    &client,
-                    record.review_thread_id,
-                    record.review_turn_id,
-                    record.event_log_path,
-                    null,
-                    codex_version,
-                );
+            error.WaitTimedOut => timeout: {
+                var timeout_status = fetch_timeout_status: {
+                    break :fetch_timeout_status fetchReviewStatus(
+                        allocator,
+                        &client,
+                        record.review_thread_id,
+                        record.review_turn_id,
+                        record.event_log_path,
+                        null,
+                        codex_version,
+                    ) catch |fetch_err| {
+                        if (!isTransportLossError(fetch_err)) return fetch_err;
+                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
+                    };
+                };
+                if (timeout_status.review_result_available) break :timeout timeout_status;
+                defer timeout_status.deinit(allocator);
+                const timeout_disposition = reviewWaitTimeoutDisposition(workflow_binding != null);
                 record.last_observed_status = timeoutStatusString(&timeout_status);
                 try writeSessionRecord(allocator, record_path, record);
-                updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "waiting", "wait_timed_out", review_thread_id, review_turn_id, record_path, event_log_path);
+                updateReviewTupleLockBestEffort(
+                    allocator,
+                    tuple_lock_bundle.path,
+                    tuple_lock_bundle.lock,
+                    timeout_disposition.lock_state,
+                    timeout_disposition.failure.code,
+                    review_thread_id,
+                    review_turn_id,
+                    record_path,
+                    event_log_path,
+                );
                 if (parsed.json) {
                     try printStartJson(
                         allocator,
@@ -1399,11 +1416,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         timeout_status,
                         true,
                         true,
-                        .{
-                            .code = "wait_timed_out",
-                            .hint = "retry cas review wait on the same review thread " ++
-                                "or increase --timeout-ms",
-                        },
+                        timeout_disposition.failure,
                     );
                 } else {
                     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -3746,44 +3759,30 @@ fn waitForReviewCompletion(
     }
 }
 
-const OwnerLivedTimeoutDisposition = enum {
-    continue_waiting,
-    return_timeout,
+const ReviewWaitTimeoutDisposition = struct {
+    lock_state: []const u8,
+    failure: FailureInfo,
 };
 
-fn ownerLivedTimeoutDisposition(workflow_bound: bool) OwnerLivedTimeoutDisposition {
-    return if (workflow_bound) .continue_waiting else .return_timeout;
-}
-
-fn waitForReviewCompletionOwnerLived(
-    allocator: std.mem.Allocator,
-    client: *cas.Client,
-    review_thread_id: []const u8,
-    review_turn_id: []const u8,
-    event_log_path: []const u8,
-    timeout_ms: u32,
-    poll_interval_ms: u32,
-    codex_version: []const u8,
-    workflow_bound: bool,
-) !ReviewStatus {
-    while (true) {
-        return waitForReviewCompletion(
-            allocator,
-            client,
-            review_thread_id,
-            review_turn_id,
-            event_log_path,
-            timeout_ms,
-            poll_interval_ms,
-            codex_version,
-        ) catch |err| switch (err) {
-            error.WaitTimedOut => switch (ownerLivedTimeoutDisposition(workflow_bound)) {
-                .continue_waiting => continue,
-                .return_timeout => return error.WaitTimedOut,
+fn reviewWaitTimeoutDisposition(workflow_bound: bool) ReviewWaitTimeoutDisposition {
+    if (workflow_bound) {
+        return .{
+            .lock_state = "terminal",
+            .failure = .{
+                .code = "review_transport_timeout",
+                .hint = "owner-lived review reached its finite deadline; " ++
+                    "start one fresh same-request recovery attempt",
             },
-            else => return err,
         };
     }
+    return .{
+        .lock_state = "waiting",
+        .failure = .{
+            .code = "wait_timed_out",
+            .hint = "retry cas review wait on the same review thread " ++
+                "or increase --timeout-ms",
+        },
+    };
 }
 
 fn startParentThreadAlloc(
@@ -5307,6 +5306,7 @@ fn reviewBrokerActionForBlockedLock(decision: ReviewTupleLockAction) []const u8 
 }
 
 fn tupleLockDiagnosticVerdictStatus(lock: ReviewTupleLock) []const u8 {
+    if (std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_timeout")) return "review_transport_failure";
     if (std.mem.eql(u8, lock.lastFailureCode orelse "", "wait_timed_out")) return "timeout";
     return "incomplete";
 }
@@ -7178,6 +7178,9 @@ fn statusReviewAttemptPhase(status: ?ReviewStatus, timed_out: ?bool) []const u8 
 
 fn startReceiptReviewAttemptPhase(status: ?ReviewStatus, timed_out: bool, failure: ?FailureInfo, review_thread_id: ?[]const u8) []const u8 {
     if (failure) |value| {
+        if (std.mem.indexOf(u8, value.code, "transport") != null) {
+            return if (reviewAttemptExists(review_thread_id)) "review_terminal" else "pre_review_start";
+        }
         if (failureCodeIsAccountResourceExhausted(value.code)) {
             return if (reviewAttemptExists(review_thread_id)) "review_terminal" else "pre_review_start";
         }
@@ -7791,16 +7794,24 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
             rootHasStructuredAccountResourceExhaustion(root)
     else
         rootHasStructuredAccountResourceExhaustion(root);
+    const timed_out = jsonBoolField(root, "timedOut") orelse false;
     const status = if (account_failure and !reviewAttemptExists(review_thread_id))
         "incomplete"
     else if (account_failure)
         "account_resource_exhausted"
-    else if (jsonBoolField(root, "timedOut") orelse false)
+    else if (failure_code) |code|
+        if (std.mem.indexOf(u8, code, "transport") != null)
+            reviewVerdictStatus(false, finding_count, .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" }, review_thread_id)
+        else if (timed_out)
+            "timeout"
+        else if (!reviewAttemptExists(review_thread_id))
+            "incomplete"
+        else
+            reviewVerdictStatus(false, finding_count, .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" }, review_thread_id)
+    else if (timed_out)
         "timeout"
     else if (!reviewAttemptExists(review_thread_id))
         "incomplete"
-    else if (failure_code) |code|
-        reviewVerdictStatus(false, finding_count, .{ .code = code, .hint = jsonStringField(root, "failureHint") orelse "" }, review_thread_id)
     else if (finding_count > 0)
         "findings"
     else if (review_result_json != null)
@@ -8891,6 +8902,7 @@ fn retryableSameTupleNowForCode(code: ?[]const u8) ?bool {
     const value = code orelse return null;
     if (failureCodeIsAccountResourceExhausted(value)) return false;
     if (std.mem.eql(u8, value, "review_transport_lost")) return true;
+    if (std.mem.eql(u8, value, "review_transport_timeout")) return true;
     if (std.mem.eql(u8, value, "wait_timed_out")) return true;
     if (std.mem.eql(u8, value, "workflow_bound_review_requires_owner_lived_wait")) return true;
     return null;
@@ -9358,14 +9370,23 @@ test "owner-lived admission exhausts action binding and wait states" {
     }
 }
 
-test "workflow-bound wait timeout preserves the notification owner" {
-    try std.testing.expectEqual(
-        OwnerLivedTimeoutDisposition.continue_waiting,
-        ownerLivedTimeoutDisposition(true),
+test "workflow-bound wait timeout is one terminal owner failure" {
+    const workflow_bound = reviewWaitTimeoutDisposition(true);
+    try std.testing.expectEqualStrings("terminal", workflow_bound.lock_state);
+    try std.testing.expectEqualStrings("review_transport_timeout", workflow_bound.failure.code);
+    try std.testing.expectEqualStrings("transport_review_attempt", failureClassForCode(workflow_bound.failure.code).?);
+    try std.testing.expectEqual(true, retryableSameTupleNowForCode(workflow_bound.failure.code).?);
+    try std.testing.expectEqualStrings(
+        "review_terminal",
+        startReceiptReviewAttemptPhase(null, true, workflow_bound.failure, "thr"),
     );
-    try std.testing.expectEqual(
-        OwnerLivedTimeoutDisposition.return_timeout,
-        ownerLivedTimeoutDisposition(false),
+
+    const unbound = reviewWaitTimeoutDisposition(false);
+    try std.testing.expectEqualStrings("waiting", unbound.lock_state);
+    try std.testing.expectEqualStrings("wait_timed_out", unbound.failure.code);
+    try std.testing.expectEqualStrings(
+        "review_waiting",
+        startReceiptReviewAttemptPhase(null, true, unbound.failure, "thr"),
     );
 }
 
@@ -11720,6 +11741,27 @@ test "receipt normalizer preserves transport failure over requested tuple bindin
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("review_waiting", receipt.review_attempt_phase);
     try std.testing.expectEqualStrings("review_transport_lost", receipt.failure_code.?);
+}
+
+test "workflow-bound timeout normalizes as terminal retryable transport failure" {
+    const raw =
+        \\{"demo":"cas-review-session","action":"start","timedOut":true,"reviewAttemptPhase":"review_terminal","reviewAttemptExists":true,"tupleVerdictExists":false,"reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.jsonl","baseSha":"base_a","headSha":"head_a","targetFingerprint":"fp_a","failureCode":"review_transport_timeout","failureClass":"transport_review_attempt","retryableSameTupleNow":true,"failureHint":"finite owner deadline","workflowBinding":{"requestId":"request-timeout","requestFingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(
+        std.testing.allocator,
+        "transport-timeout.json",
+        raw,
+        true,
+        .{},
+    );
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review_transport_failure", receipt.status);
+    try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
+    try std.testing.expect(receipt.review_attempt_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("review_transport_timeout", receipt.failure_code.?);
+    try std.testing.expectEqualStrings("transport_review_attempt", receipt.failure_class.?);
+    try std.testing.expectEqual(true, receipt.retryable_same_tuple_now.?);
 }
 
 test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
