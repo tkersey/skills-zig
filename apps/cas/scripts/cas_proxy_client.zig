@@ -416,7 +416,7 @@ pub const Client = struct {
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.websocket.?.sendText(payload),
+            .websocket => try self.sendWebSocket(payload),
         }
     }
 
@@ -532,8 +532,22 @@ pub const Client = struct {
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.websocket.?.sendText(payload),
+            .websocket => try self.sendWebSocket(payload),
         }
+    }
+
+    fn sendWebSocket(self: *Client, payload: []const u8) !void {
+        const deadline_ms = self.request_deadline_ms orelse
+            return self.websocket.?.sendText(payload);
+        const remaining_ms = deadline_ms - monotonicMillis();
+        if (remaining_ms <= 0) {
+            self.websocket.?.poison();
+            return error.ConnectionTimedOut;
+        }
+        self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
+            error.Timeout => return error.ConnectionTimedOut,
+            else => return err,
+        };
     }
 
     fn sendServerError(self: *Client, id: i64, code: i64, message: []const u8) !void {

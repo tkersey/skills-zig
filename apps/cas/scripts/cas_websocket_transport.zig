@@ -82,7 +82,23 @@ pub const Connection = struct {
 
     pub fn sendText(self: *Connection, payload: []const u8) !void {
         if (!self.usable) return error.ConnectionPoisoned;
-        try writeClientFrame(self, 0x1, payload);
+        try writeClientFrame(self, 0x1, payload, null);
+    }
+
+    pub fn sendTextTimeout(self: *Connection, payload: []const u8, timeout_ms: u32) !void {
+        if (!self.usable) return error.ConnectionPoisoned;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        });
+        writeClientFrame(self, 0x1, payload, deadline) catch |err| switch (err) {
+            error.Timeout => {
+                self.poison();
+                return error.Timeout;
+            },
+            else => return err,
+        };
     }
 
     pub fn readTextAlloc(self: *Connection) !?[]u8 {
@@ -134,7 +150,7 @@ pub const Connection = struct {
                     }
                 },
                 0x8 => return null,
-                0x9 => try writeClientFrame(self, 0xA, frame.payload.?),
+                0x9 => try writeClientFrame(self, 0xA, frame.payload.?, deadline),
                 0xA => {},
                 else => return error.WebSocketUnexpectedOpcode,
             }
@@ -413,7 +429,12 @@ fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
+fn writeClientFrame(
+    self: *Connection,
+    opcode: u8,
+    payload: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
     const payload_len = payload.len;
     var header: [14]u8 = undefined;
     var header_len: usize = 0;
@@ -440,17 +461,69 @@ fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
     @memcpy(header[header_len .. header_len + 4], &mask);
     header_len += 4;
 
-    var stream_writer = self.stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try stream_writer.interface.writeAll(header[0..header_len]);
+    try writeStreamAllUntil(self.stream, header[0..header_len], deadline);
     if (payload_len == 0) {
-        try stream_writer.interface.flush();
         return;
     }
     const masked = try self.allocator.dupe(u8, payload);
     defer self.allocator.free(masked);
     applyMask(&mask, masked);
-    try stream_writer.interface.writeAll(masked);
-    try stream_writer.interface.flush();
+    try writeStreamAllUntil(self.stream, masked, deadline);
+}
+
+fn writeStreamAllUntil(
+    stream: std.Io.net.Stream,
+    bytes: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    if (deadline == null) {
+        var stream_writer = stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        try stream_writer.interface.writeAll(bytes);
+        try stream_writer.interface.flush();
+        return;
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const remaining_ms = deadline.?.durationFromNow(io).raw.toMilliseconds();
+        if (remaining_ms <= 0) return error.Timeout;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.OUT | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        if (try std.posix.poll(&fds, poll_timeout) == 0) return error.Timeout;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+            return error.ConnectionResetByPeer;
+        }
+
+        var iov = [_]std.posix.iovec_const{.{
+            .base = bytes[offset..].ptr,
+            .len = bytes.len - offset,
+        }};
+        var msg: std.posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = iov.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        const rc = std.posix.system.sendmsg(
+            stream.socket.handle,
+            &msg,
+            std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => offset += @intCast(rc),
+            .INTR, .AGAIN => continue,
+            .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionResetByPeer,
+            else => return error.WebSocketWriteFailed,
+        }
+    }
 }
 
 fn applyMask(mask: *const [4]u8, payload: []u8) void {
@@ -516,4 +589,29 @@ test "websocket read deadline bounds a stalled live socket" {
     try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "websocket write deadline expires before a frame crosses the socket" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer {
+        connection.close();
+        connection.deinit();
+    }
+
+    try std.testing.expectError(error.Timeout, connection.sendTextTimeout("payload", 0));
+    try std.testing.expectError(error.ConnectionPoisoned, connection.sendText("retry"));
 }
