@@ -13,10 +13,14 @@ pub const ManagedServer = struct {
     child: std.process.Child,
     listen_url: []u8,
     owner_control: ?std.Io.File = null,
+    shutdown_receipt_path: ?[]u8 = null,
+    shutdown_receipt_token: ?[]u8 = null,
     stopped: bool = false,
 
     pub fn deinit(self: *ManagedServer, allocator: std.mem.Allocator) void {
         if (self.owner_control != null) self.kill();
+        if (self.shutdown_receipt_token) |value| allocator.free(value);
+        if (self.shutdown_receipt_path) |value| allocator.free(value);
         allocator.free(self.listen_url);
     }
 
@@ -27,6 +31,14 @@ pub const ManagedServer = struct {
             .wasi => 0,
             else => @intCast(child_id),
         };
+    }
+
+    pub fn shutdownReceiptPath(self: *const ManagedServer) ?[]const u8 {
+        return self.shutdown_receipt_path;
+    }
+
+    pub fn shutdownReceiptToken(self: *const ManagedServer) ?[]const u8 {
+        return self.shutdown_receipt_token;
     }
 
     pub fn kill(self: *ManagedServer) void {
@@ -316,6 +328,9 @@ fn startManagedLoopbackServerWithOwnership(
 }
 
 const owner_watchdog_script =
+    \\receipt_path=$1
+    \\receipt_token=$2
+    \\shift 2
     \\child=0
     \\cleanup() {
     \\  if [ "$child" -gt 0 ] 2>/dev/null; then
@@ -327,6 +342,13 @@ const owner_watchdog_script =
     \\    done
     \\    kill -KILL "$child" 2>/dev/null || true
     \\    wait "$child" 2>/dev/null || true
+    \\  fi
+    \\  if [ ! -e "$receipt_path" ]; then
+    \\    umask 077
+    \\    receipt_tmp="${receipt_path}.tmp.$$"
+    \\    printf '{"schema":"CAS-WDR-v1","token":"%s"}\n' "$receipt_token" >"$receipt_tmp" &&
+    \\      mv -n "$receipt_tmp" "$receipt_path" 2>/dev/null || true
+    \\    rm -f "$receipt_tmp" 2>/dev/null || true
     \\  fi
     \\}
     \\trap cleanup EXIT HUP INT TERM
@@ -342,6 +364,21 @@ fn spawnOwnerPipeManagedServer(
     listen_url: []u8,
     io: std.Io,
 ) !ManagedServer {
+    const receipt_dir = try std.fs.path.join(allocator, &.{ cwd, ".ledger", "cas", "review_sessions", "watchdog_receipts" });
+    defer allocator.free(receipt_dir);
+    try std.Io.Dir.cwd().createDirPath(io, receipt_dir);
+    var receipt_random: [16]u8 = undefined;
+    io.random(&receipt_random);
+    const receipt_hex = std.fmt.bytesToHex(receipt_random, .lower);
+    const shutdown_receipt_token = try std.fmt.allocPrint(allocator, "{s}", .{&receipt_hex});
+    errdefer allocator.free(shutdown_receipt_token);
+    const shutdown_receipt_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.json",
+        .{ receipt_dir, &receipt_hex },
+    );
+    errdefer allocator.free(shutdown_receipt_path);
+
     var watchdog_argv: std.ArrayList([]const u8) = .empty;
     defer watchdog_argv.deinit(allocator);
     try watchdog_argv.appendSlice(allocator, &.{
@@ -349,6 +386,8 @@ fn spawnOwnerPipeManagedServer(
         "-c",
         owner_watchdog_script,
         "cas-app-server-watchdog",
+        shutdown_receipt_path,
+        shutdown_receipt_token,
     });
     try watchdog_argv.appendSlice(allocator, server_argv);
 
@@ -358,6 +397,8 @@ fn spawnOwnerPipeManagedServer(
             cwd,
             watchdog_argv.items,
             listen_url,
+            shutdown_receipt_path,
+            shutdown_receipt_token,
         );
     }
 
@@ -378,6 +419,8 @@ fn spawnOwnerPipeManagedServer(
         .child = child,
         .listen_url = listen_url,
         .owner_control = owner_control,
+        .shutdown_receipt_path = shutdown_receipt_path,
+        .shutdown_receipt_token = shutdown_receipt_token,
     };
 }
 
@@ -386,6 +429,8 @@ fn spawnOwnerPipeManagedServerPosix(
     cwd: []const u8,
     watchdog_argv: []const []const u8,
     listen_url: []u8,
+    shutdown_receipt_path: []u8,
+    shutdown_receipt_token: []u8,
 ) !ManagedServer {
     var pipe_fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.SystemResources;
@@ -480,6 +525,8 @@ fn spawnOwnerPipeManagedServerPosix(
             .handle = pipe_fds[1],
             .flags = .{ .nonblocking = false },
         },
+        .shutdown_receipt_path = shutdown_receipt_path,
+        .shutdown_receipt_token = shutdown_receipt_token,
     };
 }
 
@@ -956,8 +1003,31 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     try std.testing.expect(server_pid != null);
     try std.testing.expect(processAlive(watchdog_pid));
     try std.testing.expect(processAlive(server_pid.?));
+    const receipt_path = managed.shutdownReceiptPath().?;
+    const receipt_token = managed.shutdownReceiptToken().?;
 
     managed.kill();
     try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
     try std.testing.expect(waitForProcessExit(server_pid.?, 2_000));
+    const receipt = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        receipt_path,
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(receipt);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
+    defer parsed.deinit();
+    const receipt_object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidShutdownReceipt,
+    };
+    try std.testing.expectEqualStrings(
+        "CAS-WDR-v1",
+        receipt_object.get("schema").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        receipt_token,
+        receipt_object.get("token").?.string,
+    );
 }

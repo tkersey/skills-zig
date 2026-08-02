@@ -235,6 +235,7 @@ const review_tuple_lock_version = "CAS-RTL-v2";
 const legacy_review_tuple_lock_version = "CAS-RTL-v1";
 const review_owner_lease_version = "CAS-ROL-v1";
 const review_tuple_lock_ttl_seconds: i64 = 30 * 60;
+const review_tuple_lock_rewrite_lease_wait_ms: u32 = 500;
 const unknown_account_fingerprint = "unknown-account";
 const principal_strength_strong = "strong";
 const principal_strength_reduced = "reduced";
@@ -288,6 +289,8 @@ const ReviewTupleLock = struct {
     workflowBinding: ?WorkflowBinding = null,
     ownerLeaseVersion: ?[]const u8 = null,
     managedServerPid: ?u64 = null,
+    managedServerShutdownReceiptPath: ?[]const u8 = null,
+    managedServerShutdownReceiptToken: ?[]const u8 = null,
     reviewStartSendStarted: bool = false,
     state: []const u8,
     reviewThreadId: ?[]const u8 = null,
@@ -1749,6 +1752,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             _ = client.swapRequestDeadlineMs(previous_wait_deadline);
         };
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "waiting", null, review_thread_id, review_turn_id, record_path, event_log_path);
+        var terminal_status_from_grace = false;
         const latest = waitForReviewCompletion(
             allocator,
             &client,
@@ -1792,6 +1796,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     };
                 };
                 if (reviewGraceStatusCompletesWait(&timeout_status)) {
+                    terminal_status_from_grace = true;
                     break :timeout timeout_status;
                 }
                 defer timeout_status.deinit(allocator);
@@ -2047,13 +2052,35 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             }
             return err;
         };
+        var terminal_context_client: ?cas.Client = if (terminal_status_from_grace)
+            connectReviewClient(
+                allocator,
+                cwd,
+                resolved_codex_path,
+                codex_version,
+                "websocket",
+                managed_server_listen_url,
+                io,
+                parsed,
+                monotonicMilliseconds() + 1_000,
+            ) catch null
+        else
+            null;
+        defer if (terminal_context_client) |*fresh_client| {
+            fresh_client.close();
+            fresh_client.deinit();
+        };
+        const terminal_context_client_ptr = if (terminal_context_client) |*fresh_client|
+            fresh_client
+        else
+            &client;
         const terminal_context = captureTerminalReviewContext(
             allocator,
             io,
             cwd,
             target,
             parsed.custom_instructions,
-            &client,
+            terminal_context_client_ptr,
             workflow_binding,
         );
         defer terminal_context.deinit(allocator);
@@ -2446,6 +2473,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         current_codex_version,
     );
 
+    var terminal_status_from_grace = false;
     const latest = waitForReviewCompletion(
         allocator,
         &client,
@@ -2489,6 +2517,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             // is terminal evidence, not a timeout diagnostic. Feed it through
             // the ordinary persistence and normalization path below.
             if (reviewGraceStatusCompletesWait(&timeout_status)) {
+                terminal_status_from_grace = true;
                 break :timeout timeout_status;
             }
             record.last_observed_status = timeoutStatusString(&timeout_status);
@@ -2625,13 +2654,35 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         std.process.exit(1);
     }
     try writeSessionRecord(allocator, loaded.record_path, record);
+    var terminal_context_client: ?cas.Client = if (terminal_status_from_grace)
+        connectReviewClient(
+            allocator,
+            record.cwd,
+            record.resolved_codex_path orelse "codex",
+            record.codex_version,
+            record.transport_kind,
+            record.managed_server_listen_url,
+            io,
+            parsed,
+            monotonicMilliseconds() + 1_000,
+        ) catch null
+    else
+        null;
+    defer if (terminal_context_client) |*fresh_client| {
+        fresh_client.close();
+        fresh_client.deinit();
+    };
+    const terminal_context_client_ptr = if (terminal_context_client) |*fresh_client|
+        fresh_client
+    else
+        &client;
     const terminal_context = captureTerminalReviewContext(
         allocator,
         io,
         record.cwd,
         selected_target,
         record.developer_instructions,
-        &client,
+        terminal_context_client_ptr,
         record.workflowBinding,
     );
     defer terminal_context.deinit(allocator);
@@ -3661,7 +3712,7 @@ fn finalReviewStatusGraceMs(poll_interval_ms: u32) u32 {
 }
 
 fn reviewGraceStatusCompletesWait(status: *const ReviewStatus) bool {
-    return status.review_result_available;
+    return status.review_result_available or isTerminalTurnStatus(status.turn_status);
 }
 
 fn reviewHistoryIsNotMaterialized(detail: []const u8) bool {
@@ -6120,8 +6171,42 @@ fn persistDeadOwnerRecoveryEvidence(
             null,
             lock.eventLogPath,
         );
+        const terminal_json = try stringifyAnyAlloc(allocator, terminal);
+        defer allocator.free(terminal_json);
+        const terminal_digest = try sha256HexAlloc(allocator, terminal_json);
+        defer allocator.free(terminal_digest);
+        const predecessor_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.predecessor-{s}",
+            .{ lock_path, terminal_digest["sha256:".len..] },
+        );
+        errdefer allocator.free(predecessor_path);
+        writeReviewTupleLockExclusive(
+            allocator,
+            predecessor_path,
+            terminal,
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                var existing = (try loadReviewTupleLockArtifact(
+                    allocator,
+                    predecessor_path,
+                    false,
+                )) orelse return error.InvalidReviewTupleLockBinding;
+                defer existing.deinit(allocator);
+                if (!std.mem.eql(u8, existing.record.tupleHash, terminal.tupleHash) or
+                    existing.record.ownerPid != terminal.ownerPid or
+                    existing.record.createdAtUnixS != terminal.createdAtUnixS or
+                    !std.mem.eql(u8, existing.record.state, terminal.state) or
+                    !std.mem.eql(
+                        u8,
+                        existing.record.lastFailureCode orelse "",
+                        terminal.lastFailureCode orelse "",
+                    )) return error.InvalidReviewTupleLockBinding;
+            },
+            else => return err,
+        };
         try writeReviewTupleLock(allocator, lock_path, terminal);
-        return null;
+        return predecessor_path;
     };
     var loaded_record = try loadOwnedSessionRecordPath(
         allocator,
@@ -6187,8 +6272,8 @@ fn reviewTupleLockPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ locks_dir, bare_hash });
 }
 
-fn reviewTupleLockRewriteClaimPathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
+fn reviewTupleLockRewriteLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.rewrite-lease", .{lock_path});
 }
 
 fn reviewOwnerLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
@@ -6200,6 +6285,16 @@ const ReviewOwnerLease = struct {
     path: []const u8,
 
     fn deinit(self: *ReviewOwnerLease, allocator: std.mem.Allocator) void {
+        self.file.close(std.Io.Threaded.global_single_threaded.io());
+        allocator.free(self.path);
+    }
+};
+
+const ReviewTupleRewriteLease = struct {
+    file: std.Io.File,
+    path: []const u8,
+
+    fn deinit(self: *ReviewTupleRewriteLease, allocator: std.mem.Allocator) void {
         self.file.close(std.Io.Threaded.global_single_threaded.io());
         allocator.free(self.path);
     }
@@ -6308,7 +6403,11 @@ fn reviewTupleLockPathMatchesHash(path: []const u8, tuple_hash: []const u8) bool
     return std.mem.eql(u8, basename[0 .. basename.len - ".json".len], bare_hash);
 }
 
-fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedReviewTupleLock {
+fn loadReviewTupleLockArtifact(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    require_canonical_path: bool,
+) !?LoadedReviewTupleLock {
     const raw = durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
@@ -6317,7 +6416,8 @@ fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedR
     const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{ .ignore_unknown_fields = true });
     errdefer parsed.deinit();
     if (!try reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value) or
-        !reviewTupleLockPathMatchesHash(path, parsed.value.tupleHash))
+        (require_canonical_path and
+            !reviewTupleLockPathMatchesHash(path, parsed.value.tupleHash)))
     {
         return error.InvalidReviewTupleLockBinding;
     }
@@ -6327,6 +6427,10 @@ fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedR
         .parsed = parsed,
         .record = parsed.value,
     };
+}
+
+fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedReviewTupleLock {
+    return loadReviewTupleLockArtifact(allocator, path, true);
 }
 
 fn makeReviewTupleLock(
@@ -6391,9 +6495,12 @@ fn markReviewStartSendStarted(
     lock: *ReviewTupleLock,
 ) !void {
     if (lock.reviewStartSendStarted) return;
-    const claim_path = try claimReviewTupleLockRewriteExclusive(allocator, lock_path);
-    defer allocator.free(claim_path);
-    defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
+    var rewrite_lease = try acquireReviewTupleLockRewriteLeaseWithin(
+        allocator,
+        lock_path,
+        0,
+    );
+    defer rewrite_lease.deinit(allocator);
     var loaded = (try loadReviewTupleLock(allocator, lock_path)) orelse
         return error.MissingReviewTupleLock;
     defer loaded.deinit(allocator);
@@ -6463,45 +6570,58 @@ fn writeReviewTupleLockExclusive(allocator: std.mem.Allocator, path: []const u8,
     try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
 }
 
-fn reviewTupleLockRewriteClaimExpired(allocator: std.mem.Allocator, claim_path: []const u8, now_s: i64) bool {
-    const raw = durable_store.readRegularFileNoSymlink(allocator, claim_path, 4096) catch return true;
-    defer allocator.free(raw);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
-    defer parsed.deinit();
-    const obj = switch (parsed.value) {
-        .object => |value| value,
-        else => return true,
-    };
-    const created_at = jsonI64Field(obj, "createdAtUnixS") orelse return true;
-    return created_at + review_tuple_lock_ttl_seconds <= now_s;
-}
+fn acquireReviewTupleLockRewriteLeaseWithin(
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+    wait_ms: u32,
+) !ReviewTupleRewriteLease {
+    const lease_path = try reviewTupleLockRewriteLeasePathAlloc(allocator, lock_path);
+    errdefer allocator.free(lease_path);
+    try ensureParentPath(lease_path);
 
-fn claimReviewTupleLockRewriteExclusive(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
-    const claim_path = try reviewTupleLockRewriteClaimPathAlloc(allocator, lock_path);
-    errdefer allocator.free(claim_path);
-    try ensureParentPath(claim_path);
-
-    var stale_claim_removed = false;
+    const started_ms = monotonicMilliseconds();
     while (true) {
-        const claim = try std.fmt.allocPrint(allocator, "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n", .{ currentProcessId(), unixSeconds() });
-        defer allocator.free(claim);
-        durable_store.writeTextCreateNew(allocator, claim_path, claim, .{ .reject_symlinks = true }) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                if (!stale_claim_removed and reviewTupleLockRewriteClaimExpired(allocator, claim_path, unixSeconds())) {
-                    deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
-                    stale_claim_removed = true;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = std.Io.Dir.openFileAbsolute(io, lease_path, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .follow_symlinks = false,
+        }) catch |open_err| switch (open_err) {
+            error.FileNotFound => std.Io.Dir.createFileAbsolute(io, lease_path, .{
+                .read = true,
+                .truncate = false,
+                .exclusive = true,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => continue,
+                error.WouldBlock => {
+                    const elapsed_ms = monotonicMilliseconds() - started_ms;
+                    if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
+                    std.Io.sleep(
+                        io,
+                        .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
+                        .awake,
+                    ) catch {};
                     continue;
-                }
-                return err;
+                },
+                else => return create_err,
             },
-            else => return err,
+            error.WouldBlock => {
+                const elapsed_ms = monotonicMilliseconds() - started_ms;
+                if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
+                std.Io.sleep(
+                    io,
+                    .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
+                    .awake,
+                ) catch {};
+                continue;
+            },
+            else => return open_err,
         };
-        return claim_path;
+        return .{ .file = file, .path = lease_path };
     }
-}
-
-fn deleteReviewTupleLockRewriteClaimBestEffort(claim_path: []const u8) void {
-    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), claim_path) catch {};
 }
 
 fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8) ReviewTupleLockAction {
@@ -6613,12 +6733,64 @@ fn ensureReviewTuplePredecessorExitedWithin(
     lock: ReviewTupleLock,
     timeout_ms: u32,
 ) !void {
-    const managed_server_pid = reviewTupleManagedServerPid(allocator, lock) orelse
-        return error.InvalidReviewTupleLockBinding;
-    if (managed_server_pid == 0) return error.InvalidReviewTupleLockBinding;
-    if (!cas_websocket.waitForProcessExit(managed_server_pid, timeout_ms)) {
+    if (lock.managedServerShutdownReceiptPath) |receipt_path| {
+        const receipt_token = lock.managedServerShutdownReceiptToken orelse
+            return error.InvalidReviewTupleLockBinding;
+        const started_ms = monotonicMilliseconds();
+        while (true) {
+            const raw = durable_store.readRegularFileNoSymlink(
+                allocator,
+                receipt_path,
+                4096,
+            ) catch null;
+            if (raw) |payload| {
+                defer allocator.free(payload);
+                var parsed = std.json.parseFromSlice(
+                    std.json.Value,
+                    allocator,
+                    payload,
+                    .{},
+                ) catch return error.InvalidReviewTupleLockBinding;
+                defer parsed.deinit();
+                const object = switch (parsed.value) {
+                    .object => |value| value,
+                    else => return error.InvalidReviewTupleLockBinding,
+                };
+                if (!std.mem.eql(
+                    u8,
+                    jsonStringField(object, "schema") orelse "",
+                    "CAS-WDR-v1",
+                ) or !std.mem.eql(
+                    u8,
+                    jsonStringField(object, "token") orelse "",
+                    receipt_token,
+                )) return error.InvalidReviewTupleLockBinding;
+                return;
+            }
+            if (monotonicMilliseconds() - started_ms >= timeout_ms) {
+                return error.ReviewPredecessorStillAlive;
+            }
+            std.Io.sleep(
+                std.Io.Threaded.global_single_threaded.io(),
+                .fromMilliseconds(10),
+                .awake,
+            ) catch {};
+        }
+    }
+
+    // Existing CAS-RTL-v2 locks predate the stable shutdown receipt. Their
+    // acquired owner lease proves the owner is gone, and the released
+    // watchdog contract has a bounded child-retirement grace. Numeric PID is
+    // diagnostic only and cannot gate authority across PID reuse.
+    const compatibility_wait_ms = cas_websocket.owner_watchdog_shutdown_grace_ms + 100;
+    if (timeout_ms < compatibility_wait_ms) {
         return error.ReviewPredecessorStillAlive;
     }
+    std.Io.sleep(
+        std.Io.Threaded.global_single_threaded.io(),
+        .fromMilliseconds(compatibility_wait_ms),
+        .awake,
+    ) catch {};
 }
 
 fn reviewTupleLockActionForAcquire(
@@ -7115,6 +7287,14 @@ fn acquireReviewTupleStartLockOrExit(
                 server.processId()
             else
                 null;
+            lock.managedServerShutdownReceiptPath = if (managed_server_to_kill_on_exit) |server|
+                server.shutdownReceiptPath()
+            else
+                null;
+            lock.managedServerShutdownReceiptToken = if (managed_server_to_kill_on_exit) |server|
+                server.shutdownReceiptToken()
+            else
+                null;
             writeReviewTupleLockExclusive(allocator, lock_path, lock) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     var raced = (loadReviewTupleLock(allocator, lock_path) catch {
@@ -7193,9 +7373,10 @@ fn acquireReviewTupleStartLockOrExit(
         .takeover_with_override,
         .fresh_after_terminal,
         => {
-            const claim_path = claimReviewTupleLockRewriteExclusive(
+            var rewrite_lease = acquireReviewTupleLockRewriteLeaseWithin(
                 allocator,
                 lock_path,
+                0,
             ) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -7213,8 +7394,7 @@ fn acquireReviewTupleStartLockOrExit(
                 },
                 else => return err,
             };
-            defer allocator.free(claim_path);
-            defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
+            defer rewrite_lease.deinit(allocator);
 
             var latest = (loadReviewTupleLock(allocator, lock_path) catch {
                 killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -7332,6 +7512,14 @@ fn acquireReviewTupleStartLockOrExit(
                 server.processId()
             else
                 null;
+            lock.managedServerShutdownReceiptPath = if (managed_server_to_kill_on_exit) |server|
+                server.shutdownReceiptPath()
+            else
+                null;
+            lock.managedServerShutdownReceiptToken = if (managed_server_to_kill_on_exit) |server|
+                server.shutdownReceiptToken()
+            else
+                null;
             try writeReviewTupleLock(allocator, lock_path, lock);
             return .{
                 .path = lock_path,
@@ -7433,9 +7621,12 @@ fn transitionActiveReviewTupleLockForRecord(
 ) !bool {
     const lock_path = try storedReviewTupleLockPathAlloc(allocator, record);
     defer allocator.free(lock_path);
-    const claim_path = try claimReviewTupleLockRewriteExclusive(allocator, lock_path);
-    defer allocator.free(claim_path);
-    defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
+    var rewrite_lease = try acquireReviewTupleLockRewriteLeaseWithin(
+        allocator,
+        lock_path,
+        review_tuple_lock_rewrite_lease_wait_ms,
+    );
+    defer rewrite_lease.deinit(allocator);
     var loaded = try loadExactReviewTupleLockForRecord(
         allocator,
         record,
@@ -11188,6 +11379,12 @@ test "workflow-bound wait timeout is one terminal owner failure" {
 
     var grace_status = try makeDisconnectedReviewStatus(std.testing.allocator);
     defer grace_status.deinit(std.testing.allocator);
+    try std.testing.expect(!reviewGraceStatusCompletesWait(&grace_status));
+    std.testing.allocator.free(grace_status.turn_status);
+    grace_status.turn_status = try std.testing.allocator.dupe(u8, "failed");
+    try std.testing.expect(reviewGraceStatusCompletesWait(&grace_status));
+    std.testing.allocator.free(grace_status.turn_status);
+    grace_status.turn_status = try std.testing.allocator.dupe(u8, "inProgress");
     try std.testing.expect(!reviewGraceStatusCompletesWait(&grace_status));
     grace_status.review_result_available = true;
     try std.testing.expect(reviewGraceStatusCompletesWait(&grace_status));
@@ -15627,12 +15824,13 @@ test "recordless dead owner recovery terminalizes the exact lock" {
         .fingerprint = "fp",
     };
 
-    try std.testing.expect((try persistDeadOwnerRecoveryEvidence(
+    const pre_send_predecessor_path = (try persistDeadOwnerRecoveryEvidence(
         std.testing.allocator,
         lock_path,
         lock,
         identity,
-    )) == null);
+    )).?;
+    defer std.testing.allocator.free(pre_send_predecessor_path);
     var pre_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
     defer pre_send.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("pre_review_start_failed", pre_send.record.state);
@@ -15640,15 +15838,28 @@ test "recordless dead owner recovery terminalizes the exact lock" {
         "workflow_bound_review_owner_lost_before_start",
         pre_send.record.lastFailureCode.?,
     );
+    var pre_send_predecessor = (try loadReviewTupleLockArtifact(
+        std.testing.allocator,
+        pre_send_predecessor_path,
+        false,
+    )).?;
+    defer pre_send_predecessor.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(
+        "pre_review_start_failed",
+        pre_send_predecessor.record.state,
+    );
 
+    lock.ownerPid = 2;
+    lock.createdAtUnixS = 2;
     lock.reviewStartSendStarted = true;
     try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
-    try std.testing.expect((try persistDeadOwnerRecoveryEvidence(
+    const post_send_predecessor_path = (try persistDeadOwnerRecoveryEvidence(
         std.testing.allocator,
         lock_path,
         lock,
         identity,
-    )) == null);
+    )).?;
+    defer std.testing.allocator.free(post_send_predecessor_path);
     var post_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
     defer post_send.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("terminal", post_send.record.state);
@@ -15656,18 +15867,48 @@ test "recordless dead owner recovery terminalizes the exact lock" {
         "review_transport_lost",
         post_send.record.lastFailureCode.?,
     );
+    var post_send_predecessor = (try loadReviewTupleLockArtifact(
+        std.testing.allocator,
+        post_send_predecessor_path,
+        false,
+    )).?;
+    defer post_send_predecessor.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("terminal", post_send_predecessor.record.state);
+
+    var successor = lock;
+    successor.ownerPid = 3;
+    successor.createdAtUnixS = 3;
+    successor.state = "starting_review";
+    successor.lastFailureCode = null;
+    try writeReviewTupleLock(std.testing.allocator, lock_path, successor);
+    var preserved_predecessor = (try loadReviewTupleLockArtifact(
+        std.testing.allocator,
+        post_send_predecessor_path,
+        false,
+    )).?;
+    defer preserved_predecessor.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("terminal", preserved_predecessor.record.state);
+    try std.testing.expectEqual(@as(u64, 2), preserved_predecessor.record.ownerPid);
 }
 
-test "replacement admission requires predecessor process exit" {
+test "replacement admission requires exact predecessor shutdown receipt" {
     const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const receipt_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "shutdown-receipt.json" },
+    );
+    defer std.testing.allocator.free(receipt_path);
     var child = try cas_websocket.spawnDetachedProcess(
         std.testing.allocator,
         "/tmp",
         &.{ "/bin/sh", "-c", "sleep 10" },
         io,
     );
-    var child_live = true;
-    defer if (child_live) child.kill(io);
+    defer child.kill(io);
     const process_id: u64 = switch (builtin.os.tag) {
         .windows => @intCast(@intFromPtr(child.id.?)),
         .wasi => 0,
@@ -15685,6 +15926,8 @@ test "replacement admission requires predecessor process exit" {
         .accountFingerprintReducedProtection = false,
         .state = "starting_review",
         .managedServerPid = process_id,
+        .managedServerShutdownReceiptPath = receipt_path,
+        .managedServerShutdownReceiptToken = "generation-token",
         .createdAtUnixS = 1,
         .updatedAtUnixS = 1,
         .expiresAtUnixS = 61,
@@ -15695,10 +15938,37 @@ test "replacement admission requires predecessor process exit" {
         error.ReviewPredecessorStillAlive,
         ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
     );
-    child.kill(io);
-    child_live = false;
-    try std.testing.expect(cas_websocket.waitForProcessExit(process_id, 2_000));
+
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        receipt_path,
+        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"wrong-token\"}\n",
+    );
+    try std.testing.expectError(
+        error.InvalidReviewTupleLockBinding,
+        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
+    );
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        receipt_path,
+        "{\"schema\":\"CAS-WDR-v1\",\"token\":\"generation-token\"}\n",
+    );
     try ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1);
+    try std.testing.expect(cas_websocket.processAlive(process_id));
+
+    var legacy_lock = lock;
+    legacy_lock.managedServerShutdownReceiptPath = null;
+    legacy_lock.managedServerShutdownReceiptToken = null;
+    try std.testing.expectError(
+        error.ReviewPredecessorStillAlive,
+        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, legacy_lock, 1),
+    );
+    try ensureReviewTuplePredecessorExitedWithin(
+        std.testing.allocator,
+        legacy_lock,
+        cas_websocket.owner_watchdog_shutdown_grace_ms + 100,
+    );
+    try std.testing.expect(cas_websocket.processAlive(process_id));
 }
 
 test "review tuple lock load rejects path and complete-tuple mismatches" {
@@ -16369,7 +16639,7 @@ test "terminal clean receipt preserves transport lock" {
     try std.testing.expectEqualStrings(record_path, updated.record.recordPath.?);
 }
 
-test "review tuple lock rewrite claim is exclusive" {
+test "review tuple lock rewrite lease is exclusive and kernel released" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16378,18 +16648,25 @@ test "review tuple lock rewrite claim is exclusive" {
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
 
-    const claim_path = try claimReviewTupleLockRewriteExclusive(std.testing.allocator, path);
-    defer std.testing.allocator.free(claim_path);
-    defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
-
-    try std.testing.expectError(error.PathAlreadyExists, claimReviewTupleLockRewriteExclusive(std.testing.allocator, path));
-    deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
-    const reclaimed_path = try claimReviewTupleLockRewriteExclusive(std.testing.allocator, path);
-    defer std.testing.allocator.free(reclaimed_path);
-    defer deleteReviewTupleLockRewriteClaimBestEffort(reclaimed_path);
+    var lease = try acquireReviewTupleLockRewriteLeaseWithin(
+        std.testing.allocator,
+        path,
+        0,
+    );
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        acquireReviewTupleLockRewriteLeaseWithin(std.testing.allocator, path, 0),
+    );
+    lease.deinit(std.testing.allocator);
+    var reacquired = try acquireReviewTupleLockRewriteLeaseWithin(
+        std.testing.allocator,
+        path,
+        0,
+    );
+    defer reacquired.deinit(std.testing.allocator);
 }
 
-test "review tuple lock rewrite claim expires stale sidecar" {
+test "review tuple lock rewrite lease ignores orphaned sidecar content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -16397,15 +16674,18 @@ test "review tuple lock rewrite claim expires stale sidecar" {
     defer std.testing.allocator.free(tmp_root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock.json", .{tmp_root});
     defer std.testing.allocator.free(path);
-    const claim_path = try reviewTupleLockRewriteClaimPathAlloc(std.testing.allocator, path);
-    defer std.testing.allocator.free(claim_path);
-    defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
+    const lease_path = try reviewTupleLockRewriteLeasePathAlloc(std.testing.allocator, path);
+    defer std.testing.allocator.free(lease_path);
 
     try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
-        .sub_path = claim_path,
+        .sub_path = lease_path,
         .data = "{\"ownerPid\":1,\"createdAtUnixS\":1}\n",
     });
-    const reclaimed_path = try claimReviewTupleLockRewriteExclusive(std.testing.allocator, path);
-    defer std.testing.allocator.free(reclaimed_path);
-    try std.testing.expectEqualStrings(claim_path, reclaimed_path);
+    var lease = try acquireReviewTupleLockRewriteLeaseWithin(
+        std.testing.allocator,
+        path,
+        0,
+    );
+    defer lease.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(lease_path, lease.path);
 }

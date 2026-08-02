@@ -601,10 +601,17 @@ pub const Client = struct {
             self.request_send_started = true;
             return self.websocket.?.sendText(payload);
         };
-        const remaining_ms = deadline_ms - monotonicMillis();
+        var remaining_ms = deadline_ms - monotonicMillis();
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
-        if (send_observer) |observer| try observer.before_send(observer.context);
-        self.request_send_started = true;
+        if (send_observer) |observer| {
+            try observer.before_send(observer.context);
+            // Crossing the durable observer boundary owns every subsequent
+            // outcome, including a deadline that expires before socket write.
+            self.request_send_started = true;
+        }
+        remaining_ms = deadline_ms - monotonicMillis();
+        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (send_observer == null) self.request_send_started = true;
         self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
             error.Timeout => return error.ConnectionTimedOut,
             else => return err,
@@ -979,6 +986,16 @@ const SendObserverProbe = struct {
         probe.calls += 1;
         return error.SendBoundaryPersistenceFailed;
     }
+
+    fn expireDeadlineAfterPersistence(context: *anyopaque) anyerror!void {
+        const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
+        probe.calls += 1;
+        std.Io.sleep(
+            std.Io.Threaded.global_single_threaded.io(),
+            .fromMilliseconds(100),
+            .awake,
+        ) catch {};
+    }
 };
 
 test "request send observer runs before transport send attribution" {
@@ -1013,6 +1030,41 @@ test "request send observer runs before transport send attribution" {
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(!client.lastRequestSendStarted());
+}
+
+test "request send ownership survives deadline expiry after durable observer" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .websocket,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+        .request_deadline_ms = monotonicMillis() + 50,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+    var probe = SendObserverProbe{};
+
+    try std.testing.expectError(
+        error.ConnectionTimedOut,
+        client.sendToServer(.{ .method = "review/start" }, .{
+            .context = &probe,
+            .before_send = SendObserverProbe.expireDeadlineAfterPersistence,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(client.lastRequestSendStarted());
 }
 
 test "resolveExecDecision honors read_only and explicit approvals" {
