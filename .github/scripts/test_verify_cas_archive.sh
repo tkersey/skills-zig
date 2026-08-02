@@ -65,8 +65,7 @@ write_stub_set() {
     cas-session-inquiry \
     cas-conformance-suite \
     cas-goal \
-    cas-perf-budget-governor \
-    ledger; do
+    cas-perf-budget-governor; do
     stub_marker="$name"
     if [[ "$name" == "cas_review_session" ]]; then
       stub_marker="cas review"
@@ -102,9 +101,9 @@ clone_set "$tmp/base-linux" "$tmp/missing-sibling"
 rm "$tmp/missing-sibling/cas_review_session"
 archive_dot "$tmp/missing-sibling" "$tmp/missing-sibling.tar.gz"
 
-clone_set "$tmp/base-linux" "$tmp/missing-ledger"
-rm "$tmp/missing-ledger/ledger"
-archive_dot "$tmp/missing-ledger" "$tmp/missing-ledger.tar.gz"
+clone_set "$tmp/base-linux" "$tmp/bundled-ledger"
+write_stub "$tmp/bundled-ledger/ledger" ledger
+archive_dot "$tmp/bundled-ledger" "$tmp/bundled-ledger.tar.gz"
 
 clone_set "$tmp/base-linux" "$tmp/non-executable-sibling"
 chmod -x "$tmp/non-executable-sibling/cas_review_session"
@@ -133,7 +132,7 @@ archive_dot "$tmp/broken-dispatcher" "$tmp/broken-dispatcher.tar.gz"
 "$verifier" darwin-arm64 "$tmp/darwin-bare.tar.gz" >/dev/null
 "$verifier" linux-x86_64 "$tmp/linux.tar.gz" >/dev/null
 expect_fail linux-x86_64 "$tmp/missing-sibling.tar.gz" "missing dispatcher sibling"
-expect_fail linux-x86_64 "$tmp/missing-ledger.tar.gz" "missing Ledger dependency"
+expect_fail linux-x86_64 "$tmp/bundled-ledger.tar.gz" "bundled Ledger executable"
 expect_fail linux-x86_64 "$tmp/non-executable-sibling.tar.gz" "non-executable dispatcher sibling"
 expect_fail linux-x86_64 "$tmp/symlink-sibling.tar.gz" "symbolic-link dispatcher sibling"
 expect_fail linux-x86_64 "$tmp/hardlink-sibling.tar.gz" "hard-link dispatcher sibling"

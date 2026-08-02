@@ -209,7 +209,7 @@ write_ci_helper() {
 }
 
 assert_affected seq write_seq
-assert_affected cas,ledger write_ledger
+assert_affected ledger write_ledger
 assert_affected seq,cas,ledger write_definition_core
 assert_affected seq,cas,ledger write_definition_compat
 assert_affected seq,cas write_trace_core
@@ -220,16 +220,16 @@ assert_affected "" move_perf_contract_to_tools
 assert_affected "" write_tool_perf_contract
 assert_affected "" write_perf_hub_build
 assert_affected seq write_seq_build
-assert_affected cas,ledger write_ledger_build
-assert_affected cas,ledger write_ledger_module_build
-assert_affected cas,ledger write_universalist_build
+assert_affected ledger write_ledger_build
+assert_affected ledger write_ledger_module_build
+assert_affected ledger write_universalist_build
 assert_affected seq write_seq_strip_build
 assert_affected img move_build_line
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_mixed_seq_unknown_build
 assert_affected seq,cas,ledger write_definition_package_path
-assert_affected cas,ledger write_ledger_package_path
-assert_affected cas,ledger write_learnings_package_path
-assert_affected cas,ledger write_synesthesia_package_path
+assert_affected ledger write_ledger_package_path
+assert_affected ledger write_learnings_package_path
+assert_affected ledger write_synesthesia_package_path
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_package_change
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_build_only
 assert_affected seq,lift,cas,cron,ledger,memory-note,img write_unknown_app
