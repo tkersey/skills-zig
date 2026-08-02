@@ -59,6 +59,10 @@ pub const Connection = struct {
         const address = try std.Io.net.IpAddress.parse(parsed.host, parsed.port);
         const io = std.Io.Threaded.global_single_threaded.io();
         const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        });
         while (true) {
             const stream = address.connect(io, .{ .mode = .stream }) catch |err| {
                 const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
@@ -67,9 +71,12 @@ pub const Connection = struct {
                 continue;
             };
 
-            handshakeClient(allocator, stream, parsed.host, parsed.port, parsed.path) catch |err| {
+            handshakeClient(allocator, stream, parsed.host, parsed.port, parsed.path, deadline) catch |err| {
                 stream.close(io);
-                return err;
+                return switch (err) {
+                    error.Timeout => error.ConnectionTimedOut,
+                    else => err,
+                };
             };
 
             return .{
@@ -628,6 +635,7 @@ fn handshakeClient(
     host: []const u8,
     port: u16,
     path: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
 ) !void {
     var random_bytes: [16]u8 = undefined;
     std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
@@ -640,19 +648,17 @@ fn handshakeClient(
         .{ path, host, port, key },
     );
     defer allocator.free(request);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var stream_writer = stream.writer(io, &.{});
-    try stream_writer.interface.writeAll(request);
-    try stream_writer.interface.flush();
+    try writeStreamAllUntil(stream, request, deadline);
 
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
     while (mem.indexOf(u8, response_buf.items, "\r\n\r\n") == null) {
         var tmp: [1]u8 = undefined;
-        var stream_reader = stream.reader(io, &.{});
-        const n = try stream_reader.interface.readSliceShort(tmp[0..]);
-        if (n == 0) return error.WebSocketHandshakeClosed;
-        try response_buf.appendSlice(allocator, tmp[0..n]);
+        readStreamExact(stream, &tmp, deadline) catch |err| switch (err) {
+            error.EndOfStream => return error.WebSocketHandshakeClosed,
+            else => return err,
+        };
+        try response_buf.append(allocator, tmp[0]);
     }
 
     const header_end = mem.indexOf(u8, response_buf.items, "\r\n\r\n").? + 4;
@@ -840,6 +846,31 @@ test "websocket read deadline bounds a stalled live socket" {
     const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
     try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(50));
     try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
+    const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "websocket HTTP upgrade shares the finite connection deadline" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    defer client_stream.close(io);
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = std.Io.Duration.fromMilliseconds(50),
+        .clock = .awake,
+    });
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    try std.testing.expectError(
+        error.Timeout,
+        handshakeClient(std.testing.allocator, client_stream, loopback_host, port, "/", deadline),
+    );
     const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
     try std.testing.expect(elapsed_ms < 1_000);
 }
