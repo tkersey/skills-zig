@@ -94,6 +94,7 @@ pub const Client = struct {
     dynamic_tool_response_json: ?[]const u8,
     read_only: bool,
     blocking_server_request_count: u64 = 0,
+    request_deadline_ms: ?i64 = null,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         if (opts.websocket_url) |url| {
@@ -255,6 +256,12 @@ pub const Client = struct {
             }
             return error.InvalidAppServerResponse;
         }
+    }
+
+    pub fn swapRequestDeadlineMs(self: *Client, deadline_ms: ?i64) ?i64 {
+        const previous = self.request_deadline_ms;
+        self.request_deadline_ms = deadline_ms;
+        return previous;
     }
 
     fn isNotificationMessage(msg_obj: core_json.ObjectMap) bool {
@@ -763,7 +770,14 @@ pub const Client = struct {
 
     fn readLineAlloc(self: *Client) !?[]u8 {
         if (self.transport_kind == .websocket) {
-            return try self.websocket.?.readTextAlloc();
+            const deadline_ms = self.request_deadline_ms orelse
+                return try self.websocket.?.readTextAlloc();
+            const remaining_ms = deadline_ms - monotonicMillis();
+            if (remaining_ms <= 0) return error.ConnectionTimedOut;
+            return self.websocket.?.readTextAllocTimeout(@intCast(remaining_ms)) catch |err| switch (err) {
+                error.Timeout => error.ConnectionTimedOut,
+                else => err,
+            };
         }
 
         while (true) {

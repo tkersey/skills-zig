@@ -77,12 +77,32 @@ pub const Connection = struct {
     }
 
     pub fn readTextAlloc(self: *Connection) !?[]u8 {
+        return self.readTextAllocUntil(null);
+    }
+
+    pub fn readTextAllocTimeout(self: *Connection, timeout_ms: u32) !?[]u8 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const duration = std.Io.Clock.Duration{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        };
+        const deadline = std.Io.Clock.Timestamp.fromNow(
+            io,
+            duration,
+        );
+        return self.readTextAllocUntil(deadline);
+    }
+
+    fn readTextAllocUntil(
+        self: *Connection,
+        deadline: ?std.Io.Clock.Timestamp,
+    ) !?[]u8 {
         var fragment_type: ?u8 = null;
         var fragmented: std.ArrayList(u8) = .empty;
         defer fragmented.deinit(self.allocator);
 
         while (true) {
-            const frame = try self.readFrameAlloc();
+            const frame = try self.readFrameAlloc(deadline);
             defer if (frame.payload) |owned| self.allocator.free(owned);
 
             switch (frame.opcode) {
@@ -116,9 +136,12 @@ pub const Connection = struct {
         payload: ?[]u8,
     };
 
-    fn readFrameAlloc(self: *Connection) !Frame {
-        const first = try readByte(self);
-        const second = try readByte(self);
+    fn readFrameAlloc(
+        self: *Connection,
+        deadline: ?std.Io.Clock.Timestamp,
+    ) !Frame {
+        const first = try readByte(self, deadline);
+        const second = try readByte(self, deadline);
         const fin = (first & 0x80) != 0;
         const opcode = first & 0x0F;
         const masked = (second & 0x80) != 0;
@@ -126,17 +149,17 @@ pub const Connection = struct {
         var payload_len: u64 = second & 0x7F;
         if (payload_len == 126) {
             var extended: [2]u8 = undefined;
-            try readStreamExact(self.stream, &extended);
+            try readStreamExact(self.stream, &extended, deadline);
             payload_len = mem.readInt(u16, &extended, .big);
         } else if (payload_len == 127) {
             var extended: [8]u8 = undefined;
-            try readStreamExact(self.stream, &extended);
+            try readStreamExact(self.stream, &extended, deadline);
             payload_len = mem.readInt(u64, &extended, .big);
         }
 
         var mask: [4]u8 = undefined;
         if (masked) {
-            try readStreamExact(self.stream, &mask);
+            try readStreamExact(self.stream, &mask, deadline);
         }
 
         const payload = if (payload_len == 0)
@@ -144,7 +167,7 @@ pub const Connection = struct {
         else blk: {
             const owned = try self.allocator.alloc(u8, @intCast(payload_len));
             errdefer self.allocator.free(owned);
-            try readStreamExact(self.stream, owned);
+            try readStreamExact(self.stream, owned, deadline);
             if (masked) applyMask(&mask, owned);
             break :blk owned;
         };
@@ -425,13 +448,56 @@ fn applyMask(mask: *const [4]u8, payload: []u8) void {
     }
 }
 
-fn readByte(self: *Connection) !u8 {
+fn readByte(self: *Connection, deadline: ?std.Io.Clock.Timestamp) !u8 {
     var buf: [1]u8 = undefined;
-    try readStreamExact(self.stream, &buf);
+    try readStreamExact(self.stream, &buf, deadline);
     return buf[0];
 }
 
-fn readStreamExact(stream: std.Io.net.Stream, dest: []u8) !void {
-    var reader = stream.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try reader.interface.readSliceAll(dest);
+fn readStreamExact(
+    stream: std.Io.net.Stream,
+    dest: []u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var offset: usize = 0;
+    while (offset < dest.len) {
+        const incoming = if (deadline) |value|
+            try stream.socket.receiveTimeout(
+                io,
+                dest[offset..],
+                .{ .deadline = value },
+            )
+        else
+            try stream.socket.receive(io, dest[offset..]);
+        if (incoming.data.len == 0) return error.EndOfStream;
+        offset += incoming.data.len;
+    }
+}
+
+test "websocket read deadline bounds a stalled live socket" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer {
+        connection.close();
+        connection.deinit();
+    }
+
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(50));
+    const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
 }
