@@ -37,16 +37,16 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
 - `cas review` exposes exactly three actions: `run`, `start`, and `wait`. `run` brokers one tuple-bound attempt to a terminal verdict; `start` creates one detached attempt; `wait` observes that detached attempt to a terminal result. On Codex 0.145 and newer, CAS runs the native review inline within its own fresh isolated thread because Codex's detached delivery is an ordinary prose-oriented review-agent turn and does not emit `exited_review_mode.review_output`. Parent-thread reuse is rejected on this route because Codex returns the parent ID as the inline `reviewThreadId`; requiring a fresh parent preserves one unique persisted handle per attempt. Before that inline rollout materializes, CAS preserves a structured non-terminal state and still requires the exact review turn before accepting a terminal result. A partially materialized `completed` turn that entered review mode but has not emitted its structured exit also remains non-terminal. Later `wait` calls bind completion semantics to the attempt's recorded Codex runtime; the currently installed runtime is used only for tuple-currentness checks. Older Codex runtimes retain detached delivery and their existing parent-reuse path. Process completion and prose remain non-proof on both routes.
 - The review kernel is a clean schema-4 cutover. Finish active pre-kernel reviews before upgrading: current CAS intentionally rejects pre-kernel session records and does not discover or coordinate through pre-kernel tuple locks. After upgrading, start a current attempt with a fresh caller binding; CAS does not migrate or bridge the retired state.
-- `cas review run` and `start` accept an optional `--workflow-binding-json JSON|@FILE` containing caller-owned `requestId` and `requestFingerprint` strings. CAS validates the opaque binding, binds it to the attempt identity, and returns it unchanged.
+- `cas review run` and `start` accept an optional `--workflow-binding-json JSON|@FILE` containing caller-owned `requestId` and `requestFingerprint` strings. CAS validates the opaque binding, binds it to the attempt identity, and returns it unchanged. A workflow-bound `start` is admitted only with `--wait`, so one CAS process owns the notification channel from `review/start` through terminal evidence. Without `--wait`, CAS returns `workflow_bound_review_requires_owner_lived_wait` before Codex resolution, app-server launch, tuple locking, session persistence, or `review/start`; this path cannot consume attempt or recovery credit. Unbound detached starts and historical `wait` remain available for diagnostics and compatibility.
 - `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied text as fresh-parent `developerInstructions` and sends the Git selector separately as `review/start.target`; the selector remains the source of base/head/fingerprint identity.
-- Review waits default to `2700000` ms. Detached `start` defaults to `300000` ms unless `--wait` is supplied. An explicit positive `--timeout-ms` value always wins.
+- Review waits default to `2700000` ms. Unbound detached `start` defaults to `300000` ms unless `--wait` is supplied. Workflow-bound starts require `--wait`. An explicit positive `--timeout-ms` value always wins.
 - On Codex 0.145 and newer, CAS sets `excludeTurns:true` on metadata-only `thread/resume` requests. Older runtimes retain the prior parameter shape.
 - `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It requires the packaged Ledger runtime plus Ledger-validated DCP-v2/RIP-v1 inputs, snapshots and revalidates the exact inquiry carriers before initial or resumed execution, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. Release archives include the required `ledger` sibling; package managers must declare Ledger as a runtime dependency. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
 - Thread-backed inquiry rejects paginated source history before `thread/fork`, which Codex 0.145 does not support. Use a legacy-history thread or the verified `rollout_transcript` lineage.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports both `thread_fork_replay` and `rollout_transcript_replay` support.
-- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, `cas_review_scoped_instructions_v1`, and `cas_codex_0145_structured_review_v4` (`v1` through `v3` remain advertised for compatibility).
+- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, `cas_workflow_bound_owner_lived_review_v1`, `cas_review_scoped_instructions_v1`, and `cas_codex_0145_structured_review_v4` (`v1` through `v3` remain advertised for compatibility).
 
 ## API Examples
 
@@ -104,12 +104,14 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --timeout-ms 2700000 \
   --json
 
-# Start one detached review with an opaque caller-owned request identity.
+# Start one owner-lived review with an opaque caller-owned request identity.
 ./zig-out/bin/cas review start \
+  --wait \
   --cwd /path/to/workspace \
   --base main \
   --custom-instructions @review-prompt.txt \
   --workflow-binding-json @workflow-binding.json \
+  --timeout-ms 2700000 \
   --json
 
 # Wait for the detached review to reach a terminal result.

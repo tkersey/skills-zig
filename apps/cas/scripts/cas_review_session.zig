@@ -27,14 +27,15 @@ const UsageText =
     \\
     \\Actions:
     \\  run        Broker one tuple-bound review verdict; waits and hides lock recovery.
-    \\  start      Start a detached review session and persist its handle.
+    \\  start      Start a review session; workflow-bound starts require --wait.
     \\  wait       Poll the persisted session until the review turn reaches a terminal status.
     \\
     \\Run/start options:
     \\  --cwd DIR                        Workspace for the app-server.
     \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
     \\  --parent-mode MODE               Parent strategy: auto|fresh|reuse (default: auto).
-    \\  --wait                           Keep the start process alive until the review turn reaches a terminal status.
+    \\  --wait                           Keep the start process alive until the review turn reaches a terminal status;
+    \\                                   required when start uses --workflow-binding-json.
     \\  --uncommitted                    Review staged, unstaged, and untracked changes.
     \\  --base BRANCH                    Review changes against a base branch.
     \\  --commit SHA                     Review a specific commit.
@@ -79,7 +80,8 @@ const UsageText =
     \\      --workflow-binding-json @binding.json --timeout-ms 2700000 --json
     \\  cas review start --cwd /path/to/repo --uncommitted --json
     \\  cas review start --cwd /path/to/repo --base main --json
-    \\  cas review start --wait --cwd /path/to/repo --base main --timeout-ms 2700000 --json
+    \\  cas review start --wait --cwd /path/to/repo --base main --workflow-binding-json @binding.json
+    \\      --timeout-ms 2700000 --json
     \\  cas review wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 2700000 --json
     \\  cas review wait --path /path/to/repo/.ledger/cas/review_sessions/thr_123.json --json
     \\  cas review wait --cwd /path/to/repo --latest --json
@@ -930,6 +932,19 @@ fn loadWorkflowBindingAlloc(allocator: std.mem.Allocator, raw_arg: ?[]const u8) 
     return parsed;
 }
 
+fn workflowBoundStartAdmissionFailure(
+    parsed: ParsedArgs,
+    workflow_binding: ?WorkflowBinding,
+) ?FailureInfo {
+    if (parsed.action != .start or workflow_binding == null or parsed.wait_after_start) {
+        return null;
+    }
+    return .{
+        .code = "workflow_bound_review_requires_owner_lived_wait",
+        .hint = "workflow-bound review attempts require one owner-lived `cas review start --wait` process through terminal evidence; rerun with --wait --timeout-ms 2700000",
+    };
+}
+
 fn cmdRun(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var broker_parsed = parsed;
     broker_parsed.wait_after_start = true;
@@ -947,6 +962,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const workflow_binding = if (loaded_workflow_binding) |binding| binding.value else null;
     const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
     defer allocator.free(cwd);
+    if (workflowBoundStartAdmissionFailure(parsed, workflow_binding)) |failure| {
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "review/start",
+            failure.hint,
+            cwd,
+            .{ .workflow_binding = workflow_binding },
+            failure,
+        );
+    }
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
         try renderErrorAndExit(
             parsed.json,
@@ -9254,6 +9280,36 @@ test "workflow binding input accepts only complete opaque request identity" {
             error.InvalidWorkflowBinding,
             loadWorkflowBindingAlloc(std.testing.allocator, raw),
         );
+    }
+}
+
+test "owner-lived admission exhausts action binding and wait states" {
+    const actions = [_]Action{ .run, .start, .wait };
+    for (actions) |action| {
+        for ([_]bool{ false, true }) |has_binding| {
+            for ([_]bool{ false, true }) |wait_after_start| {
+                const workflow_binding: ?WorkflowBinding = if (has_binding)
+                    testWorkflowBinding()
+                else
+                    null;
+                const failure = workflowBoundStartAdmissionFailure(
+                    .{
+                        .action = action,
+                        .wait_after_start = wait_after_start,
+                    },
+                    workflow_binding,
+                );
+                const should_reject = action == .start and has_binding and !wait_after_start;
+                try std.testing.expectEqual(should_reject, failure != null);
+                if (failure) |value| {
+                    try std.testing.expectEqualStrings(
+                        "workflow_bound_review_requires_owner_lived_wait",
+                        value.code,
+                    );
+                    try std.testing.expect(std.mem.indexOf(u8, value.hint, "start --wait") != null);
+                }
+            }
+        }
     }
 }
 
