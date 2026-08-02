@@ -16352,7 +16352,9 @@ test "recordless dead owner recovery terminalizes the exact lock" {
 }
 
 test "replacement admission requires exact predecessor shutdown receipt" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
@@ -16970,7 +16972,9 @@ test "terminal timeout session replays only through its exact tuple lock" {
 }
 
 test "terminal owner receipt survives persistence failure" {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const child = try cas_websocket.spawnDetachedProcess(
         std.testing.allocator,
         "/tmp",

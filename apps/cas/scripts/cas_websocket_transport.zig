@@ -738,12 +738,14 @@ pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
         },
         .linux => blk: {
             const io = std.Io.Threaded.global_single_threaded.io();
-            const raw = try std.Io.Dir.cwd().readFileAlloc(
+            var file = try std.Io.Dir.openFileAbsolute(
                 io,
                 "/proc/sys/kernel/random/boot_id",
-                allocator,
-                .limited(256),
+                .{},
             );
+            defer file.close(io);
+            var reader = file.reader(io, &.{});
+            const raw = try reader.interface.allocRemaining(allocator, .limited(256));
             errdefer allocator.free(raw);
             const trimmed = std.mem.trim(u8, raw, " \t\r\n");
             if (trimmed.len == 0) return error.SystemBootIdentityUnavailable;
@@ -1081,7 +1083,9 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
         return error.SkipZigTest;
     }
     const allocator = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
