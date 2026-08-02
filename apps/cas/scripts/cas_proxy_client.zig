@@ -72,6 +72,12 @@ pub const ClientOptions = struct {
     hook_policy: hooks.HookPolicy = .inherit,
     websocket_url: ?[]const u8 = null,
     websocket_connect_timeout_ms: u32 = 10_000,
+    request_deadline_ms: ?i64 = null,
+};
+
+pub const RequestSendObserver = struct {
+    context: *anyopaque,
+    before_send: *const fn (context: *anyopaque) anyerror!void,
 };
 
 pub const Client = struct {
@@ -94,6 +100,8 @@ pub const Client = struct {
     dynamic_tool_response_json: ?[]const u8,
     read_only: bool,
     blocking_server_request_count: u64 = 0,
+    request_deadline_ms: ?i64 = null,
+    request_send_started: bool = false,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         if (opts.websocket_url) |url| {
@@ -146,6 +154,7 @@ pub const Client = struct {
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
+            .request_deadline_ms = opts.request_deadline_ms,
         };
         try client.handshake(opts);
         return client;
@@ -178,6 +187,7 @@ pub const Client = struct {
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
+            .request_deadline_ms = opts.request_deadline_ms,
         };
         try client.handshake(opts);
         return client;
@@ -206,7 +216,21 @@ pub const Client = struct {
     }
 
     pub fn requestJson(self: *Client, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        return self.requestJsonCaptureNotifications(method, params_json, null);
+        return self.requestJsonCaptureNotificationsInternal(method, params_json, null, null);
+    }
+
+    pub fn requestJsonWithSendObserver(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        send_observer: RequestSendObserver,
+    ) ![]u8 {
+        return self.requestJsonCaptureNotificationsInternal(
+            method,
+            params_json,
+            null,
+            send_observer,
+        );
     }
 
     pub fn requestJsonCaptureNotifications(
@@ -215,10 +239,26 @@ pub const Client = struct {
         params_json: ?[]const u8,
         notification_lines: ?*std.ArrayList([]u8),
     ) ![]u8 {
+        return self.requestJsonCaptureNotificationsInternal(
+            method,
+            params_json,
+            notification_lines,
+            null,
+        );
+    }
+
+    fn requestJsonCaptureNotificationsInternal(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        notification_lines: ?*std.ArrayList([]u8),
+        send_observer: ?RequestSendObserver,
+    ) ![]u8 {
+        self.request_send_started = false;
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        try self.sendRequest(request_id, method, params_json);
+        try self.sendRequest(request_id, method, params_json, send_observer);
 
         while (true) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
@@ -255,6 +295,16 @@ pub const Client = struct {
             }
             return error.InvalidAppServerResponse;
         }
+    }
+
+    pub fn swapRequestDeadlineMs(self: *Client, deadline_ms: ?i64) ?i64 {
+        const previous = self.request_deadline_ms;
+        self.request_deadline_ms = deadline_ms;
+        return previous;
+    }
+
+    pub fn lastRequestSendStarted(self: *const Client) bool {
+        return self.request_send_started;
     }
 
     fn isNotificationMessage(msg_obj: core_json.ObjectMap) bool {
@@ -299,7 +349,7 @@ pub const Client = struct {
                     },
                 },
             };
-            try self.sendToServer(initialize);
+            try self.sendToServer(initialize, null);
         } else {
             const InitNoOptOut = struct {
                 method: []const u8,
@@ -329,7 +379,7 @@ pub const Client = struct {
                     },
                 },
             };
-            try self.sendToServer(initialize);
+            try self.sendToServer(initialize, null);
         }
 
         const started_ms = monotonicMillis();
@@ -362,7 +412,7 @@ pub const Client = struct {
             const Initialized = struct {
                 method: []const u8,
             };
-            try self.sendToServer(Initialized{ .method = "initialized" });
+            try self.sendToServer(Initialized{ .method = "initialized" }, null);
             return;
         }
 
@@ -370,7 +420,13 @@ pub const Client = struct {
         return error.HandshakeTimeout;
     }
 
-    fn sendRequest(self: *Client, request_id: i64, method: []const u8, params_json: ?[]const u8) !void {
+    fn sendRequest(
+        self: *Client,
+        request_id: i64,
+        method: []const u8,
+        params_json: ?[]const u8,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         if (params_json) |raw| {
             var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
             defer parsed_params.deinit();
@@ -385,7 +441,7 @@ pub const Client = struct {
                 .id = request_id,
                 .params = parsed_params.value,
             };
-            try self.sendToServer(req);
+            try self.sendToServer(req, send_observer);
         } else {
             const ReqNoParams = struct {
                 method: []const u8,
@@ -395,21 +451,27 @@ pub const Client = struct {
                 .method = method,
                 .id = request_id,
             };
-            try self.sendToServer(req);
+            try self.sendToServer(req, send_observer);
         }
     }
 
-    fn sendToServer(self: *Client, msg: anytype) !void {
+    fn sendToServer(
+        self: *Client,
+        msg: anytype,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
+                if (send_observer) |observer| try observer.before_send(observer.context);
+                self.request_send_started = true;
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.websocket.?.sendText(payload),
+            .websocket => try self.sendWebSocket(payload, send_observer),
         }
     }
 
@@ -493,7 +555,7 @@ pub const Client = struct {
         try self.sendToServer(Response{
             .id = id,
             .result = .{ .decision = decision },
-        });
+        }, null);
     }
 
     fn sendApprovalDecisionValue(self: *Client, id: i64, decision: std.json.Value) !void {
@@ -506,7 +568,7 @@ pub const Client = struct {
         try self.sendToServer(Response{
             .id = id,
             .result = .{ .decision = decision },
-        });
+        }, null);
     }
 
     fn sendResultRawJson(self: *Client, id: i64, result_json: []const u8) !void {
@@ -525,8 +587,35 @@ pub const Client = struct {
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.websocket.?.sendText(payload),
+            .websocket => try self.sendWebSocket(payload, null),
         }
+    }
+
+    fn sendWebSocket(
+        self: *Client,
+        payload: []const u8,
+        send_observer: ?RequestSendObserver,
+    ) !void {
+        const deadline_ms = self.request_deadline_ms orelse {
+            if (send_observer) |observer| try observer.before_send(observer.context);
+            self.request_send_started = true;
+            return self.websocket.?.sendText(payload);
+        };
+        var remaining_ms = deadline_ms - monotonicMillis();
+        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (send_observer) |observer| {
+            try observer.before_send(observer.context);
+            // Crossing the durable observer boundary owns every subsequent
+            // outcome, including a deadline that expires before socket write.
+            self.request_send_started = true;
+        }
+        remaining_ms = deadline_ms - monotonicMillis();
+        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (send_observer == null) self.request_send_started = true;
+        self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
+            error.Timeout => return error.ConnectionTimedOut,
+            else => return err,
+        };
     }
 
     fn sendServerError(self: *Client, id: i64, code: i64, message: []const u8) !void {
@@ -543,7 +632,7 @@ pub const Client = struct {
                 .code = code,
                 .message = message,
             },
-        });
+        }, null);
     }
 
     fn resolveExecDecision(self: *const Client) []const u8 {
@@ -763,7 +852,16 @@ pub const Client = struct {
 
     fn readLineAlloc(self: *Client) !?[]u8 {
         if (self.transport_kind == .websocket) {
-            return try self.websocket.?.readTextAlloc();
+            const deadline_ms = self.request_deadline_ms orelse
+                return try self.websocket.?.readTextAlloc();
+            const remaining_ms = deadline_ms - monotonicMillis();
+            if (remaining_ms <= 0) return error.ConnectionTimedOut;
+            return self.websocket.?.readTextAllocTimeout(
+                @intCast(remaining_ms),
+            ) catch |err| switch (err) {
+                error.Timeout => return error.ConnectionTimedOut,
+                else => err,
+            };
         }
 
         while (true) {
@@ -853,6 +951,124 @@ pub fn stringField(obj: ObjectMap, key: []const u8) ?[]const u8 {
 
 pub fn intField(obj: ObjectMap, key: []const u8) ?i64 {
     return core_json.intField(obj, key);
+}
+
+test "expired request deadline remains pre-send" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .websocket,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+        .request_deadline_ms = monotonicMillis() - 1,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.ConnectionTimedOut, client.sendWebSocket("{}", null));
+    try std.testing.expect(!client.lastRequestSendStarted());
+}
+
+const SendObserverProbe = struct {
+    calls: usize = 0,
+
+    fn failBeforeSend(context: *anyopaque) anyerror!void {
+        const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
+        probe.calls += 1;
+        return error.SendBoundaryPersistenceFailed;
+    }
+
+    fn expireDeadlineAfterPersistence(context: *anyopaque) anyerror!void {
+        const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
+        probe.calls += 1;
+        std.Io.sleep(
+            std.Io.Threaded.global_single_threaded.io(),
+            .fromMilliseconds(100),
+            .awake,
+        ) catch |err| switch (err) {
+            else => {},
+        };
+    }
+};
+
+test "request send observer runs before transport send attribution" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+    var probe = SendObserverProbe{};
+
+    try std.testing.expectError(
+        error.SendBoundaryPersistenceFailed,
+        client.sendToServer(.{ .method = "review/start" }, .{
+            .context = &probe,
+            .before_send = SendObserverProbe.failBeforeSend,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!client.lastRequestSendStarted());
+}
+
+test "request send ownership survives deadline expiry after durable observer" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .websocket,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+        .request_deadline_ms = monotonicMillis() + 50,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+    var probe = SendObserverProbe{};
+
+    try std.testing.expectError(
+        error.ConnectionTimedOut,
+        client.sendToServer(.{ .method = "review/start" }, .{
+            .context = &probe,
+            .before_send = SendObserverProbe.expireDeadlineAfterPersistence,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(client.lastRequestSendStarted());
 }
 
 test "resolveExecDecision honors read_only and explicit approvals" {

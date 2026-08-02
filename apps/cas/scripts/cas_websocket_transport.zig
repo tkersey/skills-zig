@@ -7,11 +7,23 @@ const mem = std.mem;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const loopback_host = "127.0.0.1";
 
+pub const owner_watchdog_shutdown_grace_ms: u32 = 1_000;
+
 pub const ManagedServer = struct {
     child: std.process.Child,
     listen_url: []u8,
+    owner_control: ?std.Io.File = null,
+    shutdown_receipt_path: ?[]u8 = null,
+    shutdown_receipt_token: ?[]u8 = null,
+    process_group_id: ?u64 = null,
+    boot_id: ?[]u8 = null,
+    stopped: bool = false,
 
     pub fn deinit(self: *ManagedServer, allocator: std.mem.Allocator) void {
+        if (self.owner_control != null) self.kill();
+        if (self.shutdown_receipt_token) |value| allocator.free(value);
+        if (self.shutdown_receipt_path) |value| allocator.free(value);
+        if (self.boot_id) |value| allocator.free(value);
         allocator.free(self.listen_url);
     }
 
@@ -24,8 +36,36 @@ pub const ManagedServer = struct {
         };
     }
 
+    pub fn shutdownReceiptPath(self: *const ManagedServer) ?[]const u8 {
+        return self.shutdown_receipt_path;
+    }
+
+    pub fn shutdownReceiptToken(self: *const ManagedServer) ?[]const u8 {
+        return self.shutdown_receipt_token;
+    }
+
+    pub fn processGroupId(self: *const ManagedServer) ?u64 {
+        return self.process_group_id;
+    }
+
+    pub fn bootId(self: *const ManagedServer) ?[]const u8 {
+        return self.boot_id;
+    }
+
     pub fn kill(self: *ManagedServer) void {
-        self.child.kill(std.Io.Threaded.global_single_threaded.io());
+        if (self.stopped) return;
+        self.stopped = true;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (self.owner_control) |control| {
+            control.close(io);
+            self.owner_control = null;
+            _ = self.child.wait(io) catch {
+                self.child.kill(io);
+                return;
+            };
+            return;
+        }
+        self.child.kill(io);
     }
 };
 
@@ -33,6 +73,7 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
     read_buf: std.ArrayList(u8) = .empty,
+    usable: bool = true,
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -43,6 +84,10 @@ pub const Connection = struct {
         const address = try std.Io.net.IpAddress.parse(parsed.host, parsed.port);
         const io = std.Io.Threaded.global_single_threaded.io();
         const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        });
         while (true) {
             const stream = address.connect(io, .{ .mode = .stream }) catch |err| {
                 const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
@@ -51,9 +96,19 @@ pub const Connection = struct {
                 continue;
             };
 
-            handshakeClient(allocator, stream, parsed.host, parsed.port, parsed.path) catch |err| {
+            handshakeClient(
+                allocator,
+                stream,
+                parsed.host,
+                parsed.port,
+                parsed.path,
+                deadline,
+            ) catch |err| {
                 stream.close(io);
-                return err;
+                return switch (err) {
+                    error.Timeout => error.ConnectionTimedOut,
+                    else => err,
+                };
             };
 
             return .{
@@ -65,7 +120,14 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
+        if (!self.usable) return;
+        self.usable = false;
         self.stream.close(std.Io.Threaded.global_single_threaded.io());
+    }
+
+    pub fn poison(self: *Connection) void {
+        self.close();
+        self.read_buf.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *Connection) void {
@@ -73,16 +135,61 @@ pub const Connection = struct {
     }
 
     pub fn sendText(self: *Connection, payload: []const u8) !void {
-        try writeClientFrame(self, 0x1, payload);
+        if (!self.usable) return error.ConnectionPoisoned;
+        try writeClientFrame(self, 0x1, payload, null);
+    }
+
+    pub fn sendTextTimeout(self: *Connection, payload: []const u8, timeout_ms: u32) !void {
+        if (!self.usable) return error.ConnectionPoisoned;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        });
+        writeClientFrame(self, 0x1, payload, deadline) catch |err| switch (err) {
+            error.Timeout => {
+                self.poison();
+                return error.Timeout;
+            },
+            else => return err,
+        };
     }
 
     pub fn readTextAlloc(self: *Connection) !?[]u8 {
+        if (!self.usable) return error.ConnectionPoisoned;
+        return self.readTextAllocUntil(null);
+    }
+
+    pub fn readTextAllocTimeout(self: *Connection, timeout_ms: u32) !?[]u8 {
+        if (!self.usable) return error.ConnectionPoisoned;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const duration = std.Io.Clock.Duration{
+            .raw = std.Io.Duration.fromMilliseconds(timeout_ms),
+            .clock = .awake,
+        };
+        const deadline = std.Io.Clock.Timestamp.fromNow(
+            io,
+            duration,
+        );
+        return self.readTextAllocUntil(deadline) catch |err| switch (err) {
+            error.Timeout => {
+                self.poison();
+                return error.Timeout;
+            },
+            else => return err,
+        };
+    }
+
+    fn readTextAllocUntil(
+        self: *Connection,
+        deadline: ?std.Io.Clock.Timestamp,
+    ) !?[]u8 {
         var fragment_type: ?u8 = null;
         var fragmented: std.ArrayList(u8) = .empty;
         defer fragmented.deinit(self.allocator);
 
         while (true) {
-            const frame = try self.readFrameAlloc();
+            const frame = try self.readFrameAlloc(deadline);
             defer if (frame.payload) |owned| self.allocator.free(owned);
 
             switch (frame.opcode) {
@@ -103,7 +210,7 @@ pub const Connection = struct {
                     }
                 },
                 0x8 => return null,
-                0x9 => try writeClientFrame(self, 0xA, frame.payload.?),
+                0x9 => try writeClientFrame(self, 0xA, frame.payload.?, deadline),
                 0xA => {},
                 else => return error.WebSocketUnexpectedOpcode,
             }
@@ -116,9 +223,12 @@ pub const Connection = struct {
         payload: ?[]u8,
     };
 
-    fn readFrameAlloc(self: *Connection) !Frame {
-        const first = try readByte(self);
-        const second = try readByte(self);
+    fn readFrameAlloc(
+        self: *Connection,
+        deadline: ?std.Io.Clock.Timestamp,
+    ) !Frame {
+        const first = try readByte(self, deadline);
+        const second = try readByte(self, deadline);
         const fin = (first & 0x80) != 0;
         const opcode = first & 0x0F;
         const masked = (second & 0x80) != 0;
@@ -126,17 +236,17 @@ pub const Connection = struct {
         var payload_len: u64 = second & 0x7F;
         if (payload_len == 126) {
             var extended: [2]u8 = undefined;
-            try readStreamExact(self.stream, &extended);
+            try readStreamExact(self.stream, &extended, deadline);
             payload_len = mem.readInt(u16, &extended, .big);
         } else if (payload_len == 127) {
             var extended: [8]u8 = undefined;
-            try readStreamExact(self.stream, &extended);
+            try readStreamExact(self.stream, &extended, deadline);
             payload_len = mem.readInt(u64, &extended, .big);
         }
 
         var mask: [4]u8 = undefined;
         if (masked) {
-            try readStreamExact(self.stream, &mask);
+            try readStreamExact(self.stream, &mask, deadline);
         }
 
         const payload = if (payload_len == 0)
@@ -144,7 +254,7 @@ pub const Connection = struct {
         else blk: {
             const owned = try self.allocator.alloc(u8, @intCast(payload_len));
             errdefer self.allocator.free(owned);
-            try readStreamExact(self.stream, owned);
+            try readStreamExact(self.stream, owned, deadline);
             if (masked) applyMask(&mask, owned);
             break :blk owned;
         };
@@ -164,6 +274,45 @@ pub fn startManagedLoopbackServer(
     hook_policy: hooks.HookPolicy,
     io: std.Io,
 ) !ManagedServer {
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        null,
+        codex_path,
+        hook_policy,
+        false,
+        io,
+    );
+}
+
+pub fn startOwnerLivedLoopbackServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    receipt_dir: []const u8,
+    codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    io: std.Io,
+) !ManagedServer {
+    return startManagedLoopbackServerWithOwnership(
+        allocator,
+        cwd,
+        receipt_dir,
+        codex_path,
+        hook_policy,
+        true,
+        io,
+    );
+}
+
+fn startManagedLoopbackServerWithOwnership(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    receipt_dir: ?[]const u8,
+    codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    owner_lived: bool,
+    io: std.Io,
+) !ManagedServer {
     try hooks.ensureLaunchSupportsPolicy(allocator, io, codex_path, cwd, hook_policy);
 
     var address = try std.Io.net.IpAddress.parse(loopback_host, 0);
@@ -179,6 +328,20 @@ pub fn startManagedLoopbackServer(
     try argv.append(allocator, codex_path);
     try hooks.appendAppServerArgs(allocator, &argv, hook_policy, listen_url);
 
+    if (owner_lived) {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            return error.OwnerLivedManagedServerUnsupported;
+        }
+        return spawnOwnerPipeManagedServer(
+            allocator,
+            cwd,
+            receipt_dir orelse return error.MissingOwnerLivedReceiptDirectory,
+            argv.items,
+            listen_url,
+            io,
+        );
+    }
+
     const child = try spawnDetachedProcess(allocator, cwd, argv.items, io);
 
     return .{
@@ -186,6 +349,236 @@ pub fn startManagedLoopbackServer(
         .listen_url = listen_url,
     };
 }
+
+const owner_watchdog_script =
+    \\receipt_path=$1
+    \\receipt_token=$2
+    \\shift 2
+    \\child=0
+    \\cleanup() {
+    \\  if [ "$child" -gt 0 ] 2>/dev/null; then
+    \\    kill "$child" 2>/dev/null || true
+    \\    attempts=0
+    \\    while kill -0 "$child" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    \\      sleep 0.05
+    \\      attempts=$((attempts + 1))
+    \\    done
+    \\    kill -KILL "$child" 2>/dev/null || true
+    \\    wait "$child" 2>/dev/null || true
+    \\  fi
+    \\  if [ ! -e "$receipt_path" ]; then
+    \\    umask 077
+    \\    receipt_tmp="${receipt_path}.tmp.$$"
+    \\    printf '{"schema":"CAS-WDR-v1","token":"%s"}\n' "$receipt_token" >"$receipt_tmp" &&
+    \\      mv -n "$receipt_tmp" "$receipt_path" 2>/dev/null || true
+    \\    rm -f "$receipt_tmp" 2>/dev/null || true
+    \\  fi
+    \\}
+    \\trap cleanup EXIT HUP INT TERM
+    \\"$@" &
+    \\child=$!
+    \\while IFS= read -r _; do :; done
+;
+
+fn spawnOwnerPipeManagedServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    receipt_dir: []const u8,
+    server_argv: []const []const u8,
+    listen_url: []u8,
+    io: std.Io,
+) !ManagedServer {
+    try std.Io.Dir.cwd().createDirPath(io, receipt_dir);
+    const boot_id = try currentBootIdAlloc(allocator);
+    errdefer allocator.free(boot_id);
+    var receipt_random: [16]u8 = undefined;
+    io.random(&receipt_random);
+    const receipt_hex = std.fmt.bytesToHex(receipt_random, .lower);
+    const shutdown_receipt_token = try std.fmt.allocPrint(allocator, "{s}", .{&receipt_hex});
+    errdefer allocator.free(shutdown_receipt_token);
+    const shutdown_receipt_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.json",
+        .{ receipt_dir, &receipt_hex },
+    );
+    errdefer allocator.free(shutdown_receipt_path);
+
+    var watchdog_argv: std.ArrayList([]const u8) = .empty;
+    defer watchdog_argv.deinit(allocator);
+    try watchdog_argv.appendSlice(allocator, &.{
+        "/bin/sh",
+        "-c",
+        owner_watchdog_script,
+        "cas-app-server-watchdog",
+        shutdown_receipt_path,
+        shutdown_receipt_token,
+    });
+    try watchdog_argv.appendSlice(allocator, server_argv);
+
+    if (builtin.os.tag == .macos and builtin.link_libc) {
+        return spawnOwnerPipeManagedServerPosix(
+            allocator,
+            cwd,
+            watchdog_argv.items,
+            listen_url,
+            shutdown_receipt_path,
+            shutdown_receipt_token,
+            boot_id,
+        );
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = watchdog_argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    });
+    const owner_control = child.stdin orelse {
+        child.kill(io);
+        return error.ChildMissingStdin;
+    };
+    child.stdin = null;
+    return .{
+        .child = child,
+        .listen_url = listen_url,
+        .owner_control = owner_control,
+        .shutdown_receipt_path = shutdown_receipt_path,
+        .shutdown_receipt_token = shutdown_receipt_token,
+        .process_group_id = switch (builtin.os.tag) {
+            .windows, .wasi => null,
+            else => if (child.id) |value| @intCast(value) else null,
+        },
+        .boot_id = boot_id,
+    };
+}
+
+fn spawnOwnerPipeManagedServerPosix(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    watchdog_argv: []const []const u8,
+    listen_url: []u8,
+    shutdown_receipt_path: []u8,
+    shutdown_receipt_token: []u8,
+    boot_id: []u8,
+) !ManagedServer {
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.SystemResources;
+    var read_open = true;
+    var write_open = true;
+    defer if (read_open) {
+        _ = std.c.close(pipe_fds[0]);
+    };
+    errdefer if (write_open) {
+        _ = std.c.close(pipe_fds[1]);
+    };
+    const write_fd_flags = std.c.fcntl(pipe_fds[1], std.c.F.GETFD);
+    if (write_fd_flags < 0 or
+        std.c.fcntl(
+            pipe_fds[1],
+            std.c.F.SETFD,
+            write_fd_flags | std.c.FD_CLOEXEC,
+        ) < 0)
+    {
+        return error.SystemResources;
+    }
+
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+
+    var attributes: std.c.posix_spawnattr_t = undefined;
+    if (std.c.posix_spawnattr_init(&attributes) != 0) {
+        return error.SpawnAttributesFailed;
+    }
+    defer _ = std.c.posix_spawnattr_destroy(&attributes);
+    if (std.c.posix_spawnattr_setflags(
+        &attributes,
+        .{ .SETPGROUP = true },
+    ) != 0 or posix_spawnattr_setpgroup(&attributes, 0) != 0) {
+        return error.SpawnAttributesFailed;
+    }
+
+    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    defer allocator.free(cwd_storage);
+    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[0] != 0 and
+        (std.c.posix_spawn_file_actions_adddup2(&actions, pipe_fds[0], 0) != 0 or
+            std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[0]) != 0))
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    if (pipe_fds[1] != 0 and
+        std.c.posix_spawn_file_actions_addclose(&actions, pipe_fds[1]) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+    const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0 or
+        std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0)
+    {
+        return error.SpawnFileActionsFailed;
+    }
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, watchdog_argv.len, null);
+    defer allocator.free(argv_buf);
+    var arg_storage = try allocator.alloc([:0]u8, watchdog_argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (watchdog_argv, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = std.c.posix_spawn(
+        &pid,
+        argv_buf[0].?,
+        &actions,
+        &attributes,
+        argv_buf.ptr,
+        envp,
+    );
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    _ = std.c.close(pipe_fds[0]);
+    read_open = false;
+    write_open = false;
+    return .{
+        .child = .{
+            .id = pid,
+            .thread_handle = {},
+            .stdin = null,
+            .stdout = null,
+            .stderr = null,
+            .request_resource_usage_statistics = false,
+        },
+        .listen_url = listen_url,
+        .owner_control = .{
+            .handle = pipe_fds[1],
+            .flags = .{ .nonblocking = false },
+        },
+        .shutdown_receipt_path = shutdown_receipt_path,
+        .shutdown_receipt_token = shutdown_receipt_token,
+        .process_group_id = @intCast(pid),
+        .boot_id = boot_id,
+    };
+}
+
+extern "c" fn posix_spawnattr_setpgroup(
+    attr: *std.c.posix_spawnattr_t,
+    process_group: std.c.pid_t,
+) c_int;
 
 pub fn spawnDetachedProcess(
     allocator: std.mem.Allocator,
@@ -277,7 +670,8 @@ pub fn processAlive(process_id: u64) bool {
         .windows => true,
         .wasi => false,
         else => blk: {
-            const pid: std.posix.pid_t = @intCast(process_id);
+            const pid = std.math.cast(std.posix.pid_t, process_id) orelse
+                break :blk true;
             std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
@@ -285,6 +679,99 @@ pub fn processAlive(process_id: u64) bool {
             break :blk true;
         },
     };
+}
+
+pub fn processGroupAlive(process_group_id: u64) bool {
+    return switch (builtin.os.tag) {
+        .windows, .wasi => true,
+        else => blk: {
+            const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse
+                break :blk true;
+            std.posix.kill(-positive, @enumFromInt(0)) catch |err| switch (err) {
+                error.ProcessNotFound => break :blk false,
+                else => break :blk true,
+            };
+            break :blk true;
+        },
+    };
+}
+
+pub fn waitForProcessGroupExit(process_group_id: u64, timeout_ms: u32) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const started_ms = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    );
+    while (processGroupAlive(process_group_id)) {
+        const now_ms = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            1_000_000,
+        );
+        if (now_ms - started_ms >= timeout_ms) return false;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
+    }
+    return true;
+}
+
+pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return switch (builtin.os.tag) {
+        .macos => blk: {
+            if (!builtin.link_libc) return error.SystemBootIdentityUnsupported;
+            var boot_time: std.c.timeval = undefined;
+            var boot_time_len: usize = @sizeOf(std.c.timeval);
+            if (std.c.sysctlbyname(
+                "kern.boottime",
+                &boot_time,
+                &boot_time_len,
+                null,
+                0,
+            ) != 0 or boot_time_len != @sizeOf(std.c.timeval)) {
+                return error.SystemBootIdentityUnavailable;
+            }
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "darwin:{d}:{d}",
+                .{ boot_time.sec, boot_time.usec },
+            );
+        },
+        .linux => blk: {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var file = try std.Io.Dir.openFileAbsolute(
+                io,
+                "/proc/sys/kernel/random/boot_id",
+                .{},
+            );
+            defer file.close(io);
+            var reader = file.reader(io, &.{});
+            var raw: [256]u8 = undefined;
+            const raw_len = try reader.interface.readSliceShort(&raw);
+            const trimmed = std.mem.trim(u8, raw[0..raw_len], " \t\r\n");
+            if (trimmed.len == 0) return error.SystemBootIdentityUnavailable;
+            break :blk try allocator.dupe(u8, trimmed);
+        },
+        else => error.SystemBootIdentityUnsupported,
+    };
+}
+
+pub fn waitForProcessExit(process_id: u64, timeout_ms: u32) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const started_ms = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    );
+    while (processAlive(process_id)) {
+        const now_ms = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            1_000_000,
+        );
+        if (now_ms - started_ms >= timeout_ms) return false;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+            else => {},
+        };
+    }
+    return true;
 }
 
 pub fn terminateProcess(process_id: u64) void {
@@ -324,6 +811,7 @@ fn handshakeClient(
     host: []const u8,
     port: u16,
     path: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
 ) !void {
     var random_bytes: [16]u8 = undefined;
     std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
@@ -336,19 +824,17 @@ fn handshakeClient(
         .{ path, host, port, key },
     );
     defer allocator.free(request);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var stream_writer = stream.writer(io, &.{});
-    try stream_writer.interface.writeAll(request);
-    try stream_writer.interface.flush();
+    try writeStreamAllUntil(stream, request, deadline);
 
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
     while (mem.indexOf(u8, response_buf.items, "\r\n\r\n") == null) {
         var tmp: [1]u8 = undefined;
-        var stream_reader = stream.reader(io, &.{});
-        const n = try stream_reader.interface.readSliceShort(tmp[0..]);
-        if (n == 0) return error.WebSocketHandshakeClosed;
-        try response_buf.appendSlice(allocator, tmp[0..n]);
+        readStreamExact(stream, &tmp, deadline) catch |err| switch (err) {
+            error.EndOfStream => return error.WebSocketHandshakeClosed,
+            else => return err,
+        };
+        try response_buf.append(allocator, tmp[0]);
     }
 
     const header_end = mem.indexOf(u8, response_buf.items, "\r\n\r\n").? + 4;
@@ -379,7 +865,12 @@ fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
+fn writeClientFrame(
+    self: *Connection,
+    opcode: u8,
+    payload: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
     const payload_len = payload.len;
     var header: [14]u8 = undefined;
     var header_len: usize = 0;
@@ -406,17 +897,69 @@ fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
     @memcpy(header[header_len .. header_len + 4], &mask);
     header_len += 4;
 
-    var stream_writer = self.stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try stream_writer.interface.writeAll(header[0..header_len]);
+    try writeStreamAllUntil(self.stream, header[0..header_len], deadline);
     if (payload_len == 0) {
-        try stream_writer.interface.flush();
         return;
     }
     const masked = try self.allocator.dupe(u8, payload);
     defer self.allocator.free(masked);
     applyMask(&mask, masked);
-    try stream_writer.interface.writeAll(masked);
-    try stream_writer.interface.flush();
+    try writeStreamAllUntil(self.stream, masked, deadline);
+}
+
+fn writeStreamAllUntil(
+    stream: std.Io.net.Stream,
+    bytes: []const u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    if (deadline == null) {
+        var stream_writer = stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        try stream_writer.interface.writeAll(bytes);
+        try stream_writer.interface.flush();
+        return;
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const remaining_ms = deadline.?.durationFromNow(io).raw.toMilliseconds();
+        if (remaining_ms <= 0) return error.Timeout;
+        var fds = [_]std.posix.pollfd{.{
+            .fd = stream.socket.handle,
+            .events = std.posix.POLL.OUT | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        const poll_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        if (try std.posix.poll(&fds, poll_timeout) == 0) return error.Timeout;
+        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+            return error.ConnectionResetByPeer;
+        }
+
+        var iov = [_]std.posix.iovec_const{.{
+            .base = bytes[offset..].ptr,
+            .len = bytes.len - offset,
+        }};
+        var msg: std.posix.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = iov.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        const rc = std.posix.system.sendmsg(
+            stream.socket.handle,
+            &msg,
+            std.posix.MSG.NOSIGNAL | std.posix.MSG.DONTWAIT,
+        );
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => offset += @intCast(rc),
+            .INTR, .AGAIN => continue,
+            .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionResetByPeer,
+            else => return error.WebSocketWriteFailed,
+        }
+    }
 }
 
 fn applyMask(mask: *const [4]u8, payload: []u8) void {
@@ -425,13 +968,203 @@ fn applyMask(mask: *const [4]u8, payload: []u8) void {
     }
 }
 
-fn readByte(self: *Connection) !u8 {
+fn readByte(self: *Connection, deadline: ?std.Io.Clock.Timestamp) !u8 {
     var buf: [1]u8 = undefined;
-    try readStreamExact(self.stream, &buf);
+    try readStreamExact(self.stream, &buf, deadline);
     return buf[0];
 }
 
-fn readStreamExact(stream: std.Io.net.Stream, dest: []u8) !void {
-    var reader = stream.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try reader.interface.readSliceAll(dest);
+fn readStreamExact(
+    stream: std.Io.net.Stream,
+    dest: []u8,
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var offset: usize = 0;
+    while (offset < dest.len) {
+        const incoming = if (deadline) |value|
+            try stream.socket.receiveTimeout(
+                io,
+                dest[offset..],
+                .{ .deadline = value },
+            )
+        else
+            try stream.socket.receive(io, dest[offset..]);
+        if (incoming.data.len == 0) return error.EndOfStream;
+        offset += incoming.data.len;
+    }
+}
+
+test "websocket read deadline bounds a stalled live socket" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer {
+        connection.close();
+        connection.deinit();
+    }
+    var server_writer = server_stream.writer(io, &.{});
+    try server_writer.interface.writeAll(&.{ 0x81, 0x05, 'h', 'e' });
+    try server_writer.interface.flush();
+
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    try std.testing.expectError(error.Timeout, connection.readTextAllocTimeout(50));
+    try std.testing.expectError(error.ConnectionPoisoned, connection.readTextAlloc());
+    const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "websocket HTTP upgrade shares the finite connection deadline" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    defer client_stream.close(io);
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = std.Io.Duration.fromMilliseconds(50),
+        .clock = .awake,
+    });
+    const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+    try std.testing.expectError(
+        error.Timeout,
+        handshakeClient(std.testing.allocator, client_stream, loopback_host, port, "/", deadline),
+    );
+    const elapsed_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) - started_ms;
+    try std.testing.expect(elapsed_ms < 1_000);
+}
+
+test "websocket write deadline expires before a frame crosses the socket" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listen_address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    var listener = try listen_address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    const peer_address = try std.Io.net.IpAddress.parse(loopback_host, port);
+    const client_stream = try peer_address.connect(io, .{ .mode = .stream });
+    var server_stream = try listener.accept(io);
+    defer server_stream.close(io);
+
+    var connection = Connection{
+        .allocator = std.testing.allocator,
+        .stream = client_stream,
+        .read_buf = .empty,
+    };
+    defer {
+        connection.close();
+        connection.deinit();
+    }
+
+    try std.testing.expectError(error.Timeout, connection.sendTextTimeout("payload", 0));
+    try std.testing.expectError(error.ConnectionPoisoned, connection.sendText("retry"));
+}
+
+test "owner-lived watchdog retires its exact server when owner control closes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
+    defer allocator.free(pid_path);
+    const listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1");
+    var managed = spawnOwnerPipeManagedServer(
+        allocator,
+        root,
+        root,
+        &.{
+            "/bin/sh",
+            "-c",
+            "pid_tmp=\"$1.tmp\"; printf '%s\\n' \"$$\" > \"$pid_tmp\"; " ++
+                "mv \"$pid_tmp\" \"$1\"; while :; do sleep 1; done",
+            "cas-owner-lived-test-server",
+            pid_path,
+        },
+        listen_url,
+        io,
+    ) catch |err| {
+        allocator.free(listen_url);
+        return err;
+    };
+    defer managed.deinit(allocator);
+    const watchdog_pid = managed.processId();
+    try std.testing.expectEqual(watchdog_pid, managed.processGroupId().?);
+    try std.testing.expect(managed.bootId().?.len > 0);
+
+    var server_pid: ?u64 = null;
+    for (0..100) |_| {
+        const pid_bytes = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            pid_path,
+            allocator,
+            .limited(64),
+        ) catch {
+            std.Io.sleep(io, .fromMilliseconds(10), .awake) catch |err| switch (err) {
+                else => {},
+            };
+            continue;
+        };
+        defer allocator.free(pid_bytes);
+        server_pid = try std.fmt.parseInt(
+            u64,
+            std.mem.trim(u8, pid_bytes, " \t\r\n"),
+            10,
+        );
+        break;
+    }
+    try std.testing.expect(server_pid != null);
+    try std.testing.expect(processAlive(watchdog_pid));
+    try std.testing.expect(processAlive(server_pid.?));
+    const receipt_path = managed.shutdownReceiptPath().?;
+    const receipt_token = managed.shutdownReceiptToken().?;
+    try std.testing.expectEqualStrings(root, std.fs.path.dirname(receipt_path).?);
+
+    managed.kill();
+    try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
+    try std.testing.expect(waitForProcessExit(server_pid.?, 2_000));
+    try std.testing.expect(waitForProcessGroupExit(managed.processGroupId().?, 2_000));
+    const receipt = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        receipt_path,
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(receipt);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
+    defer parsed.deinit();
+    const receipt_object = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidShutdownReceipt,
+    };
+    try std.testing.expectEqualStrings(
+        "CAS-WDR-v1",
+        receipt_object.get("schema").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        receipt_token,
+        receipt_object.get("token").?.string,
+    );
 }

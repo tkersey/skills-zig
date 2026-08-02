@@ -15,6 +15,7 @@ const CapabilitiesText =
     \\dcp_v1=true
     \\dcp_v2=true
     \\cas_rer_opaque_request_binding_v1=true
+    \\cas_workflow_bound_owner_lived_review_v1=true
     \\cas_review_scoped_instructions_v1=true
     \\cas_codex_0145_structured_review_v1=true
     \\cas_codex_0145_structured_review_v2=true
@@ -36,6 +37,7 @@ const CapabilitiesJson =
     \\      "read_only_inquiry": true,
     \\      "detached_inquiry": true,
     \\      "cas_rer_opaque_request_binding_v1": true,
+    \\      "cas_workflow_bound_owner_lived_review_v1": true,
     \\      "cas_review_scoped_instructions_v1": true,
     \\      "cas_codex_0145_structured_review_v1": true,
     \\      "cas_codex_0145_structured_review_v2": true,
@@ -312,6 +314,11 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
+        "cas_workflow_bound_owner_lived_review_v1=true",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text_output.written(),
         "cas_review_scoped_instructions_v1=true",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
@@ -350,6 +357,11 @@ test "capabilities advertise only current review boundary features" {
     defer json_output.deinit();
     try writeCapabilities(&json_output.writer, true);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_opaque_request_binding_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json_output.written(),
+        "\"cas_workflow_bound_owner_lived_review_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v2\": true") != null);
@@ -370,6 +382,7 @@ test "capabilities advertise only current review boundary features" {
     defer parsed.deinit();
     const features = parsed.value.object.get("cas_capabilities").?.object.get("features").?.object;
     try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);
+    try std.testing.expect(features.get("cas_workflow_bound_owner_lived_review_v1").?.bool);
     try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
     try std.testing.expect(features.get("cas_codex_0145_structured_review_v1").?.bool);
     try std.testing.expect(features.get("cas_codex_0145_structured_review_v2").?.bool);
