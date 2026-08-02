@@ -745,13 +745,11 @@ pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
             );
             defer file.close(io);
             var reader = file.reader(io, &.{});
-            const raw = try reader.interface.allocRemaining(allocator, .limited(256));
-            errdefer allocator.free(raw);
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            var raw: [256]u8 = undefined;
+            const raw_len = try reader.interface.readSliceShort(&raw);
+            const trimmed = std.mem.trim(u8, raw[0..raw_len], " \t\r\n");
             if (trimmed.len == 0) return error.SystemBootIdentityUnavailable;
-            const result = try allocator.dupe(u8, trimmed);
-            allocator.free(raw);
-            break :blk result;
+            break :blk try allocator.dupe(u8, trimmed);
         },
         else => error.SystemBootIdentityUnsupported,
     };
