@@ -287,6 +287,7 @@ const ReviewTupleLock = struct {
     codexThreadId: ?[]const u8 = null,
     workflowBinding: ?WorkflowBinding = null,
     ownerLeaseVersion: ?[]const u8 = null,
+    managedServerPid: ?u64 = null,
     reviewStartSendStarted: bool = false,
     state: []const u8,
     reviewThreadId: ?[]const u8 = null,
@@ -1384,42 +1385,50 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         };
         appendLogRecord(allocator, parent_event_log_path, "review/start", "note", "{\"compatibility\":\"pre-materialized-fresh-parent\"}") catch {};
     }
-    if (workflow_binding != null) {
-        markReviewStartSendStarted(
-            allocator,
-            tuple_lock_bundle.path,
-            &tuple_lock_bundle.lock,
-        ) catch |err| {
-            updateReviewTupleLockBestEffort(
+    var review_start_send_boundary = ReviewStartSendBoundary{
+        .allocator = allocator,
+        .lock_path = tuple_lock_bundle.path,
+        .lock = &tuple_lock_bundle.lock,
+    };
+    const review_start_send_observer: ?cas.RequestSendObserver = if (workflow_binding != null)
+        .{
+            .context = &review_start_send_boundary,
+            .before_send = persistReviewStartSendBoundary,
+        }
+    else
+        null;
+    review_result_json = requestReviewStart(
+        &client,
+        review_params_json,
+        review_start_send_observer,
+    ) catch |err| blk: {
+        const request_send_started = client.lastRequestSendStarted();
+        const raw_message = client.lastError() orelse @errorName(err);
+        const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
+        if (workflow_binding != null and request_send_started and
+            failure != null and
+            std.mem.eql(u8, failure.?.code, "account_resource_exhausted"))
+        {
+            output_receipt.error_review_attempt_phase = "review_terminal";
+            output_receipt.error_review_attempt_exists = true;
+            terminalizeOwnedReviewAttempt(
                 allocator,
+                &managed_server,
                 tuple_lock_bundle.path,
                 tuple_lock_bundle.lock,
-                "pre_review_start_failed",
-                "pre_review_start_failed",
-                null,
-                null,
-                null,
-                parent_event_log_path,
+                .{ .event_log_path = parent_event_log_path },
+                failure.?,
             );
-            managed_server.kill();
-            output_receipt.error_review_attempt_phase = "pre_review_start";
-            output_receipt.error_review_attempt_exists = false;
             try renderErrorAndExit(
                 parsed.json,
                 "start",
                 "review/start",
-                @errorName(err),
+                failure.?.hint,
                 cwd,
                 output_receipt,
-                .{
-                    .code = "pre_review_start_failed",
-                    .hint = "CAS could not persist the review/start send boundary; no review attempt was created",
-                },
+                failure.?,
             );
-        };
-    }
-    review_result_json = client.requestJson("review/start", review_params_json) catch |err| blk: {
-        const request_send_started = client.lastRequestSendStarted();
+        }
         if (reviewStartFailureOwnsAttempt(workflow_binding != null, request_send_started, err)) {
             output_receipt.error_review_attempt_phase = if (request_send_started) "review_terminal" else "pre_review_start";
             output_receipt.error_review_attempt_exists = request_send_started;
@@ -1442,8 +1451,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 timeout_failure,
             );
         }
-        const raw_message = client.lastError() orelse @errorName(err);
-        const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
         if (created_parent_thread and failure != null and !pre_materialize_parent) {
             materializeParentThreadTurn(
                 allocator,
@@ -1475,8 +1482,38 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             };
 
             review_start_retry_used = true;
-            break :blk client.requestJson("review/start", review_params_json) catch |retry_err| {
+            break :blk requestReviewStart(
+                &client,
+                review_params_json,
+                review_start_send_observer,
+            ) catch |retry_err| {
                 const retry_send_started = client.lastRequestSendStarted();
+                const retry_message = client.lastError() orelse @errorName(retry_err);
+                const retry_failure = failureInfoForReviewStart(retry_message, created_parent_thread);
+                if (workflow_binding != null and retry_send_started and
+                    retry_failure != null and
+                    std.mem.eql(u8, retry_failure.?.code, "account_resource_exhausted"))
+                {
+                    output_receipt.error_review_attempt_phase = "review_terminal";
+                    output_receipt.error_review_attempt_exists = true;
+                    terminalizeOwnedReviewAttempt(
+                        allocator,
+                        &managed_server,
+                        tuple_lock_bundle.path,
+                        tuple_lock_bundle.lock,
+                        .{ .event_log_path = parent_event_log_path },
+                        retry_failure.?,
+                    );
+                    try renderErrorAndExit(
+                        parsed.json,
+                        "start",
+                        "review/start",
+                        retry_failure.?.hint,
+                        cwd,
+                        output_receipt,
+                        retry_failure.?,
+                    );
+                }
                 if (reviewStartFailureOwnsAttempt(workflow_binding != null, retry_send_started, retry_err)) {
                     output_receipt.error_review_attempt_phase = if (retry_send_started) "review_terminal" else "pre_review_start";
                     output_receipt.error_review_attempt_exists = retry_send_started;
@@ -1499,8 +1536,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         timeout_failure,
                     );
                 }
-                const retry_message = client.lastError() orelse @errorName(retry_err);
-                const retry_failure = failureInfoForReviewStart(retry_message, created_parent_thread);
                 const message = if (retry_failure) |value| value.hint else retry_message;
                 const failure_for_lock: FailureInfo = retry_failure orelse .{
                     .code = "pre_review_start_failed",
@@ -1726,9 +1761,41 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             wait_deadline_ms,
         ) catch |err| switch (err) {
             error.WaitTimedOut => timeout: {
+                var timeout_status = fetch_timeout_status: {
+                    var grace_client = connectReviewClient(
+                        allocator,
+                        cwd,
+                        resolved_codex_path,
+                        codex_version,
+                        "websocket",
+                        managed_server_listen_url,
+                        io,
+                        parsed,
+                        monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
+                    ) catch {
+                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
+                    };
+                    defer {
+                        grace_client.close();
+                        grace_client.deinit();
+                    }
+                    break :fetch_timeout_status fetchReviewStatusAfterWaitTimeout(
+                        allocator,
+                        &grace_client,
+                        record.review_thread_id,
+                        record.review_turn_id,
+                        record.event_log_path,
+                        codex_version,
+                        parsed.poll_interval_ms,
+                    ) catch {
+                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
+                    };
+                };
+                if (reviewGraceStatusCompletesWait(&timeout_status)) {
+                    break :timeout timeout_status;
+                }
+                defer timeout_status.deinit(allocator);
                 if (workflow_binding != null) {
-                    var timeout_status = try makeDisconnectedReviewStatus(allocator);
-                    defer timeout_status.deinit(allocator);
                     const failure = reviewWaitTimeoutDisposition(true).failure;
                     terminalizeOwnedReviewAttempt(
                         allocator,
@@ -1762,38 +1829,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     );
                     std.process.exit(1);
                 }
-                var timeout_status = fetch_timeout_status: {
-                    var grace_client = connectReviewClient(
-                        allocator,
-                        cwd,
-                        resolved_codex_path,
-                        codex_version,
-                        "websocket",
-                        managed_server_listen_url,
-                        io,
-                        parsed,
-                        monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
-                    ) catch {
-                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
-                    };
-                    defer {
-                        grace_client.close();
-                        grace_client.deinit();
-                    }
-                    break :fetch_timeout_status fetchReviewStatusAfterWaitTimeout(
-                        allocator,
-                        &grace_client,
-                        record.review_thread_id,
-                        record.review_turn_id,
-                        record.event_log_path,
-                        codex_version,
-                        parsed.poll_interval_ms,
-                    ) catch {
-                        break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
-                    };
-                };
-                if (timeout_status.review_result_available) break :timeout timeout_status;
-                defer timeout_status.deinit(allocator);
                 const timeout_disposition = reviewWaitTimeoutDisposition(workflow_binding != null);
                 record.last_observed_status = timeoutStatusString(&timeout_status);
                 try writeSessionRecord(allocator, record_path, record);
@@ -2457,12 +2492,14 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 break :timeout timeout_status;
             }
             record.last_observed_status = timeoutStatusString(&timeout_status);
-            updateReviewTupleLockForRecordBestEffort(
+            try transitionReviewTupleLockForRecordOrReplay(
                 allocator,
+                parsed.json,
                 record,
                 loaded.record_path,
                 "waiting",
                 "wait_timed_out",
+                current_identity,
             );
             if (parsed.json) {
                 try printStatusJson(
@@ -2503,12 +2540,14 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         },
         else => {
             if (isTransportLossError(err)) {
-                updateReviewTupleLockForRecordBestEffort(
+                try transitionReviewTupleLockForRecordOrReplay(
                     allocator,
+                    parsed.json,
                     record,
                     loaded.record_path,
                     "terminal",
                     "review_transport_lost",
+                    current_identity,
                 );
                 if (parsed.json) {
                     const failure = terminalReviewTransportFailure("review_transport_lost").?;
@@ -2542,12 +2581,14 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             }
         }
         try writeSessionRecord(allocator, loaded.record_path, record);
-        updateReviewTupleLockForRecordBestEffort(
+        try transitionReviewTupleLockForRecordOrReplay(
             allocator,
+            parsed.json,
             record,
             loaded.record_path,
             if (std.mem.eql(u8, failure_for_lock.code, "account_resource_exhausted")) "account_resource_exhausted" else "terminal",
             failure_for_lock.code,
+            current_identity,
         );
         if (parsed.json) {
             try printStatusJson(
@@ -2602,12 +2643,14 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         stored_tuple,
         terminal_context.tuple,
     );
-    updateReviewTupleLockForRecordBestEffort(
+    try transitionReviewTupleLockForRecordOrReplay(
         allocator,
+        parsed.json,
         record,
         loaded.record_path,
         if (terminal_lock_failure == null) "normalized" else "terminal",
         if (terminal_lock_failure) |failure| failure.code else null,
+        current_identity,
     );
 
     if (parsed.json) {
@@ -4643,10 +4686,14 @@ fn terminalizeOwnedReviewAttempt(
 ) void {
     managed_server.kill();
     const durable_failure = terminalReviewOwnerFailure(failure.code) orelse failure;
+    const terminal_state = if (std.mem.eql(u8, failure.code, "account_resource_exhausted"))
+        "account_resource_exhausted"
+    else
+        "terminal";
 
     const terminal_lock = withReviewTupleLockState(
         lock,
-        "terminal",
+        terminal_state,
         unixSeconds(),
         failure.code,
         context.review_thread_id,
@@ -5979,8 +6026,22 @@ fn workflowBoundRecordOwnerState(
             loaded.record.ownerLeaseVersion orelse "",
             review_owner_lease_version,
         )) return .not_applicable;
-    const lease = try tryAcquireReviewOwnerLeaseAlloc(allocator, loaded.path);
-    if (lease == null) return .live;
+    var lease = (try tryAcquireReviewOwnerLeaseAlloc(allocator, loaded.path)) orelse
+        return .live;
+    errdefer lease.deinit(allocator);
+    var rechecked = try loadExactReviewTupleLockForRecord(
+        allocator,
+        record,
+        record_path,
+    );
+    defer rechecked.deinit(allocator);
+    const rechecked_active = std.mem.eql(u8, rechecked.record.state, "starting_review") or
+        std.mem.eql(u8, rechecked.record.state, "review_started") or
+        std.mem.eql(u8, rechecked.record.state, "waiting");
+    if (!rechecked_active) {
+        lease.deinit(allocator);
+        return .not_applicable;
+    }
     retained_owner_lease.* = lease;
     return .dead;
 }
@@ -6039,11 +6100,29 @@ fn terminalizeDeadWorkflowBoundOwner(
 
 fn persistDeadOwnerRecoveryEvidence(
     allocator: std.mem.Allocator,
+    lock_path: []const u8,
     lock: ReviewTupleLock,
     target_identity: TargetIdentity,
-) ![]const u8 {
-    const record_path = lock.recordPath orelse
-        return error.InvalidReviewTupleLockBinding;
+) !?[]const u8 {
+    const record_path = lock.recordPath orelse {
+        const failure = workflowDeadOwnerFailureInfo(lock);
+        const terminal_state = if (workflowDeadOwnerAttemptExists(lock))
+            "terminal"
+        else
+            "pre_review_start_failed";
+        const terminal = withReviewTupleLockState(
+            lock,
+            terminal_state,
+            unixSeconds(),
+            failure.code,
+            lock.reviewThreadId,
+            lock.reviewTurnId,
+            null,
+            lock.eventLogPath,
+        );
+        try writeReviewTupleLock(allocator, lock_path, terminal);
+        return null;
+    };
     var loaded_record = try loadOwnedSessionRecordPath(
         allocator,
         try allocator.dupe(u8, record_path),
@@ -6069,7 +6148,7 @@ fn persistDeadOwnerRecoveryEvidence(
     defer normalized.deinit(allocator);
     const timestamp = try casRerTimestampAlloc(allocator);
     defer allocator.free(timestamp);
-    return writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+    return try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
         .command_surface = "start_wait",
         .backend_selected = "cas-start-wait",
         .broker_action = "recover_dead_owner",
@@ -6312,12 +6391,60 @@ fn markReviewStartSendStarted(
     lock: *ReviewTupleLock,
 ) !void {
     if (lock.reviewStartSendStarted) return;
-    var next = lock.*;
+    const claim_path = try claimReviewTupleLockRewriteExclusive(allocator, lock_path);
+    defer allocator.free(claim_path);
+    defer deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
+    var loaded = (try loadReviewTupleLock(allocator, lock_path)) orelse
+        return error.MissingReviewTupleLock;
+    defer loaded.deinit(allocator);
+    if (!std.mem.eql(u8, loaded.record.tupleHash, lock.tupleHash) or
+        !std.mem.eql(u8, loaded.record.state, "starting_review") or
+        loaded.record.ownerPid != lock.ownerPid)
+    {
+        return error.InvalidReviewTupleLockBinding;
+    }
+    if (loaded.record.reviewStartSendStarted) {
+        lock.reviewStartSendStarted = true;
+        return;
+    }
+    var next = loaded.record;
     next.reviewStartSendStarted = true;
     next.updatedAtUnixS = unixSeconds();
     next.expiresAtUnixS = next.updatedAtUnixS + review_tuple_lock_ttl_seconds;
     try writeReviewTupleLock(allocator, lock_path, next);
-    lock.* = next;
+    lock.reviewStartSendStarted = true;
+    lock.updatedAtUnixS = next.updatedAtUnixS;
+    lock.expiresAtUnixS = next.expiresAtUnixS;
+}
+
+const ReviewStartSendBoundary = struct {
+    allocator: std.mem.Allocator,
+    lock_path: []const u8,
+    lock: *ReviewTupleLock,
+};
+
+fn persistReviewStartSendBoundary(context: *anyopaque) anyerror!void {
+    const boundary: *ReviewStartSendBoundary = @ptrCast(@alignCast(context));
+    try markReviewStartSendStarted(
+        boundary.allocator,
+        boundary.lock_path,
+        boundary.lock,
+    );
+}
+
+fn requestReviewStart(
+    client: *cas.Client,
+    params_json: []const u8,
+    send_observer: ?cas.RequestSendObserver,
+) ![]u8 {
+    if (send_observer) |observer| {
+        return client.requestJsonWithSendObserver(
+            "review/start",
+            params_json,
+            observer,
+        );
+    }
+    return client.requestJson("review/start", params_json);
 }
 
 fn writeReviewTupleLock(allocator: std.mem.Allocator, path: []const u8, lock: ReviewTupleLock) !void {
@@ -6454,12 +6581,44 @@ fn reviewTupleLockReplaceableDeadFailure(lock: ReviewTupleLock) bool {
 fn reviewTupleLockDeadTransportProven(allocator: std.mem.Allocator, lock: ReviewTupleLock) bool {
     if (!reviewTupleLockReplaceableDeadFailure(lock)) return false;
     if (cas_websocket.processAlive(lock.ownerPid)) return false;
-    const record_path = lock.recordPath orelse return false;
-    const owned_record_path = allocator.dupe(u8, record_path) catch return false;
-    var loaded = loadOwnedSessionRecordPath(allocator, owned_record_path) catch return false;
-    defer loaded.deinit(allocator);
-    const managed_server_pid = loaded.record.managed_server_pid orelse return false;
+    const managed_server_pid = reviewTupleManagedServerPid(allocator, lock) orelse return false;
     return !cas_websocket.processAlive(managed_server_pid);
+}
+
+fn reviewTupleManagedServerPid(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+) ?u64 {
+    if (lock.managedServerPid) |process_id| return process_id;
+    const record_path = lock.recordPath orelse return null;
+    const owned_record_path = allocator.dupe(u8, record_path) catch return null;
+    var loaded = loadOwnedSessionRecordPath(allocator, owned_record_path) catch return null;
+    defer loaded.deinit(allocator);
+    return loaded.record.managed_server_pid;
+}
+
+fn ensureReviewTuplePredecessorExited(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+) !void {
+    return ensureReviewTuplePredecessorExitedWithin(
+        allocator,
+        lock,
+        cas_websocket.owner_watchdog_shutdown_grace_ms + 1_500,
+    );
+}
+
+fn ensureReviewTuplePredecessorExitedWithin(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+    timeout_ms: u32,
+) !void {
+    const managed_server_pid = reviewTupleManagedServerPid(allocator, lock) orelse
+        return error.InvalidReviewTupleLockBinding;
+    if (managed_server_pid == 0) return error.InvalidReviewTupleLockBinding;
+    if (!cas_websocket.waitForProcessExit(managed_server_pid, timeout_ms)) {
+        return error.ReviewPredecessorStillAlive;
+    }
 }
 
 fn reviewTupleLockActionForAcquire(
@@ -6944,7 +7103,7 @@ fn acquireReviewTupleStartLockOrExit(
     );
     switch (decision) {
         .create => {
-            const lock = makeReviewTupleLock(
+            var lock = makeReviewTupleLock(
                 tuple_hash,
                 tuple,
                 "starting_review",
@@ -6952,6 +7111,10 @@ fn acquireReviewTupleStartLockOrExit(
                 override_reason,
                 fresh_attempt_reason,
             );
+            lock.managedServerPid = if (managed_server_to_kill_on_exit) |server|
+                server.processId()
+            else
+                null;
             writeReviewTupleLockExclusive(allocator, lock_path, lock) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     var raced = (loadReviewTupleLock(allocator, lock_path) catch {
@@ -7148,14 +7311,16 @@ fn acquireReviewTupleStartLockOrExit(
                 else
                     override_reason;
             if (latest_decision == .recover_dead_owner) {
+                try ensureReviewTuplePredecessorExited(allocator, latest.record);
                 const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
                     allocator,
+                    lock_path,
                     latest.record,
                     target_identity,
                 );
-                allocator.free(predecessor_rer_path);
+                if (predecessor_rer_path) |path| allocator.free(path);
             }
-            const lock = makeReviewTupleLock(
+            var lock = makeReviewTupleLock(
                 tuple_hash,
                 tuple,
                 "starting_review",
@@ -7163,6 +7328,10 @@ fn acquireReviewTupleStartLockOrExit(
                 replacement_override_reason,
                 fresh_attempt_reason,
             );
+            lock.managedServerPid = if (managed_server_to_kill_on_exit) |server|
+                server.processId()
+            else
+                null;
             try writeReviewTupleLock(allocator, lock_path, lock);
             return .{
                 .path = lock_path,
@@ -7229,20 +7398,30 @@ fn updateReviewTupleLockBestEffort(
     writeReviewTupleLock(allocator, path, next) catch {};
 }
 
-fn updateReviewTupleLockForRecordBestEffort(
+fn transitionReviewTupleLockForRecordOrReplay(
     allocator: std.mem.Allocator,
+    json_mode: bool,
     record: SessionRecord,
     record_path: []const u8,
     state: []const u8,
     failure_code: ?[]const u8,
-) void {
-    _ = transitionActiveReviewTupleLockForRecord(
+    identity: TargetIdentity,
+) !void {
+    if (try transitionActiveReviewTupleLockForRecord(
         allocator,
         record,
         record_path,
         state,
         failure_code,
-    ) catch return;
+    )) return;
+    try replayTerminalRecordAndExit(
+        allocator,
+        json_mode,
+        record,
+        record_path,
+        identity,
+    );
+    return error.InvalidReviewTupleLockBinding;
 }
 
 fn transitionActiveReviewTupleLockForRecord(
@@ -15392,11 +15571,12 @@ test "review tuple lock write and load roundtrip" {
     );
     defer std.testing.allocator.free(path);
 
-    var lock = makeReviewTupleLock(tuple_hash, tuple, "review_started", 1, null, null);
+    var lock = makeReviewTupleLock(tuple_hash, tuple, "starting_review", 1, null, null);
     lock.reviewThreadId = "thr_1";
     lock.reviewTurnId = "turn_1";
     lock.recordPath = "/repo/receipt.json";
     lock.eventLogPath = "/repo/events.ndjson";
+    lock.managedServerPid = 9;
     lock.updatedAtUnixS = 2;
     lock.expiresAtUnixS = 3;
     lock.ownerPid = 4;
@@ -15405,15 +15585,120 @@ test "review tuple lock write and load roundtrip" {
     defer loaded.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(review_tuple_lock_version, loaded.record.lockVersion);
-    try std.testing.expectEqualStrings("review_started", loaded.record.state);
+    try std.testing.expectEqualStrings("starting_review", loaded.record.state);
     try std.testing.expectEqualStrings("thr_1", loaded.record.reviewThreadId.?);
     try std.testing.expectEqualStrings("acct:a", loaded.record.accountFingerprint);
+    try std.testing.expectEqual(@as(?u64, 9), loaded.record.managedServerPid);
 
     try markReviewStartSendStarted(std.testing.allocator, path, &lock);
     try std.testing.expect(lock.reviewStartSendStarted);
     var marked = (try loadReviewTupleLock(std.testing.allocator, path)).?;
     defer marked.deinit(std.testing.allocator);
     try std.testing.expect(marked.record.reviewStartSendStarted);
+}
+
+test "recordless dead owner recovery terminalizes the exact lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const tuple = testTupleIdentity("acct:a");
+    const tuple_hash = try reviewTupleHashAlloc(std.testing.allocator, tuple);
+    defer std.testing.allocator.free(tuple_hash);
+    const lock_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/{s}.json",
+        .{ root, tuple_hash["sha256:".len..] },
+    );
+    defer std.testing.allocator.free(lock_path);
+    var lock = makeReviewTupleLock(
+        tuple_hash,
+        tuple,
+        "starting_review",
+        1,
+        null,
+        "recover exact request",
+    );
+    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+
+    try std.testing.expect((try persistDeadOwnerRecoveryEvidence(
+        std.testing.allocator,
+        lock_path,
+        lock,
+        identity,
+    )) == null);
+    var pre_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
+    defer pre_send.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pre_review_start_failed", pre_send.record.state);
+    try std.testing.expectEqualStrings(
+        "workflow_bound_review_owner_lost_before_start",
+        pre_send.record.lastFailureCode.?,
+    );
+
+    lock.reviewStartSendStarted = true;
+    try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
+    try std.testing.expect((try persistDeadOwnerRecoveryEvidence(
+        std.testing.allocator,
+        lock_path,
+        lock,
+        identity,
+    )) == null);
+    var post_send = (try loadReviewTupleLock(std.testing.allocator, lock_path)).?;
+    defer post_send.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("terminal", post_send.record.state);
+    try std.testing.expectEqualStrings(
+        "review_transport_lost",
+        post_send.record.lastFailureCode.?,
+    );
+}
+
+test "replacement admission requires predecessor process exit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var child = try cas_websocket.spawnDetachedProcess(
+        std.testing.allocator,
+        "/tmp",
+        &.{ "/bin/sh", "-c", "sleep 10" },
+        io,
+    );
+    var child_live = true;
+    defer if (child_live) child.kill(io);
+    const process_id: u64 = switch (builtin.os.tag) {
+        .windows => @intCast(@intFromPtr(child.id.?)),
+        .wasi => 0,
+        else => @intCast(child.id.?),
+    };
+    const lock = ReviewTupleLock{
+        .tupleHash = "sha256:predecessor",
+        .repoRealpath = "/repo",
+        .baseSha = "base",
+        .headSha = "head",
+        .targetFingerprint = "fp",
+        .resolvedCodexPath = "/bin/codex",
+        .resolvedCodexVersion = "codex 0.1.0",
+        .accountFingerprint = "acct:a",
+        .accountFingerprintReducedProtection = false,
+        .state = "starting_review",
+        .managedServerPid = process_id,
+        .createdAtUnixS = 1,
+        .updatedAtUnixS = 1,
+        .expiresAtUnixS = 61,
+        .ownerPid = 1,
+    };
+
+    try std.testing.expectError(
+        error.ReviewPredecessorStillAlive,
+        ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1),
+    );
+    child.kill(io);
+    child_live = false;
+    try std.testing.expect(cas_websocket.waitForProcessExit(process_id, 2_000));
+    try ensureReviewTuplePredecessorExitedWithin(std.testing.allocator, lock, 1);
 }
 
 test "review tuple lock load rejects path and complete-tuple mismatches" {
@@ -15865,11 +16150,12 @@ test "terminal timeout session replays only through its exact tuple lock" {
     try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
     const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
         std.testing.allocator,
+        lock_path,
         lock,
         requested_identity,
     );
-    defer std.testing.allocator.free(predecessor_rer_path);
-    try std.Io.Dir.accessAbsolute(io, predecessor_rer_path, .{});
+    defer std.testing.allocator.free(predecessor_rer_path.?);
+    try std.Io.Dir.accessAbsolute(io, predecessor_rer_path.?, .{});
     var persisted_terminal = try loadOwnedSessionRecordPath(
         std.testing.allocator,
         try std.testing.allocator.dupe(u8, record_path),

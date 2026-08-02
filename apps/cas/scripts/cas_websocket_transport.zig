@@ -7,6 +7,8 @@ const mem = std.mem;
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const loopback_host = "127.0.0.1";
 
+pub const owner_watchdog_shutdown_grace_ms: u32 = 1_000;
+
 pub const ManagedServer = struct {
     child: std.process.Child,
     listen_url: []u8,

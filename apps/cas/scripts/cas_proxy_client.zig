@@ -75,6 +75,11 @@ pub const ClientOptions = struct {
     request_deadline_ms: ?i64 = null,
 };
 
+pub const RequestSendObserver = struct {
+    context: *anyopaque,
+    before_send: *const fn (context: *anyopaque) anyerror!void,
+};
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
@@ -211,7 +216,21 @@ pub const Client = struct {
     }
 
     pub fn requestJson(self: *Client, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        return self.requestJsonCaptureNotifications(method, params_json, null);
+        return self.requestJsonCaptureNotificationsInternal(method, params_json, null, null);
+    }
+
+    pub fn requestJsonWithSendObserver(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        send_observer: RequestSendObserver,
+    ) ![]u8 {
+        return self.requestJsonCaptureNotificationsInternal(
+            method,
+            params_json,
+            null,
+            send_observer,
+        );
     }
 
     pub fn requestJsonCaptureNotifications(
@@ -220,11 +239,26 @@ pub const Client = struct {
         params_json: ?[]const u8,
         notification_lines: ?*std.ArrayList([]u8),
     ) ![]u8 {
+        return self.requestJsonCaptureNotificationsInternal(
+            method,
+            params_json,
+            notification_lines,
+            null,
+        );
+    }
+
+    fn requestJsonCaptureNotificationsInternal(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        notification_lines: ?*std.ArrayList([]u8),
+        send_observer: ?RequestSendObserver,
+    ) ![]u8 {
         self.request_send_started = false;
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
-        try self.sendRequest(request_id, method, params_json);
+        try self.sendRequest(request_id, method, params_json, send_observer);
 
         while (true) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
@@ -315,7 +349,7 @@ pub const Client = struct {
                     },
                 },
             };
-            try self.sendToServer(initialize);
+            try self.sendToServer(initialize, null);
         } else {
             const InitNoOptOut = struct {
                 method: []const u8,
@@ -345,7 +379,7 @@ pub const Client = struct {
                     },
                 },
             };
-            try self.sendToServer(initialize);
+            try self.sendToServer(initialize, null);
         }
 
         const started_ms = monotonicMillis();
@@ -378,7 +412,7 @@ pub const Client = struct {
             const Initialized = struct {
                 method: []const u8,
             };
-            try self.sendToServer(Initialized{ .method = "initialized" });
+            try self.sendToServer(Initialized{ .method = "initialized" }, null);
             return;
         }
 
@@ -386,7 +420,13 @@ pub const Client = struct {
         return error.HandshakeTimeout;
     }
 
-    fn sendRequest(self: *Client, request_id: i64, method: []const u8, params_json: ?[]const u8) !void {
+    fn sendRequest(
+        self: *Client,
+        request_id: i64,
+        method: []const u8,
+        params_json: ?[]const u8,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         if (params_json) |raw| {
             var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
             defer parsed_params.deinit();
@@ -401,7 +441,7 @@ pub const Client = struct {
                 .id = request_id,
                 .params = parsed_params.value,
             };
-            try self.sendToServer(req);
+            try self.sendToServer(req, send_observer);
         } else {
             const ReqNoParams = struct {
                 method: []const u8,
@@ -411,22 +451,27 @@ pub const Client = struct {
                 .method = method,
                 .id = request_id,
             };
-            try self.sendToServer(req);
+            try self.sendToServer(req, send_observer);
         }
     }
 
-    fn sendToServer(self: *Client, msg: anytype) !void {
+    fn sendToServer(
+        self: *Client,
+        msg: anytype,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
+                if (send_observer) |observer| try observer.before_send(observer.context);
                 self.request_send_started = true;
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.sendWebSocket(payload),
+            .websocket => try self.sendWebSocket(payload, send_observer),
         }
     }
 
@@ -510,7 +555,7 @@ pub const Client = struct {
         try self.sendToServer(Response{
             .id = id,
             .result = .{ .decision = decision },
-        });
+        }, null);
     }
 
     fn sendApprovalDecisionValue(self: *Client, id: i64, decision: std.json.Value) !void {
@@ -523,7 +568,7 @@ pub const Client = struct {
         try self.sendToServer(Response{
             .id = id,
             .result = .{ .decision = decision },
-        });
+        }, null);
     }
 
     fn sendResultRawJson(self: *Client, id: i64, result_json: []const u8) !void {
@@ -542,17 +587,23 @@ pub const Client = struct {
                 try self.stdin_file.?.writeStreamingAll(self.io, payload);
                 try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
-            .websocket => try self.sendWebSocket(payload),
+            .websocket => try self.sendWebSocket(payload, null),
         }
     }
 
-    fn sendWebSocket(self: *Client, payload: []const u8) !void {
+    fn sendWebSocket(
+        self: *Client,
+        payload: []const u8,
+        send_observer: ?RequestSendObserver,
+    ) !void {
         const deadline_ms = self.request_deadline_ms orelse {
+            if (send_observer) |observer| try observer.before_send(observer.context);
             self.request_send_started = true;
             return self.websocket.?.sendText(payload);
         };
         const remaining_ms = deadline_ms - monotonicMillis();
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        if (send_observer) |observer| try observer.before_send(observer.context);
         self.request_send_started = true;
         self.websocket.?.sendTextTimeout(payload, @intCast(remaining_ms)) catch |err| switch (err) {
             error.Timeout => return error.ConnectionTimedOut,
@@ -574,7 +625,7 @@ pub const Client = struct {
                 .code = code,
                 .message = message,
             },
-        });
+        }, null);
     }
 
     fn resolveExecDecision(self: *const Client) []const u8 {
@@ -916,7 +967,51 @@ test "expired request deadline remains pre-send" {
     };
     defer client.line_buf.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.ConnectionTimedOut, client.sendWebSocket("{}"));
+    try std.testing.expectError(error.ConnectionTimedOut, client.sendWebSocket("{}", null));
+    try std.testing.expect(!client.lastRequestSendStarted());
+}
+
+const SendObserverProbe = struct {
+    calls: usize = 0,
+
+    fn failBeforeSend(context: *anyopaque) anyerror!void {
+        const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
+        probe.calls += 1;
+        return error.SendBoundaryPersistenceFailed;
+    }
+};
+
+test "request send observer runs before transport send attribution" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = null,
+        .file_approval = null,
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = true,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+    var probe = SendObserverProbe{};
+
+    try std.testing.expectError(
+        error.SendBoundaryPersistenceFailed,
+        client.sendToServer(.{ .method = "review/start" }, .{
+            .context = &probe,
+            .before_send = SendObserverProbe.failBeforeSend,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(!client.lastRequestSendStarted());
 }
 
