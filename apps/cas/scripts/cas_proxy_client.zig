@@ -72,6 +72,7 @@ pub const ClientOptions = struct {
     hook_policy: hooks.HookPolicy = .inherit,
     websocket_url: ?[]const u8 = null,
     websocket_connect_timeout_ms: u32 = 10_000,
+    request_deadline_ms: ?i64 = null,
 };
 
 pub const Client = struct {
@@ -148,6 +149,7 @@ pub const Client = struct {
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
+            .request_deadline_ms = opts.request_deadline_ms,
         };
         try client.handshake(opts);
         return client;
@@ -180,6 +182,7 @@ pub const Client = struct {
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
+            .request_deadline_ms = opts.request_deadline_ms,
         };
         try client.handshake(opts);
         return client;

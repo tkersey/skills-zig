@@ -1071,6 +1071,11 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         );
     }
 
+    const workflow_deadline_ms: ?i64 = if (workflow_binding != null)
+        monotonicMilliseconds() + @as(i64, parsed.timeout_ms)
+    else
+        null;
+
     var managed_server = startManagedWebsocketServer(
         allocator,
         cwd,
@@ -1108,6 +1113,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         managed_server_listen_url,
         io,
         parsed,
+        workflow_deadline_ms,
     ) catch |err| {
         managed_server.kill();
         try renderErrorAndExit(
@@ -1136,10 +1142,6 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         client.close();
         client.deinit();
     }
-    const workflow_deadline_ms: ?i64 = if (workflow_binding != null)
-        monotonicMilliseconds() + @as(i64, parsed.timeout_ms)
-    else
-        null;
     const previous_request_deadline = if (workflow_deadline_ms) |deadline_ms|
         client.swapRequestDeadlineMs(deadline_ms)
     else
@@ -1770,6 +1772,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         managed_server_listen_url,
                         io,
                         parsed,
+                        monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
                     ) catch {
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
@@ -2133,6 +2136,22 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const stored_identity = try targetIdentityForRecordAlloc(allocator, record);
     defer stored_identity.deinit(allocator);
     const stored_identity_opt: ?TargetIdentity = stored_identity;
+    const wait_deadline_ms = monotonicMilliseconds() + @as(i64, parsed.timeout_ms);
+
+    if (try recordHasTerminalFailureReplayCandidate(
+        allocator,
+        record,
+        loaded.record_path,
+    )) {
+        try replayTerminalRecordAndExit(
+            allocator,
+            parsed.json,
+            record,
+            loaded.record_path,
+            stored_identity,
+        );
+    }
+
     const current_codex_path = try cas.resolveExecutableAlloc(allocator, "codex");
     defer allocator.free(current_codex_path);
     const current_codex_version = try readCodexVersionAlloc(
@@ -2152,7 +2171,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     defer current_identity.deinit(allocator);
     const current_identity_opt: ?TargetIdentity = current_identity;
 
-    if (try recordIsTerminalReplayCandidate(
+    if (try recordIsNormalizedVerdictReplayCandidate(
         allocator,
         record,
         loaded.record_path,
@@ -2177,6 +2196,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 validation_server.listen_url,
                 io,
                 parsed,
+                wait_deadline_ms,
             );
             defer {
                 validation_client.close();
@@ -2283,6 +2303,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.managed_server_listen_url,
         io,
         parsed,
+        wait_deadline_ms,
     ) catch |err| {
         if (isTransportLossError(err)) {
             updateReviewTupleLockForRecordBestEffort(
@@ -2312,7 +2333,6 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         client.close();
         client.deinit();
     }
-    const wait_deadline_ms = monotonicMilliseconds() + @as(i64, parsed.timeout_ms);
     const previous_wait_deadline = client.swapRequestDeadlineMs(wait_deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_wait_deadline);
     var stored_tuple = try storedReviewTupleIdentityAlloc(allocator, record);
@@ -2354,6 +2374,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     record.managed_server_listen_url,
                     io,
                     parsed,
+                    monotonicMilliseconds() + @as(i64, finalReviewStatusGraceMs(parsed.poll_interval_ms)),
                 ) catch break :grace try makeDisconnectedReviewStatus(allocator);
                 defer {
                     grace_client.close();
@@ -2391,7 +2412,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     loaded.record_path,
                     record.event_log_path,
                     record.target,
-                    current_identity_opt,
+                    stored_identity_opt,
                     waitOutputReceipt(
                         record,
                         current_tuple,
@@ -2432,7 +2453,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                         .wait,
                         record,
                         loaded.record_path,
-                        current_identity_opt,
+                        stored_identity_opt,
                         null,
                         failure,
                     );
@@ -5044,8 +5065,14 @@ fn connectReviewClient(
     websocket_url: ?[]const u8,
     io: std.Io,
     parsed: ParsedArgs,
+    request_deadline_ms: ?i64,
 ) !cas.Client {
     _ = codex_version;
+    const websocket_connect_timeout_ms: u32 = if (request_deadline_ms) |deadline_ms| blk: {
+        const remaining_ms = deadline_ms - monotonicMilliseconds();
+        if (remaining_ms <= 0) return error.ConnectionTimedOut;
+        break :blk @intCast(@min(remaining_ms, 10_000));
+    } else 10_000;
     return cas.Client.start(allocator, .{
         .cwd = cwd,
         .io = io,
@@ -5063,6 +5090,8 @@ fn connectReviewClient(
         .read_only = parsed.read_only,
         .hook_policy = parsed.hook_policy,
         .websocket_url = if (transport_kind != null and std.mem.eql(u8, transport_kind.?, "websocket")) websocket_url else null,
+        .websocket_connect_timeout_ms = websocket_connect_timeout_ms,
+        .request_deadline_ms = request_deadline_ms,
     });
 }
 
@@ -5633,7 +5662,7 @@ fn loadExactReviewTupleLockForRecord(
     return loaded;
 }
 
-fn recordIsTerminalReplayCandidate(
+fn recordHasTerminalFailureReplayCandidate(
     allocator: std.mem.Allocator,
     record: SessionRecord,
     record_path: []const u8,
@@ -5644,10 +5673,31 @@ fn recordIsTerminalReplayCandidate(
         record_path,
     );
     defer loaded.deinit(allocator);
-    return std.mem.eql(u8, loaded.record.state, "normalized") or
-        std.mem.eql(u8, loaded.record.state, "terminal") or
-        std.mem.eql(u8, loaded.record.state, "account_resource_exhausted") or
-        record.terminal_failure_code != null;
+    const terminal = std.mem.eql(u8, loaded.record.state, "terminal") or
+        std.mem.eql(u8, loaded.record.state, "account_resource_exhausted");
+    if (!terminal) return false;
+    const lock_code = loaded.record.lastFailureCode orelse
+        return error.InvalidReviewTupleLockBinding;
+    if (record.terminal_failure_code) |record_code| {
+        if (!std.mem.eql(u8, record_code, lock_code)) {
+            return error.InvalidReviewTupleLockBinding;
+        }
+    }
+    return true;
+}
+
+fn recordIsNormalizedVerdictReplayCandidate(
+    allocator: std.mem.Allocator,
+    record: SessionRecord,
+    record_path: []const u8,
+) !bool {
+    var loaded = try loadExactReviewTupleLockForRecord(
+        allocator,
+        record,
+        record_path,
+    );
+    defer loaded.deinit(allocator);
+    return std.mem.eql(u8, loaded.record.state, "normalized");
 }
 
 fn recordTerminalOwnerFailure(
@@ -5713,8 +5763,7 @@ fn replayTerminalRecordAndExit(
     }
 
     const terminal = std.mem.eql(u8, loaded.record.state, "terminal") or
-        std.mem.eql(u8, loaded.record.state, "account_resource_exhausted") or
-        record.terminal_failure_code != null;
+        std.mem.eql(u8, loaded.record.state, "account_resource_exhausted");
     if (!terminal) return;
     const code = loaded.record.lastFailureCode orelse
         record.terminal_failure_code orelse "review_failed";
@@ -5809,14 +5858,9 @@ fn terminalizeDeadWorkflowBoundOwner(
     record: *SessionRecord,
     failure: FailureInfo,
 ) !void {
-    // CAS-RTL-v2 owner-lived servers are children of an owner-pipe watchdog.
-    // The kernel closes that pipe when the owner dies; recovery waits for the
-    // watchdog to retire its exact child instead of killing a recycled PID.
-    if (record.managed_server_pid) |process_id| {
-        if (!cas_websocket.waitForProcessExit(process_id, 2_000)) {
-            return error.ManagedServerStillLive;
-        }
-    }
+    // The owner lease is the durable identity. A persisted numeric PID is
+    // diagnostic only and may already name an unrelated process. Owner-pipe
+    // EOF independently directs the watchdog to retire its exact child.
 
     var loaded = try loadExactReviewTupleLockForRecord(
         allocator,
@@ -6149,7 +6193,16 @@ fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, no
 
 fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8, dead_transport_proven: bool) ReviewTupleLockAction {
     const lock = existing orelse return .create;
-    if (!std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version)) return .block_invalid;
+    const current_lock = std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version);
+    const legacy_lock = std.mem.eql(u8, lock.lockVersion, legacy_review_tuple_lock_version);
+    if (!current_lock and !legacy_lock) return .block_invalid;
+    if (legacy_lock and
+        !(std.mem.eql(u8, lock.state, "terminal") or
+            std.mem.eql(u8, lock.state, "normalized") or
+            std.mem.eql(u8, lock.state, "account_resource_exhausted")))
+    {
+        return .block_invalid;
+    }
     if (std.mem.eql(u8, lock.state, "account_resource_exhausted")) {
         return if (override_reason != null) .takeover_with_override else .block_account_resource;
     }
@@ -14969,6 +15022,25 @@ test "review tuple lock action classifies active terminal exhausted and stale st
         reviewTupleLockAction("run", terminal, now_s, null, "run 3"),
     );
 
+    var legacy_terminal = terminal;
+    legacy_terminal.lockVersion = legacy_review_tuple_lock_version;
+    legacy_terminal.ownerLeaseVersion = null;
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.normalize_existing,
+        reviewTupleLockAction("run", legacy_terminal, now_s, null, null),
+    );
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.fresh_after_terminal,
+        reviewTupleLockAction("start", legacy_terminal, now_s, null, "upgrade retry"),
+    );
+    var legacy_active = active;
+    legacy_active.lockVersion = legacy_review_tuple_lock_version;
+    legacy_active.ownerLeaseVersion = null;
+    try std.testing.expectEqual(
+        ReviewTupleLockAction.block_invalid,
+        reviewTupleLockAction("run", legacy_active, now_s, "override", null),
+    );
+
     var exhausted = active;
     exhausted.state = "account_resource_exhausted";
     try std.testing.expectEqual(
@@ -15377,6 +15449,16 @@ test "terminal timeout session replays only through its exact tuple lock" {
         record_path,
     )).?;
     try std.testing.expectEqualStrings("review_transport_timeout", failure.code);
+    try std.testing.expect(try recordHasTerminalFailureReplayCandidate(
+        std.testing.allocator,
+        loaded.record,
+        record_path,
+    ));
+    try std.testing.expect(!try recordIsNormalizedVerdictReplayCandidate(
+        std.testing.allocator,
+        loaded.record,
+        record_path,
+    ));
     const requested_identity = TargetIdentity{
         .base_sha = record.base_sha,
         .head_sha = record.head_sha,
@@ -15450,6 +15532,11 @@ test "terminal timeout session replays only through its exact tuple lock" {
     lock.lastFailureCode = null;
     lock.ownerPid = currentProcessId();
     try writeReviewTupleLock(std.testing.allocator, lock_path, lock);
+    try std.testing.expect(!try recordHasTerminalFailureReplayCandidate(
+        std.testing.allocator,
+        loaded.record,
+        record_path,
+    ));
     {
         var owner_lease = (try tryAcquireReviewOwnerLeaseAlloc(
             std.testing.allocator,
@@ -15474,35 +15561,19 @@ test "terminal timeout session replays only through its exact tuple lock" {
         ),
     );
 
-    const child = try cas_websocket.spawnDetachedProcess(
-        std.testing.allocator,
-        root,
-        &.{ "/bin/sh", "-c", "sleep 10" },
-        io,
-    );
-    var managed_server = cas_websocket.ManagedServer{
-        .child = child,
-        .listen_url = try std.testing.allocator.dupe(u8, "ws://127.0.0.1:1"),
-    };
-    defer managed_server.deinit(std.testing.allocator);
-    const managed_pid = managed_server.processId();
-    try std.testing.expect(cas_websocket.processAlive(managed_pid));
-
     var active_record = loaded.record;
-    active_record.managed_server_pid = managed_pid;
+    active_record.managed_server_pid = currentProcessId();
     active_record.last_observed_status = "inProgress";
     active_record.terminal_failure_code = null;
     active_record.terminal_failure_hint = null;
     active_record.terminal_failure_at_unix_s = null;
-    managed_server.kill();
-    try std.testing.expect(cas_websocket.waitForProcessExit(managed_pid, 2_000));
     try terminalizeDeadWorkflowBoundOwner(
         std.testing.allocator,
         record_path,
         &active_record,
         timeout_failure,
     );
-    try std.testing.expect(!cas_websocket.processAlive(managed_pid));
+    try std.testing.expect(cas_websocket.processAlive(currentProcessId()));
     var terminalized = try loadOwnedSessionRecordPath(
         std.testing.allocator,
         try std.testing.allocator.dupe(u8, record_path),

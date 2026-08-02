@@ -882,20 +882,22 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     const pid_path = try std.fs.path.join(allocator, &.{ root, "server.pid" });
     defer allocator.free(pid_path);
     const listen_url = try allocator.dupe(u8, "ws://127.0.0.1:1");
-    errdefer allocator.free(listen_url);
-    var managed = try spawnOwnerPipeManagedServer(
+    var managed = spawnOwnerPipeManagedServer(
         allocator,
         root,
         &.{
             "/bin/sh",
             "-c",
-            "printf '%s\\n' \"$$\" > \"$1\"; while :; do sleep 1; done",
+            "pid_tmp=\"$1.tmp\"; printf '%s\\n' \"$$\" > \"$pid_tmp\"; mv \"$pid_tmp\" \"$1\"; while :; do sleep 1; done",
             "cas-owner-lived-test-server",
             pid_path,
         },
         listen_url,
         io,
-    );
+    ) catch |err| {
+        allocator.free(listen_url);
+        return err;
+    };
     defer managed.deinit(allocator);
     const watchdog_pid = managed.processId();
 
