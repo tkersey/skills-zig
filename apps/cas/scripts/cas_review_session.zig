@@ -1419,8 +1419,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         record.event_log_path,
                         null,
                         codex_version,
-                    ) catch |fetch_err| {
-                        _ = fetch_err;
+                    ) catch {
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
                 };
@@ -3777,7 +3776,10 @@ fn waitForReviewCompletion(
     poll_interval_ms: u32,
     codex_version: []const u8,
 ) !ReviewStatus {
-    const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
+    const started_ms: i64 = @intCast(@divFloor(
+        std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+        1_000_000,
+    ));
     const deadline_ms = started_ms + @as(i64, timeout_ms);
     const previous_request_deadline = client.swapRequestDeadlineMs(deadline_ms);
     defer _ = client.swapRequestDeadlineMs(previous_request_deadline);
