@@ -231,7 +231,8 @@ const SessionRecord = struct {
     workflowBinding: ?WorkflowBinding = null,
 };
 
-const review_tuple_lock_version = "CAS-RTL-v2";
+const review_tuple_lock_version = "CAS-RTL-v3";
+const previous_review_tuple_lock_version = "CAS-RTL-v2";
 const legacy_review_tuple_lock_version = "CAS-RTL-v1";
 const review_owner_lease_version = "CAS-ROL-v1";
 const review_tuple_lock_ttl_seconds: i64 = 30 * 60;
@@ -291,6 +292,8 @@ const ReviewTupleLock = struct {
     managedServerPid: ?u64 = null,
     managedServerShutdownReceiptPath: ?[]const u8 = null,
     managedServerShutdownReceiptToken: ?[]const u8 = null,
+    managedServerProcessGroupId: ?u64 = null,
+    managedServerBootId: ?[]const u8 = null,
     reviewStartSendStarted: bool = false,
     state: []const u8,
     reviewThreadId: ?[]const u8 = null,
@@ -1795,7 +1798,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
                 };
-                if (reviewGraceStatusCompletesWait(&timeout_status)) {
+                if (reviewGraceStatusCompletesWait(codex_version, &timeout_status)) {
                     terminal_status_from_grace = true;
                     break :timeout timeout_status;
                 }
@@ -2082,6 +2085,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parsed.custom_instructions,
             terminal_context_client_ptr,
             workflow_binding,
+            terminal_status_from_grace,
         );
         defer terminal_context.deinit(allocator);
         const terminal_binding_failure = try terminalReviewFailureAlloc(
@@ -2516,7 +2520,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             // A semantic result observed inside the bounded final grace window
             // is terminal evidence, not a timeout diagnostic. Feed it through
             // the ordinary persistence and normalization path below.
-            if (reviewGraceStatusCompletesWait(&timeout_status)) {
+            if (reviewGraceStatusCompletesWait(attempt_codex_version, &timeout_status)) {
                 terminal_status_from_grace = true;
                 break :timeout timeout_status;
             }
@@ -2684,6 +2688,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         record.developer_instructions,
         terminal_context_client_ptr,
         record.workflowBinding,
+        terminal_status_from_grace,
     );
     defer terminal_context.deinit(allocator);
     const terminal_lock_failure = try terminalReviewFailureAlloc(
@@ -3464,6 +3469,7 @@ fn captureTerminalReviewContext(
     developer_instructions: ?[]const u8,
     client: *cas.Client,
     workflow_binding: ?WorkflowBinding,
+    refresh_request_deadline: bool,
 ) TerminalReviewContext {
     var context = TerminalReviewContext{};
     context.identity = computeTargetIdentityAlloc(
@@ -3480,6 +3486,13 @@ fn captureTerminalReviewContext(
     if (context.identity) |identity| {
         if (context.codex_path) |path| {
             if (context.codex_version) |version| {
+                const previous_deadline = if (refresh_request_deadline)
+                    client.swapRequestDeadlineMs(monotonicMilliseconds() + 1_000)
+                else
+                    null;
+                defer if (refresh_request_deadline) {
+                    _ = client.swapRequestDeadlineMs(previous_deadline);
+                };
                 context.tuple = reviewTupleIdentityAlloc(
                     allocator,
                     cwd,
@@ -3711,7 +3724,11 @@ fn finalReviewStatusGraceMs(poll_interval_ms: u32) u32 {
     return 250;
 }
 
-fn reviewGraceStatusCompletesWait(status: *const ReviewStatus) bool {
+fn reviewGraceStatusCompletesWait(
+    codex_version: []const u8,
+    status: *const ReviewStatus,
+) bool {
+    if (reviewStatusAwaitsStructuredCompletion(codex_version, status)) return false;
     return status.review_result_available or isTerminalTurnStatus(status.turn_status);
 }
 
@@ -5217,22 +5234,37 @@ fn startManagedWebsocketServer(
     owner_lived: bool,
     io: std.Io,
 ) !cas_websocket.ManagedServer {
-    return if (owner_lived)
-        cas_websocket.startOwnerLivedLoopbackServer(
+    if (owner_lived) {
+        const receipt_dir = try ownerLivedReceiptDirAlloc(allocator);
+        defer allocator.free(receipt_dir);
+        return cas_websocket.startOwnerLivedLoopbackServer(
             allocator,
             cwd,
-            codex_path,
-            hook_policy,
-            io,
-        )
-    else
-        cas_websocket.startManagedLoopbackServer(
-            allocator,
-            cwd,
+            receipt_dir,
             codex_path,
             hook_policy,
             io,
         );
+    }
+    return cas_websocket.startManagedLoopbackServer(
+        allocator,
+        cwd,
+        codex_path,
+        hook_policy,
+        io,
+    );
+}
+
+fn ownerLivedReceiptDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const session_dir = try sessionDirAlloc(allocator);
+    defer allocator.free(session_dir);
+    const receipt_dir = try std.fs.path.join(
+        allocator,
+        &.{ session_dir, "watchdog_receipts" },
+    );
+    errdefer allocator.free(receipt_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(receipt_dir);
+    return receipt_dir;
 }
 
 fn connectReviewClient(
@@ -6276,6 +6308,10 @@ fn reviewTupleLockRewriteLeasePathAlloc(allocator: std.mem.Allocator, lock_path:
     return std.fmt.allocPrint(allocator, "{s}.rewrite-lease", .{lock_path});
 }
 
+fn reviewTupleLockLegacyRewriteClaimPathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
+}
+
 fn reviewOwnerLeasePathAlloc(allocator: std.mem.Allocator, lock_path: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.owner-lease", .{lock_path});
 }
@@ -6293,8 +6329,16 @@ const ReviewOwnerLease = struct {
 const ReviewTupleRewriteLease = struct {
     file: std.Io.File,
     path: []const u8,
+    legacy_claim_path: ?[]const u8 = null,
 
     fn deinit(self: *ReviewTupleRewriteLease, allocator: std.mem.Allocator) void {
+        if (self.legacy_claim_path) |claim_path| {
+            std.Io.Dir.deleteFileAbsolute(
+                std.Io.Threaded.global_single_threaded.io(),
+                claim_path,
+            ) catch {};
+            allocator.free(claim_path);
+        }
         self.file.close(std.Io.Threaded.global_single_threaded.io());
         allocator.free(self.path);
     }
@@ -6342,8 +6386,9 @@ fn tryAcquireReviewOwnerLeaseAlloc(
 fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: ReviewTupleLock) !bool {
     const codex_thread_id = lock.codexThreadId orelse return false;
     const current_lock = std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version);
+    const previous_lock = std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version);
     const legacy_lock = std.mem.eql(u8, lock.lockVersion, legacy_review_tuple_lock_version);
-    if ((!current_lock and !legacy_lock) or
+    if ((!current_lock and !previous_lock and !legacy_lock) or
         lock.tupleHash.len == 0 or
         lock.repoRealpath.len == 0 or
         nonEmptyOptional(lock.baseSha) == null or
@@ -6363,9 +6408,20 @@ fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: 
                 lock.ownerLeaseVersion orelse "",
                 review_owner_lease_version,
             )) return false;
+        if (lock.workflowBinding != null and
+            (lock.managedServerProcessGroupId == null or
+                lock.managedServerProcessGroupId.? == 0 or
+                nonEmptyOptional(lock.managedServerBootId) == null)) return false;
+    } else if (previous_lock) {
+        if (lock.workflowBinding != null and
+            !std.mem.eql(
+                u8,
+                lock.ownerLeaseVersion orelse "",
+                review_owner_lease_version,
+            )) return false;
     } else if (lock.ownerLeaseVersion != null) {
         // CAS-RTL-v1 predates owner-lease authority. A lease-bearing lock must
-        // use CAS-RTL-v2 so older readers reject it instead of ignoring the
+        // use CAS-RTL-v2 or v3 so older readers reject it instead of ignoring the
         // authority-bearing field.
         return false;
     }
@@ -6499,6 +6555,7 @@ fn markReviewStartSendStarted(
         allocator,
         lock_path,
         0,
+        std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version),
     );
     defer rewrite_lease.deinit(allocator);
     var loaded = (try loadReviewTupleLock(allocator, lock_path)) orelse
@@ -6574,9 +6631,15 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
     allocator: std.mem.Allocator,
     lock_path: []const u8,
     wait_ms: u32,
+    bridge_legacy_claim: bool,
 ) !ReviewTupleRewriteLease {
     const lease_path = try reviewTupleLockRewriteLeasePathAlloc(allocator, lock_path);
     errdefer allocator.free(lease_path);
+    const legacy_claim_path = if (bridge_legacy_claim)
+        try reviewTupleLockLegacyRewriteClaimPathAlloc(allocator, lock_path)
+    else
+        null;
+    errdefer if (legacy_claim_path) |path| allocator.free(path);
     try ensureParentPath(lease_path);
 
     const started_ms = monotonicMilliseconds();
@@ -6620,7 +6683,41 @@ fn acquireReviewTupleLockRewriteLeaseWithin(
             },
             else => return open_err,
         };
-        return .{ .file = file, .path = lease_path };
+        if (legacy_claim_path) |claim_path| {
+            const legacy_claim = try std.fmt.allocPrint(
+                allocator,
+                "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n",
+                .{ currentProcessId(), unixSeconds() },
+            );
+            defer allocator.free(legacy_claim);
+            durable_store.writeTextCreateNew(
+                allocator,
+                claim_path,
+                legacy_claim,
+                .{ .reject_symlinks = true },
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    file.close(io);
+                    const elapsed_ms = monotonicMilliseconds() - started_ms;
+                    if (elapsed_ms >= wait_ms) return error.PathAlreadyExists;
+                    std.Io.sleep(
+                        io,
+                        .fromMilliseconds(@min(@as(i64, 10), @as(i64, wait_ms) - elapsed_ms)),
+                        .awake,
+                    ) catch {};
+                    continue;
+                },
+                else => {
+                    file.close(io);
+                    return err;
+                },
+            };
+        }
+        return .{
+            .file = file,
+            .path = lease_path,
+            .legacy_claim_path = legacy_claim_path,
+        };
     }
 }
 
@@ -6631,8 +6728,9 @@ fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, no
 fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8, dead_transport_proven: bool) ReviewTupleLockAction {
     const lock = existing orelse return .create;
     const current_lock = std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version);
+    const previous_lock = std.mem.eql(u8, lock.lockVersion, previous_review_tuple_lock_version);
     const legacy_lock = std.mem.eql(u8, lock.lockVersion, legacy_review_tuple_lock_version);
-    if (!current_lock and !legacy_lock) return .block_invalid;
+    if (!current_lock and !previous_lock and !legacy_lock) return .block_invalid;
     if (legacy_lock and
         !(std.mem.eql(u8, lock.state, "terminal") or
             std.mem.eql(u8, lock.state, "normalized") or
@@ -6701,6 +6799,12 @@ fn reviewTupleLockReplaceableDeadFailure(lock: ReviewTupleLock) bool {
 fn reviewTupleLockDeadTransportProven(allocator: std.mem.Allocator, lock: ReviewTupleLock) bool {
     if (!reviewTupleLockReplaceableDeadFailure(lock)) return false;
     if (cas_websocket.processAlive(lock.ownerPid)) return false;
+    if (std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version)) {
+        return (reviewTuplePredecessorIncarnationExitedAlloc(
+            allocator,
+            lock,
+        ) catch null) orelse false;
+    }
     const managed_server_pid = reviewTupleManagedServerPid(allocator, lock) orelse return false;
     return !cas_websocket.processAlive(managed_server_pid);
 }
@@ -6733,6 +6837,11 @@ fn ensureReviewTuplePredecessorExitedWithin(
     lock: ReviewTupleLock,
     timeout_ms: u32,
 ) !void {
+    const incarnation_status = try reviewTuplePredecessorIncarnationExitedAlloc(
+        allocator,
+        lock,
+    );
+    if (incarnation_status == true) return;
     if (lock.managedServerShutdownReceiptPath) |receipt_path| {
         const receipt_token = lock.managedServerShutdownReceiptToken orelse
             return error.InvalidReviewTupleLockBinding;
@@ -6767,6 +6876,26 @@ fn ensureReviewTuplePredecessorExitedWithin(
                 )) return error.InvalidReviewTupleLockBinding;
                 return;
             }
+            if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
+                return;
+            }
+            if (monotonicMilliseconds() - started_ms >= timeout_ms) {
+                return error.ReviewPredecessorStillAlive;
+            }
+            std.Io.sleep(
+                std.Io.Threaded.global_single_threaded.io(),
+                .fromMilliseconds(10),
+                .awake,
+            ) catch {};
+        }
+    }
+
+    if (incarnation_status != null) {
+        const started_ms = monotonicMilliseconds();
+        while (true) {
+            if (try reviewTuplePredecessorIncarnationExitedAlloc(allocator, lock) == true) {
+                return;
+            }
             if (monotonicMilliseconds() - started_ms >= timeout_ms) {
                 return error.ReviewPredecessorStillAlive;
             }
@@ -6791,6 +6920,21 @@ fn ensureReviewTuplePredecessorExitedWithin(
         .fromMilliseconds(compatibility_wait_ms),
         .awake,
     ) catch {};
+}
+
+fn reviewTuplePredecessorIncarnationExitedAlloc(
+    allocator: std.mem.Allocator,
+    lock: ReviewTupleLock,
+) !?bool {
+    if (!std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version)) return null;
+    const stored_boot_id = nonEmptyOptional(lock.managedServerBootId) orelse
+        return error.InvalidReviewTupleLockBinding;
+    const process_group_id = lock.managedServerProcessGroupId orelse
+        return error.InvalidReviewTupleLockBinding;
+    const current_boot_id = try cas_websocket.currentBootIdAlloc(allocator);
+    defer allocator.free(current_boot_id);
+    if (!std.mem.eql(u8, stored_boot_id, current_boot_id)) return true;
+    return !cas_websocket.processGroupAlive(process_group_id);
 }
 
 fn reviewTupleLockActionForAcquire(
@@ -7071,7 +7215,7 @@ fn emitReviewTupleLockBlockedAndExit(
             "--review-lock-override is supplied",
         .block_stale => "tuple lock is stale; supply --review-lock-override " ++
             "with a takeover reason before starting a new review",
-        .block_invalid => "tuple lock file is invalid for CAS-RTL-v2 or historical CAS-RTL-v1; " ++
+        .block_invalid => "tuple lock file is invalid for CAS-RTL-v3, CAS-RTL-v2, or historical CAS-RTL-v1; " ++
             "inspect or remove it before starting a new review",
         else => "an active review attempt already owns this repo/base/head/account tuple",
     };
@@ -7295,6 +7439,14 @@ fn acquireReviewTupleStartLockOrExit(
                 server.shutdownReceiptToken()
             else
                 null;
+            lock.managedServerProcessGroupId = if (managed_server_to_kill_on_exit) |server|
+                server.processGroupId()
+            else
+                null;
+            lock.managedServerBootId = if (managed_server_to_kill_on_exit) |server|
+                server.bootId()
+            else
+                null;
             writeReviewTupleLockExclusive(allocator, lock_path, lock) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     var raced = (loadReviewTupleLock(allocator, lock_path) catch {
@@ -7377,6 +7529,10 @@ fn acquireReviewTupleStartLockOrExit(
                 allocator,
                 lock_path,
                 0,
+                if (loaded_opt) |loaded|
+                    std.mem.eql(u8, loaded.record.lockVersion, previous_review_tuple_lock_version)
+                else
+                    false,
             ) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -7490,8 +7646,12 @@ fn acquireReviewTupleStartLockOrExit(
                     "recovered-dead-owner"
                 else
                     override_reason;
-            if (latest_decision == .recover_dead_owner) {
+            if (latest_decision == .recover_dead_owner or
+                latest_decision == .auto_replace_dead_transport)
+            {
                 try ensureReviewTuplePredecessorExited(allocator, latest.record);
+            }
+            if (latest_decision == .recover_dead_owner) {
                 const predecessor_rer_path = try persistDeadOwnerRecoveryEvidence(
                     allocator,
                     lock_path,
@@ -7518,6 +7678,14 @@ fn acquireReviewTupleStartLockOrExit(
                 null;
             lock.managedServerShutdownReceiptToken = if (managed_server_to_kill_on_exit) |server|
                 server.shutdownReceiptToken()
+            else
+                null;
+            lock.managedServerProcessGroupId = if (managed_server_to_kill_on_exit) |server|
+                server.processGroupId()
+            else
+                null;
+            lock.managedServerBootId = if (managed_server_to_kill_on_exit) |server|
+                server.bootId()
             else
                 null;
             try writeReviewTupleLock(allocator, lock_path, lock);
@@ -7621,10 +7789,17 @@ fn transitionActiveReviewTupleLockForRecord(
 ) !bool {
     const lock_path = try storedReviewTupleLockPathAlloc(allocator, record);
     defer allocator.free(lock_path);
+    var version_probe = try loadReviewTupleLock(allocator, lock_path);
+    const bridge_legacy_claim = if (version_probe) |*loaded|
+        std.mem.eql(u8, loaded.record.lockVersion, previous_review_tuple_lock_version)
+    else
+        false;
+    if (version_probe) |*loaded| loaded.deinit(allocator);
     var rewrite_lease = try acquireReviewTupleLockRewriteLeaseWithin(
         allocator,
         lock_path,
         review_tuple_lock_rewrite_lease_wait_ms,
+        bridge_legacy_claim,
     );
     defer rewrite_lease.deinit(allocator);
     var loaded = try loadExactReviewTupleLockForRecord(
@@ -11379,15 +11554,29 @@ test "workflow-bound wait timeout is one terminal owner failure" {
 
     var grace_status = try makeDisconnectedReviewStatus(std.testing.allocator);
     defer grace_status.deinit(std.testing.allocator);
-    try std.testing.expect(!reviewGraceStatusCompletesWait(&grace_status));
+    try std.testing.expect(!reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "failed");
-    try std.testing.expect(reviewGraceStatusCompletesWait(&grace_status));
+    try std.testing.expect(reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "inProgress");
-    try std.testing.expect(!reviewGraceStatusCompletesWait(&grace_status));
+    try std.testing.expect(!reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     grace_status.review_result_available = true;
-    try std.testing.expect(reviewGraceStatusCompletesWait(&grace_status));
+    try std.testing.expect(reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+
+    grace_status.review_result_available = false;
+    std.testing.allocator.free(grace_status.turn_status);
+    grace_status.turn_status = try std.testing.allocator.dupe(u8, "completed");
+    grace_status.last_turn_has_entered_review_mode = true;
+    grace_status.last_turn_has_exited_review_mode = false;
+    try std.testing.expect(!reviewGraceStatusCompletesWait(
+        "codex-cli 0.145.0",
+        &grace_status,
+    ));
+    try std.testing.expect(reviewGraceStatusCompletesWait(
+        "codex-cli 0.144.0",
+        &grace_status,
+    ));
 }
 
 test "owner-lived admission failure is an immediate caller retry" {
@@ -11772,6 +11961,33 @@ test "store root falls back to cwd ledger outside git while repo root stays opti
 
     const repo_root = try repoRootForCwdAlloc(std.testing.allocator, root);
     try std.testing.expect(repo_root == null);
+}
+
+test "owner-lived receipt directory follows configured store root" {
+    const old_store_root = configured_store_root_override;
+    const old_store_cwd = configured_store_cwd;
+    defer configured_store_root_override = old_store_root;
+    defer configured_store_cwd = old_store_cwd;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(root);
+    configured_store_root_override = root;
+    configured_store_cwd = "/read-only-repository";
+
+    const receipt_dir = try ownerLivedReceiptDirAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(receipt_dir);
+    const expected = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "review_sessions", "watchdog_receipts" },
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, receipt_dir);
 }
 
 test "parseArgs rejects artifact-like review thread id selectors" {
@@ -15439,7 +15655,7 @@ test "review tuple hash is stable and account-bound" {
 
     bound_tuple.workflow_binding = testWorkflowBinding();
     bound_tuple.workflow_binding_digest = binding_digest;
-    const bound_lock = makeReviewTupleLock(
+    var bound_lock = makeReviewTupleLock(
         bound_hash,
         bound_tuple,
         "starting_review",
@@ -15447,9 +15663,20 @@ test "review tuple hash is stable and account-bound" {
         null,
         null,
     );
+    bound_lock.managedServerProcessGroupId = 1;
+    bound_lock.managedServerBootId = "test-boot";
     try std.testing.expect(try reviewTupleLockWorkflowBindingValidAlloc(
         std.testing.allocator,
         bound_lock,
+    ));
+    try std.testing.expectEqualStrings("CAS-RTL-v3", bound_lock.lockVersion);
+    var previous_lock = bound_lock;
+    previous_lock.lockVersion = previous_review_tuple_lock_version;
+    previous_lock.managedServerProcessGroupId = null;
+    previous_lock.managedServerBootId = null;
+    try std.testing.expect(try reviewTupleLockWorkflowBindingValidAlloc(
+        std.testing.allocator,
+        previous_lock,
     ));
     var current_without_lease = bound_lock;
     current_without_lease.ownerLeaseVersion = null;
@@ -15915,6 +16142,7 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         else => @intCast(child.id.?),
     };
     const lock = ReviewTupleLock{
+        .lockVersion = previous_review_tuple_lock_version,
         .tupleHash = "sha256:predecessor",
         .repoRealpath = "/repo",
         .baseSha = "base",
@@ -15969,6 +16197,43 @@ test "replacement admission requires exact predecessor shutdown receipt" {
         cas_websocket.owner_watchdog_shutdown_grace_ms + 100,
     );
     try std.testing.expect(cas_websocket.processAlive(process_id));
+}
+
+test "receiptless v3 predecessor retires by boot-bound process group" {
+    const boot_id = try cas_websocket.currentBootIdAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(boot_id);
+    const lock = ReviewTupleLock{
+        .tupleHash = "sha256:incarnation",
+        .repoRealpath = "/repo",
+        .baseSha = "base",
+        .headSha = "head",
+        .targetFingerprint = "fp",
+        .resolvedCodexPath = "/bin/codex",
+        .resolvedCodexVersion = "codex 0.1.0",
+        .accountFingerprint = "acct:a",
+        .accountFingerprintReducedProtection = false,
+        .state = "starting_review",
+        .managedServerProcessGroupId = 2_000_000_000,
+        .managedServerBootId = boot_id,
+        .createdAtUnixS = 1,
+        .updatedAtUnixS = 1,
+        .expiresAtUnixS = 61,
+        .ownerPid = 1,
+    };
+    try ensureReviewTuplePredecessorExitedWithin(
+        std.testing.allocator,
+        lock,
+        1,
+    );
+
+    var prior_boot_lock = lock;
+    prior_boot_lock.managedServerProcessGroupId = 1;
+    prior_boot_lock.managedServerBootId = "different-boot-generation";
+    try ensureReviewTuplePredecessorExitedWithin(
+        std.testing.allocator,
+        prior_boot_lock,
+        1,
+    );
 }
 
 test "review tuple lock load rejects path and complete-tuple mismatches" {
@@ -16234,6 +16499,8 @@ test "terminal timeout session replays only through its exact tuple lock" {
     );
     defer std.testing.allocator.free(lock_path);
     var lock = makeReviewTupleLock(tuple_hash, tuple, "terminal", 1, null, null);
+    lock.managedServerProcessGroupId = 1;
+    lock.managedServerBootId = "test-boot";
     lock.reviewThreadId = record.review_thread_id;
     lock.reviewTurnId = record.review_turn_id;
     lock.recordPath = record_path;
@@ -16652,16 +16919,25 @@ test "review tuple lock rewrite lease is exclusive and kernel released" {
         std.testing.allocator,
         path,
         0,
+        true,
     );
+    const legacy_claim_path = try reviewTupleLockLegacyRewriteClaimPathAlloc(
+        std.testing.allocator,
+        path,
+    );
+    defer std.testing.allocator.free(legacy_claim_path);
+    try std.testing.expect(durable_store.fileExists(legacy_claim_path));
     try std.testing.expectError(
         error.PathAlreadyExists,
-        acquireReviewTupleLockRewriteLeaseWithin(std.testing.allocator, path, 0),
+        acquireReviewTupleLockRewriteLeaseWithin(std.testing.allocator, path, 0, true),
     );
     lease.deinit(std.testing.allocator);
+    try std.testing.expect(!durable_store.fileExists(legacy_claim_path));
     var reacquired = try acquireReviewTupleLockRewriteLeaseWithin(
         std.testing.allocator,
         path,
         0,
+        true,
     );
     defer reacquired.deinit(std.testing.allocator);
 }
@@ -16685,6 +16961,7 @@ test "review tuple lock rewrite lease ignores orphaned sidecar content" {
         std.testing.allocator,
         path,
         0,
+        false,
     );
     defer lease.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(lease_path, lease.path);

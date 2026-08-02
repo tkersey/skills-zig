@@ -15,12 +15,15 @@ pub const ManagedServer = struct {
     owner_control: ?std.Io.File = null,
     shutdown_receipt_path: ?[]u8 = null,
     shutdown_receipt_token: ?[]u8 = null,
+    process_group_id: ?u64 = null,
+    boot_id: ?[]u8 = null,
     stopped: bool = false,
 
     pub fn deinit(self: *ManagedServer, allocator: std.mem.Allocator) void {
         if (self.owner_control != null) self.kill();
         if (self.shutdown_receipt_token) |value| allocator.free(value);
         if (self.shutdown_receipt_path) |value| allocator.free(value);
+        if (self.boot_id) |value| allocator.free(value);
         allocator.free(self.listen_url);
     }
 
@@ -39,6 +42,14 @@ pub const ManagedServer = struct {
 
     pub fn shutdownReceiptToken(self: *const ManagedServer) ?[]const u8 {
         return self.shutdown_receipt_token;
+    }
+
+    pub fn processGroupId(self: *const ManagedServer) ?u64 {
+        return self.process_group_id;
+    }
+
+    pub fn bootId(self: *const ManagedServer) ?[]const u8 {
+        return self.boot_id;
     }
 
     pub fn kill(self: *ManagedServer) void {
@@ -259,6 +270,7 @@ pub fn startManagedLoopbackServer(
     return startManagedLoopbackServerWithOwnership(
         allocator,
         cwd,
+        null,
         codex_path,
         hook_policy,
         false,
@@ -269,6 +281,7 @@ pub fn startManagedLoopbackServer(
 pub fn startOwnerLivedLoopbackServer(
     allocator: std.mem.Allocator,
     cwd: []const u8,
+    receipt_dir: []const u8,
     codex_path: []const u8,
     hook_policy: hooks.HookPolicy,
     io: std.Io,
@@ -276,6 +289,7 @@ pub fn startOwnerLivedLoopbackServer(
     return startManagedLoopbackServerWithOwnership(
         allocator,
         cwd,
+        receipt_dir,
         codex_path,
         hook_policy,
         true,
@@ -286,6 +300,7 @@ pub fn startOwnerLivedLoopbackServer(
 fn startManagedLoopbackServerWithOwnership(
     allocator: std.mem.Allocator,
     cwd: []const u8,
+    receipt_dir: ?[]const u8,
     codex_path: []const u8,
     hook_policy: hooks.HookPolicy,
     owner_lived: bool,
@@ -313,6 +328,7 @@ fn startManagedLoopbackServerWithOwnership(
         return spawnOwnerPipeManagedServer(
             allocator,
             cwd,
+            receipt_dir orelse return error.MissingOwnerLivedReceiptDirectory,
             argv.items,
             listen_url,
             io,
@@ -360,13 +376,14 @@ const owner_watchdog_script =
 fn spawnOwnerPipeManagedServer(
     allocator: std.mem.Allocator,
     cwd: []const u8,
+    receipt_dir: []const u8,
     server_argv: []const []const u8,
     listen_url: []u8,
     io: std.Io,
 ) !ManagedServer {
-    const receipt_dir = try std.fs.path.join(allocator, &.{ cwd, ".ledger", "cas", "review_sessions", "watchdog_receipts" });
-    defer allocator.free(receipt_dir);
     try std.Io.Dir.cwd().createDirPath(io, receipt_dir);
+    const boot_id = try currentBootIdAlloc(allocator);
+    errdefer allocator.free(boot_id);
     var receipt_random: [16]u8 = undefined;
     io.random(&receipt_random);
     const receipt_hex = std.fmt.bytesToHex(receipt_random, .lower);
@@ -399,6 +416,7 @@ fn spawnOwnerPipeManagedServer(
             listen_url,
             shutdown_receipt_path,
             shutdown_receipt_token,
+            boot_id,
         );
     }
 
@@ -421,6 +439,11 @@ fn spawnOwnerPipeManagedServer(
         .owner_control = owner_control,
         .shutdown_receipt_path = shutdown_receipt_path,
         .shutdown_receipt_token = shutdown_receipt_token,
+        .process_group_id = switch (builtin.os.tag) {
+            .windows, .wasi => null,
+            else => if (child.id) |value| @intCast(value) else null,
+        },
+        .boot_id = boot_id,
     };
 }
 
@@ -431,6 +454,7 @@ fn spawnOwnerPipeManagedServerPosix(
     listen_url: []u8,
     shutdown_receipt_path: []u8,
     shutdown_receipt_token: []u8,
+    boot_id: []u8,
 ) !ManagedServer {
     var pipe_fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&pipe_fds) != 0) return error.SystemResources;
@@ -458,6 +482,18 @@ fn spawnOwnerPipeManagedServerPosix(
         return error.SpawnFileActionsFailed;
     }
     defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+
+    var attributes: std.c.posix_spawnattr_t = undefined;
+    if (std.c.posix_spawnattr_init(&attributes) != 0) {
+        return error.SpawnAttributesFailed;
+    }
+    defer _ = std.c.posix_spawnattr_destroy(&attributes);
+    if (std.c.posix_spawnattr_setflags(
+        &attributes,
+        .{ .SETPGROUP = true },
+    ) != 0 or posix_spawnattr_setpgroup(&attributes, 0) != 0) {
+        return error.SpawnAttributesFailed;
+    }
 
     const cwd_storage = try allocator.dupeZ(u8, cwd);
     defer allocator.free(cwd_storage);
@@ -502,7 +538,7 @@ fn spawnOwnerPipeManagedServerPosix(
         &pid,
         argv_buf[0].?,
         &actions,
-        null,
+        &attributes,
         argv_buf.ptr,
         envp,
     );
@@ -527,8 +563,15 @@ fn spawnOwnerPipeManagedServerPosix(
         },
         .shutdown_receipt_path = shutdown_receipt_path,
         .shutdown_receipt_token = shutdown_receipt_token,
+        .process_group_id = @intCast(pid),
+        .boot_id = boot_id,
     };
 }
+
+extern "c" fn posix_spawnattr_setpgroup(
+    attr: *std.c.posix_spawnattr_t,
+    process_group: std.c.pid_t,
+) c_int;
 
 pub fn spawnDetachedProcess(
     allocator: std.mem.Allocator,
@@ -620,13 +663,86 @@ pub fn processAlive(process_id: u64) bool {
         .windows => true,
         .wasi => false,
         else => blk: {
-            const pid: std.posix.pid_t = @intCast(process_id);
+            const pid = std.math.cast(std.posix.pid_t, process_id) orelse
+                break :blk true;
             std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
             };
             break :blk true;
         },
+    };
+}
+
+pub fn processGroupAlive(process_group_id: u64) bool {
+    return switch (builtin.os.tag) {
+        .windows, .wasi => true,
+        else => blk: {
+            const positive = std.math.cast(std.posix.pid_t, process_group_id) orelse
+                break :blk true;
+            std.posix.kill(-positive, @enumFromInt(0)) catch |err| switch (err) {
+                error.ProcessNotFound => break :blk false,
+                else => break :blk true,
+            };
+            break :blk true;
+        },
+    };
+}
+
+pub fn waitForProcessGroupExit(process_group_id: u64, timeout_ms: u32) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const started_ms = @divFloor(
+        std.Io.Clock.awake.now(io).nanoseconds,
+        1_000_000,
+    );
+    while (processGroupAlive(process_group_id)) {
+        const now_ms = @divFloor(
+            std.Io.Clock.awake.now(io).nanoseconds,
+            1_000_000,
+        );
+        if (now_ms - started_ms >= timeout_ms) return false;
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return true;
+}
+
+pub fn currentBootIdAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return switch (builtin.os.tag) {
+        .macos => blk: {
+            if (!builtin.link_libc) return error.SystemBootIdentityUnsupported;
+            var boot_time: std.c.timeval = undefined;
+            var boot_time_len: usize = @sizeOf(std.c.timeval);
+            if (std.c.sysctlbyname(
+                "kern.boottime",
+                &boot_time,
+                &boot_time_len,
+                null,
+                0,
+            ) != 0 or boot_time_len != @sizeOf(std.c.timeval)) {
+                return error.SystemBootIdentityUnavailable;
+            }
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "darwin:{d}:{d}",
+                .{ boot_time.sec, boot_time.usec },
+            );
+        },
+        .linux => blk: {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const raw = try std.Io.Dir.cwd().readFileAlloc(
+                io,
+                "/proc/sys/kernel/random/boot_id",
+                allocator,
+                .limited(256),
+            );
+            errdefer allocator.free(raw);
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len == 0) return error.SystemBootIdentityUnavailable;
+            const result = try allocator.dupe(u8, trimmed);
+            allocator.free(raw);
+            break :blk result;
+        },
+        else => error.SystemBootIdentityUnsupported,
     };
 }
 
@@ -965,6 +1081,7 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     var managed = spawnOwnerPipeManagedServer(
         allocator,
         root,
+        root,
         &.{
             "/bin/sh",
             "-c",
@@ -980,6 +1097,8 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     };
     defer managed.deinit(allocator);
     const watchdog_pid = managed.processId();
+    try std.testing.expectEqual(watchdog_pid, managed.processGroupId().?);
+    try std.testing.expect(managed.bootId().?.len > 0);
 
     var server_pid: ?u64 = null;
     for (0..100) |_| {
@@ -1005,10 +1124,12 @@ test "owner-lived watchdog retires its exact server when owner control closes" {
     try std.testing.expect(processAlive(server_pid.?));
     const receipt_path = managed.shutdownReceiptPath().?;
     const receipt_token = managed.shutdownReceiptToken().?;
+    try std.testing.expectEqualStrings(root, std.fs.path.dirname(receipt_path).?);
 
     managed.kill();
     try std.testing.expect(waitForProcessExit(watchdog_pid, 2_000));
     try std.testing.expect(waitForProcessExit(server_pid.?, 2_000));
+    try std.testing.expect(waitForProcessGroupExit(managed.processGroupId().?, 2_000));
     const receipt = try std.Io.Dir.cwd().readFileAlloc(
         io,
         receipt_path,
