@@ -1895,7 +1895,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         break :fetch_timeout_status try makeDisconnectedReviewStatus(allocator);
                     };
                 };
-                if (reviewGraceStatusCompletesWait(codex_version, &timeout_status)) {
+                if (reviewStatusCompletesWait(codex_version, &timeout_status)) {
                     terminal_status_from_grace = true;
                     break :timeout timeout_status;
                 }
@@ -2623,7 +2623,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             // A semantic result observed inside the bounded final grace window
             // is terminal evidence, not a timeout diagnostic. Feed it through
             // the ordinary persistence and normalization path below.
-            if (reviewGraceStatusCompletesWait(attempt_codex_version, &timeout_status)) {
+            if (reviewStatusCompletesWait(attempt_codex_version, &timeout_status)) {
                 terminal_status_from_grace = true;
                 break :timeout timeout_status;
             }
@@ -3827,7 +3827,7 @@ fn finalReviewStatusGraceMs(poll_interval_ms: u32) u32 {
     return 250;
 }
 
-fn reviewGraceStatusCompletesWait(
+fn reviewStatusCompletesWait(
     codex_version: []const u8,
     status: *const ReviewStatus,
 ) bool {
@@ -4712,41 +4712,23 @@ fn waitForReviewCompletion(
     };
     defer live_notifications.deinit(allocator);
     while (true) {
-        var captured_notifications: std.ArrayList([]u8) = .empty;
-        defer {
-            for (captured_notifications.items) |line| allocator.free(line);
-            captured_notifications.deinit(allocator);
-        }
-
-        const poll_result_json = client.requestJsonCaptureNotifications(
-            "experimentalFeature/list",
-            "{\"cursor\":null,\"limit\":1}",
-            &captured_notifications,
+        // The bound review thread is the sole authority for both liveness and
+        // completion. Poll it directly so an unrelated app-server method can
+        // neither fail nor consume recovery for this review attempt.
+        const latest = fetchReviewStatus(
+            allocator,
+            client,
+            review_thread_id,
+            review_turn_id,
+            event_log_path,
+            &live_notifications,
+            codex_version,
         ) catch |err| switch (err) {
             error.ConnectionTimedOut => return error.WaitTimedOut,
             else => return err,
         };
-        allocator.free(poll_result_json);
-        try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, &live_notifications);
-
-        if (live_notifications.observed_terminal_status != null) {
-            const latest = fetchReviewStatus(
-                allocator,
-                client,
-                review_thread_id,
-                review_turn_id,
-                event_log_path,
-                &live_notifications,
-                codex_version,
-            ) catch |err| switch (err) {
-                error.ConnectionTimedOut => return error.WaitTimedOut,
-                else => return err,
-            };
-            if (!reviewStatusAwaitsStructuredCompletion(codex_version, &latest)) {
-                return latest;
-            }
-            latest.deinit(allocator);
-        }
+        if (reviewStatusCompletesWait(codex_version, &latest)) return latest;
+        latest.deinit(allocator);
         const now_ms = @divFloor(
             std.Io.Clock.awake.now(
                 std.Io.Threaded.global_single_threaded.io(),
@@ -11836,26 +11818,26 @@ test "workflow-bound wait timeout is one terminal owner failure" {
 
     var grace_status = try makeDisconnectedReviewStatus(std.testing.allocator);
     defer grace_status.deinit(std.testing.allocator);
-    try std.testing.expect(!reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(!reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "failed");
-    try std.testing.expect(reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "inProgress");
-    try std.testing.expect(!reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(!reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
     grace_status.review_result_available = true;
-    try std.testing.expect(reviewGraceStatusCompletesWait("codex-cli 0.145.0", &grace_status));
+    try std.testing.expect(reviewStatusCompletesWait("codex-cli 0.145.0", &grace_status));
 
     grace_status.review_result_available = false;
     std.testing.allocator.free(grace_status.turn_status);
     grace_status.turn_status = try std.testing.allocator.dupe(u8, "completed");
     grace_status.last_turn_has_entered_review_mode = true;
     grace_status.last_turn_has_exited_review_mode = false;
-    try std.testing.expect(!reviewGraceStatusCompletesWait(
+    try std.testing.expect(!reviewStatusCompletesWait(
         "codex-cli 0.145.0",
         &grace_status,
     ));
-    try std.testing.expect(reviewGraceStatusCompletesWait(
+    try std.testing.expect(reviewStatusCompletesWait(
         "codex-cli 0.144.0",
         &grace_status,
     ));
