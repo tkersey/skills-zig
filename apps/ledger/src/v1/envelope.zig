@@ -3,6 +3,7 @@ const definition_core = @import("definition_core");
 const definition = @import("definition.zig");
 const validation = @import("validation.zig");
 const materialization = @import("materialization.zig");
+const protocol = @import("protocol.zig");
 const transaction = @import("transaction.zig");
 const projection_runtime = @import("projection.zig");
 const doctor = @import("doctor.zig");
@@ -200,18 +201,12 @@ pub fn writeMaterializationJson(
     try writeOptionalString(writer, result.canonical_content_digest);
     try writer.writeAll(",\"artifact_id\":");
     try writeOptionalString(writer, result.artifact_id);
-    try writer.writeAll(",\"errors\":[");
-    for (result.validation_result.diagnostics.items.items, 0..) |diagnostic, index| {
-        if (index != 0) try writer.writeByte(',');
-        try writer.writeAll("{\"code\":");
-        try definition_core.canonical_json.writeCanonicalString(writer, diagnostic.code);
-        try writer.writeAll(",\"path\":");
-        try definition_core.canonical_json.writeCanonicalString(writer, diagnostic.path);
-        try writer.writeAll(",\"message\":");
-        try definition_core.canonical_json.writeCanonicalString(writer, diagnostic.message);
-        try writer.writeByte('}');
-    }
-    try writer.writeAll("],\"claims\":[],\"compile_stats\":");
+    try writer.writeAll(",\"errors\":");
+    try writeDiagnosticsJson(
+        writer,
+        result.validation_result.diagnostics.items.items,
+    );
+    try writer.writeAll(",\"claims\":[],\"compile_stats\":");
     try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
         ",\"authority_granted\":false,\"storage_mutated\":false}",
@@ -288,6 +283,13 @@ pub fn writeTransactionJson(
     try writer.writeByte('}');
     try writer.writeAll(",\"valid\":");
     try writer.writeAll(if (result.validation_result.valid) "true" else "false");
+    if (!result.validation_result.valid) {
+        try writer.writeAll(",\"errors\":");
+        try writeDiagnosticsJson(
+            writer,
+            result.validation_result.diagnostics.items.items,
+        );
+    }
     try writer.writeAll(",\"structural_claims\":[],\"compile_stats\":");
     try writeCompileStatsJson(writer, compile_stats);
     try writer.writeAll(
@@ -295,6 +297,33 @@ pub fn writeTransactionJson(
     );
     try writer.writeAll(if (result.storage_mutated) "true" else "false");
     try writer.writeByte('}');
+}
+
+fn writeDiagnosticsJson(
+    writer: *std.Io.Writer,
+    diagnostics: []const definition_core.diagnostics.Diagnostic,
+) !void {
+    try writer.writeByte('[');
+    for (diagnostics, 0..) |diagnostic, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"code\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            diagnostic.code,
+        );
+        try writer.writeAll(",\"path\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            diagnostic.path,
+        );
+        try writer.writeAll(",\"message\":");
+        try definition_core.canonical_json.writeCanonicalString(
+            writer,
+            diagnostic.message,
+        );
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
 }
 
 pub fn writeTransactionErrorJson(
@@ -591,4 +620,122 @@ test "materialization envelope distinguishes canonical bytes from authority" {
         .{ .duplicate_field_behavior = .@"error" },
     );
     defer parsed.deinit();
+}
+
+test "invalid transaction envelope exposes bounded validation diagnostics" {
+    var diagnostics = definition_core.diagnostics.Collector.init(
+        std.testing.allocator,
+        .{ .max_count = 2 },
+    );
+    try diagnostics.add(
+        "cross-input-equal",
+        "/artifact/payload/subject/digest",
+        "subject digest does not match the registered goal",
+    );
+    var result: transaction.Result = .{
+        .validation_result = .{
+            .definition_id = try std.testing.allocator.dupe(
+                u8,
+                "actuating/evidence-protocol",
+            ),
+            .definition_digest = undefined,
+            .input_digests = try std.testing.allocator.alloc(
+                validation.InputDigest,
+                0,
+            ),
+            .diagnostics = diagnostics,
+            .valid = false,
+        },
+        .operation = try std.testing.allocator.dupe(u8, "register-goal"),
+        .transaction_id = null,
+        .effects = try std.testing.allocator.alloc(transaction.EffectReceipt, 0),
+        .returned_content = null,
+        .generated_outputs = try std.testing.allocator.alloc(
+            protocol.GeneratedOutput,
+            0,
+        ),
+        .storage_mutated = false,
+    };
+    @memcpy(
+        result.validation_result.definition_digest[0..],
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeTransactionJson(&output.writer, &result, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        output.written(),
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(false, root.get("valid").?.bool);
+    try std.testing.expectEqual(false, root.get("storage_mutated").?.bool);
+    const errors = root.get("errors").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqualStrings(
+        "cross-input-equal",
+        errors[0].object.get("code").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "/artifact/payload/subject/digest",
+        errors[0].object.get("path").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "subject digest does not match the registered goal",
+        errors[0].object.get("message").?.string,
+    );
+}
+
+test "valid transaction envelope preserves the existing result shape" {
+    var result: transaction.Result = .{
+        .validation_result = .{
+            .definition_id = try std.testing.allocator.dupe(
+                u8,
+                "example/transaction",
+            ),
+            .definition_digest = undefined,
+            .input_digests = try std.testing.allocator.alloc(
+                validation.InputDigest,
+                0,
+            ),
+            .diagnostics = definition_core.diagnostics.Collector.init(
+                std.testing.allocator,
+                .{},
+            ),
+            .valid = true,
+        },
+        .operation = try std.testing.allocator.dupe(u8, "append"),
+        .transaction_id = null,
+        .effects = try std.testing.allocator.alloc(transaction.EffectReceipt, 0),
+        .returned_content = null,
+        .generated_outputs = try std.testing.allocator.alloc(
+            protocol.GeneratedOutput,
+            0,
+        ),
+        .storage_mutated = false,
+    };
+    @memcpy(
+        result.validation_result.definition_digest[0..],
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try writeTransactionJson(&output.writer, &result, .{});
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        output.written(),
+        .{ .duplicate_field_behavior = .@"error" },
+    );
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(true, root.get("valid").?.bool);
+    try std.testing.expect(root.get("errors") == null);
 }
