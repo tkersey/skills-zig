@@ -11921,7 +11921,9 @@ test "terminal-only thread reads omit polling snapshots and retain terminal evid
     );
     const after_terminal = try readFileAlloc(allocator, event_log_path, 4096);
     defer allocator.free(after_terminal);
-    try std.testing.expect(std.mem.indexOf(u8, after_terminal, "\"method\":\"thread/read\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, after_terminal, "\"method\":\"thread/read\"") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, after_terminal, "completed") != null);
 }
 
