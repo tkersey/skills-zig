@@ -512,6 +512,11 @@ const ReviewStatus = struct {
     }
 };
 
+const ThreadReadPersistence = enum {
+    all,
+    terminal_only,
+};
+
 const TargetIdentity = struct {
     head_sha: ?[]const u8,
     base_sha: ?[]const u8,
@@ -1308,6 +1313,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             existing_parent_event_log_path,
             null,
             codex_version,
+            .all,
         ) catch |err| {
             updateReviewTupleLockBestEffort(
                 allocator,
@@ -3645,6 +3651,7 @@ fn fetchReviewStatus(
     event_log_path: []const u8,
     live_notifications: ?*LiveReviewNotificationState,
     codex_version: []const u8,
+    thread_read_persistence: ThreadReadPersistence,
 ) !ReviewStatus {
     const params_json = try stringifyAnyAlloc(allocator, .{
         .threadId = review_thread_id,
@@ -3693,13 +3700,6 @@ fn fetchReviewStatus(
             if (live_notifications) |state| {
                 try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
             }
-            try appendLogRecord(
-                allocator,
-                event_log_path,
-                "thread/read",
-                "response",
-                without_turns_json,
-            );
             var status = try parseReviewStatusAlloc(
                 allocator,
                 without_turns_json,
@@ -3709,6 +3709,14 @@ fn fetchReviewStatus(
             );
             try populateReviewResult(allocator, &status, review_turn_id);
             try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
+            try persistThreadReadResponse(
+                allocator,
+                event_log_path,
+                without_turns_json,
+                codex_version,
+                thread_read_persistence,
+                &status,
+            );
             if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
                 status.deinit(allocator);
                 for (captured_notifications.items) |line| allocator.free(line);
@@ -3725,7 +3733,6 @@ fn fetchReviewStatus(
                 if (live_notifications) |state| {
                     try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
                 }
-                try appendLogRecord(allocator, event_log_path, "thread/read", "response", resumed_json);
                 var resumed_status = try parseReviewStatusAlloc(
                     allocator,
                     resumed_json,
@@ -3739,6 +3746,14 @@ fn fetchReviewStatus(
                     &resumed_status,
                     live_notifications,
                 );
+                try persistThreadReadResponse(
+                    allocator,
+                    event_log_path,
+                    resumed_json,
+                    codex_version,
+                    thread_read_persistence,
+                    &resumed_status,
+                );
                 return resumed_status;
             }
             return status;
@@ -3749,7 +3764,6 @@ fn fetchReviewStatus(
     if (live_notifications) |state| {
         try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
     }
-    try appendLogRecord(allocator, event_log_path, "thread/read", "response", response_json);
     var status = try parseReviewStatusAlloc(
         allocator,
         response_json,
@@ -3759,6 +3773,14 @@ fn fetchReviewStatus(
     );
     try populateReviewResult(allocator, &status, review_turn_id);
     try populateReviewEvidenceFromLiveNotifications(allocator, &status, live_notifications);
+    try persistThreadReadResponse(
+        allocator,
+        event_log_path,
+        response_json,
+        codex_version,
+        thread_read_persistence,
+        &status,
+    );
     if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status, codex_version)) {
         status.deinit(allocator);
         const params_after_resume = try stringifyAnyAlloc(allocator, .{
@@ -3776,7 +3798,6 @@ fn fetchReviewStatus(
         if (live_notifications) |state| {
             try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
         }
-        try appendLogRecord(allocator, event_log_path, "thread/read", "response", resumed_json);
         var resumed_status = try parseReviewStatusAlloc(
             allocator,
             resumed_json,
@@ -3789,6 +3810,14 @@ fn fetchReviewStatus(
             allocator,
             &resumed_status,
             live_notifications,
+        );
+        try persistThreadReadResponse(
+            allocator,
+            event_log_path,
+            resumed_json,
+            codex_version,
+            thread_read_persistence,
+            &resumed_status,
         );
         return resumed_status;
     }
@@ -3819,6 +3848,7 @@ fn fetchReviewStatusAfterWaitTimeout(
         event_log_path,
         null,
         codex_version,
+        .all,
     );
 }
 
@@ -3833,6 +3863,18 @@ fn reviewStatusCompletesWait(
 ) bool {
     if (reviewStatusAwaitsStructuredCompletion(codex_version, status)) return false;
     return status.review_result_available or isTerminalTurnStatus(status.turn_status);
+}
+
+fn persistThreadReadResponse(
+    allocator: std.mem.Allocator,
+    event_log_path: []const u8,
+    response_json: []const u8,
+    codex_version: []const u8,
+    persistence: ThreadReadPersistence,
+    status: *const ReviewStatus,
+) !void {
+    if (persistence == .terminal_only and !reviewStatusCompletesWait(codex_version, status)) return;
+    try appendLogRecord(allocator, event_log_path, "thread/read", "response", response_json);
 }
 
 fn reviewHistoryIsNotMaterialized(detail: []const u8) bool {
@@ -4199,6 +4241,7 @@ fn waitForThreadTerminalState(
             event_log_path,
             null,
             codex_version,
+            .terminal_only,
         );
         if (isTerminalTurnStatus(latest.turn_status)) return latest;
         latest.deinit(allocator);
@@ -4723,6 +4766,7 @@ fn waitForReviewCompletion(
             event_log_path,
             &live_notifications,
             codex_version,
+            .terminal_only,
         ) catch |err| switch (err) {
             error.ConnectionTimedOut => return error.WaitTimedOut,
             else => return err,
@@ -11841,6 +11885,46 @@ test "workflow-bound wait timeout is one terminal owner failure" {
         "codex-cli 0.144.0",
         &grace_status,
     ));
+}
+
+test "terminal-only thread reads omit polling snapshots and retain terminal evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.ndjson", .data = "" });
+    const event_log_path = try tmp.dir.realPathFileAlloc(io, "events.ndjson", allocator);
+    defer allocator.free(event_log_path);
+
+    var status = try makeDisconnectedReviewStatus(allocator);
+    defer status.deinit(allocator);
+    try persistThreadReadResponse(
+        allocator,
+        event_log_path,
+        "{\"thread\":{\"status\":\"inProgress\"}}",
+        "codex-cli 0.146.0",
+        .terminal_only,
+        &status,
+    );
+    const after_poll = try readFileAlloc(allocator, event_log_path, 1024);
+    defer allocator.free(after_poll);
+    try std.testing.expectEqual(@as(usize, 0), after_poll.len);
+
+    status.review_result_available = true;
+    try persistThreadReadResponse(
+        allocator,
+        event_log_path,
+        "{\"thread\":{\"status\":\"completed\"}}",
+        "codex-cli 0.146.0",
+        .terminal_only,
+        &status,
+    );
+    const after_terminal = try readFileAlloc(allocator, event_log_path, 4096);
+    defer allocator.free(after_terminal);
+    try std.testing.expect(
+        std.mem.indexOf(u8, after_terminal, "\"method\":\"thread/read\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, after_terminal, "completed") != null);
 }
 
 test "owner-lived admission failure is an immediate caller retry" {
