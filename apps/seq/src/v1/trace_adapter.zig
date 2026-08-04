@@ -29,6 +29,55 @@ pub const SelectedParse = struct {
     file_opened: bool,
 };
 
+pub const SessionIdentity = struct {
+    session_id: ?[]u8,
+    parent_session_id: ?[]u8,
+    bytes_read: usize,
+    file_size: usize,
+
+    pub fn deinit(self: *SessionIdentity, allocator: std.mem.Allocator) void {
+        if (self.session_id) |value| allocator.free(value);
+        if (self.parent_session_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub fn discoverSessionIdentity(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: Options,
+) !SessionIdentity {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try openTraceFile(io, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    var file_reader = file.reader(io, &.{});
+    const prefix = try readSummaryPrefixAlloc(allocator, &file_reader.interface);
+    defer allocator.free(prefix);
+    var reader = std.Io.Reader.fixed(prefix);
+    var summary = try trace_core.parseSessionSummaryTraceReader(
+        allocator,
+        path,
+        &reader,
+        stat.mtime.nanoseconds,
+        .{ .ongoing_threshold_secs = options.ongoing_threshold_secs },
+    );
+    defer summary.deinit(allocator);
+    return .{
+        .session_id = if (summary.session.session_id) |value|
+            try allocator.dupe(u8, value)
+        else
+            null,
+        .parent_session_id = if (summary.session.parent_session_id) |value|
+            try allocator.dupe(u8, value)
+        else
+            null,
+        .bytes_read = prefix.len,
+        .file_size = std.math.cast(usize, stat.size) orelse
+            return error.ObservationInputByteBoundExceeded,
+    };
+}
+
 pub const Observation = struct {
     trace: trace_core.CanonicalSessionTrace,
     structured_index: structured.Index = .{},
@@ -137,6 +186,115 @@ pub fn parseFileSelected(
         .discovery_bytes_read = 0,
         .file_opened = true,
     };
+}
+
+pub fn parseRelationsFileSelected(
+    allocator: std.mem.Allocator,
+    relations: []const physical.Relation,
+    path: []const u8,
+    options: Options,
+    selection: ?SessionSelection,
+) !SelectedParse {
+    if (relations.len == 0) return error.EmptyPhysicalRelationSet;
+    for (relations) |relation| if (!supported(relation)) {
+        return error.UnsupportedTracePhysicalRelation;
+    };
+    if (selection) |selected| {
+        if (!canonicalPathPassesSessionSelection(path, selected)) {
+            return skippedSelection(false, 0);
+        }
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try openTraceFile(io, path);
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > options.max_input_bytes) {
+        return error.ObservationInputByteBoundExceeded;
+    }
+    var file_reader = file.reader(io, &.{});
+    const prefix = try readSelectionPrefixAlloc(
+        allocator,
+        &file_reader.interface,
+        selection,
+    );
+    defer allocator.free(prefix);
+    const preselection = if (selection) |selected|
+        try preselectSession(
+            allocator,
+            path,
+            stat.mtime.nanoseconds,
+            options,
+            selected,
+            prefix,
+        )
+    else
+        Preselection{};
+    if (!preselection.passes) {
+        return skippedSelection(true, preselection.bytes_read);
+    }
+    var replay_reader = PrefixReader.init(prefix, &file_reader.interface);
+    const reader = if (selection != null)
+        &replay_reader.interface
+    else
+        &file_reader.interface;
+    var metrics = trace_core.StreamMetrics{};
+    var corpus_hasher = CorpusHasher{};
+    const trace = try trace_core.parseSessionTraceReaderWithVisitorMetrics(
+        allocator,
+        path,
+        reader,
+        stat.mtime.nanoseconds,
+        relationParseOptions(relations, options),
+        &corpus_hasher,
+        CorpusHasher.visit,
+        &metrics,
+    );
+    return .{
+        .parsed = .{
+            .trace = trace,
+            .metrics = metrics,
+            .corpus_digest = corpus_hasher.digest(),
+        },
+        .discovery_bytes_read = 0,
+        .file_opened = true,
+    };
+}
+
+fn relationParseOptions(
+    relations: []const physical.Relation,
+    options: Options,
+) trace_core.TraceParseOptions {
+    var result = trace_core.TraceParseOptions{
+        .ongoing_threshold_secs = options.ongoing_threshold_secs,
+        .include_message_bodies = false,
+    };
+    for (relations) |relation| {
+        result.include_raw = result.include_raw or relation == .source_events;
+        result.include_occurrences = result.include_occurrences or
+            relation == .source_events or
+            relation == .messages or
+            relation == .tool_invocations or
+            relation == .tool_results or
+            relation == .token_events or
+            relation == .structured_documents or
+            relation == .structured_values;
+        result.include_token_events = result.include_token_events or
+            relation == .token_events;
+        result.include_message_bodies = result.include_message_bodies or
+            relation == .turns or relation == .messages;
+    }
+    result.include_occurrence_payloads = for (relations) |relation| {
+        if (relation != .token_events) break true;
+    } else false;
+    return result;
+}
+
+test "token event parsing omits unused occurrence payload copies" {
+    const token_options = relationParseOptions(&.{.token_events}, .{});
+    try std.testing.expect(token_options.include_occurrences);
+    try std.testing.expect(!token_options.include_occurrence_payloads);
+    const message_options = relationParseOptions(&.{.messages}, .{});
+    try std.testing.expect(message_options.include_occurrence_payloads);
 }
 
 fn readSelectionPrefixAlloc(
@@ -772,6 +930,213 @@ pub fn writeRelationRowsJsonSelected(
     return context.count;
 }
 
+pub fn appendRelationRowsAlloc(
+    value_allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    interner: *ValueInterner,
+    output: *std.ArrayList(execution.Value),
+    trace: *const trace_core.CanonicalSessionTrace,
+    relation: physical.Relation,
+    indices: []const u16,
+    selection: RowSelection,
+) !usize {
+    if (relation == .structured_documents or relation == .structured_values) {
+        return error.StructuredRelationRequiresIndex;
+    }
+    var row_storage: [256]execution.Value = undefined;
+    if (indices.len == 0 or indices.len > row_storage.len) {
+        return error.PhysicalRelationTooWide;
+    }
+    var context = CollectContext{
+        .value_allocator = value_allocator,
+        .retained_allocator = retained_allocator,
+        .interner = interner,
+        .output = output,
+        .trace = trace,
+        .indices = indices,
+        .values = row_storage[0..indices.len],
+        .selection = selection,
+    };
+    switch (relation) {
+        .sessions, .source_events, .turns, .messages => {
+            try context.collectPrimary(relation);
+        },
+        .tool_invocations,
+        .tool_results,
+        .tool_lifecycle,
+        .session_edges,
+        => try context.collectTools(relation),
+        .token_events => try context.collectTokenEvents(),
+        .structured_documents, .structured_values => unreachable,
+    }
+    return context.count;
+}
+
+const CollectContext = struct {
+    value_allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    interner: *ValueInterner,
+    output: *std.ArrayList(execution.Value),
+    trace: *const trace_core.CanonicalSessionTrace,
+    indices: []const u16,
+    values: []execution.Value,
+    selection: RowSelection,
+    count: usize = 0,
+
+    fn collect(self: *CollectContext) !void {
+        for (self.values) |value| {
+            try self.output.append(self.value_allocator, try cloneValue(
+                self.interner,
+                self.value_allocator,
+                self.retained_allocator,
+                value,
+            ));
+        }
+        self.count += 1;
+    }
+
+    fn collectPrimary(
+        self: *CollectContext,
+        relation: physical.Relation,
+    ) !void {
+        switch (relation) {
+            .sessions => {
+                const timestamp = self.trace.session.start_time orelse
+                    self.trace.session.end_time;
+                if (!timestampPassesSelection(timestamp, self.selection)) return;
+                try fillSession(self.values, self.indices, self.trace.session);
+                try self.collect();
+            },
+            .source_events => for (self.trace.occurrences.items) |*occurrence| {
+                if (!timestampPassesSelection(occurrence.timestamp, self.selection)) continue;
+                try fillSourceEvent(
+                    self.values,
+                    self.indices,
+                    self.trace.session,
+                    occurrence,
+                );
+                try self.collect();
+            },
+            .turns => for (self.trace.turns.items) |turn| {
+                if (!turnPassesSelection(turn, self.selection)) continue;
+                try fillTurn(self.values, self.indices, turn);
+                try self.collect();
+            },
+            .messages => for (self.trace.occurrences.items) |*occurrence| {
+                if (!timestampPassesSelection(occurrence.timestamp, self.selection)) continue;
+                if (!occurrence.message_visible or occurrence.role == null or
+                    occurrence.text == null) continue;
+                try fillMessage(
+                    self.values,
+                    self.indices,
+                    self.trace.session,
+                    occurrence,
+                );
+                try self.collect();
+            },
+            else => unreachable,
+        }
+    }
+
+    fn collectTools(
+        self: *CollectContext,
+        relation: physical.Relation,
+    ) !void {
+        switch (relation) {
+            .tool_invocations => for (self.trace.tools.items) |tool| {
+                if (tool.declared_line == null or
+                    !timestampPassesSelection(tool.started_at, self.selection)) continue;
+                try fillToolInvocation(
+                    self.values,
+                    self.indices,
+                    tool,
+                    occurrenceAtLine(self.trace, tool.declared_line.?),
+                );
+                try self.collect();
+            },
+            .tool_results => for (self.trace.tools.items) |tool| {
+                if (tool.finalized_line == null or
+                    !timestampPassesSelection(tool.completed_at, self.selection)) continue;
+                try fillToolResult(
+                    self.values,
+                    self.indices,
+                    tool,
+                    occurrenceAtLine(self.trace, tool.finalized_line.?),
+                );
+                try self.collect();
+            },
+            .tool_lifecycle => for (self.trace.tools.items) |tool| {
+                if (!timestampPassesSelection(
+                    tool.started_at orelse tool.completed_at,
+                    self.selection,
+                )) continue;
+                try fillToolLifecycle(self.values, self.indices, tool);
+                try self.collect();
+            },
+            .session_edges => for (self.trace.graph_edges.items) |edge| {
+                if (!timestampPassesSelection(edge.spawned_at, self.selection)) continue;
+                try fillSessionEdge(self.values, self.indices, edge);
+                try self.collect();
+            },
+            else => unreachable,
+        }
+    }
+
+    fn collectTokenEvents(self: *CollectContext) !void {
+        for (self.trace.token_events.items) |event| {
+            if (event.occurrence_index >= self.trace.occurrences.items.len) {
+                return error.TokenEventOccurrenceMissing;
+            }
+            const occurrence = &self.trace.occurrences.items[event.occurrence_index];
+            if (!timestampPassesSelection(occurrence.timestamp, self.selection)) continue;
+            try fillTokenEvent(
+                self.values,
+                self.indices,
+                self.trace.session,
+                occurrence,
+                event,
+            );
+            try self.collect();
+        }
+    }
+};
+
+fn cloneValue(
+    interner: *ValueInterner,
+    map_allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    value: execution.Value,
+) !execution.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try interner.intern(map_allocator, retained_allocator, text) },
+        .json => |text| .{ .json = try interner.intern(map_allocator, retained_allocator, text) },
+        else => value,
+    };
+}
+
+pub const ValueInterner = struct {
+    values: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    pub fn deinit(self: *ValueInterner, allocator: std.mem.Allocator) void {
+        self.values.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn intern(
+        self: *ValueInterner,
+        map_allocator: std.mem.Allocator,
+        retained_allocator: std.mem.Allocator,
+        text: []const u8,
+    ) ![]const u8 {
+        if (self.values.get(text)) |value| return value;
+        const retained = try retained_allocator.dupe(u8, text);
+        const entry = try self.values.getOrPut(map_allocator, retained);
+        if (entry.found_existing) return entry.value_ptr.*;
+        entry.value_ptr.* = retained;
+        return retained;
+    }
+};
+
 const WriteContext = struct {
     writer: *std.Io.Writer,
     trace: *const trace_core.CanonicalSessionTrace,
@@ -1405,6 +1770,13 @@ fn fillTokenEvent(
             24 => try usizeInteger(event.occurrence_index),
             25 => optionalString(event.model),
             26 => optionalString(event.service_tier),
+            27 => if (occurrence.timestamp) |timestamp|
+                if (seq_time.parseIsoTimestampMillis(timestamp)) |millis|
+                    .{ .integer = millis }
+                else
+                    .null
+            else
+                .null,
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }

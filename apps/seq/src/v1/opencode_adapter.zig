@@ -607,9 +607,9 @@ fn fillSession(
             1 => .{ .string = path },
             8 => .{ .string = "opencode" },
             13 => try usizeInteger(records),
-            19, 21, 22 => .{ .boolean = false },
+            19, 21, 22, 27 => .{ .boolean = false },
             23 => .{ .integer = 0 },
-            2...7, 9...12, 14...18, 20 => .null,
+            2...7, 9...12, 14...18, 20, 24...26, 28 => .null,
             else => return error.InvalidOpenCodePhysicalFieldIndex,
         };
     }

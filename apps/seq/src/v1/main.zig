@@ -230,6 +230,16 @@ fn runExplain(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
+    if (usesRelationGraph(&context.definition_plan)) {
+        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        try writeGraphExplanation(
+            allocator,
+            &stdout_writer.interface,
+            &context,
+            &args,
+        );
+        return 0;
+    }
     var program = try seq.execution.compile(
         allocator,
         &context.definition_plan,
@@ -255,6 +265,147 @@ fn runExplain(
         &args,
         &program,
     );
+    return 0;
+}
+
+fn writeGraphExplanation(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    context: *const seq.compiled_plan.PlanSet,
+    args: *const ObserveArgs,
+) !void {
+    const scans = try seq.relation_graph.requiredScanStages(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    );
+    defer allocator.free(scans);
+    const streaming = try seq.relation_graph.streamingLineagePlan(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    );
+    if (args.format == .text) {
+        try writer.print(
+            "{s}@{s}\nprojection: {s}\nsources: {d}\nstages: {d}\nmax_rows: {d}\n",
+            .{
+                context.definition_plan.id,
+                context.definition_plan.closure_digest[0..],
+                args.projection,
+                scans.len,
+                context.native_plan.stages.len,
+                context.definition_plan.bounds.max_rows,
+            },
+        );
+        if (streaming) |schedule| {
+            try writer.print(
+                "strategy: partition-lineage-stream\npartition_relation: {s}\nretained_byte_bound: {d}\n",
+                .{
+                    @tagName(context.native_plan.stages[schedule.scan_stage].operation.scan.relation),
+                    streaming_retained_byte_bound,
+                },
+            );
+        } else {
+            try writer.writeAll("strategy: materialized-graph\n");
+        }
+        return;
+    }
+    try writer.writeAll(
+        "{\"schema\":\"seq-observation-plan/v1\",\"definition\":{\"id\":",
+    );
+    try writeString(writer, context.definition_plan.id);
+    try writer.writeAll(",\"digest\":");
+    try writeString(writer, &context.definition_plan.closure_digest);
+    try writer.writeAll(",\"abi\":\"");
+    try writer.writeAll(seq.definition.abi);
+    try writer.writeAll("\"},\"projection\":");
+    try writeString(writer, args.projection);
+    try writer.writeAll(",\"sources\":[");
+    for (scans, 0..) |stage_index, index| {
+        if (index != 0) try writer.writeByte(',');
+        const scan = context.native_plan.stages[stage_index].operation.scan;
+        try writer.writeAll("{\"kind\":\"physical\",\"relation\":");
+        try writeString(writer, @tagName(scan.relation));
+        try writer.writeByte('}');
+    }
+    try writer.print(
+        "],\"stage_count\":{d},\"max_rows\":{d},\"compile_stats\":",
+        .{ context.native_plan.stages.len, context.definition_plan.bounds.max_rows },
+    );
+    try writeCompileStats(writer, context.stats);
+    if (streaming) |schedule| {
+        try writer.writeAll(",\"strategy\":{\"kind\":\"partition-lineage-stream\",\"partition_relation\":");
+        try writeString(
+            writer,
+            @tagName(context.native_plan.stages[schedule.scan_stage].operation.scan.relation),
+        );
+        try writer.print(",\"retained_byte_bound\":{d}}}", .{streaming_retained_byte_bound});
+    } else {
+        try writer.writeAll(",\"strategy\":{\"kind\":\"materialized-graph\"}");
+    }
+    try writer.writeAll(",\"corpus_read\":false,\"authority_granted\":false}\n");
+}
+
+fn usesRelationGraph(definition_plan: *const seq.definition.Plan) bool {
+    return definition_plan.requires(.derive) or
+        definition_plan.requires(.join) or
+        definition_plan.requires(.ordered_fold) or
+        definition_plan.requires(.reachability);
+}
+
+fn emitGraphObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+) !u8 {
+    const execution_start = monotonicNanoseconds();
+    var graph = try executeGraphObservation(
+        allocator,
+        args,
+        context,
+        bindings,
+    );
+    defer graph.deinit(allocator);
+    const execution_ns = elapsedNanoseconds(execution_start);
+    var execution_stats = definition_core.result.ExecutionStats{
+        .execution_ns = execution_ns,
+        .physical_passes = 1,
+        .files_opened = graph.files_opened,
+        .bytes_read = graph.bytes_read,
+        .rows_scanned = graph.result.source_row_count,
+        .rows_materialized = graph.result.materialized_row_count,
+        .output_rows = graph.result.row_count,
+    };
+    const rendered = try renderObservationAlloc(
+        allocator,
+        .{
+            .definition_plan = &context.definition_plan,
+            .projection_name = args.projection,
+            .parameters_digest = &bindings.values_digest,
+            .corpus = .{
+                .adapter = graph.corpus_adapter,
+                .digest = &graph.corpus_digest,
+                .files = graph.corpus_files,
+                .sessions = graph.corpus_sessions,
+                .contaminated = graph.warning_count != 0,
+            },
+            .rows = graph.result.rows(),
+            .compile_stats = context.stats,
+            .execution_stats = execution_stats,
+            .limitations = observationLimitations(
+                graph.warning_count,
+                false,
+            ),
+        },
+        &execution_stats,
+    );
+    defer allocator.free(rendered);
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(rendered);
+    try stdout_writer.interface.writeByte('\n');
     return 0;
 }
 
@@ -553,6 +704,14 @@ fn runObserve(
         args.parameter_specs,
     );
     defer bindings.deinit(allocator);
+    if (usesRelationGraph(&context.definition_plan)) {
+        return emitGraphObservation(
+            allocator,
+            &args,
+            &context,
+            &bindings,
+        );
+    }
     var program = try seq.execution.compile(
         allocator,
         &context.definition_plan,
@@ -648,13 +807,723 @@ const ObservationExecution = struct {
     files_opened: usize,
     bytes_read: usize,
     warning_count: usize = 0,
+    graph_arena: ?*std.heap.ArenaAllocator = null,
+    graph_result_owned: bool = false,
 
     fn deinit(self: *ObservationExecution, allocator: std.mem.Allocator) void {
         if (self.runner) |*runner| runner.deinit();
         if (self.external_relation) |*relation| relation.deinit(allocator);
+        if (self.graph_arena) |arena| {
+            if (self.graph_result_owned) allocator.free(self.result.values);
+            arena.deinit();
+            allocator.destroy(arena);
+        }
         self.* = undefined;
     }
 };
+
+const GraphScanRows = struct {
+    stage_index: u16,
+    relation: seq.physical.Relation,
+    field_indices: []const u16,
+    values: std.ArrayList(seq.execution.Value) = .empty,
+};
+
+fn executeGraphObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+) !ObservationExecution {
+    if (args.input_specs.len != 0) {
+        return error.ExternalInputNotAcceptedForPhysicalObservation;
+    }
+    try validateSelectedSelectors(&context.definition_plan, args.selectors);
+    if (try seq.relation_graph.streamingLineagePlan(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    )) |schedule| {
+        return executeStreamingGraphObservation(
+            allocator,
+            args,
+            context,
+            bindings,
+            schedule,
+        );
+    }
+    const scan_stages = try seq.relation_graph.requiredScanStages(
+        allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        args.projection,
+    );
+    defer allocator.free(scan_stages);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const graph_allocator = arena.allocator();
+    const table_allocator = std.heap.page_allocator;
+    const scan_rows = try allocator.alloc(GraphScanRows, scan_stages.len);
+    var initialized_scan_rows: usize = 0;
+    defer {
+        for (scan_rows[0..initialized_scan_rows]) |*rows| rows.values.deinit(table_allocator);
+        allocator.free(scan_rows);
+    }
+    var relations: std.ArrayList(seq.physical.Relation) = .empty;
+    defer relations.deinit(allocator);
+    for (scan_stages, 0..) |stage_index, index| {
+        const scan = switch (context.native_plan.stages[stage_index].operation) {
+            .scan => |value| value,
+            else => return error.ObservationPhysicalScanMissing,
+        };
+        scan_rows[index] = .{
+            .stage_index = stage_index,
+            .relation = scan.relation,
+            .field_indices = scan.field_indices,
+        };
+        initialized_scan_rows += 1;
+        var seen = false;
+        for (relations.items) |relation| if (relation == scan.relation) {
+            seen = true;
+            break;
+        };
+        if (!seen) try relations.append(allocator, scan.relation);
+    }
+    var discovery_selectors = args.selectors;
+    discovery_selectors.path = null;
+    discovery_selectors.session_id = null;
+    discovery_selectors.since_ms = null;
+    discovery_selectors.until_ms = null;
+    var paths = try seq.native.resolveTargetPaths(
+        allocator,
+        defaultIo(),
+        discovery_selectors,
+        false,
+    );
+    defer seq.native.freePaths(allocator, &paths);
+    for (scan_rows) |*rows| {
+        const capacity_rows = if (rows.relation == .token_events)
+            context.definition_plan.bounds.max_rows
+        else
+            paths.items.len;
+        try rows.values.ensureTotalCapacity(
+            table_allocator,
+            try std.math.mul(usize, capacity_rows, rows.field_indices.len),
+        );
+    }
+    var metrics = PhysicalMetrics{};
+    var digest_set = CorpusSetHasher{};
+    var value_interner = seq.trace_adapter.ValueInterner{};
+    defer value_interner.deinit(table_allocator);
+    for (paths.items) |path| {
+        if (seq.opencode_adapter.recognizes(path)) {
+            return error.GraphObservationOpenCodeUnsupported;
+        }
+        const selected = try seq.trace_adapter.parseRelationsFileSelected(
+            allocator,
+            relations.items,
+            path,
+            .{
+                .max_input_bytes = if (metrics.corpus_bytes < context.definition_plan.bounds.max_input_bytes)
+                    context.definition_plan.bounds.max_input_bytes - metrics.corpus_bytes
+                else
+                    0,
+            },
+            .{
+                .repo = args.selectors.repo,
+            },
+        );
+        if (selected.file_opened) metrics.opened += 1;
+        try recordDiscoveryBytes(&metrics, selected.discovery_bytes_read);
+        var parsed = selected.parsed orelse continue;
+        defer parsed.deinit(allocator);
+        try metrics.admitAdapter("codex-rollout-jsonl/v1");
+        try recordCorpusBytes(&metrics, parsed.metrics.bytes_read);
+        try admitCodexSession(&metrics, &parsed);
+        digest_set.add(path, &parsed.corpus_digest);
+        for (scan_rows) |*rows| {
+            _ = try seq.trace_adapter.appendRelationRowsAlloc(
+                table_allocator,
+                graph_allocator,
+                &value_interner,
+                &rows.values,
+                &parsed.trace,
+                rows.relation,
+                rows.field_indices,
+                .{},
+            );
+        }
+    }
+    const scans = try allocator.alloc(
+        seq.relation_graph.ScanInput,
+        scan_rows.len,
+    );
+    var initialized_scans: usize = 0;
+    defer {
+        for (scans[0..initialized_scans]) |scan| {
+            if (scan.owned) table_allocator.free(scan.allocation orelse scan.table.values);
+        }
+        allocator.free(scans);
+    }
+    for (scan_rows, 0..) |*rows, index| {
+        const values = rows.values.items;
+        const allocation = values.ptr[0..rows.values.capacity];
+        rows.values = .empty;
+        scans[index] = .{
+            .stage_index = rows.stage_index,
+            .table = .{
+                .values = values,
+                .width = rows.field_indices.len,
+            },
+            .allocation = allocation,
+            .owned = true,
+        };
+        initialized_scans += 1;
+    }
+    const graph_result = try seq.relation_graph.execute(
+        table_allocator,
+        graph_allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        bindings,
+        .{
+            .path = args.selectors.path,
+            .root = args.selectors.root,
+            .session_id = args.selectors.session_id,
+            .repo = args.selectors.repo,
+            .since_ms = args.selectors.since_ms,
+            .until_ms = args.selectors.until_ms,
+        },
+        args.projection,
+        scans,
+    );
+    const retained_result_values = try graph_allocator.dupe(
+        seq.execution.Value,
+        graph_result.table.values,
+    );
+    table_allocator.free(graph_result.table.values);
+    return .{
+        .result = .{
+            .values = retained_result_values,
+            .width = graph_result.table.width,
+            .row_count = try graph_result.table.rowCount(),
+            .source_row_count = graph_result.source_rows,
+            .materialized_row_count = graph_result.materialized_rows,
+        },
+        .corpus_adapter = metrics.adapter orelse "codex-rollout-jsonl/v1",
+        .corpus_digest = digest_set.digest(),
+        .corpus_files = metrics.files,
+        .corpus_sessions = metrics.sessions,
+        .files_opened = metrics.opened,
+        .bytes_read = metrics.bytes_read,
+        .warning_count = metrics.warnings,
+        .graph_arena = arena,
+    };
+}
+
+const DiscoveredSession = struct {
+    path_index: usize,
+    identity: seq.trace_adapter.SessionIdentity,
+    depth: usize = 0,
+    visiting: bool = false,
+    resolved: bool = false,
+};
+
+const StreamingParseTask = struct {
+    path: []const u8,
+    relation: seq.physical.Relation,
+    max_input_bytes: usize,
+    repo: ?[]const u8,
+    selected: ?seq.trace_adapter.SelectedParse = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *StreamingParseTask) void {
+        self.selected = seq.trace_adapter.parseRelationsFileSelected(
+            std.heap.smp_allocator,
+            &.{self.relation},
+            self.path,
+            .{ .max_input_bytes = self.max_input_bytes },
+            .{ .repo = self.repo },
+        ) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+const streaming_retained_byte_bound: usize = 1536 * 1024 * 1024;
+
+fn executeStreamingGraphObservation(
+    allocator: std.mem.Allocator,
+    args: *const ObserveArgs,
+    context: *const seq.compiled_plan.PlanSet,
+    bindings: *const definition_core.parameters.Bindings,
+    schedule: seq.relation_graph.StreamingLineagePlan,
+) !ObservationExecution {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const graph_allocator = arena.allocator();
+    const table_allocator = std.heap.page_allocator;
+
+    var discovery_selectors = args.selectors;
+    discovery_selectors.path = null;
+    discovery_selectors.session_id = null;
+    discovery_selectors.since_ms = null;
+    discovery_selectors.until_ms = null;
+    var paths = try seq.native.resolveTargetPaths(
+        allocator,
+        defaultIo(),
+        discovery_selectors,
+        false,
+    );
+    defer seq.native.freePaths(allocator, &paths);
+
+    const discovered = try allocator.alloc(DiscoveredSession, paths.items.len);
+    var discovered_count: usize = 0;
+    defer {
+        for (discovered[0..discovered_count]) |*item| item.identity.deinit(allocator);
+        allocator.free(discovered);
+    }
+    var identity_bytes: usize = 0;
+    var session_indices = std.StringHashMap(usize).init(allocator);
+    defer session_indices.deinit();
+    for (paths.items, 0..) |path, index| {
+        discovered[index] = .{
+            .path_index = index,
+            .identity = try seq.trace_adapter.discoverSessionIdentity(
+                allocator,
+                path,
+                .{},
+            ),
+        };
+        discovered_count += 1;
+        identity_bytes = try std.math.add(
+            usize,
+            identity_bytes,
+            discovered[index].identity.bytes_read,
+        );
+        if (discovered[index].identity.session_id) |session_id| {
+            const entry = try session_indices.getOrPut(session_id);
+            if (entry.found_existing) return error.DuplicateObservationLineageNode;
+            entry.value_ptr.* = index;
+        }
+    }
+    for (discovered, 0..) |_, index| {
+        _ = try resolveSessionDepth(
+            discovered,
+            &session_indices,
+            index,
+            context.definition_plan.bounds.max_graph_depth,
+        );
+    }
+    std.mem.sort(DiscoveredSession, discovered, {}, discoveredSessionLessThan);
+    session_indices.clearRetainingCapacity();
+    for (discovered, 0..) |item, index| {
+        if (item.identity.session_id) |session_id| {
+            try session_indices.put(session_id, index);
+        }
+    }
+
+    const session_scan = context.native_plan.stages[schedule.graph_stage];
+    _ = session_scan;
+    const raw_session_stage = try findPartitionScanRoot(
+        &context.definition_plan,
+        &context.native_plan,
+        schedule.graph_stage,
+        .sessions,
+        0,
+    );
+    const raw_session_scan = context.native_plan.stages[raw_session_stage].operation.scan;
+    var session_values: std.ArrayList(seq.execution.Value) = .empty;
+    defer session_values.deinit(table_allocator);
+    try session_values.ensureTotalCapacity(
+        table_allocator,
+        try std.math.mul(usize, discovered.len, raw_session_scan.field_indices.len),
+    );
+    for (discovered) |item| {
+        try appendDiscoveredSession(
+            table_allocator,
+            graph_allocator,
+            &session_values,
+            raw_session_scan.field_indices,
+            paths.items[item.path_index],
+            item.identity,
+        );
+    }
+    const session_seed_values = session_values.items;
+    const session_seed_allocation = session_seed_values.ptr[0..session_values.capacity];
+    session_values = .empty;
+    errdefer table_allocator.free(session_seed_allocation);
+
+    const graph_seed_copy = try table_allocator.dupe(
+        seq.execution.Value,
+        session_seed_values,
+    );
+    var graph_seed = [_]seq.relation_graph.ScanInput{.{
+        .stage_index = raw_session_stage,
+        .table = .{
+            .values = graph_seed_copy,
+            .width = raw_session_scan.field_indices.len,
+        },
+        .allocation = graph_seed_copy,
+        .owned = true,
+    }};
+    const lineage_graph = try seq.relation_graph.executeTarget(
+        table_allocator,
+        graph_allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        bindings,
+        graphRuntimeSelectors(args),
+        schedule.graph_stage,
+        &graph_seed,
+    );
+    defer table_allocator.free(lineage_graph.table.values);
+
+    var reducer = try seq.relation_graph.StreamingLineageReducer.init(
+        table_allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        schedule,
+        lineage_graph.table,
+        streaming_retained_byte_bound,
+    );
+    defer reducer.deinit();
+
+    const local_scan = context.native_plan.stages[schedule.scan_stage].operation.scan;
+    var metrics = PhysicalMetrics{};
+    var digest_set = CorpusSetHasher{};
+    var value_interner = seq.trace_adapter.ValueInterner{};
+    defer value_interner.deinit(table_allocator);
+    var raw_source_rows: usize = 0;
+    var materialized_rows: usize = lineage_graph.materialized_rows;
+    var included: std.ArrayList(usize) = .empty;
+    defer included.deinit(allocator);
+    for (discovered, 0..) |item, discovered_index| {
+        if (!sessionInSelectionClosure(
+            discovered,
+            &session_indices,
+            discovered_index,
+            args.selectors.session_id,
+            args.selectors.path,
+            paths.items,
+            context.definition_plan.bounds.max_graph_depth,
+        )) continue;
+        const path = paths.items[item.path_index];
+        if (seq.opencode_adapter.recognizes(path)) {
+            return error.GraphObservationOpenCodeUnsupported;
+        }
+        try included.append(allocator, discovered_index);
+    }
+    const parse_tasks = try allocator.alloc(StreamingParseTask, included.items.len);
+    defer allocator.free(parse_tasks);
+    for (included.items, 0..) |discovered_index, index| {
+        parse_tasks[index] = .{
+            .path = paths.items[discovered[discovered_index].path_index],
+            .relation = local_scan.relation,
+            .max_input_bytes = context.definition_plan.bounds.max_input_bytes,
+            .repo = args.selectors.repo,
+        };
+    }
+    if (parse_tasks.len != 0) {
+        const prefetch = 3;
+        var threads = [_]?std.Thread{null} ** prefetch;
+        defer for (&threads) |*thread| if (thread.*) |running| running.join();
+        for (0..@min(prefetch, parse_tasks.len)) |index| {
+            threads[index] = try std.Thread.spawn(
+                .{},
+                StreamingParseTask.run,
+                .{&parse_tasks[index]},
+            );
+        }
+        var task_index: usize = 0;
+        while (task_index < parse_tasks.len) : (task_index += 1) {
+            const slot = task_index % prefetch;
+            const running = threads[slot] orelse unreachable;
+            running.join();
+            threads[slot] = null;
+            if (parse_tasks[task_index].failure) |failure| return failure;
+            const next_index = task_index + prefetch;
+            if (next_index < parse_tasks.len) {
+                threads[slot] = try std.Thread.spawn(
+                    .{},
+                    StreamingParseTask.run,
+                    .{&parse_tasks[next_index]},
+                );
+            }
+
+            const selected = parse_tasks[task_index].selected orelse
+                return error.ObservationPhysicalParseMissing;
+            parse_tasks[task_index].selected = null;
+            if (selected.file_opened) metrics.opened += 1;
+            try recordDiscoveryBytes(&metrics, selected.discovery_bytes_read);
+            if (selected.parsed) |value| {
+                var parsed = value;
+                defer parsed.deinit(std.heap.smp_allocator);
+                try metrics.admitAdapter("codex-rollout-jsonl/v1");
+                try recordCorpusBytes(&metrics, parsed.metrics.bytes_read);
+                try admitCodexSession(&metrics, &parsed);
+                digest_set.add(parse_tasks[task_index].path, &parsed.corpus_digest);
+
+                var raw_values: std.ArrayList(seq.execution.Value) = .empty;
+                defer raw_values.deinit(table_allocator);
+                const appended = try seq.trace_adapter.appendRelationRowsAlloc(
+                    table_allocator,
+                    graph_allocator,
+                    &value_interner,
+                    &raw_values,
+                    &parsed.trace,
+                    local_scan.relation,
+                    local_scan.field_indices,
+                    .{},
+                );
+                raw_source_rows = try std.math.add(usize, raw_source_rows, appended);
+                const values = raw_values.items;
+                const allocation = values.ptr[0..raw_values.capacity];
+                raw_values = .empty;
+                var local_seed = [_]seq.relation_graph.ScanInput{.{
+                    .stage_index = schedule.scan_stage,
+                    .table = .{ .values = values, .width = local_scan.field_indices.len },
+                    .allocation = allocation,
+                    .owned = true,
+                }};
+                const local = try seq.relation_graph.executeTarget(
+                    table_allocator,
+                    graph_allocator,
+                    &context.definition_plan,
+                    &context.native_plan,
+                    bindings,
+                    graphRuntimeSelectors(args),
+                    schedule.local_stage,
+                    &local_seed,
+                );
+                defer table_allocator.free(local.table.values);
+                materialized_rows = try std.math.add(
+                    usize,
+                    materialized_rows,
+                    local.materialized_rows,
+                );
+                try reducer.appendPartition(local.table);
+            }
+        }
+    }
+    var owned = try reducer.finish();
+    errdefer table_allocator.free(owned.values);
+
+    var final_scans = [_]seq.relation_graph.ScanInput{
+        .{
+            .stage_index = raw_session_stage,
+            .table = .{
+                .values = session_seed_values,
+                .width = raw_session_scan.field_indices.len,
+            },
+            .allocation = session_seed_allocation,
+            .owned = true,
+        },
+        .{
+            .stage_index = schedule.lineage_stage,
+            .table = owned,
+            .allocation = owned.values,
+            .owned = true,
+        },
+    };
+    owned.values = &.{};
+    const graph_result = try seq.relation_graph.execute(
+        table_allocator,
+        graph_allocator,
+        &context.definition_plan,
+        &context.native_plan,
+        bindings,
+        graphRuntimeSelectors(args),
+        args.projection,
+        &final_scans,
+    );
+    const retained_result_values = try graph_allocator.dupe(
+        seq.execution.Value,
+        graph_result.table.values,
+    );
+    table_allocator.free(graph_result.table.values);
+    return .{
+        .result = .{
+            .values = retained_result_values,
+            .width = graph_result.table.width,
+            .row_count = try graph_result.table.rowCount(),
+            .source_row_count = raw_source_rows,
+            .materialized_row_count = try std.math.add(
+                usize,
+                materialized_rows,
+                graph_result.materialized_rows,
+            ),
+        },
+        .corpus_adapter = metrics.adapter orelse "codex-rollout-jsonl/v1",
+        .corpus_digest = digest_set.digest(),
+        .corpus_files = metrics.files,
+        .corpus_sessions = metrics.sessions,
+        .files_opened = metrics.opened,
+        .bytes_read = try std.math.add(usize, metrics.bytes_read, identity_bytes),
+        .warning_count = metrics.warnings,
+        .graph_arena = arena,
+    };
+}
+
+fn sessionInSelectionClosure(
+    sessions: []const DiscoveredSession,
+    indices: *const std.StringHashMap(usize),
+    candidate_index: usize,
+    selected_session_id: ?[]const u8,
+    selected_path: ?[]const u8,
+    paths: []const []const u8,
+    max_depth: usize,
+) bool {
+    if (selected_session_id == null and selected_path == null) return true;
+    for (sessions, 0..) |selected, selected_index| {
+        const id_matches = if (selected_session_id) |wanted|
+            if (selected.identity.session_id) |actual| std.mem.eql(u8, wanted, actual) else false
+        else
+            false;
+        const path_matches = if (selected_path) |wanted|
+            std.mem.eql(u8, wanted, paths[selected.path_index])
+        else
+            false;
+        if (!id_matches and !path_matches) continue;
+        return lineageRelated(
+            sessions,
+            indices,
+            candidate_index,
+            selected_index,
+            max_depth,
+        ) or lineageRelated(
+            sessions,
+            indices,
+            selected_index,
+            candidate_index,
+            max_depth,
+        );
+    }
+    return false;
+}
+
+fn lineageRelated(
+    sessions: []const DiscoveredSession,
+    indices: *const std.StringHashMap(usize),
+    descendant_index: usize,
+    ancestor_index: usize,
+    max_depth: usize,
+) bool {
+    var current = descendant_index;
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        if (current == ancestor_index) return true;
+        if (depth >= max_depth) return false;
+        const parent = sessions[current].identity.parent_session_id orelse return false;
+        current = indices.get(parent) orelse return false;
+    }
+}
+
+fn graphRuntimeSelectors(args: *const ObserveArgs) seq.relation_graph.RuntimeSelectors {
+    return .{
+        .path = args.selectors.path,
+        .root = args.selectors.root,
+        .session_id = args.selectors.session_id,
+        .repo = args.selectors.repo,
+        .since_ms = args.selectors.since_ms,
+        .until_ms = args.selectors.until_ms,
+    };
+}
+
+fn resolveSessionDepth(
+    sessions: []DiscoveredSession,
+    indices: *const std.StringHashMap(usize),
+    index: usize,
+    max_depth: usize,
+) !usize {
+    if (sessions[index].resolved) return sessions[index].depth;
+    if (sessions[index].visiting) return error.ObservationGraphCycle;
+    sessions[index].visiting = true;
+    defer sessions[index].visiting = false;
+    const depth = if (sessions[index].identity.parent_session_id) |parent|
+        if (indices.get(parent)) |parent_index|
+            try std.math.add(
+                usize,
+                try resolveSessionDepth(sessions, indices, parent_index, max_depth),
+                1,
+            )
+        else
+            0
+    else
+        0;
+    if (depth > max_depth) return error.ObservationGraphDepthExceeded;
+    sessions[index].depth = depth;
+    sessions[index].resolved = true;
+    return depth;
+}
+
+fn discoveredSessionLessThan(_: void, left: DiscoveredSession, right: DiscoveredSession) bool {
+    if (left.depth != right.depth) return left.depth < right.depth;
+    return left.path_index < right.path_index;
+}
+
+fn appendDiscoveredSession(
+    allocator: std.mem.Allocator,
+    retained_allocator: std.mem.Allocator,
+    output: *std.ArrayList(seq.execution.Value),
+    field_indices: []const u16,
+    path: []const u8,
+    identity: seq.trace_adapter.SessionIdentity,
+) !void {
+    for (field_indices) |field_index| {
+        const field = seq.physical.Relation.sessions.fields()[field_index];
+        const value: seq.execution.Value = if (std.mem.eql(u8, field.name, "session_id"))
+            if (identity.session_id) |text| .{ .string = try retained_allocator.dupe(u8, text) } else .null
+        else if (std.mem.eql(u8, field.name, "parent_session_id"))
+            if (identity.parent_session_id) |text| .{ .string = try retained_allocator.dupe(u8, text) } else .null
+        else if (std.mem.eql(u8, field.name, "lineage_conflict"))
+            .{ .boolean = false }
+        else if (std.mem.eql(u8, field.name, "path"))
+            .{ .string = try retained_allocator.dupe(u8, path) }
+        else if (field.nullable)
+            .null
+        else
+            return error.ObservationSessionDiscoveryFieldUnsupported;
+        try output.append(allocator, value);
+    }
+}
+
+fn findPartitionScanRoot(
+    definition_plan: *const seq.definition.Plan,
+    native_plan: *const seq.plan.Plan,
+    stage_index: u16,
+    relation: seq.physical.Relation,
+    depth: usize,
+) !u16 {
+    if (depth > definition_plan.bounds.max_graph_depth) {
+        return error.ObservationGraphDepthExceeded;
+    }
+    const stage = native_plan.stages[stage_index];
+    if (stage.operation == .scan) {
+        if (stage.operation.scan.relation != relation) {
+            return error.ObservationPartitionPrefixHasMultipleScans;
+        }
+        return stage_index;
+    }
+    for (definition_plan.steps[stage_index].input_names) |name| {
+        const input = native_plan.findStage(name) orelse continue;
+        const found = findPartitionScanRoot(
+            definition_plan,
+            native_plan,
+            input,
+            relation,
+            depth + 1,
+        ) catch continue;
+        return found;
+    }
+    return error.ObservationPhysicalScanMissing;
+}
 
 fn executeObservation(
     allocator: std.mem.Allocator,

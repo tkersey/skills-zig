@@ -63,7 +63,8 @@ pub const Operator = enum {
 
     pub fn version(self: Operator) u16 {
         return switch (self) {
-            .filter => 2,
+            .scan, .aggregate, .derive => 2,
+            .filter => 3,
             else => 1,
         };
     }
@@ -604,14 +605,14 @@ fn parseStep(
 ) !Step {
     const object = try definition_core.json.object(item);
     try definition_core.json.requireExactKeys(object, &.{
-        "op",              "input", "inputs",
-        "as",              "name",  "relation",
-        "fields",          "where", "where_mode",
-        "on",              "keys",  "metrics",
-        "by",              "limit", "depth",
-        "max_nodes",       "state", "order_by",
-        "transitions",     "emit",  "window",
-        "classifications",
+        "op",              "input",          "inputs",
+        "as",              "name",           "relation",
+        "fields",          "where",          "where_mode",
+        "on",              "keys",           "metrics",
+        "by",              "limit",          "depth",
+        "max_nodes",       "state",          "order_by",
+        "transitions",     "emit",           "window",
+        "classifications", "preserve_input", "sequential",
     });
     const operator_name = try definition_core.json.requiredString(
         object,

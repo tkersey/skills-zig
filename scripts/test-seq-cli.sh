@@ -243,13 +243,17 @@ test ! -e "$cache_dir/sessions/.seq-index.jsonl"
 capabilities=$("$binary" capabilities --format json)
 grep -Fq '"schema":"seq-capabilities/v1"' <<<"$capabilities"
 grep -Fq '"observation_abis":["seq-observation-abi/v1"]' <<<"$capabilities"
-grep -Fq '"id":"scan","version":1' <<<"$capabilities"
-grep -Fq '"id":"filter","version":2' <<<"$capabilities"
+grep -Fq '"id":"scan","version":2' <<<"$capabilities"
+grep -Fq '"id":"filter","version":3' <<<"$capabilities"
 grep -Fq '"id":"project","version":1' <<<"$capabilities"
-grep -Fq '"id":"aggregate","version":1' <<<"$capabilities"
+grep -Fq '"id":"derive","version":2' <<<"$capabilities"
+grep -Fq '"id":"join","version":1' <<<"$capabilities"
+grep -Fq '"id":"aggregate","version":2' <<<"$capabilities"
 grep -Fq '"id":"sort","version":1' <<<"$capabilities"
 grep -Fq '"id":"top-k","version":1' <<<"$capabilities"
 grep -Fq '"id":"distinct","version":1' <<<"$capabilities"
+grep -Fq '"id":"ordered-fold","version":1' <<<"$capabilities"
+grep -Fq '"id":"reachability","version":1' <<<"$capabilities"
 grep -Fq '"opencode-prompt-history-jsonl/v1"' <<<"$capabilities"
 grep -Fq '"seq-command-error/v1"' <<<"$capabilities"
 grep -Fq '"seq-definition-check-result/v1"' <<<"$capabilities"
@@ -257,11 +261,6 @@ grep -Fq '"seq-definition-description/v1"' <<<"$capabilities"
 grep -Fq '"seq-index-result/v1"' <<<"$capabilities"
 grep -Fq '"seq-observation-plan/v1"' <<<"$capabilities"
 grep -Fq '"seq-observation-result/v1"' <<<"$capabilities"
-if grep -Eq '"id":"(join|ordered-fold|reachability)"' \
-  <<<"$capabilities"
-then
-  exit 1
-fi
 if grep -Eq \
   'actuat|universal|learnings|negative-ledger|synesthesia|SKDC|SDR|EPG' \
   <<<"$capabilities"

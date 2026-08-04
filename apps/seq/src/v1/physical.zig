@@ -13,6 +13,12 @@ pub const Field = struct {
     nullable: bool = true,
 };
 
+pub const Layout = struct {
+    partition_field: ?[]const u8 = null,
+    order_field: ?[]const u8 = null,
+    rows_per_partition_bound: ?usize = null,
+};
+
 pub const Relation = enum {
     sessions,
     source_events,
@@ -54,6 +60,29 @@ pub const Relation = enum {
             if (std.mem.eql(u8, field.name, name)) return @intCast(index);
         }
         return error.UnknownPhysicalField;
+    }
+
+    pub fn layout(self: Relation) Layout {
+        return switch (self) {
+            .sessions => .{
+                .partition_field = "session_id",
+                .rows_per_partition_bound = 1,
+            },
+            .token_events => .{
+                .partition_field = "session_id",
+                .order_field = "source_ordinal",
+            },
+            .source_events,
+            .turns,
+            .messages,
+            .tool_invocations,
+            .tool_results,
+            .tool_lifecycle,
+            .session_edges,
+            .structured_documents,
+            .structured_values,
+            => .{ .partition_field = "session_id" },
+        };
     }
 };
 
@@ -243,6 +272,7 @@ const token_event_fields = [_]Field{
     .{ .name = "source_ordinal", .kind = .integer, .nullable = false },
     .{ .name = "model", .kind = .string },
     .{ .name = "service_tier", .kind = .string },
+    .{ .name = "timestamp_ms", .kind = .integer },
 };
 
 const structured_document_fields = [_]Field{
@@ -287,6 +317,7 @@ test "lossless session and token fields are append-only ABI v1 extensions" {
     try std.testing.expectEqual(@as(u16, 10), try Relation.token_events.fieldIndex("total_input_tokens"));
     try std.testing.expectEqual(@as(u16, 15), try Relation.token_events.fieldIndex("last_input_tokens"));
     try std.testing.expectEqual(@as(u16, 23), try Relation.token_events.fieldIndex("line_number"));
+    try std.testing.expectEqual(@as(u16, 27), try Relation.token_events.fieldIndex("timestamp_ms"));
     try std.testing.expectError(
         error.UnknownPhysicalField,
         Relation.tool_invocations.fieldIndex("total_input_tokens"),

@@ -352,6 +352,7 @@ const ProgramBuilder = struct {
             .aggregate => |aggregate| {
                 try self.applyAggregate(aggregate, stage);
             },
+            .generic => return error.ObservationGraphOperatorRequiresGraphExecutor,
         }
     }
 

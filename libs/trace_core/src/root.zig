@@ -41,6 +41,7 @@ pub const TraceParseOptions = struct {
     ongoing_threshold_secs: i64 = 60,
     include_raw: bool = false,
     include_occurrences: bool = true,
+    include_occurrence_payloads: bool = true,
     include_token_events: bool = false,
     include_message_bodies: bool = true,
     /// Retain the stable top N tools ordered by turn_index descending. This
@@ -633,6 +634,7 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                 line_number,
                 line,
                 options.include_raw,
+                options.include_occurrence_payloads,
                 saw_task_started,
                 &seen_messages,
             )
@@ -1044,6 +1046,7 @@ fn appendOccurrence(
     line_number: usize,
     raw_json: []const u8,
     include_raw: bool,
+    include_payload: bool,
     saw_task_started: bool,
     seen_messages: *std.AutoHashMap(
         [std.crypto.hash.sha2.Sha256.digest_length]u8,
@@ -1166,7 +1169,13 @@ fn appendOccurrence(
         try normalizeTimestampAlloc(allocator, value)
     else
         null;
-    occurrence.payload_json = if (!private) try stringifyJsonValue(allocator, if (payload != null) root.get("payload").? else std.json.Value{ .object = root }) else null;
+    occurrence.payload_json = if (!private and include_payload)
+        try stringifyJsonValue(
+            allocator,
+            if (payload != null) root.get("payload").? else std.json.Value{ .object = root },
+        )
+    else
+        null;
     occurrence.raw_json = if (include_raw)
         try allocator.dupe(u8, raw_json)
     else
@@ -2516,7 +2525,10 @@ test "lossless token events retain lineage, both usage tuples, and event setting
         "/provenance/worker.jsonl",
         source,
         nowRealtimeNs(),
-        .{ .include_token_events = true },
+        .{
+            .include_token_events = true,
+            .include_occurrence_payloads = false,
+        },
     );
     defer trace.deinit(std.testing.allocator);
 
@@ -2527,6 +2539,9 @@ test "lossless token events retain lineage, both usage tuples, and event setting
     try std.testing.expect(!trace.session.lineage_conflict);
     try std.testing.expectEqual(@as(usize, 1), trace.token_events.items.len);
     const event = trace.token_events.items[0];
+    const occurrence = trace.occurrences.items[event.occurrence_index];
+    try std.testing.expect(occurrence.payload_json == null);
+    try std.testing.expect(occurrence.timestamp != null);
     try std.testing.expect(event.has_total_usage);
     try std.testing.expect(event.has_last_usage);
     try std.testing.expectEqual(@as(i64, 20), event.total_input_tokens.?);

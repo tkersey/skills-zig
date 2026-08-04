@@ -7,6 +7,7 @@ pub const opencode_adapter = @import("opencode_adapter.zig");
 pub const plan = @import("plan.zig");
 pub const physical = @import("physical.zig");
 pub const result = @import("result.zig");
+pub const relation_graph = @import("relation_graph.zig");
 pub const structured = @import("structured.zig");
 pub const trace_adapter = @import("trace_adapter.zig");
 
@@ -20,6 +21,7 @@ test {
     _ = plan;
     _ = physical;
     _ = result;
+    _ = relation_graph;
     _ = structured;
     _ = trace_adapter;
 }

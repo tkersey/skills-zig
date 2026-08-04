@@ -9,6 +9,10 @@ pub fn supports(operator: definition.Operator) bool {
         .filter,
         .project,
         .aggregate,
+        .derive,
+        .join,
+        .ordered_fold,
+        .reachability,
         .limit,
         .sort,
         .top_k,
@@ -26,6 +30,15 @@ pub const ColumnKind = enum {
     float,
     boolean,
     json,
+
+    pub fn parse(raw: []const u8) !ColumnKind {
+        inline for (@typeInfo(ColumnKind).@"enum".fields) |field| {
+            if (std.mem.eql(u8, raw, field.name)) {
+                return @enumFromInt(field.value);
+            }
+        }
+        return error.InvalidObservationColumnType;
+    }
 };
 
 pub const Column = struct {
@@ -301,6 +314,16 @@ pub const Distinct = struct {
     }
 };
 
+pub const Generic = struct {
+    operator: definition.Operator,
+    canonical_config: []u8,
+
+    fn deinit(self: *Generic, allocator: std.mem.Allocator) void {
+        allocator.free(self.canonical_config);
+        self.* = undefined;
+    }
+};
+
 pub const TopK = struct {
     keys: []SortKey,
     limit: Limit,
@@ -321,6 +344,7 @@ pub const Operation = union(enum) {
     sort: Sort,
     top_k: TopK,
     distinct: Distinct,
+    generic: Generic,
 
     fn deinit(self: *Operation, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -331,6 +355,7 @@ pub const Operation = union(enum) {
             .sort => |*value| value.deinit(allocator),
             .top_k => |*value| value.deinit(allocator),
             .distinct => |*value| value.deinit(allocator),
+            .generic => |*value| value.deinit(allocator),
             .alias, .limit => {},
         }
         self.* = undefined;
@@ -487,6 +512,17 @@ fn compileStageBody(
             source,
             object,
         ),
+        .derive,
+        .join,
+        .ordered_fold,
+        .reachability,
+        => try compileGenericStage(
+            allocator,
+            definition_plan,
+            prior_stages,
+            source,
+            object,
+        ),
         else => try compilePassThroughStageBody(
             allocator,
             definition_plan,
@@ -495,6 +531,151 @@ fn compileStageBody(
             object,
         ),
     };
+}
+
+fn compileGenericStage(
+    allocator: std.mem.Allocator,
+    definition_plan: *const definition.Plan,
+    prior_stages: []const Stage,
+    source: definition.Step,
+    object: std.json.ObjectMap,
+) !StageBody {
+    var input = try compileInputStage(
+        allocator,
+        definition_plan,
+        prior_stages,
+        source,
+    );
+    defer input.deinit(allocator);
+    var schema = switch (source.operator) {
+        .derive => if (object.get("preserve_input")) |raw|
+            if (!try definition_core.json.boolean(raw))
+                try schemaFromDeclaredColumns(
+                    allocator,
+                    try definition_core.json.array(
+                        try definition_core.json.field(object, "fields"),
+                    ),
+                )
+            else
+                try appendDeclaredColumns(
+                    allocator,
+                    &input.schema,
+                    try definition_core.json.array(
+                        try definition_core.json.field(object, "fields"),
+                    ),
+                )
+        else
+            try appendDeclaredColumns(
+                allocator,
+                &input.schema,
+                try definition_core.json.array(
+                    try definition_core.json.field(object, "fields"),
+                ),
+            ),
+        .join, .reachability => try schemaFromDeclaredColumns(
+            allocator,
+            try definition_core.json.array(
+                try definition_core.json.field(object, "fields"),
+            ),
+        ),
+        .ordered_fold => try schemaFromDeclaredColumns(
+            allocator,
+            try definition_core.json.array(
+                try definition_core.json.field(object, "emit"),
+            ),
+        ),
+        else => unreachable,
+    };
+    errdefer schema.deinit(allocator);
+    return .{
+        .source = input.source,
+        .operation = .{ .generic = .{
+            .operator = source.operator,
+            .canonical_config = try allocator.dupe(
+                u8,
+                source.canonical_config,
+            ),
+        } },
+        .schema = schema,
+    };
+}
+
+fn schemaFromDeclaredColumns(
+    allocator: std.mem.Allocator,
+    values: std.json.Array,
+) !Schema {
+    if (values.items.len == 0 or values.items.len > 256) {
+        return error.InvalidObservationSourceWidth;
+    }
+    const columns = try allocator.alloc(Column, values.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |*column| column.deinit(allocator);
+        allocator.free(columns);
+    }
+    for (values.items, 0..) |value, index| {
+        const object = try definition_core.json.object(value);
+        const name = try definition_core.json.requiredString(object, "name");
+        try definition_core.json.safeIdentifier(name, 128);
+        for (columns[0..index]) |prior| if (std.mem.eql(u8, prior.name, name)) {
+            return error.DuplicateObservationColumn;
+        };
+        columns[index] = .{
+            .name = try allocator.dupe(u8, name),
+            .kind = try ColumnKind.parse(
+                try definition_core.json.requiredString(object, "type"),
+            ),
+            .nullable = if (object.get("nullable")) |raw|
+                try definition_core.json.boolean(raw)
+            else
+                true,
+        };
+        initialized += 1;
+    }
+    return .{ .columns = columns };
+}
+
+fn appendDeclaredColumns(
+    allocator: std.mem.Allocator,
+    input: *const Schema,
+    values: std.json.Array,
+) !Schema {
+    var declared = try schemaFromDeclaredColumns(allocator, values);
+    defer declared.deinit(allocator);
+    if (input.columns.len + declared.columns.len > 256) {
+        return error.InvalidObservationSourceWidth;
+    }
+    const columns = try allocator.alloc(
+        Column,
+        input.columns.len + declared.columns.len,
+    );
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |*column| column.deinit(allocator);
+        allocator.free(columns);
+    }
+    for (input.columns) |column| {
+        columns[initialized] = .{
+            .name = try allocator.dupe(u8, column.name),
+            .kind = column.kind,
+            .nullable = column.nullable,
+        };
+        initialized += 1;
+    }
+    for (declared.columns) |column| {
+        for (columns[0..initialized]) |prior| {
+            if (std.mem.eql(u8, prior.name, column.name)) {
+                return error.DuplicateObservationColumn;
+            }
+        }
+        columns[initialized] = .{
+            .name = try allocator.dupe(u8, column.name),
+            .kind = column.kind,
+            .nullable = column.nullable,
+        };
+        initialized += 1;
+    }
+    return .{ .columns = columns };
 }
 
 fn compilePassThroughStageBody(
@@ -1445,7 +1626,7 @@ pub fn encodeCache(
     native_plan: *const Plan,
     encoder: *definition_core.cache.Encoder,
 ) !void {
-    try encoder.writeU16(4);
+    try encoder.writeU16(6);
     try encoder.writeCount(native_plan.stages.len);
     for (native_plan.stages) |stage| {
         try encoder.writeBytes(stage.name);
@@ -1476,7 +1657,7 @@ pub fn decodeCache(
     decoder: *definition_core.cache.Decoder,
     definition_plan: *const definition.Plan,
 ) !Plan {
-    if (try decoder.readU16() != 4) {
+    if (try decoder.readU16() != 6) {
         return error.SeqNativePlanCacheVersionMismatch;
     }
     const stages = try decodeCacheStages(allocator, decoder);
@@ -1701,6 +1882,21 @@ fn validateCacheStage(
             source_schema.?,
         ),
         .distinct => try validateCachedDistinct(stage, source_schema.?),
+        .derive, .join, .ordered_fold, .reachability => {
+            const generic = switch (stage.operation) {
+                .generic => |value| value,
+                else => return error.CacheObservationOperationMismatch,
+            };
+            if (generic.operator != step.operator or
+                !std.mem.eql(
+                    u8,
+                    generic.canonical_config,
+                    step.canonical_config,
+                ))
+            {
+                return error.CacheObservationOperationMismatch;
+            }
+        },
         else => return error.ObservationOperatorPlanNotCompiled,
     }
 }
@@ -2168,6 +2364,10 @@ fn encodeOperation(
                 try encoder.writeU16(field_index);
             }
         },
+        .generic => |generic| {
+            try encoder.writeEnum(generic.operator);
+            try encoder.writeBytes(generic.canonical_config);
+        },
     }
 }
 
@@ -2257,6 +2457,13 @@ fn decodeOperation(
             decoder,
             schema,
         ) },
+        .generic => .{ .generic = .{
+            .operator = try decoder.readEnum(definition.Operator),
+            .canonical_config = try decoder.readBytesAlloc(
+                allocator,
+                4 * 1024 * 1024,
+            ),
+        } },
     };
 }
 
