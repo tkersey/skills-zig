@@ -82,6 +82,11 @@ const session_fields = [_]Field{
     .{ .name = "is_external_worker", .kind = .boolean, .nullable = false },
     .{ .name = "is_inline_worker", .kind = .boolean, .nullable = false },
     .{ .name = "spawned_worker_count", .kind = .integer, .nullable = false },
+    .{ .name = "root_session_id", .kind = .string },
+    .{ .name = "parent_session_id", .kind = .string },
+    .{ .name = "parent_relation", .kind = .string },
+    .{ .name = "lineage_conflict", .kind = .boolean, .nullable = false },
+    .{ .name = "service_tier", .kind = .string },
 };
 
 const source_event_fields = [_]Field{
@@ -221,6 +226,23 @@ const token_event_fields = [_]Field{
     .{ .name = "total_tokens", .kind = .integer },
     .{ .name = "source_event_id", .kind = .string },
     .{ .name = "path", .kind = .string, .nullable = false },
+    .{ .name = "total_input_tokens", .kind = .integer },
+    .{ .name = "total_cached_input_tokens", .kind = .integer },
+    .{ .name = "total_output_tokens", .kind = .integer },
+    .{ .name = "total_reasoning_output_tokens", .kind = .integer },
+    .{ .name = "total_total_tokens", .kind = .integer },
+    .{ .name = "last_input_tokens", .kind = .integer },
+    .{ .name = "last_cached_input_tokens", .kind = .integer },
+    .{ .name = "last_output_tokens", .kind = .integer },
+    .{ .name = "last_reasoning_output_tokens", .kind = .integer },
+    .{ .name = "last_total_tokens", .kind = .integer },
+    .{ .name = "has_total_usage", .kind = .boolean, .nullable = false },
+    .{ .name = "has_last_usage", .kind = .boolean, .nullable = false },
+    .{ .name = "usage_state", .kind = .string, .nullable = false },
+    .{ .name = "line_number", .kind = .integer, .nullable = false },
+    .{ .name = "source_ordinal", .kind = .integer, .nullable = false },
+    .{ .name = "model", .kind = .string },
+    .{ .name = "service_tier", .kind = .string },
 };
 
 const structured_document_fields = [_]Field{
@@ -256,5 +278,17 @@ test "physical relation schema contains only source-structural fields" {
     try std.testing.expectError(
         error.UnknownPhysicalField,
         Relation.messages.fieldIndex("approved"),
+    );
+}
+
+test "lossless session and token fields are append-only ABI v1 extensions" {
+    try std.testing.expectEqual(@as(u16, 24), try Relation.sessions.fieldIndex("root_session_id"));
+    try std.testing.expectEqual(@as(u16, 25), try Relation.sessions.fieldIndex("parent_session_id"));
+    try std.testing.expectEqual(@as(u16, 10), try Relation.token_events.fieldIndex("total_input_tokens"));
+    try std.testing.expectEqual(@as(u16, 15), try Relation.token_events.fieldIndex("last_input_tokens"));
+    try std.testing.expectEqual(@as(u16, 23), try Relation.token_events.fieldIndex("line_number"));
+    try std.testing.expectError(
+        error.UnknownPhysicalField,
+        Relation.tool_invocations.fieldIndex("total_input_tokens"),
     );
 }

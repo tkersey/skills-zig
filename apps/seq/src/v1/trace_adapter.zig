@@ -1187,6 +1187,11 @@ fn fillSession(
             21 => .{ .boolean = session.is_external_worker },
             22 => .{ .boolean = session.is_inline_worker },
             23 => .{ .integer = session.spawned_worker_count },
+            24 => optionalString(session.root_session_id),
+            25 => optionalString(session.parent_session_id),
+            26 => optionalString(session.parent_relation),
+            27 => .{ .boolean = session.lineage_conflict },
+            28 => optionalString(session.service_tier),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
@@ -1383,9 +1388,33 @@ fn fillTokenEvent(
             7 => optionalInteger(event.total_tokens),
             8 => .{ .string = occurrence.sourceEventId() },
             9 => .{ .string = session.path },
+            10 => optionalInteger(event.total_input_tokens),
+            11 => optionalInteger(event.total_cached_input_tokens),
+            12 => optionalInteger(event.total_output_tokens),
+            13 => optionalInteger(event.total_reasoning_output_tokens),
+            14 => optionalInteger(event.total_total_tokens),
+            15 => optionalInteger(event.last_input_tokens),
+            16 => optionalInteger(event.last_cached_input_tokens),
+            17 => optionalInteger(event.last_output_tokens),
+            18 => optionalInteger(event.last_reasoning_output_tokens),
+            19 => optionalInteger(event.last_total_tokens),
+            20 => .{ .boolean = event.has_total_usage },
+            21 => .{ .boolean = event.has_last_usage },
+            22 => .{ .string = tokenUsageState(event) },
+            23 => try usizeInteger(occurrence.line_number),
+            24 => try usizeInteger(event.occurrence_index),
+            25 => optionalString(event.model),
+            26 => optionalString(event.service_tier),
             else => return error.InvalidTracePhysicalFieldIndex,
         };
     }
+}
+
+fn tokenUsageState(event: trace_core.TokenEventRecord) []const u8 {
+    if (event.has_total_usage and event.has_last_usage) return "total-and-last";
+    if (event.has_total_usage) return "total-only";
+    if (event.has_last_usage) return "last-only";
+    return "missing";
 }
 
 fn occurrenceAtLine(

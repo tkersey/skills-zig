@@ -100,6 +100,11 @@ pub const SessionRecord = struct {
     is_external_worker: bool = false,
     is_inline_worker: bool = false,
     spawned_worker_count: i64 = 0,
+    root_session_id: ?[]u8 = null,
+    parent_session_id: ?[]u8 = null,
+    parent_relation: ?[]u8 = null,
+    lineage_conflict: bool = false,
+    service_tier: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !SessionRecord {
         return .{ .path = try allocator.dupe(u8, path) };
@@ -121,6 +126,10 @@ pub const SessionRecord = struct {
         freeOpt(allocator, self.model_provider);
         freeOpt(allocator, self.thread_name);
         freeOpt(allocator, self.status_reason);
+        freeOpt(allocator, self.root_session_id);
+        freeOpt(allocator, self.parent_session_id);
+        freeOpt(allocator, self.parent_relation);
+        freeOpt(allocator, self.service_tier);
     }
 };
 
@@ -331,6 +340,25 @@ pub const TokenEventRecord = struct {
     output_tokens: ?i64 = null,
     reasoning_output_tokens: ?i64 = null,
     total_tokens: ?i64 = null,
+    total_input_tokens: ?i64 = null,
+    total_cached_input_tokens: ?i64 = null,
+    total_output_tokens: ?i64 = null,
+    total_reasoning_output_tokens: ?i64 = null,
+    total_total_tokens: ?i64 = null,
+    last_input_tokens: ?i64 = null,
+    last_cached_input_tokens: ?i64 = null,
+    last_output_tokens: ?i64 = null,
+    last_reasoning_output_tokens: ?i64 = null,
+    last_total_tokens: ?i64 = null,
+    has_total_usage: bool = false,
+    has_last_usage: bool = false,
+    model: ?[]u8 = null,
+    service_tier: ?[]u8 = null,
+
+    pub fn deinit(self: *TokenEventRecord, allocator: std.mem.Allocator) void {
+        freeOpt(allocator, self.model);
+        freeOpt(allocator, self.service_tier);
+    }
 };
 
 pub const MessageTextPart = struct {
@@ -407,6 +435,7 @@ pub const CanonicalSessionTrace = struct {
         self.graph_edges.deinit(allocator);
         for (self.occurrences.items) |*occurrence| occurrence.deinit(allocator);
         self.occurrences.deinit(allocator);
+        for (self.token_events.items) |*event| event.deinit(allocator);
         self.token_events.deinit(allocator);
         for (self.warnings.items) |warning| allocator.free(warning);
         self.warnings.deinit(allocator);
@@ -677,13 +706,24 @@ pub fn parseSessionTraceReaderWithVisitorMetrics(
                         if (options.include_token_events) {
                             try trace.token_events.append(
                                 allocator,
-                                tokenEvent(
+                                try tokenEvent(
+                                    allocator,
                                     occurrence_index orelse
                                         return error.TokenEventOccurrenceMissing,
                                     trace.turns.items[idx].turn_index,
+                                    trace.session,
                                     p,
                                 ),
                             );
+                        }
+                    } else if (std.mem.eql(u8, event_type, "thread_settings_applied")) {
+                        if (objectField(p, "thread_settings")) |settings| {
+                            if (stringField(settings, "model")) |value| {
+                                try replaceOpt(allocator, &trace.session.model, value);
+                            }
+                            if (stringField(settings, "service_tier")) |value| {
+                                try replaceOpt(allocator, &trace.session.service_tier, value);
+                            }
                         }
                     } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
                         const name = stringField(p, "thread_name") orelse stringField(p, "name");
@@ -939,6 +979,15 @@ pub fn parseSessionSummaryTraceReaderWithVisitorMetrics(
                     try replaceOpt(allocator, &trace.session.status_reason, stringField(p, "message") orelse stringField(p, "error") orelse "error");
                 } else if (std.mem.eql(u8, event_type, "token_count")) {
                     applyTokenCountToSession(&trace.session, p);
+                } else if (std.mem.eql(u8, event_type, "thread_settings_applied")) {
+                    if (objectField(p, "thread_settings")) |settings| {
+                        if (stringField(settings, "model")) |value| {
+                            try replaceOpt(allocator, &trace.session.model, value);
+                        }
+                        if (stringField(settings, "service_tier")) |value| {
+                            try replaceOpt(allocator, &trace.session.service_tier, value);
+                        }
+                    }
                 } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
                     const name = stringField(p, "thread_name") orelse stringField(p, "name");
                     if (name) |value| try replaceOpt(allocator, &trace.session.thread_name, value);
@@ -1355,6 +1404,7 @@ fn deriveDateGroup(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
 
 fn applySessionMeta(allocator: std.mem.Allocator, session: *SessionRecord, meta: std.json.ObjectMap) !void {
     if (stringField(meta, "id")) |v| try replaceOpt(allocator, &session.session_id, v);
+    if (stringField(meta, "session_id")) |v| try replaceOpt(allocator, &session.root_session_id, v);
     if (stringField(meta, "cwd")) |v| try replaceOpt(allocator, &session.cwd, v);
     if (stringField(meta, "originator")) |v| try replaceOpt(allocator, &session.originator, v);
     if (stringField(meta, "cli_version")) |v| try replaceOpt(allocator, &session.cli_version, v);
@@ -1364,6 +1414,24 @@ fn applySessionMeta(allocator: std.mem.Allocator, session: *SessionRecord, meta:
     if (stringField(meta, "git_branch")) |v| try replaceOpt(allocator, &session.git_branch, v);
     if (stringField(meta, "git_commit_hash")) |v| try replaceOpt(allocator, &session.git_commit_hash, v);
     if (stringField(meta, "git_repository_url")) |v| try replaceOpt(allocator, &session.git_repository_url, v);
+    const parent_thread_id = stringField(meta, "parent_thread_id");
+    const forked_from_id = stringField(meta, "forked_from_id");
+    if (parent_thread_id != null and forked_from_id != null and
+        !std.mem.eql(u8, parent_thread_id.?, forked_from_id.?))
+    {
+        session.lineage_conflict = true;
+    }
+    if (parent_thread_id orelse forked_from_id) |v| {
+        try replaceOpt(allocator, &session.parent_session_id, v);
+        try replaceOpt(
+            allocator,
+            &session.parent_relation,
+            if (parent_thread_id != null) "parent_thread_id" else "forked_from_id",
+        );
+    }
+    if (session.root_session_id == null) {
+        if (session.session_id) |v| try replaceOpt(allocator, &session.root_session_id, v);
+    }
     if (nestedObject(meta, "source", "subagent")) |_| session.is_external_worker = true;
     if (objectField(meta, "git")) |git| {
         if (stringField(git, "branch")) |v| try replaceOpt(allocator, &session.git_branch, v);
@@ -1592,11 +1660,19 @@ fn applyTurnToken(
 }
 
 fn tokenEvent(
+    allocator: std.mem.Allocator,
     occurrence_index: usize,
     turn_index: i64,
+    session: SessionRecord,
     payload: std.json.ObjectMap,
-) TokenEventRecord {
+) !TokenEventRecord {
+    const info = objectField(payload, "info") orelse payload;
+    const total_usage = objectField(info, "total_token_usage");
+    const last_usage = objectField(info, "last_token_usage");
     const total = tokenUsage(payload);
+    const model = try dupOpt(allocator, session.model);
+    errdefer freeOpt(allocator, model);
+    const service_tier = try dupOpt(allocator, session.service_tier);
     return .{
         .occurrence_index = occurrence_index,
         .turn_index = turn_index,
@@ -1620,7 +1696,25 @@ fn tokenEvent(
             intField(value, "total_tokens")
         else
             null,
+        .total_input_tokens = tokenField(total_usage, "input_tokens"),
+        .total_cached_input_tokens = tokenField(total_usage, "cached_input_tokens"),
+        .total_output_tokens = tokenField(total_usage, "output_tokens"),
+        .total_reasoning_output_tokens = tokenField(total_usage, "reasoning_output_tokens"),
+        .total_total_tokens = tokenField(total_usage, "total_tokens"),
+        .last_input_tokens = tokenField(last_usage, "input_tokens"),
+        .last_cached_input_tokens = tokenField(last_usage, "cached_input_tokens"),
+        .last_output_tokens = tokenField(last_usage, "output_tokens"),
+        .last_reasoning_output_tokens = tokenField(last_usage, "reasoning_output_tokens"),
+        .last_total_tokens = tokenField(last_usage, "total_tokens"),
+        .has_total_usage = total_usage != null,
+        .has_last_usage = last_usage != null,
+        .model = model,
+        .service_tier = service_tier,
     };
+}
+
+fn tokenField(usage: ?std.json.ObjectMap, field: []const u8) ?i64 {
+    return if (usage) |value| intField(value, field) else null;
 }
 
 fn tokenUsage(payload: std.json.ObjectMap) ?std.json.ObjectMap {
@@ -2410,6 +2504,35 @@ test "parseSessionTrace reconstructs new complete turn" {
             .items[trace.token_events.items[0].occurrence_index]
             .sourceEventId()[0..7],
     );
+}
+
+test "lossless token events retain lineage, both usage tuples, and event settings" {
+    const source =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-07-13T00:00:00Z\",\"payload\":{\"id\":\"worker\",\"session_id\":\"root\",\"parent_thread_id\":\"parent\",\"model\":\"gpt-before\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:01Z\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_settings\":{\"model\":\"gpt-after\",\"service_tier\":\"priority\"}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-13T00:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"cached_input_tokens\":8,\"output_tokens\":3,\"reasoning_output_tokens\":1,\"total_tokens\":23},\"last_token_usage\":{\"input_tokens\":7,\"cached_input_tokens\":4,\"output_tokens\":2,\"reasoning_output_tokens\":1,\"total_tokens\":9}}}}\n";
+    var trace = try parseSessionTraceBytes(
+        std.testing.allocator,
+        "/provenance/worker.jsonl",
+        source,
+        nowRealtimeNs(),
+        .{ .include_token_events = true },
+    );
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("worker", trace.session.session_id.?);
+    try std.testing.expectEqualStrings("root", trace.session.root_session_id.?);
+    try std.testing.expectEqualStrings("parent", trace.session.parent_session_id.?);
+    try std.testing.expectEqualStrings("parent_thread_id", trace.session.parent_relation.?);
+    try std.testing.expect(!trace.session.lineage_conflict);
+    try std.testing.expectEqual(@as(usize, 1), trace.token_events.items.len);
+    const event = trace.token_events.items[0];
+    try std.testing.expect(event.has_total_usage);
+    try std.testing.expect(event.has_last_usage);
+    try std.testing.expectEqual(@as(i64, 20), event.total_input_tokens.?);
+    try std.testing.expectEqual(@as(i64, 7), event.last_input_tokens.?);
+    try std.testing.expectEqualStrings("gpt-after", event.model.?);
+    try std.testing.expectEqualStrings("priority", event.service_tier.?);
 }
 
 test "bytes-backed trace parsing preserves the exact assistant occurrence line" {
