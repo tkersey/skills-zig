@@ -16,6 +16,13 @@
       {"id":"thread-path","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/Thread/properties/path","kind":"string","nullable":true},
       {"id":"fork-last-turn","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadForkParams/properties/lastTurnId","kind":"string","nullable":true},
       {"id":"fork-ephemeral-stable","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ThreadForkParams/properties/ephemeral","kind":"boolean","nullable":false},
+      {"id":"review-start-shape","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ReviewStartParams","kind":"object","nullable":false,"required":["threadId","target"]},
+      {"id":"review-target-ref","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/ReviewStartParams/properties/target","kind":"ref","nullable":false},
+      {"id":"review-target-uncommitted","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ReviewTarget/oneOf","discriminator":"type","discriminatorValue":"uncommittedChanges","pointer":"","kind":"object","nullable":false,"required":["type"]},
+      {"id":"review-target-base","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ReviewTarget/oneOf","discriminator":"type","discriminatorValue":"baseBranch","pointer":"","kind":"object","nullable":false,"required":["type","branch"]},
+      {"id":"review-target-base-branch","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ReviewTarget/oneOf","discriminator":"type","discriminatorValue":"baseBranch","pointer":"/properties/branch","kind":"string","nullable":false},
+      {"id":"review-target-commit","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ReviewTarget/oneOf","discriminator":"type","discriminatorValue":"commit","pointer":"","kind":"object","nullable":false,"required":["type","sha"]},
+      {"id":"review-target-commit-sha","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ReviewTarget/oneOf","discriminator":"type","discriminatorValue":"commit","pointer":"/properties/sha","kind":"string","nullable":false},
       {"id":"command-plugin-id","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ThreadItem/oneOf","discriminator":"type","discriminatorValue":"commandExecution","pointer":"/properties/pluginId","kind":"string","nullable":true},
       {"id":"command-script-path","document":"codex_app_server_protocol.v2.schemas.json","variantPointer":"/definitions/ThreadItem/oneOf","discriminator":"type","discriminatorValue":"commandExecution","pointer":"/properties/scriptPath","kind":"string","nullable":true},
       {"id":"path-uri","document":"codex_app_server_protocol.v2.schemas.json","pointer":"/definitions/PathUri","kind":"string","nullable":false},
@@ -48,7 +55,9 @@
       {"id":"fork-ephemeral","document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams/properties/ephemeral","kind":"boolean","nullable":false},
       {"id":"fork-exclude-turns","document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams/properties/excludeTurns","kind":"boolean","nullable":false},
       {"id":"fork-defer-goal-continuation","document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams/properties/deferGoalContinuation","kind":"boolean","nullable":false},
-      {"id":"fork-thread-id","document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams","kind":"object","nullable":false,"required":["threadId"]}
+      {"id":"fork-thread-id","document":"ClientRequest.json","pointer":"/definitions/ThreadForkParams","kind":"object","nullable":false,"required":["threadId"]},
+      {"id":"thread-turns-list-shape","document":"ClientRequest.json","pointer":"/definitions/ThreadTurnsListParams","kind":"object","nullable":false,"required":["threadId"]},
+      {"id":"thread-items-list-shape","document":"ClientRequest.json","pointer":"/definitions/ThreadItemsListParams","kind":"object","nullable":false,"required":["threadId"]}
     ]
   },
   "serverRequestPolicies": {

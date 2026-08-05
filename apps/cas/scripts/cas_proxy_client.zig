@@ -203,6 +203,7 @@ pub const ClientOptions = struct {
     overload_retry_policy: OverloadRetryPolicy = .{},
     overload_retry_seed: ?u64 = null,
     overload_retry_telemetry: ?*OverloadRetryTelemetry = null,
+    child_environment: ?*const std.process.Environ.Map = null,
 };
 
 pub const RequestSendObserver = struct {
@@ -283,6 +284,7 @@ pub const Client = struct {
         const child = try std.process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = opts.cwd },
+            .environ_map = opts.child_environment,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,

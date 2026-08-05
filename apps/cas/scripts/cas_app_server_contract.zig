@@ -70,6 +70,14 @@ pub const CachedSchemas = struct {
     hit: bool,
     _lock_io: std.Io,
     _lock_file: std.Io.File,
+    _lock_held: bool = true,
+
+    pub fn releaseLock(self: *CachedSchemas) void {
+        if (!self._lock_held) return;
+        self._lock_file.unlock(self._lock_io);
+        self._lock_file.close(self._lock_io);
+        self._lock_held = false;
+    }
 
     pub fn deinit(self: *CachedSchemas, allocator: std.mem.Allocator) void {
         allocator.free(self.cache_path);
@@ -79,8 +87,7 @@ pub const CachedSchemas = struct {
         allocator.free(self.experimental_digest);
         self.version.deinit(allocator);
         self.executable.deinit(allocator);
-        self._lock_file.unlock(self._lock_io);
-        self._lock_file.close(self._lock_io);
+        self.releaseLock();
         self.* = undefined;
     }
 };
@@ -89,6 +96,8 @@ pub const CacheOptions = struct {
     cache_root: []const u8,
     codex_path: ?[]const u8 = null,
     contract_id: []const u8 = default_contract_id,
+    refresh: bool = false,
+    allow_prerelease: bool = false,
 };
 
 const CacheLimits = struct {
@@ -98,7 +107,9 @@ const CacheLimits = struct {
     generator_timeout_ms: u64 = 30_000,
     generator_stdout_bytes: usize = 64 * 1024,
     generator_stderr_bytes: usize = 64 * 1024,
-    lock_timeout_ms: u64 = 5_000,
+    // Cover both bounded generators plus identity hashing, bundle validation,
+    // synced manifest publication, and a conservative filesystem margin.
+    lock_timeout_ms: u64 = 180_000,
     lock_retry_ms: u64 = 25,
     binary_bytes: u64 = max_binary_bytes,
     bundle_documents: usize = max_cache_documents,
@@ -148,7 +159,8 @@ fn ensureSchemaCacheWithLimits(
     errdefer identity.deinit(allocator);
     var version = try readCodexVersion(allocator, io, identity.resolved_path, limits);
     errdefer version.deinit(allocator);
-    if (version.prerelease()) return error.PrereleaseCodex;
+    if (version.prerelease() and !options.allow_prerelease) return error.PrereleaseCodex;
+    if (!versionAtLeast(version, 0, 146, 0)) return error.CodexVersionTooOld;
     try requireIdentityUnchanged(allocator, io, &identity, limits.binary_bytes);
 
     const path_hex = identity.path_fingerprint["sha256:".len..];
@@ -172,23 +184,25 @@ fn ensureSchemaCacheWithLimits(
     const experimental_path = try std.fs.path.join(allocator, &.{ cache_path, "experimental" });
     errdefer allocator.free(experimental_path);
 
-    if (try validateCacheHit(allocator, io, cache_path, &identity, version, options.contract_id, limits)) |manifest| {
-        return .{
-            .cache_path = cache_path,
-            .stable_path = stable_path,
-            .experimental_path = experimental_path,
-            .stable_digest = manifest.stable_digest,
-            .experimental_digest = manifest.experimental_digest,
-            .stable_file_count = manifest.stable_file_count,
-            .stable_byte_count = manifest.stable_byte_count,
-            .experimental_file_count = manifest.experimental_file_count,
-            .experimental_byte_count = manifest.experimental_byte_count,
-            .version = version,
-            .executable = identity,
-            .hit = true,
-            ._lock_io = io,
-            ._lock_file = lock,
-        };
+    if (!options.refresh) {
+        if (try validateCacheHit(allocator, io, cache_path, &identity, version, options.contract_id, limits)) |manifest| {
+            return .{
+                .cache_path = cache_path,
+                .stable_path = stable_path,
+                .experimental_path = experimental_path,
+                .stable_digest = manifest.stable_digest,
+                .experimental_digest = manifest.experimental_digest,
+                .stable_file_count = manifest.stable_file_count,
+                .stable_byte_count = manifest.stable_byte_count,
+                .experimental_file_count = manifest.experimental_file_count,
+                .experimental_byte_count = manifest.experimental_byte_count,
+                .version = version,
+                .executable = identity,
+                .hit = true,
+                ._lock_io = io,
+                ._lock_file = lock,
+            };
+        }
     }
 
     const nonce = std.Io.Clock.awake.now(io).nanoseconds;
@@ -246,6 +260,25 @@ fn ensureSchemaCacheWithLimits(
         ._lock_io = io,
         ._lock_file = lock,
     };
+}
+
+pub fn versionAtLeast(version: CodexVersion, major: u64, minor: u64, patch: u64) bool {
+    if (version.major != major) return version.major > major;
+    if (version.minor != minor) return version.minor > minor;
+    return version.patch >= patch;
+}
+
+pub fn defaultCacheRootAlloc(
+    allocator: std.mem.Allocator,
+    environment: *const std.process.Environ.Map,
+) ![]u8 {
+    if (environment.get("XDG_CACHE_HOME")) |xdg| {
+        if (xdg.len != 0 and std.fs.path.isAbsolute(xdg))
+            return std.fs.path.join(allocator, &.{ xdg, "cas", "app-server-schema" });
+    }
+    const home = environment.get("HOME") orelse return error.HomeNotSet;
+    if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.InvalidHome;
+    return std.fs.path.join(allocator, &.{ home, ".cache", "cas", "app-server-schema" });
 }
 
 fn absoluteCacheRootAlloc(allocator: std.mem.Allocator, io: std.Io, raw: []const u8) ![]u8 {
@@ -430,6 +463,14 @@ fn requireIdentityUnchanged(allocator: std.mem.Allocator, io: std.Io, expected: 
     var actual = try resolveExecutableIdentity(allocator, io, expected.resolved_path, binary_limit);
     defer actual.deinit(allocator);
     if (!identitiesEqual(expected.*, actual)) return error.ExecutableChanged;
+}
+
+pub fn verifyExecutableIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    expected: *const ExecutableIdentity,
+) !void {
+    return requireIdentityUnchanged(allocator, io, expected, max_binary_bytes);
 }
 
 fn identitiesEqual(left: ExecutableIdentity, right: ExecutableIdentity) bool {
@@ -790,6 +831,56 @@ pub const Document = struct {
 pub const SchemaBundle = struct {
     documents: []const Document,
 };
+
+pub const required_schema_documents = [_][]const u8{
+    "ClientRequest.json",
+    "ServerRequest.json",
+    "ServerNotification.json",
+    "codex_app_server_protocol.v2.schemas.json",
+};
+
+pub const OwnedSchemaBundle = struct {
+    documents: [required_schema_documents.len]Document,
+    contents: [required_schema_documents.len][]u8,
+
+    pub fn view(self: *const OwnedSchemaBundle) SchemaBundle {
+        return .{ .documents = &self.documents };
+    }
+
+    pub fn deinit(self: *OwnedSchemaBundle, allocator: std.mem.Allocator) void {
+        for (self.contents) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
+pub fn loadRequiredSchemaBundle(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+) !OwnedSchemaBundle {
+    if (!std.fs.path.isAbsolute(root_path)) return error.SchemaRootNotAbsolute;
+    var root = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = false });
+    defer root.close(io);
+    var contents: [required_schema_documents.len][]u8 = undefined;
+    var loaded: usize = 0;
+    errdefer for (contents[0..loaded]) |bytes| allocator.free(bytes);
+    for (required_schema_documents, 0..) |name, index| {
+        var file = try root.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false });
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.InvalidSchemaDocument;
+        if (stat.size > max_document_bytes) return error.SchemaTooLarge;
+        contents[index] = try readFileBounded(allocator, io, file, max_document_bytes);
+        loaded += 1;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents[index], .{}) catch return error.InvalidBundleJson;
+        parsed.deinit();
+    }
+    var documents: [required_schema_documents.len]Document = undefined;
+    for (required_schema_documents, 0..) |name, index| {
+        documents[index] = .{ .name = name, .bytes = contents[index] };
+    }
+    return .{ .documents = documents, .contents = contents };
+}
 
 pub const InspectionReport = struct {
     status: Status = .compatible,
@@ -1238,7 +1329,7 @@ fn schemaHasKind(value: std.json.Value, expected: []const u8) bool {
     };
     if (std.mem.eql(u8, expected, "ref")) {
         if (object.get("$ref") != null) return true;
-        return unionHasRef(object.get("anyOf")) or unionHasRef(object.get("oneOf"));
+        return unionHasRef(object.get("anyOf")) or unionHasRef(object.get("oneOf")) or unionHasRef(object.get("allOf"));
     }
     if (object.get("type")) |type_value| switch (type_value) {
         .string => |kind| if (std.mem.eql(u8, kind, expected)) return true,
@@ -1303,14 +1394,14 @@ fn requiredNamesPresent(selector: std.json.Value, schema: std.json.Value) bool {
         .object => |value| value,
         else => return false,
     };
-    const actual = schema_object.get("required") orelse return false;
-    const actual_array = switch (actual) {
-        .array => |value| value,
-        else => return false,
-    };
     for (expected_array.items) |item| {
         const name = switch (item) {
             .string => |value| value,
+            else => return false,
+        };
+        const actual = schema_object.get("required") orelse return false;
+        const actual_array = switch (actual) {
+            .array => |value| value,
             else => return false,
         };
         if (!jsonArrayContains(actual_array, name)) return false;
@@ -1332,14 +1423,14 @@ fn enumValuesPresent(selector: std.json.Value, schema: std.json.Value) bool {
         .object => |value| value,
         else => return false,
     };
-    const actual = schema_object.get("enum") orelse return false;
-    const actual_array = switch (actual) {
-        .array => |value| value,
-        else => return false,
-    };
     for (expected_array.items) |item| {
         const name = switch (item) {
             .string => |value| value,
+            else => return false,
+        };
+        const actual = schema_object.get("enum") orelse return false;
+        const actual_array = switch (actual) {
+            .array => |value| value,
             else => return false,
         };
         if (!jsonArrayContains(actual_array, name)) return false;
@@ -1422,11 +1513,11 @@ fn deinitStrings(list: *std.ArrayList([]u8), allocator: std.mem.Allocator) void 
 }
 
 const stable_shapes =
-    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
+    \\{"definitions":{"InitializeCapabilities":{"properties":{"experimentalApi":{"type":"boolean"},"optOutNotificationMethods":{"type":["array","null"]},"mcpServerOpenaiFormElicitation":{"type":"boolean"}}},"Thread":{"properties":{"isPinned":{"type":"boolean","future":true},"path":{"type":["string","null"]}}},"ThreadMetadataUpdateParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadListParams":{"properties":{"isPinned":{"type":["boolean","null"]}}},"ThreadForkParams":{"properties":{"lastTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"}}},"ReviewStartParams":{"type":"object","required":["target","threadId"],"properties":{"target":{"allOf":[{"$ref":"#/definitions/ReviewTarget"}]}}},"ReviewTarget":{"oneOf":[{"type":"object","required":["type"],"properties":{"type":{"type":"string","enum":["uncommittedChanges"]}}},{"type":"object","required":["type","branch"],"properties":{"branch":{"type":"string"},"type":{"type":"string","enum":["baseBranch"]}}},{"type":"object","required":["type","sha"],"properties":{"sha":{"type":"string"},"type":{"type":"string","enum":["commit"]}}}]},"ThreadItem":{"oneOf":[{"properties":{"type":{"enum":["commandExecution"]},"pluginId":{"type":["string","null"]},"scriptPath":{"type":["string","null"]}}}]},"PathUri":{"type":"string"},"SkillInterface":{"properties":{"iconSmallUrl":{"type":["string","null"]},"iconLargeUrl":{"type":["string","null"]}}},"PluginListParams":{"properties":{"forceRefetch":{"type":"boolean"}}},"PluginShareContext":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"PluginShareSaveResponse":{"properties":{"canPublishToWorkspace":{"type":["boolean","null"]}}},"AppToolSummary":{"properties":{"isEnabled":{"type":"boolean"},"disabledReason":{"type":["string","null"]},"isReadOnly":{"type":"boolean"}}},"ConfigRequirements":{"properties":{"browserUse":{"anyOf":[{"$ref":"#/definitions/BrowserUseRequirements"},{"type":"null"}]},"sqliteHome":{"type":["string","null"]},"logDir":{"type":["string","null"]},"modelCatalogJson":{"type":["string","null"]},"checkForUpdateOnStartup":{"type":["boolean","null"]},"allowLoginShell":{"type":["boolean","null"]},"feedback":{"anyOf":[{"$ref":"#/definitions/FeedbackRequirements"},{"type":"null"}]},"windowsSandboxPrivateDesktop":{"type":["boolean","null"]}}},"ExternalAgentConfigDetectParams":{"properties":{"maxSessionAgeDays":{"type":["integer","null"]},"maxSessions":{"type":["integer","null"]}}},"ExternalAgentConfigImportParams":{"properties":{"providerId":{"type":["string","null"]}}},"PlanType":{"type":"string","enum":["ent26"]},"AppMetadata":{"type":"object","properties":{"name":{"type":"string"},"firstPartyType":{"type":"string"}}}}}
 ;
 
 const experimental_shapes =
-    \\{"definitions":{"ThreadForkParams":{"type":"object","required":["threadId"],"properties":{"beforeTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"},"deferGoalContinuation":{"type":"boolean"}}}}}
+    \\{"definitions":{"ThreadForkParams":{"type":"object","required":["threadId"],"properties":{"beforeTurnId":{"type":["string","null"]},"ephemeral":{"type":"boolean"},"excludeTurns":{"type":"boolean"},"deferGoalContinuation":{"type":"boolean"}}},"ThreadTurnsListParams":{"type":"object","required":["threadId"]},"ThreadItemsListParams":{"type":"object","required":["threadId"]}}}
 ;
 
 const TestBundles = struct {
@@ -1741,6 +1832,27 @@ test "required shape kind and nullability drift are incompatible" {
     try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
 }
 
+test "review target branch and commit identity remain strings" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+    var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+    defer bundles.deinit(std.testing.allocator);
+    const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
+    defer std.testing.allocator.free(drifted);
+    for ([_][]const u8{
+        "\"branch\":{\"type\":\"string\"}",
+        "\"sha\":{\"type\":\"string\"}",
+    }) |needle| {
+        const offset = std.mem.indexOf(u8, drifted, needle) orelse return error.TestExpectedEqual;
+        const kind_offset = offset + needle.len - "string\"}".len;
+        @memcpy(drifted[kind_offset .. kind_offset + "string".len], "number");
+    }
+    var report = try inspectTestBundles(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Status.incompatible, report.status);
+    try std.testing.expectEqual(@as(usize, 2), report.shape_failures.items.len);
+}
+
 test "discriminated variant and required enum drift are incompatible" {
     var baseline = try parseBaseline(std.testing.allocator);
     defer baseline.deinit();
@@ -1884,6 +1996,25 @@ test "bundle bounds reject symlink count and byte excess" {
     try std.testing.expectError(error.BundleTooLarge, digestBundle(std.testing.allocator, io, root, .{ .bundle_total_bytes = 4 }));
 }
 
+test "executable identity verification rejects an in-place replacement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "fake-codex" });
+    defer allocator.free(executable);
+    try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 0\n");
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    var identity = try resolveExecutableIdentity(allocator, io, executable, max_binary_bytes);
+    defer identity.deinit(allocator);
+
+    try writeAbsoluteTestFile(io, executable, "#!/bin/sh\nexit 1\n");
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+    try std.testing.expectError(error.ExecutableChanged, verifyExecutableIdentity(allocator, io, &identity));
+}
+
 test "schema cache hits only after exact identity manifest and canonical bundles" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1919,6 +2050,16 @@ test "schema cache hits only after exact identity manifest and canonical bundles
                 .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
             ),
         );
+        first.releaseLock();
+        first.releaseLock();
+        var concurrent_reader = try ensureSchemaCacheWithLimits(
+            allocator,
+            io,
+            .{ .cache_root = cache_root, .codex_path = executable },
+            .{ .lock_timeout_ms = 30, .lock_retry_ms = 5 },
+        );
+        defer concurrent_reader.deinit(allocator);
+        try std.testing.expect(concurrent_reader.hit);
         break :saved .{
             .stable = try allocator.dupe(u8, first.stable_path),
             .cache = try allocator.dupe(u8, first.cache_path),
