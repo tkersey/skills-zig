@@ -11,6 +11,113 @@ const max_captured_notification_bytes: usize = 16 * 1024 * 1024;
 const default_request_timeout_ms: i64 = 30_000;
 const handshake_timeout_ms: i64 = 10_000;
 
+pub const ServerRequestHandlerKind = enum {
+    command_execution_approval,
+    file_change_approval,
+    permissions_approval,
+    request_user_input,
+    mcp_elicitation,
+    dynamic_tool_call,
+    auth_tokens_refresh,
+    attestation_generate,
+    current_time_read,
+    apply_patch_approval,
+    exec_command_approval,
+    unknown,
+
+    fn parse(method: []const u8) ServerRequestHandlerKind {
+        return if (serverRequestHandler(method)) |descriptor| descriptor.kind else .unknown;
+    }
+};
+
+pub const ServerRequestHandlerDescriptor = struct {
+    method: []const u8,
+    policy: []const u8,
+    kind: ServerRequestHandlerKind,
+};
+
+pub const server_request_handler_descriptors = [_]ServerRequestHandlerDescriptor{
+    .{ .method = "item/commandExecution/requestApproval", .policy = "configured-approval-or-decline", .kind = .command_execution_approval },
+    .{ .method = "item/fileChange/requestApproval", .policy = "configured-approval-or-decline", .kind = .file_change_approval },
+    .{ .method = "item/tool/requestUserInput", .policy = "exact-response-or-decline", .kind = .request_user_input },
+    .{ .method = "mcpServer/elicitation/request", .policy = "mode-aware-exact-response-or-decline", .kind = .mcp_elicitation },
+    .{ .method = "item/permissions/requestApproval", .policy = "configured-approval-or-decline", .kind = .permissions_approval },
+    .{ .method = "item/tool/call", .policy = "configured-tool-handler-or-error", .kind = .dynamic_tool_call },
+    .{ .method = "account/chatgptAuthTokens/refresh", .policy = "exact-secret-provider-or-typed-error", .kind = .auth_tokens_refresh },
+    .{ .method = "attestation/generate", .policy = "exact-attestation-provider-or-typed-error", .kind = .attestation_generate },
+    .{ .method = "applyPatchApproval", .policy = "deprecated-reject", .kind = .apply_patch_approval },
+    .{ .method = "execCommandApproval", .policy = "deprecated-reject", .kind = .exec_command_approval },
+    .{ .method = "currentTime/read", .policy = "exact-unix-seconds", .kind = .current_time_read },
+};
+
+pub fn serverRequestHandler(method: []const u8) ?ServerRequestHandlerDescriptor {
+    for (server_request_handler_descriptors) |descriptor| {
+        if (std.mem.eql(u8, method, descriptor.method)) return descriptor;
+    }
+    return null;
+}
+
+pub const max_overload_retries: u32 = 16;
+pub const max_overload_delay_ms: u32 = 4_000;
+pub const max_overload_jitter_percent: u8 = 25;
+
+pub const OverloadRetryPolicy = struct {
+    max_retries: u32 = 4,
+    base_delay_ms: u32 = 250,
+    max_delay_ms: u32 = max_overload_delay_ms,
+    jitter_percent: u8 = max_overload_jitter_percent,
+};
+
+pub const OverloadRetryTelemetry = struct {
+    wire_attempts: u32 = 0,
+    overload_responses: u32 = 0,
+    retries: u32 = 0,
+    delay_count: u32 = 0,
+    delays_ms: [max_overload_retries]u32 = @splat(0),
+    exhausted: bool = false,
+
+    pub fn reset(self: *OverloadRetryTelemetry) void {
+        self.* = .{};
+    }
+};
+
+pub fn validateOverloadRetryPolicy(policy: OverloadRetryPolicy) !void {
+    if (policy.max_retries > max_overload_retries) return error.InvalidOverloadRetryPolicy;
+    if (policy.base_delay_ms == 0 or policy.base_delay_ms > max_overload_delay_ms) return error.InvalidOverloadRetryPolicy;
+    if (policy.max_delay_ms == 0 or policy.max_delay_ms > max_overload_delay_ms) return error.InvalidOverloadRetryPolicy;
+    if (policy.base_delay_ms > policy.max_delay_ms) return error.InvalidOverloadRetryPolicy;
+    if (policy.jitter_percent > max_overload_jitter_percent) return error.InvalidOverloadRetryPolicy;
+}
+
+fn resolveOverloadRetrySeed(explicit: ?u64, io: std.Io) !u64 {
+    if (explicit) |seed| return seed;
+    var seed: u64 = undefined;
+    try std.Io.randomSecure(io, std.mem.asBytes(&seed));
+    return seed;
+}
+
+pub fn overloadRetryDelayMs(policy: OverloadRetryPolicy, retry_index: u32, seed: u64) u32 {
+    std.debug.assert(retry_index < max_overload_retries);
+    const shift: u6 = @intCast(@min(retry_index, 31));
+    const exponential = @min(
+        @as(u64, policy.base_delay_ms) << shift,
+        @as(u64, policy.max_delay_ms),
+    );
+    const jitter_limit = exponential * policy.jitter_percent / 100;
+    const retry_bytes = std.mem.asBytes(&retry_index);
+    const sample = std.hash.Wyhash.hash(seed, retry_bytes);
+    const jitter = if (jitter_limit == 0) 0 else sample % (jitter_limit + 1);
+    return @intCast(@min(exponential + jitter, @as(u64, policy.max_delay_ms)));
+}
+
+pub fn isStructuredOverloadError(error_value: std.json.Value) bool {
+    const object = switch (error_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    return core_json.intField(object, "code") == -32001;
+}
+
 pub const TransportKind = enum {
     stdio,
     websocket,
@@ -93,6 +200,9 @@ pub const ClientOptions = struct {
     code_mode_host: ?*const app_server_launch.CodeModeHost = null,
     websocket_connect_timeout_ms: u32 = 10_000,
     request_deadline_ms: ?i64 = null,
+    overload_retry_policy: OverloadRetryPolicy = .{},
+    overload_retry_seed: ?u64 = null,
+    overload_retry_telemetry: ?*OverloadRetryTelemetry = null,
 };
 
 pub const RequestSendObserver = struct {
@@ -125,33 +235,40 @@ pub const Client = struct {
     request_deadline_ms: ?i64 = null,
     request_send_started: bool = false,
     transport_identity: []const u8 = "stdio",
+    overload_retry_policy: OverloadRetryPolicy = .{},
+    overload_retry_seed: u64 = 0,
+    overload_retry_telemetry: ?*OverloadRetryTelemetry = null,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         try validateServerRequestOptions(allocator, opts);
         try validateTransportOptions(opts);
+        try validateOverloadRetryPolicy(opts.overload_retry_policy);
+        // Resolve every fallible launch-independent input before acquiring a
+        // child process or socket. The helpers accept only the resolved value.
+        const overload_retry_seed = try resolveOverloadRetrySeed(opts.overload_retry_seed, opts.io);
         if (opts.transport) |transport| switch (transport) {
-            .stdio => return startStdio(allocator, opts),
-            .explicit_websocket => |url| return startWebsocket(allocator, opts, url, .websocket),
+            .stdio => return startStdio(allocator, opts, overload_retry_seed),
+            .explicit_websocket => |url| return startWebsocket(allocator, opts, overload_retry_seed, url, .websocket),
             .unix_socket => |maybe_path| {
                 if (maybe_path) |path| {
                     const resolved = try app_server_launch.resolveUnixPathAlloc(allocator, opts.cwd, path);
                     defer allocator.free(resolved);
-                    return startUnix(allocator, opts, resolved);
+                    return startUnix(allocator, opts, overload_retry_seed, resolved);
                 }
                 const path = try app_server_launch.defaultUnixPathAlloc(allocator);
                 defer allocator.free(path);
-                return startUnix(allocator, opts, path);
+                return startUnix(allocator, opts, overload_retry_seed, path);
             },
             .auto, .managed_websocket => return error.TransportLaunchRequired,
         };
         if (opts.websocket_url) |url| {
-            return startWebsocket(allocator, opts, url, .websocket);
+            return startWebsocket(allocator, opts, overload_retry_seed, url, .websocket);
         }
 
-        return startStdio(allocator, opts);
+        return startStdio(allocator, opts, overload_retry_seed);
     }
 
-    fn startStdio(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
+    fn startStdio(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64) !Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
@@ -197,6 +314,9 @@ pub const Client = struct {
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
             .transport_identity = "stdio",
+            .overload_retry_policy = opts.overload_retry_policy,
+            .overload_retry_seed = overload_retry_seed,
+            .overload_retry_telemetry = opts.overload_retry_telemetry,
         };
         errdefer {
             client.close();
@@ -206,18 +326,18 @@ pub const Client = struct {
         return client;
     }
 
-    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, url: []const u8, kind: TransportKind) !Client {
+    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, url: []const u8, kind: TransportKind) !Client {
         const websocket = try websocket_transport.Connection.connect(allocator, url, opts.websocket_connect_timeout_ms);
 
-        return startSocketConnection(allocator, opts, websocket, kind, "websocket");
+        return startSocketConnection(allocator, opts, overload_retry_seed, websocket, kind, "websocket");
     }
 
-    fn startUnix(allocator: std.mem.Allocator, opts: ClientOptions, path: []const u8) !Client {
+    fn startUnix(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, path: []const u8) !Client {
         const websocket = try websocket_transport.Connection.connectUnix(allocator, path, opts.websocket_connect_timeout_ms);
-        return startSocketConnection(allocator, opts, websocket, .unix_socket, "unix_socket");
+        return startSocketConnection(allocator, opts, overload_retry_seed, websocket, .unix_socket, "unix_socket");
     }
 
-    fn startSocketConnection(allocator: std.mem.Allocator, opts: ClientOptions, websocket: websocket_transport.Connection, kind: TransportKind, identity: []const u8) !Client {
+    fn startSocketConnection(allocator: std.mem.Allocator, opts: ClientOptions, overload_retry_seed: u64, websocket: websocket_transport.Connection, kind: TransportKind, identity: []const u8) !Client {
         var client = Client{
             .allocator = allocator,
             .io = opts.io,
@@ -241,6 +361,9 @@ pub const Client = struct {
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
             .transport_identity = identity,
+            .overload_retry_policy = opts.overload_retry_policy,
+            .overload_retry_seed = overload_retry_seed,
+            .overload_retry_telemetry = opts.overload_retry_telemetry,
         };
         errdefer {
             client.close();
@@ -314,6 +437,21 @@ pub const Client = struct {
         );
     }
 
+    pub fn requestJsonCaptureNotificationsWithSendObserver(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        notification_lines: *std.ArrayList([]u8),
+        send_observer: RequestSendObserver,
+    ) ![]u8 {
+        return self.requestJsonCaptureNotificationsInternal(
+            method,
+            params_json,
+            notification_lines,
+            send_observer,
+        );
+    }
+
     fn requestJsonCaptureNotificationsInternal(
         self: *Client,
         method: []const u8,
@@ -321,10 +459,12 @@ pub const Client = struct {
         notification_lines: ?*std.ArrayList([]u8),
         send_observer: ?RequestSendObserver,
     ) ![]u8 {
+        try validateOverloadRetryPolicy(self.overload_retry_policy);
         const previous_deadline_ms = self.request_deadline_ms;
         if (previous_deadline_ms == null) self.request_deadline_ms = monotonicMillis() + default_request_timeout_ms;
         defer self.request_deadline_ms = previous_deadline_ms;
         self.request_send_started = false;
+        if (self.overload_retry_telemetry) |telemetry| telemetry.reset();
         var captured_notification_bytes: usize = 0;
         if (notification_lines) |lines| {
             if (lines.items.len > max_captured_notifications) return error.AppServerNotificationLimitExceeded;
@@ -332,15 +472,76 @@ pub const Client = struct {
                 captured_notification_bytes = try addCapturedNotificationBytes(captured_notification_bytes, line.len);
             }
         }
-        const request_id = self.next_request_id;
-        self.next_request_id += 1;
-
-        try self.sendRequest(request_id, method, params_json, send_observer);
-
         var interleaved: usize = 0;
+        var retry_index: u32 = 0;
         while (true) {
-            interleaved += 1;
-            if (interleaved > max_interleaved_messages) return error.AppServerInterleavingLimitExceeded;
+            if (monotonicMillis() >= self.request_deadline_ms.?) return error.ConnectionTimedOut;
+            const request_id = self.next_request_id;
+            self.next_request_id += 1;
+            if (self.overload_retry_telemetry) |telemetry| telemetry.wire_attempts += 1;
+
+            try self.sendRequest(
+                request_id,
+                method,
+                params_json,
+                if (retry_index == 0) send_observer else null,
+            );
+            const response = try self.awaitRequestAttempt(
+                request_id,
+                notification_lines,
+                &captured_notification_bytes,
+                &interleaved,
+            );
+            switch (response) {
+                .success => |result| {
+                    self.clearLastError();
+                    return result;
+                },
+                .rpc_error => |rpc_error| {
+                    self.setLastErrorOwned(rpc_error.json);
+                    if (!rpc_error.retryable_overload) return error.RequestFailed;
+                    if (self.overload_retry_telemetry) |telemetry| telemetry.overload_responses += 1;
+                    if (retry_index >= self.overload_retry_policy.max_retries) {
+                        if (self.overload_retry_telemetry) |telemetry| telemetry.exhausted = true;
+                        return error.RequestFailed;
+                    }
+                    const delay_ms = overloadRetryDelayMs(
+                        self.overload_retry_policy,
+                        retry_index,
+                        self.overload_retry_seed,
+                    );
+                    if (self.overload_retry_telemetry) |telemetry| {
+                        telemetry.delays_ms[telemetry.delay_count] = delay_ms;
+                        telemetry.delay_count += 1;
+                        telemetry.retries += 1;
+                    }
+                    const remaining_ms = self.request_deadline_ms.? - monotonicMillis();
+                    if (remaining_ms <= 0 or delay_ms > remaining_ms) return error.ConnectionTimedOut;
+                    try std.Io.sleep(self.io, .fromMilliseconds(delay_ms), .awake);
+                    retry_index += 1;
+                },
+            }
+        }
+    }
+
+    const RequestAttemptResponse = union(enum) {
+        success: []u8,
+        rpc_error: struct {
+            json: []u8,
+            retryable_overload: bool,
+        },
+    };
+
+    fn awaitRequestAttempt(
+        self: *Client,
+        request_id: i64,
+        notification_lines: ?*std.ArrayList([]u8),
+        captured_notification_bytes: *usize,
+        interleaved: *usize,
+    ) !RequestAttemptResponse {
+        while (true) {
+            interleaved.* += 1;
+            if (interleaved.* > max_interleaved_messages) return error.AppServerInterleavingLimitExceeded;
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -356,9 +557,9 @@ pub const Client = struct {
             if (notification_lines) |lines| {
                 if (isNotificationMessage(msg_obj)) {
                     if (lines.items.len >= max_captured_notifications) return error.AppServerNotificationLimitExceeded;
-                    const updated_bytes = try addCapturedNotificationBytes(captured_notification_bytes, line.len);
+                    const updated_bytes = try addCapturedNotificationBytes(captured_notification_bytes.*, line.len);
                     try lines.append(self.allocator, try self.allocator.dupe(u8, line));
-                    captured_notification_bytes = updated_bytes;
+                    captured_notification_bytes.* = updated_bytes;
                 }
             }
 
@@ -369,12 +570,13 @@ pub const Client = struct {
             if (response_id == null or response_id.? != request_id) continue;
 
             if (msg_obj.get("error")) |err_val| {
-                const err_json = try core_json.stringifyAlloc(self.allocator, err_val);
-                self.setLastErrorOwned(err_json);
-                return error.RequestFailed;
+                return .{ .rpc_error = .{
+                    .json = try core_json.stringifyAlloc(self.allocator, err_val),
+                    .retryable_overload = isStructuredOverloadError(err_val),
+                } };
             }
             if (msg_obj.get("result")) |result_val| {
-                return core_json.stringifyAlloc(self.allocator, result_val);
+                return .{ .success = try core_json.stringifyAlloc(self.allocator, result_val) };
             }
             return error.InvalidAppServerResponse;
         }
@@ -643,40 +845,7 @@ pub const Client = struct {
         }
     };
 
-    const ServerRequestMethod = enum {
-        command_execution_approval,
-        file_change_approval,
-        permissions_approval,
-        request_user_input,
-        mcp_elicitation,
-        dynamic_tool_call,
-        auth_tokens_refresh,
-        attestation_generate,
-        current_time_read,
-        apply_patch_approval,
-        exec_command_approval,
-        unknown,
-
-        fn parse(method: []const u8) ServerRequestMethod {
-            const methods = [_]struct { []const u8, ServerRequestMethod }{
-                .{ "item/commandExecution/requestApproval", .command_execution_approval },
-                .{ "item/fileChange/requestApproval", .file_change_approval },
-                .{ "item/permissions/requestApproval", .permissions_approval },
-                .{ "item/tool/requestUserInput", .request_user_input },
-                .{ "mcpServer/elicitation/request", .mcp_elicitation },
-                .{ "item/tool/call", .dynamic_tool_call },
-                .{ "account/chatgptAuthTokens/refresh", .auth_tokens_refresh },
-                .{ "attestation/generate", .attestation_generate },
-                .{ "currentTime/read", .current_time_read },
-                .{ "applyPatchApproval", .apply_patch_approval },
-                .{ "execCommandApproval", .exec_command_approval },
-            };
-            inline for (methods) |entry| {
-                if (std.mem.eql(u8, method, entry[0])) return entry[1];
-            }
-            return .unknown;
-        }
-    };
+    const ServerRequestMethod = ServerRequestHandlerKind;
 
     const ErrorReply = struct {
         code: i64,
@@ -957,6 +1126,11 @@ pub const Client = struct {
     fn setLastErrorOwned(self: *Client, owned: []u8) void {
         if (self.last_error) |existing| self.allocator.free(existing);
         self.last_error = owned;
+    }
+
+    fn clearLastError(self: *Client) void {
+        if (self.last_error) |existing| self.allocator.free(existing);
+        self.last_error = null;
     }
 
     fn setLastError(self: *Client, text: []const u8) !void {
@@ -1828,6 +2002,11 @@ test "expired request deadline remains pre-send" {
 const SendObserverProbe = struct {
     calls: usize = 0,
 
+    fn count(context: *anyopaque) anyerror!void {
+        const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
+        probe.calls += 1;
+    }
+
     fn failBeforeSend(context: *anyopaque) anyerror!void {
         const probe: *SendObserverProbe = @ptrCast(@alignCast(context));
         probe.calls += 1;
@@ -1846,6 +2025,202 @@ const SendObserverProbe = struct {
         };
     }
 };
+
+fn retryFakeCodexScriptAlloc(
+    allocator: std.mem.Allocator,
+    mode: []const u8,
+    request_log_path: []const u8,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.print(
+        "#!/bin/sh\nset -eu\nmode='{s}'\nrequest_log='{s}'\n",
+        .{ mode, request_log_path },
+    );
+    try writer.writer.writeAll(
+        \\attempt=0
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
+        \\    *'"method":"initialized"'*) continue ;;
+        \\  esac
+        \\  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  [ -n "$id" ] || exit 7
+        \\  printf '%s\n' "$line" >> "$request_log"
+        \\  attempt=$((attempt + 1))
+        \\  if [ "$mode" = nonoverload ]; then
+        \\    printf '{"id":%s,"error":{"code":-32603,"message":"internal"}}\n' "$id"
+        \\    continue
+        \\  fi
+        \\  if [ "$mode" = failure_then_success ]; then
+        \\    if [ "$attempt" -eq 1 ]; then
+        \\      printf '{"id":%s,"error":{"code":-32603,"message":"internal"}}\n' "$id"
+        \\    else
+        \\      printf '{"id":%s,"result":{"ok":true}}\n' "$id"
+        \\    fi
+        \\    continue
+        \\  fi
+        \\  if [ "$mode" = success ] && [ "$attempt" -ge 3 ]; then
+        \\    printf '{"id":%s,"result":{"ok":true}}\n' "$id"
+        \\    continue
+        \\  fi
+        \\  printf '{"method":"test/notification","params":{"attempt":%s}}\n' "$attempt"
+        \\  printf '{"id":%s,"error":{"code":-32001,"message":"overloaded"}}\n' "$id"
+        \\done
+        \\
+    );
+    return writer.toOwnedSlice();
+}
+
+fn runRetryIntegrationCase(mode: []const u8) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "retry-codex" });
+    defer allocator.free(executable);
+    const request_log_path = try std.fs.path.join(allocator, &.{ root, "requests.jsonl" });
+    defer allocator.free(request_log_path);
+    const script = try retryFakeCodexScriptAlloc(allocator, mode, request_log_path);
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "retry-codex", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    const policy = OverloadRetryPolicy{
+        .max_retries = if (std.mem.eql(u8, mode, "exhaust")) 2 else 4,
+        .base_delay_ms = 1,
+        .max_delay_ms = 4,
+        .jitter_percent = 25,
+    };
+    var telemetry: OverloadRetryTelemetry = .{};
+    var client = try Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .request_deadline_ms = monotonicMillis() + 2_000,
+        .overload_retry_policy = policy,
+        .overload_retry_seed = 17,
+        .overload_retry_telemetry = &telemetry,
+    });
+    try std.testing.expectEqual(@as(u64, 17), client.overload_retry_seed);
+    defer {
+        client.close();
+        client.deinit();
+    }
+    var observer = SendObserverProbe{};
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+
+    if (std.mem.eql(u8, mode, "success")) {
+        const result = try client.requestJsonCaptureNotificationsWithSendObserver(
+            "test/retry",
+            "{\"value\":7}",
+            &notifications,
+            .{ .context = &observer, .before_send = SendObserverProbe.count },
+        );
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("{\"ok\":true}", result);
+        try std.testing.expectEqual(@as(u32, 3), telemetry.wire_attempts);
+        try std.testing.expectEqual(@as(u32, 2), telemetry.overload_responses);
+        try std.testing.expectEqual(@as(u32, 2), telemetry.retries);
+        try std.testing.expectEqual(@as(u32, 2), telemetry.delay_count);
+        try std.testing.expect(!telemetry.exhausted);
+        try std.testing.expectEqual(@as(usize, 2), notifications.items.len);
+        try std.testing.expect(client.lastError() == null);
+    } else if (std.mem.eql(u8, mode, "failure_then_success")) {
+        try std.testing.expectError(error.RequestFailed, client.requestJson("test/retry", "{\"value\":7}"));
+        try std.testing.expect(client.lastError() != null);
+        const result = try client.requestJson("test/retry", "{\"value\":7}");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("{\"ok\":true}", result);
+        try std.testing.expect(client.lastError() == null);
+    } else {
+        try std.testing.expectError(
+            error.RequestFailed,
+            client.requestJsonWithSendObserver(
+                "test/retry",
+                "{\"value\":7}",
+                .{ .context = &observer, .before_send = SendObserverProbe.count },
+            ),
+        );
+        if (std.mem.eql(u8, mode, "nonoverload")) {
+            try std.testing.expectEqual(@as(u32, 1), telemetry.wire_attempts);
+            try std.testing.expectEqual(@as(u32, 0), telemetry.retries);
+            try std.testing.expect(!telemetry.exhausted);
+        } else {
+            try std.testing.expectEqual(@as(u32, policy.max_retries + 1), telemetry.wire_attempts);
+            try std.testing.expectEqual(policy.max_retries, telemetry.retries);
+            try std.testing.expect(telemetry.exhausted);
+        }
+    }
+    if (!std.mem.eql(u8, mode, "failure_then_success")) {
+        try std.testing.expectEqual(@as(usize, 1), observer.calls);
+    }
+
+    const requests = try tmp.dir.readFileAlloc(io, "requests.jsonl", allocator, .limited(64 * 1024));
+    defer allocator.free(requests);
+    var lines = std.mem.tokenizeScalar(u8, requests, '\n');
+    var index: usize = 0;
+    while (lines.next()) |line| : (index += 1) {
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"method\":\"test/retry\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"params\":{\"value\":7}") != null);
+        const expected_id = try std.fmt.allocPrint(allocator, "\"id\":{d}", .{index + 1});
+        defer allocator.free(expected_id);
+        try std.testing.expect(std.mem.indexOf(u8, line, expected_id) != null);
+    }
+    const expected_requests: usize = if (std.mem.eql(u8, mode, "failure_then_success")) 2 else telemetry.wire_attempts;
+    try std.testing.expectEqual(expected_requests, index);
+}
+
+test "production retry owns structured overload classification deadlines and telemetry" {
+    try runRetryIntegrationCase("success");
+    try runRetryIntegrationCase("nonoverload");
+    try runRetryIntegrationCase("exhaust");
+    try runRetryIntegrationCase("failure_then_success");
+}
+
+test "overload retry policy validation and deterministic jitter are bounded" {
+    try validateOverloadRetryPolicy(.{});
+    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .max_retries = max_overload_retries + 1 }));
+    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .base_delay_ms = 0 }));
+    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .max_delay_ms = max_overload_delay_ms + 1 }));
+    try std.testing.expectError(error.InvalidOverloadRetryPolicy, validateOverloadRetryPolicy(.{ .jitter_percent = max_overload_jitter_percent + 1 }));
+    const policy = OverloadRetryPolicy{};
+    const delay = overloadRetryDelayMs(policy, 0, 42);
+    try std.testing.expectEqual(delay, overloadRetryDelayMs(policy, 0, 42));
+    try std.testing.expect(delay >= policy.base_delay_ms);
+    try std.testing.expect(delay <= policy.base_delay_ms + policy.base_delay_ms / 4);
+
+    var direct = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"code\":-32001}", .{});
+    defer direct.deinit();
+    try std.testing.expect(isStructuredOverloadError(direct.value));
+    var nested = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"error\":{\"code\":-32001}}", .{});
+    defer nested.deinit();
+    try std.testing.expect(!isStructuredOverloadError(nested.value));
+
+    const first_default = try resolveOverloadRetrySeed(null, std.testing.io);
+    var saw_distinct_default = false;
+    for (0..8) |_| {
+        if (try resolveOverloadRetrySeed(null, std.testing.io) != first_default) saw_distinct_default = true;
+    }
+    try std.testing.expect(saw_distinct_default);
+    try std.testing.expectEqual(@as(u64, 42), try resolveOverloadRetrySeed(42, std.testing.io));
+}
+
+test "transport acquisition helpers require an already resolved retry seed" {
+    const stdio_info = @typeInfo(@TypeOf(Client.startStdio)).@"fn";
+    const websocket_info = @typeInfo(@TypeOf(Client.startWebsocket)).@"fn";
+    const unix_info = @typeInfo(@TypeOf(Client.startUnix)).@"fn";
+    try std.testing.expect(stdio_info.params[2].type.? == u64);
+    try std.testing.expect(websocket_info.params[2].type.? == u64);
+    try std.testing.expect(unix_info.params[2].type.? == u64);
+}
 
 test "request send observer runs before transport send attribution" {
     var client = Client{

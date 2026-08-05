@@ -223,6 +223,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = lift_meta },
         },
     });
+    const cas_proxy_client_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+        },
+    });
     const cas_smoke_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_smoke_check.zig"),
         .target = target,
@@ -277,6 +285,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
     });
     const cas_goal_root = b.createModule(.{
@@ -300,14 +309,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
-    const cas_proxy_client_root = b.createModule(.{
-        .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_json", .module = core_json },
-        },
-    });
     const cas_transport_tests_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_transport_tests.zig"),
         .target = target,
@@ -329,6 +330,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "cas_app_server_contract_data", .module = cas_app_server_contract_data.createModule() },
             .{ .name = "definition_core", .module = definition_core },
+            .{ .name = "cas_proxy_client", .module = cas_proxy_client_root },
         },
     });
     const cas_budget_governor_root = b.createModule(.{

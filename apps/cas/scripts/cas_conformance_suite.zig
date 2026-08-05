@@ -1,6 +1,7 @@
 const app_meta = @import("app_meta");
 const builtin = @import("builtin");
-const cas_hooks = @import("cas_hook_policy.zig");
+const cas_proxy_client = @import("cas_proxy_client");
+const cas_hooks = cas_proxy_client.hooks;
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const std = @import("std");
@@ -30,16 +31,15 @@ const UsageText =
     \\  --hooks MODE                      Hook policy for smoke preflight: inherit|off|require-observed (default: inherit).
     \\  --backoff-base-ms N               Base retry delay for overload policy checks (default: 250).
     \\  --max-retries N                   Max overload retries before failure (default: 4).
-    \\  --overload-script TOKENS          Comma-separated synthetic outcomes (default: overload,overload,success).
     \\  --json                            Emit machine-readable JSON.
     \\  --help                            Show this help.
     \\  --version                         Show version.
     \\  version                           Show version.
 ;
 
-const DefaultBackoffBaseMs: u32 = 250;
-const DefaultMaxRetries: u32 = 4;
-const DefaultOverloadScript = [_][]const u8{ "overload", "overload", "success" };
+const DefaultRetryPolicy = cas_proxy_client.OverloadRetryPolicy{};
+const DefaultBackoffBaseMs: u32 = DefaultRetryPolicy.base_delay_ms;
+const DefaultMaxRetries: u32 = DefaultRetryPolicy.max_retries;
 
 const Scenario = enum {
     overload_backoff,
@@ -57,7 +57,7 @@ const Scenario = enum {
 
     fn mode(self: Scenario) []const u8 {
         return switch (self) {
-            .overload_backoff => "synthetic",
+            .overload_backoff => "integration",
         };
     }
 };
@@ -74,7 +74,6 @@ const ParsedArgs = struct {
     hook_policy: cas_hooks.HookPolicy = .inherit,
     backoff_base_ms: u32 = DefaultBackoffBaseMs,
     max_retries: u32 = DefaultMaxRetries,
-    overload_script: []const []const u8 = &.{},
     json: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -86,7 +85,6 @@ const Context = struct {
     hook_policy: cas_hooks.HookPolicy,
     backoff_base_ms: u32,
     max_retries: u32,
-    overload_script: []const []const u8,
 };
 
 const CommandCapture = struct {
@@ -116,19 +114,6 @@ const ScenarioResult = struct {
     attempts: u32 = 0,
     retries: u32 = 0,
     delays_ms: []const u32 = &.{},
-};
-
-const RetryOutcome = enum {
-    overload,
-    success,
-    fail,
-
-    fn parse(raw: []const u8) ?RetryOutcome {
-        if (std.mem.eql(u8, raw, "overload")) return .overload;
-        if (std.mem.eql(u8, raw, "success")) return .success;
-        if (std.mem.eql(u8, raw, "fail")) return .fail;
-        return null;
-    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -164,7 +149,6 @@ pub fn main(init: std.process.Init) !void {
         .hook_policy = parsed.hook_policy,
         .backoff_base_ms = parsed.backoff_base_ms,
         .max_retries = parsed.max_retries,
-        .overload_script = parsed.overload_script,
     };
 
     const smoke_preflight = if (parsed.skip_smoke_check)
@@ -246,7 +230,6 @@ pub fn main(init: std.process.Init) !void {
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var scenarios: std.ArrayList(Scenario) = .empty;
-    var overload_script: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -289,25 +272,13 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--backoff-base-ms")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidBackoffBase;
-            out.backoff_base_ms = @intCast(parsed);
+            const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidBackoffBase;
+            if (parsed == 0) return error.InvalidBackoffBase;
+            out.backoff_base_ms = parsed;
             continue;
         }
         if (std.mem.eql(u8, arg, "--max-retries")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed < 0) return error.InvalidMaxRetries;
-            out.max_retries = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--overload-script")) {
-            var it = std.mem.splitScalar(u8, value, ',');
-            while (it.next()) |token_raw| {
-                const token = std.mem.trim(u8, token_raw, " \t\r\n");
-                if (token.len == 0) continue;
-                _ = RetryOutcome.parse(token) orelse return error.InvalidOverloadScript;
-                try overload_script.append(allocator, token);
-            }
+            out.max_retries = std.fmt.parseInt(u32, value, 10) catch return error.InvalidMaxRetries;
             continue;
         }
         return error.UnknownArg;
@@ -316,12 +287,13 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     if (scenarios.items.len == 0) {
         try scenarios.appendSlice(allocator, DefaultScenarios[0..]);
     }
-    if (overload_script.items.len == 0) {
-        try overload_script.appendSlice(allocator, DefaultOverloadScript[0..]);
-    }
+
+    try cas_proxy_client.validateOverloadRetryPolicy(.{
+        .max_retries = out.max_retries,
+        .base_delay_ms = out.backoff_base_ms,
+    });
 
     out.scenarios = try scenarios.toOwnedSlice(allocator);
-    out.overload_script = try overload_script.toOwnedSlice(allocator);
     return out;
 }
 
@@ -542,64 +514,179 @@ fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenari
 }
 
 fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !ScenarioResult {
-    var delays = std.ArrayList(u32).empty;
-    var retries: u32 = 0;
-    var attempts: u32 = 0;
+    const success_policy = cas_proxy_client.OverloadRetryPolicy{
+        .max_retries = ctx.max_retries,
+        .base_delay_ms = ctx.backoff_base_ms,
+    };
+    try cas_proxy_client.validateOverloadRetryPolicy(success_policy);
+    if (success_policy.max_retries < 2) return error.InsufficientRetriesForConformanceFixture;
 
-    for (ctx.overload_script) |token| {
-        const outcome = RetryOutcome.parse(token) orelse {
-            return failedScenario(.overload_backoff, try std.fmt.allocPrint(allocator, "unknown overload outcome token: {s}", .{token}));
-        };
-        attempts += 1;
-        switch (outcome) {
-            .overload => {
-                if (retries >= ctx.max_retries) {
-                    return .{
-                        .name = Scenario.overload_backoff.asString(),
-                        .mode = Scenario.overload_backoff.mode(),
-                        .ok = false,
-                        .detail = "overload retries exceeded max_retries before success",
-                        .attempts = attempts,
-                        .retries = retries,
-                        .delays_ms = try delays.toOwnedSlice(allocator),
-                    };
-                }
-                try delays.append(allocator, computeBackoffDelayMs(ctx.backoff_base_ms, retries));
-                retries += 1;
-            },
-            .success => {
-                return .{
-                    .name = Scenario.overload_backoff.asString(),
-                    .mode = Scenario.overload_backoff.mode(),
-                    .ok = true,
-                    .detail = "synthetic overload script converged under bounded retries",
-                    .attempts = attempts,
-                    .retries = retries,
-                    .delays_ms = try delays.toOwnedSlice(allocator),
-                };
-            },
-            .fail => {
-                return .{
-                    .name = Scenario.overload_backoff.asString(),
-                    .mode = Scenario.overload_backoff.mode(),
-                    .ok = false,
-                    .detail = "synthetic script hit a non-retryable failure before success",
-                    .attempts = attempts,
-                    .retries = retries,
-                    .delays_ms = try delays.toOwnedSlice(allocator),
-                };
-            },
-        }
+    const temp_root = try makeTempRoot(allocator, "cas-overload-conformance");
+    defer {
+        deleteTreeAbsolute(temp_root) catch {};
+        allocator.free(temp_root);
     }
-
+    const success = try runProductionRetryCase(allocator, temp_root, "success", success_policy);
+    const tiny_policy = cas_proxy_client.OverloadRetryPolicy{
+        .max_retries = 2,
+        .base_delay_ms = 1,
+        .max_delay_ms = 4,
+        .jitter_percent = 25,
+    };
+    const nonoverload = try runProductionRetryCase(allocator, temp_root, "nonoverload", tiny_policy);
+    const exhaustion = try runProductionRetryCase(allocator, temp_root, "exhaust", tiny_policy);
+    if (success.wire_attempts != 3 or success.retries != 2 or success.notifications != 2 or success.observer_calls != 1) return error.InvalidSuccessRetryProof;
+    if (nonoverload.wire_attempts != 1 or nonoverload.retries != 0 or nonoverload.observer_calls != 1) return error.InvalidNonOverloadProof;
+    if (exhaustion.wire_attempts != tiny_policy.max_retries + 1 or exhaustion.retries != tiny_policy.max_retries or !exhaustion.exhausted or exhaustion.observer_calls != 1) return error.InvalidExhaustionProof;
+    const delays = try allocator.dupe(u32, success.delays_ms[0..success.delay_count]);
     return .{
         .name = Scenario.overload_backoff.asString(),
         .mode = Scenario.overload_backoff.mode(),
-        .ok = false,
-        .detail = "synthetic overload script ended without a terminal success",
-        .attempts = attempts,
-        .retries = retries,
-        .delays_ms = try delays.toOwnedSlice(allocator),
+        .ok = true,
+        .detail = "production proxy retry loop passed success, non-overload, and exhaustion fixtures",
+        .attempts = success.wire_attempts,
+        .retries = success.retries,
+        .delays_ms = delays,
+    };
+}
+
+const RetryCaseProof = struct {
+    wire_attempts: u32,
+    retries: u32,
+    delay_count: usize,
+    delays_ms: [cas_proxy_client.max_overload_retries]u32,
+    notifications: usize,
+    observer_calls: usize,
+    exhausted: bool,
+};
+
+const ConformanceSendObserver = struct {
+    calls: usize = 0,
+
+    fn count(context: *anyopaque) anyerror!void {
+        const self: *ConformanceSendObserver = @ptrCast(@alignCast(context));
+        self.calls += 1;
+    }
+};
+
+fn retryFixtureScriptAlloc(allocator: std.mem.Allocator, mode: []const u8, log_path: []const u8) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.print("#!/bin/sh\nset -eu\nmode='{s}'\nlog_path='{s}'\n", .{ mode, log_path });
+    try writer.writer.writeAll(
+        \\attempt=0
+        \\while IFS= read -r line; do
+        \\  case "$line" in
+        \\    *'"method":"initialize"'*) printf '%s\n' '{"id":-1,"result":{}}'; continue ;;
+        \\    *'"method":"initialized"'*) continue ;;
+        \\  esac
+        \\  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+        \\  [ -n "$id" ] || exit 7
+        \\  printf '%s\n' "$line" >> "$log_path"
+        \\  attempt=$((attempt + 1))
+        \\  if [ "$mode" = nonoverload ]; then
+        \\    printf '{"id":%s,"error":{"code":-32603,"message":"internal"}}\n' "$id"
+        \\  elif [ "$mode" = success ] && [ "$attempt" -ge 3 ]; then
+        \\    printf '{"id":%s,"result":{"ok":true}}\n' "$id"
+        \\  else
+        \\    printf '{"method":"test/notification","params":{"attempt":%s}}\n' "$attempt"
+        \\    printf '{"id":%s,"error":{"code":-32001,"message":"overloaded"}}\n' "$id"
+        \\  fi
+        \\done
+        \\
+    );
+    return writer.toOwnedSlice();
+}
+
+fn runProductionRetryCase(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    mode: []const u8,
+    policy: cas_proxy_client.OverloadRetryPolicy,
+) !RetryCaseProof {
+    const io = if (builtin.is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io();
+    const executable = try std.fmt.allocPrint(allocator, "{s}/fake-codex-{s}", .{ root, mode });
+    defer allocator.free(executable);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/requests-{s}.jsonl", .{ root, mode });
+    defer allocator.free(log_path);
+    const script = try retryFixtureScriptAlloc(allocator, mode, log_path);
+    defer allocator.free(script);
+    var script_file = try std.Io.Dir.createFileAbsolute(io, executable, .{ .truncate = true });
+    defer script_file.close(io);
+    try script_file.writeStreamingAll(io, script);
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    var telemetry: cas_proxy_client.OverloadRetryTelemetry = .{};
+    const deadline_ms: i64 = @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000) + 30_000);
+    var client = try cas_proxy_client.Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .request_deadline_ms = deadline_ms,
+        .overload_retry_policy = policy,
+        .overload_retry_seed = 17,
+        .overload_retry_telemetry = &telemetry,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+    var observer = ConformanceSendObserver{};
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+    if (std.mem.eql(u8, mode, "success")) {
+        const result = try client.requestJsonCaptureNotificationsWithSendObserver(
+            "conformance/retry",
+            "{\"value\":7}",
+            &notifications,
+            .{ .context = &observer, .before_send = ConformanceSendObserver.count },
+        );
+        defer allocator.free(result);
+        if (!std.mem.eql(u8, result, "{\"ok\":true}") or client.lastError() != null) return error.InvalidSuccessRetryProof;
+    } else {
+        const result = client.requestJsonWithSendObserver(
+            "conformance/retry",
+            "{\"value\":7}",
+            .{ .context = &observer, .before_send = ConformanceSendObserver.count },
+        );
+        if (result) |owned| {
+            allocator.free(owned);
+            return error.ExpectedRequestFailure;
+        } else |err| if (err != error.RequestFailed) return err;
+    }
+    if (observer.calls != 1) return error.ObserverCallCountMismatch;
+    for (telemetry.delays_ms[0..telemetry.delay_count]) |delay| {
+        if (delay > policy.max_delay_ms) return error.RetryDelayOutOfBounds;
+    }
+
+    const requests = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, log_path, allocator, .limited(64 * 1024));
+    defer allocator.free(requests);
+    var lines = std.mem.tokenizeScalar(u8, requests, '\n');
+    var index: i64 = 1;
+    while (lines.next()) |line| : (index += 1) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidRetryRequest,
+        };
+        if (core_json.intField(object, "id") != index) return error.NonFreshRetryRequestId;
+        if (!std.mem.eql(u8, core_json.stringField(object, "method") orelse return error.InvalidRetryRequest, "conformance/retry")) return error.InvalidRetryRequest;
+        const params = core_json.objectField(object, "params") orelse return error.InvalidRetryRequest;
+        if (core_json.intField(params, "value") != 7) return error.InvalidRetryRequest;
+    }
+    if (index - 1 != telemetry.wire_attempts) return error.RetryAttemptCountMismatch;
+    return .{
+        .wire_attempts = telemetry.wire_attempts,
+        .retries = telemetry.retries,
+        .delay_count = telemetry.delay_count,
+        .delays_ms = telemetry.delays_ms,
+        .notifications = notifications.items.len,
+        .observer_calls = observer.calls,
+        .exhausted = telemetry.exhausted,
     };
 }
 
@@ -622,66 +709,12 @@ fn commandSummary(allocator: std.mem.Allocator, capture: CommandCapture) ![]cons
     return std.fmt.allocPrint(allocator, "exit={d}", .{capture.exit_code});
 }
 
-fn failedScenario(scenario: Scenario, detail: []const u8) ScenarioResult {
-    return .{
-        .name = scenario.asString(),
-        .mode = scenario.mode(),
-        .ok = false,
-        .detail = detail,
-    };
-}
-
 fn boolField(obj: core_json.ObjectMap, key: []const u8) ?bool {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .bool => |flag| flag,
         else => null,
     };
-}
-
-fn computeBackoffDelayMs(base_ms: u32, retry_index: u32) u32 {
-    const capped_retry = @min(retry_index, @as(u32, 10));
-    const multiplier: u64 = @as(u64, 1) << @intCast(capped_retry);
-    const base_delay = @as(u64, base_ms) * multiplier;
-    const jitter = (@as(u64, base_ms) / 4) * (@as(u64, (retry_index % 3) + 1));
-    return @intCast(@min(base_delay + jitter, @as(u64, std.math.maxInt(u32))));
-}
-
-fn isOverloadErrorText(text: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, text, .{}) catch null;
-    defer if (parsed) |*owned| owned.deinit();
-    if (parsed) |value| {
-        if (value.value == .object) {
-            if (core_json.intField(value.value.object, "code")) |code| {
-                if (code == -32001) return true;
-            }
-            if (core_json.objectField(value.value.object, "error")) |err_obj| {
-                if (core_json.intField(err_obj, "code")) |code| {
-                    if (code == -32001) return true;
-                }
-            }
-        }
-    }
-    return containsCaseInsensitive(text, "server overloaded") or
-        containsCaseInsensitive(text, "retry later") or
-        containsCaseInsensitive(text, "-32001");
-}
-
-fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or haystack.len < needle.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        var matched = true;
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
-                matched = false;
-                break;
-            }
-        }
-        if (matched) return true;
-    }
-    return false;
 }
 
 fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
@@ -725,8 +758,6 @@ test "parseArgs accepts scenarios and retry knobs" {
         "500",
         "--max-retries",
         "7",
-        "--overload-script",
-        "overload,success",
         "--hooks",
         "off",
         "--json",
@@ -734,7 +765,6 @@ test "parseArgs accepts scenarios and retry knobs" {
 
     const parsed = try parseArgs(std.testing.allocator, &argv);
     defer std.testing.allocator.free(parsed.scenarios);
-    defer std.testing.allocator.free(parsed.overload_script);
 
     try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.scenarios.len);
@@ -744,9 +774,6 @@ test "parseArgs accepts scenarios and retry knobs" {
     try std.testing.expectEqual(cas_hooks.HookPolicy.off, parsed.hook_policy);
     try std.testing.expectEqual(@as(u32, 500), parsed.backoff_base_ms);
     try std.testing.expectEqual(@as(u32, 7), parsed.max_retries);
-    try std.testing.expectEqual(@as(usize, 2), parsed.overload_script.len);
-    try std.testing.expectEqualStrings("overload", parsed.overload_script[0]);
-    try std.testing.expectEqualStrings("success", parsed.overload_script[1]);
 }
 
 test "parseArgs rejects unknown scenario" {
@@ -762,17 +789,42 @@ test "parseArgs rejects unknown scenario" {
 }
 
 test "computeBackoffDelayMs grows monotonically" {
-    const d0 = computeBackoffDelayMs(250, 0);
-    const d1 = computeBackoffDelayMs(250, 1);
-    const d2 = computeBackoffDelayMs(250, 2);
+    const policy = cas_proxy_client.OverloadRetryPolicy{};
+    const d0 = cas_proxy_client.overloadRetryDelayMs(policy, 0, 0);
+    const d1 = cas_proxy_client.overloadRetryDelayMs(policy, 1, 0);
+    const d2 = cas_proxy_client.overloadRetryDelayMs(policy, 2, 0);
     try std.testing.expect(d0 > 0);
     try std.testing.expect(d1 > d0);
     try std.testing.expect(d2 > d1);
 }
 
-test "isOverloadErrorText handles structured and text forms" {
-    try std.testing.expect(isOverloadErrorText("{\"code\":-32001,\"message\":\"Server overloaded; retry later.\"}"));
-    try std.testing.expect(isOverloadErrorText("{\"error\":{\"code\":-32001,\"message\":\"retry later\"}}"));
-    try std.testing.expect(isOverloadErrorText("server overloaded; retry later"));
-    try std.testing.expect(!isOverloadErrorText("{\"code\":-32601,\"message\":\"method not found\"}"));
+test "overload classification delegates to structured proxy policy" {
+    const cases = [_]struct { raw: []const u8, expected: bool }{
+        .{ .raw = "{\"code\":-32001,\"message\":\"overloaded\"}", .expected = true },
+        .{ .raw = "{\"code\":-32603,\"message\":\"overloaded\"}", .expected = false },
+        .{ .raw = "\"server overloaded -32001\"", .expected = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, cas_proxy_client.isStructuredOverloadError(parsed.value));
+    }
+}
+
+test "overload scenario route drives production proxy retry integration" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const ctx = Context{
+        .cwd = "/tmp",
+        .smoke_binary = "unused",
+        .hook_policy = .inherit,
+        .backoff_base_ms = 1,
+        .max_retries = 2,
+    };
+    const result = try executeScenario(std.testing.allocator, ctx, .overload_backoff);
+    defer if (result.delays_ms.len != 0) std.testing.allocator.free(result.delays_ms);
+    try std.testing.expect(result.ok);
+    try std.testing.expectEqualStrings("integration", result.mode);
+    try std.testing.expectEqual(@as(u32, 3), result.attempts);
+    try std.testing.expectEqual(@as(u32, 2), result.retries);
+    try std.testing.expectEqual(@as(usize, 2), result.delays_ms.len);
 }

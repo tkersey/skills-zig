@@ -1,5 +1,6 @@
 const std = @import("std");
 const definition_core = @import("definition_core");
+const proxy_client = @import("cas_proxy_client");
 
 pub const baseline_json = @import("cas_app_server_contract_data").json;
 
@@ -709,6 +710,78 @@ fn promoteCacheDirectory(allocator: std.mem.Allocator, io: std.Io, staging: []co
 pub const Profile = enum { core, review, session_inquiry, full };
 pub const Status = enum { compatible, incompatible };
 
+pub const ProbeTransport = enum {
+    stdio,
+    managed_websocket,
+    explicit_websocket,
+    unix_websocket,
+};
+
+pub const ProbeSelection = struct {
+    transport: ProbeTransport = .stdio,
+    code_mode_host: bool = false,
+};
+
+pub const ProbeRequirement = enum { required, not_applicable };
+
+pub const BehavioralProbeDescriptor = struct {
+    id: []const u8,
+    common: bool = false,
+    core: bool = false,
+    review: bool = false,
+    session_inquiry: bool = false,
+    full: bool = false,
+    transport: ?ProbeTransport = null,
+    code_mode_host: bool = false,
+};
+
+pub const behavioral_probe_descriptors = [_]BehavioralProbeDescriptor{
+    .{ .id = "initialize-lifecycle", .common = true },
+    .{ .id = "stdio-transport", .transport = .stdio },
+    .{ .id = "managed-websocket-transport", .transport = .managed_websocket },
+    .{ .id = "explicit-websocket-transport", .transport = .explicit_websocket },
+    .{ .id = "unix-websocket-transport", .transport = .unix_websocket },
+    .{ .id = "remote-code-mode-host", .code_mode_host = true },
+    .{ .id = "server-request-coverage", .common = true },
+    .{ .id = "thread-pinning-round-trip", .full = true },
+    .{ .id = "paginated-fork", .session_inquiry = true, .full = true },
+    .{ .id = "ephemeral-fork", .session_inquiry = true, .full = true },
+    .{ .id = "executor-skill-resources", .full = true },
+    .{ .id = "external-import-history", .full = true },
+    .{ .id = "bounded-overload-retry", .common = true },
+    .{ .id = "structured-review", .review = true, .full = true },
+    .{ .id = "paginated-session-inquiry", .session_inquiry = true, .full = true },
+};
+
+pub fn behavioralProbeDescriptor(id: []const u8) ?BehavioralProbeDescriptor {
+    for (behavioral_probe_descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.id, id)) return descriptor;
+    }
+    return null;
+}
+
+pub fn probeRequirement(
+    profile: Profile,
+    selection: ProbeSelection,
+    id: []const u8,
+) ?ProbeRequirement {
+    const descriptor = behavioralProbeDescriptor(id) orelse return null;
+    if (descriptor.transport) |transport| {
+        return if (transport == selection.transport) .required else .not_applicable;
+    }
+    if (descriptor.code_mode_host) {
+        return if (selection.code_mode_host) .required else .not_applicable;
+    }
+    if (descriptor.common) return .required;
+    const applies = switch (profile) {
+        .core => descriptor.core,
+        .review => descriptor.review,
+        .session_inquiry => descriptor.session_inquiry,
+        .full => descriptor.full,
+    };
+    return if (applies) .required else .not_applicable;
+}
+
 pub const Document = struct {
     name: []const u8,
     bytes: []const u8,
@@ -726,6 +799,7 @@ pub const InspectionReport = struct {
     unclassified_server_requests: std.ArrayList([]u8) = .empty,
     additive_notifications: std.ArrayList([]u8) = .empty,
     shape_failures: std.ArrayList([]u8) = .empty,
+    handler_failures: std.ArrayList([]u8) = .empty,
 
     pub fn deinit(self: *InspectionReport, allocator: std.mem.Allocator) void {
         deinitStrings(&self.missing_required, allocator);
@@ -734,6 +808,7 @@ pub const InspectionReport = struct {
         deinitStrings(&self.unclassified_server_requests, allocator);
         deinitStrings(&self.additive_notifications, allocator);
         deinitStrings(&self.shape_failures, allocator);
+        deinitStrings(&self.handler_failures, allocator);
     }
 };
 
@@ -776,24 +851,37 @@ pub fn inspect(
     const required_experimental_clients = try arrayField(experimental_contract, "requiredClientMethods");
 
     try compareRequired(allocator, required_stable_clients, stable_clients.items.items, &report.missing_required);
+    try compareRequired(allocator, required_stable_clients, experimental_clients.items.items, &report.missing_required);
     try compareRequired(allocator, required_stable_servers, stable_servers.items.items, &report.missing_required);
+    try compareRequired(allocator, required_stable_servers, experimental_servers.items.items, &report.missing_required);
     try compareRequired(allocator, required_notifications, stable_notifications.items.items, &report.missing_required);
     try compareRequired(allocator, required_notifications, experimental_notifications.items.items, &report.missing_required);
-    try compareRequired(allocator, required_experimental_clients, experimental_clients.items.items, &report.missing_required);
+    switch (profile) {
+        .core, .review => {},
+        .session_inquiry => {
+            try requireMethod(allocator, required_experimental_clients, experimental_clients.items.items, "thread/turns/list", &report.missing_required);
+            try requireMethod(allocator, required_experimental_clients, experimental_clients.items.items, "thread/items/list", &report.missing_required);
+        },
+        .full => try compareRequired(allocator, required_experimental_clients, experimental_clients.items.items, &report.missing_required),
+    }
     try collectAdditive(allocator, stable_clients.items.items, required_stable_clients, &report.additive_client_methods);
     try collectAdditive(allocator, experimental_clients.items.items, required_experimental_clients, &report.additive_client_methods);
     try collectAdditive(allocator, stable_notifications.items.items, required_notifications, &report.additive_notifications);
     try collectAdditive(allocator, experimental_notifications.items.items, required_notifications, &report.additive_notifications);
 
     const policies = try objectField(baseline.*, "serverRequestPolicies");
+    try inspectHandlerParity(allocator, policies, &report.handler_failures);
     try comparePolicyRequired(allocator, policies, experimental_servers.items.items, &report.missing_required);
     try classifyServerAdditions(allocator, stable_servers.items.items, required_stable_servers, policies, &report);
     try classifyExperimentalServerAdditions(allocator, experimental_servers.items.items, policies, &report);
 
     try inspectShapes(allocator, stable, try arrayField(stable_contract, "requiredShapes"), &report.shape_failures);
-    try inspectShapes(allocator, experimental, try arrayField(experimental_contract, "requiredShapes"), &report.shape_failures);
+    switch (profile) {
+        .core, .review => {},
+        .session_inquiry, .full => try inspectShapes(allocator, experimental, try arrayField(experimental_contract, "requiredShapes"), &report.shape_failures),
+    }
 
-    if (report.missing_required.items.len != 0 or report.shape_failures.items.len != 0 or
+    if (report.missing_required.items.len != 0 or report.shape_failures.items.len != 0 or report.handler_failures.items.len != 0 or
         (profile == .full and report.unclassified_server_requests.items.len != 0))
     {
         report.status = .incompatible;
@@ -841,7 +929,7 @@ fn validateBaseline(root: std.json.Value) !void {
         .object => |value| value,
         else => return error.InvalidContract,
     };
-    if (policy_object.count() != 11) return error.InvalidContract;
+    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) return error.InvalidContract;
     var policy_iterator = policy_object.iterator();
     while (policy_iterator.next()) |entry| {
         const policy = switch (entry.value_ptr.*) {
@@ -850,10 +938,10 @@ fn validateBaseline(root: std.json.Value) !void {
         };
         if (std.mem.trim(u8, policy, " \t\r\n").len == 0) return error.InvalidContract;
     }
-    if (!policy_object.contains("currentTime/read")) return error.InvalidContract;
+    try validateHandlerParity(policies);
     const probes = try arrayField(root, "behavioralProbes");
     try validateStringArray(probes);
-    if (probes.items.len != 15) return error.InvalidContract;
+    try validateProbeParity(probes);
 }
 
 const MethodSet = struct {
@@ -894,6 +982,17 @@ fn compareRequired(allocator: std.mem.Allocator, required: std.json.Array, actua
         };
         if (!contains(actual, method)) try appendUnique(allocator, failures, method);
     }
+}
+
+fn requireMethod(
+    allocator: std.mem.Allocator,
+    baseline: std.json.Array,
+    actual: []const []u8,
+    method: []const u8,
+    failures: *std.ArrayList([]u8),
+) !void {
+    if (!jsonArrayContains(baseline, method)) return error.InvalidContract;
+    if (!contains(actual, method)) try appendUnique(allocator, failures, method);
 }
 
 fn collectAdditive(allocator: std.mem.Allocator, actual: []const []u8, required: std.json.Array, output: *std.ArrayList([]u8)) !void {
@@ -943,6 +1042,101 @@ fn comparePolicyRequired(allocator: std.mem.Allocator, policies: std.json.Value,
     var iterator = policy_object.iterator();
     while (iterator.next()) |entry| {
         if (!contains(actual, entry.key_ptr.*)) try appendUnique(allocator, failures, entry.key_ptr.*);
+    }
+}
+
+fn validateHandlerParity(policies: std.json.Value) !void {
+    const policy_object = switch (policies) {
+        .object => |value| value,
+        else => return error.InvalidContract,
+    };
+    if (policy_object.count() != proxy_client.server_request_handler_descriptors.len) return error.InvalidContract;
+    for (proxy_client.server_request_handler_descriptors, 0..) |descriptor, index| {
+        if (descriptor.kind == .unknown) return error.InvalidContract;
+        for (proxy_client.server_request_handler_descriptors[0..index]) |prior| {
+            if (std.mem.eql(u8, descriptor.method, prior.method) or descriptor.kind == prior.kind) return error.InvalidContract;
+        }
+        const value = policy_object.get(descriptor.method) orelse return error.InvalidContract;
+        const policy = switch (value) {
+            .string => |text| text,
+            else => return error.InvalidContract,
+        };
+        if (!std.mem.eql(u8, policy, descriptor.policy)) return error.InvalidContract;
+    }
+    var iterator = policy_object.iterator();
+    while (iterator.next()) |entry| {
+        const descriptor = proxy_client.serverRequestHandler(entry.key_ptr.*) orelse return error.InvalidContract;
+        const policy = switch (entry.value_ptr.*) {
+            .string => |text| text,
+            else => return error.InvalidContract,
+        };
+        if (!std.mem.eql(u8, policy, descriptor.policy)) return error.InvalidContract;
+    }
+}
+
+fn inspectHandlerParity(
+    allocator: std.mem.Allocator,
+    policies: std.json.Value,
+    failures: *std.ArrayList([]u8),
+) !void {
+    const policy_object = switch (policies) {
+        .object => |value| value,
+        else => {
+            try appendUnique(allocator, failures, "serverRequestPolicies");
+            return;
+        },
+    };
+    for (proxy_client.server_request_handler_descriptors, 0..) |descriptor, index| {
+        if (descriptor.kind == .unknown) try appendUnique(allocator, failures, descriptor.method);
+        for (proxy_client.server_request_handler_descriptors[0..index]) |prior| {
+            if (std.mem.eql(u8, descriptor.method, prior.method) or descriptor.kind == prior.kind) {
+                try appendUnique(allocator, failures, descriptor.method);
+            }
+        }
+        const policy_value = policy_object.get(descriptor.method) orelse {
+            try appendUnique(allocator, failures, descriptor.method);
+            continue;
+        };
+        const policy = switch (policy_value) {
+            .string => |text| text,
+            else => {
+                try appendUnique(allocator, failures, descriptor.method);
+                continue;
+            },
+        };
+        if (!std.mem.eql(u8, policy, descriptor.policy)) try appendUnique(allocator, failures, descriptor.method);
+    }
+    var iterator = policy_object.iterator();
+    while (iterator.next()) |entry| {
+        const descriptor = proxy_client.serverRequestHandler(entry.key_ptr.*) orelse {
+            try appendUnique(allocator, failures, entry.key_ptr.*);
+            continue;
+        };
+        const policy = switch (entry.value_ptr.*) {
+            .string => |text| text,
+            else => {
+                try appendUnique(allocator, failures, entry.key_ptr.*);
+                continue;
+            },
+        };
+        if (!std.mem.eql(u8, policy, descriptor.policy)) try appendUnique(allocator, failures, entry.key_ptr.*);
+    }
+}
+
+fn validateProbeParity(probes: std.json.Array) !void {
+    if (probes.items.len != behavioral_probe_descriptors.len) return error.InvalidContract;
+    for (behavioral_probe_descriptors, 0..) |descriptor, index| {
+        for (behavioral_probe_descriptors[0..index]) |prior| {
+            if (std.mem.eql(u8, descriptor.id, prior.id)) return error.InvalidContract;
+        }
+        if (!jsonArrayContains(probes, descriptor.id)) return error.InvalidContract;
+    }
+    for (probes.items) |item| {
+        const id = switch (item) {
+            .string => |value| value,
+            else => return error.InvalidContract,
+        };
+        if (behavioralProbeDescriptor(id) == null) return error.InvalidContract;
     }
 }
 
@@ -1287,6 +1481,17 @@ fn makeTestBundles(allocator: std.mem.Allocator, baseline: std.json.Value) !Test
 }
 
 fn inspectTestBundles(allocator: std.mem.Allocator, baseline: *const std.json.Value, bundles: *const TestBundles, stable_shape_doc: []const u8, experimental_shape_doc: []const u8) !InspectionReport {
+    return inspectTestBundlesForProfile(allocator, baseline, bundles, stable_shape_doc, experimental_shape_doc, .full);
+}
+
+fn inspectTestBundlesForProfile(
+    allocator: std.mem.Allocator,
+    baseline: *const std.json.Value,
+    bundles: *const TestBundles,
+    stable_shape_doc: []const u8,
+    experimental_shape_doc: []const u8,
+    profile: Profile,
+) !InspectionReport {
     const stable_docs = [_]Document{
         .{ .name = "ClientRequest.json", .bytes = bundles.stable_client },
         .{ .name = "ServerRequest.json", .bytes = bundles.stable_server },
@@ -1304,7 +1509,7 @@ fn inspectTestBundles(allocator: std.mem.Allocator, baseline: *const std.json.Va
     var adjusted = experimental_docs_with_shapes;
     adjusted[0].bytes = try mergeDefinitionsIntoMethodSchema(allocator, bundles.experimental_client, experimental_shape_doc);
     defer allocator.free(adjusted[0].bytes);
-    return inspect(allocator, baseline, .{ .documents = &stable_docs }, .{ .documents = &adjusted }, .full);
+    return inspect(allocator, baseline, .{ .documents = &stable_docs }, .{ .documents = &adjusted }, profile);
 }
 
 fn mergeDefinitionsIntoMethodSchema(allocator: std.mem.Allocator, methods: []const u8, definitions: []const u8) ![]u8 {
@@ -1321,6 +1526,161 @@ test "baseline method-set cardinalities and exact compatible bundles" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expectEqual(Status.compatible, report.status);
     try std.testing.expectEqual(@as(usize, 0), report.additive_server_requests.items.len);
+}
+
+test "profiles select only their experimental client and shape obligations" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+
+    {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const method = "thread/search";
+        const offset = std.mem.indexOf(u8, bundles.experimental_client, method) orelse return error.TestExpectedEqual;
+        bundles.experimental_client[offset + method.len - 1] = 'x';
+        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+            var report = try inspectTestBundlesForProfile(
+                std.testing.allocator,
+                &baseline.value,
+                &bundles,
+                stable_shapes,
+                experimental_shapes,
+                profile,
+            );
+            defer report.deinit(std.testing.allocator);
+            try std.testing.expectEqual(if (profile == .full) Status.incompatible else Status.compatible, report.status);
+        }
+    }
+
+    {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const method = "thread/turns/list";
+        const offset = std.mem.indexOf(u8, bundles.experimental_client, method) orelse return error.TestExpectedEqual;
+        bundles.experimental_client[offset + method.len - 1] = 'x';
+        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+            var report = try inspectTestBundlesForProfile(
+                std.testing.allocator,
+                &baseline.value,
+                &bundles,
+                stable_shapes,
+                experimental_shapes,
+                profile,
+            );
+            defer report.deinit(std.testing.allocator);
+            const requires_method = profile == .session_inquiry or profile == .full;
+            try std.testing.expectEqual(if (requires_method) Status.incompatible else Status.compatible, report.status);
+        }
+    }
+
+    {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const drifted = try std.testing.allocator.dupe(u8, experimental_shapes);
+        defer std.testing.allocator.free(drifted);
+        const method = "beforeTurnId";
+        const offset = std.mem.indexOf(u8, drifted, method) orelse return error.TestExpectedEqual;
+        drifted[offset + method.len - 1] = 'x';
+        for ([_]Profile{ .core, .review, .session_inquiry, .full }) |profile| {
+            var report = try inspectTestBundlesForProfile(
+                std.testing.allocator,
+                &baseline.value,
+                &bundles,
+                stable_shapes,
+                drifted,
+                profile,
+            );
+            defer report.deinit(std.testing.allocator);
+            const requires_shape = profile == .session_inquiry or profile == .full;
+            try std.testing.expectEqual(if (requires_shape) Status.incompatible else Status.compatible, report.status);
+        }
+    }
+}
+
+test "stable method server notification shape and handler drift fail every profile" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+    const profiles = [_]Profile{ .core, .review, .session_inquiry, .full };
+
+    for (profiles) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const method = "externalAgentConfig/import/recordHistory";
+        const offset = std.mem.indexOf(u8, bundles.stable_client, method) orelse return error.TestExpectedEqual;
+        bundles.stable_client[offset + method.len - 1] = 'x';
+        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Status.incompatible, report.status);
+    }
+
+    for (profiles) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const method = "currentTime/read";
+        const offset = std.mem.indexOf(u8, bundles.experimental_server, method) orelse return error.TestExpectedEqual;
+        bundles.experimental_server[offset + method.len - 1] = 'x';
+        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Status.incompatible, report.status);
+    }
+
+    for (profiles) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const method = "error";
+        const offset = std.mem.indexOf(u8, bundles.stable_notification, method) orelse return error.TestExpectedEqual;
+        bundles.stable_notification[offset + method.len - 1] = 'x';
+        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Status.incompatible, report.status);
+    }
+
+    for (profiles) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        const drifted = try std.testing.allocator.dupe(u8, stable_shapes);
+        defer std.testing.allocator.free(drifted);
+        const needle = "isPinned";
+        const offset = std.mem.indexOf(u8, drifted, needle) orelse return error.TestExpectedEqual;
+        drifted[offset + needle.len - 1] = 'x';
+        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, drifted, experimental_shapes, profile);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Status.incompatible, report.status);
+    }
+
+    const policy_value = baseline.value.object.getPtr("serverRequestPolicies") orelse return error.TestExpectedEqual;
+    const policy = policy_value.object.getPtr("currentTime/read") orelse return error.TestExpectedEqual;
+    policy.* = .{ .string = "wrong-policy" };
+    for (profiles) |profile| {
+        var bundles = try makeTestBundles(std.testing.allocator, baseline.value);
+        defer bundles.deinit(std.testing.allocator);
+        var report = try inspectTestBundlesForProfile(std.testing.allocator, &baseline.value, &bundles, stable_shapes, experimental_shapes, profile);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expectEqual(Status.incompatible, report.status);
+        try std.testing.expect(contains(report.handler_failures.items, "currentTime/read"));
+    }
+}
+
+test "behavioral probe descriptors exactly cover contract and select required probes" {
+    var baseline = try parseBaseline(std.testing.allocator);
+    defer baseline.deinit();
+    const probes = try arrayField(baseline.value, "behavioralProbes");
+    try std.testing.expectEqual(probes.items.len, behavioral_probe_descriptors.len);
+    for (behavioral_probe_descriptors) |descriptor| {
+        try std.testing.expect(jsonArrayContains(probes, descriptor.id));
+    }
+
+    const stdio = ProbeSelection{ .transport = .stdio };
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, stdio, "initialize-lifecycle").?);
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, stdio, "stdio-transport").?);
+    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.core, stdio, "managed-websocket-transport").?);
+    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.core, stdio, "remote-code-mode-host").?);
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.review, stdio, "structured-review").?);
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.session_inquiry, stdio, "paginated-fork").?);
+    try std.testing.expectEqual(ProbeRequirement.not_applicable, probeRequirement(.review, stdio, "paginated-fork").?);
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.full, stdio, "thread-pinning-round-trip").?);
+    try std.testing.expectEqual(ProbeRequirement.required, probeRequirement(.core, .{ .transport = .stdio, .code_mode_host = true }, "remote-code-mode-host").?);
+    try std.testing.expect(probeRequirement(.core, stdio, "future-probe") == null);
 }
 
 test "additive client notification and object fields remain compatible" {
