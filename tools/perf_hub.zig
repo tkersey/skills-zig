@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
-const cron_cli = @import("cron_cli");
+const cas_automation_cli = @import("cas_automation_cli");
 const definition_core = @import("definition_core");
 const durable_store = @import("durable_store");
 const perf_contract = @import("perf_contract");
@@ -94,8 +94,8 @@ const CompatSetup = enum {
     cas_review_session_help,
     cas_review_session_version,
     cas_budget_governor_driver,
-    cron_help,
-    cron_list,
+    cas_automation_help,
+    cas_automation_list,
 };
 
 const CompatCase = struct {
@@ -112,14 +112,14 @@ const CompatCase = struct {
 
 const DeepSetup = enum {
     seq_observe,
-    cron_show,
-    cron_create,
-    cron_update,
-    cron_enable,
-    cron_disable,
-    cron_run_now,
-    cron_delete,
-    cron_run_due,
+    cas_automation_show,
+    cas_automation_create,
+    cas_automation_update,
+    cas_automation_enable,
+    cas_automation_disable,
+    cas_automation_run_now,
+    cas_automation_delete,
+    cas_automation_run_due,
 };
 
 const DeepCase = struct {
@@ -284,20 +284,20 @@ const LedgerCoverages = [_]perf_contract.CommandCoverage{
     shallowCoverage("version", "command-surface gate"),
 };
 
-const CronCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "cron-help", .binary = "cron", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cron-list", .binary = "cron", .family = "list", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "cron-show-deep", .binary = "cron", .family = "show", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-create-deep", .binary = "cron", .family = "create", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-update-deep", .binary = "cron", .family = "update", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-enable-deep", .binary = "cron", .family = "enable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-disable-deep", .binary = "cron", .family = "disable", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-run-now-deep", .binary = "cron", .family = "run-now", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-delete-deep", .binary = "cron", .family = "delete", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "cron-run-due-deep", .binary = "cron", .family = "run-due", .case_kind = .driver, .measurement_mode = .latency_alloc },
+const CasAutomationCases = [_]perf_contract.CaseDescriptor{
+    .{ .case_id = "cas-automation-help", .binary = "cas", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
+    .{ .case_id = "cas-automation-list", .binary = "cas", .family = "list", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
+    .{ .case_id = "cas-automation-show-deep", .binary = "cas", .family = "show", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-create-deep", .binary = "cas", .family = "create", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-update-deep", .binary = "cas", .family = "update", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-enable-deep", .binary = "cas", .family = "enable", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-disable-deep", .binary = "cas", .family = "disable", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-run-now-deep", .binary = "cas", .family = "run-now", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-delete-deep", .binary = "cas", .family = "delete", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "cas-automation-run-due-deep", .binary = "cas", .family = "run-due", .case_kind = .driver, .measurement_mode = .latency_alloc },
 };
 
-const CronCoverages = buildCronCoverages();
+const CasAutomationCoverages = buildCasAutomationCoverages();
 
 const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "bench-stats-help", .binary = "bench_stats", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
@@ -370,8 +370,8 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_help, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_version, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
-    .{ .descriptor = CronCases[0], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[1], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_list, .tolerance_pct = 35.0 },
+    .{ .descriptor = CasAutomationCases[0], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_automation_help, .tolerance_pct = 25.0 },
+    .{ .descriptor = CasAutomationCases[1], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_automation_list, .tolerance_pct = 35.0 },
 };
 
 const DeepCases = [_]DeepCase{
@@ -383,19 +383,19 @@ const DeepCases = [_]DeepCase{
         .samples = 30,
         .batch_iterations = 8,
     },
-    .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
-    .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
-    .{ .descriptor = CronCases[5], .setup = .cron_enable, .tolerance_pct = 250.0 },
-    .{ .descriptor = CronCases[6], .setup = .cron_disable, .tolerance_pct = 100.0 },
-    .{ .descriptor = CronCases[7], .setup = .cron_run_now, .tolerance_pct = 70.0 },
-    .{ .descriptor = CronCases[8], .setup = .cron_delete, .tolerance_pct = 60.0 },
-    .{ .descriptor = CronCases[9], .setup = .cron_run_due, .tolerance_pct = 125.0 },
+    .{ .descriptor = CasAutomationCases[2], .setup = .cas_automation_show, .tolerance_pct = 200.0 },
+    .{ .descriptor = CasAutomationCases[3], .setup = .cas_automation_create, .tolerance_pct = 25.0 },
+    .{ .descriptor = CasAutomationCases[4], .setup = .cas_automation_update, .tolerance_pct = 25.0 },
+    .{ .descriptor = CasAutomationCases[5], .setup = .cas_automation_enable, .tolerance_pct = 250.0 },
+    .{ .descriptor = CasAutomationCases[6], .setup = .cas_automation_disable, .tolerance_pct = 100.0 },
+    .{ .descriptor = CasAutomationCases[7], .setup = .cas_automation_run_now, .tolerance_pct = 70.0 },
+    .{ .descriptor = CasAutomationCases[8], .setup = .cas_automation_delete, .tolerance_pct = 60.0 },
+    .{ .descriptor = CasAutomationCases[9], .setup = .cas_automation_run_due, .tolerance_pct = 125.0 },
 };
 
-fn buildCronCoverages() [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage {
-    var out: [cron_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
-    for (cron_cli.commandDefinitions(), 0..) |def, idx| {
+fn buildCasAutomationCoverages() [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage {
+    var out: [cas_automation_cli.commandDefinitions().len]perf_contract.CommandCoverage = undefined;
+    for (cas_automation_cli.commandDefinitions(), 0..) |def, idx| {
         const coverage, const reason = if (def.command == .list)
             .{ perf_contract.CoverageKind.shallow, "compat subprocess case exists" }
         else if (def.command == .scheduler)
@@ -411,7 +411,7 @@ fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
         .{ .binary = "seq", .coverages = &SeqCoverages, .datasets = &SeqDatasets, .cases = &SeqCases },
         .{ .binary = "ledger", .coverages = &LedgerCoverages, .cases = &LedgerCases },
-        .{ .binary = "cron", .coverages = &CronCoverages, .cases = &CronCases },
+        .{ .binary = "cas", .coverages = &CasAutomationCoverages, .cases = &CasAutomationCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
     };
 }
@@ -4502,8 +4502,8 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
         .cas_smoke_check_help,
         .cas_instance_runner_help,
         .cas_review_session_help,
-        .cron_help,
         => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .cas_automation_help => try args.appendSlice(allocator, &.{ binary_path, "automation", "--help" }),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -4526,11 +4526,11 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             try makeExecutable(stub_path);
             return .{ .cwd = cwd, .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }) };
         },
-        .cron_list => {
+        .cas_automation_list => {
             const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)});
             const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
-            try seedCronDb(allocator, db_path);
-            try args.appendSlice(allocator, &.{ binary_path, "--db", db_path, "list" });
+            try seedCasAutomationDb(allocator, db_path);
+            try args.appendSlice(allocator, &.{ binary_path, "automation", "--db", db_path, "list" });
         },
         else => return error.InvalidCommand,
     }
@@ -4748,7 +4748,7 @@ fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
 
-fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
+fn seedCasAutomationDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
     const db_path_z = try allocator.dupeZ(u8, db_path);
     defer allocator.free(db_path_z);
     var db_opt: ?*Sqlite.sqlite3 = null;
@@ -4791,7 +4791,7 @@ fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
     if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
         if (err_msg) |msg| {
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stderr_writer.interface.print("seedCronDb sqlite error: {s}\n", .{std.mem.sliceTo(msg, 0)});
+            try stderr_writer.interface.print("seedCasAutomationDb sqlite error: {s}\n", .{std.mem.sliceTo(msg, 0)});
         }
         return error.InvalidData;
     }
@@ -5678,7 +5678,7 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
 fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
     if (std.mem.startsWith(u8, case_id, "ledger-")) return "ledger";
-    if (std.mem.startsWith(u8, case_id, "cron-")) return "cron";
+    if (std.mem.startsWith(u8, case_id, "cas-automation-")) return "cas";
     if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "lift-bench-stats")) return "bench_stats";
     if (std.mem.startsWith(u8, case_id, "perf-report")) return "perf_report";

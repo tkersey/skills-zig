@@ -5,7 +5,7 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 
-const SourceFile = "cron.zig";
+const SourceFile = "cas_automation.zig";
 const DefaultCodexBin = "codex";
 const DefaultLaunchdLabel = "com.openai.codex.automation-runner";
 const DefaultIntervalSeconds: i64 = 60;
@@ -603,12 +603,12 @@ fn printUsage() !void {
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
-        \\cron
+        \\cas automation
         \\
         \\Manage Codex automations with native Zig runtime (no Python/shell delegation).
         \\
         \\Usage:
-        \\  cron [--db <path>] <command> [options]
+        \\  cas automation [--db <path>] <command> [options]
         \\
         \\Commands:
         \\
@@ -946,7 +946,7 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
     var limit: usize = 10;
     var dry_run = false;
     var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
-    var lock_label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var lock_label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1027,14 +1027,14 @@ fn cmdScheduler(allocator: std.mem.Allocator, io: std.Io, args: []const []const 
 }
 
 fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
-    var label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
     var interval_seconds: i64 = blk: {
-        if (envString("CRON_LAUNCHD_INTERVAL_SECONDS")) |value| {
-            break :blk try parsePositiveI64(value, "CRON_LAUNCHD_INTERVAL_SECONDS");
+        if (envString("CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS")) |value| {
+            break :blk try parsePositiveI64(value, "CAS_AUTOMATION_LAUNCHD_INTERVAL_SECONDS");
         }
         break :blk DefaultIntervalSeconds;
     };
-    var path_value: []const u8 = envString("CRON_LAUNCHD_PATH") orelse envString("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin";
+    var path_value: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_PATH") orelse envString("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin";
     var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
 
     var i: usize = 0;
@@ -1077,7 +1077,7 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
 }
 
 fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
-    var label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var label: []const u8 = envString("CAS_AUTOMATION_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2639,6 +2639,7 @@ fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), lock_dir);
 
     const lock_path = try std.fmt.allocPrint(allocator, "{s}/run.lock", .{lock_dir});
+    defer allocator.free(lock_path);
 
     return acquireExclusiveLockWithStaleRetry(allocator, lock_path);
 }
@@ -2711,11 +2712,14 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
 
     const self_path = try std.process.executablePathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(self_path);
+    const executable_dir = std.fs.path.dirname(self_path) orelse return userErrorFmt("failed to resolve cas executable directory", .{});
+    const cas_path = try std.fs.path.join(allocator, &.{ executable_dir, "cas" });
+    defer allocator.free(cas_path);
 
     const label_xml = try xmlEscapeAlloc(allocator, args.label);
     defer allocator.free(label_xml);
-    const self_path_xml = try xmlEscapeAlloc(allocator, self_path);
-    defer allocator.free(self_path_xml);
+    const cas_path_xml = try xmlEscapeAlloc(allocator, cas_path);
+    defer allocator.free(cas_path_xml);
     const home_xml = try xmlEscapeAlloc(allocator, home);
     defer allocator.free(home_xml);
     const log_dir_xml = try xmlEscapeAlloc(allocator, log_dir);
@@ -2724,6 +2728,8 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
     defer allocator.free(path_xml);
     const codex_bin_xml = try xmlEscapeAlloc(allocator, args.codex_bin);
     defer allocator.free(codex_bin_xml);
+    const program_arguments_xml = try renderLaunchdProgramArguments(allocator, cas_path_xml);
+    defer allocator.free(program_arguments_xml);
 
     const plist = try std.fmt.allocPrint(
         allocator,
@@ -2733,11 +2739,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
             "<dict>\n" ++
             "  <key>Label</key>\n" ++
             "  <string>{s}</string>\n" ++
-            "  <key>ProgramArguments</key>\n" ++
-            "  <array>\n" ++
-            "    <string>{s}</string>\n" ++
-            "    <string>run-due</string>\n" ++
-            "  </array>\n" ++
+            "{s}" ++
             "  <key>WorkingDirectory</key>\n" ++
             "  <string>{s}</string>\n" ++
             "  <key>RunAtLoad</key>\n" ++
@@ -2761,14 +2763,14 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
             "  <dict>\n" ++
             "    <key>PATH</key>\n" ++
             "    <string>{s}</string>\n" ++
-            "    <key>CRON_LAUNCHD_LABEL</key>\n" ++
+            "    <key>CAS_AUTOMATION_LAUNCHD_LABEL</key>\n" ++
             "    <string>{s}</string>\n" ++
             "    <key>CODEX_BIN</key>\n" ++
             "    <string>{s}</string>\n" ++
             "  </dict>\n" ++
             "</dict>\n" ++
             "</plist>\n",
-        .{ label_xml, self_path_xml, home_xml, args.interval_seconds, log_dir_xml, log_dir_xml, path_xml, label_xml, codex_bin_xml },
+        .{ label_xml, program_arguments_xml, home_xml, args.interval_seconds, log_dir_xml, log_dir_xml, path_xml, label_xml, codex_bin_xml },
     );
     defer allocator.free(plist);
 
@@ -2805,6 +2807,19 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: Scheduler
     try stdout.print("installed and started: {s}\n", .{args.label});
     try stdout.print("plist: {s}\n", .{plist_path});
     try stdout.print("logs: {s}\n", .{log_dir});
+}
+
+fn renderLaunchdProgramArguments(allocator: std.mem.Allocator, cas_path_xml: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "  <key>ProgramArguments</key>\n" ++
+            "  <array>\n" ++
+            "    <string>{s}</string>\n" ++
+            "    <string>automation</string>\n" ++
+            "    <string>run-due</string>\n" ++
+            "  </array>\n",
+        .{cas_path_xml},
+    );
 }
 
 fn cmdSchedulerUninstall(allocator: std.mem.Allocator, io: std.Io, args: SchedulerLabelArgs) !void {
@@ -3398,6 +3413,20 @@ test "xmlEscapeAlloc escapes plist string metacharacters" {
     try std.testing.expectEqualStrings("a&amp;b&lt;c&gt;d&quot;e&apos;f", escaped);
 }
 
+test "launchd ProgramArguments invoke cas automation run-due" {
+    const rendered = try renderLaunchdProgramArguments(std.testing.allocator, "/opt/cas/bin/cas");
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "  <key>ProgramArguments</key>\n" ++
+            "  <array>\n" ++
+            "    <string>/opt/cas/bin/cas</string>\n" ++
+            "    <string>automation</string>\n" ++
+            "    <string>run-due</string>\n" ++
+            "  </array>\n",
+        rendered,
+    );
+}
+
 test "runDueAutomation dry-run is read-only" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3544,7 +3573,7 @@ test "runDueAutomation non-dry-run finalizes run row with provided io" {
     }
 }
 
-test "runPerfCase covers residual cron command families" {
+test "runPerfCase covers residual automation command families" {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const alloc = arena_state.allocator();

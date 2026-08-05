@@ -21,6 +21,7 @@ const CapabilitiesText =
     \\cas_codex_0145_structured_review_v2=true
     \\cas_codex_0145_structured_review_v3=true
     \\cas_codex_0145_structured_review_v4=true
+    \\cas_automation_v1=true
 ;
 
 const CapabilitiesJson =
@@ -42,7 +43,8 @@ const CapabilitiesJson =
     \\      "cas_codex_0145_structured_review_v1": true,
     \\      "cas_codex_0145_structured_review_v2": true,
     \\      "cas_codex_0145_structured_review_v3": true,
-    \\      "cas_codex_0145_structured_review_v4": true
+    \\      "cas_codex_0145_structured_review_v4": true,
+    \\      "cas_automation_v1": true
     \\    }
     \\  }
     \\}
@@ -58,6 +60,7 @@ const UsageText =
     \\
     \\Subcommands:
     \\  account                            Run cas_account.
+    \\  automation                         Manage Codex automations.
     \\  capabilities                       Print compiled CAS feature flags.
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
@@ -67,6 +70,7 @@ const UsageText =
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
     \\Examples:
+    \\  cas automation --help
     \\  cas capabilities --json
     \\  cas account status --cwd /path/to/repo --json
     \\  cas conformance --cwd /path/to/repo --json
@@ -84,7 +88,7 @@ const UsageText =
 ;
 
 const InstalledBinarySet =
-    "cas, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
+    "cas, cas_account, cas_automation, cas_smoke_check, cas_instance_runner, cas_review_session, " ++
     "cas_session_inquiry, cas_conformance_suite, cas_goal";
 
 pub fn main(init: std.process.Init) !void {
@@ -215,6 +219,9 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "account")) {
         return "cas_account";
     }
+    if (std.mem.eql(u8, subcommand, "automation")) {
+        return "cas_automation";
+    }
     if (std.mem.eql(u8, subcommand, "conformance") or std.mem.eql(u8, subcommand, "conformance-suite") or std.mem.eql(u8, subcommand, "conformance_suite")) {
         return "cas_conformance_suite";
     }
@@ -268,6 +275,8 @@ fn writeCapabilities(writer: *std.Io.Writer, json: bool) !void {
 
 test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_account", resolveTarget("account").?);
+    try std.testing.expectEqualStrings("cas_automation", resolveTarget("automation").?);
+    try std.testing.expect(resolveTarget("cron") == null);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance").?);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance-suite").?);
     try std.testing.expectEqualStrings("cas_goal", resolveTarget("goal").?);
@@ -341,6 +350,7 @@ test "capabilities advertise only current review boundary features" {
         text_output.written(),
         "cas_codex_0145_structured_review_v4=true",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_automation_v1=true") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text_output.written(),
@@ -367,6 +377,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v3\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_codex_0145_structured_review_v4\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_automation_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         json_output.written(),
@@ -388,6 +399,7 @@ test "capabilities advertise only current review boundary features" {
     try std.testing.expect(features.get("cas_codex_0145_structured_review_v2").?.bool);
     try std.testing.expect(features.get("cas_codex_0145_structured_review_v3").?.bool);
     try std.testing.expect(features.get("cas_codex_0145_structured_review_v4").?.bool);
+    try std.testing.expect(features.get("cas_automation_v1").?.bool);
     try std.testing.expect(features.get("cas_rer_workflow_binding_v1") == null);
     try std.testing.expect(features.get("cas_review_history_v2") == null);
     try std.testing.expect(features.get("dcp_v2").?.bool);
