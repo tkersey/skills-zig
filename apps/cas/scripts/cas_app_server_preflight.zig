@@ -22,6 +22,8 @@ const Usage =
 
 const Action = enum { schema, preflight };
 
+const pinning_probe_thread_id = "019dd901-0000-7000-8000-000000000146";
+
 const Options = struct {
     action: Action,
     cwd: []const u8 = ".",
@@ -109,6 +111,10 @@ fn run(
     var lifecycle_passed = false;
     var lifecycle_failure_code: ?[]const u8 = null;
     var lifecycle_failure_hint: ?[]const u8 = null;
+    var thread_pinning: probes.LiveWitness = .{};
+    const paginated_fork: probes.LiveWitness = .{};
+    const ephemeral_fork: probes.LiveWitness = .{};
+    var external_import_history: probes.LiveWitness = .{};
     if (options.action == .preflight) {
         if (validated_transport == .stdio) {
             contract.verifyExecutableIdentity(allocator, io, &schemas.executable) catch |err| {
@@ -149,6 +155,22 @@ fn run(
         }
     }
 
+    if (options.action == .preflight and options.profile == .full and lifecycle_passed and validated_transport == .stdio) {
+        const isolated: IsolatedFullWitnesses = runIsolatedFullProbes(
+            allocator,
+            io,
+            environment,
+            cache_root,
+            cwd,
+            schemas.executable.resolved_path,
+        ) catch |err| .{
+            .thread_pinning = probes.LiveWitness.failed("isolated_thread_probe_setup_failed", @errorName(err)),
+            .external_import_history = probes.LiveWitness.failed("isolated_import_probe_setup_failed", @errorName(err)),
+        };
+        thread_pinning = isolated.thread_pinning;
+        external_import_history = isolated.external_import_history;
+    }
+
     const handler_coverage_passed = inspection.handler_failures.items.len == 0 and
         proxy.server_request_handler_descriptors.len != 0;
     const retry_passed = probes.retryKernelProbe(allocator);
@@ -162,6 +184,10 @@ fn run(
         .lifecycle_failure_hint = lifecycle_failure_hint,
         .handler_coverage_passed = handler_coverage_passed,
         .retry_passed = retry_passed,
+        .thread_pinning = thread_pinning,
+        .paginated_fork = paginated_fork,
+        .ephemeral_fork = ephemeral_fork,
+        .external_import_history = external_import_history,
     });
 
     const structurally_compatible = inspection.status == .compatible;
@@ -229,6 +255,114 @@ fn run(
     };
     try writeOutput(io, output);
     return compatible;
+}
+
+const IsolatedFullWitnesses = struct {
+    thread_pinning: probes.LiveWitness,
+    external_import_history: probes.LiveWitness,
+};
+
+fn runIsolatedFullProbes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    parent_environment: *const std.process.Environ.Map,
+    cache_root: []const u8,
+    cwd: []const u8,
+    codex_path: []const u8,
+) !IsolatedFullWitnesses {
+    const nonce: u64 = @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+    const codex_home = try std.fmt.allocPrint(allocator, "{s}/probe-{x}", .{ cache_root, nonce });
+    defer allocator.free(codex_home);
+    try std.Io.Dir.cwd().createDir(io, codex_home, .default_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(io, codex_home) catch {};
+
+    var child_environment = try parent_environment.clone(allocator);
+    defer child_environment.deinit();
+    try child_environment.put("CODEX_HOME", codex_home);
+
+    try createPinningProbeRollout(allocator, io, codex_home, cwd);
+
+    const witnesses: IsolatedFullWitnesses = witnesses: {
+        var client = try proxy.Client.start(allocator, .{
+            .cwd = cwd,
+            .io = io,
+            .codex_path = codex_path,
+            .client_name = "cas-app-server-preflight-isolated",
+            .client_title = "CAS App Server Preflight Isolated Probes",
+            .client_version = app_meta.version,
+            .transport = .stdio,
+            .read_only = true,
+            .child_environment = &child_environment,
+        });
+        defer {
+            client.close();
+            client.deinit();
+        }
+        break :witnesses .{
+            .thread_pinning = probes.threadPinningProbe(allocator, &client, cwd, pinning_probe_thread_id),
+            .external_import_history = probes.externalImportHistoryProbe(allocator, &client, cwd),
+        };
+    };
+    try std.Io.Dir.cwd().deleteTree(io, codex_home);
+    return witnesses;
+}
+
+fn createPinningProbeRollout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    codex_home: []const u8,
+    cwd: []const u8,
+) !void {
+    const sessions = try std.fmt.allocPrint(allocator, "{s}/sessions", .{codex_home});
+    defer allocator.free(sessions);
+    const year = try std.fmt.allocPrint(allocator, "{s}/2026", .{sessions});
+    defer allocator.free(year);
+    const month = try std.fmt.allocPrint(allocator, "{s}/08", .{year});
+    defer allocator.free(month);
+    const day = try std.fmt.allocPrint(allocator, "{s}/04", .{month});
+    defer allocator.free(day);
+    try std.Io.Dir.cwd().createDir(io, sessions, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, year, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, month, .default_dir);
+    try std.Io.Dir.cwd().createDir(io, day, .default_dir);
+
+    const timestamp = "2026-08-04T00:00:00Z";
+    const meta = try stringifyProbeJsonAlloc(allocator, .{
+        .timestamp = timestamp,
+        .type = "session_meta",
+        .payload = .{
+            .session_id = pinning_probe_thread_id,
+            .id = pinning_probe_thread_id,
+            .timestamp = timestamp,
+            .cwd = cwd,
+            .originator = "cas-app-server-preflight",
+            .cli_version = app_meta.version,
+            .source = "cli",
+            .model_provider = @as(?[]const u8, null),
+            .base_instructions = @as(?[]const u8, null),
+        },
+    });
+    defer allocator.free(meta);
+    const response_item =
+        "{\"timestamp\":\"2026-08-04T00:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"CAS pinning conformance fixture\"}]}}";
+    const event =
+        "{\"timestamp\":\"2026-08-04T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"CAS pinning conformance fixture\",\"kind\":\"plain\"}}";
+    const contents = try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n", .{ meta, response_item, event });
+    defer allocator.free(contents);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/rollout-2026-08-04T00-00-00-{s}.jsonl",
+        .{ day, pinning_probe_thread_id },
+    );
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+}
+
+fn stringifyProbeJsonAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
 const CodexIdentity = struct {
