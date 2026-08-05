@@ -309,6 +309,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
         },
     });
+    const cas_app_server_contract_data = b.addOptions();
+    cas_app_server_contract_data.addOption(
+        []const u8,
+        "json",
+        @embedFile("apps/cas/contracts/codex-app-server-0.146.0.json"),
+    );
+    const cas_app_server_contract_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_app_server_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "cas_app_server_contract_data", .module = cas_app_server_contract_data.createModule() },
+        },
+    });
     const cas_budget_governor_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/budget_governor.zig"),
         .target = target,
@@ -556,6 +570,12 @@ pub fn build(b: *std.Build) void {
         "test-cas-proxy-client",
         "Run cas_proxy_client tests",
     );
+    const run_cas_app_server_contract_tests = addTestStep(
+        b,
+        cas_app_server_contract_root,
+        "test-cas-app-server-contract",
+        "Run CAS app-server structural contract tests",
+    );
     const run_cas_cli_tests = addTestStepWithOptions(
         b,
         cas_root,
@@ -587,6 +607,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
+    test_cas.dependOn(&run_cas_app_server_contract_tests.step);
     test_cas.dependOn(&run_cas_cli_tests.step);
     if (run_cas_dispatch_runtime_linux) |run| test_cas.dependOn(run);
 
