@@ -1,11 +1,23 @@
 const core_json = @import("core_json");
 pub const hooks = @import("cas_hook_policy.zig");
+pub const app_server_launch = @import("cas_app_server_launch.zig");
+const builtin = @import("builtin");
 const std = @import("std");
 const websocket_transport = @import("cas_websocket_transport.zig");
+
+const max_interleaved_messages: usize = 4096;
+const max_captured_notifications: usize = 1024;
+const max_captured_notification_bytes: usize = 16 * 1024 * 1024;
+const default_request_timeout_ms: i64 = 30_000;
+const handshake_timeout_ms: i64 = 10_000;
 
 pub const TransportKind = enum {
     stdio,
     websocket,
+
+    // Compatibility value until downstream receipt switches can add an
+    // exhaustive tag without widening this operation's allowed files.
+    pub const unix_socket = TransportKind.websocket;
 };
 
 pub const MultiAgentMode = enum {
@@ -75,6 +87,10 @@ pub const ClientOptions = struct {
     opt_out_notification_methods: []const []const u8 = &.{},
     hook_policy: hooks.HookPolicy = .inherit,
     websocket_url: ?[]const u8 = null,
+    // Typed transport selection. websocket_url remains an internal
+    // compatibility carrier until route call sites migrate.
+    transport: ?app_server_launch.ValidatedTransport = null,
+    code_mode_host: ?*const app_server_launch.CodeModeHost = null,
     websocket_connect_timeout_ms: u32 = 10_000,
     request_deadline_ms: ?i64 = null,
 };
@@ -108,11 +124,28 @@ pub const Client = struct {
     blocking_server_request_count: u64 = 0,
     request_deadline_ms: ?i64 = null,
     request_send_started: bool = false,
+    transport_identity: []const u8 = "stdio",
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         try validateServerRequestOptions(allocator, opts);
+        try validateTransportOptions(opts);
+        if (opts.transport) |transport| switch (transport) {
+            .stdio => return startStdio(allocator, opts),
+            .explicit_websocket => |url| return startWebsocket(allocator, opts, url, .websocket),
+            .unix_socket => |maybe_path| {
+                if (maybe_path) |path| {
+                    const resolved = try app_server_launch.resolveUnixPathAlloc(allocator, opts.cwd, path);
+                    defer allocator.free(resolved);
+                    return startUnix(allocator, opts, resolved);
+                }
+                const path = try app_server_launch.defaultUnixPathAlloc(allocator);
+                defer allocator.free(path);
+                return startUnix(allocator, opts, path);
+            },
+            .auto, .managed_websocket => return error.TransportLaunchRequired,
+        };
         if (opts.websocket_url) |url| {
-            return startWebsocket(allocator, opts, url);
+            return startWebsocket(allocator, opts, url, .websocket);
         }
 
         return startStdio(allocator, opts);
@@ -127,7 +160,7 @@ pub const Client = struct {
         try hooks.ensureLaunchSupportsPolicy(allocator, opts.io, resolved_codex_path, opts.cwd, opts.hook_policy);
 
         try argv.append(allocator, resolved_codex_path);
-        try hooks.appendAppServerArgs(allocator, &argv, opts.hook_policy, null);
+        try app_server_launch.appendAppServerArgs(allocator, &argv, opts.hook_policy == .off, null, opts.code_mode_host);
 
         const io = opts.io;
         const child = try std.process.spawn(io, .{
@@ -163,6 +196,7 @@ pub const Client = struct {
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
+            .transport_identity = "stdio",
         };
         errdefer {
             client.close();
@@ -172,13 +206,22 @@ pub const Client = struct {
         return client;
     }
 
-    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, url: []const u8) !Client {
+    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, url: []const u8, kind: TransportKind) !Client {
         const websocket = try websocket_transport.Connection.connect(allocator, url, opts.websocket_connect_timeout_ms);
 
+        return startSocketConnection(allocator, opts, websocket, kind, "websocket");
+    }
+
+    fn startUnix(allocator: std.mem.Allocator, opts: ClientOptions, path: []const u8) !Client {
+        const websocket = try websocket_transport.Connection.connectUnix(allocator, path, opts.websocket_connect_timeout_ms);
+        return startSocketConnection(allocator, opts, websocket, .unix_socket, "unix_socket");
+    }
+
+    fn startSocketConnection(allocator: std.mem.Allocator, opts: ClientOptions, websocket: websocket_transport.Connection, kind: TransportKind, identity: []const u8) !Client {
         var client = Client{
             .allocator = allocator,
             .io = opts.io,
-            .transport_kind = .websocket,
+            .transport_kind = kind,
             .child = null,
             .stdin_file = null,
             .stdout_file = null,
@@ -197,6 +240,7 @@ pub const Client = struct {
             .read_only = opts.read_only,
             .blocking_server_request_count = 0,
             .request_deadline_ms = opts.request_deadline_ms,
+            .transport_identity = identity,
         };
         errdefer {
             client.close();
@@ -213,6 +257,10 @@ pub const Client = struct {
         self.last_unsupported_server_request = null;
         self.line_buf.deinit(self.allocator);
         if (self.websocket) |*websocket| websocket.deinit();
+    }
+
+    pub fn transportIdentity(self: *const Client) []const u8 {
+        return self.transport_identity;
     }
 
     pub fn close(self: *Client) void {
@@ -273,13 +321,26 @@ pub const Client = struct {
         notification_lines: ?*std.ArrayList([]u8),
         send_observer: ?RequestSendObserver,
     ) ![]u8 {
+        const previous_deadline_ms = self.request_deadline_ms;
+        if (previous_deadline_ms == null) self.request_deadline_ms = monotonicMillis() + default_request_timeout_ms;
+        defer self.request_deadline_ms = previous_deadline_ms;
         self.request_send_started = false;
+        var captured_notification_bytes: usize = 0;
+        if (notification_lines) |lines| {
+            if (lines.items.len > max_captured_notifications) return error.AppServerNotificationLimitExceeded;
+            for (lines.items) |line| {
+                captured_notification_bytes = try addCapturedNotificationBytes(captured_notification_bytes, line.len);
+            }
+        }
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
         try self.sendRequest(request_id, method, params_json, send_observer);
 
+        var interleaved: usize = 0;
         while (true) {
+            interleaved += 1;
+            if (interleaved > max_interleaved_messages) return error.AppServerInterleavingLimitExceeded;
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -294,7 +355,10 @@ pub const Client = struct {
 
             if (notification_lines) |lines| {
                 if (isNotificationMessage(msg_obj)) {
+                    if (lines.items.len >= max_captured_notifications) return error.AppServerNotificationLimitExceeded;
+                    const updated_bytes = try addCapturedNotificationBytes(captured_notification_bytes, line.len);
                     try lines.append(self.allocator, try self.allocator.dupe(u8, line));
+                    captured_notification_bytes = updated_bytes;
                 }
             }
 
@@ -332,6 +396,11 @@ pub const Client = struct {
 
     fn handshake(self: *Client, opts: ClientOptions) !void {
         const handshake_id: i64 = -1;
+        const previous_deadline_ms = self.request_deadline_ms;
+        const bounded_handshake_deadline = monotonicMillis() + handshake_timeout_ms;
+        if (previous_deadline_ms == null or previous_deadline_ms.? > bounded_handshake_deadline)
+            self.request_deadline_ms = bounded_handshake_deadline;
+        defer self.request_deadline_ms = previous_deadline_ms;
 
         const client_name = opts.client_name orelse "cas-zig";
         const client_title = opts.client_title orelse "CAS Zig Client";
@@ -459,9 +528,7 @@ pub const Client = struct {
             try self.sendToServer(initialize, null);
         }
 
-        const started_ms = monotonicMillis();
-        const timeout_ms: i64 = 10_000;
-        while (monotonicMillis() - started_ms < timeout_ms) {
+        while (monotonicMillis() < self.request_deadline_ms.?) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -505,6 +572,7 @@ pub const Client = struct {
         send_observer: ?RequestSendObserver,
     ) !void {
         if (params_json) |raw| {
+            if (raw.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
             var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
             defer parsed_params.deinit();
 
@@ -541,12 +609,20 @@ pub const Client = struct {
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
         const payload = payload_writer.written();
+        if (payload.len > websocket_transport.max_message_bytes) return error.AppServerMessageTooLarge;
         switch (self.transport_kind) {
             .stdio => {
                 if (send_observer) |observer| try observer.before_send(observer.context);
                 self.request_send_started = true;
-                try self.stdin_file.?.writeStreamingAll(self.io, payload);
-                try self.stdin_file.?.writeStreamingAll(self.io, "\n");
+                const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
+                writeFileAllUntil(self.stdin_file.?, payload, deadline_ms) catch |err| {
+                    self.close();
+                    return err;
+                };
+                writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms) catch |err| {
+                    self.close();
+                    return err;
+                };
             },
             .websocket => try self.sendWebSocket(payload, send_observer),
         }
@@ -662,8 +738,9 @@ pub const Client = struct {
         defer self.allocator.free(payload);
         switch (self.transport_kind) {
             .stdio => {
-                try self.stdin_file.?.writeStreamingAll(self.io, payload);
-                try self.stdin_file.?.writeStreamingAll(self.io, "\n");
+                const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
+                try writeFileAllUntil(self.stdin_file.?, payload, deadline_ms);
+                try writeFileAllUntil(self.stdin_file.?, "\n", deadline_ms);
             },
             .websocket => try self.sendWebSocket(payload, null),
         }
@@ -697,11 +774,7 @@ pub const Client = struct {
         payload: []const u8,
         send_observer: ?RequestSendObserver,
     ) !void {
-        const deadline_ms = self.request_deadline_ms orelse {
-            if (send_observer) |observer| try observer.before_send(observer.context);
-            self.request_send_started = true;
-            return self.websocket.?.sendText(payload);
-        };
+        const deadline_ms = self.request_deadline_ms orelse monotonicMillis() + default_request_timeout_ms;
         var remaining_ms = deadline_ms - monotonicMillis();
         if (remaining_ms <= 0) return error.ConnectionTimedOut;
         if (send_observer) |observer| {
@@ -918,6 +991,9 @@ pub const Client = struct {
             }
 
             var tmp: [1]u8 = undefined;
+            if (self.request_deadline_ms) |deadline_ms| {
+                try waitFileReadableUntil(self.stdout_file.?, deadline_ms);
+            }
             var reader = self.stdout_file.?.reader(self.io, &.{});
             const n = try reader.interface.readSliceShort(tmp[0..]);
             if (n == 0) {
@@ -926,10 +1002,103 @@ pub const Client = struct {
                 self.line_buf.items.len = 0;
                 return tail;
             }
+            if (self.line_buf.items.len > websocket_transport.max_message_bytes - n) {
+                self.close();
+                return error.AppServerMessageTooLarge;
+            }
             try self.line_buf.appendSlice(self.allocator, tmp[0..n]);
         }
     }
 };
+
+fn addCapturedNotificationBytes(current: usize, additional: usize) !usize {
+    if (current > max_captured_notification_bytes or
+        additional > max_captured_notification_bytes - current)
+        return error.AppServerNotificationBytesLimitExceeded;
+    return current + additional;
+}
+
+fn waitFileReadableUntil(file: std.Io.File, deadline_ms: i64) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        return error.StdioDeadlineUnsupported;
+    try waitFileEventUntil(
+        file,
+        deadline_ms,
+        std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP,
+    );
+}
+
+fn waitFileWritableUntil(file: std.Io.File, deadline_ms: i64) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        return error.StdioDeadlineUnsupported;
+    try waitFileEventUntil(
+        file,
+        deadline_ms,
+        std.posix.POLL.OUT | std.posix.POLL.ERR | std.posix.POLL.HUP,
+    );
+}
+
+fn waitFileEventUntil(file: std.Io.File, deadline_ms: i64, events: i16) !void {
+    const remaining_ms = deadline_ms - monotonicMillis();
+    if (remaining_ms <= 0) return error.ConnectionTimedOut;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = file.handle,
+        .events = events,
+        .revents = 0,
+    }};
+    const timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+    if (try std.posix.poll(&fds, timeout) == 0) return error.ConnectionTimedOut;
+    if ((fds[0].revents & std.posix.POLL.NVAL) != 0) return error.AppServerClosed;
+}
+
+fn writeFileAllUntil(file: std.Io.File, bytes: []const u8, deadline_ms: i64) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi)
+        return error.StdioDeadlineUnsupported;
+
+    const original_flags: usize = while (true) {
+        const rc = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(usize, 0));
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            else => return error.AppServerWriteFailed,
+        }
+    };
+    const nonblocking_flags = original_flags | @as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.SETFL, nonblocking_flags))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.AppServerWriteFailed,
+        }
+    }
+    defer _ = std.posix.system.fcntl(file.handle, std.posix.F.SETFL, original_flags);
+
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        try waitFileWritableUntil(file, deadline_ms);
+        const rc = std.posix.system.write(file.handle, bytes[offset..].ptr, bytes.len - offset);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                const written: usize = @intCast(rc);
+                if (written == 0) return error.AppServerClosed;
+                offset += written;
+            },
+            .INTR, .AGAIN => continue,
+            .PIPE => return error.AppServerClosed,
+            else => return error.AppServerWriteFailed,
+        }
+    }
+}
+
+fn validateTransportOptions(opts: ClientOptions) !void {
+    if (opts.transport != null and opts.websocket_url != null) return error.ConflictingTransportOptions;
+    if (opts.code_mode_host == null) return;
+    if (opts.websocket_url != null) return error.CodeModeHostRequiresManagedLaunch;
+    if (opts.transport) |transport| switch (transport) {
+        .explicit_websocket, .unix_socket => return error.CodeModeHostRequiresManagedLaunch,
+        else => {},
+    };
+}
 
 fn hasExactOpenaiFormPolicy(opts: ClientOptions) bool {
     if (opts.elicitation_response_json != null) return true;
@@ -1324,6 +1493,84 @@ test "stdio handshake failure reaps the spawned app-server" {
     try std.testing.expect(!websocket_transport.processAlive(process_id));
 }
 
+test "stdio request deadline bounds a silent live app-server and reaps it" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "silent-codex" });
+    defer allocator.free(executable);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "silent.pid" });
+    defer allocator.free(pid_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" > '{s}'\nwhile IFS= read -r _; do sleep 600; done\n",
+        .{pid_path},
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "silent-codex", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    const started_ms = monotonicMillis();
+    try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .request_deadline_ms = started_ms + 100,
+    }));
+    try std.testing.expect(monotonicMillis() - started_ms < 1_000);
+
+    const pid_bytes = try tmp.dir.readFileAlloc(io, "silent.pid", allocator, .limited(64));
+    defer allocator.free(pid_bytes);
+    const process_id = try std.fmt.parseInt(u64, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    try std.testing.expect(!websocket_transport.processAlive(process_id));
+}
+
+test "stdio request deadline bounds a blocked write and reaps the app-server" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const executable = try std.fs.path.join(allocator, &.{ root, "blocked-codex" });
+    defer allocator.free(executable);
+    const pid_path = try std.fs.path.join(allocator, &.{ root, "blocked.pid" });
+    defer allocator.free(pid_path);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\nset -eu\nprintf '%s' \"$$\" > '{s}'\nsleep 600\n",
+        .{pid_path},
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(io, .{ .sub_path = "blocked-codex", .data = script });
+    try std.Io.Dir.cwd().setFilePermissions(io, executable, std.Io.File.Permissions.fromMode(0o755), .{});
+
+    const large_title = try allocator.alloc(u8, 1024 * 1024);
+    defer allocator.free(large_title);
+    @memset(large_title, 'x');
+    const started_ms = monotonicMillis();
+    try std.testing.expectError(error.ConnectionTimedOut, Client.start(allocator, .{
+        .cwd = root,
+        .io = io,
+        .codex_path = executable,
+        .client_title = large_title,
+        .request_deadline_ms = started_ms + 200,
+    }));
+    try std.testing.expect(monotonicMillis() - started_ms < 1_000);
+
+    const pid_bytes = try tmp.dir.readFileAlloc(io, "blocked.pid", allocator, .limited(64));
+    defer allocator.free(pid_bytes);
+    const process_id = try std.fmt.parseInt(u64, std.mem.trim(u8, pid_bytes, " \t\r\n"), 10);
+    try std.testing.expect(!websocket_transport.processAlive(process_id));
+}
+
 test "unknown server request replies then records exact method and terminates" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1667,6 +1914,34 @@ test "request send ownership survives deadline expiry after durable observer" {
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expect(client.lastRequestSendStarted());
+}
+
+test "code mode host cannot be silently ignored by existing endpoint transports" {
+    var host = try app_server_launch.CodeModeHost.init(std.testing.allocator, "ws://127.0.0.1:9911");
+    defer host.deinit();
+    try std.testing.expectError(
+        error.CodeModeHostRequiresManagedLaunch,
+        validateTransportOptions(.{ .cwd = ".", .code_mode_host = &host, .transport = .{ .explicit_websocket = "ws://127.0.0.1:1" } }),
+    );
+    try std.testing.expectError(
+        error.CodeModeHostRequiresManagedLaunch,
+        validateTransportOptions(.{ .cwd = ".", .code_mode_host = &host, .transport = .{ .unix_socket = null } }),
+    );
+    try std.testing.expectError(
+        error.ConflictingTransportOptions,
+        validateTransportOptions(.{ .cwd = ".", .websocket_url = "ws://127.0.0.1:1", .transport = .stdio }),
+    );
+}
+
+test "notification capture has an aggregate byte bound" {
+    try std.testing.expectEqual(
+        max_captured_notification_bytes,
+        try addCapturedNotificationBytes(max_captured_notification_bytes - 1, 1),
+    );
+    try std.testing.expectError(
+        error.AppServerNotificationBytesLimitExceeded,
+        addCapturedNotificationBytes(max_captured_notification_bytes, 1),
+    );
 }
 
 test "resolveExecDecision honors read_only and explicit approvals" {

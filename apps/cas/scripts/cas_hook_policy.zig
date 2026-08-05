@@ -1,5 +1,6 @@
 const core_json = @import("core_json");
 const std = @import("std");
+const app_server_launch = @import("cas_app_server_launch.zig");
 
 pub const HookPolicy = enum {
     inherit,
@@ -175,15 +176,7 @@ pub fn appendAppServerArgs(
     policy: HookPolicy,
     listen_url: ?[]const u8,
 ) !void {
-    try argv.append(allocator, "app-server");
-    if (policy == .off) {
-        try argv.append(allocator, "--disable");
-        try argv.append(allocator, "codex_hooks");
-    }
-    if (listen_url) |url| {
-        try argv.append(allocator, "--listen");
-        try argv.append(allocator, url);
-    }
+    try app_server_launch.appendAppServerArgs(allocator, argv, policy == .off, listen_url, null);
 }
 
 pub fn ensureLaunchSupportsPolicy(

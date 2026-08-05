@@ -308,6 +308,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
         },
     });
+    const cas_transport_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_transport_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+        },
+    });
     const cas_app_server_contract_data = b.addOptions();
     cas_app_server_contract_data.addOption(
         []const u8,
@@ -573,6 +581,13 @@ pub fn build(b: *std.Build) void {
         "test-cas-proxy-client",
         "Run cas_proxy_client tests",
     );
+    const run_cas_transport_tests = addTestStepWithOptions(
+        b,
+        cas_transport_tests_root,
+        "test-cas-transport",
+        "Run CAS app-server transport kernel tests",
+        .{ .link_libc = true },
+    );
     const run_cas_app_server_contract_tests = addTestStep(
         b,
         cas_app_server_contract_root,
@@ -610,6 +625,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
+    test_cas.dependOn(&run_cas_transport_tests.step);
     test_cas.dependOn(&run_cas_app_server_contract_tests.step);
     test_cas.dependOn(&run_cas_cli_tests.step);
     if (run_cas_dispatch_runtime_linux) |run| test_cas.dependOn(run);
